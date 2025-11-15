@@ -1,7 +1,7 @@
 """
 Train SPROUT on Masked Language Modeling (MLM) task.
 
-Simple training script compatible with Google Colab.
+Self-contained training script - no external dependencies on dawn utils.
 
 Usage (Colab):
     !python scripts/train_sprout_mlm.py \
@@ -20,23 +20,198 @@ import sys
 import argparse
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer
+from datasets import load_dataset
 from tqdm import tqdm
-import time
+import random
+import re
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sprout import SproutLanguageModel
 
-# Import dawn utilities (if available)
-try:
-    from dawn.utils.data_utils import load_wikipedia_streaming, MaskingStrategy
-    DAWN_AVAILABLE = True
-except ImportError:
-    DAWN_AVAILABLE = False
-    print("⚠️  Dawn utilities not available. Using simplified data loading.")
+
+# ============================================================================
+# Data Loading Functions
+# ============================================================================
+
+def load_wikipedia_data(max_samples=50000, streaming=True):
+    """
+    Load Wikipedia dataset.
+
+    Args:
+        max_samples: Maximum number of samples
+        streaming: Use streaming mode
+
+    Returns:
+        List of sentences
+    """
+    print("🔄 Loading Wikipedia dataset...")
+
+    try:
+        # Try WikiText-103 (smaller, faster)
+        dataset = load_dataset(
+            "Salesforce/wikitext",
+            "wikitext-103-raw-v1",
+            split="train",
+            streaming=streaming,
+            trust_remote_code=False
+        )
+        print("✅ Loaded Salesforce/wikitext-103")
+    except Exception as e:
+        print(f"⚠️  Failed to load wikitext: {e}")
+        # Fallback to simple sentences
+        return generate_fallback_sentences(max_samples)
+
+    # Filter and collect sentences
+    sentences = []
+    max_items = max_samples * 10  # Over-sample for filtering
+
+    for idx, item in enumerate(dataset):
+        if idx >= max_items:
+            break
+
+        text = item.get("text", "").strip()
+        if not text or text.startswith("="):  # Skip titles
+            continue
+
+        # Split into sentences
+        sents = [s.strip() for s in re.split(r'[.!?]+', text)]
+
+        for sent in sents:
+            word_count = len(sent.split())
+            if 5 <= word_count <= 50:  # Filter by length
+                sentences.append(sent)
+
+            if len(sentences) >= max_samples:
+                break
+
+        if len(sentences) >= max_samples:
+            break
+
+    print(f"✅ Loaded {len(sentences)} sentences")
+    return sentences
+
+
+def generate_fallback_sentences(num_samples):
+    """Generate simple fallback sentences for testing."""
+    base_sentences = [
+        "The quick brown fox jumps over the lazy dog.",
+        "Machine learning is a subset of artificial intelligence.",
+        "Natural language processing enables computers to understand text.",
+        "Deep learning models require large amounts of data.",
+        "Neural networks are inspired by the human brain.",
+        "Transformers have revolutionized natural language processing.",
+        "Attention mechanisms allow models to focus on relevant information.",
+        "Self-supervised learning reduces the need for labeled data.",
+        "Language models can generate coherent and contextual text.",
+        "Gradient descent is used to optimize neural network parameters.",
+    ]
+
+    sentences = base_sentences * (num_samples // len(base_sentences) + 1)
+    return sentences[:num_samples]
+
+
+# ============================================================================
+# MLM Dataset
+# ============================================================================
+
+class MLMDataset(Dataset):
+    """
+    Masked Language Modeling Dataset.
+
+    Implements BERT-style MLM masking:
+    - 80% of masked tokens → [MASK]
+    - 10% of masked tokens → random token
+    - 10% of masked tokens → unchanged
+    """
+
+    def __init__(self, sentences, tokenizer, max_length=128, mask_prob=0.15):
+        """
+        Initialize MLM dataset.
+
+        Args:
+            sentences: List of text sentences
+            tokenizer: HuggingFace tokenizer
+            max_length: Maximum sequence length
+            mask_prob: Probability of masking (default: 15%)
+        """
+        self.sentences = sentences
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.mask_prob = mask_prob
+
+    def __len__(self):
+        return len(self.sentences)
+
+    def __getitem__(self, idx):
+        text = self.sentences[idx]
+
+        # Tokenize
+        encoding = self.tokenizer(
+            text,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        input_ids = encoding["input_ids"].squeeze(0)
+        attention_mask = encoding["attention_mask"].squeeze(0)
+        labels = input_ids.clone()
+
+        # Apply MLM masking
+        input_ids, labels = self._apply_mlm_masking(input_ids, labels)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
+        }
+
+    def _apply_mlm_masking(self, input_ids, labels):
+        """
+        Apply BERT-style MLM masking.
+
+        Args:
+            input_ids: Token IDs [seq_len]
+            labels: Label IDs [seq_len]
+
+        Returns:
+            Masked input_ids and labels
+        """
+        # Create masking probability matrix
+        probability_matrix = torch.full(labels.shape, self.mask_prob)
+
+        # Don't mask special tokens
+        special_tokens_mask = torch.tensor([
+            self.tokenizer.get_special_tokens_mask([val], already_has_special_tokens=True)[0]
+            for val in labels.tolist()
+        ], dtype=torch.bool)
+        probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+
+        # Don't mask padding
+        padding_mask = input_ids == self.tokenizer.pad_token_id
+        probability_matrix.masked_fill_(padding_mask, value=0.0)
+
+        # Sample masked positions
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+        labels[~masked_indices] = -100  # Only compute loss on masked tokens
+
+        # 80% of the time: replace with [MASK]
+        indices_replaced = masked_indices & (torch.rand(labels.shape) < 0.8)
+        input_ids[indices_replaced] = self.tokenizer.mask_token_id
+
+        # 10% of the time: replace with random token
+        indices_random = masked_indices & ~indices_replaced & (torch.rand(labels.shape) < 0.5)
+        random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
+        input_ids[indices_random] = random_words[indices_random]
+
+        # 10% of the time: keep original (already done)
+
+        return input_ids, labels
 
 
 # ============================================================================
@@ -86,8 +261,6 @@ def get_args():
                         help="Checkpoint directory")
     parser.add_argument("--save_every", type=int, default=5000,
                         help="Save checkpoint every N steps")
-    parser.add_argument("--eval_every", type=int, default=1000,
-                        help="Evaluate every N steps")
 
     # Logging
     parser.add_argument("--log_every", type=int, default=100,
@@ -104,64 +277,6 @@ def get_args():
 
 
 # ============================================================================
-# Simple MLM Dataset (fallback if dawn not available)
-# ============================================================================
-
-class SimpleMLMDataset(torch.utils.data.Dataset):
-    """Simple MLM dataset for testing."""
-
-    def __init__(self, sentences, tokenizer, max_length=128, mask_prob=0.15):
-        self.sentences = sentences
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.mask_prob = mask_prob
-
-    def __len__(self):
-        return len(self.sentences)
-
-    def __getitem__(self, idx):
-        text = self.sentences[idx]
-
-        # Tokenize
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
-        )
-
-        input_ids = encoding["input_ids"].squeeze(0)
-        attention_mask = encoding["attention_mask"].squeeze(0)
-        labels = input_ids.clone()
-
-        # Apply masking (simple version)
-        probability_matrix = torch.full(labels.shape, self.mask_prob)
-        special_tokens_mask = [
-            self.tokenizer.get_special_tokens_mask([val], already_has_special_tokens=True)[0]
-            for val in labels.tolist()
-        ]
-        probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
-
-        masked_indices = torch.bernoulli(probability_matrix).bool()
-        labels[~masked_indices] = -100
-
-        # 80% mask, 10% random, 10% keep
-        indices_replaced = masked_indices & (torch.rand(labels.shape) < 0.8)
-        input_ids[indices_replaced] = self.tokenizer.mask_token_id
-
-        indices_random = masked_indices & ~indices_replaced & (torch.rand(labels.shape) < 0.5)
-        random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
-        input_ids[indices_random] = random_words[indices_random]
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
-        }
-
-
-# ============================================================================
 # Training Functions
 # ============================================================================
 
@@ -173,41 +288,18 @@ def create_dataloader(args, tokenizer):
 
     # Load sentences
     if args.debug_mode:
-        sentences = [
-            "The quick brown fox jumps over the lazy dog.",
-            "Machine learning is a subset of artificial intelligence.",
-            "Natural language processing enables computers to understand text.",
-            "Deep learning models require large amounts of data.",
-            "Neural networks are inspired by the human brain."
-        ] * 100
-        print(f"✅ Debug mode: Using {len(sentences)} simple sentences")
+        print("🐛 Debug mode: Using simple sentences")
+        sentences = generate_fallback_sentences(500)
     else:
-        if DAWN_AVAILABLE:
-            print("✅ Using dawn data utilities")
-            sentences = load_wikipedia_streaming(
-                max_samples=args.max_samples,
-                streaming=True
-            )
-        else:
-            # Fallback: generate simple data
-            print("⚠️  Using fallback simple sentences")
-            base_sentences = [
-                "The quick brown fox jumps over the lazy dog.",
-                "Machine learning is a subset of artificial intelligence.",
-                "Natural language processing enables computers to understand text.",
-                "Deep learning models require large amounts of data.",
-                "Neural networks are inspired by the human brain.",
-                "Transformers have revolutionized natural language processing.",
-                "Attention mechanisms allow models to focus on relevant information.",
-                "Self-supervised learning reduces the need for labeled data.",
-            ]
-            sentences = base_sentences * (args.max_samples // len(base_sentences) + 1)
-            sentences = sentences[:args.max_samples]
+        sentences = load_wikipedia_data(
+            max_samples=args.max_samples,
+            streaming=True
+        )
 
     print(f"   Total sentences: {len(sentences)}")
 
     # Create dataset
-    dataset = SimpleMLMDataset(
+    dataset = MLMDataset(
         sentences=sentences,
         tokenizer=tokenizer,
         max_length=args.max_length,
@@ -265,7 +357,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, args, epoch, de
         # Backward pass
         optimizer.zero_grad()
 
-        if args.mixed_precision:
+        if args.mixed_precision and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
