@@ -51,7 +51,7 @@ def collect_routing_stats(model, dataloader, num_batches=10, device='cpu'):
             input_ids = batch['input_ids'].to(device)
 
             # Forward with detailed logging
-            outputs = model(input_ids=input_ids, return_path_log=True)
+            outputs = model(input_ids=input_ids)
             path_log = outputs.get('path_log', [])
 
             for log in path_log:
