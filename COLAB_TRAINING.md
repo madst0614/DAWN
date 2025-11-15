@@ -2,7 +2,25 @@
 
 Train SPROUT on Masked Language Modeling (MLM) with Google Colab.
 
-## Quick Start
+## One-Line Quick Start 🚀
+
+**Copy-paste this into a Colab cell:**
+
+```python
+# Clone and setup
+!git clone https://github.com/madst0614/sprout.git 2>/dev/null || true
+%cd /content/sprout
+!git checkout claude/implement-sprout-model-01L9icytevoJcfrrmKZo6Rm4
+!git pull origin claude/implement-sprout-model-01L9icytevoJcfrrmKZo6Rm4
+
+# Install dependencies (takes ~30 seconds)
+!pip install -q torch transformers datasets tqdm
+
+# Quick test (debug mode - 1 minute)
+!python scripts/train_sprout_mlm.py --debug_mode --num_epochs 1 --visualize_structure
+```
+
+## Full Training Setup
 
 ### 1. Mount Google Drive (for checkpoints)
 
@@ -11,25 +29,19 @@ from google.colab import drive
 drive.mount('/content/drive')
 ```
 
-### 2. Clone Repository
+### 2. Clone and Setup
 
 ```python
-from google.colab import userdata
-token = userdata.get('GITHUB_TOKEN')  # Add your token to Colab secrets
-!git clone https://x-access-token:{token}@github.com/madst0614/sprout.git
-```
-
-Or clone without token (public repo):
-
-```python
-!git clone https://github.com/madst0614/sprout.git
+!git clone https://github.com/madst0614/sprout.git 2>/dev/null || true
+%cd /content/sprout
+!git checkout claude/implement-sprout-model-01L9icytevoJcfrrmKZo6Rm4
+!git pull origin claude/implement-sprout-model-01L9icytevoJcfrrmKZo6Rm4
 ```
 
 ### 3. Install Dependencies
 
 ```python
-%cd /content/sprout
-!pip install -r requirements.txt
+!pip install -q torch transformers datasets tqdm
 ```
 
 ### 4. Run Training
@@ -40,6 +52,7 @@ Or clone without token (public repo):
   --num_epochs 3 \
   --batch_size 32 \
   --max_samples 50000 \
+  --max_nodes 5 \
   --visualize_structure
 ```
 
