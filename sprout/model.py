@@ -23,22 +23,24 @@ class SPROUT(nn.Module):
     def __init__(
         self,
         dim: int = 512,
-        max_depth: int = 5,
-        compatibility_threshold: float = 0.8,
+        max_depth: int = 4,
+        compatibility_threshold: float = 0.5,
         num_heads: int = 4,
         ffn_mult: int = 4,
-        max_nodes: Optional[int] = None
+        max_nodes: Optional[int] = 20,
+        exploration_rate: float = 0.0
     ):
         """
         Initialize SPROUT model.
 
         Args:
             dim: Hidden dimension
-            max_depth: Maximum tree depth
-            compatibility_threshold: Threshold for creating new branches
+            max_depth: Maximum tree depth (default: 4)
+            compatibility_threshold: Threshold for creating new branches (default: 0.5)
             num_heads: Number of attention heads
             ffn_mult: FFN expansion multiplier
-            max_nodes: Maximum total nodes (None = unlimited)
+            max_nodes: Maximum total nodes (default: 20)
+            exploration_rate: Random exploration probability (default: 0.0)
         """
         super().__init__()
         self.dim = dim
@@ -47,6 +49,7 @@ class SPROUT(nn.Module):
         self.num_heads = num_heads
         self.ffn_mult = ffn_mult
         self.max_nodes = max_nodes
+        self.exploration_rate = exploration_rate
 
         # Single root entry point
         self.root = Node(
@@ -55,7 +58,8 @@ class SPROUT(nn.Module):
             depth=0,
             max_depth=max_depth,
             num_heads=num_heads,
-            ffn_mult=ffn_mult
+            ffn_mult=ffn_mult,
+            exploration_rate=exploration_rate
         )
         # Pass parent reference for node counting (use weakref to avoid circular reference)
         self.root._sprout_parent_ref = weakref.ref(self)

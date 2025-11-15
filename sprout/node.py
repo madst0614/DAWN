@@ -7,6 +7,7 @@ Implements the recursive node structure with Attention → FFN → Router flow.
 import torch
 import torch.nn as nn
 import weakref
+import random
 from typing import List, Dict, Optional, Tuple
 
 from .router import Router
@@ -25,7 +26,8 @@ class Node(nn.Module):
         depth: int = 0,
         max_depth: int = 5,
         num_heads: int = 4,
-        ffn_mult: int = 4
+        ffn_mult: int = 4,
+        exploration_rate: float = 0.0
     ):
         """
         Initialize node.
@@ -37,12 +39,14 @@ class Node(nn.Module):
             max_depth: Maximum allowed depth
             num_heads: Number of attention heads
             ffn_mult: FFN expansion multiplier
+            exploration_rate: Probability of random exploration (0.0-1.0)
         """
         super().__init__()
         self.dim = dim
         self.node_id = node_id
         self.depth = depth
         self.max_depth = max_depth
+        self.exploration_rate = exploration_rate
 
         # Processing components
         self.attention = nn.MultiheadAttention(
@@ -151,6 +155,71 @@ class Node(nn.Module):
         )
         best_compat = child_compatibilities[best_idx]
 
+        # Exploration: randomly explore or exploit
+        should_explore = random.random() < self.exploration_rate
+
+        if should_explore:
+            # Random exploration: 50% random child, 50% create new child
+            if random.random() < 0.5 and len(self.child_nodes) > 0:
+                # Random existing child
+                explore_idx = random.randint(0, len(self.child_nodes) - 1)
+                best_child = self.child_nodes[explore_idx]
+                gate_strength = child_compatibilities[explore_idx]
+                child_output, child_log = best_child(
+                    x,
+                    context_bias,
+                    compatibility_threshold
+                )
+                child_output = gate_strength * child_output + (1 - gate_strength) * x
+
+                path_log.append({
+                    'node_id': self.node_id,
+                    'depth': self.depth,
+                    'action': 'explored_random',
+                    'child_id': best_child.node_id,
+                    'compatibility': child_compatibilities[explore_idx]
+                })
+                path_log.extend(child_log)
+                return child_output, path_log
+            else:
+                # Create new child (exploration)
+                new_child = self._create_child()
+                if new_child is None:
+                    # Node limit reached, fall back to best child
+                    best_child = self.child_nodes[best_idx]
+                    gate_strength = child_compatibilities[best_idx]
+                    child_output, child_log = best_child(
+                        x,
+                        context_bias,
+                        compatibility_threshold
+                    )
+                    child_output = gate_strength * child_output + (1 - gate_strength) * x
+
+                    path_log.append({
+                        'node_id': self.node_id,
+                        'depth': self.depth,
+                        'action': 'explored_but_limit_reached',
+                        'child_id': best_child.node_id,
+                        'compatibility': best_compat
+                    })
+                    path_log.extend(child_log)
+                    return child_output, path_log
+
+                child_output, child_log = new_child(
+                    x,
+                    context_bias,
+                    compatibility_threshold
+                )
+
+                path_log.append({
+                    'node_id': self.node_id,
+                    'depth': self.depth,
+                    'action': 'explored_new',
+                    'new_child_id': new_child.node_id
+                })
+                path_log.extend(child_log)
+                return child_output, path_log
+
         if best_compat < compatibility_threshold:
             # Create new branch
             new_child = self._create_child()
@@ -235,7 +304,8 @@ class Node(nn.Module):
             dim=self.dim,
             node_id=self.next_child_id,
             depth=self.depth + 1,
-            max_depth=self.max_depth
+            max_depth=self.max_depth,
+            exploration_rate=self.exploration_rate
         )
         # Move child to same device as parent
         child = child.to(self.node_key.device)

@@ -225,14 +225,18 @@ def get_args():
     # Model config
     parser.add_argument("--hidden_dim", type=int, default=512,
                         help="Hidden dimension")
-    parser.add_argument("--max_depth", type=int, default=2,
-                        help="Maximum tree depth (2 = ~5 nodes)")
-    parser.add_argument("--max_nodes", type=int, default=5,
-                        help="Hard limit on total nodes")
-    parser.add_argument("--compatibility_threshold", type=float, default=0.8,
-                        help="Compatibility threshold for branching")
+    parser.add_argument("--max_depth", type=int, default=4,
+                        help="Maximum tree depth (default: 4)")
+    parser.add_argument("--max_nodes", type=int, default=20,
+                        help="Hard limit on total nodes (default: 20)")
+    parser.add_argument("--compatibility_threshold", type=float, default=0.5,
+                        help="Compatibility threshold for branching (default: 0.5)")
     parser.add_argument("--num_heads", type=int, default=4,
                         help="Number of attention heads")
+    parser.add_argument("--exploration_rate", type=float, default=0.2,
+                        help="Initial exploration rate (default: 0.2)")
+    parser.add_argument("--exploration_decay", type=float, default=0.99,
+                        help="Exploration decay per epoch (default: 0.99)")
 
     # Training config
     parser.add_argument("--num_epochs", type=int, default=3,
@@ -267,6 +271,8 @@ def get_args():
                         help="Log every N steps")
     parser.add_argument("--visualize_structure", action="store_true",
                         help="Visualize tree structure after training")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose logging (compatibility, routing stats)")
 
     # Debug
     parser.add_argument("--debug_mode", action="store_true",
@@ -329,6 +335,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, args, epoch, de
     total_correct = 0
     total_tokens = 0
 
+    # Verbose logging stats
+    if args.verbose:
+        routing_stats = {
+            'routed': 0,
+            'branched': 0,
+            'explored_random': 0,
+            'explored_new': 0,
+            'created_first_child': 0
+        }
+
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs}", ncols=100)
 
     for batch_idx, batch in enumerate(progress_bar):
@@ -382,6 +398,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, args, epoch, de
         total_correct += correct
         total_tokens += total
 
+        # Collect routing stats if verbose
+        if args.verbose:
+            path_log = outputs.get("path_log", [])
+            for log_entry in path_log:
+                action = log_entry.get('action', 'unknown')
+                if action in routing_stats:
+                    routing_stats[action] += 1
+
         # Update progress bar
         if batch_idx % 10 == 0:
             acc = 100.0 * total_correct / total_tokens if total_tokens > 0 else 0.0
@@ -394,6 +418,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, args, epoch, de
 
     avg_loss = total_loss / len(dataloader)
     avg_acc = 100.0 * total_correct / total_tokens if total_tokens > 0 else 0.0
+
+    # Print verbose routing stats
+    if args.verbose:
+        print(f"\n{'='*70}")
+        print("ROUTING STATISTICS")
+        print(f"{'='*70}")
+        for action, count in routing_stats.items():
+            print(f"  {action}: {count}")
+        print(f"{'='*70}\n")
 
     return avg_loss, avg_acc
 
@@ -432,7 +465,8 @@ def main():
         max_depth=args.max_depth,
         compatibility_threshold=args.compatibility_threshold,
         num_heads=args.num_heads,
-        max_nodes=args.max_nodes
+        max_nodes=args.max_nodes,
+        exploration_rate=args.exploration_rate
     ).to(device)
 
     model_info = model.get_model_info()
@@ -474,6 +508,12 @@ def main():
     best_loss = float('inf')
 
     for epoch in range(args.num_epochs):
+        # Show current exploration rate
+        current_exploration = model.sprout.exploration_rate
+        print(f"\n{'='*70}")
+        print(f"Epoch {epoch+1}/{args.num_epochs} - Exploration rate: {current_exploration:.4f}")
+        print(f"{'='*70}")
+
         epoch_loss, epoch_acc = train_epoch(
             model, dataloader, optimizer, scheduler, scaler, args, epoch, device
         )
@@ -486,6 +526,18 @@ def main():
         model_info = model.get_model_info()
         print(f"  Total nodes: {model_info['total_nodes']}/{args.max_nodes}")
         print(f"  Node limit reached: {model_info['node_limit_reached']}")
+
+        # Decay exploration rate
+        if epoch < args.num_epochs - 1:  # Don't decay on last epoch
+            new_exploration = model.sprout.exploration_rate * args.exploration_decay
+            model.sprout.exploration_rate = new_exploration
+            # Update all nodes recursively
+            def update_exploration(node, rate):
+                node.exploration_rate = rate
+                for child in node.child_nodes:
+                    update_exploration(child, rate)
+            update_exploration(model.sprout.root, new_exploration)
+            print(f"  🔄 Exploration rate decayed: {current_exploration:.4f} → {new_exploration:.4f}")
 
         # Save checkpoint
         if epoch_loss < best_loss:

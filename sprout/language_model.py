@@ -23,12 +23,13 @@ class SproutLanguageModel(nn.Module):
         self,
         vocab_size: int,
         hidden_dim: int = 512,
-        max_depth: int = 2,  # Limited to ~5 nodes total
-        compatibility_threshold: float = 0.8,
+        max_depth: int = 4,  # Default: 4 for more expressive trees
+        compatibility_threshold: float = 0.5,  # Lower for easier branching
         num_heads: int = 4,
         ffn_mult: int = 4,
-        max_nodes: int = 5,  # Hard limit on total nodes
+        max_nodes: int = 20,  # Default: 20 nodes
         dropout: float = 0.1,
+        exploration_rate: float = 0.0,  # Random exploration probability
     ):
         """
         Initialize SPROUT language model.
@@ -36,12 +37,13 @@ class SproutLanguageModel(nn.Module):
         Args:
             vocab_size: Vocabulary size
             hidden_dim: Hidden dimension
-            max_depth: Maximum tree depth (2 = ~5 nodes max)
-            compatibility_threshold: Branching threshold
+            max_depth: Maximum tree depth (default: 4)
+            compatibility_threshold: Branching threshold (default: 0.5)
             num_heads: Number of attention heads
             ffn_mult: FFN expansion multiplier
-            max_nodes: Hard limit on total nodes
+            max_nodes: Hard limit on total nodes (default: 20)
             dropout: Dropout probability
+            exploration_rate: Random exploration probability (default: 0.0)
         """
         super().__init__()
 
@@ -61,7 +63,8 @@ class SproutLanguageModel(nn.Module):
             compatibility_threshold=compatibility_threshold,
             num_heads=num_heads,
             ffn_mult=ffn_mult,
-            max_nodes=max_nodes
+            max_nodes=max_nodes,
+            exploration_rate=exploration_rate
         )
 
         # MLM head
