@@ -25,7 +25,8 @@ class SPROUT(nn.Module):
         max_depth: int = 5,
         compatibility_threshold: float = 0.8,
         num_heads: int = 4,
-        ffn_mult: int = 4
+        ffn_mult: int = 4,
+        max_nodes: Optional[int] = None
     ):
         """
         Initialize SPROUT model.
@@ -36,6 +37,7 @@ class SPROUT(nn.Module):
             compatibility_threshold: Threshold for creating new branches
             num_heads: Number of attention heads
             ffn_mult: FFN expansion multiplier
+            max_nodes: Maximum total nodes (None = unlimited)
         """
         super().__init__()
         self.dim = dim
@@ -43,6 +45,7 @@ class SPROUT(nn.Module):
         self.compatibility_threshold = compatibility_threshold
         self.num_heads = num_heads
         self.ffn_mult = ffn_mult
+        self.max_nodes = max_nodes
 
         # Single root entry point
         self.root = Node(
@@ -53,6 +56,8 @@ class SPROUT(nn.Module):
             num_heads=num_heads,
             ffn_mult=ffn_mult
         )
+        # Pass parent reference for node counting
+        self.root._sprout_parent = self
 
         # Track convergence
         self.branch_history: List[int] = []

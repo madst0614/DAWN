@@ -61,6 +61,7 @@ class SproutLanguageModel(nn.Module):
             compatibility_threshold=compatibility_threshold,
             num_heads=num_heads,
             ffn_mult=ffn_mult,
+            max_nodes=max_nodes
         )
 
         # MLM head

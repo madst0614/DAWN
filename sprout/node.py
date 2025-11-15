@@ -70,6 +70,9 @@ class Node(nn.Module):
         # Statistics
         self.usage_count = 0
 
+        # Parent SPROUT reference (set externally for node limit checking)
+        self._sprout_parent = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -116,6 +119,10 @@ class Node(nn.Module):
         if len(self.child_nodes) == 0:
             # No children yet, create first child
             new_child = self._create_child()
+            if new_child is None:
+                # Node limit reached, return current representation
+                return x, path_log
+
             child_output, child_log = new_child(
                 x,
                 context_bias,
@@ -146,21 +153,41 @@ class Node(nn.Module):
         if best_compat < compatibility_threshold:
             # Create new branch
             new_child = self._create_child()
-            child_output, child_log = new_child(
-                x,
-                context_bias,
-                compatibility_threshold
-            )
+            if new_child is None:
+                # Node limit reached, route to best existing child instead
+                best_child = self.child_nodes[best_idx]
+                gate_strength = child_compatibilities[best_idx]
+                child_output, child_log = best_child(
+                    x,
+                    context_bias,
+                    compatibility_threshold
+                )
+                child_output = gate_strength * child_output + (1 - gate_strength) * x
 
-            path_log.append({
-                'node_id': self.node_id,
-                'depth': self.depth,
-                'action': 'branched',
-                'new_child_id': new_child.node_id,
-                'best_existing_compat': best_compat,
-                'threshold': compatibility_threshold
-            })
-            path_log.extend(child_log)
+                path_log.append({
+                    'node_id': self.node_id,
+                    'depth': self.depth,
+                    'action': 'routed_limit_reached',
+                    'child_id': best_child.node_id,
+                    'compatibility': best_compat
+                })
+                path_log.extend(child_log)
+            else:
+                child_output, child_log = new_child(
+                    x,
+                    context_bias,
+                    compatibility_threshold
+                )
+
+                path_log.append({
+                    'node_id': self.node_id,
+                    'depth': self.depth,
+                    'action': 'branched',
+                    'new_child_id': new_child.node_id,
+                    'best_existing_compat': best_compat,
+                    'threshold': compatibility_threshold
+                })
+                path_log.extend(child_log)
         else:
             # Route to best existing child
             best_child = self.child_nodes[best_idx]
@@ -185,8 +212,22 @@ class Node(nn.Module):
 
         return child_output, path_log
 
-    def _create_child(self) -> 'Node':
-        """Create a new child node"""
+    def _create_child(self) -> Optional['Node']:
+        """
+        Create a new child node.
+
+        Returns:
+            New child node, or None if node limit reached
+        """
+        # Check node limit if parent SPROUT is set
+        if self._sprout_parent is not None:
+            max_nodes = getattr(self._sprout_parent, 'max_nodes', None)
+            if max_nodes is not None:
+                current_count = self._sprout_parent.count_total_nodes()
+                if current_count >= max_nodes:
+                    # Node limit reached - don't create new node
+                    return None
+
         child = Node(
             dim=self.dim,
             node_id=self.next_child_id,
@@ -195,6 +236,8 @@ class Node(nn.Module):
         )
         # Move child to same device as parent
         child = child.to(self.node_key.device)
+        # Pass parent reference
+        child._sprout_parent = self._sprout_parent
         self.child_nodes.append(child)
         self.next_child_id += 1
         return child
