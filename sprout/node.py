@@ -193,6 +193,8 @@ class Node(nn.Module):
             depth=self.depth + 1,
             max_depth=self.max_depth
         )
+        # Move child to same device as parent
+        child = child.to(self.node_key.device)
         self.child_nodes.append(child)
         self.next_child_id += 1
         return child
