@@ -6,6 +6,7 @@ Self-organizing Progressive Routing with Organic Unified Trees
 
 import torch
 import torch.nn as nn
+import weakref
 from typing import List, Dict, Optional, Tuple
 
 from .node import Node
@@ -56,8 +57,8 @@ class SPROUT(nn.Module):
             num_heads=num_heads,
             ffn_mult=ffn_mult
         )
-        # Pass parent reference for node counting
-        self.root._sprout_parent = self
+        # Pass parent reference for node counting (use weakref to avoid circular reference)
+        self.root._sprout_parent_ref = weakref.ref(self)
 
         # Track convergence
         self.branch_history: List[int] = []

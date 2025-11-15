@@ -6,6 +6,7 @@ Implements the recursive node structure with Attention → FFN → Router flow.
 
 import torch
 import torch.nn as nn
+import weakref
 from typing import List, Dict, Optional, Tuple
 
 from .router import Router
@@ -70,8 +71,8 @@ class Node(nn.Module):
         # Statistics
         self.usage_count = 0
 
-        # Parent SPROUT reference (set externally for node limit checking)
-        self._sprout_parent = None
+        # Parent SPROUT reference (weakref to avoid circular reference)
+        self._sprout_parent_ref = None
 
     def forward(
         self,
@@ -220,13 +221,15 @@ class Node(nn.Module):
             New child node, or None if node limit reached
         """
         # Check node limit if parent SPROUT is set
-        if self._sprout_parent is not None:
-            max_nodes = getattr(self._sprout_parent, 'max_nodes', None)
-            if max_nodes is not None:
-                current_count = self._sprout_parent.count_total_nodes()
-                if current_count >= max_nodes:
-                    # Node limit reached - don't create new node
-                    return None
+        if self._sprout_parent_ref is not None:
+            sprout_parent = self._sprout_parent_ref()
+            if sprout_parent is not None:
+                max_nodes = getattr(sprout_parent, 'max_nodes', None)
+                if max_nodes is not None:
+                    current_count = sprout_parent.count_total_nodes()
+                    if current_count >= max_nodes:
+                        # Node limit reached - don't create new node
+                        return None
 
         child = Node(
             dim=self.dim,
@@ -236,8 +239,8 @@ class Node(nn.Module):
         )
         # Move child to same device as parent
         child = child.to(self.node_key.device)
-        # Pass parent reference
-        child._sprout_parent = self._sprout_parent
+        # Pass parent reference (weakref)
+        child._sprout_parent_ref = self._sprout_parent_ref
         self.child_nodes.append(child)
         self.next_child_id += 1
         return child
