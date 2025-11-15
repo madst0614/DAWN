@@ -217,7 +217,8 @@ def analyze_node_usage(model):
 
 def main():
     parser = argparse.ArgumentParser(description="Diagnose SPROUT routing behavior")
-    parser.add_argument('--checkpoint', type=str, help='Path to checkpoint (optional)')
+    parser.add_argument('--checkpoint', type=str, help='Path to checkpoint file')
+    parser.add_argument('--checkpoint_dir', type=str, help='Directory containing checkpoints (auto-finds best)')
     parser.add_argument('--num_samples', type=int, default=1000, help='Number of samples to analyze')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
     parser.add_argument('--num_batches', type=int, default=10, help='Number of batches to analyze')
@@ -229,6 +230,7 @@ def main():
     parser.add_argument('--max_depth', type=int, default=4)
     parser.add_argument('--max_nodes', type=int, default=20)
     parser.add_argument('--compatibility_threshold', type=float, default=0.5)
+    parser.add_argument('--exploration_rate', type=float, default=0.0)
 
     args = parser.parse_args()
 
@@ -238,21 +240,53 @@ def main():
     # Initialize tokenizer
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
-    # Load or create model
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        print(f"📥 Loading checkpoint from {args.checkpoint}")
-        checkpoint = torch.load(args.checkpoint, map_location=device)
+    # Determine checkpoint path
+    checkpoint_path = None
+    if args.checkpoint:
+        checkpoint_path = args.checkpoint
+    elif args.checkpoint_dir:
+        # Auto-find best checkpoint
+        best_checkpoint = os.path.join(args.checkpoint_dir, "sprout_mlm_best.pt")
+        if os.path.exists(best_checkpoint):
+            checkpoint_path = best_checkpoint
+        else:
+            # Try to find any .pt file
+            pt_files = [f for f in os.listdir(args.checkpoint_dir) if f.endswith('.pt')]
+            if pt_files:
+                checkpoint_path = os.path.join(args.checkpoint_dir, pt_files[0])
+                print(f"⚠️  Best checkpoint not found, using: {pt_files[0]}")
 
-        model = SproutLanguageModel(
-            vocab_size=len(tokenizer),
-            hidden_dim=checkpoint['model_info']['hidden_dim'],
-            max_depth=checkpoint['model_info']['max_depth'],
-            max_nodes=checkpoint['model_info'].get('max_nodes', 20),
-            compatibility_threshold=checkpoint['model_info'].get('compatibility_threshold', 0.5)
-        )
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model = model.to(device)
-        print(f"✅ Loaded checkpoint (epoch {checkpoint['epoch']}, loss {checkpoint['loss']:.4f})")
+    # Load or create model
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"📥 Loading checkpoint from {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+
+            # Extract model info
+            model_info = checkpoint.get('model_info', {})
+
+            model = SproutLanguageModel(
+                vocab_size=len(tokenizer),
+                hidden_dim=model_info.get('hidden_dim', args.hidden_dim),
+                max_depth=model_info.get('max_depth', args.max_depth),
+                max_nodes=model_info.get('max_nodes', args.max_nodes),
+                compatibility_threshold=model_info.get('compatibility_threshold', args.compatibility_threshold),
+                exploration_rate=0.0  # No exploration during analysis
+            )
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model = model.to(device)
+            print(f"✅ Loaded checkpoint (epoch {checkpoint.get('epoch', 'N/A')}, loss {checkpoint.get('loss', 0):.4f})")
+        except Exception as e:
+            print(f"❌ Failed to load checkpoint: {e}")
+            print("🔨 Creating new model instead")
+            model = SproutLanguageModel(
+                vocab_size=len(tokenizer),
+                hidden_dim=args.hidden_dim,
+                max_depth=args.max_depth,
+                max_nodes=args.max_nodes,
+                compatibility_threshold=args.compatibility_threshold,
+                exploration_rate=args.exploration_rate
+            ).to(device)
     else:
         print("🔨 Creating new model")
         model = SproutLanguageModel(
@@ -260,7 +294,8 @@ def main():
             hidden_dim=args.hidden_dim,
             max_depth=args.max_depth,
             max_nodes=args.max_nodes,
-            compatibility_threshold=args.compatibility_threshold
+            compatibility_threshold=args.compatibility_threshold,
+            exploration_rate=args.exploration_rate
         ).to(device)
 
     # Show model info
@@ -269,7 +304,8 @@ def main():
     print(f"   Hidden dim: {model.hidden_dim}")
     print(f"   Max depth: {model.sprout.root.max_depth}")
     print(f"   Max nodes: {model.sprout.max_nodes}")
-    print(f"   Compatibility threshold: {model.sprout.root.compatibility_threshold}")
+    print(f"   Compatibility threshold: {model.sprout.compatibility_threshold}")
+    print(f"   Exploration rate: {model.sprout.exploration_rate}")
     print(f"   Total nodes: {model.sprout.count_total_nodes()}")
 
     # Load sample data

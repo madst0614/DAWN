@@ -172,8 +172,11 @@ class SproutLanguageModel(nn.Module):
         return {
             "vocab_size": self.vocab_size,
             "hidden_dim": self.hidden_dim,
-            "total_nodes": self.sprout.count_total_nodes(),
+            "max_depth": self.sprout.max_depth,
             "max_nodes": self.max_nodes,
+            "compatibility_threshold": self.sprout.compatibility_threshold,
+            "exploration_rate": self.sprout.exploration_rate,
+            "total_nodes": self.sprout.count_total_nodes(),
             "node_limit_reached": self._node_limit_reached,
             "sprout_stats": self.sprout.get_statistics(),
             "total_params": sum(p.numel() for p in self.parameters()),
