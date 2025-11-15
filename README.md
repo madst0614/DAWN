@@ -42,11 +42,34 @@ pip install -e .
 
 ## Quick Start
 
-### Language Model Training (MLM)
+### Google Colab (One-Click) 🚀
+
+**Copy-paste into Colab:**
+
+```python
+# Clone and setup
+!git clone https://github.com/madst0614/sprout.git 2>/dev/null || true
+%cd /content/sprout
+!git checkout claude/implement-sprout-model-01L9icytevoJcfrrmKZo6Rm4
+!git pull origin claude/implement-sprout-model-01L9icytevoJcfrrmKZo6Rm4
+
+# Install (30 seconds)
+!pip install -q torch transformers datasets tqdm
+
+# Quick test (1 minute)
+!python scripts/train_sprout_mlm.py --debug_mode --num_epochs 1 --visualize_structure
+```
+
+For full training guide, see [COLAB_TRAINING.md](COLAB_TRAINING.md)
+
+### Local Training (MLM)
 
 Train SPROUT on Masked Language Modeling:
 
 ```bash
+# Install dependencies
+pip install torch transformers datasets tqdm
+
 # Quick test
 python scripts/train_sprout_mlm.py --debug_mode --num_epochs 1
 
@@ -58,8 +81,6 @@ python scripts/train_sprout_mlm.py \
   --max_nodes 5 \
   --visualize_structure
 ```
-
-For Google Colab training, see [COLAB_TRAINING.md](COLAB_TRAINING.md)
 
 ### Core SPROUT Model
 
