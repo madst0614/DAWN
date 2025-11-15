@@ -1,0 +1,31 @@
+# Optimized config for A100 80GB GPU
+# Expected speed: ~15-20 it/s
+
+# Model
+model: pnn_exp1
+hidden_size: 768
+num_heads: 12
+intermediate_size: 2048
+num_steps: 4
+max_length: 128
+dropout: 0.1
+
+# Training - Optimized for A100
+dataset: wikitext-103
+batch_size: 1024          # Increased for A100 80GB
+gradient_accumulation: 1  # No accumulation needed with large batch
+epochs: 15
+lr: 3.0e-4
+warmup_steps: 500
+weight_decay: 0.01
+max_samples: 200000
+
+# System - Optimized for throughput
+use_amp: true
+use_tf32: true
+num_workers: 12  # Increased for faster data loading
+seed: 42
+
+# Checkpointing
+checkpoint_dir: checkpoints/exp1_a100
+save_every: 500
