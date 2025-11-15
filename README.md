@@ -42,6 +42,27 @@ pip install -e .
 
 ## Quick Start
 
+### Language Model Training (MLM)
+
+Train SPROUT on Masked Language Modeling:
+
+```bash
+# Quick test
+python scripts/train_sprout_mlm.py --debug_mode --num_epochs 1
+
+# Full training
+python scripts/train_sprout_mlm.py \
+  --checkpoint_dir ./checkpoints \
+  --num_epochs 3 \
+  --batch_size 32 \
+  --max_nodes 5 \
+  --visualize_structure
+```
+
+For Google Colab training, see [COLAB_TRAINING.md](COLAB_TRAINING.md)
+
+### Core SPROUT Model
+
 ```python
 import torch
 from sprout import SPROUT
