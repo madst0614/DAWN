@@ -237,6 +237,10 @@ def get_args():
                         help="Initial exploration rate (default: 0.2)")
     parser.add_argument("--exploration_decay", type=float, default=0.99,
                         help="Exploration decay per epoch (default: 0.99)")
+    parser.add_argument("--router_loss_weight", type=float, default=0.0,
+                        help="Router loss weight (default: 0.0, disabled)")
+    parser.add_argument("--diversity_loss_weight", type=float, default=0.0,
+                        help="Diversity loss weight (default: 0.0, disabled)")
 
     # Training config
     parser.add_argument("--num_epochs", type=int, default=3,
@@ -334,6 +338,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, args, epoch, de
     total_loss = 0
     total_correct = 0
     total_tokens = 0
+    total_router_loss = 0
+    total_diversity_loss = 0
+    num_batches_with_routing_loss = 0
 
     # Verbose logging stats
     if args.verbose:
@@ -398,6 +405,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, args, epoch, de
         total_correct += correct
         total_tokens += total
 
+        # Track routing losses
+        router_loss = outputs.get("router_loss")
+        diversity_loss = outputs.get("diversity_loss")
+        if router_loss is not None:
+            total_router_loss += router_loss.item()
+            num_batches_with_routing_loss += 1
+        if diversity_loss is not None:
+            total_diversity_loss += diversity_loss.item()
+
         # Collect routing stats if verbose
         if args.verbose:
             path_log = outputs.get("path_log", [])
@@ -410,14 +426,24 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, args, epoch, de
         if batch_idx % 10 == 0:
             acc = 100.0 * total_correct / total_tokens if total_tokens > 0 else 0.0
             num_nodes = outputs.get("num_nodes", 0)
-            progress_bar.set_postfix({
+            postfix = {
                 'loss': f'{loss.item():.4f}',
                 'acc': f'{acc:.1f}%',
                 'nodes': num_nodes
-            })
+            }
+            # Add routing losses if enabled
+            if router_loss is not None:
+                postfix['r_loss'] = f'{router_loss.item():.4f}'
+            if diversity_loss is not None:
+                postfix['d_loss'] = f'{diversity_loss.item():.4f}'
+            progress_bar.set_postfix(postfix)
 
     avg_loss = total_loss / len(dataloader)
     avg_acc = 100.0 * total_correct / total_tokens if total_tokens > 0 else 0.0
+
+    # Average routing losses
+    avg_router_loss = total_router_loss / num_batches_with_routing_loss if num_batches_with_routing_loss > 0 else 0
+    avg_diversity_loss = total_diversity_loss / num_batches_with_routing_loss if num_batches_with_routing_loss > 0 else 0
 
     # Print verbose routing stats
     if args.verbose:
@@ -426,9 +452,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, args, epoch, de
         print(f"{'='*70}")
         for action, count in routing_stats.items():
             print(f"  {action}: {count}")
+        if num_batches_with_routing_loss > 0:
+            print(f"\n  Routing Losses:")
+            if args.router_loss_weight > 0:
+                print(f"    Router loss: {avg_router_loss:.4f}")
+            if args.diversity_loss_weight > 0:
+                print(f"    Diversity loss: {avg_diversity_loss:.4f}")
         print(f"{'='*70}\n")
 
-    return avg_loss, avg_acc
+    return avg_loss, avg_acc, avg_router_loss, avg_diversity_loss
 
 
 def main():
@@ -466,13 +498,23 @@ def main():
         compatibility_threshold=args.compatibility_threshold,
         num_heads=args.num_heads,
         max_nodes=args.max_nodes,
-        exploration_rate=args.exploration_rate
+        exploration_rate=args.exploration_rate,
+        router_loss_weight=args.router_loss_weight,
+        diversity_loss_weight=args.diversity_loss_weight
     ).to(device)
 
     model_info = model.get_model_info()
     print(f"✅ Model created")
     print(f"   Total params: {model_info['total_params']:,}")
     print(f"   Initial nodes: {model_info['total_nodes']}")
+
+    # Show routing loss config if enabled
+    if args.router_loss_weight > 0 or args.diversity_loss_weight > 0:
+        print(f"\n🎯 Routing Loss Config:")
+        if args.router_loss_weight > 0:
+            print(f"   Router loss weight: {args.router_loss_weight}")
+        if args.diversity_loss_weight > 0:
+            print(f"   Diversity loss weight: {args.diversity_loss_weight}")
 
     # Create dataloader
     dataloader = create_dataloader(args, tokenizer)
@@ -514,13 +556,20 @@ def main():
         print(f"Epoch {epoch+1}/{args.num_epochs} - Exploration rate: {current_exploration:.4f}")
         print(f"{'='*70}")
 
-        epoch_loss, epoch_acc = train_epoch(
+        epoch_loss, epoch_acc, epoch_router_loss, epoch_diversity_loss = train_epoch(
             model, dataloader, optimizer, scheduler, scaler, args, epoch, device
         )
 
         print(f"\nEpoch {epoch+1}/{args.num_epochs} Summary:")
         print(f"  Loss: {epoch_loss:.4f}")
         print(f"  Accuracy: {epoch_acc:.2f}%")
+
+        # Show routing losses if enabled
+        if args.router_loss_weight > 0 or args.diversity_loss_weight > 0:
+            if args.router_loss_weight > 0:
+                print(f"  Router loss: {epoch_router_loss:.4f}")
+            if args.diversity_loss_weight > 0:
+                print(f"  Diversity loss: {epoch_diversity_loss:.4f}")
 
         # Show structure info
         model_info = model.get_model_info()

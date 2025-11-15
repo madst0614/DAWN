@@ -30,6 +30,8 @@ class SproutLanguageModel(nn.Module):
         max_nodes: int = 20,  # Default: 20 nodes
         dropout: float = 0.1,
         exploration_rate: float = 0.0,  # Random exploration probability
+        router_loss_weight: float = 0.0,  # Router loss weight
+        diversity_loss_weight: float = 0.0,  # Diversity loss weight
     ):
         """
         Initialize SPROUT language model.
@@ -44,12 +46,16 @@ class SproutLanguageModel(nn.Module):
             max_nodes: Hard limit on total nodes (default: 20)
             dropout: Dropout probability
             exploration_rate: Random exploration probability (default: 0.0)
+            router_loss_weight: Weight for router loss (default: 0.0)
+            diversity_loss_weight: Weight for diversity loss (default: 0.0)
         """
         super().__init__()
 
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
         self.max_nodes = max_nodes
+        self.router_loss_weight = router_loss_weight
+        self.diversity_loss_weight = diversity_loss_weight
 
         # Token embeddings
         self.embeddings = nn.Embedding(vocab_size, hidden_dim)
@@ -152,17 +158,57 @@ class SproutLanguageModel(nn.Module):
 
         # Calculate loss if labels provided
         loss = None
+        router_loss = None
+        diversity_loss = None
+
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
             # Flatten for loss calculation
-            loss = loss_fct(
+            mlm_loss = loss_fct(
                 logits.view(-1, self.vocab_size),
                 labels.view(-1)
             )
 
+            # Calculate routing losses
+            if self.training and (self.router_loss_weight > 0 or self.diversity_loss_weight > 0):
+                router_losses = []
+                diversity_losses = []
+
+                for log_entry in path_log:
+                    all_compat = log_entry.get('all_compatibilities', [])
+                    if len(all_compat) > 0:
+                        # Router loss: encourage high compatibility with chosen path
+                        # -log(best_compat) - lower when best_compat is high
+                        best_compat = max(all_compat)
+                        router_losses.append(-torch.log(best_compat + 1e-8))
+
+                        # Diversity loss: encourage variance in compatibilities
+                        # -variance(compatibilities) - lower when variance is high
+                        if len(all_compat) > 1:
+                            compat_tensor = torch.stack(all_compat)
+                            variance = torch.var(compat_tensor)
+                            diversity_losses.append(-variance)
+
+                # Aggregate routing losses
+                if router_losses and self.router_loss_weight > 0:
+                    router_loss = torch.stack(router_losses).mean()
+
+                if diversity_losses and self.diversity_loss_weight > 0:
+                    diversity_loss = torch.stack(diversity_losses).mean()
+
+            # Combine losses
+            loss = mlm_loss
+            if router_loss is not None:
+                loss = loss + self.router_loss_weight * router_loss
+            if diversity_loss is not None:
+                loss = loss + self.diversity_loss_weight * diversity_loss
+
         return {
             "logits": logits,
             "loss": loss,
+            "mlm_loss": mlm_loss if labels is not None else None,
+            "router_loss": router_loss,
+            "diversity_loss": diversity_loss,
             "path_log": path_log,
             "num_nodes": num_nodes,
         }

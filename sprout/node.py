@@ -145,8 +145,10 @@ class Node(nn.Module):
 
         # Check compatibility with existing children
         child_compatibilities = []
+        child_compatibility_tensors = []  # Keep tensors for loss calculation
         for child in self.child_nodes:
             compat = self.router.compute_compatibility(x, child.node_key)
+            child_compatibility_tensors.append(compat.mean())
             child_compatibilities.append(compat.mean().item())
 
         best_idx = max(
@@ -177,7 +179,8 @@ class Node(nn.Module):
                     'depth': self.depth,
                     'action': 'explored_random',
                     'child_id': best_child.node_id,
-                    'compatibility': child_compatibilities[explore_idx]
+                    'compatibility': child_compatibilities[explore_idx],
+                    'all_compatibilities': child_compatibility_tensors
                 })
                 path_log.extend(child_log)
                 return child_output, path_log
@@ -200,7 +203,8 @@ class Node(nn.Module):
                         'depth': self.depth,
                         'action': 'explored_but_limit_reached',
                         'child_id': best_child.node_id,
-                        'compatibility': best_compat
+                        'compatibility': best_compat,
+                        'all_compatibilities': child_compatibility_tensors
                     })
                     path_log.extend(child_log)
                     return child_output, path_log
@@ -239,7 +243,8 @@ class Node(nn.Module):
                     'depth': self.depth,
                     'action': 'routed_limit_reached',
                     'child_id': best_child.node_id,
-                    'compatibility': best_compat
+                    'compatibility': best_compat,
+                    'all_compatibilities': child_compatibility_tensors
                 })
                 path_log.extend(child_log)
             else:
@@ -255,7 +260,8 @@ class Node(nn.Module):
                     'action': 'branched',
                     'new_child_id': new_child.node_id,
                     'best_existing_compat': best_compat,
-                    'threshold': compatibility_threshold
+                    'threshold': compatibility_threshold,
+                    'all_compatibilities': child_compatibility_tensors
                 })
                 path_log.extend(child_log)
         else:
@@ -276,7 +282,8 @@ class Node(nn.Module):
                 'depth': self.depth,
                 'action': 'routed',
                 'child_id': best_child.node_id,
-                'compatibility': best_compat
+                'compatibility': best_compat,
+                'all_compatibilities': child_compatibility_tensors
             })
             path_log.extend(child_log)
 
