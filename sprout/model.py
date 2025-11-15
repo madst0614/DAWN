@@ -121,13 +121,13 @@ class SPROUT(nn.Module):
             connector = "└── " if is_last else "├── "
             print(
                 f"{prefix}{connector}Node {node.node_id} "
-                f"(depth={node.depth}, children={len(node.children)}, "
+                f"(depth={node.depth}, children={len(node.child_nodes)}, "
                 f"usage={node.usage_count})"
             )
 
             new_prefix = prefix + ("    " if is_last else "│   ")
-            for i, child in enumerate(node.children):
-                print_node(child, new_prefix, i == len(node.children) - 1)
+            for i, child in enumerate(node.child_nodes):
+                print_node(child, new_prefix, i == len(node.child_nodes) - 1)
 
         print("\n=== SPROUT Structure ===")
         print_node(self.root)

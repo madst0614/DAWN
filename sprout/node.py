@@ -63,8 +63,8 @@ class Node(nn.Module):
         # Node representation (learnable "key" for this node)
         self.node_key = nn.Parameter(torch.randn(1, 1, dim))
 
-        # Children tracking
-        self.children: List['Node'] = []
+        # Children tracking (use ModuleList for proper parameter registration)
+        self.child_nodes = nn.ModuleList()
         self.next_child_id = 0
 
         # Statistics
@@ -113,7 +113,7 @@ class Node(nn.Module):
             # Max depth reached, return
             return x, path_log
 
-        if len(self.children) == 0:
+        if len(self.child_nodes) == 0:
             # No children yet, create first child
             new_child = self._create_child()
             child_output, child_log = new_child(
@@ -133,7 +133,7 @@ class Node(nn.Module):
 
         # Check compatibility with existing children
         child_compatibilities = []
-        for child in self.children:
+        for child in self.child_nodes:
             compat = self.router.compute_compatibility(x, child.node_key)
             child_compatibilities.append(compat.mean().item())
 
@@ -163,7 +163,7 @@ class Node(nn.Module):
             path_log.extend(child_log)
         else:
             # Route to best existing child
-            best_child = self.children[best_idx]
+            best_child = self.child_nodes[best_idx]
 
             # Soft gating based on compatibility
             gate_strength = child_compatibilities[best_idx]
@@ -193,14 +193,14 @@ class Node(nn.Module):
             depth=self.depth + 1,
             max_depth=self.max_depth
         )
-        self.children.append(child)
+        self.child_nodes.append(child)
         self.next_child_id += 1
         return child
 
     def count_nodes(self) -> int:
         """Recursively count total nodes in subtree"""
         count = 1  # self
-        for child in self.children:
+        for child in self.child_nodes:
             count += child.count_nodes()
         return count
 
@@ -209,7 +209,7 @@ class Node(nn.Module):
         return {
             'node_id': self.node_id,
             'depth': self.depth,
-            'num_children': len(self.children),
+            'num_children': len(self.child_nodes),
             'usage_count': self.usage_count,
-            'children': [child.get_structure_info() for child in self.children]
+            'children': [child.get_structure_info() for child in self.child_nodes]
         }
