@@ -383,14 +383,14 @@ class NeuronInteraction(nn.Module):
         # topk_values: [batch, k]
         # topk_indices: [batch, k]
 
-        # Sparse 텐서 생성
+        # Sparse 텐서 생성 (dtype 유지)
         new_activation = torch.zeros_like(activation)
         new_hidden = torch.zeros_like(hidden_state)
 
-        # 배치별로 scatter
+        # 배치별로 scatter (mixed precision 대응)
         for b in range(batch_size):
-            new_activation[b].scatter_(0, topk_indices[b], topk_values[b])
-            new_hidden[b, topk_indices[b]] = hidden_state[b, topk_indices[b]]
+            new_activation[b].scatter_(0, topk_indices[b], topk_values[b].to(new_activation.dtype))
+            new_hidden[b, topk_indices[b]] = hidden_state[b, topk_indices[b]].to(new_hidden.dtype)
 
         return new_activation, new_hidden
 
