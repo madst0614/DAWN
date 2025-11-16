@@ -287,21 +287,44 @@ class NeuronInteraction(nn.Module):
         active_mask: torch.Tensor  # [batch, n_neurons]
     ) -> torch.Tensor:
         """
-        활성 뉴런들끼리 메시지 교환 (배치 처리)
+        활성 뉴런들끼리 메시지 교환 (진짜 SPARSE!)
+
+        **메모리 효율:** 4096×4096 attention 대신 128×128만 계산!
         """
         batch_size, n_neurons, d_state = states.shape
 
-        # Self-attention (배치 전체)
-        messages, _ = self.message_attention(
-            states,  # Q: [batch, n_neurons, d_state]
-            states,  # K: [batch, n_neurons, d_state]
-            states,  # V: [batch, n_neurons, d_state]
-            key_padding_mask=~active_mask  # 비활성 뉴런 마스크
-        )  # [batch, n_neurons, d_state]
+        # 배치 전체에 대해 활성 뉴런 모으기
+        # 각 샘플마다 다른 뉴런이 활성화될 수 있음
+
+        # 방법: 각 배치별로 top-k 뉴런만 추출
+        k = active_mask.sum(dim=-1).max().item()  # 최대 활성 뉴런 수
+        k = min(k, 256)  # 최대 256개로 제한
+
+        if k == 0:
+            return torch.zeros_like(states)
+
+        # Top-k 활성 뉴런의 인덱스 (배치별로)
+        topk_values, topk_indices = torch.topk(activations, k=k, dim=-1)
+        # topk_indices: [batch, k]
+
+        # 활성 뉴런 상태 추출
+        batch_indices = torch.arange(batch_size, device=states.device).unsqueeze(1).expand(-1, k)
+        active_states = states[batch_indices, topk_indices]  # [batch, k, d_state]
+
+        # Attention on active neurons only! (k×k instead of n_neurons×n_neurons)
+        messages_sparse, _ = self.message_attention(
+            active_states,  # Q: [batch, k, d_state] (k ≈ 128)
+            active_states,  # K
+            active_states   # V
+        )  # [batch, k, d_state]
 
         # 활성화 강도로 가중
-        activation_weights = activations.unsqueeze(-1)  # [batch, n_neurons, 1]
-        messages = messages * activation_weights
+        active_weights = topk_values.unsqueeze(-1)  # [batch, k, 1]
+        messages_sparse = messages_sparse * active_weights
+
+        # 원래 크기로 복원 (sparse → dense)
+        messages = torch.zeros_like(states)
+        messages[batch_indices, topk_indices] = messages_sparse
 
         return messages
 
