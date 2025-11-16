@@ -111,13 +111,8 @@ class InputToActivation(nn.Module):
             num_layers=n_layers
         )
 
-        # 시퀀스 → 단일 벡터 (attention pooling)
-        self.pooling_query = nn.Parameter(torch.randn(1, d_model))
-        self.pooling_attention = nn.MultiheadAttention(
-            d_model, num_heads=n_heads, batch_first=True
-        )
-
-        # 단일 벡터 → 뉴런 활성화 패턴
+        # Token representations → neuron activation votes
+        # 각 토큰이 개별적으로 뉴런 활성화 제안
         self.to_activation = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
             nn.GELU(),
@@ -145,37 +140,41 @@ class InputToActivation(nn.Module):
         # 3. 시퀀스 인코딩
         encoded = self.sequence_encoder(embeddings)  # [batch, seq, d_model]
 
-        # 4. Attention pooling으로 단일 벡터로 통합
-        query = self.pooling_query.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, 1, d_model]
-        pooled, _ = self.pooling_attention(
-            query, encoded, encoded
-        )  # [batch, 1, d_model]
-        pooled = pooled.squeeze(1)  # [batch, d_model]
+        # 4. Token-wise neuron voting (정보 손실 방지!)
+        # 각 토큰이 뉴런 활성화 제안
+        token_votes = self.to_activation(encoded)  # [batch, seq, n_neurons]
 
-        # 5. 뉴런 활성화 패턴 생성
-        activation_logits = self.to_activation(pooled)  # [batch, n_neurons]
+        # 5. 투표 집계: max pooling (가장 강한 신호)
+        # mean은 정보 희석, max는 강한 신호 보존
+        activation_logits, _ = token_votes.max(dim=1)  # [batch, n_neurons]
 
-        # 6. Sparse 활성화 (top-k)
+        # 6. Soft sparse 활성화 (미분 가능!)
         activation = self.sparse_activation(activation_logits, k=self.top_k)
 
         return activation
 
     def sparse_activation(self, logits: torch.Tensor, k: int) -> torch.Tensor:
         """
-        Top-k sparse activation
-        상위 k개만 활성화, 나머지는 0
+        Soft Top-k sparse activation (DIFFERENTIABLE!)
+
+        기존 hard top-k는 미분 불가 → 학습 느림
+        Soft top-k: sigmoid + threshold로 부드럽게 선택
         """
         batch_size = logits.shape[0]
 
-        # Top-k 선택
-        topk_values, topk_indices = torch.topk(logits, k, dim=-1)
+        # Sigmoid로 [0, 1] 범위로 (모든 뉴런)
+        activations = torch.sigmoid(logits)  # [batch, n_neurons]
 
-        # Sigmoid로 [0, 1] 범위로
-        topk_activations = torch.sigmoid(topk_values)
+        # Dynamic threshold: k번째 값을 threshold로
+        kth_values, _ = torch.kthvalue(activations, activations.shape[1] - k + 1, dim=-1)
+        threshold = kth_values.unsqueeze(-1)  # [batch, 1]
 
-        # Sparse 텐서 생성
-        sparse_activation = torch.zeros_like(logits)
-        sparse_activation.scatter_(1, topk_indices, topk_activations)
+        # Soft masking: sigmoid((x - threshold) / temperature)
+        temperature = 0.1
+        soft_mask = torch.sigmoid((activations - threshold) / temperature)
+
+        # Soft sparse activation (미분 가능!)
+        sparse_activation = activations * soft_mask
 
         return sparse_activation
 
@@ -506,11 +505,13 @@ class SPROUT_BrainLike(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
-        return_activation_history: bool = False
+        return_activation_history: bool = False,
+        return_aux_losses: bool = False
     ) -> torch.Tensor:
         """
         tokens: [batch, seq_len]
         returns: [batch, vocab_size] logits
+                 (optionally with aux_losses dict)
 
         **중요: 배치 전체를 한 번에 처리!**
         """
@@ -518,7 +519,8 @@ class SPROUT_BrainLike(nn.Module):
         device = tokens.device
 
         # 1. 초기 활성화 패턴 생성 (배치 처리!)
-        activation = self.input_encoder(tokens)  # [batch, n_neurons]
+        initial_activation = self.input_encoder(tokens)  # [batch, n_neurons]
+        activation = initial_activation
 
         # 2. 뉴런 hidden state 초기화 (배치 처리!)
         hidden_state = torch.zeros(batch_size, self.n_neurons, self.d_state, device=device)
@@ -532,6 +534,7 @@ class SPROUT_BrainLike(nn.Module):
 
         # 3. 반복적 상호작용 (배치 처리!)
         history = [activation.detach().cpu()] if return_activation_history else None
+        all_activations = [initial_activation] if return_aux_losses else None
 
         for step in range(self.n_interaction_steps):
             activation, hidden_state = self.interaction(
@@ -542,14 +545,64 @@ class SPROUT_BrainLike(nn.Module):
 
             if return_activation_history:
                 history.append(activation.detach().cpu())
+            if return_aux_losses:
+                all_activations.append(activation)
 
         # 4. 출력 디코딩 (배치 처리!)
         logits = self.output_decoder(activation)  # [batch, vocab_size]
 
-        if return_activation_history:
+        # Auxiliary losses
+        if return_aux_losses:
+            aux_losses = self.compute_auxiliary_losses(
+                torch.stack(all_activations),  # [n_steps+1, batch, n_neurons]
+                initial_activation
+            )
+        else:
+            aux_losses = None
+
+        if return_activation_history and return_aux_losses:
+            return logits, history, aux_losses
+        elif return_activation_history:
             return logits, history
+        elif return_aux_losses:
+            return logits, aux_losses
         else:
             return logits
+
+    def compute_auxiliary_losses(
+        self,
+        all_activations: torch.Tensor,  # [n_steps, batch, n_neurons]
+        initial_activation: torch.Tensor  # [batch, n_neurons]
+    ) -> dict:
+        """
+        Auxiliary losses for better training
+
+        1. Diversity loss: 배치 내 다양한 뉴런 사용 장려
+        2. Sparsity loss: 적절한 희소성 유지
+        """
+        batch_size = initial_activation.shape[0]
+
+        # 1. Diversity loss: 배치 전체에서 다양한 뉴런 사용
+        # 모든 step의 activation 평균
+        mean_activation = all_activations.mean(dim=0)  # [batch, n_neurons]
+
+        # 배치 내 분산 (뉴런별로)
+        neuron_variance = mean_activation.var(dim=0)  # [n_neurons]
+
+        # 분산이 높을수록 좋음 (다양하게 사용)
+        diversity_loss = -neuron_variance.mean()
+
+        # 2. Sparsity loss: 너무 많거나 적으면 페널티
+        n_active = (initial_activation > 0.01).sum(dim=-1).float()  # [batch]
+        target_sparsity = self.initial_sparsity
+
+        # L1 loss from target
+        sparsity_loss = (n_active - target_sparsity).abs().mean()
+
+        return {
+            'diversity_loss': diversity_loss,
+            'sparsity_loss': sparsity_loss
+        }
 
     def analyze_activation(self, tokens: torch.Tensor) -> dict:
         """

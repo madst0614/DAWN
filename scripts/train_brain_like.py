@@ -224,8 +224,8 @@ def get_args():
                         help="MLM masking probability")
 
     # Checkpointing
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints",
-                        help="Checkpoint directory")
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                        help="Checkpoint directory (default: auto-detect Colab drive or ./checkpoints)")
     parser.add_argument("--save_every", type=int, default=5000,
                         help="Save checkpoint every N steps")
 
@@ -350,11 +350,23 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, args, epoch, de
         # Forward pass
         if args.mixed_precision:
             with torch.cuda.amp.autocast():
-                logits = model(input_ids)
-                loss = compute_mlm_loss(logits, labels)
+                logits, aux_losses = model(input_ids, return_aux_losses=True)
+                loss_mlm = compute_mlm_loss(logits, labels)
+
+                # Add auxiliary losses
+                loss_diversity = aux_losses['diversity_loss']
+                loss_sparsity = aux_losses['sparsity_loss']
+
+                loss = loss_mlm + 0.01 * loss_diversity + 0.001 * loss_sparsity
         else:
-            logits = model(input_ids)
-            loss = compute_mlm_loss(logits, labels)
+            logits, aux_losses = model(input_ids, return_aux_losses=True)
+            loss_mlm = compute_mlm_loss(logits, labels)
+
+            # Add auxiliary losses
+            loss_diversity = aux_losses['diversity_loss']
+            loss_sparsity = aux_losses['sparsity_loss']
+
+            loss = loss_mlm + 0.01 * loss_diversity + 0.001 * loss_sparsity
 
         # Backward pass
         optimizer.zero_grad()
@@ -436,6 +448,16 @@ def main():
     print(f"Device: {device}")
     print(f"Mixed precision: {args.mixed_precision}")
     print(f"{'='*70}\n")
+
+    # Auto-detect checkpoint directory
+    if args.checkpoint_dir is None:
+        # Check if running on Colab with mounted Drive
+        if os.path.exists("/content/drive/MyDrive"):
+            args.checkpoint_dir = "/content/drive/MyDrive/sprout_checkpoints"
+            print(f"📂 Using Google Drive: {args.checkpoint_dir}")
+        else:
+            args.checkpoint_dir = "./checkpoints"
+            print(f"📂 Using local directory: {args.checkpoint_dir}")
 
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
