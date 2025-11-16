@@ -155,26 +155,30 @@ class InputToActivation(nn.Module):
 
     def sparse_activation(self, logits: torch.Tensor, k: int) -> torch.Tensor:
         """
-        Soft Top-k sparse activation (DIFFERENTIABLE!)
+        TRUE Sparse Top-k activation (확실하게!)
 
-        기존 hard top-k는 미분 불가 → 학습 느림
-        Soft top-k: sigmoid + threshold로 부드럽게 선택
+        상위 k개만 선택, 나머지는 완전히 0
+        Gradient는 선택된 뉴런에만 흐름 (학습 효율)
         """
         batch_size = logits.shape[0]
+        n_neurons = logits.shape[1]
 
-        # Sigmoid로 [0, 1] 범위로 (모든 뉴런)
-        activations = torch.sigmoid(logits)  # [batch, n_neurons]
+        # Top-k 선택 (hard)
+        topk_values, topk_indices = torch.topk(logits, k, dim=-1)
+        # topk_values: [batch, k]
+        # topk_indices: [batch, k]
 
-        # Dynamic threshold: k번째 값을 threshold로
-        kth_values, _ = torch.kthvalue(activations, activations.shape[1] - k + 1, dim=-1)
-        threshold = kth_values.unsqueeze(-1)  # [batch, 1]
+        # Sigmoid 적용 (선택된 k개에만)
+        activated_values = torch.sigmoid(topk_values)
 
-        # Soft masking: sigmoid((x - threshold) / temperature)
-        temperature = 0.1
-        soft_mask = torch.sigmoid((activations - threshold) / temperature)
+        # Sparse tensor 생성 (나머지는 완전히 0!)
+        sparse_activation = torch.zeros(batch_size, n_neurons,
+                                       dtype=activated_values.dtype,
+                                       device=logits.device)
 
-        # Soft sparse activation (미분 가능!)
-        sparse_activation = activations * soft_mask
+        # Scatter (배치별로)
+        batch_idx = torch.arange(batch_size, device=logits.device).unsqueeze(1).expand(-1, k)
+        sparse_activation[batch_idx, topk_indices] = activated_values
 
         return sparse_activation
 
