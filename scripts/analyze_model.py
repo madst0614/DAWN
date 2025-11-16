@@ -266,15 +266,15 @@ def analyze_prediction_quality(model, tokenizer, device):
                 truncation=True
             )['input_ids'].to(device)
 
-            # MASK 위치 찾기
+            # MASK 위치 확인 (존재 여부만)
             mask_pos = (tokens == tokenizer.mask_token_id).nonzero()
             if len(mask_pos) == 0:
                 continue
-            mask_pos = mask_pos[0, 1].item()
 
             # 예측
+            # Brain-Like 모델: 전체 시퀀스 → 하나의 예측 [batch, vocab_size]
             logits = model(tokens)
-            pred_logits = logits[0, mask_pos]  # [vocab_size]
+            pred_logits = logits[0]  # [vocab_size]
 
             # Top-10 예측
             top_values, top_indices = torch.topk(pred_logits, k=10)
