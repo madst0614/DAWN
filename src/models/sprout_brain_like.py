@@ -182,10 +182,12 @@ class InputToActivation(nn.Module):
 
 class NeuronInteraction(nn.Module):
     """
-    활성 뉴런들끼리 정보 교환 및 상태 업데이트
+    활성 뉴런들끼리 정보 교환 및 상태 업데이트 (BATCH 처리)
 
     뉴런들이 서로를 보고, 메시지를 주고받으며,
     자신의 활성화 강도와 내부 상태를 업데이트
+
+    **중요: 배치 전체를 한 번에 처리!**
     """
     def __init__(
         self,
@@ -199,15 +201,19 @@ class NeuronInteraction(nn.Module):
         self.d_state = d_state
         self.n_heads = n_heads
 
-        # 메시지 전달용 attention
+        # 메시지 전달용 attention (batch 처리)
         self.message_attention = nn.MultiheadAttention(
             d_state,
             num_heads=n_heads,
             batch_first=True
         )
 
-        # 상태 업데이트 (GRU 스타일)
-        self.state_update = nn.GRUCell(d_state, d_state)
+        # 상태 업데이트 (Linear로 변경 - 배치 처리 가능)
+        self.state_update = nn.Sequential(
+            nn.Linear(d_state * 2, d_state),  # [old_state, message] concat
+            nn.GELU(),
+            nn.Linear(d_state, d_state)
+        )
 
         # 활성화 강도 업데이트
         self.activation_update = nn.Sequential(
@@ -222,155 +228,150 @@ class NeuronInteraction(nn.Module):
 
     def forward(
         self,
-        neuron_state: NeuronState,
+        activation: torch.Tensor,  # [batch, n_neurons]
+        hidden_state: torch.Tensor,  # [batch, n_neurons, d_state]
         sparsity_k: int = 256
-    ) -> NeuronState:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        뉴런 상태 업데이트
+        뉴런 상태 업데이트 (BATCH 처리!)
 
-        1. 활성 뉴런들끼리 메시지 교환
-        2. 각 뉴런의 내부 상태 업데이트
-        3. 활성화 강도 조정
-        4. 새로운 뉴런 활성화 가능
+        Args:
+            activation: [batch, n_neurons]
+            hidden_state: [batch, n_neurons, d_state]
+            sparsity_k: 최대 활성 뉴런 수
+
+        Returns:
+            new_activation: [batch, n_neurons]
+            new_hidden_state: [batch, n_neurons, d_state]
         """
-        device = neuron_state.activation.device
+        batch_size = activation.shape[0]
 
-        # 현재 활성 뉴런 찾기
-        active_mask = neuron_state.activation > 0.01
-        active_indices = active_mask.nonzero(as_tuple=True)[0]
+        # 1. 활성 마스크
+        active_mask = activation > 0.01  # [batch, n_neurons]
 
-        if len(active_indices) == 0:
-            return neuron_state
-
-        # 활성 뉴런들의 데이터
-        active_states = neuron_state.hidden_state[active_indices]  # [k, d_state]
-        active_activations = neuron_state.activation[active_indices]  # [k]
-
-        # 1. 메시지 계산 (attention)
+        # 2. 메시지 계산 (전체 뉴런, masked attention)
+        # Attention은 모든 뉴런에 대해 계산하지만,
+        # 비활성 뉴런은 마스크로 제외
         messages = self.compute_messages(
-            active_states,
-            active_activations
-        )  # [k, d_state]
+            hidden_state,  # [batch, n_neurons, d_state]
+            activation,    # [batch, n_neurons]
+            active_mask    # [batch, n_neurons]
+        )  # [batch, n_neurons, d_state]
 
-        # 2. 상태 업데이트
-        new_states = self.update_states(
-            active_states,
-            messages
-        )  # [k, d_state]
+        # 3. 상태 업데이트
+        new_hidden = self.update_states(
+            hidden_state,  # [batch, n_neurons, d_state]
+            messages       # [batch, n_neurons, d_state]
+        )  # [batch, n_neurons, d_state]
 
-        # 3. 활성화 강도 업데이트
-        new_activations = self.update_activations(
-            active_states,
-            new_states,
-            active_activations
-        )  # [k]
+        # 4. 활성화 강도 업데이트
+        new_activation = self.update_activations(
+            hidden_state,  # [batch, n_neurons, d_state]
+            new_hidden,    # [batch, n_neurons, d_state]
+            activation     # [batch, n_neurons]
+        )  # [batch, n_neurons]
 
-        # 4. 전역 상태에 반영
-        new_neuron_state = NeuronState(
-            activation=torch.zeros_like(neuron_state.activation),
-            hidden_state=torch.zeros_like(neuron_state.hidden_state)
+        # 5. 희소성 유지 (top-k)
+        new_activation, new_hidden = self.maintain_sparsity(
+            new_activation,
+            new_hidden,
+            k=sparsity_k
         )
 
-        new_neuron_state.activation[active_indices] = new_activations
-        new_neuron_state.hidden_state[active_indices] = new_states
-
-        # 5. 희소성 유지 (top-k만 유지)
-        new_neuron_state = self.maintain_sparsity(new_neuron_state, k=sparsity_k)
-
-        return new_neuron_state
+        return new_activation, new_hidden
 
     def compute_messages(
         self,
-        states: torch.Tensor,
-        activations: torch.Tensor
+        states: torch.Tensor,      # [batch, n_neurons, d_state]
+        activations: torch.Tensor, # [batch, n_neurons]
+        active_mask: torch.Tensor  # [batch, n_neurons]
     ) -> torch.Tensor:
         """
-        활성 뉴런들끼리 메시지 교환
-
-        Attention으로 구현:
-        - Query, Key, Value = 뉴런 상태
-        - Attention weight는 활성화 강도로 조정
+        활성 뉴런들끼리 메시지 교환 (배치 처리)
         """
-        # [k, d_state] → [1, k, d_state] (batch dimension 추가)
-        states_batched = states.unsqueeze(0)
+        batch_size, n_neurons, d_state = states.shape
 
-        # Self-attention
-        messages, attn_weights = self.message_attention(
-            states_batched,
-            states_batched,
-            states_batched
-        )
-
-        # [1, k, d_state] → [k, d_state]
-        messages = messages.squeeze(0)
+        # Self-attention (배치 전체)
+        messages, _ = self.message_attention(
+            states,  # Q: [batch, n_neurons, d_state]
+            states,  # K: [batch, n_neurons, d_state]
+            states,  # V: [batch, n_neurons, d_state]
+            key_padding_mask=~active_mask  # 비활성 뉴런 마스크
+        )  # [batch, n_neurons, d_state]
 
         # 활성화 강도로 가중
-        activation_weights = activations.unsqueeze(-1)  # [k, 1]
+        activation_weights = activations.unsqueeze(-1)  # [batch, n_neurons, 1]
         messages = messages * activation_weights
 
         return messages
 
     def update_states(
         self,
-        old_states: torch.Tensor,
-        messages: torch.Tensor
+        old_states: torch.Tensor,  # [batch, n_neurons, d_state]
+        messages: torch.Tensor     # [batch, n_neurons, d_state]
     ) -> torch.Tensor:
-        """GRU 스타일 상태 업데이트"""
-        # GRUCell: (input, hidden) → new_hidden
-        new_states = self.state_update(messages, old_states)
+        """상태 업데이트 (배치 처리)"""
+        # Concat old state + message
+        combined = torch.cat([old_states, messages], dim=-1)  # [batch, n_neurons, d_state*2]
+
+        # Update
+        new_states = self.state_update(combined)  # [batch, n_neurons, d_state]
         new_states = self.norm(new_states)
 
         return new_states
 
     def update_activations(
         self,
-        old_states: torch.Tensor,
-        new_states: torch.Tensor,
-        old_activations: torch.Tensor
+        old_states: torch.Tensor,  # [batch, n_neurons, d_state]
+        new_states: torch.Tensor,  # [batch, n_neurons, d_state]
+        old_activations: torch.Tensor  # [batch, n_neurons]
     ) -> torch.Tensor:
-        """
-        활성화 강도 업데이트
+        """활성화 강도 업데이트 (배치 처리)"""
+        # Concat
+        combined = torch.cat([old_states, new_states], dim=-1)  # [batch, n_neurons, d_state*2]
 
-        상태 변화를 보고 활성화를 강화하거나 약화
-        """
-        # 이전 상태와 새 상태를 concat
-        combined = torch.cat([old_states, new_states], dim=-1)  # [k, d_state*2]
+        # Delta
+        delta = self.activation_update(combined).squeeze(-1)  # [batch, n_neurons]
 
-        # 델타 계산
-        delta = self.activation_update(combined).squeeze(-1)  # [k]
-
-        # 업데이트 (약간의 관성 유지)
+        # Update (관성 유지)
         new_activations = 0.7 * old_activations + 0.3 * delta
 
-        # [0, 1] 범위로 클램프
+        # Clamp
         new_activations = torch.clamp(new_activations, 0.0, 1.0)
 
         return new_activations
 
-    def maintain_sparsity(self, neuron_state: NeuronState, k: int) -> NeuronState:
+    def maintain_sparsity(
+        self,
+        activation: torch.Tensor,    # [batch, n_neurons]
+        hidden_state: torch.Tensor,  # [batch, n_neurons, d_state]
+        k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        희소성 유지: 상위 k개만 유지, 나머지 제거
+        희소성 유지: 배치 전체에 대해 top-k만 유지
         """
-        activations = neuron_state.activation
+        batch_size, n_neurons = activation.shape
 
-        # Top-k 선택
-        topk_values, topk_indices = torch.topk(activations, min(k, len(activations)))
+        # Top-k 선택 (배치별로)
+        topk_values, topk_indices = torch.topk(activation, min(k, n_neurons), dim=-1)
+        # topk_values: [batch, k]
+        # topk_indices: [batch, k]
 
-        # 새 sparse 상태
-        sparse_state = NeuronState(
-            activation=torch.zeros_like(activations),
-            hidden_state=torch.zeros_like(neuron_state.hidden_state)
-        )
+        # Sparse 텐서 생성
+        new_activation = torch.zeros_like(activation)
+        new_hidden = torch.zeros_like(hidden_state)
 
-        sparse_state.activation[topk_indices] = topk_values
-        sparse_state.hidden_state[topk_indices] = neuron_state.hidden_state[topk_indices]
+        # 배치별로 scatter
+        for b in range(batch_size):
+            new_activation[b].scatter_(0, topk_indices[b], topk_values[b])
+            new_hidden[b, topk_indices[b]] = hidden_state[b, topk_indices[b]]
 
-        return sparse_state
+        return new_activation, new_hidden
 
 
 class OutputDecoder(nn.Module):
     """
-    뉴런 활성화 패턴 → 예측
+    뉴런 활성화 패턴 → 예측 (BATCH 처리)
 
     최종 뉴런 패턴을 출력 공간으로 디코딩
     """
@@ -400,20 +401,17 @@ class OutputDecoder(nn.Module):
         # Layer norm
         self.norm = nn.LayerNorm(d_state)
 
-    def forward(self, neuron_state: NeuronState) -> torch.Tensor:
+    def forward(self, activation: torch.Tensor) -> torch.Tensor:
         """
-        neuron_state: NeuronState
-        returns: [vocab_size] logits
+        activation: [batch, n_neurons]
+        returns: [batch, vocab_size] logits
         """
-        # 활성화 패턴
-        activation = neuron_state.activation  # [n_neurons]
-
         # Dense 표현으로 변환
-        dense = self.to_dense(activation)  # [d_state]
+        dense = self.to_dense(activation)  # [batch, d_state]
         dense = self.norm(dense)
 
         # 예측 logits
-        logits = self.to_logits(dense)  # [vocab_size]
+        logits = self.to_logits(dense)  # [batch, vocab_size]
 
         return logits
 
@@ -488,54 +486,42 @@ class SPROUT_BrainLike(nn.Module):
         tokens: [batch, seq_len]
         returns: [batch, vocab_size] logits
 
-        또는 return_activation_history=True면:
-        returns: (logits, activation_history)
+        **중요: 배치 전체를 한 번에 처리!**
         """
         batch_size = tokens.shape[0]
         device = tokens.device
 
-        # 1. 초기 활성화 패턴 생성
-        initial_activation = self.input_encoder(tokens)  # [batch, n_neurons]
+        # 1. 초기 활성화 패턴 생성 (배치 처리!)
+        activation = self.input_encoder(tokens)  # [batch, n_neurons]
 
-        # Batch 처리
-        all_logits = []
-        all_histories = [] if return_activation_history else None
+        # 2. 뉴런 hidden state 초기화 (배치 처리!)
+        hidden_state = torch.zeros(batch_size, self.n_neurons, self.d_state, device=device)
 
-        for b in range(batch_size):
-            # 각 샘플 독립 처리
-            activation = initial_activation[b]  # [n_neurons]
+        # 활성 뉴런에 signature 할당
+        active_mask = activation > 0.01  # [batch, n_neurons]
+        # 모든 뉴런에 signature를 브로드캐스트
+        neuron_sigs = self.neuron_pool.neuron_signatures.unsqueeze(0).expand(batch_size, -1, -1)
+        # [batch, n_neurons, d_state]
+        hidden_state = neuron_sigs * active_mask.unsqueeze(-1)  # 비활성 뉴런은 0
 
-            # 2. 뉴런 상태 초기화
-            state = NeuronState.create(self.n_neurons, self.d_state, device)
-            state.activation = activation
+        # 3. 반복적 상호작용 (배치 처리!)
+        history = [activation.detach().cpu()] if return_activation_history else None
 
-            # 활성 뉴런의 hidden state 초기화
-            active_indices = (activation > 0.01).nonzero(as_tuple=True)[0]
-            if len(active_indices) > 0:
-                state.hidden_state[active_indices] = \
-                    self.neuron_pool.neuron_signatures[active_indices]
+        for step in range(self.n_interaction_steps):
+            activation, hidden_state = self.interaction(
+                activation,
+                hidden_state,
+                sparsity_k=self.final_sparsity
+            )
 
-            # 3. 반복적 상호작용
-            history = [state.activation.detach().cpu()] if return_activation_history else None
-
-            for step in range(self.n_interaction_steps):
-                state = self.interaction(state, sparsity_k=self.final_sparsity)
-
-                if return_activation_history:
-                    history.append(state.activation.detach().cpu())
-
-            # 4. 출력 디코딩
-            logits = self.output_decoder(state)  # [vocab_size]
-
-            all_logits.append(logits)
             if return_activation_history:
-                all_histories.append(history)
+                history.append(activation.detach().cpu())
 
-        # Stack batch
-        logits = torch.stack(all_logits)  # [batch, vocab_size]
+        # 4. 출력 디코딩 (배치 처리!)
+        logits = self.output_decoder(activation)  # [batch, vocab_size]
 
         if return_activation_history:
-            return logits, all_histories
+            return logits, history
         else:
             return logits
 
@@ -546,20 +532,21 @@ class SPROUT_BrainLike(nn.Module):
         각 step별로 어떤 뉴런이 활성화되는지 추적
         """
         with torch.no_grad():
-            logits, histories = self.forward(tokens, return_activation_history=True)
+            logits, history = self.forward(tokens, return_activation_history=True)
+            # history: list of [batch, n_neurons]
 
             # 첫 번째 샘플만 분석
-            history = histories[0]
+            sample_history = [h[0] for h in history]  # [n_steps] of [n_neurons]
 
             analysis = {
-                'n_steps': len(history),
-                'initial_active': (history[0] > 0.01).sum().item(),
-                'final_active': (history[-1] > 0.01).sum().item(),
-                'activation_history': history,
+                'n_steps': len(sample_history),
+                'initial_active': (sample_history[0] > 0.01).sum().item(),
+                'final_active': (sample_history[-1] > 0.01).sum().item(),
+                'activation_history': sample_history,
                 'top_neurons_per_step': []
             }
 
-            for step, activation in enumerate(history):
+            for step, activation in enumerate(sample_history):
                 top_values, top_indices = torch.topk(activation, k=10)
                 analysis['top_neurons_per_step'].append({
                     'step': step,
