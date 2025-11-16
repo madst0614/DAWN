@@ -6,6 +6,7 @@ Self-organizing Progressive Routing with Organic Unified Trees
 
 import torch
 import torch.nn as nn
+import weakref
 from typing import List, Dict, Optional, Tuple
 
 from .node import Node
@@ -22,20 +23,24 @@ class SPROUT(nn.Module):
     def __init__(
         self,
         dim: int = 512,
-        max_depth: int = 5,
-        compatibility_threshold: float = 0.8,
+        max_depth: int = 4,
+        compatibility_threshold: float = 0.5,
         num_heads: int = 4,
-        ffn_mult: int = 4
+        ffn_mult: int = 4,
+        max_nodes: Optional[int] = 20,
+        exploration_rate: float = 0.0
     ):
         """
         Initialize SPROUT model.
 
         Args:
             dim: Hidden dimension
-            max_depth: Maximum tree depth
-            compatibility_threshold: Threshold for creating new branches
+            max_depth: Maximum tree depth (default: 4)
+            compatibility_threshold: Threshold for creating new branches (default: 0.5)
             num_heads: Number of attention heads
             ffn_mult: FFN expansion multiplier
+            max_nodes: Maximum total nodes (default: 20)
+            exploration_rate: Random exploration probability (default: 0.0)
         """
         super().__init__()
         self.dim = dim
@@ -43,6 +48,8 @@ class SPROUT(nn.Module):
         self.compatibility_threshold = compatibility_threshold
         self.num_heads = num_heads
         self.ffn_mult = ffn_mult
+        self.max_nodes = max_nodes
+        self.exploration_rate = exploration_rate
 
         # Single root entry point
         self.root = Node(
@@ -51,8 +58,11 @@ class SPROUT(nn.Module):
             depth=0,
             max_depth=max_depth,
             num_heads=num_heads,
-            ffn_mult=ffn_mult
+            ffn_mult=ffn_mult,
+            exploration_rate=exploration_rate
         )
+        # Pass parent reference for node counting (use weakref to avoid circular reference)
+        self.root._sprout_parent_ref = weakref.ref(self)
 
         # Track convergence
         self.branch_history: List[int] = []
@@ -121,13 +131,13 @@ class SPROUT(nn.Module):
             connector = "└── " if is_last else "├── "
             print(
                 f"{prefix}{connector}Node {node.node_id} "
-                f"(depth={node.depth}, children={len(node.children)}, "
+                f"(depth={node.depth}, children={len(node.child_nodes)}, "
                 f"usage={node.usage_count})"
             )
 
             new_prefix = prefix + ("    " if is_last else "│   ")
-            for i, child in enumerate(node.children):
-                print_node(child, new_prefix, i == len(node.children) - 1)
+            for i, child in enumerate(node.child_nodes):
+                print_node(child, new_prefix, i == len(node.child_nodes) - 1)
 
         print("\n=== SPROUT Structure ===")
         print_node(self.root)

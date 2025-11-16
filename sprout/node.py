@@ -6,6 +6,8 @@ Implements the recursive node structure with Attention → FFN → Router flow.
 
 import torch
 import torch.nn as nn
+import weakref
+import random
 from typing import List, Dict, Optional, Tuple
 
 from .router import Router
@@ -24,7 +26,8 @@ class Node(nn.Module):
         depth: int = 0,
         max_depth: int = 5,
         num_heads: int = 4,
-        ffn_mult: int = 4
+        ffn_mult: int = 4,
+        exploration_rate: float = 0.0
     ):
         """
         Initialize node.
@@ -36,12 +39,14 @@ class Node(nn.Module):
             max_depth: Maximum allowed depth
             num_heads: Number of attention heads
             ffn_mult: FFN expansion multiplier
+            exploration_rate: Probability of random exploration (0.0-1.0)
         """
         super().__init__()
         self.dim = dim
         self.node_id = node_id
         self.depth = depth
         self.max_depth = max_depth
+        self.exploration_rate = exploration_rate
 
         # Processing components
         self.attention = nn.MultiheadAttention(
@@ -63,12 +68,15 @@ class Node(nn.Module):
         # Node representation (learnable "key" for this node)
         self.node_key = nn.Parameter(torch.randn(1, 1, dim))
 
-        # Children tracking
-        self.children: List['Node'] = []
+        # Children tracking (use ModuleList for proper parameter registration)
+        self.child_nodes = nn.ModuleList()
         self.next_child_id = 0
 
         # Statistics
         self.usage_count = 0
+
+        # Parent SPROUT reference (weakref to avoid circular reference)
+        self._sprout_parent_ref = None
 
     def forward(
         self,
@@ -113,9 +121,13 @@ class Node(nn.Module):
             # Max depth reached, return
             return x, path_log
 
-        if len(self.children) == 0:
+        if len(self.child_nodes) == 0:
             # No children yet, create first child
             new_child = self._create_child()
+            if new_child is None:
+                # Node limit reached, return current representation
+                return x, path_log
+
             child_output, child_log = new_child(
                 x,
                 context_bias,
@@ -133,8 +145,10 @@ class Node(nn.Module):
 
         # Check compatibility with existing children
         child_compatibilities = []
-        for child in self.children:
+        child_compatibility_tensors = []  # Keep tensors for loss calculation
+        for child in self.child_nodes:
             compat = self.router.compute_compatibility(x, child.node_key)
+            child_compatibility_tensors.append(compat.mean())
             child_compatibilities.append(compat.mean().item())
 
         best_idx = max(
@@ -143,27 +157,116 @@ class Node(nn.Module):
         )
         best_compat = child_compatibilities[best_idx]
 
+        # Exploration: randomly explore or exploit
+        should_explore = random.random() < self.exploration_rate
+
+        if should_explore:
+            # Random exploration: 50% random child, 50% create new child
+            if random.random() < 0.5 and len(self.child_nodes) > 0:
+                # Random existing child
+                explore_idx = random.randint(0, len(self.child_nodes) - 1)
+                best_child = self.child_nodes[explore_idx]
+                gate_strength = child_compatibilities[explore_idx]
+                child_output, child_log = best_child(
+                    x,
+                    context_bias,
+                    compatibility_threshold
+                )
+                child_output = gate_strength * child_output + (1 - gate_strength) * x
+
+                path_log.append({
+                    'node_id': self.node_id,
+                    'depth': self.depth,
+                    'action': 'explored_random',
+                    'child_id': best_child.node_id,
+                    'compatibility': child_compatibilities[explore_idx],
+                    'all_compatibilities': child_compatibility_tensors
+                })
+                path_log.extend(child_log)
+                return child_output, path_log
+            else:
+                # Create new child (exploration)
+                new_child = self._create_child()
+                if new_child is None:
+                    # Node limit reached, fall back to best child
+                    best_child = self.child_nodes[best_idx]
+                    gate_strength = child_compatibilities[best_idx]
+                    child_output, child_log = best_child(
+                        x,
+                        context_bias,
+                        compatibility_threshold
+                    )
+                    child_output = gate_strength * child_output + (1 - gate_strength) * x
+
+                    path_log.append({
+                        'node_id': self.node_id,
+                        'depth': self.depth,
+                        'action': 'explored_but_limit_reached',
+                        'child_id': best_child.node_id,
+                        'compatibility': best_compat,
+                        'all_compatibilities': child_compatibility_tensors
+                    })
+                    path_log.extend(child_log)
+                    return child_output, path_log
+
+                child_output, child_log = new_child(
+                    x,
+                    context_bias,
+                    compatibility_threshold
+                )
+
+                path_log.append({
+                    'node_id': self.node_id,
+                    'depth': self.depth,
+                    'action': 'explored_new',
+                    'new_child_id': new_child.node_id
+                })
+                path_log.extend(child_log)
+                return child_output, path_log
+
         if best_compat < compatibility_threshold:
             # Create new branch
             new_child = self._create_child()
-            child_output, child_log = new_child(
-                x,
-                context_bias,
-                compatibility_threshold
-            )
+            if new_child is None:
+                # Node limit reached, route to best existing child instead
+                best_child = self.child_nodes[best_idx]
+                gate_strength = child_compatibilities[best_idx]
+                child_output, child_log = best_child(
+                    x,
+                    context_bias,
+                    compatibility_threshold
+                )
+                child_output = gate_strength * child_output + (1 - gate_strength) * x
 
-            path_log.append({
-                'node_id': self.node_id,
-                'depth': self.depth,
-                'action': 'branched',
-                'new_child_id': new_child.node_id,
-                'best_existing_compat': best_compat,
-                'threshold': compatibility_threshold
-            })
-            path_log.extend(child_log)
+                path_log.append({
+                    'node_id': self.node_id,
+                    'depth': self.depth,
+                    'action': 'routed_limit_reached',
+                    'child_id': best_child.node_id,
+                    'compatibility': best_compat,
+                    'all_compatibilities': child_compatibility_tensors
+                })
+                path_log.extend(child_log)
+            else:
+                child_output, child_log = new_child(
+                    x,
+                    context_bias,
+                    compatibility_threshold
+                )
+
+                path_log.append({
+                    'node_id': self.node_id,
+                    'depth': self.depth,
+                    'action': 'branched',
+                    'new_child_id': new_child.node_id,
+                    'best_existing_compat': best_compat,
+                    'threshold': compatibility_threshold,
+                    'all_compatibilities': child_compatibility_tensors
+                })
+                path_log.extend(child_log)
         else:
             # Route to best existing child
-            best_child = self.children[best_idx]
+            best_child = self.child_nodes[best_idx]
 
             # Soft gating based on compatibility
             gate_strength = child_compatibilities[best_idx]
@@ -179,28 +282,50 @@ class Node(nn.Module):
                 'depth': self.depth,
                 'action': 'routed',
                 'child_id': best_child.node_id,
-                'compatibility': best_compat
+                'compatibility': best_compat,
+                'all_compatibilities': child_compatibility_tensors
             })
             path_log.extend(child_log)
 
         return child_output, path_log
 
-    def _create_child(self) -> 'Node':
-        """Create a new child node"""
+    def _create_child(self) -> Optional['Node']:
+        """
+        Create a new child node.
+
+        Returns:
+            New child node, or None if node limit reached
+        """
+        # Check node limit if parent SPROUT is set
+        if self._sprout_parent_ref is not None:
+            sprout_parent = self._sprout_parent_ref()
+            if sprout_parent is not None:
+                max_nodes = getattr(sprout_parent, 'max_nodes', None)
+                if max_nodes is not None:
+                    current_count = sprout_parent.count_total_nodes()
+                    if current_count >= max_nodes:
+                        # Node limit reached - don't create new node
+                        return None
+
         child = Node(
             dim=self.dim,
             node_id=self.next_child_id,
             depth=self.depth + 1,
-            max_depth=self.max_depth
+            max_depth=self.max_depth,
+            exploration_rate=self.exploration_rate
         )
-        self.children.append(child)
+        # Move child to same device as parent
+        child = child.to(self.node_key.device)
+        # Pass parent reference (weakref)
+        child._sprout_parent_ref = self._sprout_parent_ref
+        self.child_nodes.append(child)
         self.next_child_id += 1
         return child
 
     def count_nodes(self) -> int:
         """Recursively count total nodes in subtree"""
         count = 1  # self
-        for child in self.children:
+        for child in self.child_nodes:
             count += child.count_nodes()
         return count
 
@@ -209,7 +334,7 @@ class Node(nn.Module):
         return {
             'node_id': self.node_id,
             'depth': self.depth,
-            'num_children': len(self.children),
+            'num_children': len(self.child_nodes),
             'usage_count': self.usage_count,
-            'children': [child.get_structure_info() for child in self.children]
+            'children': [child.get_structure_info() for child in self.child_nodes]
         }

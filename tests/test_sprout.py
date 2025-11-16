@@ -36,7 +36,7 @@ class TestNode:
         assert node.node_id == 0
         assert node.depth == 0
         assert node.max_depth == 5
-        assert len(node.children) == 0
+        assert len(node.child_nodes) == 0
 
     def test_node_forward_basic(self):
         """Test basic node forward pass."""
@@ -57,7 +57,7 @@ class TestNode:
         # First forward should create first child
         output, path_log = node(x)
 
-        assert len(node.children) == 1
+        assert len(node.child_nodes) == 1
         assert any(log['action'] == 'created_first_child' for log in path_log)
 
     def test_node_max_depth(self):
@@ -68,7 +68,7 @@ class TestNode:
         output, path_log = node(x)
 
         # Should not create children at max depth
-        assert len(node.children) == 0
+        assert len(node.child_nodes) == 0
         assert len(path_log) == 0
 
     def test_node_count(self):
