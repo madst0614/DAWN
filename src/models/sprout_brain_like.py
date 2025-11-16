@@ -323,7 +323,10 @@ class NeuronInteraction(nn.Module):
         messages_sparse = messages_sparse * active_weights
 
         # 원래 크기로 복원 (sparse → dense)
-        messages = torch.zeros_like(states)
+        # Mixed precision 대응: messages_sparse의 dtype에 맞춰 생성
+        messages = torch.zeros(batch_size, n_neurons, d_state,
+                              dtype=messages_sparse.dtype,
+                              device=states.device)
         messages[batch_indices, topk_indices] = messages_sparse
 
         return messages
