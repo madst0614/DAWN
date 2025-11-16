@@ -208,8 +208,12 @@ def get_args():
                         help="Warmup steps")
     parser.add_argument("--gradient_clip", type=float, default=1.0,
                         help="Gradient clipping value")
+    parser.add_argument("--no_mixed_precision", action="store_true",
+                        help="Disable mixed precision training (default: enabled)")
+
+    # Keep old arg for compatibility but deprecate
     parser.add_argument("--mixed_precision", action="store_true",
-                        help="Use mixed precision training")
+                        help=argparse.SUPPRESS)
 
     # Data config
     parser.add_argument("--max_samples", type=int, default=50000,
@@ -236,6 +240,10 @@ def get_args():
                         help="Use tiny dataset for debugging")
 
     args = parser.parse_args()
+
+    # Set mixed_precision: default True unless --no_mixed_precision is set
+    args.mixed_precision = not args.no_mixed_precision
+
     return args
 
 
