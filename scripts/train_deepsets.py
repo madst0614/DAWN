@@ -188,7 +188,7 @@ def main():
     parser.add_argument('--n_heads', type=int, default=8)
     parser.add_argument('--n_layers', type=int, default=6)
     parser.add_argument('--max_seq_len', type=int, default=512)
-    parser.add_argument('--sparse_k', type=int, default=512, help='Number of neurons to select')
+    parser.add_argument('--sparse_k', type=int, default=128, help='Number of neurons to select')
     parser.add_argument('--d_neuron', type=int, default=128, help='Neuron info vector size (DeepSets)')
     parser.add_argument('--d_hidden', type=int, default=256, help='φ output size (DeepSets)')
     parser.add_argument('--batch_size', type=int, default=32)
