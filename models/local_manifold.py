@@ -166,62 +166,43 @@ class LocalManifoldFFNLayer(nn.Module):
         batch: int,
         seq: int
     ) -> torch.Tensor:
-        """Dense 연산: 모든 뉴런 사용 (chunked for memory efficiency)"""
-        batch_seq = x_flat.shape[0]
+        """Dense 연산: 모든 뉴런 사용 (메모리 효율적)"""
 
         # 1. 모든 뉴런의 정보 가져오기
         neuron_patterns = self.neuron_patterns.weight  # [d_ff, d_model]
         neuron_semantics = self.neuron_vecs.weight     # [d_ff, d_neuron]
         neuron_out_dirs = self.neuron_out_dirs.weight  # [d_ff, d_model]
 
-        # ✨ Chunking으로 메모리 절약
-        chunk_size = batch  # 한 번에 1 batch만 처리
+        # 2. ✨ Neuron semantic interaction (전체에 대해 1번만)
+        # Dense는 모든 뉴런 사용 → 항상 같은 attention 결과
+        # 한 번만 계산하고 재사용
+        semantics_input = neuron_semantics.unsqueeze(0)  # [1, d_ff, d_neuron]
+        attended_semantics, _ = self.neuron_attn(
+            semantics_input,
+            semantics_input,
+            semantics_input
+        )
+        attended_semantics = attended_semantics.squeeze(0)  # [d_ff, d_neuron]
 
-        outputs = []
-        for chunk_start in range(0, batch_seq, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, batch_seq)
-            x_chunk = x_flat[chunk_start:chunk_end]  # [chunk, d_model]
+        # 3. ✨ Semantic modulation weights (전체에 대해 1번만)
+        semantic_weights = self.weight_proj(attended_semantics)
+        semantic_weights = torch.sigmoid(semantic_weights).squeeze(-1)
+        # [d_ff]
 
-            # 2. ✨ Base activation (입력 패턴 매칭)
-            base_activations = F.gelu(x_chunk @ neuron_patterns.T)
-            # [chunk, d_ff]
+        # 4. ✨ 각 토큰별 base activation 계산
+        x_reshaped = x_flat.view(batch, seq, self.d_model)  # [B, S, d_model]
 
-            # 3. ✨ 의미 정보로 상호작용 (Self-Attention)
-            # Expand semantics for chunk
-            chunk_len = x_chunk.shape[0]
-            semantics_expanded = neuron_semantics.unsqueeze(0).expand(chunk_len, -1, -1)
-            # [chunk, d_ff, d_neuron]
+        # [B, S, d_model] @ [d_model, d_ff] → [B, S, d_ff]
+        base_activations = F.gelu(x_reshaped @ neuron_patterns.T)
 
-            attended_semantics, _ = self.neuron_attn(
-                semantics_expanded,
-                semantics_expanded,
-                semantics_expanded
-            )
-            # [chunk, d_ff, d_neuron]
+        # 5. ✨ Semantic modulation 적용
+        # [B, S, d_ff] * [d_ff] (broadcast)
+        final_activations = base_activations * semantic_weights
+        # [B, S, d_ff]
 
-            # 4. ✨ Semantic modulation (attended → weight)
-            semantic_weights = self.weight_proj(attended_semantics)
-            # [chunk, d_ff, 1]
-
-            semantic_weights = torch.sigmoid(semantic_weights)
-
-            # 5. ✨ Final activation = base × semantic modulation
-            final_activations = base_activations.unsqueeze(-1) * semantic_weights
-            # [chunk, d_ff, 1]
-
-            # 6. ✨ 각 뉴런의 기여
-            out_dirs_expanded = neuron_out_dirs.unsqueeze(0).expand(chunk_len, -1, -1)
-            contributions = final_activations * out_dirs_expanded
-            # [chunk, d_ff, d_model]
-
-            # 7. 합산
-            output_chunk = contributions.sum(dim=1)
-            # [chunk, d_model]
-
-            outputs.append(output_chunk)
-
-        # Concatenate all chunks
-        output = torch.cat(outputs, dim=0)  # [B*S, d_model]
+        # 6. ✨ 각 뉴런의 기여
+        # [B, S, d_ff] @ [d_ff, d_model] → [B, S, d_model]
+        output = final_activations @ neuron_out_dirs
 
         return output.view(batch, seq, self.d_model)
 
@@ -232,68 +213,62 @@ class LocalManifoldFFNLayer(nn.Module):
         batch: int,
         seq: int
     ) -> torch.Tensor:
-        """Sparse 연산: top_k 뉴런만 사용 (chunked for memory efficiency)"""
-        batch_seq = x_flat.shape[0]
+        """Sparse 연산: 시퀀스별 뉴런 선택 (메모리 효율적)"""
 
-        # ✨ Chunking으로 메모리 절약
-        # [B*S, top_k, top_k] attention은 메모리 집약적
-        # Chunk size: 시퀀스 단위로 처리 (batch 단위)
-        chunk_size = batch  # 한 번에 1 batch만 처리
+        # 1. ✨ 시퀀스별로 뉴런 선택 (토큰별 X)
+        # 한 시퀀스 내 모든 토큰이 같은 뉴런 집합 공유 → 생물학적으로 합리적
+        router_scores = self.router.compute_scores(x_flat)  # [B*S, d_ff]
+        router_scores = router_scores.view(batch, seq, self.d_ff)
 
-        outputs = []
-        for chunk_start in range(0, batch_seq, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, batch_seq)
-            x_chunk = x_flat[chunk_start:chunk_end]  # [chunk, d_model]
+        # 시퀀스 전체의 평균 점수로 뉴런 선택
+        router_scores_pooled = router_scores.mean(dim=1)  # [B, d_ff]
+        _, selected_indices = torch.topk(router_scores_pooled, top_k, dim=-1)
+        # [B, top_k]
 
-            # 1. Router로 뉴런 선택
-            router_scores = self.router.compute_scores(x_chunk)
-            _, selected_indices = torch.topk(router_scores, top_k, dim=-1)
-            # [chunk, top_k]
+        # 2. ✨ 선택된 뉴런들의 정보 (시퀀스별로 동일)
+        neuron_patterns = self.neuron_patterns(selected_indices)   # [B, top_k, d_model]
+        neuron_semantics = self.neuron_vecs(selected_indices)      # [B, top_k, d_neuron]
+        neuron_out_dirs = self.neuron_out_dirs(selected_indices)   # [B, top_k, d_model]
 
-            # 2. ✨ 선택된 뉴런들의 정보 가져오기
-            neuron_patterns = self.neuron_patterns(selected_indices)   # [chunk, top_k, d_model]
-            neuron_semantics = self.neuron_vecs(selected_indices)      # [chunk, top_k, d_neuron]
-            neuron_out_dirs = self.neuron_out_dirs(selected_indices)   # [chunk, top_k, d_model]
+        # 3. ✨ Neuron semantic interaction (시퀀스별로 1번만)
+        # 메모리: [B, top_k, top_k] = [32, 64, 64] (기존 대비 512배 감소!)
+        attended_semantics, _ = self.neuron_attn(
+            neuron_semantics,
+            neuron_semantics,
+            neuron_semantics
+        )
+        # [B, top_k, d_neuron]
 
-            # 3. ✨ Base activation (입력 패턴 매칭)
-            base_activations = torch.bmm(
-                x_chunk.unsqueeze(1),           # [chunk, 1, d_model]
-                neuron_patterns.transpose(1, 2) # [chunk, d_model, top_k]
-            ).squeeze(1)                        # [chunk, top_k]
+        # 4. ✨ Semantic modulation weights (시퀀스별로 동일)
+        semantic_weights = self.weight_proj(attended_semantics)
+        semantic_weights = torch.sigmoid(semantic_weights)
+        # [B, top_k, 1]
 
-            base_activations = F.gelu(base_activations)
+        # 5. ✨ 각 토큰별 base activation 계산
+        x_reshaped = x_flat.view(batch, seq, self.d_model)  # [B, S, d_model]
 
-            # 4. ✨ 의미 정보로 상호작용 (Self-Attention)
-            # chunk 크기만큼만 attention 수행 → 메모리 절약
-            attended_semantics, _ = self.neuron_attn(
-                neuron_semantics,
-                neuron_semantics,
-                neuron_semantics
-            )
-            # [chunk, top_k, d_neuron]
+        # [B, S, d_model] @ [B, d_model, top_k] → [B, S, top_k]
+        base_activations = torch.bmm(
+            x_reshaped,
+            neuron_patterns.transpose(1, 2)
+        )
+        base_activations = F.gelu(base_activations)  # [B, S, top_k]
 
-            # 5. ✨ Semantic modulation (attended → weight)
-            semantic_weights = self.weight_proj(attended_semantics)
-            # [chunk, top_k, 1]
+        # 6. ✨ Semantic modulation 적용
+        # [B, S, top_k] * [B, 1, top_k] (broadcast)
+        final_activations = base_activations * semantic_weights.squeeze(-1).unsqueeze(1)
+        # [B, S, top_k]
 
-            semantic_weights = torch.sigmoid(semantic_weights)
+        # 7. ✨ 각 뉴런의 기여
+        # [B, S, top_k, 1] * [B, 1, top_k, d_model] → [B, S, top_k, d_model]
+        contributions = (
+            final_activations.unsqueeze(-1) *
+            neuron_out_dirs.unsqueeze(1)
+        )
+        # [B, S, top_k, d_model]
 
-            # 6. ✨ Final activation = base × semantic modulation
-            final_activations = base_activations.unsqueeze(-1) * semantic_weights
-            # [chunk, top_k, 1]
-
-            # 7. ✨ 각 뉴런의 기여
-            contributions = final_activations * neuron_out_dirs
-            # [chunk, top_k, d_model]
-
-            # 8. 합산
-            output_chunk = contributions.sum(dim=1)
-            # [chunk, d_model]
-
-            outputs.append(output_chunk)
-
-        # Concatenate all chunks
-        output = torch.cat(outputs, dim=0)  # [B*S, d_model]
+        # 8. 합산
+        output = contributions.sum(dim=2)  # [B, S, d_model]
 
         return output.view(batch, seq, self.d_model)
 
