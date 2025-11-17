@@ -211,7 +211,7 @@ def main():
     parser.add_argument('--max_seq_len', type=int, default=512)
     parser.add_argument('--sparse_k', type=int, default=128, help='Number of neurons to select')
     parser.add_argument('--d_neuron', type=int, default=128, help='Neuron info vector size')
-    parser.add_argument('--n_attn_heads', type=int, default=4, help='Neuron attention heads')
+    parser.add_argument('--n_attn_heads', type=int, default=8, help='Neuron attention heads')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=3e-4)
