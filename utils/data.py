@@ -317,7 +317,7 @@ class CacheLoader:
         use_cache: bool = True
     ) -> Optional[List[str]]:
         """
-        Load cached text data from wikitext_5to1_texts.pkl.
+        Load cached text data from cache/{split}/wikitext_5to1_texts.pkl.
 
         Args:
             split: Dataset split ('train' or 'validation')
@@ -330,9 +330,10 @@ class CacheLoader:
         if not use_cache:
             return None
 
-        # Use wikitext_5to1_texts.pkl which has train/val already split
+        # Cache structure: cache/{split}/{dataset}_5to1_texts.pkl
         cache_path = os.path.join(
             CacheLoader.CACHE_BASE_DIR,
+            split,
             f"{dataset}_5to1_texts.pkl"
         )
 
@@ -342,15 +343,14 @@ class CacheLoader:
 
         try:
             with open(cache_path, 'rb') as f:
-                data = pickle.load(f)
+                texts = pickle.load(f)
 
-            # Data should be a dict with 'train' and 'validation' keys
-            if isinstance(data, dict) and split in data:
-                texts = data[split]
+            # Should be a list of text strings
+            if isinstance(texts, list):
                 print(f"✅ Loaded {len(texts)} {split} texts from cache: {cache_path}")
                 return texts
             else:
-                print(f"❌ Invalid cache format. Expected dict with '{split}' key")
+                print(f"❌ Invalid cache format. Expected list, got {type(texts)}")
                 return None
         except Exception as e:
             print(f"❌ Error loading cache: {e}")
