@@ -241,7 +241,7 @@ def get_current_sparsity(step, args):
     return current_top_k if current_top_k < args.d_ff else None  # None = dense
 
 
-def train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args, global_step):
+def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler, epoch, args, global_step):
     """Train for one epoch"""
     model.train()
     total_loss = 0
@@ -462,7 +462,7 @@ def main():
     print("\nStarting training...")
     for epoch in range(start_epoch, args.num_epochs):
         global_step = train_epoch(
-            model, train_loader, optimizer, scheduler, scaler,
+            model, train_loader, valid_loader, optimizer, scheduler, scaler,
             epoch, args, global_step
         )
 
