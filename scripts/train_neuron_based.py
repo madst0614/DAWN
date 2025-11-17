@@ -332,10 +332,10 @@ def evaluate(model, valid_loader, args, top_k):
     total_correct = 0
     total_masked = 0
 
-    total_batches = len(valid_loader)
-    print(f"\rEvaluating... 0/{total_batches}", end='', flush=True)
+    # 학습 progress bar와 동일한 방식으로
+    pbar = tqdm(valid_loader, desc="Eval")
 
-    for batch_idx, batch in enumerate(valid_loader):
+    for batch in pbar:
         input_ids = batch['input_ids'].to(args.device)
         labels = batch['labels'].to(args.device)
 
@@ -357,12 +357,6 @@ def evaluate(model, valid_loader, args, top_k):
             correct = (predictions[masked_positions] == labels[masked_positions]).sum().item()
             total_correct += correct
             total_masked += masked_positions.sum().item()
-
-        # 진행 상황 업데이트 (10번마다 또는 마지막)
-        if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
-            print(f"\rEvaluating... {batch_idx + 1}/{total_batches}", end='', flush=True)
-
-    print()  # 줄바꿈
     avg_loss = total_loss / len(valid_loader)
     accuracy = 100.0 * total_correct / total_masked if total_masked > 0 else 0.0
 
