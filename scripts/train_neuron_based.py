@@ -311,12 +311,6 @@ def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler,
                 'sparse%': f'{sparsity_pct:.1f}%'
             })
 
-        # Evaluation
-        if global_step % args.eval_interval == 0:
-            eval_loss, eval_acc = evaluate(model, valid_loader, args, current_top_k)
-            print(f"\n[Step {global_step}] Eval Loss: {eval_loss:.4f}, Eval Acc: {eval_acc:.2f}%")
-            model.train()
-
         # Save checkpoint
         if global_step % args.save_interval == 0:
             save_checkpoint(model, optimizer, scheduler, epoch, global_step, args)
