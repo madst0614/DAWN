@@ -1072,7 +1072,16 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--analyses", type=str, default="all",
                        help="Comma-separated list of analyses (1-7) or 'all'")
+    parser.add_argument("--num_samples", type=int, default=500,
+                       help="Number of samples for analysis (default: 500, recommended: 500-1000)")
+    parser.add_argument("--fast", action="store_true",
+                       help="Fast mode: fewer samples (100)")
     args = parser.parse_args()
+
+    # Fast mode override
+    if args.fast:
+        args.num_samples = 100
+        print("🚀 Fast mode enabled: using 100 samples")
 
     # Auto-detect checkpoint directory if not provided
     if args.checkpoint_dir is None and args.checkpoint is None:
@@ -1132,49 +1141,55 @@ def main():
     # Run analyses
     all_results = {}
 
-    if 1 in analyses_to_run:
-        all_results['usage_patterns'] = analyze_neuron_usage_patterns(
-            model, tokenizer, args.device, num_samples=200, top_k=768  # 줄임
-        )
-        # 메모리 정리
-        if args.device == 'cuda':
-            torch.cuda.empty_cache()
+    # 분석 순서: 가벼운 것부터 실행 (빠른 피드백)
+    # 7(효율성) → 6(동적) → 4(특화) → 5(레이어) → 3(라우터) → 2(성능) → 1(사용패턴)
+    execution_order = [7, 6, 4, 5, 3, 2, 1]
 
-    if 2 in analyses_to_run:
-        all_results['performance_sparsity'] = analyze_performance_vs_sparsity(
-            model, tokenizer, args.device
-        )
-        # 메모리 정리
-        if args.device == 'cuda':
-            torch.cuda.empty_cache()
+    # 실행할 분석을 순서대로 정렬
+    ordered_analyses = [a for a in execution_order if a in analyses_to_run]
 
-    if 3 in analyses_to_run:
-        all_results['router_quality'] = analyze_router_quality(
-            model, tokenizer, args.device, num_samples=50, top_k=768  # 줄임
-        )
-        # 메모리 정리
-        if args.device == 'cuda':
-            torch.cuda.empty_cache()
+    print(f"\n📊 Running {len(ordered_analyses)} analyses in optimized order: {ordered_analyses}")
+    print(f"   Samples: {args.num_samples}")
+    print()
 
-    if 4 in analyses_to_run:
-        all_results['specialization'] = analyze_neuron_specialization(
-            model, tokenizer, args.device, layer_idx=0
-        )
-
-    if 5 in analyses_to_run:
-        all_results['layer_differences'] = analyze_layer_differences(
-            model, tokenizer, args.device, num_samples=100, top_k=768
-        )
-
-    if 6 in analyses_to_run:
-        all_results['dynamic_routing'] = analyze_dynamic_routing(
-            model, tokenizer, args.device, top_k=768
-        )
-
-    if 7 in analyses_to_run:
-        all_results['efficiency'] = analyze_computation_efficiency(
-            model, tokenizer, args.device, num_samples=100
-        )
+    for analysis_id in ordered_analyses:
+        if analysis_id == 7:
+            all_results['efficiency'] = analyze_computation_efficiency(
+                model, tokenizer, args.device, num_samples=min(args.num_samples, 100)
+            )
+        elif analysis_id == 6:
+            all_results['dynamic_routing'] = analyze_dynamic_routing(
+                model, tokenizer, args.device, top_k=768
+            )
+        elif analysis_id == 4:
+            all_results['specialization'] = analyze_neuron_specialization(
+                model, tokenizer, args.device, layer_idx=0
+            )
+        elif analysis_id == 5:
+            all_results['layer_differences'] = analyze_layer_differences(
+                model, tokenizer, args.device, num_samples=min(args.num_samples, 200), top_k=768
+            )
+        elif analysis_id == 3:
+            all_results['router_quality'] = analyze_router_quality(
+                model, tokenizer, args.device, num_samples=min(args.num_samples, 200), top_k=768
+            )
+            # 메모리 정리
+            if args.device == 'cuda':
+                torch.cuda.empty_cache()
+        elif analysis_id == 2:
+            all_results['performance_sparsity'] = analyze_performance_vs_sparsity(
+                model, tokenizer, args.device
+            )
+            # 메모리 정리
+            if args.device == 'cuda':
+                torch.cuda.empty_cache()
+        elif analysis_id == 1:
+            all_results['usage_patterns'] = analyze_neuron_usage_patterns(
+                model, tokenizer, args.device, num_samples=args.num_samples, top_k=768
+            )
+            # 메모리 정리
+            if args.device == 'cuda':
+                torch.cuda.empty_cache()
 
     print("\n" + "="*70)
     print("✅ COMPREHENSIVE ANALYSIS COMPLETE!")
