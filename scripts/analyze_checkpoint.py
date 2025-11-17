@@ -104,7 +104,8 @@ def analyze_neuron_usage(model, tokenizer, device, num_samples=100):
                 x_norm = layer.norm2(x)
                 x_flat = x_norm.view(-1, x_norm.shape[-1])
 
-                router_scores = x_flat @ layer.ffn.router.W_router.T
+                # Router의 compute_scores() 메서드 사용 (MLP/Linear 모두 지원)
+                router_scores = layer.ffn.router.compute_scores(x_flat)
                 top_k = 768  # 분석용
                 _, top_indices = torch.topk(router_scores, top_k, dim=-1)
 
