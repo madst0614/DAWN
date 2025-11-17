@@ -1,14 +1,11 @@
 """
-SPROUT: Self-organizing Progressive Routing with Organic Unified Trees
+SPROUT Utilities
 
-Main package for SPROUT neural network models and utilities.
+Data processing and training utilities.
 """
 
-# Models
-from .models import NeuronBasedLanguageModel
-
 # Data utilities
-from .utils import (
+from .data import (
     SpanMasker,
     TokenDeletion,
     TextValidator,
@@ -17,18 +14,14 @@ from .utils import (
 )
 
 # Training utilities
-from .utils import (
+from .training import (
     CheckpointManager,
     TrainingMonitor,
     format_time,
     count_parameters,
 )
 
-__version__ = "0.4.0"
-
 __all__ = [
-    # Models
-    "NeuronBasedLanguageModel",
     # Data utilities
     "SpanMasker",
     "TokenDeletion",

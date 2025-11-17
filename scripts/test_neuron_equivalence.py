@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.sprout_neuron_based import (
+from sprout.models.neuron_based import (
     DynamicFFNLayer,
     NeuronBasedLanguageModel
 )
