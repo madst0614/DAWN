@@ -214,7 +214,7 @@ class DeepSetsFFNLayer(nn.Module):
         batch_seq = x_flat.shape[0]
 
         # Chunk size for memory efficiency
-        chunk_size = 16  # Process 16 tokens at a time
+        chunk_size = 8  # Process 8 tokens at a time
 
         outputs = []
 
