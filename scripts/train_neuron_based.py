@@ -42,6 +42,10 @@ def parse_args():
     # Training settings
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--router_lr_multiplier", type=float, default=5.0,
+                       help="Router learning rate = base_lr * multiplier")
+    parser.add_argument("--router_loss_weight", type=float, default=0.1,
+                       help="Weight for router quality loss (0 = disable)")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--warmup_steps", type=int, default=1000)
@@ -263,8 +267,35 @@ def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler,
         if args.no_mixed_precision:
             # Standard training
             outputs = model(input_ids, labels=labels, top_k=current_top_k)
-            loss = outputs['loss']
+            mlm_loss = outputs['loss']
             logits = outputs['logits']
+
+            # Router quality loss (if enabled and using sparsity)
+            router_loss = 0.0
+            if args.router_loss_weight > 0 and current_top_k is not None and current_top_k < args.d_ff:
+                # Get hidden states from each layer and compute router loss
+                with torch.no_grad():
+                    token_emb = model.token_embedding(input_ids)
+                    positions = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0), -1)
+                    pos_emb = model.position_embedding(positions)
+                    x = token_emb + pos_emb
+
+                # Compute router loss for each layer
+                for layer in model.layers:
+                    x_norm = layer.norm1(x)
+                    attn_out, _ = layer.attention(x_norm, x_norm, x_norm)
+                    x = x + layer.dropout(attn_out)
+
+                    x_norm = layer.norm2(x)
+                    router_loss += layer.ffn.compute_router_loss(x_norm, current_top_k)
+
+                    x_ffn = layer.ffn(x_norm, top_k=current_top_k)
+                    x = x + layer.dropout(x_ffn)
+
+                router_loss = router_loss / len(model.layers)  # Average across layers
+
+            # Total loss
+            loss = mlm_loss + args.router_loss_weight * router_loss
 
             # Backward
             loss.backward()
@@ -275,8 +306,35 @@ def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler,
             # Mixed precision training
             with torch.amp.autocast('cuda'):
                 outputs = model(input_ids, labels=labels, top_k=current_top_k)
-                loss = outputs['loss']
+                mlm_loss = outputs['loss']
                 logits = outputs['logits']
+
+                # Router quality loss (if enabled and using sparsity)
+                router_loss = 0.0
+                if args.router_loss_weight > 0 and current_top_k is not None and current_top_k < args.d_ff:
+                    # Get hidden states from each layer and compute router loss
+                    with torch.no_grad():
+                        token_emb = model.token_embedding(input_ids)
+                        positions = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0), -1)
+                        pos_emb = model.position_embedding(positions)
+                        x = token_emb + pos_emb
+
+                    # Compute router loss for each layer (in autocast context)
+                    for layer in model.layers:
+                        x_norm = layer.norm1(x)
+                        attn_out, _ = layer.attention(x_norm, x_norm, x_norm)
+                        x = x + layer.dropout(attn_out)
+
+                        x_norm = layer.norm2(x)
+                        router_loss += layer.ffn.compute_router_loss(x_norm, current_top_k)
+
+                        x_ffn = layer.ffn(x_norm, top_k=current_top_k)
+                        x = x + layer.dropout(x_ffn)
+
+                    router_loss = router_loss / len(model.layers)  # Average across layers
+
+                # Total loss
+                loss = mlm_loss + args.router_loss_weight * router_loss
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -422,11 +480,25 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
 
     # Optimizer & scheduler
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay
-    )
+    # 라우터 파라미터는 더 높은 학습률로 학습
+    router_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if 'router' in name:
+            router_params.append(param)
+        else:
+            other_params.append(param)
+
+    optimizer = torch.optim.AdamW([
+        {'params': other_params, 'lr': args.learning_rate},
+        {'params': router_params, 'lr': args.learning_rate * args.router_lr_multiplier}
+    ], weight_decay=args.weight_decay)
+
+    print(f"\nOptimizer groups:")
+    print(f"  - Base parameters: lr={args.learning_rate}")
+    print(f"  - Router parameters: lr={args.learning_rate * args.router_lr_multiplier} ({args.router_lr_multiplier}x)")
+    print(f"  - Router loss weight: {args.router_loss_weight}")
 
     total_steps = len(train_loader) * args.num_epochs
     scheduler = torch.optim.lr_scheduler.OneCycleLR(

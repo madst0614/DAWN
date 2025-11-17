@@ -103,7 +103,7 @@ def analyze_neuron_usage_patterns(
                 x_flat = x_norm.view(-1, x_norm.shape[-1])
 
                 # Router scores
-                router_scores = x_flat @ layer.ffn.router.W_router.T
+                router_scores = layer.ffn.router.compute_scores(x_flat)
                 _, top_indices = torch.topk(router_scores, top_k, dim=-1)
 
                 # 사용된 뉴런 기록
@@ -394,8 +394,14 @@ def analyze_router_quality(
     random_mse = []
 
     # 임시로 랜덤 라우터 생성
-    original_router = ffn.router.W_router.data.clone()
-    ffn.router.W_router.data = torch.randn_like(ffn.router.W_router.data) * 0.02
+    if ffn.router.use_mlp:
+        original_w1 = ffn.router.W_router_1.data.clone()
+        original_w2 = ffn.router.W_router_2.data.clone()
+        ffn.router.W_router_1.data = torch.randn_like(ffn.router.W_router_1.data) * 0.02
+        ffn.router.W_router_2.data = torch.randn_like(ffn.router.W_router_2.data) * 0.02
+    else:
+        original_router = ffn.router.W_router.data.clone()
+        ffn.router.W_router.data = torch.randn_like(ffn.router.W_router.data) * 0.02
 
     with torch.no_grad():
         for text in test_texts:
@@ -425,7 +431,11 @@ def analyze_router_quality(
     }
 
     # Restore original router
-    ffn.router.W_router.data = original_router
+    if ffn.router.use_mlp:
+        ffn.router.W_router_1.data = original_w1
+        ffn.router.W_router_2.data = original_w2
+    else:
+        ffn.router.W_router.data = original_router
 
     # 3. Oracle Router (최적 선택)
     print("Testing Oracle Router...")
@@ -709,7 +719,7 @@ def analyze_layer_differences(
                 x_flat = x_norm.view(-1, x_norm.shape[-1])
 
                 # Router scores
-                router_scores = x_flat @ layer.ffn.router.W_router.T
+                router_scores = layer.ffn.router.compute_scores(x_flat)
                 router_probs = F.softmax(router_scores, dim=-1)
 
                 # Entropy (분산도)
@@ -759,8 +769,16 @@ def analyze_layer_differences(
     # 레이어 간 유사도
     print(f"\n🔗 Layer Similarity (Router Weight Cosine):")
     for i in range(n_layers - 1):
-        w_i = model.layers[i].ffn.router.W_router.data
-        w_j = model.layers[i + 1].ffn.router.W_router.data
+        router_i = model.layers[i].ffn.router
+        router_j = model.layers[i + 1].ffn.router
+
+        # Get weights to compare (use final projection for MLP router)
+        if router_i.use_mlp:
+            w_i = router_i.W_router_2.data
+            w_j = router_j.W_router_2.data
+        else:
+            w_i = router_i.W_router.data
+            w_j = router_j.W_router.data
 
         # Flatten and compute cosine
         sim = F.cosine_similarity(w_i.flatten().unsqueeze(0), w_j.flatten().unsqueeze(0)).item()
@@ -845,7 +863,7 @@ def analyze_dynamic_routing(
             x1 = token_emb1 + pos_emb
             x1_flat = x1.view(-1, x1.shape[-1])
 
-            scores1 = x1_flat @ ffn.router.W_router.T
+            scores1 = ffn.router.compute_scores(x1_flat)
             _, top_indices1 = torch.topk(scores1, top_k, dim=-1)
 
             # Context 2
@@ -853,7 +871,7 @@ def analyze_dynamic_routing(
             x2 = token_emb2 + pos_emb
             x2_flat = x2.view(-1, x2.shape[-1])
 
-            scores2 = x2_flat @ ffn.router.W_router.T
+            scores2 = ffn.router.compute_scores(x2_flat)
             _, top_indices2 = torch.topk(scores2, top_k, dim=-1)
 
             # 선택된 뉴런 집합

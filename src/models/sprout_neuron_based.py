@@ -22,19 +22,33 @@ class Router(nn.Module):
     """
     학습 가능한 라우터 - 입력에 따라 최적의 뉴런 선택
 
+    2-layer MLP 구조로 비선형 패턴 학습 가능
     W1로 초기화하여 학습 초기부터 뉴런 특성 반영
     """
-    def __init__(self, d_model: int, d_ff: int, init_from_W1: torch.Tensor = None):
+    def __init__(self, d_model: int, d_ff: int, init_from_W1: torch.Tensor = None, use_mlp: bool = True):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
+        self.use_mlp = use_mlp
 
-        # W1로 초기화 (뉴런 시그니처 = 뉴런 가중치)
-        if init_from_W1 is not None:
-            self.W_router = nn.Parameter(init_from_W1.clone())
+        if use_mlp:
+            # 2-layer MLP router for better context sensitivity
+            # Hidden dim = d_model (same as input)
+            self.W_router_1 = nn.Parameter(torch.randn(d_model, d_model) * 0.02)
+            self.W_router_2 = nn.Parameter(torch.randn(d_ff, d_model) * 0.02)
+
+            # Initialize W_router_2 from W1 if provided
+            if init_from_W1 is not None:
+                self.W_router_2.data = init_from_W1.clone()
+
+            # Layer norm for stability
+            self.norm = nn.LayerNorm(d_model)
         else:
-            # Fallback: 랜덤 초기화
-            self.W_router = nn.Parameter(torch.randn(d_ff, d_model) * 0.02)
+            # Simple linear router (original)
+            if init_from_W1 is not None:
+                self.W_router = nn.Parameter(init_from_W1.clone())
+            else:
+                self.W_router = nn.Parameter(torch.randn(d_ff, d_model) * 0.02)
 
     def select_batch(self, x: torch.Tensor, top_k: int) -> torch.Tensor:
         """
@@ -48,7 +62,14 @@ class Router(nn.Module):
             mask: [batch*seq, d_ff] - Binary mask (1=선택, 0=제외)
         """
         # 라우터 점수
-        scores = x @ self.W_router.T  # [batch*seq, d_ff]
+        if self.use_mlp:
+            # 2-layer MLP with GELU activation
+            x_norm = self.norm(x)
+            h = F.gelu(x_norm @ self.W_router_1.T)  # [batch*seq, d_model]
+            scores = h @ self.W_router_2.T  # [batch*seq, d_ff]
+        else:
+            # Simple linear
+            scores = x @ self.W_router.T  # [batch*seq, d_ff]
 
         # Top-k 선택
         _, top_indices = torch.topk(scores, top_k, dim=-1)
@@ -58,6 +79,25 @@ class Router(nn.Module):
         mask.scatter_(-1, top_indices, 1.0)
 
         return mask
+
+    def compute_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        라우터 점수 계산 (마스크 없이)
+
+        Args:
+            x: [batch*seq, d_model]
+
+        Returns:
+            scores: [batch*seq, d_ff]
+        """
+        if self.use_mlp:
+            x_norm = self.norm(x)
+            h = F.gelu(x_norm @ self.W_router_1.T)
+            scores = h @ self.W_router_2.T
+        else:
+            scores = x @ self.W_router.T
+
+        return scores
 
 
 # ============================================================
@@ -124,6 +164,9 @@ class DynamicFFNLayer(nn.Module):
         """
         효율적인 배치 처리 구현
 
+        top_k < d_ff인 경우: 선택된 뉴런만 실제 계산 (진짜 희소 연산)
+        top_k >= d_ff 또는 None: 전체 계산 (Dense FFN)
+
         Args:
             x: [batch, seq, d_model]
             top_k: 사용할 중간 뉴런 개수 (None이면 전부)
@@ -136,19 +179,42 @@ class DynamicFFNLayer(nn.Module):
         # Flatten
         x_flat = x.view(-1, d_model)  # [batch*seq, d_model]
 
-        # 중간 계층 (W1, W2는 이미 파라미터로 존재)
-        z = x_flat @ self.W1.T  # [batch*seq, d_ff]
-
         if top_k is not None and top_k < self.d_ff:
-            # 희소화: 라우터로 상위 k개만 선택
-            mask = self.router.select_batch(x_flat, top_k)
-            z = z * mask
+            # ===== 희소 연산: 선택된 뉴런만 계산 =====
 
-        # 활성화
-        a = F.gelu(z)  # [batch*seq, d_ff]
+            # 1. 라우터로 top-k 뉴런 선택
+            scores = self.router.compute_scores(x_flat)  # [batch*seq, d_ff]
+            _, top_indices = torch.topk(scores, top_k, dim=-1)  # [batch*seq, top_k]
 
-        # 출력 계층
-        output = a @ self.W2.T  # [batch*seq, d_model]
+            # 2. 선택된 W1 가중치 gather
+            # W1: [d_ff, d_model] → selected_W1: [batch*seq, top_k, d_model]
+            selected_W1 = self.W1[top_indices]
+
+            # 3. 선택된 뉴런만 계산 (z = x @ W1.T)
+            # x_flat: [batch*seq, d_model]
+            # selected_W1: [batch*seq, top_k, d_model]
+            # → z_sparse: [batch*seq, top_k]
+            z_sparse = torch.einsum('bd,bkd->bk', x_flat, selected_W1)
+
+            # 4. GELU 활성화
+            a_sparse = F.gelu(z_sparse)  # [batch*seq, top_k]
+
+            # 5. 선택된 W2 가중치 gather
+            # W2: [d_model, d_ff] → W2.T: [d_ff, d_model]
+            # selected_W2_T: [batch*seq, top_k, d_model]
+            selected_W2_T = self.W2.T[top_indices]
+
+            # 6. 출력 계산 (output = a @ W2.T)
+            # a_sparse: [batch*seq, top_k]
+            # selected_W2_T: [batch*seq, top_k, d_model]
+            # → output: [batch*seq, d_model]
+            output = torch.einsum('bk,bkd->bd', a_sparse, selected_W2_T)
+
+        else:
+            # ===== Dense 연산: 전체 뉴런 사용 =====
+            z = x_flat @ self.W1.T  # [batch*seq, d_ff]
+            a = F.gelu(z)  # [batch*seq, d_ff]
+            output = a @ self.W2.T  # [batch*seq, d_model]
 
         return output.view(batch, seq, d_model)
 
@@ -159,6 +225,47 @@ class DynamicFFNLayer(nn.Module):
     def get_W2(self) -> torch.Tensor:
         """W2 행렬 추출 [d_model, d_ff]"""
         return self.W2
+
+    def compute_router_loss(self, x: torch.Tensor, top_k: int) -> torch.Tensor:
+        """
+        라우터 품질 loss 계산
+
+        Oracle (실제 activation 기반 선택)과 Learned router의 차이를 최소화
+
+        Args:
+            x: [batch, seq, d_model]
+            top_k: 선택할 뉴런 개수
+
+        Returns:
+            loss: 스칼라 텐서
+        """
+        batch, seq, _ = x.shape
+        x_flat = x.view(-1, self.d_model)
+
+        # 1. Oracle scores: 실제 activation 크기
+        with torch.no_grad():
+            z_oracle = x_flat @ self.W1.T  # [batch*seq, d_ff]
+            a_oracle = F.gelu(z_oracle)
+            oracle_scores = a_oracle.abs()  # 실제 activation 크기
+
+        # 2. Router scores: 학습된 라우터
+        router_scores = self.router.compute_scores(x_flat)  # [batch*seq, d_ff]
+
+        # 3. Top-k overlap 최대화
+        # Oracle이 선택할 뉴런을 Router도 높은 점수로 예측하도록
+        _, oracle_indices = torch.topk(oracle_scores, top_k, dim=-1)
+
+        # Oracle이 선택한 뉴런에 대해 router가 높은 점수를 주도록
+        oracle_mask = torch.zeros_like(router_scores)
+        oracle_mask.scatter_(-1, oracle_indices, 1.0)
+
+        # Router가 oracle 선택을 따라가도록 유도
+        # Positive: oracle이 선택한 것 → 높은 점수
+        # Negative: oracle이 선택 안 한 것 → 낮은 점수
+        router_scores_norm = F.log_softmax(router_scores, dim=-1)
+        loss = -(oracle_mask * router_scores_norm).sum() / oracle_mask.sum()
+
+        return loss
 
     def analyze_neuron_usage(self, x: torch.Tensor, top_k: int) -> dict:
         """
@@ -175,7 +282,7 @@ class DynamicFFNLayer(nn.Module):
         x_flat = x.view(-1, self.d_model)
 
         # 라우터 점수
-        scores = x_flat @ self.router.W_router.T  # [batch*seq, d_ff]
+        scores = self.router.compute_scores(x_flat)  # [batch*seq, d_ff]
 
         # 선택된 뉴런
         _, top_indices = torch.topk(scores, top_k, dim=-1)  # [batch*seq, top_k]
