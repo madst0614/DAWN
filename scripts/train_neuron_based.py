@@ -273,7 +273,7 @@ def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler,
 
         else:
             # Mixed precision training
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = model(input_ids, labels=labels, top_k=current_top_k)
                 loss = outputs['loss']
                 logits = outputs['logits']
@@ -332,17 +332,16 @@ def evaluate(model, valid_loader, args, top_k):
     total_correct = 0
     total_masked = 0
 
-    # 평가는 tqdm 없이 간단하게
-    print(f"Evaluating on {len(valid_loader)} batches...", end=' ', flush=True)
-
-    for batch in valid_loader:
+    # tqdm으로 한 줄 갱신
+    pbar = tqdm(valid_loader, desc="Eval", leave=False, ncols=100, file=sys.stdout)
+    for batch in pbar:
         input_ids = batch['input_ids'].to(args.device)
         labels = batch['labels'].to(args.device)
 
         if args.no_mixed_precision:
             outputs = model(input_ids, labels=labels, top_k=top_k)
         else:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = model(input_ids, labels=labels, top_k=top_k)
 
         loss = outputs['loss']
@@ -361,7 +360,6 @@ def evaluate(model, valid_loader, args, top_k):
     avg_loss = total_loss / len(valid_loader)
     accuracy = 100.0 * total_correct / total_masked if total_masked > 0 else 0.0
 
-    print("Done!")  # 평가 완료
     return avg_loss, accuracy
 
 
@@ -446,7 +444,7 @@ def main():
     )
 
     # Mixed precision scaler
-    scaler = torch.cuda.amp.GradScaler() if not args.no_mixed_precision else None
+    scaler = torch.amp.GradScaler('cuda') if not args.no_mixed_precision else None
 
     # Resume from checkpoint
     start_epoch = 0
