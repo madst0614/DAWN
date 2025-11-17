@@ -283,7 +283,7 @@ def main():
     )
 
     # Mixed precision scaler
-    scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if args.use_amp else None
 
     # Checkpoint & Monitor
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
