@@ -25,6 +25,46 @@ import time
 from typing import Dict, List, Tuple
 
 from src.models.sprout_neuron_based import NeuronBasedLanguageModel
+from sprout.data_utils import CacheLoader, TextValidator
+
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+def load_test_texts(num_samples: int, use_cache: bool = True) -> List[str]:
+    """
+    Load test texts from cache or use fallback.
+
+    Args:
+        num_samples: Number of samples to load
+        use_cache: Whether to try loading from cache
+
+    Returns:
+        List of test text strings
+    """
+    if use_cache:
+        cached_texts = CacheLoader.load_validation_texts(dataset="wikitext")
+        if cached_texts is not None:
+            print(f"✅ Using cached validation texts ({len(cached_texts)} available)")
+            valid_texts = TextValidator.filter_sentences(cached_texts)
+            return valid_texts[:num_samples]
+
+    # Fallback to hard-coded test texts
+    print("⚠️  Using fallback test texts")
+    fallback_texts = [
+        "The quick brown fox jumps over the lazy dog",
+        "Artificial intelligence is transforming the world",
+        "Python is a popular programming language",
+        "Machine learning requires large datasets",
+        "Deep neural networks learn hierarchical representations",
+        "Natural language processing enables computers to understand text",
+        "The weather today is sunny and warm",
+        "I love reading books in my free time",
+        "Mathematics is the foundation of science",
+        "Climate change is a global challenge",
+    ] * (num_samples // 10 + 1)
+    return fallback_texts[:num_samples]
 
 
 # ============================================================
@@ -50,21 +90,8 @@ def analyze_neuron_usage_patterns(
 
     model.eval()
 
-    # 다양한 테스트 문장
-    test_texts = [
-        "The quick brown fox jumps over the lazy dog",
-        "Artificial intelligence is transforming the world",
-        "Python is a popular programming language",
-        "Machine learning requires large datasets",
-        "Deep neural networks learn hierarchical representations",
-        "Natural language processing enables computers to understand text",
-        "The weather today is sunny and warm",
-        "I love reading books in my free time",
-        "Mathematics is the foundation of science",
-        "Climate change is a global challenge",
-    ] * 100  # 1000 samples
-
-    test_texts = test_texts[:num_samples]
+    # Load test texts
+    test_texts = load_test_texts(num_samples)
 
     n_layers = len(model.layers)
     d_ff = model.layers[0].ffn.d_ff
@@ -188,18 +215,9 @@ def analyze_performance_vs_sparsity(
     model.eval()
 
     if test_texts is None:
-        test_texts = [
-            "The [MASK] is shining brightly in the sky",
-            "I love to [MASK] books in my free time",
-            "Python is a programming [MASK] for data science",
-            "She went to the [MASK] to buy groceries",
-            "The cat is [MASK] on the comfortable mat",
-            "Artificial [MASK] is transforming technology",
-            "The capital of France is [MASK]",
-            "Machine [MASK] requires large datasets",
-            "Deep [MASK] networks learn from data",
-            "The weather today is very [MASK]",
-        ]
+        # Use cached texts for more realistic evaluation
+        # Load regular texts and rely on MLM masking
+        test_texts = load_test_texts(num_samples=10, use_cache=True)
 
     d_ff = model.layers[0].ffn.d_ff
 
@@ -347,12 +365,8 @@ def analyze_router_quality(
 
     model.eval()
 
-    test_texts = [
-        "The quick brown fox jumps over the lazy dog",
-        "Machine learning is a subset of artificial intelligence",
-        "Python programming language is widely used in data science",
-    ] * 34
-    test_texts = test_texts[:num_samples]
+    # Load test texts
+    test_texts = load_test_texts(num_samples)
 
     layer_idx = 0  # Analyze first layer
     ffn = model.layers[layer_idx].ffn
@@ -679,11 +693,8 @@ def analyze_layer_differences(
 
     model.eval()
 
-    test_texts = [
-        "The quick brown fox jumps over the lazy dog",
-        "Machine learning is transforming artificial intelligence",
-    ] * 50
-    test_texts = test_texts[:num_samples]
+    # Load test texts
+    test_texts = load_test_texts(num_samples)
 
     n_layers = len(model.layers)
     d_ff = model.layers[0].ffn.d_ff
