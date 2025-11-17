@@ -21,16 +21,25 @@ from torch.utils.checkpoint import checkpoint
 
 class Router(nn.Module):
     """
-    학습 가능한 라우터 - 입력에 따라 최적의 뉴런 선택
+    학습 가능한 라우터 - 입력과 컨텍스트에 따라 최적의 뉴런 선택
 
     2-layer MLP 구조로 비선형 패턴 학습 가능
     W1로 초기화하여 학습 초기부터 뉴런 특성 반영
+    컨텍스트 반영으로 동적 라우팅 지원
     """
-    def __init__(self, d_model: int, d_ff: int, init_from_W1: torch.Tensor = None, use_mlp: bool = True):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        init_from_W1: torch.Tensor = None,
+        use_mlp: bool = True,
+        context_weight: float = 0.3
+    ):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
         self.use_mlp = use_mlp
+        self.context_weight = context_weight  # 컨텍스트 반영 비율
 
         if use_mlp:
             # 2-layer MLP router for better context sensitivity
@@ -199,25 +208,29 @@ class DynamicFFNLayer(nn.Module):
 
         # 단일 배치 처리
         if top_k is not None and top_k < self.d_ff:
-            # ===== 희소 연산: 마스킹 방식 (메모리 효율적) =====
+            # ===== 희소 연산: 전략 선택 =====
+            sparsity_ratio = top_k / self.d_ff
 
-            # 전체 계산 후 마스킹
-            # 미래 최적화: top_k가 매우 작을 때 (<10%) sparse matmul 사용
-            z = x_flat @ self.W1.T  # [batch*seq, d_ff]
+            # 전략 1: 매우 sparse (< 10%) → 진짜 sparse 계산 (빠름!)
+            if sparsity_ratio < 0.10:
+                output = self._forward_true_sparse(x_flat, top_k, batch, seq)
 
-            # 라우터로 top-k 선택
-            scores = self.router.compute_scores(x_flat)
-            _, top_indices = torch.topk(scores, top_k, dim=-1)
+            # 전략 2: 중간 sparse (10% ~ 90%) → 마스킹 방식 (안전)
+            else:
+                # 라우터로 top-k 선택
+                scores = self.router.compute_scores(x_flat)
+                _, top_indices = torch.topk(scores, top_k, dim=-1)
 
-            # 마스크 생성 및 적용 (메모리 효율적)
-            mask = torch.zeros_like(z)
-            mask.scatter_(-1, top_indices, 1.0)
-            z.mul_(mask)  # In-place 연산으로 메모리 절약
-            del mask  # 즉시 메모리 해제
+                # 전체 계산 후 마스킹
+                z = x_flat @ self.W1.T  # [batch*seq, d_ff]
+                mask = torch.zeros_like(z)
+                mask.scatter_(-1, top_indices, 1.0)
+                z.mul_(mask)  # In-place
+                del mask
 
-            # 활성화 및 출력
-            a = F.gelu(z)
-            output = a @ self.W2.T
+                # 활성화 및 출력
+                a = F.gelu(z)
+                output = a @ self.W2.T
 
         else:
             # ===== Dense 연산: 전체 뉴런 사용 =====
@@ -226,6 +239,72 @@ class DynamicFFNLayer(nn.Module):
             output = a @ self.W2.T  # [batch*seq, d_model]
 
         return output.view(batch, seq, d_model)
+
+    def _forward_true_sparse(
+        self,
+        x_flat: torch.Tensor,
+        top_k: int,
+        batch: int,
+        seq: int
+    ) -> torch.Tensor:
+        """
+        진짜 sparse 계산: 선택된 뉴런만 실제 계산
+
+        메모리 안전을 위해 작은 청크로 처리
+        매우 sparse한 경우 (top_k < 10% d_ff)에만 사용
+
+        Args:
+            x_flat: [total_tokens, d_model]
+            top_k: 선택할 뉴런 개수
+            batch, seq: 원본 형태
+
+        Returns:
+            output: [batch, seq, d_model]
+        """
+        total_tokens = x_flat.shape[0]
+
+        # 라우터로 top-k 선택
+        scores = self.router.compute_scores(x_flat)
+        _, top_indices = torch.topk(scores, top_k, dim=-1)  # [total_tokens, top_k]
+
+        # 메모리 안전을 위한 청크 크기
+        # 휴리스틱: selected_W1이 2GB를 넘지 않도록
+        # selected_W1 size = chunk_size * top_k * d_model * 4 bytes
+        max_memory_gb = 2.0
+        max_elements = (max_memory_gb * 1024**3) / 4  # float32
+        chunk_size = int(max_elements / (top_k * self.d_model))
+        chunk_size = max(1, min(chunk_size, total_tokens))
+
+        # 출력 텐서 초기화
+        z_sparse = torch.zeros(total_tokens, self.d_ff, device=x_flat.device, dtype=x_flat.dtype)
+
+        # 청크 단위로 진짜 sparse 계산
+        for i in range(0, total_tokens, chunk_size):
+            end_idx = min(i + chunk_size, total_tokens)
+            x_chunk = x_flat[i:end_idx]  # [chunk, d_model]
+            indices_chunk = top_indices[i:end_idx]  # [chunk, top_k]
+
+            # 각 토큰별로 선택된 뉴런의 가중치 gather
+            # 배치 처리: advanced indexing 사용
+            batch_indices = torch.arange(indices_chunk.shape[0], device=x_flat.device).unsqueeze(1).expand_as(indices_chunk)
+
+            # 선택된 가중치 수집: [chunk, top_k, d_model]
+            selected_W1 = self.W1[indices_chunk]  # Broadcasting으로 안전
+
+            # 선택된 뉴런만 계산: [chunk, top_k]
+            z_selected = torch.bmm(
+                x_chunk.unsqueeze(1),  # [chunk, 1, d_model]
+                selected_W1.transpose(1, 2)  # [chunk, d_model, top_k]
+            ).squeeze(1)  # [chunk, top_k]
+
+            # 희소 텐서에 할당
+            z_sparse[i:end_idx].scatter_(1, indices_chunk, z_selected)
+
+        # 활성화 및 출력 (dense)
+        a = F.gelu(z_sparse)
+        output = a @ self.W2.T
+
+        return output
 
     def _forward_chunked(
         self,
@@ -291,15 +370,22 @@ class DynamicFFNLayer(nn.Module):
         """W2 행렬 추출 [d_model, d_ff]"""
         return self.W2
 
-    def compute_router_loss(self, x: torch.Tensor, top_k: int) -> torch.Tensor:
+    def compute_router_loss(
+        self,
+        x: torch.Tensor,
+        top_k: int,
+        load_balance_weight: float = 0.01
+    ) -> torch.Tensor:
         """
-        라우터 품질 loss 계산
+        개선된 라우터 품질 loss 계산
 
         Oracle (실제 activation 기반 선택)과 Learned router의 차이를 최소화
+        + Load balancing + Ranking consistency
 
         Args:
             x: [batch, seq, d_model]
             top_k: 선택할 뉴런 개수
+            load_balance_weight: Load balancing loss 가중치
 
         Returns:
             loss: 스칼라 텐서
@@ -316,21 +402,41 @@ class DynamicFFNLayer(nn.Module):
         # 2. Router scores: 학습된 라우터
         router_scores = self.router.compute_scores(x_flat)  # [batch*seq, d_ff]
 
-        # 3. Top-k overlap 최대화
-        # Oracle이 선택할 뉴런을 Router도 높은 점수로 예측하도록
+        # ===== Loss 1: Top-k Overlap (Cross Entropy) =====
         _, oracle_indices = torch.topk(oracle_scores, top_k, dim=-1)
-
-        # Oracle이 선택한 뉴런에 대해 router가 높은 점수를 주도록
         oracle_mask = torch.zeros_like(router_scores)
         oracle_mask.scatter_(-1, oracle_indices, 1.0)
 
-        # Router가 oracle 선택을 따라가도록 유도
-        # Positive: oracle이 선택한 것 → 높은 점수
-        # Negative: oracle이 선택 안 한 것 → 낮은 점수
         router_scores_norm = F.log_softmax(router_scores, dim=-1)
-        loss = -(oracle_mask * router_scores_norm).sum() / oracle_mask.sum()
+        ce_loss = -(oracle_mask * router_scores_norm).sum() / oracle_mask.sum()
 
-        return loss
+        # ===== Loss 2: Ranking Consistency (순위 일치) =====
+        # Oracle과 Router의 상위 뉴런 순위가 일치하도록
+        # Spearman correlation 근사: MSE on normalized scores
+        oracle_scores_norm = (oracle_scores - oracle_scores.mean(dim=-1, keepdim=True)) / (oracle_scores.std(dim=-1, keepdim=True) + 1e-6)
+        router_scores_norm_mse = (router_scores - router_scores.mean(dim=-1, keepdim=True)) / (router_scores.std(dim=-1, keepdim=True) + 1e-6)
+
+        # Top-k 영역에서만 MSE 계산 (중요한 뉴런만)
+        ranking_loss = ((oracle_scores_norm - router_scores_norm_mse) * oracle_mask).pow(2).sum() / oracle_mask.sum()
+
+        # ===== Loss 3: Load Balancing (뉴런 사용 다양성) =====
+        # 모든 뉴런이 골고루 선택되도록
+        _, router_indices = torch.topk(router_scores, top_k, dim=-1)  # [batch*seq, top_k]
+
+        # 각 뉴런의 선택 빈도 계산
+        neuron_usage = torch.zeros(self.d_ff, device=x.device)
+        ones = torch.ones_like(router_indices, dtype=torch.float)
+        neuron_usage.scatter_add_(0, router_indices.flatten(), ones.flatten())
+
+        # 균등 분포에서의 차이 (엔트로피 최대화)
+        total_selections = neuron_usage.sum()
+        expected_usage = total_selections / self.d_ff
+        load_balance_loss = ((neuron_usage - expected_usage).pow(2).mean())
+
+        # ===== Total Loss =====
+        total_loss = ce_loss + 0.1 * ranking_loss + load_balance_weight * load_balance_loss
+
+        return total_loss
 
     def analyze_neuron_usage(self, x: torch.Tensor, top_k: int) -> dict:
         """
