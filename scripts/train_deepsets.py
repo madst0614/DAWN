@@ -115,6 +115,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, scaler=N
     model.train()
     total_loss = 0
     total_tokens = 0
+    total_correct = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for batch in pbar:
@@ -130,6 +131,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, scaler=N
             with torch.amp.autocast('cuda'):
                 outputs = model(input_ids=input_ids, labels=labels)
                 loss = outputs['loss']
+                logits = outputs['logits']
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -139,6 +141,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, scaler=N
         else:
             outputs = model(input_ids=input_ids, labels=labels)
             loss = outputs['loss']
+            logits = outputs['logits']
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -146,14 +149,24 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, scaler=N
         if scheduler is not None:
             scheduler.step()
 
+        # Calculate accuracy
+        predictions = logits.argmax(dim=-1)
+        correct = (predictions == labels).sum().item()
+        total_correct += correct
+
         batch_size, seq_len = input_ids.shape
         num_tokens = batch_size * seq_len
         total_loss += loss.item() * num_tokens
         total_tokens += num_tokens
 
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        pbar.set_postfix({
+            "loss": f"{loss.item():.4f}",
+            "acc": f"{correct / num_tokens:.4f}"
+        })
 
-    return total_loss / total_tokens
+    avg_loss = total_loss / total_tokens
+    avg_acc = total_correct / total_tokens
+    return avg_loss, avg_acc
 
 
 def evaluate(model, dataloader, device):
@@ -161,6 +174,7 @@ def evaluate(model, dataloader, device):
     model.eval()
     total_loss = 0
     total_tokens = 0
+    total_correct = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
@@ -169,13 +183,21 @@ def evaluate(model, dataloader, device):
 
             outputs = model(input_ids=input_ids, labels=labels)
             loss = outputs['loss']
+            logits = outputs['logits']
+
+            # Calculate accuracy
+            predictions = logits.argmax(dim=-1)
+            correct = (predictions == labels).sum().item()
+            total_correct += correct
 
             batch_size, seq_len = input_ids.shape
             num_tokens = batch_size * seq_len
             total_loss += loss.item() * num_tokens
             total_tokens += num_tokens
 
-    return total_loss / total_tokens
+    avg_loss = total_loss / total_tokens
+    avg_acc = total_correct / total_tokens
+    return avg_loss, avg_acc
 
 
 def main():
@@ -257,7 +279,7 @@ def main():
             d_neuron=args.d_neuron,
             d_hidden=args.d_hidden,
             use_context=use_context,
-            gradient_checkpointing=True  # Enable for memory efficiency
+            gradient_checkpointing=False  # Disable for speed (memory is fine with optimizations)
         )
 
     model = model.to(device)
@@ -298,23 +320,30 @@ def main():
         epoch_start = time.time()
 
         # Train
-        train_loss = train_epoch(
+        train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, scaler
         )
 
         # Evaluate
-        val_loss = evaluate(model, val_loader, device)
+        val_loss, val_acc = evaluate(model, val_loader, device)
 
         epoch_time = time.time() - epoch_start
 
         # Log
         metrics = {
             'train_loss': train_loss,
+            'train_acc': train_acc,
             'val_loss': val_loss,
+            'val_acc': val_acc,
             'learning_rate': optimizer.param_groups[0]['lr'],
             'epoch_time': epoch_time
         }
         monitor.log_epoch(epoch, metrics)
+
+        print(f"\nEpoch {epoch}/{args.num_epochs}")
+        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+        print(f"  Time: {format_time(epoch_time)}")
 
         # Save checkpoint
         is_best = val_loss < best_val_loss

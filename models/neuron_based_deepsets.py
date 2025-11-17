@@ -155,36 +155,28 @@ class DeepSetsFFNLayer(nn.Module):
         batch: int,
         seq: int
     ) -> torch.Tensor:
-        """Dense 연산: 모든 뉴런 사용 (vectorized with Embedding)"""
+        """Dense 연산: 모든 뉴런 사용 (optimized with weight caching)"""
         batch_seq = x_flat.shape[0]
 
-        # 모든 뉴런 인덱스
-        all_indices = torch.arange(self.d_ff, device=x_flat.device)
-        all_indices = all_indices.unsqueeze(0).expand(batch_seq, -1)  # [B*S, d_ff]
+        # ✨ Embedding weight 직접 사용 (캐싱 효과)
+        W_in_all = self.W_in.weight  # [d_ff, d_model]
+        neuron_vecs_all = self.neuron_vecs.weight  # [d_ff, d_neuron]
 
-        # Embedding으로 가져오기 (병렬)
-        W_in_all = self.W_in(all_indices)  # [B*S, d_ff, d_model]
-        neuron_vecs_all = self.neuron_vecs(all_indices)  # [B*S, d_ff, d_neuron]
-
-        # 모든 뉴런의 activation 계산
-        activations = torch.bmm(
-            x_flat.unsqueeze(1),  # [B*S, 1, d_model]
-            W_in_all.transpose(1, 2)  # [B*S, d_model, d_ff]
-        ).squeeze(1)  # [B*S, d_ff]
-        activations = F.gelu(activations)
+        # 모든 뉴런의 activation 계산 (빠른 matmul)
+        activations = F.gelu(x_flat @ W_in_all.T)  # [B*S, d_ff]
 
         # 벡터화된 φ 입력 구성
         if self.use_context:
-            # 전체 맥락
-            context = neuron_vecs_all.mean(dim=1)  # [B*S, d_neuron]
+            # 전체 맥락 (한번만 계산)
+            context = neuron_vecs_all.mean(dim=0)  # [d_neuron]
 
             # Expand for batch processing
             activations_expanded = activations.unsqueeze(-1)  # [B*S, d_ff, 1]
             x_expanded = x_flat.unsqueeze(1).expand(-1, self.d_ff, -1)  # [B*S, d_ff, d_model]
-            context_expanded = context.unsqueeze(1).expand(-1, self.d_ff, -1)  # [B*S, d_ff, d_neuron]
+            context_expanded = context.unsqueeze(0).unsqueeze(0).expand(batch_seq, self.d_ff, -1)  # [B*S, d_ff, d_neuron]
 
             phi_input = torch.cat([
-                neuron_vecs_all,
+                neuron_vecs_all.unsqueeze(0).expand(batch_seq, -1, -1),  # [B*S, d_ff, d_neuron]
                 activations_expanded,
                 x_expanded,
                 context_expanded
@@ -194,7 +186,7 @@ class DeepSetsFFNLayer(nn.Module):
             activations_expanded = activations.unsqueeze(-1)  # [B*S, d_ff, 1]
 
             phi_input = torch.cat([
-                neuron_vecs_all,
+                neuron_vecs_all.unsqueeze(0).expand(batch_seq, -1, -1),  # [B*S, d_ff, d_neuron]
                 activations_expanded
             ], dim=-1)  # [B*S, d_ff, d_neuron + 1]
 
