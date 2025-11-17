@@ -180,35 +180,24 @@ class DynamicFFNLayer(nn.Module):
         x_flat = x.view(-1, d_model)  # [batch*seq, d_model]
 
         if top_k is not None and top_k < self.d_ff:
-            # ===== 희소 연산: 선택된 뉴런만 계산 =====
+            # ===== 희소 연산: 마스킹 방식 (메모리 효율적) =====
 
-            # 1. 라우터로 top-k 뉴런 선택
-            scores = self.router.compute_scores(x_flat)  # [batch*seq, d_ff]
-            _, top_indices = torch.topk(scores, top_k, dim=-1)  # [batch*seq, top_k]
+            # 전체 계산 후 마스킹
+            # 미래 최적화: top_k가 매우 작을 때 (<10%) sparse matmul 사용
+            z = x_flat @ self.W1.T  # [batch*seq, d_ff]
 
-            # 2. 선택된 W1 가중치 gather
-            # W1: [d_ff, d_model] → selected_W1: [batch*seq, top_k, d_model]
-            selected_W1 = self.W1[top_indices]
+            # 라우터로 top-k 선택
+            scores = self.router.compute_scores(x_flat)
+            _, top_indices = torch.topk(scores, top_k, dim=-1)
 
-            # 3. 선택된 뉴런만 계산 (z = x @ W1.T)
-            # x_flat: [batch*seq, d_model]
-            # selected_W1: [batch*seq, top_k, d_model]
-            # → z_sparse: [batch*seq, top_k]
-            z_sparse = torch.einsum('bd,bkd->bk', x_flat, selected_W1)
+            # 마스크 생성 및 적용
+            mask = torch.zeros_like(z)
+            mask.scatter_(-1, top_indices, 1.0)
+            z = z * mask
 
-            # 4. GELU 활성화
-            a_sparse = F.gelu(z_sparse)  # [batch*seq, top_k]
-
-            # 5. 선택된 W2 가중치 gather
-            # W2: [d_model, d_ff] → W2.T: [d_ff, d_model]
-            # selected_W2_T: [batch*seq, top_k, d_model]
-            selected_W2_T = self.W2.T[top_indices]
-
-            # 6. 출력 계산 (output = a @ W2.T)
-            # a_sparse: [batch*seq, top_k]
-            # selected_W2_T: [batch*seq, top_k, d_model]
-            # → output: [batch*seq, d_model]
-            output = torch.einsum('bk,bkd->bd', a_sparse, selected_W2_T)
+            # 활성화 및 출력
+            a = F.gelu(z)
+            output = a @ self.W2.T
 
         else:
             # ===== Dense 연산: 전체 뉴런 사용 =====
