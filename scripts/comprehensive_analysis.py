@@ -69,13 +69,17 @@ def analyze_neuron_usage_patterns(
     n_layers = len(model.layers)
     d_ff = model.layers[0].ffn.d_ff
 
-    # 각 레이어별 뉴런 사용 카운트
-    layer_usage = {i: torch.zeros(d_ff, device=device) for i in range(n_layers)}
+    # 각 레이어별 뉴런 사용 카운트 (CPU에 저장)
+    layer_usage = {i: torch.zeros(d_ff, device='cpu') for i in range(n_layers)}
 
     print(f"\nAnalyzing {num_samples} samples with top_k={top_k} ({top_k/d_ff*100:.1f}%)")
 
     with torch.no_grad():
-        for text in test_texts:
+        for idx, text in enumerate(test_texts):
+            if idx % 100 == 0 and idx > 0:
+                # 주기적으로 캐시 비우기
+                if device == 'cuda':
+                    torch.cuda.empty_cache()
             tokens = tokenizer(
                 text,
                 return_tensors='pt',
@@ -106,9 +110,8 @@ def analyze_neuron_usage_patterns(
                 router_scores = layer.ffn.router.compute_scores(x_flat)
                 _, top_indices = torch.topk(router_scores, top_k, dim=-1)
 
-                # 사용된 뉴런 기록
-                for indices in top_indices:
-                    layer_usage[layer_idx][indices] += 1
+                # 사용된 뉴런 기록 (CPU로 이동)
+                layer_usage[layer_idx][top_indices.cpu().flatten().unique()] += 1
 
                 # FFN 통과
                 x_ffn = layer.ffn(x_norm, top_k=top_k)
@@ -212,7 +215,7 @@ def analyze_performance_vs_sparsity(
 
     results = {}
 
-    # Dense 출력 (ground truth)
+    # Dense 출력 (ground truth) - CPU로 이동
     print("\nComputing dense outputs as ground truth...")
     dense_outputs = []
     dense_correct = 0
@@ -231,7 +234,8 @@ def analyze_performance_vs_sparsity(
             outputs = model(input_ids, top_k=None)
             logits = outputs['logits']
 
-            dense_outputs.append(logits)
+            # CPU로 이동하여 메모리 절약
+            dense_outputs.append(logits.cpu())
 
             # MLM accuracy (if [MASK] exists)
             mask_pos = (input_ids == tokenizer.mask_token_id).nonzero(as_tuple=True)
@@ -264,7 +268,7 @@ def analyze_performance_vs_sparsity(
 
                 outputs = model(tokens['input_ids'], top_k=top_k)
                 logits_sparse = outputs['logits']
-                logits_dense = dense_outputs[i]
+                logits_dense = dense_outputs[i].to(device)  # GPU로 이동
 
                 # Metrics
                 mse = F.mse_loss(logits_sparse, logits_dense).item()
@@ -281,6 +285,10 @@ def analyze_performance_vs_sparsity(
                 mse_losses.append(mse)
                 cos_sims.append(cos_sim)
                 norm_ratios.append(norm_ratio)
+
+            # 메모리 정리
+            if device == 'cuda':
+                torch.cuda.empty_cache()
 
         avg_mse = np.mean(mse_losses)
         avg_cos = np.mean(cos_sims)
@@ -1035,14 +1043,56 @@ def analyze_computation_efficiency(
 # Main
 # ============================================================
 
+def find_latest_checkpoint(checkpoint_dir: str) -> str:
+    """Find the latest checkpoint in the directory"""
+    import glob
+
+    if not os.path.exists(checkpoint_dir):
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    # Look for checkpoint files
+    pattern = os.path.join(checkpoint_dir, "checkpoint_*.pt")
+    checkpoints = glob.glob(pattern)
+
+    if not checkpoints:
+        raise FileNotFoundError(f"No checkpoint files found in {checkpoint_dir}")
+
+    # Sort by modification time (most recent first)
+    checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+
+    return checkpoints[0]
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True,
-                       help="Path to checkpoint file")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="Path to checkpoint file (optional if --checkpoint_dir is provided)")
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                       help="Directory containing checkpoints (will use latest)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--analyses", type=str, default="all",
                        help="Comma-separated list of analyses (1-7) or 'all'")
     args = parser.parse_args()
+
+    # Auto-detect checkpoint directory if not provided
+    if args.checkpoint_dir is None and args.checkpoint is None:
+        # Try Colab first
+        if os.path.exists("/content/drive/MyDrive/sprout_neuron_checkpoints"):
+            args.checkpoint_dir = "/content/drive/MyDrive/sprout_neuron_checkpoints"
+            print(f"🔍 Auto-detected Colab checkpoint dir: {args.checkpoint_dir}")
+        # Try local
+        elif os.path.exists("./checkpoints/neuron_based"):
+            args.checkpoint_dir = "./checkpoints/neuron_based"
+            print(f"🔍 Auto-detected local checkpoint dir: {args.checkpoint_dir}")
+
+    # Determine checkpoint path
+    if args.checkpoint is None:
+        if args.checkpoint_dir is None:
+            raise ValueError("Either --checkpoint or --checkpoint_dir must be provided")
+
+        # Find latest checkpoint in directory
+        args.checkpoint = find_latest_checkpoint(args.checkpoint_dir)
+        print(f"📂 Using latest checkpoint: {os.path.basename(args.checkpoint)}")
 
     print("="*70)
     print("🔬 COMPREHENSIVE NEURON-BASED MODEL ANALYSIS")
@@ -1084,18 +1134,27 @@ def main():
 
     if 1 in analyses_to_run:
         all_results['usage_patterns'] = analyze_neuron_usage_patterns(
-            model, tokenizer, args.device, num_samples=1000, top_k=768
+            model, tokenizer, args.device, num_samples=200, top_k=768  # 줄임
         )
+        # 메모리 정리
+        if args.device == 'cuda':
+            torch.cuda.empty_cache()
 
     if 2 in analyses_to_run:
         all_results['performance_sparsity'] = analyze_performance_vs_sparsity(
             model, tokenizer, args.device
         )
+        # 메모리 정리
+        if args.device == 'cuda':
+            torch.cuda.empty_cache()
 
     if 3 in analyses_to_run:
         all_results['router_quality'] = analyze_router_quality(
-            model, tokenizer, args.device, num_samples=100, top_k=768
+            model, tokenizer, args.device, num_samples=50, top_k=768  # 줄임
         )
+        # 메모리 정리
+        if args.device == 'cuda':
+            torch.cuda.empty_cache()
 
     if 4 in analyses_to_run:
         all_results['specialization'] = analyze_neuron_specialization(

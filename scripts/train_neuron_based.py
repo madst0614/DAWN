@@ -271,28 +271,25 @@ def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler,
             logits = outputs['logits']
 
             # Router quality loss (if enabled and using sparsity)
+            # 간소화: 주기적으로만 계산 (10 step마다)
             router_loss = 0.0
-            if args.router_loss_weight > 0 and current_top_k is not None and current_top_k < args.d_ff:
-                # Get hidden states from each layer and compute router loss
+            if args.router_loss_weight > 0 and current_top_k is not None and current_top_k < args.d_ff and global_step % 10 == 0:
+                # 첫 레이어만 사용 (메모리 절약)
                 with torch.no_grad():
                     token_emb = model.token_embedding(input_ids)
                     positions = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0), -1)
                     pos_emb = model.position_embedding(positions)
                     x = token_emb + pos_emb
 
-                # Compute router loss for each layer
-                for layer in model.layers:
-                    x_norm = layer.norm1(x)
+                # 첫 레이어만 계산
+                layer = model.layers[0]
+                x_norm = layer.norm1(x)
+                with torch.no_grad():
                     attn_out, _ = layer.attention(x_norm, x_norm, x_norm)
                     x = x + layer.dropout(attn_out)
 
-                    x_norm = layer.norm2(x)
-                    router_loss += layer.ffn.compute_router_loss(x_norm, current_top_k)
-
-                    x_ffn = layer.ffn(x_norm, top_k=current_top_k)
-                    x = x + layer.dropout(x_ffn)
-
-                router_loss = router_loss / len(model.layers)  # Average across layers
+                x_norm = layer.norm2(x)
+                router_loss = layer.ffn.compute_router_loss(x_norm, current_top_k)
 
             # Total loss
             loss = mlm_loss + args.router_loss_weight * router_loss
@@ -310,28 +307,25 @@ def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler,
                 logits = outputs['logits']
 
                 # Router quality loss (if enabled and using sparsity)
+                # 간소화: 주기적으로만 계산 (10 step마다)
                 router_loss = 0.0
-                if args.router_loss_weight > 0 and current_top_k is not None and current_top_k < args.d_ff:
-                    # Get hidden states from each layer and compute router loss
+                if args.router_loss_weight > 0 and current_top_k is not None and current_top_k < args.d_ff and global_step % 10 == 0:
+                    # 첫 레이어만 사용 (메모리 절약)
                     with torch.no_grad():
                         token_emb = model.token_embedding(input_ids)
                         positions = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0).expand(input_ids.size(0), -1)
                         pos_emb = model.position_embedding(positions)
                         x = token_emb + pos_emb
 
-                    # Compute router loss for each layer (in autocast context)
-                    for layer in model.layers:
-                        x_norm = layer.norm1(x)
+                    # 첫 레이어만 계산
+                    layer = model.layers[0]
+                    x_norm = layer.norm1(x)
+                    with torch.no_grad():
                         attn_out, _ = layer.attention(x_norm, x_norm, x_norm)
                         x = x + layer.dropout(attn_out)
 
-                        x_norm = layer.norm2(x)
-                        router_loss += layer.ffn.compute_router_loss(x_norm, current_top_k)
-
-                        x_ffn = layer.ffn(x_norm, top_k=current_top_k)
-                        x = x + layer.dropout(x_ffn)
-
-                    router_loss = router_loss / len(model.layers)  # Average across layers
+                    x_norm = layer.norm2(x)
+                    router_loss = layer.ffn.compute_router_loss(x_norm, current_top_k)
 
                 # Total loss
                 loss = mlm_loss + args.router_loss_weight * router_loss
