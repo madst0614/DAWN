@@ -19,7 +19,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import argparse
 from tqdm import tqdm
 import json
@@ -28,16 +28,44 @@ from datetime import datetime
 from models.neuron_based import NeuronBasedLanguageModel as BaselineModel
 from models.neuron_based_deepsets import DeepSetsLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
+from utils.data import CacheLoader
 import time
 
 
 # ============================================================
-# Data Loading (WikiText MLM)
+# Dataset
 # ============================================================
 
-def load_wikitext_data(tokenizer_path=None, max_length=512, batch_size=32):
-    """Load WikiText MLM data"""
-    from datasets import load_dataset
+class TextDataset(Dataset):
+    """Dataset for tokenized texts"""
+    def __init__(self, texts, tokenizer, max_length=512):
+        self.texts = texts
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+
+        # Tokenize
+        encoding = self.tokenizer(
+            text,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0)
+        }
+
+
+def load_cached_data(tokenizer_path=None, max_length=512, batch_size=32):
+    """Load cached WikiText data"""
     from transformers import AutoTokenizer
 
     # Load tokenizer
@@ -45,38 +73,35 @@ def load_wikitext_data(tokenizer_path=None, max_length=512, batch_size=32):
         tokenizer_path = "bert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
-    # Load WikiText-103
-    print("Loading WikiText-103...")
-    dataset = load_dataset("wikitext", "wikitext-103-raw-v1")
+    # Load cached texts
+    print("Loading cached WikiText data...")
+    train_texts = CacheLoader.load_train_texts(dataset="wikitext")
+    val_texts = CacheLoader.load_validation_texts(dataset="wikitext")
 
-    def tokenize_function(examples):
-        return tokenizer(
-            examples["text"],
-            padding="max_length",
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt"
+    if train_texts is None or val_texts is None:
+        raise ValueError(
+            "Cached data not found! "
+            f"Expected at: {CacheLoader.CACHE_BASE_DIR}/{{train,validation}}/wikitext_5to1_texts.pkl"
         )
 
-    # Tokenize
-    print("Tokenizing...")
-    tokenized_train = dataset["train"].map(
-        tokenize_function,
-        batched=True,
-        remove_columns=dataset["train"].column_names
-    )
-    tokenized_val = dataset["validation"].map(
-        tokenize_function,
-        batched=True,
-        remove_columns=dataset["validation"].column_names
-    )
+    print(f"Loaded {len(train_texts)} train texts, {len(val_texts)} val texts")
 
-    # Create DataLoaders
-    tokenized_train.set_format(type="torch", columns=["input_ids", "attention_mask"])
-    tokenized_val.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    # Create datasets
+    train_dataset = TextDataset(train_texts, tokenizer, max_length)
+    val_dataset = TextDataset(val_texts, tokenizer, max_length)
 
-    train_loader = DataLoader(tokenized_train, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(tokenized_val, batch_size=batch_size)
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        num_workers=2
+    )
 
     return train_loader, val_loader, tokenizer
 
@@ -195,8 +220,8 @@ def main():
         print(f"  {key}: {value}")
 
     # Load data
-    print("\nLoading WikiText data...")
-    train_loader, val_loader, tokenizer = load_wikitext_data(
+    print("\nLoading cached WikiText data...")
+    train_loader, val_loader, tokenizer = load_cached_data(
         max_length=args.max_seq_len,
         batch_size=args.batch_size
     )
