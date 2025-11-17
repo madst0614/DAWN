@@ -210,58 +210,73 @@ class DeepSetsFFNLayer(nn.Module):
         batch: int,
         seq: int
     ) -> torch.Tensor:
-        """Sparse 연산: top_k 뉴런만 사용"""
+        """Sparse 연산: top_k 뉴런만 사용 (chunked processing)"""
         batch_seq = x_flat.shape[0]
 
-        # 1. Router로 뉴런 선택
-        router_scores = self.router.compute_scores(x_flat)
-        _, selected_indices = torch.topk(router_scores, top_k, dim=-1)
-        # [B*S, top_k]
+        # Chunk size for memory efficiency
+        chunk_size = 128  # Process 128 tokens at a time
 
-        # 2. 선택된 뉴런의 activation 계산
-        W_in_selected = self.W_in[selected_indices]  # [B*S, top_k, d_model]
+        outputs = []
 
-        # Batched dot product
-        activations = torch.bmm(
-            x_flat.unsqueeze(1),  # [B*S, 1, d_model]
-            W_in_selected.transpose(1, 2)  # [B*S, d_model, top_k]
-        ).squeeze(1)  # [B*S, top_k]
+        for chunk_start in range(0, batch_seq, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, batch_seq)
+            x_chunk = x_flat[chunk_start:chunk_end]
+            chunk_len = x_chunk.shape[0]
 
-        activations = F.gelu(activations)
+            # 1. Router로 뉴런 선택
+            router_scores = self.router.compute_scores(x_chunk)
+            _, selected_indices = torch.topk(router_scores, top_k, dim=-1)
+            # [chunk_len, top_k]
 
-        # 3. 선택된 뉴런 정보 가져오기
-        neuron_vecs_selected = self.neuron_vecs[selected_indices]
-        # [B*S, top_k, d_neuron]
+            # 2. 선택된 뉴런의 activation 계산
+            W_in_selected = self.W_in[selected_indices]  # [chunk_len, top_k, d_model]
 
-        # 4. φ 입력 구성
-        if self.use_context:
-            # 전체 맥락 계산
-            context = neuron_vecs_selected.mean(dim=1)  # [B*S, d_neuron]
+            # Batched dot product
+            activations = torch.bmm(
+                x_chunk.unsqueeze(1),  # [chunk_len, 1, d_model]
+                W_in_selected.transpose(1, 2)  # [chunk_len, d_model, top_k]
+            ).squeeze(1)  # [chunk_len, top_k]
 
-            # 확장
-            x_expanded = x_flat.unsqueeze(1).expand(-1, top_k, -1)
-            context_expanded = context.unsqueeze(1).expand(-1, top_k, -1)
+            activations = F.gelu(activations)
 
-            phi_input = torch.cat([
-                neuron_vecs_selected,      # [B*S, top_k, d_neuron]
-                activations.unsqueeze(-1), # [B*S, top_k, 1]
-                x_expanded,                # [B*S, top_k, d_model]
-                context_expanded           # [B*S, top_k, d_neuron]
-            ], dim=-1)  # [B*S, top_k, d_neuron + 1 + d_model + d_neuron]
-        else:
-            phi_input = torch.cat([
-                neuron_vecs_selected,      # [B*S, top_k, d_neuron]
-                activations.unsqueeze(-1)  # [B*S, top_k, 1]
-            ], dim=-1)  # [B*S, top_k, d_neuron + 1]
+            # 3. 선택된 뉴런 정보 가져오기
+            neuron_vecs_selected = self.neuron_vecs[selected_indices]
+            # [chunk_len, top_k, d_neuron]
 
-        # 5. ✨ φ: 각 뉴런 독립적으로 변환
-        transformed = self.phi(phi_input)  # [B*S, top_k, d_hidden]
+            # 4. φ 입력 구성
+            if self.use_context:
+                # 전체 맥락 계산
+                context = neuron_vecs_selected.mean(dim=1)  # [chunk_len, d_neuron]
 
-        # 6. ✨ Σ: Sum aggregation (permutation invariant!)
-        aggregated = transformed.sum(dim=1)  # [B*S, d_hidden]
+                # 확장
+                x_expanded = x_chunk.unsqueeze(1).expand(-1, top_k, -1)
+                context_expanded = context.unsqueeze(1).expand(-1, top_k, -1)
 
-        # 7. ✨ ρ: 최종 변환
-        output = self.rho(aggregated)  # [B*S, d_model]
+                phi_input = torch.cat([
+                    neuron_vecs_selected,      # [chunk_len, top_k, d_neuron]
+                    activations.unsqueeze(-1), # [chunk_len, top_k, 1]
+                    x_expanded,                # [chunk_len, top_k, d_model]
+                    context_expanded           # [chunk_len, top_k, d_neuron]
+                ], dim=-1)  # [chunk_len, top_k, d_neuron + 1 + d_model + d_neuron]
+            else:
+                phi_input = torch.cat([
+                    neuron_vecs_selected,      # [chunk_len, top_k, d_neuron]
+                    activations.unsqueeze(-1)  # [chunk_len, top_k, 1]
+                ], dim=-1)  # [chunk_len, top_k, d_neuron + 1]
+
+            # 5. ✨ φ: 각 뉴런 독립적으로 변환
+            transformed = self.phi(phi_input)  # [chunk_len, top_k, d_hidden]
+
+            # 6. ✨ Σ: Sum aggregation (permutation invariant!)
+            aggregated = transformed.sum(dim=1)  # [chunk_len, d_hidden]
+
+            # 7. ✨ ρ: 최종 변환
+            chunk_output = self.rho(aggregated)  # [chunk_len, d_model]
+
+            outputs.append(chunk_output)
+
+        # Concatenate all chunks
+        output = torch.cat(outputs, dim=0)  # [B*S, d_model]
 
         return output.view(batch, seq, self.d_model)
 

@@ -127,7 +127,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, scaler=N
 
         # Mixed precision training
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = model(input_ids=input_ids, labels=labels)
                 loss = outputs['loss']
 
