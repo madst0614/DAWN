@@ -265,7 +265,10 @@ class DeepSetsFFNLayer(nn.Module):
                 ], dim=-1)  # [chunk_len, top_k, d_neuron + 1]
 
             # 5. ✨ φ: 각 뉴런 독립적으로 변환
-            transformed = self.phi(phi_input)  # [chunk_len, top_k, d_hidden]
+            # Reshape to 2D for memory efficiency
+            phi_input_2d = phi_input.view(-1, phi_input.size(-1))  # [chunk_len * top_k, input_dim]
+            transformed_2d = self.phi(phi_input_2d)  # [chunk_len * top_k, d_hidden]
+            transformed = transformed_2d.view(chunk_len, top_k, -1)  # [chunk_len, top_k, d_hidden]
 
             # 6. ✨ Σ: Sum aggregation (permutation invariant!)
             aggregated = transformed.sum(dim=1)  # [chunk_len, d_hidden]
