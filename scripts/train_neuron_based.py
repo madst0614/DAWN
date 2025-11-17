@@ -52,6 +52,10 @@ def parse_args():
     parser.add_argument("--gradient_clip", type=float, default=1.0)
     parser.add_argument("--no_mixed_precision", action="store_true",
                        help="Disable mixed precision training")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                       help="Enable gradient checkpointing to reduce memory (trades compute for memory)")
+    parser.add_argument("--enable_memory_monitor", action="store_true",
+                       help="Enable detailed memory monitoring and logging")
 
     # Data settings
     parser.add_argument("--dataset", type=str, default="wikitext",
@@ -81,6 +85,32 @@ def parse_args():
             args.checkpoint_dir = "./checkpoints/neuron_based"
 
     return args
+
+
+def log_memory_stats(step: int = 0, prefix: str = ""):
+    """
+    Log CUDA memory statistics
+
+    Args:
+        step: Current training step
+        prefix: Prefix for log message
+    """
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # GB
+
+        print(f"[{prefix}] Step {step}: "
+              f"Allocated: {allocated:.2f}GB | "
+              f"Reserved: {reserved:.2f}GB | "
+              f"Max: {max_allocated:.2f}GB")
+
+        # Warning if memory is getting critically high
+        if allocated > 35:  # Warning at 35GB
+            print(f"⚠️  WARNING: High memory usage! Consider enabling --gradient_checkpointing")
+
+        return allocated, reserved, max_allocated
+    return 0, 0, 0
 
 
 class MLMDataset:
@@ -363,6 +393,10 @@ def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler,
                 'sparse%': f'{sparsity_pct:.1f}%'
             })
 
+            # Memory monitoring
+            if args.enable_memory_monitor:
+                log_memory_stats(global_step, "Training")
+
         # Save checkpoint
         if global_step % args.save_interval == 0:
             save_checkpoint(model, optimizer, scheduler, epoch, global_step, args)
@@ -464,8 +498,15 @@ def main():
         d_ff=args.d_ff,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
-        max_seq_len=args.max_seq_len
+        max_seq_len=args.max_seq_len,
+        gradient_checkpointing=args.gradient_checkpointing
     ).to(args.device)
+
+    # Memory optimizations
+    if args.gradient_checkpointing:
+        print("✅ Gradient checkpointing enabled (trades ~20% speed for 30-50% less memory)")
+    if args.d_ff >= 8192:
+        print("✅ Large d_ff detected - automatic chunked computation will be used")
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -522,6 +563,15 @@ def main():
 
     # Training loop
     print("\nStarting training...")
+
+    # Initial memory stats
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"GPU Total Memory: {total_memory:.2f}GB")
+        if args.enable_memory_monitor:
+            log_memory_stats(0, "Initial")
+
     for epoch in range(start_epoch, args.num_epochs):
         global_step = train_epoch(
             model, train_loader, valid_loader, optimizer, scheduler, scaler,

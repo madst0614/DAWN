@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+from torch.utils.checkpoint import checkpoint
 
 
 # ============================================================
@@ -160,9 +161,9 @@ class DynamicFFNLayer(nn.Module):
 
         return NeuronView(self.W2)
 
-    def forward(self, x: torch.Tensor, top_k: Optional[int] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, top_k: Optional[int] = None, chunk_size: Optional[int] = None) -> torch.Tensor:
         """
-        효율적인 배치 처리 구현
+        메모리 효율적인 배치 처리 구현
 
         top_k < d_ff인 경우: 선택된 뉴런만 실제 계산 (진짜 희소 연산)
         top_k >= d_ff 또는 None: 전체 계산 (Dense FFN)
@@ -170,15 +171,33 @@ class DynamicFFNLayer(nn.Module):
         Args:
             x: [batch, seq, d_model]
             top_k: 사용할 중간 뉴런 개수 (None이면 전부)
+            chunk_size: 청크 크기 (None이면 자동 결정, 메모리 절약용)
 
         Returns:
             output: [batch, seq, d_model]
         """
         batch, seq, d_model = x.shape
+        total_tokens = batch * seq
+
+        # 자동 청크 크기 결정: 메모리 효율성과 성능 균형
+        # d_ff가 클수록, 청크 크기를 작게 설정
+        if chunk_size is None:
+            # 휴리스틱: d_ff에 따라 청크 크기 자동 조정
+            if self.d_ff >= 8192:
+                chunk_size = min(2048, total_tokens)  # 큰 d_ff: 작은 청크
+            elif self.d_ff >= 4096:
+                chunk_size = min(4096, total_tokens)  # 중간 d_ff: 중간 청크
+            else:
+                chunk_size = total_tokens  # 작은 d_ff: 청크 없음
 
         # Flatten
         x_flat = x.view(-1, d_model)  # [batch*seq, d_model]
 
+        # 청크 처리가 필요한 경우
+        if chunk_size < total_tokens:
+            return self._forward_chunked(x_flat, top_k, chunk_size, batch, seq)
+
+        # 단일 배치 처리
         if top_k is not None and top_k < self.d_ff:
             # ===== 희소 연산: 마스킹 방식 (메모리 효율적) =====
 
@@ -190,10 +209,11 @@ class DynamicFFNLayer(nn.Module):
             scores = self.router.compute_scores(x_flat)
             _, top_indices = torch.topk(scores, top_k, dim=-1)
 
-            # 마스크 생성 및 적용
+            # 마스크 생성 및 적용 (메모리 효율적)
             mask = torch.zeros_like(z)
             mask.scatter_(-1, top_indices, 1.0)
-            z = z * mask
+            z.mul_(mask)  # In-place 연산으로 메모리 절약
+            del mask  # 즉시 메모리 해제
 
             # 활성화 및 출력
             a = F.gelu(z)
@@ -206,6 +226,62 @@ class DynamicFFNLayer(nn.Module):
             output = a @ self.W2.T  # [batch*seq, d_model]
 
         return output.view(batch, seq, d_model)
+
+    def _forward_chunked(
+        self,
+        x_flat: torch.Tensor,
+        top_k: Optional[int],
+        chunk_size: int,
+        batch: int,
+        seq: int
+    ) -> torch.Tensor:
+        """
+        청크 단위로 처리하여 메모리 사용량 감소
+
+        Args:
+            x_flat: [total_tokens, d_model]
+            top_k: 사용할 뉴런 개수
+            chunk_size: 청크 크기
+            batch, seq: 원본 형태
+
+        Returns:
+            output: [batch, seq, d_model]
+        """
+        total_tokens = x_flat.shape[0]
+        outputs = []
+
+        for i in range(0, total_tokens, chunk_size):
+            end_idx = min(i + chunk_size, total_tokens)
+            x_chunk = x_flat[i:end_idx]
+
+            if top_k is not None and top_k < self.d_ff:
+                # 희소 연산
+                z = x_chunk @ self.W1.T
+
+                # 라우터로 top-k 선택
+                scores = self.router.compute_scores(x_chunk)
+                _, top_indices = torch.topk(scores, top_k, dim=-1)
+
+                # 마스크 생성 및 적용
+                mask = torch.zeros_like(z)
+                mask.scatter_(-1, top_indices, 1.0)
+                z.mul_(mask)
+                del mask
+
+                # 활성화 및 출력
+                a = F.gelu(z)
+                out_chunk = a @ self.W2.T
+            else:
+                # Dense 연산
+                z = x_chunk @ self.W1.T
+                a = F.gelu(z)
+                out_chunk = a @ self.W2.T
+
+            outputs.append(out_chunk)
+
+        # 청크 결과 결합
+        output = torch.cat(outputs, dim=0)
+        return output.view(batch, seq, self.d_model)
 
     def get_W1(self) -> torch.Tensor:
         """W1 행렬 추출 [d_ff, d_model]"""
@@ -316,7 +392,8 @@ class NeuronBasedLanguageModel(nn.Module):
         max_len: int = 512,
         max_seq_len: int = None,  # Alias for max_len
         dropout: float = 0.1,
-        sparse_k: Optional[int] = None  # None이면 dense
+        sparse_k: Optional[int] = None,  # None이면 dense
+        gradient_checkpointing: bool = False  # 메모리 절약 옵션
     ):
         # Handle max_seq_len alias
         if max_seq_len is not None:
@@ -327,6 +404,7 @@ class NeuronBasedLanguageModel(nn.Module):
         self.d_model = d_model
         self.d_ff = d_ff
         self.sparse_k = sparse_k
+        self.gradient_checkpointing = gradient_checkpointing
 
         # Embeddings
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -335,7 +413,7 @@ class NeuronBasedLanguageModel(nn.Module):
         # Transformer Encoder Layers
         self.layers = nn.ModuleList([
             TransformerLayerWithDynamicFFN(
-                d_model, d_ff, n_heads, dropout
+                d_model, d_ff, n_heads, dropout, use_checkpoint=gradient_checkpointing
             )
             for _ in range(n_layers)
         ])
@@ -347,6 +425,18 @@ class NeuronBasedLanguageModel(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
         self._init_weights()
+
+    def enable_gradient_checkpointing(self):
+        """메모리 절약을 위한 gradient checkpointing 활성화"""
+        self.gradient_checkpointing = True
+        for layer in self.layers:
+            layer.use_checkpoint = True
+
+    def disable_gradient_checkpointing(self):
+        """Gradient checkpointing 비활성화"""
+        self.gradient_checkpointing = False
+        for layer in self.layers:
+            layer.use_checkpoint = False
 
     def _init_weights(self):
         """Initialize weights"""
@@ -415,7 +505,7 @@ class TransformerLayerWithDynamicFFN(nn.Module):
 
     = Attention + Dynamic FFN
     """
-    def __init__(self, d_model: int, d_ff: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, d_ff: int, n_heads: int, dropout: float, use_checkpoint: bool = False):
         super().__init__()
 
         # Multi-head attention
@@ -433,6 +523,23 @@ class TransformerLayerWithDynamicFFN(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
 
+        # Gradient checkpointing
+        self.use_checkpoint = use_checkpoint
+
+    def _attention_block(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """Attention block for checkpointing"""
+        x = self.norm1(x)
+        x, _ = self.attention(x, x, x, key_padding_mask=attention_mask)
+        x = self.dropout(x)
+        return x
+
+    def _ffn_block(self, x: torch.Tensor, top_k: Optional[int]) -> torch.Tensor:
+        """FFN block for checkpointing"""
+        x = self.norm2(x)
+        x = self.ffn(x, top_k=top_k)
+        x = self.dropout(x)
+        return x
+
     def forward(
         self,
         x: torch.Tensor,
@@ -446,17 +553,17 @@ class TransformerLayerWithDynamicFFN(nn.Module):
             top_k: FFN에서 사용할 뉴런 수
         """
         # Attention block
-        residual = x
-        x = self.norm1(x)
-        x, _ = self.attention(x, x, x, key_padding_mask=attention_mask)
-        x = self.dropout(x)
-        x = residual + x
+        if self.use_checkpoint and self.training:
+            attn_out = checkpoint(self._attention_block, x, attention_mask, use_reentrant=False)
+        else:
+            attn_out = self._attention_block(x, attention_mask)
+        x = x + attn_out
 
         # FFN block
-        residual = x
-        x = self.norm2(x)
-        x = self.ffn(x, top_k=top_k)
-        x = self.dropout(x)
-        x = residual + x
+        if self.use_checkpoint and self.training:
+            ffn_out = checkpoint(self._ffn_block, x, top_k, use_reentrant=False)
+        else:
+            ffn_out = self._ffn_block(x, top_k)
+        x = x + ffn_out
 
         return x
