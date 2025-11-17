@@ -73,14 +73,19 @@ class Router(nn.Module):
     입력 계층: 어떤 중간 뉴런 활성화할지 결정
 
     학습 가능한 라우터 - 입력 보고 최적의 뉴런 선택
+    W1로 초기화하여 학습 초기부터 뉴런 특성을 반영
     """
-    def __init__(self, d_model: int, d_ff: int):
+    def __init__(self, d_model: int, d_ff: int, init_from_W1: torch.Tensor = None):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
 
-        # 학습 가능한 라우터
-        self.W_router = nn.Parameter(torch.randn(d_ff, d_model) * 0.02)
+        # 라우터 가중치: W1로 초기화 (뉴런 시그니처 = 뉴런 가중치)
+        if init_from_W1 is not None:
+            self.W_router = nn.Parameter(init_from_W1.clone())
+        else:
+            # Fallback: 랜덤 초기화
+            self.W_router = nn.Parameter(torch.randn(d_ff, d_model) * 0.02)
 
     def select_batch(self, x: torch.Tensor, top_k: int) -> torch.Tensor:
         """
@@ -127,8 +132,8 @@ class DynamicFFNLayer(nn.Module):
         self.W1 = nn.Parameter(torch.randn(d_ff, d_model) * 0.02)
         self.W2 = nn.Parameter(torch.randn(d_model, d_ff) * 0.02)
 
-        # 라우터 (학습 가능)
-        self.router = Router(d_model, d_ff)
+        # 라우터 (학습 가능) - W1로 초기화하여 뉴런 특성 반영
+        self.router = Router(d_model, d_ff, init_from_W1=self.W1.data)
 
     @property
     def middle_neurons(self):
@@ -233,10 +238,11 @@ class DynamicFFNLayer(nn.Module):
         # 선택된 뉴런
         _, top_indices = torch.topk(scores, top_k, dim=-1)  # [batch*seq, top_k]
 
-        # 사용 빈도
+        # 사용 빈도 (벡터화)
         usage_count = torch.zeros(self.d_ff, device=x.device)
-        for idx in top_indices.flatten():
-            usage_count[idx] += 1
+        flattened_indices = top_indices.flatten()
+        ones = torch.ones_like(flattened_indices, dtype=torch.float)
+        usage_count.scatter_add_(0, flattened_indices, ones)
 
         usage_freq = usage_count / (batch * seq)
 
