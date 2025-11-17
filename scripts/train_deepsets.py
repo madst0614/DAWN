@@ -1,12 +1,11 @@
 """
-DeepSets FFN Training Script
+Local Manifold FFN Training Script
 
-Baseline vs DeepSets 모델 학습
+Baseline vs Local Manifold 모델 학습
 
 Usage:
     python scripts/train_deepsets.py --model baseline
-    python scripts/train_deepsets.py --model deepsets-basic
-    python scripts/train_deepsets.py --model deepsets-context
+    python scripts/train_deepsets.py --model local-manifold
 """
 
 import sys
@@ -26,7 +25,7 @@ import json
 from datetime import datetime
 
 from models.neuron_based import NeuronBasedLanguageModel as BaselineModel
-from models.neuron_based_deepsets import DeepSetsLanguageModel
+from models.local_manifold import LocalManifoldLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import CacheLoader
 import time
@@ -203,7 +202,7 @@ def evaluate(model, dataloader, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True,
-                        choices=['baseline', 'deepsets-basic', 'deepsets-context'],
+                        choices=['baseline', 'local-manifold'],
                         help='Model type to train')
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--d_ff', type=int, default=2048)
@@ -211,8 +210,8 @@ def main():
     parser.add_argument('--n_layers', type=int, default=6)
     parser.add_argument('--max_seq_len', type=int, default=512)
     parser.add_argument('--sparse_k', type=int, default=128, help='Number of neurons to select')
-    parser.add_argument('--d_neuron', type=int, default=128, help='Neuron info vector size (DeepSets)')
-    parser.add_argument('--d_hidden', type=int, default=256, help='φ output size (DeepSets)')
+    parser.add_argument('--d_neuron', type=int, default=128, help='Neuron info vector size')
+    parser.add_argument('--n_attn_heads', type=int, default=4, help='Neuron attention heads')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=3e-4)
@@ -267,8 +266,7 @@ def main():
             sparse_k=args.sparse_k
         )
     else:
-        use_context = (args.model == 'deepsets-context')
-        model = DeepSetsLanguageModel(
+        model = LocalManifoldLanguageModel(
             vocab_size=vocab_size,
             d_model=args.d_model,
             d_ff=args.d_ff,
@@ -277,9 +275,8 @@ def main():
             max_seq_len=args.max_seq_len,
             sparse_k=args.sparse_k,
             d_neuron=args.d_neuron,
-            d_hidden=args.d_hidden,
-            use_context=use_context,
-            gradient_checkpointing=False  # Disable for speed (memory is fine with optimizations)
+            n_attn_heads=args.n_attn_heads,
+            gradient_checkpointing=False  # Disable for speed
         )
 
     model = model.to(device)
