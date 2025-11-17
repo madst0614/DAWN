@@ -22,9 +22,69 @@ from collections import defaultdict
 import numpy as np
 import argparse
 import time
+import pickle
 from typing import Dict, List, Tuple
+from datasets import load_dataset
 
 from src.models.sprout_neuron_based import NeuronBasedLanguageModel
+
+
+# ============================================================
+# Data Loading (Same as train_neuron_based.py)
+# ============================================================
+
+def load_validation_texts(use_cache: bool = True) -> List[str]:
+    """
+    Load validation texts with caching support
+
+    Same strategy as training script:
+    1. Try to load from cache
+    2. Fall back to downloading if cache not found
+
+    Returns:
+        valid_texts: List of validation texts
+    """
+    cache_paths = [
+        "/content/drive/MyDrive/dawn_v4/cache/train/wikitext_texts.pkl",
+        "/content/drive/MyDrive/dawn_v4/cache/validation/wikitext_texts.pkl"
+    ]
+
+    valid_texts = None
+
+    # Try cache first
+    if use_cache and all(os.path.exists(p) for p in cache_paths):
+        print("📂 Found cached dataset! Loading from cache...")
+        try:
+            with open(cache_paths[0], 'rb') as f:
+                all_train_texts = pickle.load(f)
+            with open(cache_paths[1], 'rb') as f:
+                original_valid_texts = pickle.load(f)
+
+            # Combine and resplit (same as training)
+            all_texts = all_train_texts + original_valid_texts
+            valid_texts = all_texts[100000:]  # After 100K train
+
+            print(f"✅ Loaded {len(valid_texts)} validation texts from cache")
+        except Exception as e:
+            print(f"⚠️  Failed to load cache: {e}")
+            print("Falling back to downloading dataset...")
+            valid_texts = None
+
+    # Download if cache failed or not using cache
+    if valid_texts is None:
+        print("📥 Downloading wikitext dataset...")
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+
+        # Extract texts
+        def extract_text(examples):
+            return {'text': [t for t in examples['text'] if len(t.strip()) > 0]}
+
+        dataset = dataset.map(extract_text, batched=True, remove_columns=dataset['validation'].column_names)
+        valid_texts = dataset['validation']['text']
+
+        print(f"✅ Downloaded {len(valid_texts)} validation texts")
+
+    return valid_texts
 
 
 # ============================================================
@@ -36,10 +96,14 @@ def analyze_neuron_usage_patterns(
     tokenizer,
     device: str,
     num_samples: int = 1000,
-    top_k: int = 768
+    top_k: int = 768,
+    test_texts: List[str] = None  # 실제 validation set 사용 가능
 ) -> Dict:
     """
     뉴런 사용 패턴 분석 - 불균형 체크
+
+    Args:
+        test_texts: 사용할 텍스트 리스트 (None이면 하드코딩된 샘플 사용)
 
     Returns:
         stats: 각 레이어별 사용 통계
@@ -50,19 +114,23 @@ def analyze_neuron_usage_patterns(
 
     model.eval()
 
-    # 다양한 테스트 문장
-    test_texts = [
-        "The quick brown fox jumps over the lazy dog",
-        "Artificial intelligence is transforming the world",
-        "Python is a popular programming language",
-        "Machine learning requires large datasets",
-        "Deep neural networks learn hierarchical representations",
-        "Natural language processing enables computers to understand text",
-        "The weather today is sunny and warm",
-        "I love reading books in my free time",
-        "Mathematics is the foundation of science",
-        "Climate change is a global challenge",
-    ] * 100  # 1000 samples
+    # Use provided texts or fallback to hard-coded samples
+    if test_texts is None:
+        print("⚠️  Using hard-coded test texts (not real validation data)")
+        test_texts = [
+            "The quick brown fox jumps over the lazy dog",
+            "Artificial intelligence is transforming the world",
+            "Python is a popular programming language",
+            "Machine learning requires large datasets",
+            "Deep neural networks learn hierarchical representations",
+            "Natural language processing enables computers to understand text",
+            "The weather today is sunny and warm",
+            "I love reading books in my free time",
+            "Mathematics is the foundation of science",
+            "Climate change is a global challenge",
+        ] * 100  # 1000 samples
+    else:
+        print(f"✅ Using {len(test_texts)} validation texts")
 
     test_texts = test_texts[:num_samples]
 
@@ -1132,6 +1200,13 @@ def main():
     # Tokenizer
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
+    # Load validation texts (same strategy as training script)
+    print("\n" + "="*70)
+    print("LOADING VALIDATION DATA")
+    print("="*70)
+    valid_texts = load_validation_texts(use_cache=True)
+    print(f"✅ Loaded {len(valid_texts)} validation texts")
+
     # Parse which analyses to run
     if args.analyses == "all":
         analyses_to_run = list(range(1, 8))
@@ -1149,7 +1224,7 @@ def main():
     ordered_analyses = [a for a in execution_order if a in analyses_to_run]
 
     print(f"\n📊 Running {len(ordered_analyses)} analyses in optimized order: {ordered_analyses}")
-    print(f"   Samples: {args.num_samples}")
+    print(f"   Samples: {args.num_samples} (from {len(valid_texts)} available validation texts)")
     print()
 
     for analysis_id in ordered_analyses:
@@ -1185,7 +1260,8 @@ def main():
                 torch.cuda.empty_cache()
         elif analysis_id == 1:
             all_results['usage_patterns'] = analyze_neuron_usage_patterns(
-                model, tokenizer, args.device, num_samples=args.num_samples, top_k=768
+                model, tokenizer, args.device, num_samples=args.num_samples, top_k=768,
+                test_texts=valid_texts  # Use real validation data!
             )
             # 메모리 정리
             if args.device == 'cuda':
