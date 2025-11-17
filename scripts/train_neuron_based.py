@@ -227,14 +227,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args, 
 
         if args.no_mixed_precision:
             # Standard training
-            logits = model(input_ids, top_k=current_top_k)
-
-            # MLM loss
-            loss = F.cross_entropy(
-                logits.view(-1, args.vocab_size),
-                labels.view(-1),
-                ignore_index=-100
-            )
+            outputs = model(input_ids, labels=labels, top_k=current_top_k)
+            loss = outputs['loss']
+            logits = outputs['logits']
 
             # Backward
             loss.backward()
@@ -244,13 +239,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args, 
         else:
             # Mixed precision training
             with torch.cuda.amp.autocast():
-                logits = model(input_ids, top_k=current_top_k)
-
-                loss = F.cross_entropy(
-                    logits.view(-1, args.vocab_size),
-                    labels.view(-1),
-                    ignore_index=-100
-                )
+                outputs = model(input_ids, labels=labels, top_k=current_top_k)
+                loss = outputs['loss']
+                logits = outputs['logits']
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -311,16 +302,13 @@ def evaluate(model, valid_loader, args, top_k):
         labels = batch['labels'].to(args.device)
 
         if args.no_mixed_precision:
-            logits = model(input_ids, top_k=top_k)
+            outputs = model(input_ids, labels=labels, top_k=top_k)
         else:
             with torch.cuda.amp.autocast():
-                logits = model(input_ids, top_k=top_k)
+                outputs = model(input_ids, labels=labels, top_k=top_k)
 
-        loss = F.cross_entropy(
-            logits.view(-1, args.vocab_size),
-            labels.view(-1),
-            ignore_index=-100
-        )
+        loss = outputs['loss']
+        logits = outputs['logits']
 
         total_loss += loss.item()
 

@@ -236,7 +236,12 @@ def analyze_routing_diversity(model, tokenizer, device='cpu', top_k=512):
                 )['input_ids'].to(device)
 
                 batch, seq = tokens.shape
-                x = model.embed(tokens)  # [batch, seq, d_model]
+
+                # Get embeddings manually
+                token_emb = model.token_embedding(tokens)
+                positions = torch.arange(seq, device=device).unsqueeze(0).expand(batch, -1)
+                pos_emb = model.position_embedding(positions)
+                x = token_emb + pos_emb  # [batch, seq, d_model]
                 x_flat = x.view(-1, x.shape[-1])
 
                 # Router scores

@@ -300,7 +300,8 @@ def test_full_model():
     try:
         # Dense mode
         with torch.no_grad():
-            logits_dense = model(tokens, top_k=None)
+            outputs_dense = model(tokens, top_k=None)
+            logits_dense = outputs_dense['logits']
 
         print(f"\nInput shape: {tokens.shape}")
         print(f"Output shape (dense): {logits_dense.shape}")
@@ -308,7 +309,8 @@ def test_full_model():
 
         # Sparse mode
         with torch.no_grad():
-            logits_sparse = model(tokens, top_k=128)
+            outputs_sparse = model(tokens, top_k=128)
+            logits_sparse = outputs_sparse['logits']
 
         print(f"Output shape (sparse): {logits_sparse.shape}")
 
@@ -317,11 +319,24 @@ def test_full_model():
         assert not torch.isnan(logits_dense).any(), "NaN in output"
         assert not torch.isinf(logits_dense).any(), "Inf in output"
 
+        # Test with labels (loss computation)
+        labels = torch.randint(0, vocab_size, (batch, seq))
+        with torch.no_grad():
+            outputs_with_loss = model(tokens, labels=labels, top_k=None)
+            loss = outputs_with_loss['loss']
+
+        assert loss is not None, "Loss should not be None when labels provided"
+        assert not torch.isnan(loss), "Loss is NaN"
+        print(f"Loss shape: {loss.shape}")
+        print(f"Loss value: {loss.item():.4f}")
+
         print("\n✅ FULL MODEL TEST PASSED")
         return True
 
     except Exception as e:
         print(f"\n❌ FULL MODEL TEST FAILED: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
