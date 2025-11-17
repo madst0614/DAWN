@@ -152,10 +152,18 @@ def prepare_datasets(args):
         print("Found cached dataset! Loading from cache...")
         try:
             with open(cache_paths[0], 'rb') as f:
-                train_texts = pickle.load(f)
+                all_train_texts = pickle.load(f)
             with open(cache_paths[1], 'rb') as f:
-                valid_texts = pickle.load(f)
-            print(f"✅ Loaded from cache: {len(train_texts)} train, {len(valid_texts)} valid")
+                original_valid_texts = pickle.load(f)
+
+            # Combine and resplit: 100K train, rest for validation
+            all_texts = all_train_texts + original_valid_texts
+            train_texts = all_texts[:100000]
+            valid_texts = all_texts[100000:]
+
+            print(f"✅ Loaded from cache and resplit:")
+            print(f"   Original: {len(all_train_texts)} train, {len(original_valid_texts)} valid")
+            print(f"   Resplit:  {len(train_texts)} train, {len(valid_texts)} valid")
         except Exception as e:
             print(f"⚠️  Failed to load cache: {e}")
             print("Falling back to downloading dataset...")

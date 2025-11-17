@@ -115,26 +115,56 @@ class DynamicFFNLayer(nn.Module):
     뉴런 기반 동적 FFN
 
     기존 FFN과 완벽히 동등하지만, 일부 뉴런만 선택 가능
+
+    최적화: W1, W2를 직접 파라미터로 관리 (매번 stack하지 않음)
     """
     def __init__(self, d_model: int = 512, d_ff: int = 2048):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
 
-        # 중간 뉴런들 (W1의 각 행)
-        self.middle_neurons = nn.ModuleList([
-            MiddleNeuron(i, d_model)
-            for i in range(d_ff)
-        ])
-
-        # 출력 뉴런들 (W2의 각 행)
-        self.output_neurons = nn.ModuleList([
-            OutputNeuron(j, d_ff)
-            for j in range(d_model)
-        ])
+        # W1, W2를 직접 파라미터로 (훨씬 빠름!)
+        self.W1 = nn.Parameter(torch.randn(d_ff, d_model) * 0.02)
+        self.W2 = nn.Parameter(torch.randn(d_model, d_ff) * 0.02)
 
         # 라우터 (학습 가능)
         self.router = Router(d_model, d_ff)
+
+    @property
+    def middle_neurons(self):
+        """개별 middle neuron 접근 (backward compatibility)"""
+        class NeuronView:
+            def __init__(self, weight_matrix):
+                self.weight_matrix = weight_matrix
+
+            def __len__(self):
+                return self.weight_matrix.shape[0]
+
+            def __getitem__(self, idx):
+                class Neuron:
+                    def __init__(self, w):
+                        self.W_in = w
+                return Neuron(self.weight_matrix[idx])
+
+        return NeuronView(self.W1)
+
+    @property
+    def output_neurons(self):
+        """개별 output neuron 접근 (backward compatibility)"""
+        class NeuronView:
+            def __init__(self, weight_matrix):
+                self.weight_matrix = weight_matrix
+
+            def __len__(self):
+                return self.weight_matrix.shape[0]
+
+            def __getitem__(self, idx):
+                class Neuron:
+                    def __init__(self, w):
+                        self.W = w
+                return Neuron(self.weight_matrix[idx])
+
+        return NeuronView(self.W2)
 
     def forward(self, x: torch.Tensor, top_k: Optional[int] = None) -> torch.Tensor:
         """
@@ -153,20 +183,11 @@ class DynamicFFNLayer(nn.Module):
         x_flat = x.view(-1, d_model)  # [batch*seq, d_model]
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 1. W1, W2 재구성 (효율성)
+        # 1. 중간 계층 (Sparse 가능)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # W1, W2는 이미 파라미터로 존재 (매번 재구성 불필요!)
 
-        # W1: [d_ff, d_model]
-        W1 = torch.stack([n.W_in for n in self.middle_neurons])
-
-        # W2: [d_model, d_ff]
-        W2 = torch.stack([n.W for n in self.output_neurons])
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 2. 중간 계층 (Sparse 가능)
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-        z = x_flat @ W1.T  # [batch*seq, d_ff]
+        z = x_flat @ self.W1.T  # [batch*seq, d_ff]
 
         if top_k is not None and top_k < self.d_ff:
             # 희소화: 라우터로 상위 k개만 선택
@@ -177,20 +198,20 @@ class DynamicFFNLayer(nn.Module):
         a = F.gelu(z)  # [batch*seq, d_ff]
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 3. 출력 계층
+        # 2. 출력 계층
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        output = a @ W2.T  # [batch*seq, d_model]
+        output = a @ self.W2.T  # [batch*seq, d_model]
 
         return output.view(batch, seq, d_model)
 
     def get_W1(self) -> torch.Tensor:
         """W1 행렬 추출 [d_ff, d_model]"""
-        return torch.stack([n.W_in for n in self.middle_neurons])
+        return self.W1
 
     def get_W2(self) -> torch.Tensor:
         """W2 행렬 추출 [d_model, d_ff]"""
-        return torch.stack([n.W for n in self.output_neurons])
+        return self.W2
 
     def analyze_neuron_usage(self, x: torch.Tensor, top_k: int) -> dict:
         """
