@@ -158,48 +158,49 @@ class DeepSetsFFNLayer(nn.Module):
         batch: int,
         seq: int
     ) -> torch.Tensor:
-        """Dense 연산: 모든 뉴런 사용"""
+        """Dense 연산: 모든 뉴런 사용 (vectorized)"""
         batch_seq = x_flat.shape[0]
 
         # 모든 뉴런의 activation 계산
         activations = F.gelu(x_flat @ self.W_in.T)  # [B*S, d_ff]
 
-        # φ 입력 구성
+        # 벡터화된 φ 입력 구성
         if self.use_context:
             # 전체 맥락
             context = self.neuron_vecs.mean(dim=0)  # [d_neuron]
-            context = context.unsqueeze(0).expand(batch_seq, -1)  # [B*S, d_neuron]
 
-            # 각 뉴런에 대해
-            outputs = []
-            for i in range(batch_seq):
-                # 모든 뉴런
-                neuron_vecs = self.neuron_vecs  # [d_ff, d_neuron]
-                acts = activations[i].unsqueeze(1)  # [d_ff, 1]
-                x_rep = x_flat[i].unsqueeze(0).expand(self.d_ff, -1)  # [d_ff, d_model]
-                ctx = context[i].unsqueeze(0).expand(self.d_ff, -1)  # [d_ff, d_neuron]
+            # Expand for batch processing
+            neuron_vecs_expanded = self.neuron_vecs.unsqueeze(0).expand(batch_seq, -1, -1)  # [B*S, d_ff, d_neuron]
+            activations_expanded = activations.unsqueeze(-1)  # [B*S, d_ff, 1]
+            x_expanded = x_flat.unsqueeze(1).expand(-1, self.d_ff, -1)  # [B*S, d_ff, d_model]
+            context_expanded = context.unsqueeze(0).unsqueeze(0).expand(batch_seq, self.d_ff, -1)  # [B*S, d_ff, d_neuron]
 
-                phi_input = torch.cat([neuron_vecs, acts, x_rep, ctx], dim=-1)
-                transformed = self.phi(phi_input)  # [d_ff, d_hidden]
-                aggregated = transformed.sum(dim=0)  # [d_hidden]
-                output = self.rho(aggregated)  # [d_model]
-                outputs.append(output)
-
-            output = torch.stack(outputs)  # [B*S, d_model]
+            phi_input = torch.cat([
+                neuron_vecs_expanded,
+                activations_expanded,
+                x_expanded,
+                context_expanded
+            ], dim=-1)  # [B*S, d_ff, d_neuron + 1 + d_model + d_neuron]
         else:
-            # 기본 버전
-            outputs = []
-            for i in range(batch_seq):
-                neuron_vecs = self.neuron_vecs  # [d_ff, d_neuron]
-                acts = activations[i].unsqueeze(1)  # [d_ff, 1]
+            # 기본 버전 - 벡터화
+            neuron_vecs_expanded = self.neuron_vecs.unsqueeze(0).expand(batch_seq, -1, -1)  # [B*S, d_ff, d_neuron]
+            activations_expanded = activations.unsqueeze(-1)  # [B*S, d_ff, 1]
 
-                phi_input = torch.cat([neuron_vecs, acts], dim=-1)  # [d_ff, d_neuron + 1]
-                transformed = self.phi(phi_input)  # [d_ff, d_hidden]
-                aggregated = transformed.sum(dim=0)  # [d_hidden]
-                output = self.rho(aggregated)  # [d_model]
-                outputs.append(output)
+            phi_input = torch.cat([
+                neuron_vecs_expanded,
+                activations_expanded
+            ], dim=-1)  # [B*S, d_ff, d_neuron + 1]
 
-            output = torch.stack(outputs)  # [B*S, d_model]
+        # ✨ φ: 각 뉴런 독립적으로 변환 (2D reshape for efficiency)
+        phi_input_2d = phi_input.view(-1, phi_input.size(-1))  # [B*S * d_ff, input_dim]
+        transformed_2d = self.phi(phi_input_2d)  # [B*S * d_ff, d_hidden]
+        transformed = transformed_2d.view(batch_seq, self.d_ff, -1)  # [B*S, d_ff, d_hidden]
+
+        # ✨ Σ: Sum aggregation (permutation invariant!)
+        aggregated = transformed.sum(dim=1)  # [B*S, d_hidden]
+
+        # ✨ ρ: 최종 변환
+        output = self.rho(aggregated)  # [B*S, d_model]
 
         return output.view(batch, seq, self.d_model)
 
@@ -214,7 +215,7 @@ class DeepSetsFFNLayer(nn.Module):
         batch_seq = x_flat.shape[0]
 
         # Chunk size for memory efficiency
-        chunk_size = 2  # Process 2 tokens at a time for maximum memory efficiency
+        chunk_size = 32  # Process 32 tokens at a time (balanced memory/speed)
 
         outputs = []
 
