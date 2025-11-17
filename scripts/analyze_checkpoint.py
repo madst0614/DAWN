@@ -9,8 +9,44 @@ import torch
 import torch.nn.functional as F
 from transformers import BertTokenizer
 import argparse
+import glob
+from pathlib import Path
 
 from src.models.sprout_neuron_based import NeuronBasedLanguageModel
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    """
+    체크포인트 디렉토리에서 최신 체크포인트 찾기
+
+    Args:
+        checkpoint_dir: 체크포인트 디렉토리 경로
+
+    Returns:
+        최신 체크포인트 파일 경로
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"체크포인트 디렉토리를 찾을 수 없습니다: {checkpoint_dir}")
+
+    # .pt 파일 찾기
+    checkpoints = list(checkpoint_dir.glob("*.pt"))
+
+    if not checkpoints:
+        raise FileNotFoundError(f"체크포인트 파일(.pt)을 찾을 수 없습니다: {checkpoint_dir}")
+
+    # 수정 시간 기준 정렬 (최신 순)
+    checkpoints.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+    latest = checkpoints[0]
+    print(f"✓ 최신 체크포인트 발견: {latest.name}")
+    print(f"  수정 시간: {Path(latest).stat().st_mtime}")
+
+    if len(checkpoints) > 1:
+        print(f"  (총 {len(checkpoints)}개 체크포인트 중 최신)")
+
+    return str(latest)
 
 
 def analyze_neuron_usage(model, tokenizer, device, num_samples=100):
@@ -68,7 +104,8 @@ def analyze_neuron_usage(model, tokenizer, device, num_samples=100):
                 x_norm = layer.norm2(x)
                 x_flat = x_norm.view(-1, x_norm.shape[-1])
 
-                router_scores = x_flat @ layer.ffn.router.W_router.T
+                # Router의 compute_scores() 메서드 사용 (MLP/Linear 모두 지원)
+                router_scores = layer.ffn.router.compute_scores(x_flat)
                 top_k = 768  # 분석용
                 _, top_indices = torch.topk(router_scores, top_k, dim=-1)
 
@@ -226,21 +263,62 @@ def analyze_sparsity_quality(model, tokenizer, device):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True,
-                       help="Path to checkpoint file")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser(
+        description="뉴런 기반 모델 체크포인트 분석",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+사용 예시:
+  # 특정 체크포인트 파일 분석
+  python scripts/analyze_checkpoint.py --checkpoint path/to/checkpoint.pt
+
+  # 디렉토리에서 최신 체크포인트 자동 선택
+  python scripts/analyze_checkpoint.py --checkpoint_dir /content/drive/MyDrive/sprout_neuron_checkpoints
+
+  # 특정 카테고리만 분석
+  python scripts/analyze_checkpoint.py --checkpoint_dir ./checkpoints --categories usage sparsity
+
+  # 모든 카테고리 분석
+  python scripts/analyze_checkpoint.py --checkpoint_dir ./checkpoints --categories all
+        """
+    )
+
+    # 체크포인트 옵션 (둘 중 하나 필수)
+    checkpoint_group = parser.add_mutually_exclusive_group(required=True)
+    checkpoint_group.add_argument("--checkpoint", type=str,
+                                 help="Path to specific checkpoint file (.pt)")
+    checkpoint_group.add_argument("--checkpoint_dir", type=str,
+                                 help="Directory containing checkpoints (will use latest)")
+
+    # 분석 옵션
+    parser.add_argument("--categories", type=str, nargs='+', default=['all'],
+                       choices=['all', 'usage', 'sparsity', 'mlm'],
+                       help="Analysis categories to run (default: all)")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
+                       help="Device to use (default: cuda if available)")
+    parser.add_argument("--num_samples", type=int, default=100,
+                       help="Number of samples for analysis (default: 100)")
+
     args = parser.parse_args()
 
     print("="*70)
     print("뉴런 기반 모델 체크포인트 분석")
     print("="*70)
-    print(f"체크포인트: {args.checkpoint}")
+
+    # 체크포인트 경로 결정
+    if args.checkpoint:
+        checkpoint_path = args.checkpoint
+        print(f"체크포인트: {checkpoint_path}")
+    else:
+        print(f"체크포인트 디렉토리: {args.checkpoint_dir}")
+        checkpoint_path = find_latest_checkpoint(args.checkpoint_dir)
+
     print(f"디바이스: {args.device}")
+    print(f"분석 카테고리: {', '.join(args.categories)}")
+    print()
 
     # 체크포인트 로드
-    print("\n체크포인트 로딩 중...")
-    checkpoint = torch.load(args.checkpoint, map_location=args.device)
+    print("체크포인트 로딩 중...")
+    checkpoint = torch.load(checkpoint_path, map_location=args.device)
 
     # 모델 설정 복원
     model_args = checkpoint.get('args', {})
@@ -265,10 +343,19 @@ def main():
     # Tokenizer
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
+    # 카테고리 선택
+    categories = set(args.categories)
+    run_all = 'all' in categories
+
     # 분석 실행
-    analyze_neuron_usage(model, tokenizer, args.device, num_samples=100)
-    analyze_sparsity_quality(model, tokenizer, args.device)
-    analyze_mlm_quality(model, tokenizer, args.device)
+    if run_all or 'usage' in categories:
+        analyze_neuron_usage(model, tokenizer, args.device, num_samples=args.num_samples)
+
+    if run_all or 'sparsity' in categories:
+        analyze_sparsity_quality(model, tokenizer, args.device)
+
+    if run_all or 'mlm' in categories:
+        analyze_mlm_quality(model, tokenizer, args.device)
 
     print("\n" + "="*70)
     print("분석 완료!")
