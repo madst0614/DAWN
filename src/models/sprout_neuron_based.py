@@ -250,9 +250,13 @@ class NeuronBasedLanguageModel(nn.Module):
         n_heads: int = 8,
         n_layers: int = 6,
         max_len: int = 512,
+        max_seq_len: int = None,  # Alias for max_len
         dropout: float = 0.1,
         sparse_k: Optional[int] = None  # None이면 dense
     ):
+        # Handle max_seq_len alias
+        if max_seq_len is not None:
+            max_len = max_seq_len
         super().__init__()
 
         self.vocab_size = vocab_size

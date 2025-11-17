@@ -137,19 +137,47 @@ class MLMDataset:
 
 def prepare_datasets(args):
     """Load and prepare datasets"""
-    print(f"Loading dataset: {args.dataset} ({args.dataset_config})")
+    import pickle
 
-    # Load dataset
-    dataset = load_dataset(args.dataset, args.dataset_config)
+    # Check for cached datasets first
+    cache_paths = [
+        "/content/drive/MyDrive/dawn_v4/cache/train/wikitext_texts.pkl",
+        "/content/drive/MyDrive/dawn_v4/cache/validation/wikitext_texts.pkl"
+    ]
 
-    # Extract texts
-    def extract_text(examples):
-        return {'text': [t for t in examples['text'] if len(t.strip()) > 0]}
+    train_texts = None
+    valid_texts = None
 
-    dataset = dataset.map(extract_text, batched=True, remove_columns=dataset['train'].column_names)
+    # Try to load from cache
+    if all(os.path.exists(p) for p in cache_paths):
+        print("Found cached dataset! Loading from cache...")
+        try:
+            with open(cache_paths[0], 'rb') as f:
+                train_texts = pickle.load(f)
+            with open(cache_paths[1], 'rb') as f:
+                valid_texts = pickle.load(f)
+            print(f"✅ Loaded from cache: {len(train_texts)} train, {len(valid_texts)} valid")
+        except Exception as e:
+            print(f"⚠️  Failed to load cache: {e}")
+            print("Falling back to downloading dataset...")
+            train_texts = None
+            valid_texts = None
 
-    train_texts = dataset['train']['text']
-    valid_texts = dataset['validation']['text']
+    # If cache loading failed or not found, download dataset
+    if train_texts is None or valid_texts is None:
+        print(f"Loading dataset: {args.dataset} ({args.dataset_config})")
+
+        # Load dataset
+        dataset = load_dataset(args.dataset, args.dataset_config)
+
+        # Extract texts
+        def extract_text(examples):
+            return {'text': [t for t in examples['text'] if len(t.strip()) > 0]}
+
+        dataset = dataset.map(extract_text, batched=True, remove_columns=dataset['train'].column_names)
+
+        train_texts = dataset['train']['text']
+        valid_texts = dataset['validation']['text']
 
     # Limit samples if specified
     if args.max_samples is not None:
