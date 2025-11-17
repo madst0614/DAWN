@@ -1,86 +1,35 @@
 """
 SPROUT Neuron-Based Architecture
 
-완전히 새로운 접근:
-- FFN을 뉴런 레벨로 분해
-- 각 뉴런이 독립적인 모듈
-- 동적으로 뉴런 선택
+뉴런 기반 동적 FFN을 사용하는 Transformer 모델
+- W1, W2를 직접 Parameter로 관리 (빠른 계산)
+- 학습 가능한 Router로 뉴런 선택
 - 표준 FFN과 완벽히 동등 (모든 뉴런 사용시)
+- Runtime sparsity 조절 가능
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional
 
 
 # ============================================================
-# 1. 뉴런 클래스들
-# ============================================================
-
-class MiddleNeuron(nn.Module):
-    """
-    중간 뉴런 (W1의 한 행에 해당)
-
-    입력 받아서 활성화 전 값 출력
-    """
-    def __init__(self, neuron_id: int, d_model: int = 512):
-        super().__init__()
-        self.neuron_id = neuron_id
-        # W1의 neuron_id번째 행
-        self.W_in = nn.Parameter(torch.randn(d_model) * 0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [d_model] 또는 [batch*seq, d_model]
-        returns: scalar 또는 [batch*seq]
-        """
-        if x.dim() == 1:
-            return torch.dot(self.W_in, x)
-        else:
-            return x @ self.W_in  # [batch*seq]
-
-
-class OutputNeuron(nn.Module):
-    """
-    출력 뉴런 (W2의 한 행에 해당)
-
-    중간 뉴런들의 활성화 받아서 출력
-    """
-    def __init__(self, neuron_id: int, n_middle: int = 2048):
-        super().__init__()
-        self.neuron_id = neuron_id
-        # W2의 neuron_id번째 행
-        self.W = nn.Parameter(torch.randn(n_middle) * 0.02)
-
-    def forward(self, activations: torch.Tensor) -> torch.Tensor:
-        """
-        activations: [d_ff] 희소 벡터 또는 [batch*seq, d_ff]
-        returns: scalar 또는 [batch*seq]
-        """
-        if activations.dim() == 1:
-            return torch.dot(self.W, activations)
-        else:
-            return activations @ self.W  # [batch*seq]
-
-
-# ============================================================
-# 2. 라우터
+# Router
 # ============================================================
 
 class Router(nn.Module):
     """
-    입력 계층: 어떤 중간 뉴런 활성화할지 결정
+    학습 가능한 라우터 - 입력에 따라 최적의 뉴런 선택
 
-    학습 가능한 라우터 - 입력 보고 최적의 뉴런 선택
-    W1로 초기화하여 학습 초기부터 뉴런 특성을 반영
+    W1로 초기화하여 학습 초기부터 뉴런 특성 반영
     """
     def __init__(self, d_model: int, d_ff: int, init_from_W1: torch.Tensor = None):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
 
-        # 라우터 가중치: W1로 초기화 (뉴런 시그니처 = 뉴런 가중치)
+        # W1로 초기화 (뉴런 시그니처 = 뉴런 가중치)
         if init_from_W1 is not None:
             self.W_router = nn.Parameter(init_from_W1.clone())
         else:
@@ -98,13 +47,13 @@ class Router(nn.Module):
         Returns:
             mask: [batch*seq, d_ff] - Binary mask (1=선택, 0=제외)
         """
-        # 각 중간 뉴런과의 유사도
+        # 라우터 점수
         scores = x @ self.W_router.T  # [batch*seq, d_ff]
 
-        # 각 샘플마다 상위 k개 선택
+        # Top-k 선택
         _, top_indices = torch.topk(scores, top_k, dim=-1)
 
-        # Binary mask 생성
+        # Binary mask
         mask = torch.zeros_like(scores)
         mask.scatter_(-1, top_indices, 1.0)
 
@@ -112,7 +61,7 @@ class Router(nn.Module):
 
 
 # ============================================================
-# 3. 동적 FFN 레이어
+# Dynamic FFN Layer
 # ============================================================
 
 class DynamicFFNLayer(nn.Module):
@@ -187,11 +136,7 @@ class DynamicFFNLayer(nn.Module):
         # Flatten
         x_flat = x.view(-1, d_model)  # [batch*seq, d_model]
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 1. 중간 계층 (Sparse 가능)
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # W1, W2는 이미 파라미터로 존재 (매번 재구성 불필요!)
-
+        # 중간 계층 (W1, W2는 이미 파라미터로 존재)
         z = x_flat @ self.W1.T  # [batch*seq, d_ff]
 
         if top_k is not None and top_k < self.d_ff:
@@ -202,10 +147,7 @@ class DynamicFFNLayer(nn.Module):
         # 활성화
         a = F.gelu(z)  # [batch*seq, d_ff]
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 2. 출력 계층
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+        # 출력 계층
         output = a @ self.W2.T  # [batch*seq, d_model]
 
         return output.view(batch, seq, d_model)
@@ -256,7 +198,7 @@ class DynamicFFNLayer(nn.Module):
 
 
 # ============================================================
-# 4. 전체 Language Model
+# Neuron-Based Language Model
 # ============================================================
 
 class NeuronBasedLanguageModel(nn.Module):
@@ -264,10 +206,9 @@ class NeuronBasedLanguageModel(nn.Module):
     뉴런 기반 Language Model
 
     구조:
-    - Token Embedding
-    - Transformer Encoder (attention)
-    - Dynamic FFN (뉴런 기반)
-    - Output Head
+    - Token Embedding + Position Embedding
+    - Transformer Layers with DynamicFFN
+    - Output Projection
     """
     def __init__(
         self,
@@ -367,69 +308,10 @@ class NeuronBasedLanguageModel(nn.Module):
             'loss': loss
         }
 
-    def analyze_neuron_usage(self, dataloader, top_k: int, num_batches: int = 10):
-        """
-        전체 모델의 뉴런 사용 패턴 분석
 
-        Args:
-            dataloader: 데이터 로더
-            top_k: 사용할 뉴런 수
-            num_batches: 분석할 배치 수
-
-        Returns:
-            layer별 통계
-        """
-        self.eval()
-
-        layer_stats = []
-
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(dataloader):
-                if batch_idx >= num_batches:
-                    break
-
-                input_ids = batch['input_ids']
-
-                # Forward through embeddings
-                token_emb = self.token_embedding(input_ids)
-                positions = torch.arange(input_ids.shape[1], device=input_ids.device)
-                positions = positions.unsqueeze(0).expand(input_ids.shape[0], -1)
-                pos_emb = self.position_embedding(positions)
-                x = token_emb + pos_emb
-
-                # Each layer
-                for layer_idx, layer in enumerate(self.layers):
-                    # Attention
-                    x = layer.attention(layer.norm1(x))
-
-                    # FFN neuron analysis
-                    stats = layer.ffn.analyze_neuron_usage(x, top_k)
-
-                    if batch_idx == 0:
-                        layer_stats.append([stats])
-                    else:
-                        layer_stats[layer_idx].append(stats)
-
-                    # Complete layer
-                    x = layer(x, top_k=top_k)
-
-        # Aggregate stats
-        aggregated = []
-        for layer_idx, stats_list in enumerate(layer_stats):
-            # Average usage frequencies
-            all_freqs = torch.stack([s['usage_frequency'] for s in stats_list])
-            avg_freq = all_freqs.mean(dim=0)
-
-            aggregated.append({
-                'layer': layer_idx,
-                'avg_usage_frequency': avg_freq,
-                'unique_neurons_used': (avg_freq > 0).sum().item(),
-                'max_usage': avg_freq.max().item(),
-                'min_usage': avg_freq.min().item()
-            })
-
-        return aggregated
-
+# ============================================================
+# Transformer Layer with Dynamic FFN
+# ============================================================
 
 class TransformerLayerWithDynamicFFN(nn.Module):
     """
@@ -482,76 +364,3 @@ class TransformerLayerWithDynamicFFN(nn.Module):
         x = residual + x
 
         return x
-
-
-# ============================================================
-# 5. Helper Functions
-# ============================================================
-
-def create_neuron_based_model(
-    vocab_size: int = 30000,
-    d_model: int = 512,
-    d_ff: int = 2048,
-    n_heads: int = 8,
-    n_layers: int = 6,
-    sparse_k: Optional[int] = None,
-    **kwargs
-) -> NeuronBasedLanguageModel:
-    """
-    Create neuron-based language model
-
-    Args:
-        vocab_size: Vocabulary size
-        d_model: Model dimension
-        d_ff: FFN hidden dimension
-        n_heads: Number of attention heads
-        n_layers: Number of transformer layers
-        sparse_k: Number of neurons to use in FFN (None = dense)
-
-    Returns:
-        NeuronBasedLanguageModel
-    """
-    return NeuronBasedLanguageModel(
-        vocab_size=vocab_size,
-        d_model=d_model,
-        d_ff=d_ff,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        sparse_k=sparse_k,
-        **kwargs
-    )
-
-
-if __name__ == "__main__":
-    # 간단한 테스트
-    print("=" * 70)
-    print("Neuron-Based Language Model Test")
-    print("=" * 70)
-
-    # Model
-    model = create_neuron_based_model(
-        vocab_size=1000,
-        d_model=256,
-        d_ff=1024,
-        n_heads=4,
-        n_layers=2,
-        sparse_k=512  # 50% sparse
-    )
-
-    # Count params
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"\nTotal parameters: {total_params:,}")
-
-    # Test input
-    batch_size = 2
-    seq_len = 10
-    input_ids = torch.randint(0, 1000, (batch_size, seq_len))
-
-    print(f"\nInput shape: {input_ids.shape}")
-
-    # Forward
-    outputs = model(input_ids, top_k=512)
-    logits = outputs['logits']
-
-    print(f"Output shape: {logits.shape}")
-    print(f"\nTest passed! ✅")
