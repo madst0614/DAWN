@@ -92,7 +92,7 @@ class LocalManifoldFFNLayer(nn.Module):
         d_model: int = 512,
         d_ff: int = 2048,
         d_neuron: int = 128,     # 뉴런 의미 벡터 차원
-        n_attn_heads: int = 8,   # 뉴런 간 Attention heads
+        n_attn_heads: int = 4,   # 뉴런 간 Attention heads
     ):
         super().__init__()
         self.d_model = d_model
@@ -123,9 +123,6 @@ class LocalManifoldFFNLayer(nn.Module):
             nn.Linear(d_neuron // 2, 1)
         )
 
-        # 캐시: 전역 semantic interaction 결과
-        self.register_buffer('_global_attended_cache', None, persistent=False)
-
         self._init_weights()
 
     def _init_weights(self):
@@ -139,32 +136,6 @@ class LocalManifoldFFNLayer(nn.Module):
             self.router.W_router_2.data = self.neuron_patterns.weight.data.clone()
         elif hasattr(self.router, 'W_router'):
             self.router.W_router.data = self.neuron_patterns.weight.data.clone()
-
-    def _get_global_attended_semantics(self) -> torch.Tensor:
-        """
-        전역 뉴런 semantic interaction (메모리 효율적)
-
-        뉴런 semantic은 전역 속성이므로 한 번만 계산하고 재사용
-        Returns: [d_ff, d_neuron]
-        """
-        if self.training or self._global_attended_cache is None:
-            # Self-Attention을 전체 뉴런에 대해 한 번만 수행
-            all_semantics = self.neuron_vecs.weight.unsqueeze(0)  # [1, d_ff, d_neuron]
-            attended, _ = self.neuron_attn(
-                all_semantics,
-                all_semantics,
-                all_semantics
-            )  # [1, d_ff, d_neuron]
-
-            result = attended.squeeze(0)  # [d_ff, d_neuron]
-
-            # Inference 시에만 캐시 (training 시엔 매번 계산)
-            if not self.training:
-                self._global_attended_cache = result
-
-            return result
-        else:
-            return self._global_attended_cache
 
     def forward(
         self,
@@ -200,24 +171,38 @@ class LocalManifoldFFNLayer(nn.Module):
 
         # 1. 모든 뉴런의 정보 가져오기
         neuron_patterns = self.neuron_patterns.weight  # [d_ff, d_model]
+        neuron_semantics = self.neuron_vecs.weight     # [d_ff, d_neuron]
         neuron_out_dirs = self.neuron_out_dirs.weight  # [d_ff, d_model]
 
         # 2. ✨ Base activation (입력 패턴 매칭)
         base_activations = F.gelu(x_flat @ neuron_patterns.T)
         # [B*S, d_ff]
 
-        # 3. ✨ 의미 정보로 상호작용 (전역 계산 - 메모리 효율적)
-        attended_semantics = self._get_global_attended_semantics()  # [d_ff, d_neuron]
+        # 3. ✨ 의미 정보로 상호작용 (Self-Attention)
+        # Expand semantics for batch
+        semantics_expanded = neuron_semantics.unsqueeze(0).expand(batch_seq, -1, -1)
+        # [B*S, d_ff, d_neuron]
+
+        attended_semantics, _ = self.neuron_attn(
+            semantics_expanded,
+            semantics_expanded,
+            semantics_expanded
+        )
+        # [B*S, d_ff, d_neuron]
 
         # 4. ✨ Semantic modulation (attended → weight)
-        semantic_weights = self.weight_proj(attended_semantics)  # [d_ff, 1]
+        semantic_weights = self.weight_proj(attended_semantics)
+        # [B*S, d_ff, 1]
+
         semantic_weights = torch.sigmoid(semantic_weights)
 
         # 5. ✨ Final activation = base × semantic modulation
-        final_activations = base_activations * semantic_weights.T  # [B*S, d_ff]
+        final_activations = base_activations.unsqueeze(-1) * semantic_weights
+        # [B*S, d_ff, 1]
 
         # 6. ✨ 각 뉴런의 기여
-        contributions = final_activations.unsqueeze(-1) * neuron_out_dirs.unsqueeze(0)
+        out_dirs_expanded = neuron_out_dirs.unsqueeze(0).expand(batch_seq, -1, -1)
+        contributions = final_activations * out_dirs_expanded
         # [B*S, d_ff, d_model]
 
         # 7. 합산
@@ -233,7 +218,7 @@ class LocalManifoldFFNLayer(nn.Module):
         batch: int,
         seq: int
     ) -> torch.Tensor:
-        """Sparse 연산: top_k 뉴런만 사용 (메모리 효율적)"""
+        """Sparse 연산: top_k 뉴런만 사용"""
         batch_seq = x_flat.shape[0]
 
         # 1. Router로 뉴런 선택
@@ -243,6 +228,7 @@ class LocalManifoldFFNLayer(nn.Module):
 
         # 2. ✨ 선택된 뉴런들의 정보 가져오기
         neuron_patterns = self.neuron_patterns(selected_indices)   # [B*S, top_k, d_model]
+        neuron_semantics = self.neuron_vecs(selected_indices)      # [B*S, top_k, d_neuron]
         neuron_out_dirs = self.neuron_out_dirs(selected_indices)   # [B*S, top_k, d_model]
 
         # 3. ✨ Base activation (입력 패턴 매칭)
@@ -253,27 +239,26 @@ class LocalManifoldFFNLayer(nn.Module):
 
         base_activations = F.gelu(base_activations)
 
-        # 4. ✨ 의미 정보로 상호작용 (전역 계산 후 indexing - 메모리 효율적)
-        # 전체 뉴런에 대해 한 번만 Self-Attention 수행
-        global_attended = self._get_global_attended_semantics()  # [d_ff, d_neuron]
-
-        # 선택된 뉴런의 attended semantics만 가져오기
-        # [B*S, top_k] -> [B*S, top_k, d_neuron]
-        attended_semantics = global_attended[selected_indices]
+        # 4. ✨ 의미 정보로 상호작용 (Self-Attention)
+        attended_semantics, _ = self.neuron_attn(
+            neuron_semantics,
+            neuron_semantics,
+            neuron_semantics
+        )
+        # [B*S, top_k, d_neuron]
 
         # 5. ✨ Semantic modulation (attended → weight)
         semantic_weights = self.weight_proj(attended_semantics)
         # [B*S, top_k, 1]
 
-        semantic_weights = torch.sigmoid(semantic_weights).squeeze(-1)
-        # [B*S, top_k]
+        semantic_weights = torch.sigmoid(semantic_weights)
 
         # 6. ✨ Final activation = base × semantic modulation
-        final_activations = base_activations * semantic_weights
-        # [B*S, top_k]
+        final_activations = base_activations.unsqueeze(-1) * semantic_weights
+        # [B*S, top_k, 1]
 
         # 7. ✨ 각 뉴런의 기여
-        contributions = final_activations.unsqueeze(-1) * neuron_out_dirs
+        contributions = final_activations * neuron_out_dirs
         # [B*S, top_k, d_model]
 
         # 8. 합산
