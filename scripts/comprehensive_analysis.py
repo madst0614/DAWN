@@ -24,8 +24,8 @@ import argparse
 import time
 from typing import Dict, List, Tuple
 
-from src.models.sprout_neuron_based import NeuronBasedLanguageModel
-from sprout.data_utils import CacheLoader, TextValidator
+from models import NeuronBasedLanguageModel
+from utils import CacheLoader, TextValidator
 
 
 # ============================================================

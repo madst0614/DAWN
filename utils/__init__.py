@@ -1,12 +1,11 @@
 """
-SPROUT: Self-organizing Progressive Routing with Organic Unified Trees
+SPROUT Utilities
 
-Utility package for SPROUT training and analysis.
-Core model implementation is in src/models/sprout_neuron_based.py
+Data processing and training utilities.
 """
 
 # Data utilities
-from .data_utils import (
+from .data import (
     SpanMasker,
     TokenDeletion,
     TextValidator,
@@ -15,14 +14,12 @@ from .data_utils import (
 )
 
 # Training utilities
-from .training_utils import (
+from .training import (
     CheckpointManager,
     TrainingMonitor,
     format_time,
     count_parameters,
 )
-
-__version__ = "0.4.0"
 
 __all__ = [
     # Data utilities
