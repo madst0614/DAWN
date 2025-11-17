@@ -332,7 +332,10 @@ def evaluate(model, valid_loader, args, top_k):
     total_correct = 0
     total_masked = 0
 
-    for batch in tqdm(valid_loader, desc="Evaluating", leave=False):
+    # 평가는 tqdm 없이 간단하게
+    print(f"Evaluating on {len(valid_loader)} batches...", end=' ', flush=True)
+
+    for batch in valid_loader:
         input_ids = batch['input_ids'].to(args.device)
         labels = batch['labels'].to(args.device)
 
@@ -358,6 +361,7 @@ def evaluate(model, valid_loader, args, top_k):
     avg_loss = total_loss / len(valid_loader)
     accuracy = 100.0 * total_correct / total_masked if total_masked > 0 else 0.0
 
+    print("Done!")  # 평가 완료
     return avg_loss, accuracy
 
 
