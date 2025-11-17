@@ -214,7 +214,7 @@ class DeepSetsFFNLayer(nn.Module):
         batch_seq = x_flat.shape[0]
 
         # Chunk size for memory efficiency
-        chunk_size = 8  # Process 8 tokens at a time
+        chunk_size = 2  # Process 2 tokens at a time for maximum memory efficiency
 
         outputs = []
 
@@ -277,6 +277,16 @@ class DeepSetsFFNLayer(nn.Module):
             chunk_output = self.rho(aggregated)  # [chunk_len, d_model]
 
             outputs.append(chunk_output)
+
+            # Clean up intermediate tensors to free memory
+            del phi_input, phi_input_2d, transformed_2d, transformed, aggregated
+            del neuron_vecs_selected, activations, W_in_selected, router_scores, selected_indices
+            if self.use_context:
+                del context, x_expanded, context_expanded
+
+            # Periodically clear CUDA cache
+            if chunk_start % 64 == 0:
+                torch.cuda.empty_cache()
 
         # Concatenate all chunks
         output = torch.cat(outputs, dim=0)  # [B*S, d_model]
