@@ -4,12 +4,16 @@
 
 ## 개요
 
-이 폴더는 Baseline (표준 뉴런 선택)과 Manifold (DeepSets 기반 협력적 뉴런 조합) 버전을 비교하는 실험들을 포함합니다.
+이 폴더는 다양한 뉴런 조합 방식을 비교하는 실험들을 포함합니다:
+- **Baseline**: 표준 뉴런 선택
+- **Manifold**: Activation 기반 협력적 조합
+- **DeepSets**: 학습 가능한 뉴런 정보 벡터 기반 조합
 
 ## 모델 버전
 
 - **Baseline**: `models/neuron_based.py` - 표준 동적 뉴런 선택
-- **Manifold**: `models/neuron_based_manifold.py` - DeepSets 매니폴드 형성
+- **Manifold**: `models/neuron_based_manifold.py` - Activation 기반 매니폴드 형성
+- **DeepSets**: `models/neuron_based_deepsets.py` - 학습 가능한 뉴런 정보 벡터 기반
 
 ## 실험 목록
 
@@ -24,6 +28,26 @@ python quick_validation.py
 - 다양한 sparsity level 테스트
 
 **추천**: 먼저 이것을 실행하여 모든 것이 작동하는지 확인하세요.
+
+---
+
+### DeepSets Sanity Check (NEW!)
+```bash
+python exp_deepsets_sanity.py
+```
+
+**목표**: DeepSets FFN이 제대로 작동하는지 검증
+
+**테스트 항목**:
+- Forward/backward pass 검증
+- Gradient flow 확인
+- Baseline vs DeepSets-Basic vs DeepSets-Context 비교
+- 학습 안정성 분석
+
+**기대 결과**:
+- DeepSets가 기존 FFN과 비슷한 성능 달성
+- Context 추가 시 성능 향상
+- 안정적인 학습
 
 ---
 
