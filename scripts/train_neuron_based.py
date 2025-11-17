@@ -87,27 +87,41 @@ def parse_args():
     return args
 
 
-def log_memory_stats(step: int = 0, prefix: str = ""):
+def log_memory_stats(step: int = 0, prefix: str = "", suggest_optimization: bool = False):
     """
     Log CUDA memory statistics
 
     Args:
         step: Current training step
         prefix: Prefix for log message
+        suggest_optimization: Whether to suggest optimization based on usage
     """
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3  # GB
         reserved = torch.cuda.memory_reserved() / 1024**3  # GB
         max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # GB
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+
+        usage_pct = (allocated / total_memory) * 100
 
         print(f"[{prefix}] Step {step}: "
-              f"Allocated: {allocated:.2f}GB | "
+              f"Allocated: {allocated:.2f}GB / {total_memory:.1f}GB ({usage_pct:.1f}%) | "
               f"Reserved: {reserved:.2f}GB | "
               f"Max: {max_allocated:.2f}GB")
 
-        # Warning if memory is getting critically high
-        if allocated > 35:  # Warning at 35GB
-            print(f"⚠️  WARNING: High memory usage! Consider enabling --gradient_checkpointing")
+        # Suggestions based on memory usage
+        if suggest_optimization:
+            if usage_pct > 90:
+                print(f"⚠️  WARNING: Very high memory usage! Consider:")
+                print(f"   - Enabling --gradient_checkpointing")
+                print(f"   - Reducing --batch_size")
+            elif usage_pct > 75:
+                print(f"⚠️  High memory usage! Monitor for OOM errors.")
+            elif usage_pct < 25:
+                print(f"💡 Low memory usage ({usage_pct:.1f}%). You can:")
+                print(f"   - Increase --batch_size (current usage allows ~{int(allocated * 4)}GB)")
+                print(f"   - Disable --gradient_checkpointing for faster training")
+                print(f"   - Use larger --d_ff or --d_model")
 
         return allocated, reserved, max_allocated
     return 0, 0, 0
@@ -282,7 +296,14 @@ def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler,
     total_correct = 0
     total_masked = 0
 
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+    pbar = tqdm(
+        train_loader,
+        desc=f"Epoch {epoch}",
+        ncols=120,  # 출력 폭 고정
+        leave=True,  # epoch 끝나도 progress bar 유지
+        position=0,  # 첫 번째 위치
+        dynamic_ncols=False  # 폭 자동 조정 비활성화
+    )
 
     for batch_idx, batch in enumerate(pbar):
         input_ids = batch['input_ids'].to(args.device)
@@ -395,7 +416,9 @@ def train_epoch(model, train_loader, valid_loader, optimizer, scheduler, scaler,
 
             # Memory monitoring
             if args.enable_memory_monitor:
-                log_memory_stats(global_step, "Training")
+                # 첫 로그에서만 최적화 제안 표시
+                suggest = (global_step == args.log_interval)
+                log_memory_stats(global_step, "Training", suggest_optimization=suggest)
 
         # Save checkpoint
         if global_step % args.save_interval == 0:
@@ -413,7 +436,14 @@ def evaluate(model, valid_loader, args, top_k):
     total_masked = 0
 
     # 학습 progress bar와 동일한 방식으로
-    pbar = tqdm(valid_loader, desc="Eval")
+    pbar = tqdm(
+        valid_loader,
+        desc="Eval",
+        ncols=120,
+        leave=False,  # eval 끝나면 progress bar 제거
+        position=0,
+        dynamic_ncols=False
+    )
 
     for batch in pbar:
         input_ids = batch['input_ids'].to(args.device)
@@ -564,13 +594,22 @@ def main():
     # Training loop
     print("\nStarting training...")
 
-    # Initial memory stats
+    # Initial memory stats with optimization suggestions
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
         total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"GPU Total Memory: {total_memory:.2f}GB")
-        if args.enable_memory_monitor:
-            log_memory_stats(0, "Initial")
+        print(f"\nGPU Total Memory: {total_memory:.2f}GB")
+        print("Checking initial memory usage...")
+        # 짧은 forward pass로 실제 메모리 사용량 측정
+        dummy_batch = next(iter(train_loader))
+        dummy_ids = dummy_batch['input_ids'][:1].to(args.device)  # 1 sample만
+        with torch.no_grad():
+            _ = model(dummy_ids)
+        torch.cuda.synchronize()
+
+        # 첫 실행 후 메모리 사용량 확인 및 제안
+        log_memory_stats(0, "After first forward", suggest_optimization=True)
+        print()  # 빈 줄 추가
 
     for epoch in range(start_epoch, args.num_epochs):
         global_step = train_epoch(
