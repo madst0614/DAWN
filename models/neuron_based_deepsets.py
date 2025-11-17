@@ -90,18 +90,14 @@ class DeepSetsFFNLayer(nn.Module):
         self.d_hidden = d_hidden
         self.use_context = use_context
 
-        # ✨ 각 뉴런의 학습 가능한 정보 벡터
-        self.neuron_vecs = nn.Parameter(
-            torch.randn(d_ff, d_neuron) * 0.02
-        )
+        # ✨ 각 뉴런의 학습 가능한 정보 벡터 (Embedding)
+        self.neuron_vecs = nn.Embedding(d_ff, d_neuron)
 
-        # 입력 패턴 (activation 계산용)
-        self.W_in = nn.Parameter(
-            torch.randn(d_ff, d_model) * 0.02
-        )
+        # 입력 패턴 (activation 계산용, Embedding)
+        self.W_in = nn.Embedding(d_ff, d_model)
 
         # Router
-        self.router = Router(d_model, d_ff, init_from_W1=self.W_in.data)
+        self.router = Router(d_model, d_ff, init_from_W1=self.W_in.weight.data)
 
         # ✨ φ: 뉴런 정보 + activation → 중간 표현
         if use_context:
@@ -159,36 +155,46 @@ class DeepSetsFFNLayer(nn.Module):
         batch: int,
         seq: int
     ) -> torch.Tensor:
-        """Dense 연산: 모든 뉴런 사용 (vectorized)"""
+        """Dense 연산: 모든 뉴런 사용 (vectorized with Embedding)"""
         batch_seq = x_flat.shape[0]
 
+        # 모든 뉴런 인덱스
+        all_indices = torch.arange(self.d_ff, device=x_flat.device)
+        all_indices = all_indices.unsqueeze(0).expand(batch_seq, -1)  # [B*S, d_ff]
+
+        # Embedding으로 가져오기 (병렬)
+        W_in_all = self.W_in(all_indices)  # [B*S, d_ff, d_model]
+        neuron_vecs_all = self.neuron_vecs(all_indices)  # [B*S, d_ff, d_neuron]
+
         # 모든 뉴런의 activation 계산
-        activations = F.gelu(x_flat @ self.W_in.T)  # [B*S, d_ff]
+        activations = torch.bmm(
+            x_flat.unsqueeze(1),  # [B*S, 1, d_model]
+            W_in_all.transpose(1, 2)  # [B*S, d_model, d_ff]
+        ).squeeze(1)  # [B*S, d_ff]
+        activations = F.gelu(activations)
 
         # 벡터화된 φ 입력 구성
         if self.use_context:
             # 전체 맥락
-            context = self.neuron_vecs.mean(dim=0)  # [d_neuron]
+            context = neuron_vecs_all.mean(dim=1)  # [B*S, d_neuron]
 
             # Expand for batch processing
-            neuron_vecs_expanded = self.neuron_vecs.unsqueeze(0).expand(batch_seq, -1, -1)  # [B*S, d_ff, d_neuron]
             activations_expanded = activations.unsqueeze(-1)  # [B*S, d_ff, 1]
             x_expanded = x_flat.unsqueeze(1).expand(-1, self.d_ff, -1)  # [B*S, d_ff, d_model]
-            context_expanded = context.unsqueeze(0).unsqueeze(0).expand(batch_seq, self.d_ff, -1)  # [B*S, d_ff, d_neuron]
+            context_expanded = context.unsqueeze(1).expand(-1, self.d_ff, -1)  # [B*S, d_ff, d_neuron]
 
             phi_input = torch.cat([
-                neuron_vecs_expanded,
+                neuron_vecs_all,
                 activations_expanded,
                 x_expanded,
                 context_expanded
             ], dim=-1)  # [B*S, d_ff, d_neuron + 1 + d_model + d_neuron]
         else:
             # 기본 버전 - 벡터화
-            neuron_vecs_expanded = self.neuron_vecs.unsqueeze(0).expand(batch_seq, -1, -1)  # [B*S, d_ff, d_neuron]
             activations_expanded = activations.unsqueeze(-1)  # [B*S, d_ff, 1]
 
             phi_input = torch.cat([
-                neuron_vecs_expanded,
+                neuron_vecs_all,
                 activations_expanded
             ], dim=-1)  # [B*S, d_ff, d_neuron + 1]
 
@@ -230,20 +236,17 @@ class DeepSetsFFNLayer(nn.Module):
             _, selected_indices = torch.topk(router_scores, top_k, dim=-1)
             # [chunk_len, top_k]
 
-            # 2. 선택된 뉴런의 activation 계산
-            W_in_selected = self.W_in[selected_indices]  # [chunk_len, top_k, d_model]
+            # 2. ✨ Embedding으로 선택된 뉴런 가져오기 (병렬)
+            W_in_selected = self.W_in(selected_indices)  # [chunk_len, top_k, d_model]
+            neuron_vecs_selected = self.neuron_vecs(selected_indices)  # [chunk_len, top_k, d_neuron]
 
-            # Batched dot product
+            # 3. 선택된 뉴런의 activation 계산
             activations = torch.bmm(
                 x_chunk.unsqueeze(1),  # [chunk_len, 1, d_model]
                 W_in_selected.transpose(1, 2)  # [chunk_len, d_model, top_k]
             ).squeeze(1)  # [chunk_len, top_k]
 
             activations = F.gelu(activations)
-
-            # 3. 선택된 뉴런 정보 가져오기
-            neuron_vecs_selected = self.neuron_vecs[selected_indices]
-            # [chunk_len, top_k, d_neuron]
 
             # 4. φ 입력 구성
             if self.use_context:
