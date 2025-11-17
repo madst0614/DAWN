@@ -8,7 +8,9 @@ Includes advanced masking strategies and data loading.
 import torch
 import numpy as np
 import random
-from typing import List, Set, Tuple
+import pickle
+import os
+from typing import List, Set, Tuple, Optional
 
 
 class SpanMasker:
@@ -174,31 +176,55 @@ class TokenDeletion:
 
 
 class TextValidator:
-    """Validate text quality for training."""
+    """
+    Validate text quality for training.
+
+    Standalone text validator compatible with dawn's validation logic.
+    """
+
+    # Default validation parameters (matching dawn/configs/data.py)
+    DEFAULT_MIN_WORDS = 10
+    DEFAULT_MAX_WORDS = 300
+    DEFAULT_MIN_CHARS = 30
+    DEFAULT_MIN_ALPHA_RATIO = 0.5
+    DEFAULT_EXCLUDE_STARTS = ["=", "#", "@", "*", "-", "Category:", "File:"]
+    DEFAULT_EXCLUDE_CONTAINS = ["http://", "https://"]
 
     @staticmethod
     def is_valid_sentence(
         text: str,
-        min_words: int = 5,
-        max_words: int = 50,
-        min_chars: int = 20,
-        min_alpha_ratio: float = 0.5
+        min_words: int = None,
+        max_words: int = None,
+        min_chars: int = None,
+        min_alpha_ratio: float = None,
+        exclude_starts_with: List[str] = None,
+        exclude_contains: List[str] = None
     ) -> bool:
         """
         Check if sentence is valid for training.
 
         Args:
             text: Text to validate
-            min_words: Minimum word count
-            max_words: Maximum word count
-            min_chars: Minimum character count
-            min_alpha_ratio: Minimum alphabetic character ratio
+            min_words: Minimum word count (default: 10)
+            max_words: Maximum word count (default: 300)
+            min_chars: Minimum character count (default: 30)
+            min_alpha_ratio: Minimum alphabetic character ratio (default: 0.5)
+            exclude_starts_with: Patterns to exclude if text starts with them
+            exclude_contains: Patterns to exclude if text contains them
 
         Returns:
             True if valid
         """
         if not text:
             return False
+
+        # Apply defaults
+        min_words = min_words if min_words is not None else TextValidator.DEFAULT_MIN_WORDS
+        max_words = max_words if max_words is not None else TextValidator.DEFAULT_MAX_WORDS
+        min_chars = min_chars if min_chars is not None else TextValidator.DEFAULT_MIN_CHARS
+        min_alpha_ratio = min_alpha_ratio if min_alpha_ratio is not None else TextValidator.DEFAULT_MIN_ALPHA_RATIO
+        exclude_starts_with = exclude_starts_with if exclude_starts_with is not None else TextValidator.DEFAULT_EXCLUDE_STARTS
+        exclude_contains = exclude_contains if exclude_contains is not None else TextValidator.DEFAULT_EXCLUDE_CONTAINS
 
         word_count = len(text.split())
         char_count = len(text)
@@ -211,8 +237,13 @@ class TextValidator:
             return False
 
         # Exclude special formats
-        if text.startswith(("=", "#", "*", "-", "Category:", "File:")):
-            return False
+        for pattern in exclude_starts_with:
+            if text.startswith(pattern):
+                return False
+
+        for pattern in exclude_contains:
+            if pattern in text:
+                return False
 
         # Minimum alphabetic ratio
         alpha_count = sum(c.isalpha() for c in text)
@@ -267,3 +298,82 @@ class DatasetStats:
             'avg_seq_len': np.mean(self.sequence_lengths) if self.sequence_lengths else 0,
             'max_seq_len': max(self.sequence_lengths) if self.sequence_lengths else 0
         }
+
+
+class CacheLoader:
+    """
+    Load cached datasets from pickle files.
+
+    Uses the cache system at /content/drive/MyDrive/dawn_v4/cache/
+    """
+
+    CACHE_BASE_DIR = "/content/drive/MyDrive/dawn_v4/cache"
+
+    @staticmethod
+    def load_texts(
+        split: str = "validation",
+        dataset: str = "wikitext",
+        use_cache: bool = True
+    ) -> Optional[List[str]]:
+        """
+        Load cached text data.
+
+        Args:
+            split: Dataset split ('train' or 'validation')
+            dataset: Dataset name (e.g., 'wikitext')
+            use_cache: Whether to use cache (if False, returns None)
+
+        Returns:
+            List of text strings, or None if cache not available
+        """
+        if not use_cache:
+            return None
+
+        cache_path = os.path.join(
+            CacheLoader.CACHE_BASE_DIR,
+            split,
+            f"{dataset}_texts.pkl"
+        )
+
+        if not os.path.exists(cache_path):
+            print(f"⚠️  Cache not found: {cache_path}")
+            return None
+
+        try:
+            with open(cache_path, 'rb') as f:
+                texts = pickle.load(f)
+            print(f"✅ Loaded {len(texts)} texts from cache: {cache_path}")
+            return texts
+        except Exception as e:
+            print(f"❌ Error loading cache: {e}")
+            return None
+
+    @staticmethod
+    def load_validation_texts(dataset: str = "wikitext") -> Optional[List[str]]:
+        """
+        Load validation texts from cache.
+
+        Convenience method for loading validation split.
+
+        Args:
+            dataset: Dataset name (default: 'wikitext')
+
+        Returns:
+            List of validation texts, or None if not available
+        """
+        return CacheLoader.load_texts(split="validation", dataset=dataset)
+
+    @staticmethod
+    def load_train_texts(dataset: str = "wikitext") -> Optional[List[str]]:
+        """
+        Load training texts from cache.
+
+        Convenience method for loading train split.
+
+        Args:
+            dataset: Dataset name (default: 'wikitext')
+
+        Returns:
+            List of training texts, or None if not available
+        """
+        return CacheLoader.load_texts(split="train", dataset=dataset)

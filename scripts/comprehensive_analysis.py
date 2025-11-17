@@ -25,6 +25,46 @@ import time
 from typing import Dict, List, Tuple
 
 from src.models.sprout_neuron_based import NeuronBasedLanguageModel
+from sprout.data_utils import CacheLoader, TextValidator
+
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+def load_test_texts(num_samples: int, use_cache: bool = True) -> List[str]:
+    """
+    Load test texts from cache or use fallback.
+
+    Args:
+        num_samples: Number of samples to load
+        use_cache: Whether to try loading from cache
+
+    Returns:
+        List of test text strings
+    """
+    if use_cache:
+        cached_texts = CacheLoader.load_validation_texts(dataset="wikitext")
+        if cached_texts is not None:
+            print(f"✅ Using cached validation texts ({len(cached_texts)} available)")
+            valid_texts = TextValidator.filter_sentences(cached_texts)
+            return valid_texts[:num_samples]
+
+    # Fallback to hard-coded test texts
+    print("⚠️  Using fallback test texts")
+    fallback_texts = [
+        "The quick brown fox jumps over the lazy dog",
+        "Artificial intelligence is transforming the world",
+        "Python is a popular programming language",
+        "Machine learning requires large datasets",
+        "Deep neural networks learn hierarchical representations",
+        "Natural language processing enables computers to understand text",
+        "The weather today is sunny and warm",
+        "I love reading books in my free time",
+        "Mathematics is the foundation of science",
+        "Climate change is a global challenge",
+    ] * (num_samples // 10 + 1)
+    return fallback_texts[:num_samples]
 
 
 # ============================================================
@@ -50,21 +90,8 @@ def analyze_neuron_usage_patterns(
 
     model.eval()
 
-    # 다양한 테스트 문장
-    test_texts = [
-        "The quick brown fox jumps over the lazy dog",
-        "Artificial intelligence is transforming the world",
-        "Python is a popular programming language",
-        "Machine learning requires large datasets",
-        "Deep neural networks learn hierarchical representations",
-        "Natural language processing enables computers to understand text",
-        "The weather today is sunny and warm",
-        "I love reading books in my free time",
-        "Mathematics is the foundation of science",
-        "Climate change is a global challenge",
-    ] * 100  # 1000 samples
-
-    test_texts = test_texts[:num_samples]
+    # Load test texts
+    test_texts = load_test_texts(num_samples)
 
     n_layers = len(model.layers)
     d_ff = model.layers[0].ffn.d_ff
@@ -188,18 +215,9 @@ def analyze_performance_vs_sparsity(
     model.eval()
 
     if test_texts is None:
-        test_texts = [
-            "The [MASK] is shining brightly in the sky",
-            "I love to [MASK] books in my free time",
-            "Python is a programming [MASK] for data science",
-            "She went to the [MASK] to buy groceries",
-            "The cat is [MASK] on the comfortable mat",
-            "Artificial [MASK] is transforming technology",
-            "The capital of France is [MASK]",
-            "Machine [MASK] requires large datasets",
-            "Deep [MASK] networks learn from data",
-            "The weather today is very [MASK]",
-        ]
+        # Use cached texts for more realistic evaluation
+        # Load regular texts and rely on MLM masking
+        test_texts = load_test_texts(num_samples=10, use_cache=True)
 
     d_ff = model.layers[0].ffn.d_ff
 
@@ -347,12 +365,8 @@ def analyze_router_quality(
 
     model.eval()
 
-    test_texts = [
-        "The quick brown fox jumps over the lazy dog",
-        "Machine learning is a subset of artificial intelligence",
-        "Python programming language is widely used in data science",
-    ] * 34
-    test_texts = test_texts[:num_samples]
+    # Load test texts
+    test_texts = load_test_texts(num_samples)
 
     layer_idx = 0  # Analyze first layer
     ffn = model.layers[layer_idx].ffn
@@ -679,11 +693,8 @@ def analyze_layer_differences(
 
     model.eval()
 
-    test_texts = [
-        "The quick brown fox jumps over the lazy dog",
-        "Machine learning is transforming artificial intelligence",
-    ] * 50
-    test_texts = test_texts[:num_samples]
+    # Load test texts
+    test_texts = load_test_texts(num_samples)
 
     n_layers = len(model.layers)
     d_ff = model.layers[0].ffn.d_ff
@@ -1072,7 +1083,16 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--analyses", type=str, default="all",
                        help="Comma-separated list of analyses (1-7) or 'all'")
+    parser.add_argument("--num_samples", type=int, default=500,
+                       help="Number of samples for analysis (default: 500, recommended: 500-1000)")
+    parser.add_argument("--fast", action="store_true",
+                       help="Fast mode: fewer samples (100)")
     args = parser.parse_args()
+
+    # Fast mode override
+    if args.fast:
+        args.num_samples = 100
+        print("🚀 Fast mode enabled: using 100 samples")
 
     # Auto-detect checkpoint directory if not provided
     if args.checkpoint_dir is None and args.checkpoint is None:
@@ -1132,49 +1152,55 @@ def main():
     # Run analyses
     all_results = {}
 
-    if 1 in analyses_to_run:
-        all_results['usage_patterns'] = analyze_neuron_usage_patterns(
-            model, tokenizer, args.device, num_samples=200, top_k=768  # 줄임
-        )
-        # 메모리 정리
-        if args.device == 'cuda':
-            torch.cuda.empty_cache()
+    # 분석 순서: 가벼운 것부터 실행 (빠른 피드백)
+    # 7(효율성) → 6(동적) → 4(특화) → 5(레이어) → 3(라우터) → 2(성능) → 1(사용패턴)
+    execution_order = [7, 6, 4, 5, 3, 2, 1]
 
-    if 2 in analyses_to_run:
-        all_results['performance_sparsity'] = analyze_performance_vs_sparsity(
-            model, tokenizer, args.device
-        )
-        # 메모리 정리
-        if args.device == 'cuda':
-            torch.cuda.empty_cache()
+    # 실행할 분석을 순서대로 정렬
+    ordered_analyses = [a for a in execution_order if a in analyses_to_run]
 
-    if 3 in analyses_to_run:
-        all_results['router_quality'] = analyze_router_quality(
-            model, tokenizer, args.device, num_samples=50, top_k=768  # 줄임
-        )
-        # 메모리 정리
-        if args.device == 'cuda':
-            torch.cuda.empty_cache()
+    print(f"\n📊 Running {len(ordered_analyses)} analyses in optimized order: {ordered_analyses}")
+    print(f"   Samples: {args.num_samples}")
+    print()
 
-    if 4 in analyses_to_run:
-        all_results['specialization'] = analyze_neuron_specialization(
-            model, tokenizer, args.device, layer_idx=0
-        )
-
-    if 5 in analyses_to_run:
-        all_results['layer_differences'] = analyze_layer_differences(
-            model, tokenizer, args.device, num_samples=100, top_k=768
-        )
-
-    if 6 in analyses_to_run:
-        all_results['dynamic_routing'] = analyze_dynamic_routing(
-            model, tokenizer, args.device, top_k=768
-        )
-
-    if 7 in analyses_to_run:
-        all_results['efficiency'] = analyze_computation_efficiency(
-            model, tokenizer, args.device, num_samples=100
-        )
+    for analysis_id in ordered_analyses:
+        if analysis_id == 7:
+            all_results['efficiency'] = analyze_computation_efficiency(
+                model, tokenizer, args.device, num_samples=min(args.num_samples, 100)
+            )
+        elif analysis_id == 6:
+            all_results['dynamic_routing'] = analyze_dynamic_routing(
+                model, tokenizer, args.device, top_k=768
+            )
+        elif analysis_id == 4:
+            all_results['specialization'] = analyze_neuron_specialization(
+                model, tokenizer, args.device, layer_idx=0
+            )
+        elif analysis_id == 5:
+            all_results['layer_differences'] = analyze_layer_differences(
+                model, tokenizer, args.device, num_samples=min(args.num_samples, 200), top_k=768
+            )
+        elif analysis_id == 3:
+            all_results['router_quality'] = analyze_router_quality(
+                model, tokenizer, args.device, num_samples=min(args.num_samples, 200), top_k=768
+            )
+            # 메모리 정리
+            if args.device == 'cuda':
+                torch.cuda.empty_cache()
+        elif analysis_id == 2:
+            all_results['performance_sparsity'] = analyze_performance_vs_sparsity(
+                model, tokenizer, args.device
+            )
+            # 메모리 정리
+            if args.device == 'cuda':
+                torch.cuda.empty_cache()
+        elif analysis_id == 1:
+            all_results['usage_patterns'] = analyze_neuron_usage_patterns(
+                model, tokenizer, args.device, num_samples=args.num_samples, top_k=768
+            )
+            # 메모리 정리
+            if args.device == 'cuda':
+                torch.cuda.empty_cache()
 
     print("\n" + "="*70)
     print("✅ COMPREHENSIVE ANALYSIS COMPLETE!")
