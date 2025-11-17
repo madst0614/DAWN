@@ -121,6 +121,7 @@ class DeepSetsFFNLayer(nn.Module):
 
         # ✨ ρ: 집계된 정보 → 최종 출력
         self.rho = nn.Sequential(
+            nn.LayerNorm(d_hidden),  # ✨ Sum aggregation 안정화
             nn.Linear(d_hidden, d_hidden * 2),
             nn.GELU(),
             nn.Dropout(0.1),
