@@ -138,7 +138,7 @@ def analyze_neuron_usage_patterns(
         # Gini coefficient (불균형 지수, 0=완전 균등, 1=완전 불균등)
         usage_sorted = torch.sort(usage)[0]
         n = len(usage_sorted)
-        index = torch.arange(1, n + 1, device=device, dtype=torch.float)
+        index = torch.arange(1, n + 1, device=usage_sorted.device, dtype=torch.float)
         gini = (2 * (index * usage_sorted).sum() / (n * usage_sorted.sum()) - (n + 1) / n).item()
 
         results[layer_idx] = {
