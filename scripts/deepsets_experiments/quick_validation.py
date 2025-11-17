@@ -2,9 +2,9 @@
 Quick Validation Script
 
 빠른 검증용 작은 실험
-- 작은 모델로 manifold 작동 확인
+- 작은 모델로 DeepSets 작동 확인
 - 간단한 데이터셋으로 학습/평가
-- Baseline vs Manifold 기본 비교
+- Baseline vs DeepSets 기본 비교
 
 Usage:
     python quick_validation.py
@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from models.neuron_based import NeuronBasedLanguageModel as BaselineModel
-from models.neuron_based_manifold import NeuronBasedLanguageModel as ManifoldModel
+from models.neuron_based_deepsets import DeepSetsLanguageModel
 from utils.data import create_dummy_dataset
 
 
@@ -76,7 +76,7 @@ def quick_eval(model, dataloader, device, num_steps=10):
 
 def main():
     print("="*80)
-    print("QUICK VALIDATION: Baseline vs Manifold")
+    print("QUICK VALIDATION: Baseline vs DeepSets")
     print("="*80)
 
     # Device
@@ -92,7 +92,9 @@ def main():
         'n_layers': 2,
         'max_seq_len': 64,
         'dropout': 0.1,
-        'sparse_k': 128,  # 25% sparsity
+        'sparse_k': 128,
+        'd_neuron': 64,
+        'd_hidden': 128,
         'batch_size': 16,
         'num_train_samples': 500,
         'num_val_samples': 100,
@@ -153,10 +155,10 @@ def main():
     print(f"Parameters: {baseline_params:,}\n")
 
     print("-" * 80)
-    print("Creating Manifold Model...")
+    print("Creating DeepSets Model...")
     print("-" * 80)
 
-    manifold_model = ManifoldModel(
+    deepsets_model = DeepSetsLanguageModel(
         vocab_size=config['vocab_size'],
         d_model=config['d_model'],
         d_ff=config['d_ff'],
@@ -165,14 +167,15 @@ def main():
         max_seq_len=config['max_seq_len'],
         dropout=config['dropout'],
         sparse_k=config['sparse_k'],
-        use_manifold=True,
-        manifold_d_hidden=32  # Small for quick test
+        d_neuron=config['d_neuron'],
+        d_hidden=config['d_hidden'],
+        use_context=False
     ).to(device)
 
-    manifold_params = sum(p.numel() for p in manifold_model.parameters() if p.requires_grad)
-    print(f"Parameters: {manifold_params:,}")
-    print(f"Additional params: {manifold_params - baseline_params:,} "
-          f"({(manifold_params - baseline_params) / baseline_params * 100:.2f}%)\n")
+    deepsets_params = sum(p.numel() for p in deepsets_model.parameters() if p.requires_grad)
+    print(f"Parameters: {deepsets_params:,}")
+    print(f"Additional params: {deepsets_params - baseline_params:,} "
+          f"({(deepsets_params - baseline_params) / baseline_params * 100:.2f}%)\n")
 
     # Test forward pass
     print("-" * 80)
@@ -188,10 +191,10 @@ def main():
     print(f"  ✓ Output shape: {baseline_output['logits'].shape}")
     print(f"  ✓ Loss: {baseline_output['loss'].item():.4f}")
 
-    print("\nManifold forward pass...")
-    manifold_output = manifold_model(input_ids=sample_input, labels=sample_labels)
-    print(f"  ✓ Output shape: {manifold_output['logits'].shape}")
-    print(f"  ✓ Loss: {manifold_output['loss'].item():.4f}\n")
+    print("\nDeepSets forward pass...")
+    deepsets_output = deepsets_model(input_ids=sample_input, labels=sample_labels)
+    print(f"  ✓ Output shape: {deepsets_output['logits'].shape}")
+    print(f"  ✓ Loss: {deepsets_output['loss'].item():.4f}\n")
 
     # Quick training
     print("="*80)
@@ -207,14 +210,14 @@ def main():
     )
 
     print("="*80)
-    print("MANIFOLD TRAINING")
+    print("DEEPSETS TRAINING")
     print("="*80)
-    manifold_optimizer = torch.optim.AdamW(
-        manifold_model.parameters(),
+    deepsets_optimizer = torch.optim.AdamW(
+        deepsets_model.parameters(),
         lr=config['lr']
     )
-    manifold_train_loss = quick_train(
-        manifold_model, train_loader, manifold_optimizer, device,
+    deepsets_train_loss = quick_train(
+        deepsets_model, train_loader, deepsets_optimizer, device,
         num_steps=config['num_train_steps']
     )
 
@@ -230,12 +233,12 @@ def main():
     )
     print(f"  Validation Loss: {baseline_val_loss:.4f}\n")
 
-    print("Manifold evaluation...")
-    manifold_val_loss = quick_eval(
-        manifold_model, val_loader, device,
+    print("DeepSets evaluation...")
+    deepsets_val_loss = quick_eval(
+        deepsets_model, val_loader, device,
         num_steps=config['num_eval_steps']
     )
-    print(f"  Validation Loss: {manifold_val_loss:.4f}\n")
+    print(f"  Validation Loss: {deepsets_val_loss:.4f}\n")
 
     # Summary
     print("="*80)
@@ -244,16 +247,16 @@ def main():
     print(f"{'Model':<15} {'Params':<15} {'Train Loss':<15} {'Val Loss':<15}")
     print("-"*80)
     print(f"{'Baseline':<15} {baseline_params:>14,} {baseline_train_loss:>14.4f} {baseline_val_loss:>14.4f}")
-    print(f"{'Manifold':<15} {manifold_params:>14,} {manifold_train_loss:>14.4f} {manifold_val_loss:>14.4f}")
+    print(f"{'DeepSets':<15} {deepsets_params:>14,} {deepsets_train_loss:>14.4f} {deepsets_val_loss:>14.4f}")
     print("="*80)
 
     # Test different sparsity levels
     print("\nTesting different sparsity levels...")
     print("-"*80)
 
-    sparsity_tests = [64, 128, 256, 512]  # Different top_k values
+    sparsity_tests = [64, 128, 256, 512]
 
-    print(f"{'Top-K':<10} {'Baseline Loss':<20} {'Manifold Loss':<20}")
+    print(f"{'Top-K':<10} {'Baseline Loss':<20} {'DeepSets Loss':<20}")
     print("-"*80)
 
     for top_k in sparsity_tests:
@@ -263,13 +266,13 @@ def main():
             bl_out = baseline_model(input_ids=sample_input, labels=sample_labels, top_k=top_k)
             bl_loss = bl_out['loss'].item()
 
-        # Manifold
-        manifold_model.eval()
+        # DeepSets
+        deepsets_model.eval()
         with torch.no_grad():
-            mf_out = manifold_model(input_ids=sample_input, labels=sample_labels, top_k=top_k)
-            mf_loss = mf_out['loss'].item()
+            ds_out = deepsets_model(input_ids=sample_input, labels=sample_labels, top_k=top_k)
+            ds_loss = ds_out['loss'].item()
 
-        print(f"{top_k:<10} {bl_loss:>19.4f} {mf_loss:>19.4f}")
+        print(f"{top_k:<10} {bl_loss:>19.4f} {ds_loss:>19.4f}")
 
     print("="*80)
     print("✓ Quick validation completed successfully!")
