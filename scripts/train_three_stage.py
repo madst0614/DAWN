@@ -342,9 +342,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Mixed precision training
         # Dynamic aux weight: stronger in early epochs
         if epoch <= 5:
-            aux_weight = 0.05  # Strong regularization initially
+            aux_weight = 0.5  # Strong regularization initially (was 0.05)
         else:
-            aux_weight = 0.01  # Moderate regularization later
+            aux_weight = 0.1  # Moderate regularization later (was 0.01)
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -366,6 +366,32 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 print(f"  Logits shape: {logits.shape}")
                 print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
                 print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+
+                # Routing debug
+                print(f"\n[Routing Debug - Step {step+1}]")
+                first_ffn = model.layers[0].ffn
+
+                if first_ffn.last_routing_scores is not None:
+                    routing_weights = first_ffn.last_routing_scores  # [B, n_input]
+
+                    # Top-k pattern analysis
+                    topk_vals, topk_idx = routing_weights[0].topk(10)
+                    print(f"  Top 10 routing weights: {topk_vals.cpu().numpy()}")
+
+                    # Distribution stats
+                    print(f"  Distribution: min={routing_weights.min():.6f}, max={routing_weights.max():.6f}, mean={routing_weights.mean():.6f}")
+
+                    # Sparsity check
+                    nonzero = (routing_weights[0] > 1e-6).sum()
+                    print(f"  Non-zero weights: {nonzero}/{len(routing_weights[0])}")
+
+                    # Usage stats
+                    if first_ffn.input_neuron_counts is not None:
+                        counts = first_ffn.input_neuron_counts
+                        active_neurons = (counts > 0).sum()
+                        print(f"  Active input neurons: {active_neurons}/{len(counts)}")
+                else:
+                    print(f"  No routing scores available")
 
             scaler.scale(total_loss_combined).backward()
 
@@ -412,6 +438,32 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 print(f"  Logits shape: {logits.shape}")
                 print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
                 print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+
+                # Routing debug
+                print(f"\n[Routing Debug - Step {step+1}]")
+                first_ffn = model.layers[0].ffn
+
+                if first_ffn.last_routing_scores is not None:
+                    routing_weights = first_ffn.last_routing_scores  # [B, n_input]
+
+                    # Top-k pattern analysis
+                    topk_vals, topk_idx = routing_weights[0].topk(10)
+                    print(f"  Top 10 routing weights: {topk_vals.cpu().numpy()}")
+
+                    # Distribution stats
+                    print(f"  Distribution: min={routing_weights.min():.6f}, max={routing_weights.max():.6f}, mean={routing_weights.mean():.6f}")
+
+                    # Sparsity check
+                    nonzero = (routing_weights[0] > 1e-6).sum()
+                    print(f"  Non-zero weights: {nonzero}/{len(routing_weights[0])}")
+
+                    # Usage stats
+                    if first_ffn.input_neuron_counts is not None:
+                        counts = first_ffn.input_neuron_counts
+                        active_neurons = (counts > 0).sum()
+                        print(f"  Active input neurons: {active_neurons}/{len(counts)}")
+                else:
+                    print(f"  No routing scores available")
 
             total_loss_combined.backward()
 

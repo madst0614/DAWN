@@ -101,8 +101,8 @@ class GlobalRouter(nn.Module):
         # [B, n_input]
 
         # Soft routing for gradient flow
-        # Temperature = 0.1 for sharper distribution
-        routing_probs = F.softmax(routing_logits / 0.1, dim=-1)
+        # Temperature = 1.0 for smoother distribution (was 0.1 - too sharp)
+        routing_probs = F.softmax(routing_logits / 1.0, dim=-1)
         # [B, n_input]
 
         # Hard selection (top-k)
