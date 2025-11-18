@@ -47,17 +47,26 @@ class GlobalRouter(nn.Module):
         else:
             self.query_net = nn.Linear(d_model, d_routing)
 
+        # Initialized with orthogonal in _init_weights()
         self.neuron_keys = nn.Parameter(
-            torch.randn(n_input_neurons, d_routing) * 0.02
+            torch.empty(n_input_neurons, d_routing)
         )
 
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.orthogonal_(self.neuron_keys)
+        """
+        Initialize router weights.
+
+        Uses gain=sqrt(2) for GELU compatibility and Xavier for linear layers.
+        """
+        import math
+        gain = math.sqrt(2.0)
+
+        nn.init.orthogonal_(self.neuron_keys, gain=gain)
         for module in self.query_net.modules():
             if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
+                nn.init.xavier_normal_(module.weight, gain=gain)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
@@ -141,16 +150,18 @@ class HierarchicalDynamicFFN(nn.Module):
         )
 
         # ===== Phase 2: Input Neurons =====
+        # Initialized with orthogonal in _init_weights()
         self.input_patterns = nn.Parameter(
-            torch.randn(n_input_neurons, d_model) * 0.02
+            torch.empty(n_input_neurons, d_model)
         )
 
         # ===== Phase 3: Process Neurons =====
+        # Initialized with orthogonal in _init_weights()
         self.process_weights = nn.Parameter(
-            torch.randn(n_process_neurons, n_input_neurons) * 0.02
+            torch.empty(n_process_neurons, n_input_neurons)
         )
         self.process_outputs = nn.Parameter(
-            torch.randn(n_process_neurons, d_model) * 0.02
+            torch.empty(n_process_neurons, d_model)
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -163,9 +174,18 @@ class HierarchicalDynamicFFN(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.orthogonal_(self.input_patterns)
-        nn.init.orthogonal_(self.process_weights)
-        nn.init.orthogonal_(self.process_outputs)
+        """
+        Initialize weights with orthogonal initialization.
+
+        Uses gain=sqrt(2) ≈ 1.414 for GELU activation (recommended by Kaiming He).
+        This prevents vanishing signals through the network depth.
+        """
+        import math
+        gain = math.sqrt(2.0)  # For GELU/ReLU-like activations
+
+        nn.init.orthogonal_(self.input_patterns, gain=gain)
+        nn.init.orthogonal_(self.process_weights, gain=gain)
+        nn.init.orthogonal_(self.process_outputs, gain=gain)
 
     def forward(
         self,
