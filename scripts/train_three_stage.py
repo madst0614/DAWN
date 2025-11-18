@@ -231,17 +231,18 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     for batch in pbar:
         input_ids = batch["input_ids"].to(device)
 
+        # TEMPORARY: Disable MLM masking for debugging
         # Apply MLM masking
-        if tokenizer is not None:
-            input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
-        else:
-            # Fallback: no masking
-            labels = input_ids.clone()
+        # if tokenizer is not None:
+        #     input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+        # else:
+        #     # Fallback: no masking
+        labels = input_ids.clone()  # Identity task for testing
 
         optimizer.zero_grad()
 
         # Mixed precision training
-        aux_weight = 0.001  # Load balancing loss 가중치
+        aux_weight = 0.0  # TEMPORARY: Disable aux loss for debugging
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
