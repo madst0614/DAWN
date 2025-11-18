@@ -474,13 +474,15 @@ def main():
     print(f"  Number of layers: {stats['n_layers']}")
 
     # Sparsity info
+    # Start with less aggressive sparsity to verify architecture works
+    # Then gradually increase sparsity if training succeeds
     if args.k_input is None:
-        k_input_actual = max(args.n_input_neurons // 8, 64)
+        k_input_actual = args.n_input_neurons // 2  # 50% (was 12.5%)
     else:
         k_input_actual = args.k_input
 
     if args.k_process is None:
-        k_process_actual = max(args.n_process_neurons // 8, 32)
+        k_process_actual = args.n_process_neurons  # 100% - no selection (was 12.5%)
     else:
         k_process_actual = args.k_process
 
