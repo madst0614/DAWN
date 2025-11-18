@@ -41,6 +41,7 @@ from tqdm import tqdm
 import json
 from datetime import datetime
 import time
+import numpy as np
 
 from models.three_stage_ffn import HierarchicalLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
@@ -52,6 +53,268 @@ MLM_CONFIG = {
     "mask_token_ratio": 0.8,
     "random_token_ratio": 0.5
 }
+
+
+# ============================================================
+# Comprehensive Debugging Function
+# ============================================================
+
+def comprehensive_debug(
+    step: int,
+    model,
+    input_ids,
+    labels,
+    logits,
+    loss,
+    aux_loss,
+    optimizer,
+    debug_first_n_steps: int = 10
+):
+    """
+    종합 디버깅 함수 - 학습이 안 되는 원인을 찾기 위한 완전한 진단
+
+    Args:
+        step: 현재 스텝
+        model: 모델
+        input_ids: [B, S]
+        labels: [B, S]
+        logits: [B, S, V]
+        loss: 스칼라
+        aux_loss: 스칼라
+        optimizer: 옵티마이저
+        debug_first_n_steps: 처음 몇 스텝 디버깅할지
+    """
+
+    if step > debug_first_n_steps:
+        return
+
+    print("\n" + "="*70)
+    print(f"🔍 COMPREHENSIVE DEBUG - STEP {step}")
+    print("="*70)
+
+    B, S = input_ids.shape
+    V = logits.shape[-1]
+    device = input_ids.device
+
+    # ============================================================
+    # 1. 데이터 검증 (가장 중요!)
+    # ============================================================
+    print("\n📊 1. DATA VALIDATION")
+    print("-" * 70)
+
+    # 1.1 입력 통계
+    print(f"\n[Input IDs]")
+    print(f"  Shape: {input_ids.shape}")
+    print(f"  Range: [{input_ids.min().item()}, {input_ids.max().item()}]")
+    print(f"  Unique tokens: {input_ids.unique().numel()}")
+    print(f"  First sequence (first 30): {input_ids[0, :30].tolist()}")
+
+    # 1.2 라벨 통계 (핵심!)
+    print(f"\n[Labels - CRITICAL]")
+    print(f"  Shape: {labels.shape}")
+    print(f"  Range: [{labels.min().item()}, {labels.max().item()}]")
+
+    valid_mask = (labels != -100)
+    masked_count = (labels == -100).sum().item()
+    valid_count = valid_mask.sum().item()
+    total_count = labels.numel()
+
+    print(f"  Total tokens: {total_count}")
+    print(f"  Masked (-100): {masked_count} ({masked_count/total_count*100:.2f}%)")
+    print(f"  Valid tokens: {valid_count} ({valid_count/total_count*100:.2f}%)")
+    print(f"  ⚠️  Masking ratio: {masked_count/total_count*100:.1f}%")
+
+    if masked_count / total_count > 0.5:
+        print(f"  🚨 WARNING: Over 50% masked! This is abnormal!")
+    if masked_count / total_count > 0.9:
+        print(f"  🚨🚨 CRITICAL: Over 90% masked! Training will fail!")
+
+    # 첫 시퀀스의 라벨 패턴 분석
+    print(f"\n[First Sequence Label Pattern]")
+    first_labels = labels[0]
+    first_valid = first_labels[first_labels != -100]
+
+    print(f"  Valid positions (first 20): {valid_mask[0].nonzero().squeeze()[:20].tolist()}")
+    print(f"  First 30 labels: {labels[0, :30].tolist()}")
+    if len(first_valid) > 0:
+        print(f"  Valid label values (first 20): {first_valid[:20].tolist()}")
+
+    # 라벨과 입력 비교
+    print(f"\n[Input vs Labels Alignment]")
+    print(f"  Input [0, :10]:  {input_ids[0, :10].tolist()}")
+    print(f"  Labels[0, :10]:  {labels[0, :10].tolist()}")
+    print(f"  Input [0, -10:]: {input_ids[0, -10:].tolist()}")
+    print(f"  Labels[0, -10:]: {labels[0, -10:].tolist()}")
+
+    # ============================================================
+    # 2. 모델 출력 검증
+    # ============================================================
+    print("\n📈 2. MODEL OUTPUT VALIDATION")
+    print("-" * 70)
+
+    # 2.1 Logits 통계
+    print(f"\n[Logits]")
+    print(f"  Shape: {logits.shape}")
+    print(f"  Range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
+    print(f"  Mean: {logits.mean().item():.4f}")
+    print(f"  Std: {logits.std().item():.4f}")
+
+    # NaN/Inf 체크
+    if torch.isnan(logits).any():
+        print(f"  🚨 NaN detected in logits!")
+        nan_count = torch.isnan(logits).sum().item()
+        print(f"     NaN count: {nan_count}/{logits.numel()}")
+    if torch.isinf(logits).any():
+        print(f"  🚨 Inf detected in logits!")
+
+    # 2.2 예측 분석
+    print(f"\n[Predictions]")
+    preds = logits.argmax(dim=-1)
+    print(f"  Predicted tokens (first seq, first 30): {preds[0, :30].tolist()}")
+
+    # 예측의 다양성
+    unique_preds = preds.unique().numel()
+    print(f"  Unique predictions: {unique_preds}/{V} ({unique_preds/V*100:.2f}%)")
+
+    # 가장 자주 예측되는 토큰
+    pred_counts = torch.bincount(preds.flatten(), minlength=V)
+    top_preds = pred_counts.topk(10)
+    print(f"  Top 10 predicted tokens:")
+    for i, (count, token_id) in enumerate(zip(top_preds.values, top_preds.indices)):
+        print(f"    #{i+1}: token {token_id.item()} (count: {count.item()})")
+
+    # 2.3 정확도 계산 (valid token만)
+    print(f"\n[Accuracy on Valid Tokens]")
+    if valid_count > 0:
+        correct = (preds == labels) & valid_mask
+        acc = correct.sum().item() / valid_count
+        print(f"  Overall: {acc*100:.2f}% ({correct.sum().item()}/{valid_count})")
+
+        # 첫 시퀀스의 매칭
+        if valid_mask[0].sum() > 0:
+            first_preds = preds[0][valid_mask[0]]
+            first_labels_valid = labels[0][valid_mask[0]]
+            first_matches = (first_preds == first_labels_valid).sum().item()
+            print(f"  First sequence: {first_matches}/{len(first_preds)} correct")
+            print(f"    Predicted: {first_preds[:10].tolist()}")
+            print(f"    Actual:    {first_labels_valid[:10].tolist()}")
+    else:
+        print(f"  ⚠️  No valid tokens to compute accuracy!")
+
+    # ============================================================
+    # 3. Loss 분석
+    # ============================================================
+    print("\n💰 3. LOSS ANALYSIS")
+    print("-" * 70)
+
+    print(f"\n[Main Loss]")
+    print(f"  Value: {loss.item():.4f}")
+    print(f"  Expected range: 0-10 (vocab ~30k)")
+
+    # Per-token loss 계산
+    if valid_count > 0:
+        # Flatten and compute per-token loss
+        logits_flat = logits.view(-1, V)
+        labels_flat = labels.view(-1)
+
+        per_token_loss = F.cross_entropy(
+            logits_flat,
+            labels_flat,
+            ignore_index=-100,
+            reduction='none'
+        )
+
+        # Valid token의 loss만
+        valid_losses = per_token_loss[labels_flat != -100]
+
+        print(f"\n[Per-Token Loss Statistics]")
+        print(f"  Min: {valid_losses.min().item():.4f}")
+        print(f"  Max: {valid_losses.max().item():.4f}")
+        print(f"  Mean: {valid_losses.mean().item():.4f}")
+        print(f"  Median: {valid_losses.median().item():.4f}")
+        print(f"  Std: {valid_losses.std().item():.4f}")
+
+        # Loss 분포
+        print(f"\n[Loss Distribution]")
+        print(f"  <1.0:  {(valid_losses < 1.0).sum().item()} tokens")
+        print(f"  1-5:   {((valid_losses >= 1.0) & (valid_losses < 5.0)).sum().item()} tokens")
+        print(f"  5-10:  {((valid_losses >= 5.0) & (valid_losses < 10.0)).sum().item()} tokens")
+        print(f"  >10:   {(valid_losses >= 10.0).sum().item()} tokens")
+
+        # 첫 10개 valid token의 loss
+        first_seq_valid_idx = valid_mask[0].nonzero().squeeze()
+        if len(first_seq_valid_idx) > 0:
+            first_10_idx = first_seq_valid_idx[:10]
+            print(f"\n[First Sequence - First 10 Valid Tokens]")
+            for i, idx in enumerate(first_10_idx):
+                idx_item = idx.item()
+                token_id = labels[0, idx_item].item()
+                pred_id = preds[0, idx_item].item()
+                token_loss = per_token_loss[idx_item].item()
+                match = "✓" if token_id == pred_id else "✗"
+                print(f"    Pos {idx_item}: label={token_id}, pred={pred_id}, loss={token_loss:.3f} {match}")
+
+    print(f"\n[Auxiliary Loss]")
+    print(f"  Value: {aux_loss.item():.6f}")
+    print(f"  Expected range: 0-2")
+
+    # ============================================================
+    # 4. 종합 진단
+    # ============================================================
+    print("\n🏥 4. DIAGNOSTIC SUMMARY")
+    print("-" * 70)
+
+    issues = []
+    warnings = []
+
+    # 체크리스트
+    if masked_count / total_count > 0.9:
+        issues.append("🚨 CRITICAL: >90% tokens masked - training impossible")
+    elif masked_count / total_count > 0.5:
+        warnings.append("⚠️  >50% tokens masked - training inefficient")
+
+    if valid_count == 0:
+        issues.append("🚨 CRITICAL: No valid tokens - cannot compute loss")
+
+    if torch.isnan(logits).any():
+        issues.append("🚨 CRITICAL: NaN in logits")
+
+    if loss.item() > 12:
+        warnings.append(f"⚠️  Very high loss: {loss.item():.2f}")
+
+    if valid_count > 0:
+        correct = (preds == labels) & valid_mask
+        acc = correct.sum().item() / valid_count
+        if acc < 0.001:
+            warnings.append(f"⚠️  Near-zero accuracy: {acc*100:.3f}%")
+
+    # 출력
+    if issues:
+        print("\n🚨 CRITICAL ISSUES:")
+        for issue in issues:
+            print(f"  {issue}")
+
+    if warnings:
+        print("\n⚠️  WARNINGS:")
+        for warning in warnings:
+            print(f"  {warning}")
+
+    if not issues and not warnings:
+        print("\n✅ No major issues detected")
+
+    # 추천 액션
+    print("\n💡 RECOMMENDED ACTIONS:")
+    if masked_count / total_count > 0.5:
+        print("  1. Check data preprocessing - fix masking ratio")
+        print("     → Look for collate_fn or Dataset code")
+        print("     → Should mask 0% (CLM) or ~15% (MLM)")
+
+    if aux_loss.item() < 0.001:
+        print("  2. Increase aux_loss_weight:")
+        print("     → Currently too small, increase to 0.01 or 0.1")
+
+    print("\n" + "="*70)
+    print()
 
 
 # ============================================================
@@ -450,8 +713,21 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             scaler.scale(total_loss_combined).backward()
 
+            # 🔥 COMPREHENSIVE DEBUGGING (first 10 steps)
+            comprehensive_debug(
+                step=step + 1,
+                model=model,
+                input_ids=input_ids,
+                labels=labels,
+                logits=logits,
+                loss=loss,
+                aux_loss=aux_loss,
+                optimizer=optimizer,
+                debug_first_n_steps=10
+            )
+
             if debug_mode:
-                print(f"\nAfter Backward:")
+                print(f"\n[Additional Debug Info - After Backward]")
 
                 # CRITICAL: Check neuron_keys gradient specifically
                 print(f"\n[Critical Gradient Check - neuron_keys]")
@@ -559,8 +835,21 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             total_loss_combined.backward()
 
+            # 🔥 COMPREHENSIVE DEBUGGING (first 10 steps)
+            comprehensive_debug(
+                step=step + 1,
+                model=model,
+                input_ids=input_ids,
+                labels=labels,
+                logits=logits,
+                loss=loss,
+                aux_loss=aux_loss,
+                optimizer=optimizer,
+                debug_first_n_steps=10
+            )
+
             if debug_mode:
-                print(f"\nAfter Backward:")
+                print(f"\n[Additional Debug Info - After Backward]")
 
                 # CRITICAL: Check neuron_keys gradient specifically
                 print(f"\n[Critical Gradient Check - neuron_keys]")
