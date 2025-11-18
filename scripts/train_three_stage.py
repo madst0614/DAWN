@@ -127,7 +127,7 @@ def apply_mlm_masking(input_ids, tokenizer, config=None):
 
 class TextDataset(Dataset):
     """Dataset for tokenized texts"""
-    def __init__(self, texts, tokenizer, max_length=512):
+    def __init__(self, texts, tokenizer, max_length=128):  # CHANGED: 512 → 128
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -138,10 +138,9 @@ class TextDataset(Dataset):
     def __getitem__(self, idx):
         text = self.texts[idx]
 
-        # Tokenize
+        # Tokenize (NO padding here - will be done dynamically in collate_fn)
         encoding = self.tokenizer(
             text,
-            padding='max_length',
             truncation=True,
             max_length=self.max_length,
             return_tensors='pt'
@@ -153,9 +152,50 @@ class TextDataset(Dataset):
         }
 
 
-def load_cached_data(tokenizer_path=None, max_length=512, batch_size=32):
-    """Load cached WikiText data"""
+def collate_fn_dynamic_padding(batch, tokenizer):
+    """
+    Collate function with DYNAMIC padding (배치별 최대 길이만큼만 padding)
+
+    큰 개선:
+    - Before: 모든 시퀀스를 512로 padding → 90% padding!
+    - After: 배치 내 최대 길이로만 padding → ~10-30% padding
+    """
+    # Find max length in this batch
+    max_len = max(item['input_ids'].size(0) for item in batch)
+
+    input_ids_list = []
+    attention_mask_list = []
+
+    for item in batch:
+        input_ids = item['input_ids']
+        attention_mask = item['attention_mask']
+        seq_len = input_ids.size(0)
+
+        # Pad to batch max length
+        if seq_len < max_len:
+            padding_len = max_len - seq_len
+            input_ids = torch.cat([
+                input_ids,
+                torch.full((padding_len,), tokenizer.pad_token_id, dtype=torch.long)
+            ])
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.zeros(padding_len, dtype=torch.long)
+            ])
+
+        input_ids_list.append(input_ids)
+        attention_mask_list.append(attention_mask)
+
+    return {
+        'input_ids': torch.stack(input_ids_list),
+        'attention_mask': torch.stack(attention_mask_list)
+    }
+
+
+def load_cached_data(tokenizer_path=None, max_length=128, batch_size=128):  # CHANGED: defaults
+    """Load cached WikiText data with DYNAMIC padding"""
     from transformers import AutoTokenizer
+    from functools import partial
 
     # Load tokenizer
     if tokenizer_path is None:
@@ -179,17 +219,22 @@ def load_cached_data(tokenizer_path=None, max_length=512, batch_size=32):
     train_dataset = TextDataset(train_texts, tokenizer, max_length)
     val_dataset = TextDataset(val_texts, tokenizer, max_length)
 
-    # Create dataloaders
+    # Create collate function with tokenizer
+    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+
+    # Create dataloaders with DYNAMIC padding
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2
+        num_workers=2,
+        collate_fn=collate_fn  # ← Dynamic padding!
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        num_workers=2
+        num_workers=2,
+        collate_fn=collate_fn  # ← Dynamic padding!
     )
 
     return train_loader, val_loader, tokenizer
@@ -454,7 +499,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     print("\n  ✓ All other gradients OK")
 
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Stronger clipping
+
+            # Gradient clipping with verification
+            grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            if debug_mode:
+                print(f"\n[Gradient Clipping]")
+                print(f"  Grad norm before clipping: {grad_norm_before:.2f}")
+                if grad_norm_before > 10.0:
+                    print(f"  ⚠ WARNING: Gradient exploding! (>{10.0})")
+
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -553,7 +607,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 else:
                     print("\n  ✓ All other gradients OK")
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Stronger clipping
+            # Gradient clipping with verification
+            grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            if debug_mode:
+                print(f"\n[Gradient Clipping]")
+                print(f"  Grad norm before clipping: {grad_norm_before:.2f}")
+                if grad_norm_before > 10.0:
+                    print(f"  ⚠ WARNING: Gradient exploding! (>{10.0})")
+
             optimizer.step()
 
         if scheduler is not None:
@@ -657,7 +719,7 @@ def main():
                         help='Number of attention heads')
     parser.add_argument('--n_layers', type=int, default=6,
                         help='Number of transformer layers')
-    parser.add_argument('--max_seq_len', type=int, default=512,
+    parser.add_argument('--max_seq_len', type=int, default=128,  # CHANGED: 512 → 128 (Scenario B)
                         help='Maximum sequence length')
 
     # Hierarchical FFN specific
@@ -675,7 +737,7 @@ def main():
                         help='Number of process neurons to activate (None = n_process//8)')
 
     # Training
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=128,  # CHANGED: 32 → 128 (Scenario B)
                         help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=30,
                         help='Number of epochs')
