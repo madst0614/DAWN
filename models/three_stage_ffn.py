@@ -162,8 +162,9 @@ class HierarchicalDynamicFFN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Routing 통계 저장 (load balancing용)
-        self.register_buffer('input_routing_counts', torch.zeros(n_input_neurons))
-        self.register_buffer('process_routing_counts', torch.zeros(n_process_neurons))
+        self.input_neuron_counts = None
+        self.process_neuron_counts = None
+        self.last_routing_scores = None
 
         self._init_weights()
 
@@ -199,6 +200,32 @@ class HierarchicalDynamicFFN(nn.Module):
         # 시퀀스별로 입력 뉴런 선택 (거시적 결정)
         input_idx, routing_scores = self.global_router(x, k_input)
         # input_idx: [B, k_input]
+
+        # Routing 통계 저장 (load balancing용)
+        if self.training:
+            if self.input_neuron_counts is None:
+                self.input_neuron_counts = torch.zeros(
+                    self.n_input,
+                    device=x.device,
+                    dtype=torch.float32
+                )
+            if self.process_neuron_counts is None:
+                self.process_neuron_counts = torch.zeros(
+                    self.n_process,
+                    device=x.device,
+                    dtype=torch.float32
+                )
+
+            # Input neuron 사용 카운트
+            ones = torch.ones_like(input_idx, dtype=torch.float32)
+            self.input_neuron_counts.scatter_add_(
+                0,
+                input_idx.flatten(),
+                ones.flatten()
+            )
+
+            # Routing scores 저장 (entropy 계산용)
+            self.last_routing_scores = routing_scores.detach()
 
         # ===== Phase 2: Input Neurons =====
         # 모든 입력 뉴런의 토큰별 activation 계산
@@ -250,42 +277,76 @@ class HierarchicalDynamicFFN(nn.Module):
         output = torch.stack(outputs, dim=0)  # [B, S, d_model]
         output = self.dropout(output)
 
-        # Load balancing용 통계 업데이트 (training 시에만)
-        if self.training:
-            # Input neuron 사용 통계
-            for idx in input_idx:
-                self.input_routing_counts.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
-            # Process neuron 사용 통계
-            for idx in process_indices:
-                self.process_routing_counts.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
+        # Process neuron 통계 수집 (training 시에만)
+        if self.training and len(process_indices) > 0:
+            process_indices_tensor = torch.stack(process_indices)  # [B, k_process]
+            ones = torch.ones_like(process_indices_tensor, dtype=torch.float32)
+            self.process_neuron_counts.scatter_add_(
+                0,
+                process_indices_tensor.flatten(),
+                ones.flatten()
+            )
 
         return output
 
     def get_load_balance_loss(self) -> torch.Tensor:
         """
-        Load balancing loss를 계산합니다.
-        뉴런들이 균등하게 사용되도록 유도합니다.
+        Load balancing loss 계산 (KL divergence + entropy 기반)
 
         Returns:
-            load_balance_loss: coefficient of variation 기반 loss
+            loss: 0-2 범위의 정규화된 loss
         """
-        # Input neurons의 CV (Coefficient of Variation)
-        input_mean = self.input_routing_counts.mean()
-        input_std = self.input_routing_counts.std()
-        input_cv = input_std / (input_mean + 1e-6)
+        if self.input_neuron_counts is None or not self.training:
+            device = self.input_patterns.device
+            return torch.tensor(0.0, device=device)
 
-        # Process neurons의 CV
-        process_mean = self.process_routing_counts.mean()
-        process_std = self.process_routing_counts.std()
-        process_cv = process_std / (process_mean + 1e-6)
+        counts = self.input_neuron_counts
+        device = counts.device
 
-        # 평균 CV (낮을수록 균등)
-        return (input_cv + process_cv) / 2
+        # 사용 빈도가 0이면 계산 불가
+        if counts.sum() == 0:
+            return torch.tensor(0.0, device=device)
+
+        # 정규화 (확률 분포)
+        usage_probs = counts / (counts.sum() + 1e-8)
+
+        # 목표: 균등 분포
+        target_prob = 1.0 / self.n_input
+        target = torch.full_like(usage_probs, target_prob)
+
+        # KL divergence (안정적)
+        usage_probs = usage_probs + 1e-8  # Smoothing
+        target = target + 1e-8
+
+        kl_loss = F.kl_div(
+            usage_probs.log(),
+            target,
+            reduction='sum'
+        ) / self.n_input
+
+        # Routing entropy (다양성)
+        if self.last_routing_scores is not None:
+            routing_probs = F.softmax(self.last_routing_scores, dim=-1)
+            avg_probs = routing_probs.mean(dim=0) + 1e-8
+
+            entropy = -(avg_probs * avg_probs.log()).sum()
+            max_entropy = torch.log(torch.tensor(float(self.n_input), device=device))
+
+            # 낮은 엔트로피 = penalty
+            entropy_loss = 1.0 - (entropy / max_entropy)
+        else:
+            entropy_loss = torch.tensor(0.0, device=device)
+
+        # 합치기 (각각 0-1 범위)
+        total_loss = kl_loss + entropy_loss
+
+        return total_loss
 
     def reset_routing_counts(self):
         """Routing 통계를 초기화합니다."""
-        self.input_routing_counts.zero_()
-        self.process_routing_counts.zero_()
+        self.input_neuron_counts = None
+        self.process_neuron_counts = None
+        self.last_routing_scores = None
 
     def get_neuron_stats(
         self,

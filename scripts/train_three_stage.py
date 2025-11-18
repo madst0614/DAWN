@@ -173,6 +173,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         optimizer.zero_grad()
 
         # Mixed precision training
+        aux_weight = 0.001  # Load balancing loss 가중치
+
         if scaler is not None:
             with torch.amp.autocast('cuda'):
                 outputs = model(
@@ -186,7 +188,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # Load balancing loss 추가
                 aux_loss = compute_load_balance_loss(model)
-                total_loss = loss + 0.01 * aux_loss
+                total_loss = loss + aux_weight * aux_loss
 
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -205,7 +207,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             # Load balancing loss 추가
             aux_loss = compute_load_balance_loss(model)
-            total_loss = loss + 0.01 * aux_loss
+            total_loss = loss + aux_weight * aux_loss
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -227,6 +229,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
             "aux": f"{aux_loss.item():.4f}",
+            "w_aux": f"{(aux_weight * aux_loss).item():.5f}",
             "acc": f"{correct / num_tokens:.4f}"
         })
 
