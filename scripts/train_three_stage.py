@@ -34,6 +34,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import argparse
 from tqdm import tqdm
@@ -226,6 +227,83 @@ def reset_routing_stats(model):
         layer.ffn.reset_routing_counts()
 
 
+def print_diagnostic_metrics(model, epoch):
+    """
+    학습 진단 메트릭 출력
+
+    - Gradient norm (exploding/vanishing 체크)
+    - Neuron 사용률 (input neurons)
+    - Router entropy (다양성)
+    - Process neuron 사용률
+    """
+    print(f"\n{'='*60}")
+    print(f"Diagnostic Metrics (Epoch {epoch})")
+    print(f"{'='*60}")
+
+    # 1. Gradient norm
+    grad_norm = 0.0
+    grad_count = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            grad_norm += p.grad.norm().item() ** 2
+            grad_count += 1
+
+    if grad_count > 0:
+        grad_norm = grad_norm ** 0.5
+        status = "✓ OK"
+        if grad_norm < 0.01:
+            status = "⚠ VANISHING"
+        elif grad_norm > 100:
+            status = "⚠ EXPLODING"
+        print(f"Gradient Norm: {grad_norm:.4f} {status}")
+        print(f"  Expected: 0.1 ~ 10 | < 0.01 = vanishing | > 100 = exploding")
+    else:
+        print(f"Gradient Norm: N/A (no gradients)")
+
+    # 첫 번째 레이어의 FFN 분석 (대표값)
+    first_ffn = model.layers[0].ffn
+
+    # 2. Input Neuron 사용률
+    if first_ffn.input_neuron_counts is not None:
+        active_input = (first_ffn.input_neuron_counts > 0).sum().item()
+        total_input = first_ffn.n_input
+        usage_pct = active_input / total_input * 100
+
+        status = "✓ OK" if usage_pct > 50 else "⚠ LOW"
+        print(f"\nInput Neurons (Layer 0): {active_input}/{total_input} ({usage_pct:.1f}%) {status}")
+        print(f"  Expected: > 50% for good diversity")
+    else:
+        print(f"\nInput Neurons: N/A (no stats collected)")
+
+    # 3. Router Entropy (다양성)
+    neuron_keys = first_ffn.global_router.neuron_keys  # [n_input, d_routing]
+    # 각 뉴런의 key를 확률 분포로 변환 (softmax over neurons)
+    # 높은 entropy = 다양한 뉴런이 선택될 가능성
+    routing_logits = neuron_keys.norm(dim=1)  # [n_input] - 각 뉴런의 key 크기
+    routing_probs = F.softmax(routing_logits, dim=0)
+    entropy = -(routing_probs * (routing_probs + 1e-10).log()).sum().item()
+    max_entropy = torch.log(torch.tensor(float(first_ffn.n_input))).item()
+    entropy_pct = entropy / max_entropy * 100
+
+    status = "✓ OK" if entropy_pct > 50 else "⚠ LOW"
+    print(f"\nRouter Entropy (Layer 0): {entropy_pct:.1f}% of max {status}")
+    print(f"  Expected: > 50% for diverse routing")
+
+    # 4. Process Neuron 사용률
+    if first_ffn.process_neuron_counts is not None:
+        active_process = (first_ffn.process_neuron_counts > 0).sum().item()
+        total_process = first_ffn.n_process
+        process_pct = active_process / total_process * 100
+
+        status = "✓ OK" if process_pct > 50 else "⚠ LOW"
+        print(f"\nProcess Neurons (Layer 0): {active_process}/{total_process} ({process_pct:.1f}%) {status}")
+        print(f"  Expected: ~100% if k_process=n_process (no selection)")
+    else:
+        print(f"\nProcess Neurons: N/A (no stats collected)")
+
+    print(f"{'='*60}\n")
+
+
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None):
     """Train for one epoch"""
     model.train()
@@ -238,7 +316,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     total_correct = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
-    for batch in pbar:
+    for step, batch in enumerate(pbar):
         input_ids = batch["input_ids"].to(device)
 
         # Apply MLM masking
@@ -247,6 +325,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         else:
             # Fallback: no masking
             labels = input_ids.clone()
+
+        # Detailed debugging for first 10 steps of epoch 1
+        debug_mode = (epoch == 1 and step < 10)
+
+        if debug_mode:
+            print(f"\n{'='*60}")
+            print(f"Step {step + 1} Debugging")
+            print(f"{'='*60}")
+            print(f"Before Forward:")
+            print(f"  Input shape: {input_ids.shape}, range: [{input_ids.min()}, {input_ids.max()}]")
+            print(f"  Model embedding norm: {model.token_embedding.weight.norm():.4f}")
 
         optimizer.zero_grad()
 
@@ -270,9 +359,36 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # Load balancing loss 추가
                 aux_loss = compute_load_balance_loss(model)
-                total_loss = loss + aux_weight * aux_loss
+                total_loss_combined = loss + aux_weight * aux_loss
 
-            scaler.scale(total_loss).backward()
+            if debug_mode:
+                print(f"\nAfter Forward:")
+                print(f"  Logits shape: {logits.shape}")
+                print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
+                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+
+            scaler.scale(total_loss_combined).backward()
+
+            if debug_mode:
+                print(f"\nAfter Backward:")
+                grad_issues = []
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        if grad_norm < 1e-7:
+                            grad_issues.append(f"  ⚠ {name}: grad too small ({grad_norm:.2e})")
+                        elif grad_norm > 100:
+                            grad_issues.append(f"  ⚠ {name}: grad too large ({grad_norm:.2e})")
+                    else:
+                        grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
+
+                if grad_issues:
+                    print("  Gradient Issues:")
+                    for issue in grad_issues[:10]:  # Show first 10 issues
+                        print(issue)
+                else:
+                    print("  ✓ All gradients OK")
+
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
@@ -289,9 +405,36 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             # Load balancing loss 추가
             aux_loss = compute_load_balance_loss(model)
-            total_loss = loss + aux_weight * aux_loss
+            total_loss_combined = loss + aux_weight * aux_loss
 
-            total_loss.backward()
+            if debug_mode:
+                print(f"\nAfter Forward:")
+                print(f"  Logits shape: {logits.shape}")
+                print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
+                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+
+            total_loss_combined.backward()
+
+            if debug_mode:
+                print(f"\nAfter Backward:")
+                grad_issues = []
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        if grad_norm < 1e-7:
+                            grad_issues.append(f"  ⚠ {name}: grad too small ({grad_norm:.2e})")
+                        elif grad_norm > 100:
+                            grad_issues.append(f"  ⚠ {name}: grad too large ({grad_norm:.2e})")
+                    else:
+                        grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
+
+                if grad_issues:
+                    print("  Gradient Issues:")
+                    for issue in grad_issues[:10]:  # Show first 10 issues
+                        print(issue)
+                else:
+                    print("  ✓ All gradients OK")
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
@@ -566,6 +709,10 @@ def main():
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
+
+        # Print diagnostic metrics every 100 epochs (or first epoch)
+        if epoch == 1 or epoch % 100 == 0:
+            print_diagnostic_metrics(model, epoch)
 
         # Save checkpoint
         is_best = val_loss < best_val_loss
