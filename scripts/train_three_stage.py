@@ -1,7 +1,7 @@
 """
-Three-Stage Dynamic Neuron FFN Training Script
+Hierarchical Dynamic Neuron FFN Training Script
 
-Three-Stage FFN 모델 학습
+계층적 동적 뉴런 FFN 모델 학습
 
 Usage:
     # 기본 학습
@@ -12,8 +12,7 @@ Usage:
         --d_model 768 \
         --n_input_neurons 4096 \
         --n_process_neurons 2048 \
-        --n_output_neurons 4096 \
-        --d_process_value 512 \
+        --d_routing 512 \
         --batch_size 16 \
         --num_epochs 30 \
         --lr 3e-4
@@ -42,7 +41,7 @@ import json
 from datetime import datetime
 import time
 
-from models.three_stage_ffn import ThreeStageLanguageModel
+from models.three_stage_ffn import HierarchicalLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import CacheLoader
 
@@ -148,8 +147,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     input_ids=input_ids,
                     labels=labels,
                     k_input=args.k_input,
-                    k_process=args.k_process,
-                    k_output=args.k_output
+                    k_process=args.k_process
                 )
                 loss = outputs['loss']
                 logits = outputs['logits']
@@ -164,8 +162,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 input_ids=input_ids,
                 labels=labels,
                 k_input=args.k_input,
-                k_process=args.k_process,
-                k_output=args.k_output
+                k_process=args.k_process
             )
             loss = outputs['loss']
             logits = outputs['logits']
@@ -212,8 +209,7 @@ def evaluate(model, dataloader, device, args):
                 input_ids=input_ids,
                 labels=labels,
                 k_input=args.k_input,
-                k_process=args.k_process,
-                k_output=args.k_output
+                k_process=args.k_process
             )
             loss = outputs['loss']
             logits = outputs['logits']
@@ -234,7 +230,7 @@ def evaluate(model, dataloader, device, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Three-Stage Dynamic Neuron FFN')
+    parser = argparse.ArgumentParser(description='Train Hierarchical Dynamic Neuron FFN')
 
     # Model architecture
     parser.add_argument('--d_model', type=int, default=512,
@@ -246,23 +242,19 @@ def main():
     parser.add_argument('--max_seq_len', type=int, default=512,
                         help='Maximum sequence length')
 
-    # Three-Stage FFN specific
+    # Hierarchical FFN specific
     parser.add_argument('--n_input_neurons', type=int, default=2048,
                         help='Number of input neurons')
     parser.add_argument('--n_process_neurons', type=int, default=1024,
                         help='Number of process neurons')
-    parser.add_argument('--n_output_neurons', type=int, default=2048,
-                        help='Number of output neurons')
-    parser.add_argument('--d_process_value', type=int, default=256,
-                        help='Process value dimension')
+    parser.add_argument('--d_routing', type=int, default=256,
+                        help='Routing dimension for global router')
 
     # Sparsity control (runtime)
     parser.add_argument('--k_input', type=int, default=None,
                         help='Number of input neurons to activate (None = n_input//8)')
     parser.add_argument('--k_process', type=int, default=None,
                         help='Number of process neurons to activate (None = n_process//8)')
-    parser.add_argument('--k_output', type=int, default=None,
-                        help='Number of output neurons to activate (None = n_output//8)')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=32,
@@ -305,7 +297,7 @@ def main():
         json.dump(config, f, indent=2)
 
     print(f"\n{'='*60}")
-    print(f"Three-Stage Dynamic Neuron FFN Training")
+    print(f"Hierarchical Dynamic Neuron FFN Training")
     print(f"{'='*60}")
     print(f"\nConfiguration:")
     for key, value in config.items():
@@ -327,10 +319,10 @@ def main():
 
     # Create model
     print(f"\n{'='*60}")
-    print("Creating Three-Stage FFN model...")
+    print("Creating Hierarchical FFN model...")
     print(f"{'='*60}")
 
-    model = ThreeStageLanguageModel(
+    model = HierarchicalLanguageModel(
         vocab_size=vocab_size,
         d_model=args.d_model,
         n_heads=args.n_heads,
@@ -338,8 +330,7 @@ def main():
         max_seq_len=args.max_seq_len,
         n_input_neurons=args.n_input_neurons,
         n_process_neurons=args.n_process_neurons,
-        n_output_neurons=args.n_output_neurons,
-        d_process_value=args.d_process_value,
+        d_routing=args.d_routing,
         dropout=args.dropout,
         gradient_checkpointing=args.gradient_checkpointing
     )
@@ -352,6 +343,7 @@ def main():
     print(f"  Total parameters: {stats['total_parameters']:,}")
     print(f"  Trainable parameters: {stats['trainable_parameters']:,}")
     print(f"  FFN parameters: {stats['ffn_parameters']:,} ({stats['ffn_percentage']:.1f}%)")
+    print(f"  Router parameters: {stats['router_parameters']:,} ({stats['router_percentage']:.1f}%)")
     print(f"  Number of layers: {stats['n_layers']}")
 
     # Sparsity info
@@ -365,15 +357,9 @@ def main():
     else:
         k_process_actual = args.k_process
 
-    if args.k_output is None:
-        k_output_actual = max(args.n_output_neurons // 8, 64)
-    else:
-        k_output_actual = args.k_output
-
     print(f"\nSparsity Configuration:")
     print(f"  Input neurons: {k_input_actual}/{args.n_input_neurons} ({k_input_actual/args.n_input_neurons*100:.1f}%)")
     print(f"  Process neurons: {k_process_actual}/{args.n_process_neurons} ({k_process_actual/args.n_process_neurons*100:.1f}%)")
-    print(f"  Output neurons: {k_output_actual}/{args.n_output_neurons} ({k_output_actual/args.n_output_neurons*100:.1f}%)")
 
     # Optimizer & Scheduler
     optimizer = torch.optim.AdamW(

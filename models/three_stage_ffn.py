@@ -1,15 +1,16 @@
 """
-Three-Stage Dynamic Neuron FFN - Sequence-level Selection
+Hierarchical Dynamic Neuron FFN with Global Router
 
 구조:
-1. Input Neurons: 입력 패턴 감지 및 해석
-2. Process Neurons: 입력 조합을 처리하여 의미 생성
-3. Output Neurons: 처리 결과를 출력 공간으로 변환
+Phase 1: Global Router (QKV) - 시퀀스 전체 요약 → 입력 뉴런 집합 선택
+Phase 2: Input Neurons - 선택된 뉴런들이 토큰별 세밀한 해석
+Phase 3: Process Neurons - 입력 조합하여 기계적 계산
 
 특징:
-- 시퀀스별로 뉴런 조합 선택 (메모리 효율적)
-- Sparse activation으로 효율성
-- 조합 폭발을 통한 창발적 표현
+- 계층적 라우팅: 거시적 → 미시적
+- QKV 기반 전역 라우터
+- 메모리 효율적 (시퀀스별 뉴런 선택)
+- 생물학적 영감 (Thalamus → V1/V2 → IT/Prefrontal)
 """
 
 import torch
@@ -20,16 +21,103 @@ from torch.utils.checkpoint import checkpoint
 
 
 # ============================================================
-# Three-Stage Dynamic FFN
+# Global Router (QKV-based)
 # ============================================================
 
-class ThreeStageFFN(nn.Module):
+class GlobalRouter(nn.Module):
     """
-    3단계 동적 뉴런 FFN (시퀀스별 선택)
+    전역 라우터: 시퀀스 전체 맥락 파악하여 입력 뉴런 선택
 
-    핵심: 한 시퀀스 내 모든 토큰이 같은 뉴런 조합 사용
-    - 메모리 효율성 대폭 향상
-    - 각 시퀀스가 고유한 신경 회로를 가짐
+    - Query: 시퀀스 요약 → "이 문장은 대략 무엇인가?"
+    - Key: 각 입력 뉴런의 "정체성"
+    - Value: 암묵적 (뉴런 인덱스)
+    """
+
+    def __init__(
+        self,
+        d_model: int = 512,
+        n_input_neurons: int = 2048,
+        d_routing: int = 256,
+        use_mlp: bool = True
+    ):
+        super().__init__()
+
+        self.d_routing = d_routing
+        self.n_input = n_input_neurons
+        self.use_mlp = use_mlp
+
+        if use_mlp:
+            # MLP로 더 강력한 Query 생성
+            self.query_net = nn.Sequential(
+                nn.Linear(d_model, d_routing * 2),
+                nn.GELU(),
+                nn.LayerNorm(d_routing * 2),
+                nn.Linear(d_routing * 2, d_routing)
+            )
+        else:
+            # 단순 선형 변환
+            self.query_net = nn.Linear(d_model, d_routing)
+
+        # 각 입력 뉴런의 "정체성" (Key)
+        self.neuron_keys = nn.Parameter(
+            torch.randn(n_input_neurons, d_routing) * 0.02
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_normal_(self.neuron_keys)
+        for module in self.query_net.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        k_input: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [B, S, d_model]
+            k_input: 선택할 입력 뉴런 개수
+
+        Returns:
+            input_idx: [B, k_input] - 선택된 뉴런 인덱스
+            routing_scores: [B, k_input] - 라우팅 점수
+        """
+        B, S, d_model = x.shape
+
+        # 시퀀스 전체 요약 (거시적 맥락)
+        global_context = x.mean(dim=1)  # [B, d_model]
+
+        # Query: "이 시퀀스는 어떤 특성인가?"
+        query = self.query_net(global_context)  # [B, d_routing]
+
+        # Attention with neuron keys
+        # scores = Q @ K^T / sqrt(d)
+        routing_logits = (query @ self.neuron_keys.T) / (self.d_routing ** 0.5)
+        # [B, n_input]
+
+        # Top-k 입력 뉴런 선택
+        routing_scores, input_idx = routing_logits.topk(k_input, dim=-1)
+        # [B, k_input]
+
+        return input_idx, routing_scores
+
+
+# ============================================================
+# Hierarchical Dynamic FFN
+# ============================================================
+
+class HierarchicalDynamicFFN(nn.Module):
+    """
+    계층적 동적 FFN
+
+    Phase 1: Global Router → 입력 뉴런 집합 선택 (거시적)
+    Phase 2: Input Neurons → 토큰별 세밀한 해석 (미시적)
+    Phase 3: Process Neurons → 단순 계산 및 출력
     """
 
     def __init__(
@@ -37,8 +125,7 @@ class ThreeStageFFN(nn.Module):
         d_model: int = 512,
         n_input_neurons: int = 2048,
         n_process_neurons: int = 1024,
-        n_output_neurons: int = 2048,
-        d_process_value: int = 256,
+        d_routing: int = 256,
         dropout: float = 0.1
     ):
         super().__init__()
@@ -46,33 +133,30 @@ class ThreeStageFFN(nn.Module):
         self.d_model = d_model
         self.n_input = n_input_neurons
         self.n_process = n_process_neurons
-        self.n_output = n_output_neurons
-        self.d_process_value = d_process_value
+        self.d_routing = d_routing
 
-        # ===== Stage 1: Input Neurons =====
-        # 각 입력 뉴런의 패턴 (어떤 입력에 반응하는가)
+        # ===== Phase 1: Global Router =====
+        self.global_router = GlobalRouter(
+            d_model=d_model,
+            n_input_neurons=n_input_neurons,
+            d_routing=d_routing,
+            use_mlp=True
+        )
+
+        # ===== Phase 2: Input Neurons =====
+        # 각 입력 뉴런의 패턴 (토큰별 해석용)
         self.input_patterns = nn.Parameter(
             torch.randn(n_input_neurons, d_model) * 0.02
         )
 
-        # ===== Stage 2: Process Neurons =====
-        # 처리 뉴런이 입력 뉴런들로부터 받는 가중치
-        self.process_input_weights = nn.Parameter(
+        # ===== Phase 3: Process Neurons =====
+        # 처리 뉴런 가중치 (입력 → 처리)
+        self.process_weights = nn.Parameter(
             torch.randn(n_process_neurons, n_input_neurons) * 0.02
         )
-        # 처리 뉴런의 내부 표현 (처리된 정보)
-        self.process_values = nn.Parameter(
-            torch.randn(n_process_neurons, d_process_value) * 0.02
-        )
-
-        # ===== Stage 3: Output Neurons =====
-        # 출력 뉴런이 처리 값을 받는 가중치
-        self.output_input_weights = nn.Parameter(
-            torch.randn(n_output_neurons, d_process_value) * 0.02
-        )
-        # 출력 뉴런의 출력 패턴
-        self.output_patterns = nn.Parameter(
-            torch.randn(n_output_neurons, d_model) * 0.02
+        # 처리 뉴런 출력 패턴
+        self.process_outputs = nn.Parameter(
+            torch.randn(n_process_neurons, d_model) * 0.02
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -80,26 +164,21 @@ class ThreeStageFFN(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """가중치 초기화"""
         nn.init.xavier_normal_(self.input_patterns)
-        nn.init.xavier_normal_(self.process_input_weights)
-        nn.init.xavier_normal_(self.process_values)
-        nn.init.xavier_normal_(self.output_input_weights)
-        nn.init.xavier_normal_(self.output_patterns)
+        nn.init.xavier_normal_(self.process_weights)
+        nn.init.xavier_normal_(self.process_outputs)
 
     def forward(
         self,
         x: torch.Tensor,
         k_input: Optional[int] = None,
-        k_process: Optional[int] = None,
-        k_output: Optional[int] = None
+        k_process: Optional[int] = None
     ) -> torch.Tensor:
         """
         Args:
             x: [B, S, d_model]
-            k_input: 활성화할 입력 뉴런 수 (None이면 n_input//8)
-            k_process: 활성화할 처리 뉴런 수 (None이면 n_process//8)
-            k_output: 활성화할 출력 뉴런 수 (None이면 n_output//8)
+            k_input: 선택할 입력 뉴런 수 (None이면 n_input//8)
+            k_process: 선택할 처리 뉴런 수 (None이면 n_process//8)
 
         Returns:
             output: [B, S, d_model]
@@ -111,81 +190,58 @@ class ThreeStageFFN(nn.Module):
             k_input = max(self.n_input // 8, 64)
         if k_process is None:
             k_process = max(self.n_process // 8, 32)
-        if k_output is None:
-            k_output = max(self.n_output // 8, 64)
 
-        # ===== Stage 1: Input Neuron Activation =====
-        # 토큰별로 계산 (입력 해석은 토큰별로 다름)
-        input_scores = x @ self.input_patterns.T  # [B, S, n_input]
-        input_acts = F.gelu(input_scores)
+        # ===== Phase 1: Global Router =====
+        # 시퀀스별로 입력 뉴런 선택 (거시적 결정)
+        input_idx, routing_scores = self.global_router(x, k_input)
+        # input_idx: [B, k_input]
 
-        # 시퀀스별 평균으로 뉴런 선택 (핵심!)
-        input_acts_seq = input_acts.mean(dim=1)  # [B, n_input]
-        top_input_acts, top_input_idx = input_acts_seq.topk(k_input, dim=-1)
-        # [B, k_input] - 시퀀스별로만 다름!
+        # ===== Phase 2: Input Neurons =====
+        # 모든 입력 뉴런의 토큰별 activation 계산
+        input_acts = F.gelu(x @ self.input_patterns.T)  # [B, S, n_input]
 
-        # ===== Stage 2: Process Neuron Activation =====
-        # 선택된 입력 뉴런의 토큰별 activation
+        # 선택된 입력 뉴런의 activation만 추출
+        expanded_input_idx = input_idx.unsqueeze(1).expand(-1, S, -1)
         # [B, S, k_input]
-        expanded_idx = top_input_idx.unsqueeze(1).expand(-1, S, -1)
-        selected_input_acts = torch.gather(input_acts, 2, expanded_idx)
+        selected_input_acts = torch.gather(input_acts, 2, expanded_input_idx)
+        # [B, S, k_input]
 
-        # Sparse representation (시퀀스별로 같은 뉴런)
-        input_repr = torch.zeros(B, self.n_input, device=x.device, dtype=x.dtype)
-        input_repr.scatter_(1, top_input_idx, top_input_acts.to(input_repr.dtype))  # [B, n_input]
+        # ===== Phase 3: Process Neurons =====
+        # 배치별로 처리 (각 시퀀스가 다른 입력 뉴런 사용)
+        outputs = []
 
-        # Process neuron activation
-        process_scores = input_repr @ self.process_input_weights.T  # [B, n_process]
-        process_acts_seq = F.gelu(process_scores)
+        for b in range(B):
+            # 이 시퀀스의 입력 뉴런 인덱스
+            idx_b = input_idx[b]  # [k_input]
+            acts_b = selected_input_acts[b]  # [S, k_input]
 
-        # 시퀀스별로 처리 뉴런 선택
-        top_process_acts, top_process_idx = process_acts_seq.topk(k_process, dim=-1)
-        # [B, k_process]
+            # Sparse representation 생성
+            # [S, n_input] - 선택된 뉴런만 활성화
+            input_repr = torch.zeros(
+                S, self.n_input,
+                device=x.device,
+                dtype=x.dtype
+            )
+            input_repr.scatter_(1, idx_b.unsqueeze(0).expand(S, -1), acts_b)
 
-        # 선택된 처리 뉴런의 values
-        selected_process_values = self.process_values[top_process_idx]  # [B, k_process, d_process_value]
+            # 처리 뉴런 활성화 (단순 계산)
+            process_acts = F.gelu(input_repr @ self.process_weights.T)
+            # [S, n_process]
 
-        # Value aggregation
-        process_weights = F.softmax(top_process_acts, dim=-1)  # [B, k_process]
-        aggregated_value = torch.einsum('bk,bkd->bd',
-                                       process_weights,
-                                       selected_process_values)
-        # [B, d_process_value]
+            # 처리 뉴런 선택 (시퀀스 평균 기준)
+            process_scores = process_acts.mean(dim=0)  # [n_process]
+            _, process_idx = process_scores.topk(k_process)  # [k_process]
 
-        aggregated_value = self.dropout(aggregated_value)
+            # 선택된 처리 뉴런의 출력
+            selected_process_acts = process_acts[:, process_idx]  # [S, k_process]
+            selected_process_outputs = self.process_outputs[process_idx]  # [k_process, d_model]
 
-        # ===== Stage 3: Output Neuron Activation =====
-        # 시퀀스별로 뉴런 선택
-        output_scores = aggregated_value @ self.output_input_weights.T  # [B, n_output]
-        output_acts_seq = F.gelu(output_scores)
+            # 최종 출력
+            output_b = selected_process_acts @ selected_process_outputs  # [S, d_model]
+            outputs.append(output_b)
 
-        top_output_acts_seq, top_output_idx_seq = output_acts_seq.topk(k_output, dim=-1)
-        # [B, k_output]
-
-        # 선택된 출력 뉴런의 패턴
-        selected_output_patterns = self.output_patterns[top_output_idx_seq]
-        # [B, k_output, d_model] - 메모리 효율적!
-
-        # 토큰별 activation 계산 (하지만 같은 뉴런 사용)
-        # aggregated_value를 토큰별로 확장
-        aggregated_value_expanded = aggregated_value.unsqueeze(1).expand(-1, S, -1)
-        # [B, S, d_process_value]
-
-        token_output_scores = aggregated_value_expanded @ self.output_input_weights.T
-        # [B, S, n_output]
-        token_output_acts = F.gelu(token_output_scores)
-
-        # 선택된 뉴런의 activation만 추출
-        expanded_output_idx = top_output_idx_seq.unsqueeze(1).expand(-1, S, -1)
-        # [B, S, k_output]
-        selected_output_acts = torch.gather(token_output_acts, 2, expanded_output_idx)
-        # [B, S, k_output]
-
-        # 최종 출력
-        output = torch.einsum('bsk,bkm->bsm',
-                             selected_output_acts,
-                             selected_output_patterns)
-        # [B, S, d_model]
+        output = torch.stack(outputs, dim=0)  # [B, S, d_model]
+        output = self.dropout(output)
 
         return output
 
@@ -193,68 +249,63 @@ class ThreeStageFFN(nn.Module):
         self,
         x: torch.Tensor,
         k_input: Optional[int] = None,
-        k_process: Optional[int] = None,
-        k_output: Optional[int] = None
+        k_process: Optional[int] = None
     ) -> dict:
-        """
-        디버깅/분석용: 각 단계의 뉴런 활성화 통계
-        """
+        """디버깅/분석용 통계"""
         B, S, _ = x.shape
 
         if k_input is None:
             k_input = max(self.n_input // 8, 64)
         if k_process is None:
             k_process = max(self.n_process // 8, 32)
-        if k_output is None:
-            k_output = max(self.n_output // 8, 64)
 
         with torch.no_grad():
-            # Stage 1
+            # Global Router
+            input_idx, routing_scores = self.global_router(x, k_input)
+
+            # Input Neurons
             input_acts = F.gelu(x @ self.input_patterns.T)
-            input_acts_seq = input_acts.mean(dim=1)
-            top_input_acts, top_input_idx = input_acts_seq.topk(k_input, dim=-1)
+            expanded_idx = input_idx.unsqueeze(1).expand(-1, S, -1)
+            selected_input_acts = torch.gather(input_acts, 2, expanded_idx)
 
-            # Stage 2
-            input_repr = torch.zeros(B, self.n_input, device=x.device, dtype=x.dtype)
-            input_repr.scatter_(1, top_input_idx, top_input_acts.to(input_repr.dtype))
-            process_acts = F.gelu(input_repr @ self.process_input_weights.T)
-            top_process_acts, top_process_idx = process_acts.topk(k_process, dim=-1)
+            # Process Neurons (첫 번째 시퀀스만)
+            idx_0 = input_idx[0]
+            acts_0 = selected_input_acts[0]
 
-            # Stage 3
-            selected_process_values = self.process_values[top_process_idx]
-            process_weights = F.softmax(top_process_acts, dim=-1)
-            aggregated_value = torch.einsum('bk,bkd->bd', process_weights, selected_process_values)
-            output_acts = F.gelu(aggregated_value @ self.output_input_weights.T)
-            top_output_acts, top_output_idx = output_acts.topk(k_output, dim=-1)
+            input_repr = torch.zeros(S, self.n_input, device=x.device, dtype=x.dtype)
+            input_repr.scatter_(1, idx_0.unsqueeze(0).expand(S, -1), acts_0)
+
+            process_acts = F.gelu(input_repr @ self.process_weights.T)
+            process_scores = process_acts.mean(dim=0)
+            top_process_scores, process_idx = process_scores.topk(k_process)
 
             return {
+                'global_router': {
+                    'input_indices': input_idx.cpu(),  # [B, k_input]
+                    'routing_scores': routing_scores.cpu(),
+                    'mean_score': routing_scores.mean().item()
+                },
                 'input_neurons': {
-                    'indices': top_input_idx.cpu(),  # [B, k_input]
-                    'activations': top_input_acts.cpu(),
-                    'mean_activation': top_input_acts.mean().item(),
+                    'indices': input_idx.cpu(),
+                    'activations': selected_input_acts.mean(dim=1).cpu(),  # [B, k_input]
+                    'mean_activation': selected_input_acts.mean().item(),
                     'sparsity': k_input / self.n_input
                 },
                 'process_neurons': {
-                    'indices': top_process_idx.cpu(),  # [B, k_process]
-                    'activations': top_process_acts.cpu(),
-                    'mean_activation': top_process_acts.mean().item(),
+                    'indices': process_idx.cpu(),  # [k_process]
+                    'activations': top_process_scores.cpu(),
+                    'mean_activation': top_process_scores.mean().item(),
                     'sparsity': k_process / self.n_process
-                },
-                'output_neurons': {
-                    'indices': top_output_idx.cpu(),  # [B, k_output]
-                    'activations': top_output_acts.cpu(),
-                    'mean_activation': top_output_acts.mean().item(),
-                    'sparsity': k_output / self.n_output
                 }
             }
 
 
 # ============================================================
-# Transformer Layer with Three-Stage FFN
+# Transformer Layer with Hierarchical FFN
 # ============================================================
 
-class TransformerLayerWithThreeStageFFN(nn.Module):
-    """Transformer layer with Three-Stage Dynamic FFN"""
+class TransformerLayerWithHierarchicalFFN(nn.Module):
+    """Transformer layer with Hierarchical Dynamic FFN"""
 
     def __init__(
         self,
@@ -262,8 +313,7 @@ class TransformerLayerWithThreeStageFFN(nn.Module):
         n_heads: int,
         n_input_neurons: int = 2048,
         n_process_neurons: int = 1024,
-        n_output_neurons: int = 2048,
-        d_process_value: int = 256,
+        d_routing: int = 256,
         dropout: float = 0.1,
         use_checkpoint: bool = False
     ):
@@ -273,12 +323,11 @@ class TransformerLayerWithThreeStageFFN(nn.Module):
             d_model, n_heads, dropout=dropout, batch_first=True
         )
 
-        self.ffn = ThreeStageFFN(
+        self.ffn = HierarchicalDynamicFFN(
             d_model=d_model,
             n_input_neurons=n_input_neurons,
             n_process_neurons=n_process_neurons,
-            n_output_neurons=n_output_neurons,
-            d_process_value=d_process_value,
+            d_routing=d_routing,
             dropout=dropout
         )
 
@@ -292,9 +341,9 @@ class TransformerLayerWithThreeStageFFN(nn.Module):
         attn_out, _ = self.attention(x_norm, x_norm, x_norm, key_padding_mask=attention_mask)
         return self.dropout(attn_out)
 
-    def _ffn_block(self, x, k_input, k_process, k_output):
+    def _ffn_block(self, x, k_input, k_process):
         x_norm = self.norm2(x)
-        ffn_out = self.ffn(x_norm, k_input, k_process, k_output)
+        ffn_out = self.ffn(x_norm, k_input, k_process)
         return self.dropout(ffn_out)
 
     def forward(
@@ -302,8 +351,7 @@ class TransformerLayerWithThreeStageFFN(nn.Module):
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         k_input: Optional[int] = None,
-        k_process: Optional[int] = None,
-        k_output: Optional[int] = None
+        k_process: Optional[int] = None
     ) -> torch.Tensor:
         # Attention
         if self.use_checkpoint and self.training:
@@ -314,20 +362,20 @@ class TransformerLayerWithThreeStageFFN(nn.Module):
 
         # FFN
         if self.use_checkpoint and self.training:
-            ffn_out = checkpoint(self._ffn_block, x, k_input, k_process, k_output, use_reentrant=False)
+            ffn_out = checkpoint(self._ffn_block, x, k_input, k_process, use_reentrant=False)
         else:
-            ffn_out = self._ffn_block(x, k_input, k_process, k_output)
+            ffn_out = self._ffn_block(x, k_input, k_process)
         x = x + ffn_out
 
         return x
 
 
 # ============================================================
-# Language Model with Three-Stage FFN
+# Language Model with Hierarchical FFN
 # ============================================================
 
-class ThreeStageLanguageModel(nn.Module):
-    """Language Model with Three-Stage Dynamic Neuron FFN"""
+class HierarchicalLanguageModel(nn.Module):
+    """Language Model with Hierarchical Dynamic Neuron FFN"""
 
     def __init__(
         self,
@@ -338,8 +386,7 @@ class ThreeStageLanguageModel(nn.Module):
         max_seq_len: int = 512,
         n_input_neurons: int = 2048,
         n_process_neurons: int = 1024,
-        n_output_neurons: int = 2048,
-        d_process_value: int = 256,
+        d_routing: int = 256,
         dropout: float = 0.1,
         gradient_checkpointing: bool = False
     ):
@@ -356,13 +403,12 @@ class ThreeStageLanguageModel(nn.Module):
 
         # Transformer Layers
         self.layers = nn.ModuleList([
-            TransformerLayerWithThreeStageFFN(
+            TransformerLayerWithHierarchicalFFN(
                 d_model=d_model,
                 n_heads=n_heads,
                 n_input_neurons=n_input_neurons,
                 n_process_neurons=n_process_neurons,
-                n_output_neurons=n_output_neurons,
-                d_process_value=d_process_value,
+                d_routing=d_routing,
                 dropout=dropout,
                 use_checkpoint=gradient_checkpointing
             )
@@ -388,15 +434,15 @@ class ThreeStageLanguageModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         k_input: Optional[int] = None,
-        k_process: Optional[int] = None,
-        k_output: Optional[int] = None
+        k_process: Optional[int] = None
     ) -> dict:
         """
         Args:
             input_ids: [B, S]
             attention_mask: [B, S]
             labels: [B, S]
-            k_input, k_process, k_output: 각 단계의 뉴런 수
+            k_input: 입력 뉴런 수
+            k_process: 처리 뉴런 수
 
         Returns:
             dict with 'logits', 'loss'
@@ -413,7 +459,7 @@ class ThreeStageLanguageModel(nn.Module):
 
         # Transformer layers
         for layer in self.layers:
-            x = layer(x, attention_mask, k_input, k_process, k_output)
+            x = layer(x, attention_mask, k_input, k_process)
 
         x = self.norm(x)
         logits = self.output_projection(x)  # [B, S, vocab_size]
@@ -440,11 +486,19 @@ class ThreeStageLanguageModel(nn.Module):
             for layer in self.layers
         )
 
+        # Global Router 파라미터
+        router_params = sum(
+            sum(p.numel() for p in layer.ffn.global_router.parameters())
+            for layer in self.layers
+        )
+
         return {
             'total_parameters': total_params,
             'trainable_parameters': trainable_params,
             'ffn_parameters': ffn_params,
+            'router_parameters': router_params,
             'ffn_percentage': ffn_params / total_params * 100,
+            'router_percentage': router_params / total_params * 100,
             'n_layers': self.n_layers,
             'vocab_size': self.vocab_size,
             'd_model': self.d_model
@@ -467,23 +521,23 @@ def count_parameters(model: nn.Module) -> dict:
     }
 
 
-def analyze_neuron_usage(
-    model: ThreeStageLanguageModel,
+def analyze_routing_patterns(
+    model: HierarchicalLanguageModel,
     dataloader,
     device: str = 'cuda',
     n_batches: int = 10
 ) -> dict:
     """
-    뉴런 사용 패턴 분석
-    - 어떤 뉴런이 자주 사용되는가?
-    - 입력 복잡도별 뉴런 사용량은?
+    라우팅 패턴 분석
+    - Global Router가 어떤 뉴런을 선택하는가?
+    - 문맥에 따라 다른 뉴런이 선택되는가?
     """
     model.eval()
 
     input_neuron_counts = torch.zeros(model.layers[0].ffn.n_input)
     process_neuron_counts = torch.zeros(model.layers[0].ffn.n_process)
-    output_neuron_counts = torch.zeros(model.layers[0].ffn.n_output)
 
+    routing_scores_all = []
     total_sequences = 0
 
     with torch.no_grad():
@@ -507,32 +561,37 @@ def analyze_neuron_usage(
 
             stats = layer.ffn.get_neuron_stats(x_norm)
 
-            # Count neuron usage (시퀀스별)
+            # Count neuron usage
             input_idx = stats['input_neurons']['indices'].flatten()
             process_idx = stats['process_neurons']['indices'].flatten()
-            output_idx = stats['output_neurons']['indices'].flatten()
 
             for idx in input_idx:
                 input_neuron_counts[idx] += 1
             for idx in process_idx:
                 process_neuron_counts[idx] += 1
-            for idx in output_idx:
-                output_neuron_counts[idx] += 1
+
+            # Collect routing scores
+            routing_scores_all.append(stats['global_router']['routing_scores'])
+
+    routing_scores_all = torch.cat(routing_scores_all, dim=0)  # [total_seqs, k_input]
 
     return {
         'input_neuron_usage': input_neuron_counts / total_sequences,
         'process_neuron_usage': process_neuron_counts / total_sequences,
-        'output_neuron_usage': output_neuron_counts / total_sequences,
-        'total_sequences': total_sequences
+        'routing_score_mean': routing_scores_all.mean().item(),
+        'routing_score_std': routing_scores_all.std().item(),
+        'total_sequences': total_sequences,
+        'unique_input_neurons_used': (input_neuron_counts > 0).sum().item(),
+        'unique_process_neurons_used': (process_neuron_counts > 0).sum().item()
     }
 
 
 if __name__ == '__main__':
     # 간단한 테스트
-    print("Testing Three-Stage Dynamic Neuron FFN...")
+    print("Testing Hierarchical Dynamic Neuron FFN...")
 
     # 모델 생성
-    model = ThreeStageLanguageModel(
+    model = HierarchicalLanguageModel(
         vocab_size=30000,
         d_model=512,
         n_heads=8,
@@ -540,8 +599,7 @@ if __name__ == '__main__':
         max_seq_len=512,
         n_input_neurons=2048,
         n_process_neurons=1024,
-        n_output_neurons=2048,
-        d_process_value=256
+        d_routing=256
     )
 
     # 통계 출력
@@ -550,6 +608,7 @@ if __name__ == '__main__':
     print(f"  Total parameters: {stats['total_parameters']:,}")
     print(f"  Trainable parameters: {stats['trainable_parameters']:,}")
     print(f"  FFN parameters: {stats['ffn_parameters']:,} ({stats['ffn_percentage']:.1f}%)")
+    print(f"  Router parameters: {stats['router_parameters']:,} ({stats['router_percentage']:.1f}%)")
 
     # Forward pass 테스트
     batch_size = 4
@@ -567,6 +626,9 @@ if __name__ == '__main__':
     x = model.token_embedding(input_ids)
     neuron_stats = layer0_ffn.get_neuron_stats(x)
 
+    print(f"  Global Router:")
+    print(f"    Mean routing score: {neuron_stats['global_router']['mean_score']:.4f}")
+
     print(f"  Input neurons:")
     print(f"    Selected: {neuron_stats['input_neurons']['sparsity']*100:.1f}%")
     print(f"    Mean activation: {neuron_stats['input_neurons']['mean_activation']:.4f}")
@@ -574,9 +636,5 @@ if __name__ == '__main__':
     print(f"  Process neurons:")
     print(f"    Selected: {neuron_stats['process_neurons']['sparsity']*100:.1f}%")
     print(f"    Mean activation: {neuron_stats['process_neurons']['mean_activation']:.4f}")
-
-    print(f"  Output neurons:")
-    print(f"    Selected: {neuron_stats['output_neurons']['sparsity']*100:.1f}%")
-    print(f"    Mean activation: {neuron_stats['output_neurons']['mean_activation']:.4f}")
 
     print(f"\n✓ All tests passed!")
