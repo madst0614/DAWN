@@ -109,14 +109,19 @@ class GlobalRouter(nn.Module):
         _, input_idx = routing_logits.topk(k_input, dim=-1)
         # [B, k_input]
 
-        # Straight-through estimator:
-        # Forward: hard selection (one-hot mask)
-        # Backward: soft gradient (routing_probs)
-        hard_mask = torch.zeros_like(routing_probs)  # [B, n_input]
-        hard_mask.scatter_(1, input_idx, 1.0)
+        # One-hot encoding for selected neurons
+        one_hot = torch.zeros_like(routing_probs)  # [B, n_input]
+        one_hot.scatter_(1, input_idx, 1.0)
 
-        # This maintains gradient flow to neuron_keys!
-        routing_weights = hard_mask + (routing_probs - routing_probs.detach())
+        # Straight-through estimator (CORRECT implementation):
+        # Forward: one_hot (hard, discrete, sparse)
+        # Backward: routing_probs (soft, continuous, dense gradient)
+        routing_weights = (one_hot - routing_probs).detach() + routing_probs
+        # Equivalently: one_hot + (routing_probs - one_hot).detach()
+        #
+        # Forward pass: one_hot - routing_probs + routing_probs = one_hot
+        # Backward pass: d(routing_weights)/d(routing_probs) = 0 + 1 = 1
+        #                (detach blocks gradient from one_hot - routing_probs)
         # [B, n_input]
 
         return input_idx, routing_weights
