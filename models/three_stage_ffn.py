@@ -29,13 +29,15 @@ class GlobalRouter(nn.Module):
         d_model: int = 512,
         n_input_neurons: int = 2048,
         d_routing: int = 256,
-        use_mlp: bool = True
+        use_mlp: bool = True,
+        temperature: float = 0.5  # Lower temperature = smoother routing
     ):
         super().__init__()
 
         self.d_routing = d_routing
         self.n_input = n_input_neurons
         self.use_mlp = use_mlp
+        self.temperature = temperature
 
         if use_mlp:
             self.query_net = nn.Sequential(
@@ -96,9 +98,9 @@ class GlobalRouter(nn.Module):
         routing_logits = (query @ self.neuron_keys.T) / (self.d_routing ** 0.5)
         # [B, n_input]
 
-        # Soft routing for gradient flow
-        routing_probs = F.softmax(routing_logits / 1.0, dim=-1)
-        # [B, n_input]
+        # Soft routing for gradient flow (with temperature for smoother distribution)
+        routing_probs = F.softmax(routing_logits / self.temperature, dim=-1)
+        # [B, n_input] - Lower temperature = more uniform, Higher = more peaked
 
         # Hard selection (top-k)
         _, input_idx = routing_logits.topk(k_input, dim=-1)
@@ -132,7 +134,8 @@ class HierarchicalDynamicFFN(nn.Module):
         n_input_neurons: int = 2048,
         n_process_neurons: int = 1024,
         d_routing: int = 256,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        temperature: float = 0.5  # Routing temperature
     ):
         super().__init__()
 
@@ -146,7 +149,8 @@ class HierarchicalDynamicFFN(nn.Module):
             d_model=d_model,
             n_input_neurons=n_input_neurons,
             d_routing=d_routing,
-            use_mlp=True
+            use_mlp=True,
+            temperature=temperature
         )
 
         # ===== Phase 2: Input Neurons =====
@@ -470,7 +474,8 @@ class TransformerLayerWithHierarchicalFFN(nn.Module):
         n_process_neurons: int = 1024,
         d_routing: int = 256,
         dropout: float = 0.1,
-        use_checkpoint: bool = False
+        use_checkpoint: bool = False,
+        temperature: float = 0.5  # Routing temperature
     ):
         super().__init__()
 
@@ -483,7 +488,8 @@ class TransformerLayerWithHierarchicalFFN(nn.Module):
             n_input_neurons=n_input_neurons,
             n_process_neurons=n_process_neurons,
             d_routing=d_routing,
-            dropout=dropout
+            dropout=dropout,
+            temperature=temperature
         )
 
         self.norm1 = nn.LayerNorm(d_model)
@@ -552,7 +558,8 @@ class HierarchicalLanguageModel(nn.Module):
         n_process_neurons: int = 1024,
         d_routing: int = 256,
         dropout: float = 0.1,
-        gradient_checkpointing: bool = False
+        gradient_checkpointing: bool = False,
+        temperature: float = 0.5  # Routing temperature (lower = smoother)
     ):
         super().__init__()
 
@@ -574,7 +581,8 @@ class HierarchicalLanguageModel(nn.Module):
                 n_process_neurons=n_process_neurons,
                 d_routing=d_routing,
                 dropout=dropout,
-                use_checkpoint=gradient_checkpointing
+                use_checkpoint=gradient_checkpointing,
+                temperature=temperature
             )
             for _ in range(n_layers)
         ])

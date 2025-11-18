@@ -906,11 +906,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         optimizer.zero_grad()
 
         # Mixed precision training
-        # Dynamic aux weight: stronger in early epochs
-        if epoch <= 5:
-            aux_weight = 0.5  # Strong regularization initially (was 0.05)
+        # Dynamic aux weight: MUCH stronger to overcome tiny loss values
+        # aux_loss is ~0.0008 due to normalization by n_neurons, so need 100x+ multiplier
+        if epoch <= 3:
+            aux_weight = 100.0  # Very strong routing signal initially
+        elif epoch <= 10:
+            aux_weight = 50.0   # Strong routing signal
         else:
-            aux_weight = 0.1  # Moderate regularization later (was 0.01)
+            aux_weight = 10.0   # Moderate routing signal
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -1399,12 +1402,28 @@ def main():
     print(f"  Process neurons: {k_process_actual}/{args.n_process_neurons} ({k_process_actual/args.n_process_neurons*100:.1f}%)")
 
     # Optimizer & Scheduler
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
+    # Separate parameter groups: Router gets 10x higher LR for faster learning
+    router_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if 'neuron_keys' in name or 'query_net' in name:
+            router_params.append(param)
+        else:
+            other_params.append(param)
+
+    print(f"\nOptimizer parameter groups:")
+    print(f"  Router params: {len(router_params)} tensors (neuron_keys, query_net)")
+    print(f"  Other params: {len(other_params)} tensors")
+    print(f"  Router LR: {args.lr * 10.0:.2e} (10x base)")
+    print(f"  Other LR: {args.lr:.2e}")
+
+    optimizer = torch.optim.AdamW([
+        {'params': router_params, 'lr': args.lr * 10.0, 'weight_decay': 0.001},  # 10x LR, less decay
+        {'params': other_params, 'lr': args.lr, 'weight_decay': 0.01}
+    ],
         betas=(0.9, 0.98),
-        eps=1e-9,
-        weight_decay=0.01
+        eps=1e-9
     )
 
     # Warmup + Cosine Annealing scheduler
