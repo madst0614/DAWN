@@ -571,7 +571,7 @@ class HierarchicalLanguageModel(nn.Module):
         # Loss
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)  # Ignore masked tokens
             loss = loss_fct(logits.view(-1, self.vocab_size), labels.view(-1))
 
         return {
