@@ -350,8 +350,10 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10):
 
     with torch.no_grad():
         # Embedding 출력
+        B, S = x.shape
         token_emb = model.token_embedding(x)
-        pos_emb = model.pos_embedding(torch.arange(x.size(1), device=x.device).unsqueeze(0))
+        positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
+        pos_emb = model.position_embedding(positions)
         x_emb = token_emb + pos_emb
 
         print(f"\n[Embedding Layer]")
@@ -453,8 +455,10 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10):
     with torch.no_grad():
         # Routing pattern 변화
         layer0_ffn = model.layers[0].ffn
+        B, S = x.shape
         token_emb = model.token_embedding(x)
-        pos_emb = model.pos_embedding(torch.arange(x.size(1), device=x.device).unsqueeze(0))
+        positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
+        pos_emb = model.position_embedding(positions)
         x_emb = token_emb + pos_emb
 
         # Get routing info
