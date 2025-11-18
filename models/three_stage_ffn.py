@@ -162,8 +162,8 @@ class HierarchicalDynamicFFN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Routing 통계 저장 (load balancing용)
-        self.register_buffer('input_routing_counts', torch.zeros(n_input))
-        self.register_buffer('process_routing_counts', torch.zeros(n_process))
+        self.register_buffer('input_routing_counts', torch.zeros(n_input_neurons))
+        self.register_buffer('process_routing_counts', torch.zeros(n_process_neurons))
 
         self._init_weights()
 
