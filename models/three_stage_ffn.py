@@ -1,5 +1,5 @@
 """
-Three-Stage Dynamic Neuron FFN
+Three-Stage Dynamic Neuron FFN - Sequence-level Selection
 
 구조:
 1. Input Neurons: 입력 패턴 감지 및 해석
@@ -7,7 +7,7 @@ Three-Stage Dynamic Neuron FFN
 3. Output Neurons: 처리 결과를 출력 공간으로 변환
 
 특징:
-- 입력마다 다른 신경 회로 동적 형성
+- 시퀀스별로 뉴런 조합 선택 (메모리 효율적)
 - Sparse activation으로 효율성
 - 조합 폭발을 통한 창발적 표현
 """
@@ -25,19 +25,11 @@ from torch.utils.checkpoint import checkpoint
 
 class ThreeStageFFN(nn.Module):
     """
-    3단계 동적 뉴런 FFN
+    3단계 동적 뉴런 FFN (시퀀스별 선택)
 
-    Stage 1 (Input Neurons): 입력 해석
-    - 각 뉴런이 특정 입력 패턴 감지
-    - Top-k 선택으로 sparse activation
-
-    Stage 2 (Process Neurons): 조합 처리
-    - 입력 뉴런 조합을 인식하고 처리
-    - 내부 표현(value)으로 의미 생성
-
-    Stage 3 (Output Neurons): 출력 생성
-    - 처리 결과를 d_model 차원으로 변환
-    - 다양한 출력 패턴 생성
+    핵심: 한 시퀀스 내 모든 토큰이 같은 뉴런 조합 사용
+    - 메모리 효율성 대폭 향상
+    - 각 시퀀스가 고유한 신경 회로를 가짐
     """
 
     def __init__(
@@ -123,67 +115,77 @@ class ThreeStageFFN(nn.Module):
             k_output = max(self.n_output // 8, 64)
 
         # ===== Stage 1: Input Neuron Activation =====
+        # 토큰별로 계산 (입력 해석은 토큰별로 다름)
         input_scores = x @ self.input_patterns.T  # [B, S, n_input]
         input_acts = F.gelu(input_scores)
 
-        # Top-k 입력 뉴런 선택
-        top_input_acts, top_input_idx = input_acts.topk(k_input, dim=-1)
-        # [B, S, k_input]
+        # 시퀀스별 평균으로 뉴런 선택 (핵심!)
+        input_acts_seq = input_acts.mean(dim=1)  # [B, n_input]
+        top_input_acts, top_input_idx = input_acts_seq.topk(k_input, dim=-1)
+        # [B, k_input] - 시퀀스별로만 다름!
 
         # ===== Stage 2: Process Neuron Activation =====
-        # Sparse representation: 선택된 입력 뉴런만 활성화
-        input_repr = torch.zeros(
-            B, S, self.n_input,
-            device=x.device,
-            dtype=x.dtype
-        )
-        # Ensure dtype compatibility for scatter operation
-        input_repr.scatter_(2, top_input_idx, top_input_acts.to(input_repr.dtype))
-        # [B, S, n_input]
+        # 선택된 입력 뉴런의 토큰별 activation
+        # [B, S, k_input]
+        expanded_idx = top_input_idx.unsqueeze(1).expand(-1, S, -1)
+        selected_input_acts = torch.gather(input_acts, 2, expanded_idx)
 
-        # 처리 뉴런 활성화
-        process_scores = input_repr @ self.process_input_weights.T
-        process_acts = F.gelu(process_scores)  # [B, S, n_process]
+        # Sparse representation (시퀀스별로 같은 뉴런)
+        input_repr = torch.zeros(B, self.n_input, device=x.device, dtype=x.dtype)
+        input_repr.scatter_(1, top_input_idx, top_input_acts.to(input_repr.dtype))  # [B, n_input]
 
-        # Top-k 처리 뉴런 선택
-        top_process_acts, top_process_idx = process_acts.topk(k_process, dim=-1)
-        # [B, S, k_process]
+        # Process neuron activation
+        process_scores = input_repr @ self.process_input_weights.T  # [B, n_process]
+        process_acts_seq = F.gelu(process_scores)
 
-        # 선택된 처리 뉴런들의 value 가져오기
-        selected_process_values = self.process_values[top_process_idx]
-        # [B, S, k_process, d_process_value]
+        # 시퀀스별로 처리 뉴런 선택
+        top_process_acts, top_process_idx = process_acts_seq.topk(k_process, dim=-1)
+        # [B, k_process]
 
-        # 처리 뉴런들의 value를 가중 평균으로 조합
-        # Softmax로 정규화하여 안정적인 학습
-        process_weights = F.softmax(top_process_acts, dim=-1)  # [B, S, k_process]
+        # 선택된 처리 뉴런의 values
+        selected_process_values = self.process_values[top_process_idx]  # [B, k_process, d_process_value]
 
-        # Weighted sum of values
-        aggregated_value = torch.einsum(
-            'bsk,bskd->bsd',
-            process_weights,
-            selected_process_values
-        )  # [B, S, d_process_value]
+        # Value aggregation
+        process_weights = F.softmax(top_process_acts, dim=-1)  # [B, k_process]
+        aggregated_value = torch.einsum('bk,bkd->bd',
+                                       process_weights,
+                                       selected_process_values)
+        # [B, d_process_value]
 
         aggregated_value = self.dropout(aggregated_value)
 
         # ===== Stage 3: Output Neuron Activation =====
-        output_scores = aggregated_value @ self.output_input_weights.T
-        output_acts = F.gelu(output_scores)  # [B, S, n_output]
+        # 시퀀스별로 뉴런 선택
+        output_scores = aggregated_value @ self.output_input_weights.T  # [B, n_output]
+        output_acts_seq = F.gelu(output_scores)
 
-        # Top-k 출력 뉴런 선택
-        top_output_acts, top_output_idx = output_acts.topk(k_output, dim=-1)
+        top_output_acts_seq, top_output_idx_seq = output_acts_seq.topk(k_output, dim=-1)
+        # [B, k_output]
+
+        # 선택된 출력 뉴런의 패턴
+        selected_output_patterns = self.output_patterns[top_output_idx_seq]
+        # [B, k_output, d_model] - 메모리 효율적!
+
+        # 토큰별 activation 계산 (하지만 같은 뉴런 사용)
+        # aggregated_value를 토큰별로 확장
+        aggregated_value_expanded = aggregated_value.unsqueeze(1).expand(-1, S, -1)
+        # [B, S, d_process_value]
+
+        token_output_scores = aggregated_value_expanded @ self.output_input_weights.T
+        # [B, S, n_output]
+        token_output_acts = F.gelu(token_output_scores)
+
+        # 선택된 뉴런의 activation만 추출
+        expanded_output_idx = top_output_idx_seq.unsqueeze(1).expand(-1, S, -1)
+        # [B, S, k_output]
+        selected_output_acts = torch.gather(token_output_acts, 2, expanded_output_idx)
         # [B, S, k_output]
 
-        # 선택된 출력 뉴런들의 출력 패턴
-        selected_output_patterns = self.output_patterns[top_output_idx]
-        # [B, S, k_output, d_model]
-
-        # 최종 출력 조합
-        output = torch.einsum(
-            'bsk,bskm->bsm',
-            top_output_acts,
-            selected_output_patterns
-        )  # [B, S, d_model]
+        # 최종 출력
+        output = torch.einsum('bsk,bkm->bsm',
+                             selected_output_acts,
+                             selected_output_patterns)
+        # [B, S, d_model]
 
         return output
 
@@ -209,36 +211,37 @@ class ThreeStageFFN(nn.Module):
         with torch.no_grad():
             # Stage 1
             input_acts = F.gelu(x @ self.input_patterns.T)
-            top_input_acts, top_input_idx = input_acts.topk(k_input, dim=-1)
+            input_acts_seq = input_acts.mean(dim=1)
+            top_input_acts, top_input_idx = input_acts_seq.topk(k_input, dim=-1)
 
             # Stage 2
-            input_repr = torch.zeros(B, S, self.n_input, device=x.device, dtype=x.dtype)
-            input_repr.scatter_(2, top_input_idx, top_input_acts.to(input_repr.dtype))
+            input_repr = torch.zeros(B, self.n_input, device=x.device, dtype=x.dtype)
+            input_repr.scatter_(1, top_input_idx, top_input_acts.to(input_repr.dtype))
             process_acts = F.gelu(input_repr @ self.process_input_weights.T)
             top_process_acts, top_process_idx = process_acts.topk(k_process, dim=-1)
 
             # Stage 3
             selected_process_values = self.process_values[top_process_idx]
             process_weights = F.softmax(top_process_acts, dim=-1)
-            aggregated_value = torch.einsum('bsk,bskd->bsd', process_weights, selected_process_values)
+            aggregated_value = torch.einsum('bk,bkd->bd', process_weights, selected_process_values)
             output_acts = F.gelu(aggregated_value @ self.output_input_weights.T)
             top_output_acts, top_output_idx = output_acts.topk(k_output, dim=-1)
 
             return {
                 'input_neurons': {
-                    'indices': top_input_idx.cpu(),
+                    'indices': top_input_idx.cpu(),  # [B, k_input]
                     'activations': top_input_acts.cpu(),
                     'mean_activation': top_input_acts.mean().item(),
                     'sparsity': k_input / self.n_input
                 },
                 'process_neurons': {
-                    'indices': top_process_idx.cpu(),
+                    'indices': top_process_idx.cpu(),  # [B, k_process]
                     'activations': top_process_acts.cpu(),
                     'mean_activation': top_process_acts.mean().item(),
                     'sparsity': k_process / self.n_process
                 },
                 'output_neurons': {
-                    'indices': top_output_idx.cpu(),
+                    'indices': top_output_idx.cpu(),  # [B, k_output]
                     'activations': top_output_acts.cpu(),
                     'mean_activation': top_output_acts.mean().item(),
                     'sparsity': k_output / self.n_output
@@ -481,7 +484,7 @@ def analyze_neuron_usage(
     process_neuron_counts = torch.zeros(model.layers[0].ffn.n_process)
     output_neuron_counts = torch.zeros(model.layers[0].ffn.n_output)
 
-    total_tokens = 0
+    total_sequences = 0
 
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
@@ -490,7 +493,7 @@ def analyze_neuron_usage(
 
             input_ids = batch['input_ids'].to(device)
             B, S = input_ids.shape
-            total_tokens += B * S
+            total_sequences += B
 
             # Get embeddings
             token_emb = model.token_embedding(input_ids)
@@ -504,7 +507,7 @@ def analyze_neuron_usage(
 
             stats = layer.ffn.get_neuron_stats(x_norm)
 
-            # Count neuron usage
+            # Count neuron usage (시퀀스별)
             input_idx = stats['input_neurons']['indices'].flatten()
             process_idx = stats['process_neurons']['indices'].flatten()
             output_idx = stats['output_neurons']['indices'].flatten()
@@ -517,10 +520,10 @@ def analyze_neuron_usage(
                 output_neuron_counts[idx] += 1
 
     return {
-        'input_neuron_usage': input_neuron_counts / total_tokens,
-        'process_neuron_usage': process_neuron_counts / total_tokens,
-        'output_neuron_usage': output_neuron_counts / total_tokens,
-        'total_tokens': total_tokens
+        'input_neuron_usage': input_neuron_counts / total_sequences,
+        'process_neuron_usage': process_neuron_counts / total_sequences,
+        'output_neuron_usage': output_neuron_counts / total_sequences,
+        'total_sequences': total_sequences
     }
 
 
