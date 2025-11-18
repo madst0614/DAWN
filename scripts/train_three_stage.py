@@ -314,6 +314,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     total_loss = 0
     total_tokens = 0
     total_correct = 0
+    total_valid_tokens = 0  # CRITICAL FIX: Track valid tokens only (labels != -100)
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for step, batch in enumerate(pbar):
@@ -333,7 +334,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             print(f"\n{'='*60}")
             print(f"Step {step + 1} Debugging")
             print(f"{'='*60}")
-            print(f"Before Forward:")
+
+            # CRITICAL: Label analysis for first step
+            if step == 0:
+                print(f"\n[Label Analysis]")
+                print(f"  Total tokens: {labels.numel()}")
+                print(f"  Masked tokens (-100): {(labels == -100).sum().item()}")
+                print(f"  Valid tokens: {(labels != -100).sum().item()}")
+                print(f"  Masking ratio: {(labels == -100).sum().item() / labels.numel() * 100:.1f}%")
+
+            print(f"\nBefore Forward:")
             print(f"  Input shape: {input_ids.shape}, range: [{input_ids.min()}, {input_ids.max()}]")
             print(f"  Model embedding norm: {model.token_embedding.weight.norm():.4f}")
 
@@ -549,11 +559,32 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         if scheduler is not None:
             scheduler.step()
 
-        # Calculate accuracy
-        predictions = logits.argmax(dim=-1)
-        correct = (predictions == labels).sum().item()
-        total_correct += correct
+        # ===== CRITICAL FIX: Accuracy calculation (only valid tokens) =====
+        predictions = logits.argmax(dim=-1)  # [B, S]
 
+        # Only count tokens that are not masked (-100)
+        valid_mask = (labels != -100)  # [B, S]
+        correct_predictions = (predictions == labels) & valid_mask
+
+        correct = correct_predictions.sum().item()
+        valid_tokens = valid_mask.sum().item()
+
+        total_correct += correct
+        total_valid_tokens += valid_tokens
+
+        # Debug prediction analysis
+        if debug_mode and step == 0:
+            print(f"\n[Prediction Analysis - First Sequence]")
+            seq_0_valid = valid_mask[0]
+            seq_0_labels = labels[0][seq_0_valid]
+            seq_0_preds = predictions[0][seq_0_valid]
+
+            print(f"  Valid tokens in seq 0: {seq_0_valid.sum().item()}")
+            print(f"  First 10 labels: {seq_0_labels[:10].cpu().tolist()}")
+            print(f"  First 10 preds:  {seq_0_preds[:10].cpu().tolist()}")
+            print(f"  Matches: {(seq_0_labels[:10] == seq_0_preds[:10]).sum().item()}/10")
+
+        # Loss는 전체 토큰 수로 계산 (기존 유지)
         batch_size, seq_len = input_ids.shape
         num_tokens = batch_size * seq_len
         total_loss += loss.item() * num_tokens
@@ -563,11 +594,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             "loss": f"{loss.item():.4f}",
             "aux": f"{aux_loss.item():.4f}",
             "w_aux": f"{(aux_weight * aux_loss).item():.5f}",
-            "acc": f"{correct / num_tokens:.4f}"
+            "acc": f"{correct / valid_tokens:.4f}" if valid_tokens > 0 else "0.0000"
         })
 
     avg_loss = total_loss / total_tokens
-    avg_acc = total_correct / total_tokens
+    avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
     return avg_loss, avg_acc
 
 
@@ -577,6 +608,7 @@ def evaluate(model, dataloader, device, args):
     total_loss = 0
     total_tokens = 0
     total_correct = 0
+    total_valid_tokens = 0  # CRITICAL FIX: Track valid tokens only
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
@@ -592,10 +624,18 @@ def evaluate(model, dataloader, device, args):
             loss = outputs['loss']
             logits = outputs['logits']
 
-            # Calculate accuracy
+            # ===== CRITICAL FIX: Accuracy calculation (only valid tokens) =====
             predictions = logits.argmax(dim=-1)
-            correct = (predictions == labels).sum().item()
+
+            # Only count tokens that are not masked (-100)
+            valid_mask = (labels != -100)
+            correct_predictions = (predictions == labels) & valid_mask
+
+            correct = correct_predictions.sum().item()
+            valid_tokens = valid_mask.sum().item()
+
             total_correct += correct
+            total_valid_tokens += valid_tokens
 
             batch_size, seq_len = input_ids.shape
             num_tokens = batch_size * seq_len
@@ -603,7 +643,7 @@ def evaluate(model, dataloader, device, args):
             total_tokens += num_tokens
 
     avg_loss = total_loss / total_tokens
-    avg_acc = total_correct / total_tokens
+    avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
     return avg_loss, avg_acc
 
 
