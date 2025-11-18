@@ -266,8 +266,8 @@ def main():
         train_module.MLM_CONFIG
     )
 
-    # 라벨 분석
-    analyze_labels(input_ids, labels, tokenizer)
+    # 라벨 분석 (FIXED: Use masked input_ids, not original)
+    analyze_labels(input_ids_masked, labels, tokenizer)
 
     print("\n" + "="*70)
     print("ANALYSIS COMPLETE")
