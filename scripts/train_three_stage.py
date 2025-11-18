@@ -318,6 +318,251 @@ def comprehensive_debug(
 
 
 # ============================================================
+# Deep Learning Analysis Function
+# ============================================================
+
+def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10):
+    """
+    학습 과정의 본질적 정보 추출 - 정보 흐름, gradient 흐름, 라우팅, weight 분포 등 심층 분석
+
+    Args:
+        model: HierarchicalLanguageModel
+        x: Input token IDs [B, S]
+        labels: Labels [B, S]
+        step: Current step
+        debug_first_n_steps: Debug first N steps only
+    """
+    if step > debug_first_n_steps:
+        return
+
+    import torch.nn.functional as F
+    from collections import Counter
+
+    print(f"\n{'='*70}")
+    print(f"🔬 DEEP LEARNING ANALYSIS - Step {step}")
+    print(f"{'='*70}")
+
+    # ============================================================
+    # 1. 정보 흐름 분석 (Information Flow)
+    # ============================================================
+    print("\n📊 1. INFORMATION FLOW ANALYSIS")
+    print("-" * 70)
+
+    with torch.no_grad():
+        # Embedding 출력
+        token_emb = model.token_embedding(x)
+        pos_emb = model.pos_embedding(torch.arange(x.size(1), device=x.device).unsqueeze(0))
+        x_emb = token_emb + pos_emb
+
+        print(f"\n[Embedding Layer]")
+        print(f"  Token emb norm: {token_emb.norm(dim=-1).mean():.4f}")
+        print(f"  Pos emb norm: {pos_emb.norm(dim=-1).mean():.4f}")
+        print(f"  Combined std: {x_emb.std():.4f}")
+        print(f"  Combined range: [{x_emb.min():.4f}, {x_emb.max():.4f}]")
+
+        # 각 레이어별 출력 분석
+        x_layer = x_emb
+        for i, layer in enumerate(model.layers):
+            # Attention block
+            attn_out = layer.attn(layer.norm1(x_layer))
+            print(f"\n[Layer {i} - Attention]")
+            print(f"  Output norm: {attn_out.norm(dim=-1).mean():.4f}")
+            print(f"  Output std: {attn_out.std():.4f}")
+            print(f"  Signal strength: {attn_out.abs().mean():.4f}")
+
+            x_layer = x_layer + attn_out
+
+            # FFN block
+            ffn_input = layer.norm2(x_layer)
+            ffn_out = layer.ffn(ffn_input)
+            print(f"\n[Layer {i} - FFN]")
+            print(f"  Input norm: {ffn_input.norm(dim=-1).mean():.4f}")
+            print(f"  Output norm: {ffn_out.norm(dim=-1).mean():.4f}")
+            print(f"  Output std: {ffn_out.std():.4f}")
+            print(f"  Signal strength: {ffn_out.abs().mean():.4f}")
+
+            # FFN 내부 분석
+            ffn = layer.ffn
+            with torch.no_grad():
+                # Input neuron activations
+                input_acts = F.gelu(ffn_input @ ffn.input_patterns.T)
+                print(f"  Input neurons:")
+                print(f"    Activation mean: {input_acts.mean():.4f}")
+                print(f"    Activation std: {input_acts.std():.4f}")
+                print(f"    Dead neurons (act < 0.01): {(input_acts.abs() < 0.01).float().mean()*100:.1f}%")
+                print(f"    Active neurons: {(input_acts.abs() > 0.1).float().mean()*100:.1f}%")
+
+            x_layer = x_layer + ffn_out
+
+            print(f"\n[Layer {i} - Residual Output]")
+            print(f"  Output norm: {x_layer.norm(dim=-1).mean():.4f}")
+            print(f"  Output std: {x_layer.std():.4f}")
+
+    # ============================================================
+    # 2. Gradient Flow 분석
+    # ============================================================
+    print(f"\n📈 2. GRADIENT FLOW ANALYSIS")
+    print("-" * 70)
+
+    # Forward pass with gradient tracking
+    model.zero_grad()
+    output = model(x, labels=labels)
+    loss = output['loss']
+    loss.backward()
+
+    print(f"\n[Loss Value]")
+    print(f"  Total loss: {loss.item():.4f}")
+
+    # 각 레이어별 gradient 분석
+    for i, layer in enumerate(model.layers):
+        ffn = layer.ffn
+
+        print(f"\n[Layer {i} - Gradient Magnitudes]")
+
+        # Neuron keys (routing)
+        if ffn.global_router.neuron_keys.grad is not None:
+            grad = ffn.global_router.neuron_keys.grad
+            print(f"  Router neuron_keys:")
+            print(f"    Grad norm: {grad.norm():.6f}")
+            print(f"    Grad mean (abs): {grad.abs().mean():.6f}")
+            print(f"    Grad max: {grad.abs().max():.6f}")
+            print(f"    Non-zero grads: {(grad.abs() > 1e-8).sum()}/{grad.numel()}")
+
+        # Input patterns
+        if ffn.input_patterns.grad is not None:
+            grad = ffn.input_patterns.grad
+            print(f"  Input patterns:")
+            print(f"    Grad norm: {grad.norm():.6f}")
+            print(f"    Grad mean (abs): {grad.abs().mean():.6f}")
+            print(f"    Dead neurons (grad < 1e-6): {(grad.abs().mean(dim=1) < 1e-6).sum()}/{grad.shape[0]}")
+
+        # Process weights
+        if ffn.process_weights.grad is not None:
+            grad = ffn.process_weights.grad
+            print(f"  Process weights:")
+            print(f"    Grad norm: {grad.norm():.6f}")
+            print(f"    Grad mean (abs): {grad.abs().mean():.6f}")
+            print(f"    Dead neurons (grad < 1e-6): {(grad.abs().mean(dim=1) < 1e-6).sum()}/{grad.shape[0]}")
+
+    # ============================================================
+    # 3. 학습 역학 분석 (Learning Dynamics)
+    # ============================================================
+    print(f"\n🎯 3. LEARNING DYNAMICS")
+    print("-" * 70)
+
+    with torch.no_grad():
+        # Routing pattern 변화
+        layer0_ffn = model.layers[0].ffn
+        token_emb = model.token_embedding(x)
+        pos_emb = model.pos_embedding(torch.arange(x.size(1), device=x.device).unsqueeze(0))
+        x_emb = token_emb + pos_emb
+
+        # Get routing info
+        input_idx, routing_weights = layer0_ffn.global_router(x_emb, k_input=1024)
+
+        print(f"\n[Routing Behavior]")
+        print(f"  Selected neurons (first batch, first 10): {input_idx[0, :10].tolist()}")
+        top_weights = routing_weights[0].topk(10)
+        print(f"  Top 10 routing weights: {top_weights.values.tolist()}")
+        print(f"  Top 10 neuron indices: {top_weights.indices.tolist()}")
+
+        # Routing entropy
+        routing_probs = routing_weights[0] / routing_weights[0].sum()
+        entropy = -(routing_probs * torch.log(routing_probs + 1e-8)).sum()
+        max_entropy = torch.log(torch.tensor(float(routing_weights.shape[1])))
+        print(f"  Routing entropy: {entropy:.4f} (max: {max_entropy:.4f})")
+        print(f"  Normalized entropy: {(entropy / max_entropy):.4f}")
+
+        # Logits 분포
+        logits = output['logits']
+        print(f"\n[Logits Distribution]")
+        print(f"  Mean: {logits.mean():.4f}")
+        print(f"  Std: {logits.std():.4f}")
+        print(f"  Max: {logits.max():.4f}")
+        print(f"  Min: {logits.min():.4f}")
+
+        # Softmax 후 확률 분포
+        probs = F.softmax(logits, dim=-1)
+        max_probs, _ = probs.max(dim=-1)
+        print(f"\n[Prediction Confidence]")
+        print(f"  Mean max probability: {max_probs.mean():.4f}")
+        print(f"  Min max probability: {max_probs.min():.4f}")
+        print(f"  Max max probability: {max_probs.max():.4f}")
+
+        # Entropy of predictions
+        entropy_pred = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
+        max_vocab_entropy = torch.log(torch.tensor(float(model.vocab_size)))
+        print(f"\n[Prediction Entropy]")
+        print(f"  Mean entropy: {entropy_pred.mean():.4f}")
+        print(f"  Max possible entropy: {max_vocab_entropy:.4f}")
+        print(f"  Normalized entropy: {(entropy_pred.mean() / max_vocab_entropy):.4f}")
+
+    # ============================================================
+    # 4. Weight 분포 분석
+    # ============================================================
+    print(f"\n⚖️  4. WEIGHT DISTRIBUTION ANALYSIS")
+    print("-" * 70)
+
+    for i, layer in enumerate(model.layers):
+        ffn = layer.ffn
+
+        print(f"\n[Layer {i}]")
+
+        # Input patterns
+        print(f"  Input patterns:")
+        print(f"    Mean: {ffn.input_patterns.mean():.6f}")
+        print(f"    Std: {ffn.input_patterns.std():.6f}")
+        print(f"    Norm: {ffn.input_patterns.norm():.6f}")
+
+        # Process weights
+        print(f"  Process weights:")
+        print(f"    Mean: {ffn.process_weights.mean():.6f}")
+        print(f"    Std: {ffn.process_weights.std():.6f}")
+        print(f"    Norm: {ffn.process_weights.norm():.6f}")
+
+        # Neuron keys
+        print(f"  Neuron keys:")
+        print(f"    Mean: {ffn.global_router.neuron_keys.mean():.6f}")
+        print(f"    Std: {ffn.global_router.neuron_keys.std():.6f}")
+        print(f"    Norm: {ffn.global_router.neuron_keys.norm():.6f}")
+
+    # ============================================================
+    # 5. 학습 진전도 (Learning Progress)
+    # ============================================================
+    print(f"\n📉 5. LEARNING PROGRESS INDICATORS")
+    print("-" * 70)
+
+    with torch.no_grad():
+        # Token prediction diversity
+        _, preds = logits.max(dim=-1)
+        unique_preds = preds.unique().numel()
+        print(f"\n[Prediction Diversity]")
+        print(f"  Unique tokens predicted: {unique_preds}/{model.vocab_size}")
+        print(f"  Diversity ratio: {unique_preds/model.vocab_size*100:.2f}%")
+
+        # Most common predictions
+        pred_counts = Counter(preds.flatten().tolist())
+        top_10_preds = pred_counts.most_common(10)
+        print(f"\n[Top 10 Most Predicted Tokens]")
+        for token, count in top_10_preds:
+            pct = count/preds.numel()*100
+            print(f"    Token {token}: {count} times ({pct:.2f}%)")
+
+        # Label distribution (for comparison)
+        if labels is not None:
+            valid_labels = labels[labels != -100]
+            if valid_labels.numel() > 0:
+                label_counts = Counter(valid_labels.tolist())
+                top_10_labels = label_counts.most_common(10)
+                print(f"\n[Top 10 Most Frequent True Labels]")
+                for token, count in top_10_labels:
+                    pct = count/valid_labels.numel()*100
+                    print(f"    Token {token}: {count} times ({pct:.2f}%)")
+
+    print(f"\n{'='*70}\n")
+
+
+# ============================================================
 # MLM Masking Function
 # ============================================================
 
@@ -726,6 +971,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 debug_first_n_steps=10
             )
 
+            # 🔬 DEEP LEARNING ANALYSIS (first 10 steps)
+            deep_learning_analysis(
+                model=model,
+                x=input_ids,
+                labels=labels,
+                step=step + 1,
+                debug_first_n_steps=10
+            )
+
             if debug_mode:
                 print(f"\n[Additional Debug Info - After Backward]")
 
@@ -845,6 +1099,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 loss=loss,
                 aux_loss=aux_loss,
                 optimizer=optimizer,
+                debug_first_n_steps=10
+            )
+
+            # 🔬 DEEP LEARNING ANALYSIS (first 10 steps)
+            deep_learning_analysis(
+                model=model,
+                x=input_ids,
+                labels=labels,
+                step=step + 1,
                 debug_first_n_steps=10
             )
 
