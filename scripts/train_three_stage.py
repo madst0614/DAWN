@@ -374,7 +374,7 @@ def main():
                         help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=30,
                         help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=3e-4,
+    parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate')
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate')
@@ -461,12 +461,12 @@ def main():
 
     # Sparsity info
     if args.k_input is None:
-        k_input_actual = max(args.n_input_neurons // 8, 64)
+        k_input_actual = max(args.n_input_neurons // 2, 512)
     else:
         k_input_actual = args.k_input
 
     if args.k_process is None:
-        k_process_actual = max(args.n_process_neurons // 8, 32)
+        k_process_actual = max(args.n_process_neurons // 2, 256)
     else:
         k_process_actual = args.k_process
 
