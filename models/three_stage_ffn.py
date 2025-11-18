@@ -66,7 +66,8 @@ class GlobalRouter(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_normal_(self.neuron_keys)
+        # Orthogonal initialization for better diversity
+        nn.init.orthogonal_(self.neuron_keys)
         for module in self.query_net.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_normal_(module.weight)
@@ -89,14 +90,13 @@ class GlobalRouter(nn.Module):
         """
         B, S, d_model = x.shape
 
-        # 시퀀스 전체 요약 (거시적 맥락)
-        global_context = x.mean(dim=1)  # [B, d_model]
+        # Max pooling for stronger signal (instead of mean)
+        global_context = x.max(dim=1)[0]  # [B, d_model]
 
         # Query: "이 시퀀스는 어떤 특성인가?"
         query = self.query_net(global_context)  # [B, d_routing]
 
         # Attention with neuron keys
-        # scores = Q @ K^T / sqrt(d)
         routing_logits = (query @ self.neuron_keys.T) / (self.d_routing ** 0.5)
         # [B, n_input]
 
@@ -161,12 +161,18 @@ class HierarchicalDynamicFFN(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # Routing 통계 저장 (load balancing용)
+        self.input_neuron_counts = None
+        self.process_neuron_counts = None
+        self.last_routing_scores = None
+
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_normal_(self.input_patterns)
-        nn.init.xavier_normal_(self.process_weights)
-        nn.init.xavier_normal_(self.process_outputs)
+        # Orthogonal initialization for better diversity and gradient flow
+        nn.init.orthogonal_(self.input_patterns)
+        nn.init.orthogonal_(self.process_weights)
+        nn.init.orthogonal_(self.process_outputs)
 
     def forward(
         self,
@@ -185,7 +191,7 @@ class HierarchicalDynamicFFN(nn.Module):
         """
         B, S, d_model = x.shape
 
-        # Default k values
+        # Default k values (12.5% sparsity - initial setting)
         if k_input is None:
             k_input = max(self.n_input // 8, 64)
         if k_process is None:
@@ -195,6 +201,32 @@ class HierarchicalDynamicFFN(nn.Module):
         # 시퀀스별로 입력 뉴런 선택 (거시적 결정)
         input_idx, routing_scores = self.global_router(x, k_input)
         # input_idx: [B, k_input]
+
+        # Routing 통계 저장 (load balancing용)
+        if self.training:
+            if self.input_neuron_counts is None:
+                self.input_neuron_counts = torch.zeros(
+                    self.n_input,
+                    device=x.device,
+                    dtype=torch.float32
+                )
+            if self.process_neuron_counts is None:
+                self.process_neuron_counts = torch.zeros(
+                    self.n_process,
+                    device=x.device,
+                    dtype=torch.float32
+                )
+
+            # Input neuron 사용 카운트
+            ones = torch.ones_like(input_idx, dtype=torch.float32)
+            self.input_neuron_counts.scatter_add_(
+                0,
+                input_idx.flatten(),
+                ones.flatten()
+            )
+
+            # Routing scores 저장 (entropy 계산용)
+            self.last_routing_scores = routing_scores.detach()
 
         # ===== Phase 2: Input Neurons =====
         # 모든 입력 뉴런의 토큰별 activation 계산
@@ -209,6 +241,7 @@ class HierarchicalDynamicFFN(nn.Module):
         # ===== Phase 3: Process Neurons =====
         # 배치별로 처리 (각 시퀀스가 다른 입력 뉴런 사용)
         outputs = []
+        process_indices = []  # load balancing용
 
         for b in range(B):
             # 이 시퀀스의 입력 뉴런 인덱스
@@ -222,7 +255,7 @@ class HierarchicalDynamicFFN(nn.Module):
                 device=x.device,
                 dtype=x.dtype
             )
-            input_repr.scatter_(1, idx_b.unsqueeze(0).expand(S, -1), acts_b)
+            input_repr.scatter_(1, idx_b.unsqueeze(0).expand(S, -1), acts_b.to(x.dtype))
 
             # 처리 뉴런 활성화 (단순 계산)
             process_acts = F.gelu(input_repr @ self.process_weights.T)
@@ -231,6 +264,8 @@ class HierarchicalDynamicFFN(nn.Module):
             # 처리 뉴런 선택 (시퀀스 평균 기준)
             process_scores = process_acts.mean(dim=0)  # [n_process]
             _, process_idx = process_scores.topk(k_process)  # [k_process]
+
+            process_indices.append(process_idx)
 
             # 선택된 처리 뉴런의 출력
             selected_process_acts = process_acts[:, process_idx]  # [S, k_process]
@@ -243,7 +278,76 @@ class HierarchicalDynamicFFN(nn.Module):
         output = torch.stack(outputs, dim=0)  # [B, S, d_model]
         output = self.dropout(output)
 
+        # Process neuron 통계 수집 (training 시에만)
+        if self.training and len(process_indices) > 0:
+            process_indices_tensor = torch.stack(process_indices)  # [B, k_process]
+            ones = torch.ones_like(process_indices_tensor, dtype=torch.float32)
+            self.process_neuron_counts.scatter_add_(
+                0,
+                process_indices_tensor.flatten(),
+                ones.flatten()
+            )
+
         return output
+
+    def get_load_balance_loss(self) -> torch.Tensor:
+        """
+        Load balancing loss 계산 (KL divergence + entropy 기반)
+
+        Returns:
+            loss: 0-2 범위의 정규화된 loss
+        """
+        if self.input_neuron_counts is None or not self.training:
+            device = self.input_patterns.device
+            return torch.tensor(0.0, device=device)
+
+        counts = self.input_neuron_counts
+        device = counts.device
+
+        # 사용 빈도가 0이면 계산 불가
+        if counts.sum() == 0:
+            return torch.tensor(0.0, device=device)
+
+        # 정규화 (확률 분포)
+        usage_probs = counts / (counts.sum() + 1e-8)
+
+        # 목표: 균등 분포
+        target_prob = 1.0 / self.n_input
+        target = torch.full_like(usage_probs, target_prob)
+
+        # KL divergence (안정적)
+        usage_probs = usage_probs + 1e-8  # Smoothing
+        target = target + 1e-8
+
+        kl_loss = F.kl_div(
+            usage_probs.log(),
+            target,
+            reduction='sum'
+        ) / self.n_input
+
+        # Routing entropy (다양성)
+        if self.last_routing_scores is not None:
+            routing_probs = F.softmax(self.last_routing_scores, dim=-1)
+            avg_probs = routing_probs.mean(dim=0) + 1e-8
+
+            entropy = -(avg_probs * avg_probs.log()).sum()
+            max_entropy = torch.log(torch.tensor(float(self.n_input), device=device))
+
+            # 낮은 엔트로피 = penalty
+            entropy_loss = 1.0 - (entropy / max_entropy)
+        else:
+            entropy_loss = torch.tensor(0.0, device=device)
+
+        # 합치기 (각각 0-1 범위)
+        total_loss = kl_loss + entropy_loss
+
+        return total_loss
+
+    def reset_routing_counts(self):
+        """Routing 통계를 초기화합니다."""
+        self.input_neuron_counts = None
+        self.process_neuron_counts = None
+        self.last_routing_scores = None
 
     def get_neuron_stats(
         self,
@@ -273,7 +377,7 @@ class HierarchicalDynamicFFN(nn.Module):
             acts_0 = selected_input_acts[0]
 
             input_repr = torch.zeros(S, self.n_input, device=x.device, dtype=x.dtype)
-            input_repr.scatter_(1, idx_0.unsqueeze(0).expand(S, -1), acts_0)
+            input_repr.scatter_(1, idx_0.unsqueeze(0).expand(S, -1), acts_0.to(x.dtype))
 
             process_acts = F.gelu(input_repr @ self.process_weights.T)
             process_scores = process_acts.mean(dim=0)
@@ -467,7 +571,7 @@ class HierarchicalLanguageModel(nn.Module):
         # Loss
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)  # Ignore masked tokens
             loss = loss_fct(logits.view(-1, self.vocab_size), labels.view(-1))
 
         return {

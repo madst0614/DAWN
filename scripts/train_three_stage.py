@@ -45,6 +45,80 @@ from models.three_stage_ffn import HierarchicalLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import CacheLoader
 
+# MLM 마스킹 설정
+MLM_CONFIG = {
+    "mask_prob": 0.15,
+    "mask_token_ratio": 0.8,
+    "random_token_ratio": 0.5
+}
+
+
+# ============================================================
+# MLM Masking Function
+# ============================================================
+
+def apply_mlm_masking(input_ids, tokenizer, config=None):
+    """
+    Apply MLM-style masking (80% [MASK], 10% random, 10% keep).
+    Based on dawn/utils/data_utils.py MaskingStrategy.apply_mlm_masking
+
+    Args:
+        input_ids: [B, S] Token IDs to mask
+        tokenizer: Tokenizer instance
+        config: Optional config dict with mask_prob, mask_token_ratio, random_token_ratio
+
+    Returns:
+        Tuple of (masked_input_ids, labels)
+    """
+    if config is None:
+        config = MLM_CONFIG
+
+    labels = input_ids.clone()
+    mask_prob = config.get("mask_prob", 0.15)
+    device = input_ids.device
+
+    probability_matrix = torch.full(labels.shape, mask_prob, device=device)
+
+    # ✅ Exclude special tokens (CLS, SEP, PAD, etc.) - Dawn style
+    # labels is [B, S], need to preserve batch dimension
+    special_tokens_mask = []
+    for seq in labels.tolist():  # Iterate over batch
+        seq_mask = [
+            tokenizer.get_special_tokens_mask([val], already_has_special_tokens=True)[0]
+            for val in seq
+        ]
+        special_tokens_mask.append(seq_mask)
+    special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool, device=device)
+    probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+
+    # ✅ Exclude padding tokens (belt and suspenders)
+    padding_mask = input_ids == tokenizer.pad_token_id
+    probability_matrix.masked_fill_(padding_mask, value=0.0)
+
+    # Sample masked positions
+    masked_indices = torch.bernoulli(probability_matrix).bool()
+    labels[~masked_indices] = -100  # Only compute loss on masked tokens
+
+    # Apply masking strategy
+    mask_ratio = config.get("mask_token_ratio", 0.8)
+    random_ratio = config.get("random_token_ratio", 0.5)
+
+    # 80% [MASK]
+    indices_replaced = masked_indices & (torch.rand(labels.shape, device=device) < mask_ratio)
+    input_ids[indices_replaced] = tokenizer.mask_token_id
+
+    # 10% random (of remaining)
+    indices_random = (
+        masked_indices
+        & ~indices_replaced
+        & (torch.rand(labels.shape, device=device) < random_ratio)
+    )
+    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long, device=device)
+    input_ids[indices_random] = random_words[indices_random]
+
+    # 10% keep original (implicit)
+    return input_ids, labels
+
 
 # ============================================================
 # Dataset
@@ -124,9 +198,41 @@ def load_cached_data(tokenizer_path=None, max_length=512, batch_size=32):
 # Training Functions
 # ============================================================
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None):
+def compute_load_balance_loss(model):
+    """
+    모든 레이어의 load balancing loss를 계산합니다.
+
+    Args:
+        model: HierarchicalFFNModel
+
+    Returns:
+        total_loss: 전체 레이어의 평균 load balance loss
+    """
+    total_loss = 0
+    count = 0
+
+    for layer in model.layers:
+        # 각 layer의 ffn에서 load balance loss 계산
+        lb_loss = layer.ffn.get_load_balance_loss()
+        total_loss = total_loss + lb_loss
+        count += 1
+
+    return total_loss / count if count > 0 else torch.tensor(0.0)
+
+
+def reset_routing_stats(model):
+    """모든 레이어의 routing 통계를 초기화합니다."""
+    for layer in model.layers:
+        layer.ffn.reset_routing_counts()
+
+
+def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None):
     """Train for one epoch"""
     model.train()
+
+    # Epoch 시작 시 routing 통계 초기화
+    reset_routing_stats(model)
+
     total_loss = 0
     total_tokens = 0
     total_correct = 0
@@ -135,12 +241,22 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     for batch in pbar:
         input_ids = batch["input_ids"].to(device)
 
-        # Create MLM labels (same as input for simplicity)
-        labels = input_ids.clone()
+        # Apply MLM masking
+        if tokenizer is not None:
+            input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+        else:
+            # Fallback: no masking
+            labels = input_ids.clone()
 
         optimizer.zero_grad()
 
         # Mixed precision training
+        # Dynamic aux weight: stronger in early epochs
+        if epoch <= 5:
+            aux_weight = 0.05  # Strong regularization initially
+        else:
+            aux_weight = 0.01  # Moderate regularization later
+
         if scaler is not None:
             with torch.amp.autocast('cuda'):
                 outputs = model(
@@ -152,7 +268,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 loss = outputs['loss']
                 logits = outputs['logits']
 
-            scaler.scale(loss).backward()
+                # Load balancing loss 추가
+                aux_loss = compute_load_balance_loss(model)
+                total_loss = loss + aux_weight * aux_loss
+
+            scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
@@ -166,7 +286,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             )
             loss = outputs['loss']
             logits = outputs['logits']
-            loss.backward()
+
+            # Load balancing loss 추가
+            aux_loss = compute_load_balance_loss(model)
+            total_loss = loss + aux_weight * aux_loss
+
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
@@ -185,6 +310,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
+            "aux": f"{aux_loss.item():.4f}",
+            "w_aux": f"{(aux_weight * aux_loss).item():.5f}",
             "acc": f"{correct / num_tokens:.4f}"
         })
 
@@ -261,7 +388,7 @@ def main():
                         help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=30,
                         help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=3e-4,
+    parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate')
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate')
@@ -370,10 +497,28 @@ def main():
         weight_decay=0.01
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Warmup + Cosine Annealing scheduler
+    warmup_epochs = 2
+    warmup_steps = warmup_epochs * len(train_loader)
+    total_steps = args.num_epochs * len(train_loader)
+
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        T_max=args.num_epochs * len(train_loader),
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_steps
+    )
+
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
         eta_min=args.lr * 0.1
+    )
+
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps]
     )
 
     # Mixed precision scaler
@@ -396,7 +541,7 @@ def main():
 
         # Train
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, device, epoch, args, scaler
+            model, train_loader, optimizer, scheduler, device, epoch, args, scaler, tokenizer
         )
 
         # Evaluate
