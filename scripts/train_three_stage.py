@@ -860,7 +860,7 @@ def print_diagnostic_metrics(model, epoch):
     print(f"{'='*60}\n")
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None):
+def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None):
     """Train for one epoch"""
     model.train()
 
@@ -964,27 +964,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             scaler.scale(total_loss_combined).backward()
 
-            # 🔥 COMPREHENSIVE DEBUGGING (first 10 steps)
-            comprehensive_debug(
-                step=step + 1,
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                logits=logits,
-                loss=loss,
-                aux_loss=aux_loss,
-                optimizer=optimizer,
-                debug_first_n_steps=10
-            )
-
-            # 🔬 DEEP LEARNING ANALYSIS (first 10 steps)
-            deep_learning_analysis(
-                model=model,
-                x=input_ids,
-                labels=labels,
-                step=step + 1,
-                debug_first_n_steps=10
-            )
+            # Router-specific gradient clipping to prevent vanishing gradients
+            for name, param in model.named_parameters():
+                if param.grad is not None and ('neuron_keys' in name or 'query_net' in name):
+                    # Ensure router gradients stay in reasonable range
+                    param.grad.data.clamp_(-0.01, 0.01)
 
             if debug_mode:
                 print(f"\n[Additional Debug Info - After Backward]")
@@ -1095,27 +1079,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             total_loss_combined.backward()
 
-            # 🔥 COMPREHENSIVE DEBUGGING (first 10 steps)
-            comprehensive_debug(
-                step=step + 1,
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                logits=logits,
-                loss=loss,
-                aux_loss=aux_loss,
-                optimizer=optimizer,
-                debug_first_n_steps=10
-            )
-
-            # 🔬 DEEP LEARNING ANALYSIS (first 10 steps)
-            deep_learning_analysis(
-                model=model,
-                x=input_ids,
-                labels=labels,
-                step=step + 1,
-                debug_first_n_steps=10
-            )
+            # Router-specific gradient clipping to prevent vanishing gradients
+            for name, param in model.named_parameters():
+                if param.grad is not None and ('neuron_keys' in name or 'query_net' in name):
+                    # Ensure router gradients stay in reasonable range
+                    param.grad.data.clamp_(-0.01, 0.01)
 
             if debug_mode:
                 print(f"\n[Additional Debug Info - After Backward]")
@@ -1216,6 +1184,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             "w_aux": f"{(aux_weight * aux_loss).item():.5f}",
             "acc": f"{correct / valid_tokens:.4f}" if valid_tokens > 0 else "0.0000"
         })
+
+        # Log to file every step
+        if log_file:
+            with open(log_file, 'a') as f:
+                acc_val = correct / valid_tokens if valid_tokens > 0 else 0.0
+                f.write(f"epoch={epoch},step={step+1},loss={loss.item():.6f},"
+                       f"aux_loss={aux_loss.item():.6f},weighted_aux={(aux_weight * aux_loss).item():.6f},"
+                       f"acc={acc_val:.6f}\n")
 
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
@@ -1459,9 +1435,20 @@ def main():
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
     monitor = TrainingMonitor(str(log_dir))
 
+    # Training log file (append mode)
+    training_log_file = checkpoint_dir / "training_log.txt"
+    debug_log_file = checkpoint_dir / "debug_log.txt"
+
+    # Write header to training log
+    with open(training_log_file, 'w') as f:
+        f.write("# Training Log\n")
+        f.write("# Format: epoch,step,loss,aux_loss,weighted_aux,acc\n")
+
     # Training loop
     print(f"\n{'='*60}")
     print(f"Starting training...")
+    print(f"  Training log: {training_log_file}")
+    print(f"  Debug log: {debug_log_file}")
     print(f"{'='*60}")
     best_val_loss = float('inf')
 
@@ -1470,7 +1457,8 @@ def main():
 
         # Train
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, device, epoch, args, scaler, tokenizer
+            model, train_loader, optimizer, scheduler, device, epoch, args, scaler, tokenizer,
+            log_file=str(training_log_file)
         )
 
         # Evaluate

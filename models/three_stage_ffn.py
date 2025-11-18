@@ -30,7 +30,7 @@ class GlobalRouter(nn.Module):
         n_input_neurons: int = 2048,
         d_routing: int = 256,
         use_mlp: bool = True,
-        temperature: float = 0.5  # Lower temperature = smoother routing
+        temperature: float = 2.0  # Lower temperature = smoother routing
     ):
         super().__init__()
 
@@ -135,7 +135,7 @@ class HierarchicalDynamicFFN(nn.Module):
         n_process_neurons: int = 1024,
         d_routing: int = 256,
         dropout: float = 0.1,
-        temperature: float = 0.5  # Routing temperature
+        temperature: float = 2.0  # Routing temperature
     ):
         super().__init__()
 
@@ -475,7 +475,7 @@ class TransformerLayerWithHierarchicalFFN(nn.Module):
         d_routing: int = 256,
         dropout: float = 0.1,
         use_checkpoint: bool = False,
-        temperature: float = 0.5  # Routing temperature
+        temperature: float = 2.0  # Routing temperature
     ):
         super().__init__()
 
@@ -559,7 +559,7 @@ class HierarchicalLanguageModel(nn.Module):
         d_routing: int = 256,
         dropout: float = 0.1,
         gradient_checkpointing: bool = False,
-        temperature: float = 0.5  # Routing temperature (lower = smoother)
+        temperature: float = 2.0  # Routing temperature (lower = smoother)
     ):
         super().__init__()
 
