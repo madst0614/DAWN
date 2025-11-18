@@ -60,6 +60,7 @@ MLM_CONFIG = {
 def apply_mlm_masking(input_ids, tokenizer, config=None):
     """
     Apply MLM-style masking (80% [MASK], 10% random, 10% keep).
+    Based on dawn/utils/data_utils.py MaskingStrategy.apply_mlm_masking
 
     Args:
         input_ids: [B, S] Token IDs to mask
@@ -78,12 +79,18 @@ def apply_mlm_masking(input_ids, tokenizer, config=None):
 
     probability_matrix = torch.full(labels.shape, mask_prob, device=device)
 
-    # Exclude special tokens (CLS, SEP, PAD, etc.)
-    special_tokens_mask = torch.zeros_like(labels, dtype=torch.bool)
-    for token_id in [tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id]:
-        if token_id is not None:
-            special_tokens_mask |= (labels == token_id)
+    # ✅ Exclude special tokens (CLS, SEP, PAD, etc.) - Dawn style
+    special_tokens_mask = torch.tensor([
+        tokenizer.get_special_tokens_mask(
+            [val], already_has_special_tokens=True
+        )[0]
+        for val in labels.tolist()
+    ], dtype=torch.bool, device=device)
     probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+
+    # ✅ Exclude padding tokens (belt and suspenders)
+    padding_mask = input_ids == tokenizer.pad_token_id
+    probability_matrix.masked_fill_(padding_mask, value=0.0)
 
     # Sample masked positions
     masked_indices = torch.bernoulli(probability_matrix).bool()
@@ -94,16 +101,16 @@ def apply_mlm_masking(input_ids, tokenizer, config=None):
     random_ratio = config.get("random_token_ratio", 0.5)
 
     # 80% [MASK]
-    indices_replaced = masked_indices & (torch.rand(labels.shape, device=labels.device) < mask_ratio)
+    indices_replaced = masked_indices & (torch.rand(labels.shape, device=device) < mask_ratio)
     input_ids[indices_replaced] = tokenizer.mask_token_id
 
     # 10% random (of remaining)
     indices_random = (
         masked_indices
         & ~indices_replaced
-        & (torch.rand(labels.shape, device=labels.device) < random_ratio)
+        & (torch.rand(labels.shape, device=device) < random_ratio)
     )
-    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long, device=labels.device)
+    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long, device=device)
     input_ids[indices_random] = random_words[indices_random]
 
     # 10% keep original (implicit)
@@ -231,18 +238,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     for batch in pbar:
         input_ids = batch["input_ids"].to(device)
 
-        # TEMPORARY: Disable MLM masking for debugging
         # Apply MLM masking
-        # if tokenizer is not None:
-        #     input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
-        # else:
-        #     # Fallback: no masking
-        labels = input_ids.clone()  # Identity task for testing
+        if tokenizer is not None:
+            input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+        else:
+            # Fallback: no masking
+            labels = input_ids.clone()
 
         optimizer.zero_grad()
 
         # Mixed precision training
-        aux_weight = 0.0  # TEMPORARY: Disable aux loss for debugging
+        aux_weight = 0.001  # Load balancing loss 가중치
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -462,12 +468,12 @@ def main():
 
     # Sparsity info
     if args.k_input is None:
-        k_input_actual = args.n_input_neurons  # Dense (100%)
+        k_input_actual = max(args.n_input_neurons // 8, 64)
     else:
         k_input_actual = args.k_input
 
     if args.k_process is None:
-        k_process_actual = args.n_process_neurons  # Dense (100%)
+        k_process_actual = max(args.n_process_neurons // 8, 32)
     else:
         k_process_actual = args.k_process
 

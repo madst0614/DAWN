@@ -190,11 +190,11 @@ class HierarchicalDynamicFFN(nn.Module):
         """
         B, S, d_model = x.shape
 
-        # Default k values (Dense - 100% for initial training)
+        # Default k values (12.5% sparsity - initial setting)
         if k_input is None:
-            k_input = self.n_input  # Use all input neurons
+            k_input = max(self.n_input // 8, 64)
         if k_process is None:
-            k_process = self.n_process  # Use all process neurons
+            k_process = max(self.n_process // 8, 32)
 
         # ===== Phase 1: Global Router =====
         # 시퀀스별로 입력 뉴런 선택 (거시적 결정)
@@ -358,9 +358,9 @@ class HierarchicalDynamicFFN(nn.Module):
         B, S, _ = x.shape
 
         if k_input is None:
-            k_input = self.n_input
+            k_input = max(self.n_input // 8, 64)
         if k_process is None:
-            k_process = self.n_process
+            k_process = max(self.n_process // 8, 32)
 
         with torch.no_grad():
             # Global Router
