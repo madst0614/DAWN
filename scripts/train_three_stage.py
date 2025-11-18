@@ -390,7 +390,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     print("  ✓ All gradients OK")
 
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Stronger clipping
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -435,7 +435,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 else:
                     print("  ✓ All gradients OK")
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Stronger clipping
             optimizer.step()
 
         if scheduler is not None:

@@ -86,7 +86,7 @@ class GlobalRouter(nn.Module):
 
         Returns:
             input_idx: [B, k_input] - 선택된 뉴런 인덱스
-            routing_scores: [B, k_input] - 라우팅 점수
+            routing_weights: [B, n_input] - Soft weights for gradient flow
         """
         B, S, d_model = x.shape
 
@@ -100,11 +100,26 @@ class GlobalRouter(nn.Module):
         routing_logits = (query @ self.neuron_keys.T) / (self.d_routing ** 0.5)
         # [B, n_input]
 
-        # Top-k 입력 뉴런 선택
-        routing_scores, input_idx = routing_logits.topk(k_input, dim=-1)
+        # Soft routing for gradient flow
+        # Temperature = 0.1 for sharper distribution
+        routing_probs = F.softmax(routing_logits / 0.1, dim=-1)
+        # [B, n_input]
+
+        # Hard selection (top-k)
+        _, input_idx = routing_logits.topk(k_input, dim=-1)
         # [B, k_input]
 
-        return input_idx, routing_scores
+        # Straight-through estimator:
+        # Forward: hard selection (one-hot mask)
+        # Backward: soft gradient (routing_probs)
+        hard_mask = torch.zeros_like(routing_probs)  # [B, n_input]
+        hard_mask.scatter_(1, input_idx, 1.0)
+
+        # This maintains gradient flow to neuron_keys!
+        routing_weights = hard_mask + (routing_probs - routing_probs.detach())
+        # [B, n_input]
+
+        return input_idx, routing_weights
 
 
 # ============================================================
@@ -201,8 +216,9 @@ class HierarchicalDynamicFFN(nn.Module):
 
         # ===== Phase 1: Global Router =====
         # 시퀀스별로 입력 뉴런 선택 (거시적 결정)
-        input_idx, routing_scores = self.global_router(x, k_input)
-        # input_idx: [B, k_input]
+        input_idx, routing_weights = self.global_router(x, k_input)
+        # input_idx: [B, k_input] - selected neuron indices
+        # routing_weights: [B, n_input] - soft weights for gradient flow
 
         # Routing 통계 저장 (load balancing용)
         if self.training:
@@ -219,16 +235,12 @@ class HierarchicalDynamicFFN(nn.Module):
                     dtype=torch.float32
                 )
 
-            # Input neuron 사용 카운트
-            ones = torch.ones_like(input_idx, dtype=torch.float32)
-            self.input_neuron_counts.scatter_add_(
-                0,
-                input_idx.flatten(),
-                ones.flatten()
-            )
+            # Input neuron 사용 카운트 (soft weights로 더 정확)
+            # routing_weights: [B, n_input]
+            self.input_neuron_counts += routing_weights.sum(dim=0).detach()
 
-            # Routing scores 저장 (entropy 계산용)
-            self.last_routing_scores = routing_scores.detach()
+            # Routing weights 저장 (entropy 계산용)
+            self.last_routing_scores = routing_weights.detach()
 
         # ===== Phase 2: Input Neurons =====
         # 모든 입력 뉴런의 토큰별 activation 계산
@@ -323,10 +335,12 @@ class HierarchicalDynamicFFN(nn.Module):
         ) / self.n_input
 
         # Routing entropy (다양성)
+        # last_routing_scores is now routing_weights [B, n_input] (already soft)
         if self.last_routing_scores is not None:
-            routing_probs = F.softmax(self.last_routing_scores, dim=-1)
-            avg_probs = routing_probs.mean(dim=0) + 1e-8
+            # Average across batch
+            avg_probs = self.last_routing_scores.mean(dim=0) + 1e-8  # [n_input]
 
+            # Entropy of average distribution
             entropy = -(avg_probs * avg_probs.log()).sum()
             max_entropy = torch.log(torch.tensor(float(self.n_input), device=device))
 
@@ -362,7 +376,8 @@ class HierarchicalDynamicFFN(nn.Module):
 
         with torch.no_grad():
             # Global Router
-            input_idx, routing_scores = self.global_router(x, k_input)
+            input_idx, routing_weights = self.global_router(x, k_input)
+            # routing_weights: [B, n_input]
 
             # Input Neurons
             input_acts = F.gelu(x @ self.input_patterns.T)
@@ -379,11 +394,16 @@ class HierarchicalDynamicFFN(nn.Module):
             process_scores = process_acts.mean(dim=0)
             top_process_scores, process_idx = process_scores.topk(k_process)
 
+            # Extract routing scores for selected neurons
+            selected_routing_scores = torch.gather(
+                routing_weights, 1, input_idx
+            )  # [B, k_input]
+
             return {
                 'global_router': {
                     'input_indices': input_idx.cpu(),  # [B, k_input]
-                    'routing_scores': routing_scores.cpu(),
-                    'mean_score': routing_scores.mean().item()
+                    'routing_scores': selected_routing_scores.cpu(),  # [B, k_input]
+                    'mean_score': selected_routing_scores.mean().item()
                 },
                 'input_neurons': {
                     'indices': input_idx.cpu(),
