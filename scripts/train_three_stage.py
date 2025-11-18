@@ -365,8 +365,8 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10):
         # 각 레이어별 출력 분석
         x_layer = x_emb
         for i, layer in enumerate(model.layers):
-            # Attention block
-            attn_out = layer.attn(layer.norm1(x_layer))
+            # Attention block (uses _attention_block method)
+            attn_out = layer._attention_block(x_layer, None)
             print(f"\n[Layer {i} - Attention]")
             print(f"  Output norm: {attn_out.norm(dim=-1).mean():.4f}")
             print(f"  Output std: {attn_out.std():.4f}")
@@ -374,17 +374,16 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10):
 
             x_layer = x_layer + attn_out
 
-            # FFN block
-            ffn_input = layer.norm2(x_layer)
-            ffn_out = layer.ffn(ffn_input)
+            # FFN block (uses _ffn_block method)
+            ffn_out = layer._ffn_block(x_layer, None, None)
             print(f"\n[Layer {i} - FFN]")
-            print(f"  Input norm: {ffn_input.norm(dim=-1).mean():.4f}")
             print(f"  Output norm: {ffn_out.norm(dim=-1).mean():.4f}")
             print(f"  Output std: {ffn_out.std():.4f}")
             print(f"  Signal strength: {ffn_out.abs().mean():.4f}")
 
             # FFN 내부 분석
             ffn = layer.ffn
+            ffn_input = layer.norm2(x_layer)  # Get normalized input for analysis
             with torch.no_grad():
                 # Input neuron activations
                 input_acts = F.gelu(ffn_input @ ffn.input_patterns.T)
