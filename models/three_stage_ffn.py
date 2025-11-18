@@ -137,7 +137,8 @@ class ThreeStageFFN(nn.Module):
             device=x.device,
             dtype=x.dtype
         )
-        input_repr.scatter_(2, top_input_idx, top_input_acts)
+        # Ensure dtype compatibility for scatter operation
+        input_repr.scatter_(2, top_input_idx, top_input_acts.to(input_repr.dtype))
         # [B, S, n_input]
 
         # 처리 뉴런 활성화
@@ -211,8 +212,8 @@ class ThreeStageFFN(nn.Module):
             top_input_acts, top_input_idx = input_acts.topk(k_input, dim=-1)
 
             # Stage 2
-            input_repr = torch.zeros(B, S, self.n_input, device=x.device)
-            input_repr.scatter_(2, top_input_idx, top_input_acts)
+            input_repr = torch.zeros(B, S, self.n_input, device=x.device, dtype=x.dtype)
+            input_repr.scatter_(2, top_input_idx, top_input_acts.to(input_repr.dtype))
             process_acts = F.gelu(input_repr @ self.process_input_weights.T)
             top_process_acts, top_process_idx = process_acts.topk(k_process, dim=-1)
 
