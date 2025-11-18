@@ -161,6 +161,10 @@ class HierarchicalDynamicFFN(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # Routing 통계 저장 (load balancing용)
+        self.register_buffer('input_routing_counts', torch.zeros(n_input))
+        self.register_buffer('process_routing_counts', torch.zeros(n_process))
+
         self._init_weights()
 
     def _init_weights(self):
@@ -209,6 +213,7 @@ class HierarchicalDynamicFFN(nn.Module):
         # ===== Phase 3: Process Neurons =====
         # 배치별로 처리 (각 시퀀스가 다른 입력 뉴런 사용)
         outputs = []
+        process_indices = []  # load balancing용
 
         for b in range(B):
             # 이 시퀀스의 입력 뉴런 인덱스
@@ -232,6 +237,8 @@ class HierarchicalDynamicFFN(nn.Module):
             process_scores = process_acts.mean(dim=0)  # [n_process]
             _, process_idx = process_scores.topk(k_process)  # [k_process]
 
+            process_indices.append(process_idx)
+
             # 선택된 처리 뉴런의 출력
             selected_process_acts = process_acts[:, process_idx]  # [S, k_process]
             selected_process_outputs = self.process_outputs[process_idx]  # [k_process, d_model]
@@ -243,7 +250,42 @@ class HierarchicalDynamicFFN(nn.Module):
         output = torch.stack(outputs, dim=0)  # [B, S, d_model]
         output = self.dropout(output)
 
+        # Load balancing용 통계 업데이트 (training 시에만)
+        if self.training:
+            # Input neuron 사용 통계
+            for idx in input_idx:
+                self.input_routing_counts.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
+            # Process neuron 사용 통계
+            for idx in process_indices:
+                self.process_routing_counts.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
+
         return output
+
+    def get_load_balance_loss(self) -> torch.Tensor:
+        """
+        Load balancing loss를 계산합니다.
+        뉴런들이 균등하게 사용되도록 유도합니다.
+
+        Returns:
+            load_balance_loss: coefficient of variation 기반 loss
+        """
+        # Input neurons의 CV (Coefficient of Variation)
+        input_mean = self.input_routing_counts.mean()
+        input_std = self.input_routing_counts.std()
+        input_cv = input_std / (input_mean + 1e-6)
+
+        # Process neurons의 CV
+        process_mean = self.process_routing_counts.mean()
+        process_std = self.process_routing_counts.std()
+        process_cv = process_std / (process_mean + 1e-6)
+
+        # 평균 CV (낮을수록 균등)
+        return (input_cv + process_cv) / 2
+
+    def reset_routing_counts(self):
+        """Routing 통계를 초기화합니다."""
+        self.input_routing_counts.zero_()
+        self.process_routing_counts.zero_()
 
     def get_neuron_stats(
         self,

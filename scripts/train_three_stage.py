@@ -124,9 +124,41 @@ def load_cached_data(tokenizer_path=None, max_length=512, batch_size=32):
 # Training Functions
 # ============================================================
 
+def compute_load_balance_loss(model):
+    """
+    모든 레이어의 load balancing loss를 계산합니다.
+
+    Args:
+        model: HierarchicalFFNModel
+
+    Returns:
+        total_loss: 전체 레이어의 평균 load balance loss
+    """
+    total_loss = 0
+    count = 0
+
+    for layer in model.layers:
+        # 각 layer의 ffn에서 load balance loss 계산
+        lb_loss = layer.ffn.get_load_balance_loss()
+        total_loss = total_loss + lb_loss
+        count += 1
+
+    return total_loss / count if count > 0 else torch.tensor(0.0)
+
+
+def reset_routing_stats(model):
+    """모든 레이어의 routing 통계를 초기화합니다."""
+    for layer in model.layers:
+        layer.ffn.reset_routing_counts()
+
+
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None):
     """Train for one epoch"""
     model.train()
+
+    # Epoch 시작 시 routing 통계 초기화
+    reset_routing_stats(model)
+
     total_loss = 0
     total_tokens = 0
     total_correct = 0
@@ -152,7 +184,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 loss = outputs['loss']
                 logits = outputs['logits']
 
-            scaler.scale(loss).backward()
+                # Load balancing loss 추가
+                aux_loss = compute_load_balance_loss(model)
+                total_loss = loss + 0.01 * aux_loss
+
+            scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
@@ -166,7 +202,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             )
             loss = outputs['loss']
             logits = outputs['logits']
-            loss.backward()
+
+            # Load balancing loss 추가
+            aux_loss = compute_load_balance_loss(model)
+            total_loss = loss + 0.01 * aux_loss
+
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
@@ -185,6 +226,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
+            "aux": f"{aux_loss.item():.4f}",
             "acc": f"{correct / num_tokens:.4f}"
         })
 
