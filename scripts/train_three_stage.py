@@ -397,6 +397,32 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             if debug_mode:
                 print(f"\nAfter Backward:")
+
+                # CRITICAL: Check neuron_keys gradient specifically
+                print(f"\n[Critical Gradient Check - neuron_keys]")
+                neuron_keys = model.layers[0].ffn.global_router.neuron_keys
+                if neuron_keys.grad is not None:
+                    grad_norm = neuron_keys.grad.norm().item()
+                    grad_mean = neuron_keys.grad.abs().mean().item()
+                    nonzero = (neuron_keys.grad.abs() > 1e-10).sum().item()
+                    total = neuron_keys.grad.numel()
+
+                    print(f"  ✓ neuron_keys HAS gradient!")
+                    print(f"    Shape: {neuron_keys.grad.shape}")
+                    print(f"    Grad norm: {grad_norm:.6f}")
+                    print(f"    Grad mean (abs): {grad_mean:.8f}")
+                    print(f"    Non-zero grads: {nonzero}/{total} ({nonzero/total*100:.1f}%)")
+
+                    if grad_norm < 1e-7:
+                        print(f"    ⚠ WARNING: Gradient too small (vanishing)")
+                    elif grad_norm > 100:
+                        print(f"    ⚠ WARNING: Gradient too large (exploding)")
+                    else:
+                        print(f"    ✓ Gradient magnitude OK")
+                else:
+                    print(f"  ✗ neuron_keys has NO GRADIENT - PROBLEM!")
+
+                # Check other parameters
                 grad_issues = []
                 for name, param in model.named_parameters():
                     if param.grad is not None:
@@ -406,14 +432,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         elif grad_norm > 100:
                             grad_issues.append(f"  ⚠ {name}: grad too large ({grad_norm:.2e})")
                     else:
-                        grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
+                        # Skip neuron_keys since we already checked it above
+                        if 'neuron_keys' not in name:
+                            grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
 
                 if grad_issues:
-                    print("  Gradient Issues:")
+                    print("\n  Other Gradient Issues:")
                     for issue in grad_issues[:10]:  # Show first 10 issues
                         print(issue)
                 else:
-                    print("  ✓ All gradients OK")
+                    print("\n  ✓ All other gradients OK")
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Stronger clipping
@@ -469,6 +497,32 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             if debug_mode:
                 print(f"\nAfter Backward:")
+
+                # CRITICAL: Check neuron_keys gradient specifically
+                print(f"\n[Critical Gradient Check - neuron_keys]")
+                neuron_keys = model.layers[0].ffn.global_router.neuron_keys
+                if neuron_keys.grad is not None:
+                    grad_norm = neuron_keys.grad.norm().item()
+                    grad_mean = neuron_keys.grad.abs().mean().item()
+                    nonzero = (neuron_keys.grad.abs() > 1e-10).sum().item()
+                    total = neuron_keys.grad.numel()
+
+                    print(f"  ✓ neuron_keys HAS gradient!")
+                    print(f"    Shape: {neuron_keys.grad.shape}")
+                    print(f"    Grad norm: {grad_norm:.6f}")
+                    print(f"    Grad mean (abs): {grad_mean:.8f}")
+                    print(f"    Non-zero grads: {nonzero}/{total} ({nonzero/total*100:.1f}%)")
+
+                    if grad_norm < 1e-7:
+                        print(f"    ⚠ WARNING: Gradient too small (vanishing)")
+                    elif grad_norm > 100:
+                        print(f"    ⚠ WARNING: Gradient too large (exploding)")
+                    else:
+                        print(f"    ✓ Gradient magnitude OK")
+                else:
+                    print(f"  ✗ neuron_keys has NO GRADIENT - PROBLEM!")
+
+                # Check other parameters
                 grad_issues = []
                 for name, param in model.named_parameters():
                     if param.grad is not None:
@@ -478,14 +532,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         elif grad_norm > 100:
                             grad_issues.append(f"  ⚠ {name}: grad too large ({grad_norm:.2e})")
                     else:
-                        grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
+                        # Skip neuron_keys since we already checked it above
+                        if 'neuron_keys' not in name:
+                            grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
 
                 if grad_issues:
-                    print("  Gradient Issues:")
+                    print("\n  Other Gradient Issues:")
                     for issue in grad_issues[:10]:  # Show first 10 issues
                         print(issue)
                 else:
-                    print("  ✓ All gradients OK")
+                    print("\n  ✓ All other gradients OK")
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Stronger clipping
             optimizer.step()
