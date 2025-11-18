@@ -68,7 +68,8 @@ def comprehensive_debug(
     loss,
     aux_loss,
     optimizer,
-    debug_first_n_steps: int = 10
+    debug_first_n_steps: int = 10,
+    log_file: str = None
 ):
     """
     종합 디버깅 함수 - 학습이 안 되는 원인을 찾기 위한 완전한 진단
@@ -83,10 +84,22 @@ def comprehensive_debug(
         aux_loss: 스칼라
         optimizer: 옵티마이저
         debug_first_n_steps: 처음 몇 스텝 디버깅할지
+        log_file: 로그 파일 경로
     """
 
     if step > debug_first_n_steps:
         return
+
+    # Redirect all output to file
+    if log_file is None:
+        return  # Skip debug output if no log file specified
+
+    import sys
+    from io import StringIO
+
+    # Capture stdout
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()
 
     print("\n" + "="*70)
     print(f"🔍 COMPREHENSIVE DEBUG - STEP {step}")
@@ -316,12 +329,20 @@ def comprehensive_debug(
     print("\n" + "="*70)
     print()
 
+    # Restore stdout and write to file
+    captured = sys.stdout.getvalue()
+    sys.stdout = old_stdout
+
+    if log_file:
+        with open(log_file, 'a') as f:
+            f.write(captured)
+
 
 # ============================================================
 # Deep Learning Analysis Function
 # ============================================================
 
-def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10):
+def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_file=None):
     """
     학습 과정의 본질적 정보 추출 - 정보 흐름, gradient 흐름, 라우팅, weight 분포 등 심층 분석
 
@@ -331,12 +352,23 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10):
         labels: Labels [B, S]
         step: Current step
         debug_first_n_steps: Debug first N steps only
+        log_file: Log file path for redirecting output
     """
     if step > debug_first_n_steps:
         return
 
+    # Redirect all output to file
+    if log_file is None:
+        return  # Skip debug output if no log file specified
+
+    import sys
+    from io import StringIO
     import torch.nn.functional as F
     from collections import Counter
+
+    # Capture stdout
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()
 
     print(f"\n{'='*70}")
     print(f"🔬 DEEP LEARNING ANALYSIS - Step {step}")
@@ -563,6 +595,14 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10):
                     print(f"    Token {token}: {count} times ({pct:.2f}%)")
 
     print(f"\n{'='*70}\n")
+
+    # Restore stdout and write to file
+    captured = sys.stdout.getvalue()
+    sys.stdout = old_stdout
+
+    if log_file:
+        with open(log_file, 'a') as f:
+            f.write(captured)
 
 
 # ============================================================
@@ -860,7 +900,7 @@ def print_diagnostic_metrics(model, epoch):
     print(f"{'='*60}\n")
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None):
+def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None, debug_log_file=None):
     """Train for one epoch"""
     model.train()
 
@@ -885,6 +925,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         # Detailed debugging for first 10 steps of epoch 1
         debug_mode = (epoch == 1 and step < 10)
+
+        # Capture debug output to file
+        debug_output_buffer = None
+        old_stdout = None
+        if debug_mode and debug_log_file:
+            import sys
+            from io import StringIO
+            old_stdout = sys.stdout
+            debug_output_buffer = StringIO()
+            sys.stdout = debug_output_buffer
 
         if debug_mode:
             print(f"\n{'='*60}")
@@ -1193,6 +1243,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                        f"aux_loss={aux_loss.item():.6f},weighted_aux={(aux_weight * aux_loss).item():.6f},"
                        f"acc={acc_val:.6f}\n")
 
+        # Restore stdout and write debug output to file
+        if debug_mode and debug_log_file and old_stdout is not None:
+            captured = debug_output_buffer.getvalue()
+            sys.stdout = old_stdout
+            if captured:
+                with open(debug_log_file, 'a') as f:
+                    f.write(captured)
+
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
     return avg_loss, avg_acc
@@ -1444,6 +1502,11 @@ def main():
         f.write("# Training Log\n")
         f.write("# Format: epoch,step,loss,aux_loss,weighted_aux,acc\n")
 
+    # Write header to debug log
+    with open(debug_log_file, 'w') as f:
+        f.write("# Debug Log\n")
+        f.write("# Contains detailed debugging information for first 10 steps of epoch 1\n\n")
+
     # Training loop
     print(f"\n{'='*60}")
     print(f"Starting training...")
@@ -1458,7 +1521,8 @@ def main():
         # Train
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args, scaler, tokenizer,
-            log_file=str(training_log_file)
+            log_file=str(training_log_file),
+            debug_log_file=str(debug_log_file)
         )
 
         # Evaluate
