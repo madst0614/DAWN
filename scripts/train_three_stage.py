@@ -45,6 +45,69 @@ from models.three_stage_ffn import HierarchicalLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import CacheLoader
 
+# MLM 마스킹 설정
+MLM_CONFIG = {
+    "mask_prob": 0.15,
+    "mask_token_ratio": 0.8,
+    "random_token_ratio": 0.5
+}
+
+
+# ============================================================
+# MLM Masking Function
+# ============================================================
+
+def apply_mlm_masking(input_ids, tokenizer, config=None):
+    """
+    Apply MLM-style masking (80% [MASK], 10% random, 10% keep).
+
+    Args:
+        input_ids: [B, S] Token IDs to mask
+        tokenizer: Tokenizer instance
+        config: Optional config dict with mask_prob, mask_token_ratio, random_token_ratio
+
+    Returns:
+        Tuple of (masked_input_ids, labels)
+    """
+    if config is None:
+        config = MLM_CONFIG
+
+    labels = input_ids.clone()
+    mask_prob = config.get("mask_prob", 0.15)
+
+    probability_matrix = torch.full(labels.shape, mask_prob)
+
+    # Exclude special tokens (CLS, SEP, PAD, etc.)
+    special_tokens_mask = torch.zeros_like(labels, dtype=torch.bool)
+    for token_id in [tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id]:
+        if token_id is not None:
+            special_tokens_mask |= (labels == token_id)
+    probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+
+    # Sample masked positions
+    masked_indices = torch.bernoulli(probability_matrix).bool()
+    labels[~masked_indices] = -100  # Only compute loss on masked tokens
+
+    # Apply masking strategy
+    mask_ratio = config.get("mask_token_ratio", 0.8)
+    random_ratio = config.get("random_token_ratio", 0.5)
+
+    # 80% [MASK]
+    indices_replaced = masked_indices & (torch.rand(labels.shape, device=labels.device) < mask_ratio)
+    input_ids[indices_replaced] = tokenizer.mask_token_id
+
+    # 10% random (of remaining)
+    indices_random = (
+        masked_indices
+        & ~indices_replaced
+        & (torch.rand(labels.shape, device=labels.device) < random_ratio)
+    )
+    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long, device=labels.device)
+    input_ids[indices_random] = random_words[indices_random]
+
+    # 10% keep original (implicit)
+    return input_ids, labels
+
 
 # ============================================================
 # Dataset
@@ -152,7 +215,7 @@ def reset_routing_stats(model):
         layer.ffn.reset_routing_counts()
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None):
+def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None):
     """Train for one epoch"""
     model.train()
 
@@ -167,8 +230,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     for batch in pbar:
         input_ids = batch["input_ids"].to(device)
 
-        # Create MLM labels (same as input for simplicity)
-        labels = input_ids.clone()
+        # Apply MLM masking
+        if tokenizer is not None:
+            input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+        else:
+            # Fallback: no masking
+            labels = input_ids.clone()
 
         optimizer.zero_grad()
 
@@ -441,7 +508,7 @@ def main():
 
         # Train
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, device, epoch, args, scaler
+            model, train_loader, optimizer, scheduler, device, epoch, args, scaler, tokenizer
         )
 
         # Evaluate
