@@ -74,8 +74,9 @@ def apply_mlm_masking(input_ids, tokenizer, config=None):
 
     labels = input_ids.clone()
     mask_prob = config.get("mask_prob", 0.15)
+    device = input_ids.device
 
-    probability_matrix = torch.full(labels.shape, mask_prob)
+    probability_matrix = torch.full(labels.shape, mask_prob, device=device)
 
     # Exclude special tokens (CLS, SEP, PAD, etc.)
     special_tokens_mask = torch.zeros_like(labels, dtype=torch.bool)
