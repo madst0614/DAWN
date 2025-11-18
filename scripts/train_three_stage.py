@@ -34,12 +34,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import argparse
 from tqdm import tqdm
 import json
 from datetime import datetime
 import time
+import numpy as np
 
 from models.three_stage_ffn import HierarchicalLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
@@ -51,6 +53,268 @@ MLM_CONFIG = {
     "mask_token_ratio": 0.8,
     "random_token_ratio": 0.5
 }
+
+
+# ============================================================
+# Comprehensive Debugging Function
+# ============================================================
+
+def comprehensive_debug(
+    step: int,
+    model,
+    input_ids,
+    labels,
+    logits,
+    loss,
+    aux_loss,
+    optimizer,
+    debug_first_n_steps: int = 10
+):
+    """
+    종합 디버깅 함수 - 학습이 안 되는 원인을 찾기 위한 완전한 진단
+
+    Args:
+        step: 현재 스텝
+        model: 모델
+        input_ids: [B, S]
+        labels: [B, S]
+        logits: [B, S, V]
+        loss: 스칼라
+        aux_loss: 스칼라
+        optimizer: 옵티마이저
+        debug_first_n_steps: 처음 몇 스텝 디버깅할지
+    """
+
+    if step > debug_first_n_steps:
+        return
+
+    print("\n" + "="*70)
+    print(f"🔍 COMPREHENSIVE DEBUG - STEP {step}")
+    print("="*70)
+
+    B, S = input_ids.shape
+    V = logits.shape[-1]
+    device = input_ids.device
+
+    # ============================================================
+    # 1. 데이터 검증 (가장 중요!)
+    # ============================================================
+    print("\n📊 1. DATA VALIDATION")
+    print("-" * 70)
+
+    # 1.1 입력 통계
+    print(f"\n[Input IDs]")
+    print(f"  Shape: {input_ids.shape}")
+    print(f"  Range: [{input_ids.min().item()}, {input_ids.max().item()}]")
+    print(f"  Unique tokens: {input_ids.unique().numel()}")
+    print(f"  First sequence (first 30): {input_ids[0, :30].tolist()}")
+
+    # 1.2 라벨 통계 (핵심!)
+    print(f"\n[Labels - CRITICAL]")
+    print(f"  Shape: {labels.shape}")
+    print(f"  Range: [{labels.min().item()}, {labels.max().item()}]")
+
+    valid_mask = (labels != -100)
+    masked_count = (labels == -100).sum().item()
+    valid_count = valid_mask.sum().item()
+    total_count = labels.numel()
+
+    print(f"  Total tokens: {total_count}")
+    print(f"  Masked (-100): {masked_count} ({masked_count/total_count*100:.2f}%)")
+    print(f"  Valid tokens: {valid_count} ({valid_count/total_count*100:.2f}%)")
+    print(f"  ⚠️  Masking ratio: {masked_count/total_count*100:.1f}%")
+
+    if masked_count / total_count > 0.5:
+        print(f"  🚨 WARNING: Over 50% masked! This is abnormal!")
+    if masked_count / total_count > 0.9:
+        print(f"  🚨🚨 CRITICAL: Over 90% masked! Training will fail!")
+
+    # 첫 시퀀스의 라벨 패턴 분석
+    print(f"\n[First Sequence Label Pattern]")
+    first_labels = labels[0]
+    first_valid = first_labels[first_labels != -100]
+
+    print(f"  Valid positions (first 20): {valid_mask[0].nonzero().squeeze()[:20].tolist()}")
+    print(f"  First 30 labels: {labels[0, :30].tolist()}")
+    if len(first_valid) > 0:
+        print(f"  Valid label values (first 20): {first_valid[:20].tolist()}")
+
+    # 라벨과 입력 비교
+    print(f"\n[Input vs Labels Alignment]")
+    print(f"  Input [0, :10]:  {input_ids[0, :10].tolist()}")
+    print(f"  Labels[0, :10]:  {labels[0, :10].tolist()}")
+    print(f"  Input [0, -10:]: {input_ids[0, -10:].tolist()}")
+    print(f"  Labels[0, -10:]: {labels[0, -10:].tolist()}")
+
+    # ============================================================
+    # 2. 모델 출력 검증
+    # ============================================================
+    print("\n📈 2. MODEL OUTPUT VALIDATION")
+    print("-" * 70)
+
+    # 2.1 Logits 통계
+    print(f"\n[Logits]")
+    print(f"  Shape: {logits.shape}")
+    print(f"  Range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
+    print(f"  Mean: {logits.mean().item():.4f}")
+    print(f"  Std: {logits.std().item():.4f}")
+
+    # NaN/Inf 체크
+    if torch.isnan(logits).any():
+        print(f"  🚨 NaN detected in logits!")
+        nan_count = torch.isnan(logits).sum().item()
+        print(f"     NaN count: {nan_count}/{logits.numel()}")
+    if torch.isinf(logits).any():
+        print(f"  🚨 Inf detected in logits!")
+
+    # 2.2 예측 분석
+    print(f"\n[Predictions]")
+    preds = logits.argmax(dim=-1)
+    print(f"  Predicted tokens (first seq, first 30): {preds[0, :30].tolist()}")
+
+    # 예측의 다양성
+    unique_preds = preds.unique().numel()
+    print(f"  Unique predictions: {unique_preds}/{V} ({unique_preds/V*100:.2f}%)")
+
+    # 가장 자주 예측되는 토큰
+    pred_counts = torch.bincount(preds.flatten(), minlength=V)
+    top_preds = pred_counts.topk(10)
+    print(f"  Top 10 predicted tokens:")
+    for i, (count, token_id) in enumerate(zip(top_preds.values, top_preds.indices)):
+        print(f"    #{i+1}: token {token_id.item()} (count: {count.item()})")
+
+    # 2.3 정확도 계산 (valid token만)
+    print(f"\n[Accuracy on Valid Tokens]")
+    if valid_count > 0:
+        correct = (preds == labels) & valid_mask
+        acc = correct.sum().item() / valid_count
+        print(f"  Overall: {acc*100:.2f}% ({correct.sum().item()}/{valid_count})")
+
+        # 첫 시퀀스의 매칭
+        if valid_mask[0].sum() > 0:
+            first_preds = preds[0][valid_mask[0]]
+            first_labels_valid = labels[0][valid_mask[0]]
+            first_matches = (first_preds == first_labels_valid).sum().item()
+            print(f"  First sequence: {first_matches}/{len(first_preds)} correct")
+            print(f"    Predicted: {first_preds[:10].tolist()}")
+            print(f"    Actual:    {first_labels_valid[:10].tolist()}")
+    else:
+        print(f"  ⚠️  No valid tokens to compute accuracy!")
+
+    # ============================================================
+    # 3. Loss 분석
+    # ============================================================
+    print("\n💰 3. LOSS ANALYSIS")
+    print("-" * 70)
+
+    print(f"\n[Main Loss]")
+    print(f"  Value: {loss.item():.4f}")
+    print(f"  Expected range: 0-10 (vocab ~30k)")
+
+    # Per-token loss 계산
+    if valid_count > 0:
+        # Flatten and compute per-token loss
+        logits_flat = logits.view(-1, V)
+        labels_flat = labels.view(-1)
+
+        per_token_loss = F.cross_entropy(
+            logits_flat,
+            labels_flat,
+            ignore_index=-100,
+            reduction='none'
+        )
+
+        # Valid token의 loss만
+        valid_losses = per_token_loss[labels_flat != -100]
+
+        print(f"\n[Per-Token Loss Statistics]")
+        print(f"  Min: {valid_losses.min().item():.4f}")
+        print(f"  Max: {valid_losses.max().item():.4f}")
+        print(f"  Mean: {valid_losses.mean().item():.4f}")
+        print(f"  Median: {valid_losses.median().item():.4f}")
+        print(f"  Std: {valid_losses.std().item():.4f}")
+
+        # Loss 분포
+        print(f"\n[Loss Distribution]")
+        print(f"  <1.0:  {(valid_losses < 1.0).sum().item()} tokens")
+        print(f"  1-5:   {((valid_losses >= 1.0) & (valid_losses < 5.0)).sum().item()} tokens")
+        print(f"  5-10:  {((valid_losses >= 5.0) & (valid_losses < 10.0)).sum().item()} tokens")
+        print(f"  >10:   {(valid_losses >= 10.0).sum().item()} tokens")
+
+        # 첫 10개 valid token의 loss
+        first_seq_valid_idx = valid_mask[0].nonzero().squeeze()
+        if len(first_seq_valid_idx) > 0:
+            first_10_idx = first_seq_valid_idx[:10]
+            print(f"\n[First Sequence - First 10 Valid Tokens]")
+            for i, idx in enumerate(first_10_idx):
+                idx_item = idx.item()
+                token_id = labels[0, idx_item].item()
+                pred_id = preds[0, idx_item].item()
+                token_loss = per_token_loss[idx_item].item()
+                match = "✓" if token_id == pred_id else "✗"
+                print(f"    Pos {idx_item}: label={token_id}, pred={pred_id}, loss={token_loss:.3f} {match}")
+
+    print(f"\n[Auxiliary Loss]")
+    print(f"  Value: {aux_loss.item():.6f}")
+    print(f"  Expected range: 0-2")
+
+    # ============================================================
+    # 4. 종합 진단
+    # ============================================================
+    print("\n🏥 4. DIAGNOSTIC SUMMARY")
+    print("-" * 70)
+
+    issues = []
+    warnings = []
+
+    # 체크리스트
+    if masked_count / total_count > 0.9:
+        issues.append("🚨 CRITICAL: >90% tokens masked - training impossible")
+    elif masked_count / total_count > 0.5:
+        warnings.append("⚠️  >50% tokens masked - training inefficient")
+
+    if valid_count == 0:
+        issues.append("🚨 CRITICAL: No valid tokens - cannot compute loss")
+
+    if torch.isnan(logits).any():
+        issues.append("🚨 CRITICAL: NaN in logits")
+
+    if loss.item() > 12:
+        warnings.append(f"⚠️  Very high loss: {loss.item():.2f}")
+
+    if valid_count > 0:
+        correct = (preds == labels) & valid_mask
+        acc = correct.sum().item() / valid_count
+        if acc < 0.001:
+            warnings.append(f"⚠️  Near-zero accuracy: {acc*100:.3f}%")
+
+    # 출력
+    if issues:
+        print("\n🚨 CRITICAL ISSUES:")
+        for issue in issues:
+            print(f"  {issue}")
+
+    if warnings:
+        print("\n⚠️  WARNINGS:")
+        for warning in warnings:
+            print(f"  {warning}")
+
+    if not issues and not warnings:
+        print("\n✅ No major issues detected")
+
+    # 추천 액션
+    print("\n💡 RECOMMENDED ACTIONS:")
+    if masked_count / total_count > 0.5:
+        print("  1. Check data preprocessing - fix masking ratio")
+        print("     → Look for collate_fn or Dataset code")
+        print("     → Should mask 0% (CLM) or ~15% (MLM)")
+
+    if aux_loss.item() < 0.001:
+        print("  2. Increase aux_loss_weight:")
+        print("     → Currently too small, increase to 0.01 or 0.1")
+
+    print("\n" + "="*70)
+    print()
 
 
 # ============================================================
@@ -126,7 +390,7 @@ def apply_mlm_masking(input_ids, tokenizer, config=None):
 
 class TextDataset(Dataset):
     """Dataset for tokenized texts"""
-    def __init__(self, texts, tokenizer, max_length=512):
+    def __init__(self, texts, tokenizer, max_length=128):  # CHANGED: 512 → 128
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -137,10 +401,9 @@ class TextDataset(Dataset):
     def __getitem__(self, idx):
         text = self.texts[idx]
 
-        # Tokenize
+        # Tokenize (NO padding here - will be done dynamically in collate_fn)
         encoding = self.tokenizer(
             text,
-            padding='max_length',
             truncation=True,
             max_length=self.max_length,
             return_tensors='pt'
@@ -152,9 +415,50 @@ class TextDataset(Dataset):
         }
 
 
-def load_cached_data(tokenizer_path=None, max_length=512, batch_size=32):
-    """Load cached WikiText data"""
+def collate_fn_dynamic_padding(batch, tokenizer):
+    """
+    Collate function with DYNAMIC padding (배치별 최대 길이만큼만 padding)
+
+    큰 개선:
+    - Before: 모든 시퀀스를 512로 padding → 90% padding!
+    - After: 배치 내 최대 길이로만 padding → ~10-30% padding
+    """
+    # Find max length in this batch
+    max_len = max(item['input_ids'].size(0) for item in batch)
+
+    input_ids_list = []
+    attention_mask_list = []
+
+    for item in batch:
+        input_ids = item['input_ids']
+        attention_mask = item['attention_mask']
+        seq_len = input_ids.size(0)
+
+        # Pad to batch max length
+        if seq_len < max_len:
+            padding_len = max_len - seq_len
+            input_ids = torch.cat([
+                input_ids,
+                torch.full((padding_len,), tokenizer.pad_token_id, dtype=torch.long)
+            ])
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.zeros(padding_len, dtype=torch.long)
+            ])
+
+        input_ids_list.append(input_ids)
+        attention_mask_list.append(attention_mask)
+
+    return {
+        'input_ids': torch.stack(input_ids_list),
+        'attention_mask': torch.stack(attention_mask_list)
+    }
+
+
+def load_cached_data(tokenizer_path=None, max_length=128, batch_size=128):  # CHANGED: defaults
+    """Load cached WikiText data with DYNAMIC padding"""
     from transformers import AutoTokenizer
+    from functools import partial
 
     # Load tokenizer
     if tokenizer_path is None:
@@ -178,17 +482,22 @@ def load_cached_data(tokenizer_path=None, max_length=512, batch_size=32):
     train_dataset = TextDataset(train_texts, tokenizer, max_length)
     val_dataset = TextDataset(val_texts, tokenizer, max_length)
 
-    # Create dataloaders
+    # Create collate function with tokenizer
+    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+
+    # Create dataloaders with DYNAMIC padding
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2
+        num_workers=2,
+        collate_fn=collate_fn  # ← Dynamic padding!
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        num_workers=2
+        num_workers=2,
+        collate_fn=collate_fn  # ← Dynamic padding!
     )
 
     return train_loader, val_loader, tokenizer
@@ -226,6 +535,83 @@ def reset_routing_stats(model):
         layer.ffn.reset_routing_counts()
 
 
+def print_diagnostic_metrics(model, epoch):
+    """
+    학습 진단 메트릭 출력
+
+    - Gradient norm (exploding/vanishing 체크)
+    - Neuron 사용률 (input neurons)
+    - Router entropy (다양성)
+    - Process neuron 사용률
+    """
+    print(f"\n{'='*60}")
+    print(f"Diagnostic Metrics (Epoch {epoch})")
+    print(f"{'='*60}")
+
+    # 1. Gradient norm
+    grad_norm = 0.0
+    grad_count = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            grad_norm += p.grad.norm().item() ** 2
+            grad_count += 1
+
+    if grad_count > 0:
+        grad_norm = grad_norm ** 0.5
+        status = "✓ OK"
+        if grad_norm < 0.01:
+            status = "⚠ VANISHING"
+        elif grad_norm > 100:
+            status = "⚠ EXPLODING"
+        print(f"Gradient Norm: {grad_norm:.4f} {status}")
+        print(f"  Expected: 0.1 ~ 10 | < 0.01 = vanishing | > 100 = exploding")
+    else:
+        print(f"Gradient Norm: N/A (no gradients)")
+
+    # 첫 번째 레이어의 FFN 분석 (대표값)
+    first_ffn = model.layers[0].ffn
+
+    # 2. Input Neuron 사용률
+    if first_ffn.input_neuron_counts is not None:
+        active_input = (first_ffn.input_neuron_counts > 0).sum().item()
+        total_input = first_ffn.n_input
+        usage_pct = active_input / total_input * 100
+
+        status = "✓ OK" if usage_pct > 50 else "⚠ LOW"
+        print(f"\nInput Neurons (Layer 0): {active_input}/{total_input} ({usage_pct:.1f}%) {status}")
+        print(f"  Expected: > 50% for good diversity")
+    else:
+        print(f"\nInput Neurons: N/A (no stats collected)")
+
+    # 3. Router Entropy (다양성)
+    neuron_keys = first_ffn.global_router.neuron_keys  # [n_input, d_routing]
+    # 각 뉴런의 key를 확률 분포로 변환 (softmax over neurons)
+    # 높은 entropy = 다양한 뉴런이 선택될 가능성
+    routing_logits = neuron_keys.norm(dim=1)  # [n_input] - 각 뉴런의 key 크기
+    routing_probs = F.softmax(routing_logits, dim=0)
+    entropy = -(routing_probs * (routing_probs + 1e-10).log()).sum().item()
+    max_entropy = torch.log(torch.tensor(float(first_ffn.n_input))).item()
+    entropy_pct = entropy / max_entropy * 100
+
+    status = "✓ OK" if entropy_pct > 50 else "⚠ LOW"
+    print(f"\nRouter Entropy (Layer 0): {entropy_pct:.1f}% of max {status}")
+    print(f"  Expected: > 50% for diverse routing")
+
+    # 4. Process Neuron 사용률
+    if first_ffn.process_neuron_counts is not None:
+        active_process = (first_ffn.process_neuron_counts > 0).sum().item()
+        total_process = first_ffn.n_process
+        process_pct = active_process / total_process * 100
+
+        status = "✓ OK" if process_pct > 50 else "⚠ LOW"
+        print(f"\nProcess Neurons (Layer 0): {active_process}/{total_process} ({process_pct:.1f}%) {status}")
+        print(f"  Expected: ~100% if k_process=n_process (no selection)")
+    else:
+        print(f"\nProcess Neurons: N/A (no stats collected)")
+
+    print(f"{'='*60}\n")
+
+
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None):
     """Train for one epoch"""
     model.train()
@@ -236,9 +622,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     total_loss = 0
     total_tokens = 0
     total_correct = 0
+    total_valid_tokens = 0  # CRITICAL FIX: Track valid tokens only (labels != -100)
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
-    for batch in pbar:
+    for step, batch in enumerate(pbar):
         input_ids = batch["input_ids"].to(device)
 
         # Apply MLM masking
@@ -248,14 +635,34 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Fallback: no masking
             labels = input_ids.clone()
 
+        # Detailed debugging for first 10 steps of epoch 1
+        debug_mode = (epoch == 1 and step < 10)
+
+        if debug_mode:
+            print(f"\n{'='*60}")
+            print(f"Step {step + 1} Debugging")
+            print(f"{'='*60}")
+
+            # CRITICAL: Label analysis for first step
+            if step == 0:
+                print(f"\n[Label Analysis]")
+                print(f"  Total tokens: {labels.numel()}")
+                print(f"  Masked tokens (-100): {(labels == -100).sum().item()}")
+                print(f"  Valid tokens: {(labels != -100).sum().item()}")
+                print(f"  Masking ratio: {(labels == -100).sum().item() / labels.numel() * 100:.1f}%")
+
+            print(f"\nBefore Forward:")
+            print(f"  Input shape: {input_ids.shape}, range: [{input_ids.min()}, {input_ids.max()}]")
+            print(f"  Model embedding norm: {model.token_embedding.weight.norm():.4f}")
+
         optimizer.zero_grad()
 
         # Mixed precision training
         # Dynamic aux weight: stronger in early epochs
         if epoch <= 5:
-            aux_weight = 0.05  # Strong regularization initially
+            aux_weight = 0.5  # Strong regularization initially (was 0.05)
         else:
-            aux_weight = 0.01  # Moderate regularization later
+            aux_weight = 0.1  # Moderate regularization later (was 0.01)
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -270,11 +677,114 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # Load balancing loss 추가
                 aux_loss = compute_load_balance_loss(model)
-                total_loss = loss + aux_weight * aux_loss
+                total_loss_combined = loss + aux_weight * aux_loss
 
-            scaler.scale(total_loss).backward()
+            if debug_mode:
+                print(f"\nAfter Forward:")
+                print(f"  Logits shape: {logits.shape}")
+                print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
+                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+
+                # Routing debug
+                print(f"\n[Routing Debug - Step {step+1}]")
+                first_ffn = model.layers[0].ffn
+
+                if first_ffn.last_routing_scores is not None:
+                    routing_weights = first_ffn.last_routing_scores  # [B, n_input]
+
+                    # Top-k pattern analysis
+                    topk_vals, topk_idx = routing_weights[0].topk(10)
+                    print(f"  Top 10 routing weights: {topk_vals.cpu().numpy()}")
+
+                    # Distribution stats
+                    print(f"  Distribution: min={routing_weights.min():.6f}, max={routing_weights.max():.6f}, mean={routing_weights.mean():.6f}")
+
+                    # Sparsity check
+                    nonzero = (routing_weights[0] > 1e-6).sum()
+                    print(f"  Non-zero weights: {nonzero}/{len(routing_weights[0])}")
+
+                    # Usage stats
+                    if first_ffn.input_neuron_counts is not None:
+                        counts = first_ffn.input_neuron_counts
+                        active_neurons = (counts > 0).sum()
+                        print(f"  Active input neurons: {active_neurons}/{len(counts)}")
+                else:
+                    print(f"  No routing scores available")
+
+            scaler.scale(total_loss_combined).backward()
+
+            # 🔥 COMPREHENSIVE DEBUGGING (first 10 steps)
+            comprehensive_debug(
+                step=step + 1,
+                model=model,
+                input_ids=input_ids,
+                labels=labels,
+                logits=logits,
+                loss=loss,
+                aux_loss=aux_loss,
+                optimizer=optimizer,
+                debug_first_n_steps=10
+            )
+
+            if debug_mode:
+                print(f"\n[Additional Debug Info - After Backward]")
+
+                # CRITICAL: Check neuron_keys gradient specifically
+                print(f"\n[Critical Gradient Check - neuron_keys]")
+                neuron_keys = model.layers[0].ffn.global_router.neuron_keys
+                if neuron_keys.grad is not None:
+                    grad_norm = neuron_keys.grad.norm().item()
+                    grad_mean = neuron_keys.grad.abs().mean().item()
+                    nonzero = (neuron_keys.grad.abs() > 1e-10).sum().item()
+                    total = neuron_keys.grad.numel()
+
+                    print(f"  ✓ neuron_keys HAS gradient!")
+                    print(f"    Shape: {neuron_keys.grad.shape}")
+                    print(f"    Grad norm: {grad_norm:.6f}")
+                    print(f"    Grad mean (abs): {grad_mean:.8f}")
+                    print(f"    Non-zero grads: {nonzero}/{total} ({nonzero/total*100:.1f}%)")
+
+                    if grad_norm < 1e-7:
+                        print(f"    ⚠ WARNING: Gradient too small (vanishing)")
+                    elif grad_norm > 100:
+                        print(f"    ⚠ WARNING: Gradient too large (exploding)")
+                    else:
+                        print(f"    ✓ Gradient magnitude OK")
+                else:
+                    print(f"  ✗ neuron_keys has NO GRADIENT - PROBLEM!")
+
+                # Check other parameters
+                grad_issues = []
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        if grad_norm < 1e-7:
+                            grad_issues.append(f"  ⚠ {name}: grad too small ({grad_norm:.2e})")
+                        elif grad_norm > 100:
+                            grad_issues.append(f"  ⚠ {name}: grad too large ({grad_norm:.2e})")
+                    else:
+                        # Skip neuron_keys since we already checked it above
+                        if 'neuron_keys' not in name:
+                            grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
+
+                if grad_issues:
+                    print("\n  Other Gradient Issues:")
+                    for issue in grad_issues[:10]:  # Show first 10 issues
+                        print(issue)
+                else:
+                    print("\n  ✓ All other gradients OK")
+
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            # Gradient clipping with verification
+            grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            if debug_mode:
+                print(f"\n[Gradient Clipping]")
+                print(f"  Grad norm before clipping: {grad_norm_before:.2f}")
+                if grad_norm_before > 10.0:
+                    print(f"  ⚠ WARNING: Gradient exploding! (>{10.0})")
+
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -289,20 +799,143 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             # Load balancing loss 추가
             aux_loss = compute_load_balance_loss(model)
-            total_loss = loss + aux_weight * aux_loss
+            total_loss_combined = loss + aux_weight * aux_loss
 
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if debug_mode:
+                print(f"\nAfter Forward:")
+                print(f"  Logits shape: {logits.shape}")
+                print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
+                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+
+                # Routing debug
+                print(f"\n[Routing Debug - Step {step+1}]")
+                first_ffn = model.layers[0].ffn
+
+                if first_ffn.last_routing_scores is not None:
+                    routing_weights = first_ffn.last_routing_scores  # [B, n_input]
+
+                    # Top-k pattern analysis
+                    topk_vals, topk_idx = routing_weights[0].topk(10)
+                    print(f"  Top 10 routing weights: {topk_vals.cpu().numpy()}")
+
+                    # Distribution stats
+                    print(f"  Distribution: min={routing_weights.min():.6f}, max={routing_weights.max():.6f}, mean={routing_weights.mean():.6f}")
+
+                    # Sparsity check
+                    nonzero = (routing_weights[0] > 1e-6).sum()
+                    print(f"  Non-zero weights: {nonzero}/{len(routing_weights[0])}")
+
+                    # Usage stats
+                    if first_ffn.input_neuron_counts is not None:
+                        counts = first_ffn.input_neuron_counts
+                        active_neurons = (counts > 0).sum()
+                        print(f"  Active input neurons: {active_neurons}/{len(counts)}")
+                else:
+                    print(f"  No routing scores available")
+
+            total_loss_combined.backward()
+
+            # 🔥 COMPREHENSIVE DEBUGGING (first 10 steps)
+            comprehensive_debug(
+                step=step + 1,
+                model=model,
+                input_ids=input_ids,
+                labels=labels,
+                logits=logits,
+                loss=loss,
+                aux_loss=aux_loss,
+                optimizer=optimizer,
+                debug_first_n_steps=10
+            )
+
+            if debug_mode:
+                print(f"\n[Additional Debug Info - After Backward]")
+
+                # CRITICAL: Check neuron_keys gradient specifically
+                print(f"\n[Critical Gradient Check - neuron_keys]")
+                neuron_keys = model.layers[0].ffn.global_router.neuron_keys
+                if neuron_keys.grad is not None:
+                    grad_norm = neuron_keys.grad.norm().item()
+                    grad_mean = neuron_keys.grad.abs().mean().item()
+                    nonzero = (neuron_keys.grad.abs() > 1e-10).sum().item()
+                    total = neuron_keys.grad.numel()
+
+                    print(f"  ✓ neuron_keys HAS gradient!")
+                    print(f"    Shape: {neuron_keys.grad.shape}")
+                    print(f"    Grad norm: {grad_norm:.6f}")
+                    print(f"    Grad mean (abs): {grad_mean:.8f}")
+                    print(f"    Non-zero grads: {nonzero}/{total} ({nonzero/total*100:.1f}%)")
+
+                    if grad_norm < 1e-7:
+                        print(f"    ⚠ WARNING: Gradient too small (vanishing)")
+                    elif grad_norm > 100:
+                        print(f"    ⚠ WARNING: Gradient too large (exploding)")
+                    else:
+                        print(f"    ✓ Gradient magnitude OK")
+                else:
+                    print(f"  ✗ neuron_keys has NO GRADIENT - PROBLEM!")
+
+                # Check other parameters
+                grad_issues = []
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        if grad_norm < 1e-7:
+                            grad_issues.append(f"  ⚠ {name}: grad too small ({grad_norm:.2e})")
+                        elif grad_norm > 100:
+                            grad_issues.append(f"  ⚠ {name}: grad too large ({grad_norm:.2e})")
+                    else:
+                        # Skip neuron_keys since we already checked it above
+                        if 'neuron_keys' not in name:
+                            grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
+
+                if grad_issues:
+                    print("\n  Other Gradient Issues:")
+                    for issue in grad_issues[:10]:  # Show first 10 issues
+                        print(issue)
+                else:
+                    print("\n  ✓ All other gradients OK")
+
+            # Gradient clipping with verification
+            grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            if debug_mode:
+                print(f"\n[Gradient Clipping]")
+                print(f"  Grad norm before clipping: {grad_norm_before:.2f}")
+                if grad_norm_before > 10.0:
+                    print(f"  ⚠ WARNING: Gradient exploding! (>{10.0})")
+
             optimizer.step()
 
         if scheduler is not None:
             scheduler.step()
 
-        # Calculate accuracy
-        predictions = logits.argmax(dim=-1)
-        correct = (predictions == labels).sum().item()
-        total_correct += correct
+        # ===== CRITICAL FIX: Accuracy calculation (only valid tokens) =====
+        predictions = logits.argmax(dim=-1)  # [B, S]
 
+        # Only count tokens that are not masked (-100)
+        valid_mask = (labels != -100)  # [B, S]
+        correct_predictions = (predictions == labels) & valid_mask
+
+        correct = correct_predictions.sum().item()
+        valid_tokens = valid_mask.sum().item()
+
+        total_correct += correct
+        total_valid_tokens += valid_tokens
+
+        # Debug prediction analysis
+        if debug_mode and step == 0:
+            print(f"\n[Prediction Analysis - First Sequence]")
+            seq_0_valid = valid_mask[0]
+            seq_0_labels = labels[0][seq_0_valid]
+            seq_0_preds = predictions[0][seq_0_valid]
+
+            print(f"  Valid tokens in seq 0: {seq_0_valid.sum().item()}")
+            print(f"  First 10 labels: {seq_0_labels[:10].cpu().tolist()}")
+            print(f"  First 10 preds:  {seq_0_preds[:10].cpu().tolist()}")
+            print(f"  Matches: {(seq_0_labels[:10] == seq_0_preds[:10]).sum().item()}/10")
+
+        # Loss는 전체 토큰 수로 계산 (기존 유지)
         batch_size, seq_len = input_ids.shape
         num_tokens = batch_size * seq_len
         total_loss += loss.item() * num_tokens
@@ -312,11 +945,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             "loss": f"{loss.item():.4f}",
             "aux": f"{aux_loss.item():.4f}",
             "w_aux": f"{(aux_weight * aux_loss).item():.5f}",
-            "acc": f"{correct / num_tokens:.4f}"
+            "acc": f"{correct / valid_tokens:.4f}" if valid_tokens > 0 else "0.0000"
         })
 
     avg_loss = total_loss / total_tokens
-    avg_acc = total_correct / total_tokens
+    avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
     return avg_loss, avg_acc
 
 
@@ -326,6 +959,7 @@ def evaluate(model, dataloader, device, args):
     total_loss = 0
     total_tokens = 0
     total_correct = 0
+    total_valid_tokens = 0  # CRITICAL FIX: Track valid tokens only
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
@@ -341,10 +975,18 @@ def evaluate(model, dataloader, device, args):
             loss = outputs['loss']
             logits = outputs['logits']
 
-            # Calculate accuracy
+            # ===== CRITICAL FIX: Accuracy calculation (only valid tokens) =====
             predictions = logits.argmax(dim=-1)
-            correct = (predictions == labels).sum().item()
+
+            # Only count tokens that are not masked (-100)
+            valid_mask = (labels != -100)
+            correct_predictions = (predictions == labels) & valid_mask
+
+            correct = correct_predictions.sum().item()
+            valid_tokens = valid_mask.sum().item()
+
             total_correct += correct
+            total_valid_tokens += valid_tokens
 
             batch_size, seq_len = input_ids.shape
             num_tokens = batch_size * seq_len
@@ -352,7 +994,7 @@ def evaluate(model, dataloader, device, args):
             total_tokens += num_tokens
 
     avg_loss = total_loss / total_tokens
-    avg_acc = total_correct / total_tokens
+    avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
     return avg_loss, avg_acc
 
 
@@ -366,7 +1008,7 @@ def main():
                         help='Number of attention heads')
     parser.add_argument('--n_layers', type=int, default=6,
                         help='Number of transformer layers')
-    parser.add_argument('--max_seq_len', type=int, default=512,
+    parser.add_argument('--max_seq_len', type=int, default=128,  # CHANGED: 512 → 128 (Scenario B)
                         help='Maximum sequence length')
 
     # Hierarchical FFN specific
@@ -384,7 +1026,7 @@ def main():
                         help='Number of process neurons to activate (None = n_process//8)')
 
     # Training
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=128,  # CHANGED: 32 → 128 (Scenario B)
                         help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=30,
                         help='Number of epochs')
@@ -474,13 +1116,15 @@ def main():
     print(f"  Number of layers: {stats['n_layers']}")
 
     # Sparsity info
+    # Start with less aggressive sparsity to verify architecture works
+    # Then gradually increase sparsity if training succeeds
     if args.k_input is None:
-        k_input_actual = max(args.n_input_neurons // 8, 64)
+        k_input_actual = args.n_input_neurons // 2  # 50% (was 12.5%)
     else:
         k_input_actual = args.k_input
 
     if args.k_process is None:
-        k_process_actual = max(args.n_process_neurons // 8, 32)
+        k_process_actual = args.n_process_neurons  # 100% - no selection (was 12.5%)
     else:
         k_process_actual = args.k_process
 
@@ -564,6 +1208,10 @@ def main():
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
+
+        # Print diagnostic metrics every 100 epochs (or first epoch)
+        if epoch == 1 or epoch % 100 == 0:
+            print_diagnostic_metrics(model, epoch)
 
         # Save checkpoint
         is_best = val_loss < best_val_loss
