@@ -66,7 +66,8 @@ class GlobalRouter(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_normal_(self.neuron_keys)
+        # Orthogonal initialization for better diversity
+        nn.init.orthogonal_(self.neuron_keys)
         for module in self.query_net.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_normal_(module.weight)
@@ -85,26 +86,39 @@ class GlobalRouter(nn.Module):
 
         Returns:
             input_idx: [B, k_input] - 선택된 뉴런 인덱스
-            routing_scores: [B, k_input] - 라우팅 점수
+            routing_scores: [B, n_input] - 전체 뉴런에 대한 soft routing weights
         """
         B, S, d_model = x.shape
 
-        # 시퀀스 전체 요약 (거시적 맥락)
-        global_context = x.mean(dim=1)  # [B, d_model]
+        # Max pooling for stronger signal (instead of mean)
+        global_context = x.max(dim=1)[0]  # [B, d_model]
 
         # Query: "이 시퀀스는 어떤 특성인가?"
         query = self.query_net(global_context)  # [B, d_routing]
 
         # Attention with neuron keys
-        # scores = Q @ K^T / sqrt(d)
         routing_logits = (query @ self.neuron_keys.T) / (self.d_routing ** 0.5)
         # [B, n_input]
 
-        # Top-k 입력 뉴런 선택
-        routing_scores, input_idx = routing_logits.topk(k_input, dim=-1)
-        # [B, k_input]
+        # Soft routing weights
+        temperature = 1.0
+        routing_weights = F.softmax(routing_logits / temperature, dim=-1)  # [B, n_input]
 
-        return input_idx, routing_scores
+        # Top-k selection for sparsity
+        _, input_idx = routing_logits.topk(k_input, dim=-1)  # [B, k_input]
+
+        # Create mask for top-k
+        mask = torch.zeros_like(routing_weights)
+        mask.scatter_(1, input_idx, 1.0)
+
+        # Straight-through estimator: hard selection in forward, soft in backward
+        routing_weights_masked = routing_weights * mask
+        routing_weights_masked = routing_weights_masked / (routing_weights_masked.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # Use detach for hard selection, keep soft weights for gradient
+        routing_weights_ste = routing_weights_masked + (mask - mask.detach())
+
+        return input_idx, routing_weights_ste
 
 
 # ============================================================
@@ -169,9 +183,10 @@ class HierarchicalDynamicFFN(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_normal_(self.input_patterns)
-        nn.init.xavier_normal_(self.process_weights)
-        nn.init.xavier_normal_(self.process_outputs)
+        # Orthogonal initialization for better diversity and gradient flow
+        nn.init.orthogonal_(self.input_patterns)
+        nn.init.orthogonal_(self.process_weights)
+        nn.init.orthogonal_(self.process_outputs)
 
     def forward(
         self,

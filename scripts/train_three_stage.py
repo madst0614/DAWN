@@ -251,7 +251,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         optimizer.zero_grad()
 
         # Mixed precision training
-        aux_weight = 0.001  # Load balancing loss 가중치
+        # Dynamic aux weight: stronger in early epochs
+        if epoch <= 5:
+            aux_weight = 0.05  # Strong regularization initially
+        else:
+            aux_weight = 0.01  # Moderate regularization later
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -493,10 +497,28 @@ def main():
         weight_decay=0.01
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Warmup + Cosine Annealing scheduler
+    warmup_epochs = 2
+    warmup_steps = warmup_epochs * len(train_loader)
+    total_steps = args.num_epochs * len(train_loader)
+
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        T_max=args.num_epochs * len(train_loader),
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_steps
+    )
+
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
         eta_min=args.lr * 0.1
+    )
+
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps]
     )
 
     # Mixed precision scaler
