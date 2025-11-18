@@ -246,10 +246,16 @@ class HierarchicalDynamicFFN(nn.Module):
         # 모든 입력 뉴런의 토큰별 activation 계산
         input_acts = F.gelu(x @ self.input_patterns.T)  # [B, S, n_input]
 
-        # 선택된 입력 뉴런의 activation만 추출
+        # CRITICAL: Apply soft routing weights for gradient flow to neuron_keys
+        # This ensures routing_weights is in the computation graph!
+        weighted_input_acts = input_acts * routing_weights.unsqueeze(1)
+        # [B, S, n_input] * [B, 1, n_input] = [B, S, n_input]
+        # Now gradient flows: weighted_input_acts → routing_weights → neuron_keys ✓
+
+        # 선택된 입력 뉴런의 activation만 추출 (hard selection)
         expanded_input_idx = input_idx.unsqueeze(1).expand(-1, S, -1)
         # [B, S, k_input]
-        selected_input_acts = torch.gather(input_acts, 2, expanded_input_idx)
+        selected_input_acts = torch.gather(weighted_input_acts, 2, expanded_input_idx)
         # [B, S, k_input]
 
         # ===== Phase 3: Process Neurons =====
@@ -344,8 +350,12 @@ class HierarchicalDynamicFFN(nn.Module):
             entropy = -(avg_probs * avg_probs.log()).sum()
             max_entropy = torch.log(torch.tensor(float(self.n_input), device=device))
 
+            # Normalized entropy (0~1 range)
+            normalized_entropy = entropy / max_entropy
+
             # 낮은 엔트로피 = penalty
-            entropy_loss = 1.0 - (entropy / max_entropy)
+            # CRITICAL FIX: Clamp to prevent negative loss
+            entropy_loss = torch.clamp(1.0 - normalized_entropy, min=0.0, max=1.0)
         else:
             entropy_loss = torch.tensor(0.0, device=device)
 
@@ -379,10 +389,11 @@ class HierarchicalDynamicFFN(nn.Module):
             input_idx, routing_weights = self.global_router(x, k_input)
             # routing_weights: [B, n_input]
 
-            # Input Neurons
+            # Input Neurons (consistent with forward pass)
             input_acts = F.gelu(x @ self.input_patterns.T)
+            weighted_input_acts = input_acts * routing_weights.unsqueeze(1)
             expanded_idx = input_idx.unsqueeze(1).expand(-1, S, -1)
-            selected_input_acts = torch.gather(input_acts, 2, expanded_idx)
+            selected_input_acts = torch.gather(weighted_input_acts, 2, expanded_idx)
 
             # Process Neurons (첫 번째 시퀀스만)
             idx_0 = input_idx[0]
