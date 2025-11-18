@@ -80,12 +80,15 @@ def apply_mlm_masking(input_ids, tokenizer, config=None):
     probability_matrix = torch.full(labels.shape, mask_prob, device=device)
 
     # ✅ Exclude special tokens (CLS, SEP, PAD, etc.) - Dawn style
-    special_tokens_mask = torch.tensor([
-        tokenizer.get_special_tokens_mask(
-            [val], already_has_special_tokens=True
-        )[0]
-        for val in labels.tolist()
-    ], dtype=torch.bool, device=device)
+    # labels is [B, S], need to preserve batch dimension
+    special_tokens_mask = []
+    for seq in labels.tolist():  # Iterate over batch
+        seq_mask = [
+            tokenizer.get_special_tokens_mask([val], already_has_special_tokens=True)[0]
+            for val in seq
+        ]
+        special_tokens_mask.append(seq_mask)
+    special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool, device=device)
     probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
 
     # ✅ Exclude padding tokens (belt and suspenders)
