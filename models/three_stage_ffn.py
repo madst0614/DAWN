@@ -248,17 +248,12 @@ class HierarchicalDynamicFFN(nn.Module):
             idx_b = input_idx[b]  # [k_input]
             acts_b = selected_input_acts[b]  # [S, k_input]
 
-            # Sparse representation 생성
-            # [S, n_input] - 선택된 뉴런만 활성화
-            input_repr = torch.zeros(
-                S, self.n_input,
-                device=x.device,
-                dtype=x.dtype
-            )
-            input_repr.scatter_(1, idx_b.unsqueeze(0).expand(S, -1), acts_b.to(x.dtype))
+            # Dynamic weight indexing (position-invariant, more stable)
+            # 선택된 입력 뉴런에 대응하는 가중치만 추출
+            selected_weights = self.process_weights[:, idx_b]  # [n_process, k_input]
 
-            # 처리 뉴런 활성화 (단순 계산)
-            process_acts = F.gelu(input_repr @ self.process_weights.T)
+            # 처리 뉴런 활성화 (선택된 가중치로만 계산)
+            process_acts = F.gelu(acts_b @ selected_weights.T)
             # [S, n_process]
 
             # 처리 뉴런 선택 (시퀀스 평균 기준)
@@ -376,10 +371,9 @@ class HierarchicalDynamicFFN(nn.Module):
             idx_0 = input_idx[0]
             acts_0 = selected_input_acts[0]
 
-            input_repr = torch.zeros(S, self.n_input, device=x.device, dtype=x.dtype)
-            input_repr.scatter_(1, idx_0.unsqueeze(0).expand(S, -1), acts_0.to(x.dtype))
-
-            process_acts = F.gelu(input_repr @ self.process_weights.T)
+            # Dynamic weight indexing (consistent with forward)
+            selected_weights = self.process_weights[:, idx_0]  # [n_process, k_input]
+            process_acts = F.gelu(acts_0 @ selected_weights.T)  # [S, n_process]
             process_scores = process_acts.mean(dim=0)
             top_process_scores, process_idx = process_scores.topk(k_process)
 
