@@ -222,7 +222,7 @@ class HierarchicalDynamicFFN(nn.Module):
                 device=x.device,
                 dtype=x.dtype
             )
-            input_repr.scatter_(1, idx_b.unsqueeze(0).expand(S, -1), acts_b)
+            input_repr.scatter_(1, idx_b.unsqueeze(0).expand(S, -1), acts_b.to(x.dtype))
 
             # 처리 뉴런 활성화 (단순 계산)
             process_acts = F.gelu(input_repr @ self.process_weights.T)
@@ -273,7 +273,7 @@ class HierarchicalDynamicFFN(nn.Module):
             acts_0 = selected_input_acts[0]
 
             input_repr = torch.zeros(S, self.n_input, device=x.device, dtype=x.dtype)
-            input_repr.scatter_(1, idx_0.unsqueeze(0).expand(S, -1), acts_0)
+            input_repr.scatter_(1, idx_0.unsqueeze(0).expand(S, -1), acts_0.to(x.dtype))
 
             process_acts = F.gelu(input_repr @ self.process_weights.T)
             process_scores = process_acts.mean(dim=0)
