@@ -204,7 +204,7 @@ def analyze_routing_patterns(model, val_loader, device, max_batches=50):
             for layer_idx, layer in enumerate(model.layers):
                 # Get router output
                 k_input = layer.block.n_input // 2
-                indices, weights, context, routing_probs = layer.block.router(x, k_input)
+                indices, weights, context = layer.block.router(x, k_input)
 
                 # Count selections
                 for b in range(batch_size):
