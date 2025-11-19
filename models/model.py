@@ -430,8 +430,10 @@ class DAWNBlock(nn.Module):
         load_balance_loss = neuron_usage.std()
 
         # 2. Entropy Loss - encourage diverse routing
+        # Normalized to [0, 1]: 0 = max entropy (good), 1 = min entropy (bad)
         entropy = -(routing_probs * torch.log(routing_probs + 1e-10)).sum(dim=-1).mean()
-        entropy_loss = -entropy  # maximize entropy = minimize negative
+        max_entropy = math.log(self.n_input)  # Maximum possible entropy
+        entropy_loss = 1.0 - (entropy / max_entropy)  # Low = good diversity
 
         aux_loss = {
             'load_balance': load_balance_loss,
