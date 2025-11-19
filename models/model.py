@@ -52,6 +52,9 @@ class DynamicRouter(nn.Module):
         # Content-to-neuron affinity projection
         self.affinity_proj = nn.Linear(d_model, n_neurons)
 
+        # Temperature for routing (annealing: high→low)
+        self.register_buffer('temperature', torch.tensor(1.0))
+
         self._init_weights()
 
     def _init_weights(self):
@@ -63,7 +66,7 @@ class DynamicRouter(nn.Module):
         x: torch.Tensor,
         k: int,
         mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Route to top-k neurons based on input content.
 
@@ -76,6 +79,7 @@ class DynamicRouter(nn.Module):
             indices: Selected neuron indices [batch, k]
             weights: Routing weights [batch, n_neurons]
             context: Attended representations [batch, seq_len, d_model]
+            routing_probs: Softmax probabilities for aux loss [batch, n_neurons]
         """
         # Apply attention for context modeling
         context, _ = self.attention(x, x, x, key_padding_mask=mask)
@@ -89,6 +93,9 @@ class DynamicRouter(nn.Module):
         scores, _ = affinity.max(dim=1)
         # [batch, n_neurons]
 
+        # Temperature scaling
+        scores = scores / self.temperature
+
         # Select top-k neurons
         routing_probs = F.softmax(scores, dim=-1)
         _, indices = scores.topk(k, dim=-1)
@@ -100,7 +107,7 @@ class DynamicRouter(nn.Module):
         weights = (one_hot - routing_probs).detach() + routing_probs
         # [batch, n_neurons]
 
-        return indices, weights, context
+        return indices, weights, context, routing_probs
 
 
 class InputNeurons(nn.Module):
@@ -388,7 +395,7 @@ class DAWNBlock(nn.Module):
         k_input: Optional[int] = None,
         k_process: Optional[int] = None,
         mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, dict]:
         """
         Forward pass through DAWN block.
 
@@ -400,6 +407,7 @@ class DAWNBlock(nn.Module):
 
         Returns:
             output: Processed tensor [batch, seq_len, d_model]
+            aux_loss: Dictionary of auxiliary losses
         """
         batch_size, seq_len, _ = x.shape
 
@@ -410,10 +418,25 @@ class DAWNBlock(nn.Module):
             k_process = self.n_process // 2
 
         # Route to relevant neurons
-        indices, weights, context = self.router(x, k_input, mask)
+        indices, weights, context, routing_probs = self.router(x, k_input, mask)
         # indices: [batch, k_input]
         # weights: [batch, n_input]
         # context: [batch, seq_len, d_model]
+        # routing_probs: [batch, n_input]
+
+        # === Auxiliary Losses ===
+        # 1. Load Balancing Loss - encourage even neuron usage
+        neuron_usage = weights.mean(dim=0)  # [n_input]
+        load_balance_loss = neuron_usage.std()
+
+        # 2. Entropy Loss - encourage diverse routing
+        entropy = -(routing_probs * torch.log(routing_probs + 1e-10)).sum(dim=-1).mean()
+        entropy_loss = -entropy  # maximize entropy = minimize negative
+
+        aux_loss = {
+            'load_balance': load_balance_loss,
+            'entropy': entropy_loss
+        }
 
         # Compute input neuron activations
         activations = self.input_neurons(context)
@@ -436,7 +459,7 @@ class DAWNBlock(nn.Module):
         )
         # [batch, seq_len, d_model]
 
-        return self.dropout(output)
+        return self.dropout(output), aux_loss
 
 
 # ============================================================
@@ -481,7 +504,7 @@ class DAWNLayer(nn.Module):
         k_input: Optional[int] = None,
         k_process: Optional[int] = None,
         mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, dict]:
         """
         Forward pass with residual connection.
 
@@ -493,9 +516,10 @@ class DAWNLayer(nn.Module):
 
         Returns:
             output: Layer output [batch, seq_len, d_model]
+            aux_loss: Auxiliary losses from block
         """
-        output = self.block(x, k_input, k_process, mask)
-        return self.norm(x + output)
+        output, aux_loss = self.block(x, k_input, k_process, mask)
+        return self.norm(x + output), aux_loss
 
 
 # ============================================================
@@ -587,6 +611,7 @@ class DAWNLanguageModel(nn.Module):
             Dictionary containing:
                 - logits: Output logits [batch, seq_len, vocab_size]
                 - loss: Cross-entropy loss (if labels provided)
+                - aux_loss: Aggregated auxiliary losses
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -600,9 +625,11 @@ class DAWNLanguageModel(nn.Module):
 
         x = self.dropout(token_emb + position_emb)
 
-        # Process through DAWN layers
+        # Process through DAWN layers and collect aux losses
+        all_aux_losses = []
         for layer in self.layers:
-            x = layer(x, k_input, k_process, mask=attention_mask)
+            x, aux_loss = layer(x, k_input, k_process, mask=attention_mask)
+            all_aux_losses.append(aux_loss)
 
         # Output projection
         x = self.norm(x)
@@ -617,7 +644,13 @@ class DAWNLanguageModel(nn.Module):
                 ignore_index=-100
             )
 
-        return {'logits': logits, 'loss': loss}
+        # Aggregate auxiliary losses
+        aggregated_aux = {
+            'load_balance': sum(l['load_balance'] for l in all_aux_losses) / len(all_aux_losses),
+            'entropy': sum(l['entropy'] for l in all_aux_losses) / len(all_aux_losses)
+        }
+
+        return {'logits': logits, 'loss': loss, 'aux_loss': aggregated_aux}
 
     def get_model_stats(self) -> dict:
         """Get model statistics."""

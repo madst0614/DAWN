@@ -27,6 +27,7 @@ import json
 from datetime import datetime
 import time
 import numpy as np
+import math
 
 from models.model import HierarchicalLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
@@ -605,12 +606,46 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
 # Training Functions
 # ============================================================
 
-def compute_load_balance_loss(model):
+def get_curriculum_k_values(epoch, total_epochs, n_input, n_process):
     """
-    Placeholder for load balancing loss (simplified architecture).
-    Returns zero as the new DAWN architecture handles balance internally.
+    Curriculum learning: Dense → Sparse scheduling.
+
+    Args:
+        epoch: Current epoch (1-indexed)
+        total_epochs: Total number of epochs
+        n_input: Total input neurons
+        n_process: Total process neurons
+
+    Returns:
+        k_input, k_process for this epoch
     """
-    return torch.tensor(0.0, device=next(model.parameters()).device)
+    # Cosine schedule: start dense (75%), end sparse (25%)
+    progress = (epoch - 1) / max(total_epochs - 1, 1)
+    sparsity = 0.5 * (1 + math.cos(math.pi * progress))
+
+    k_input = int(n_input * (0.25 + 0.5 * sparsity))
+    k_process = int(n_process * (0.25 + 0.5 * sparsity))
+
+    return k_input, k_process
+
+
+def update_temperature(model, epoch, total_epochs):
+    """
+    Temperature annealing: high (explore) → low (exploit).
+
+    Args:
+        model: DAWN model
+        epoch: Current epoch (1-indexed)
+        total_epochs: Total number of epochs
+    """
+    progress = (epoch - 1) / max(total_epochs - 1, 1)
+    # Start: 2.0 (explore), End: 0.5 (exploit)
+    temperature = 2.0 * (1 - progress) + 0.5 * progress
+
+    for layer in model.layers:
+        layer.block.router.temperature.fill_(temperature)
+
+    return temperature
 
 
 def reset_routing_stats(model):
@@ -724,9 +759,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 )
                 loss = outputs['loss']
                 logits = outputs['logits']
+                model_aux = outputs['aux_loss']
 
-                # Load balancing loss 추가
-                aux_loss = compute_load_balance_loss(model)
+                # Combined auxiliary loss (load_balance + entropy)
+                aux_loss = model_aux['load_balance'] * 0.5 + model_aux['entropy'] * 0.5
                 total_loss_combined = loss + aux_weight * aux_loss
 
             if debug_mode:
@@ -771,9 +807,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             )
             loss = outputs['loss']
             logits = outputs['logits']
+            model_aux = outputs['aux_loss']
 
-            # Load balancing loss 추가
-            aux_loss = compute_load_balance_loss(model)
+            # Combined auxiliary loss (load_balance + entropy)
+            aux_loss = model_aux['load_balance'] * 0.5 + model_aux['entropy'] * 0.5
             total_loss_combined = loss + aux_weight * aux_loss
 
             if debug_mode:
@@ -1110,6 +1147,19 @@ def main():
 
     for epoch in range(1, args.num_epochs + 1):
         epoch_start = time.time()
+
+        # Curriculum learning: adjust k values (dense → sparse)
+        k_input, k_process = get_curriculum_k_values(
+            epoch, args.num_epochs, args.n_input, args.n_process
+        )
+        args.k_input = k_input
+        args.k_process = k_process
+
+        # Temperature annealing: update router temperature (explore → exploit)
+        temperature = update_temperature(model, epoch, args.num_epochs)
+
+        if epoch == 1 or epoch % 5 == 0:
+            print(f"\nEpoch {epoch}: k_input={k_input}, k_process={k_process}, temp={temperature:.2f}")
 
         # Train
         train_loss, train_acc = train_epoch(
