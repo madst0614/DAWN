@@ -1,23 +1,12 @@
 """
 DAWN (Dynamic Architecture With Neurons) Training Script
 
-DAWN 모델 학습
-
 Usage:
-    # 기본 학습
+    # 기본 학습 (configs/train_config.yaml 사용)
     python scripts/train.py
 
-    # 커스텀 설정
-    python scripts/train.py \
-        --d_model 768 \
-        --n_input 4096 \
-        --n_process 2048 \
-        --batch_size 16 \
-        --num_epochs 30 \
-        --lr 3e-4
-
-    # Mixed precision training
-    python scripts/train.py --use_amp
+    # 커스텀 config 파일 사용
+    python scripts/train.py --config configs/my_config.yaml
 """
 
 import sys
@@ -41,7 +30,6 @@ import numpy as np
 
 from models.model import HierarchicalLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
-from utils.data import CacheLoader
 
 # MLM 마스킹 설정
 MLM_CONFIG = {
@@ -556,26 +544,35 @@ def collate_fn_dynamic_padding(batch, tokenizer):
     }
 
 
-def load_cached_data(tokenizer_path=None, max_length=128, batch_size=128):  # CHANGED: defaults
-    """Load cached WikiText data with DYNAMIC padding"""
+def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
+    """Load data from config paths with DYNAMIC padding"""
     from transformers import AutoTokenizer
     from functools import partial
+    import pickle
 
     # Load tokenizer
     if tokenizer_path is None:
         tokenizer_path = "bert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
-    # Load cached texts
-    print("Loading cached WikiText data...")
-    train_texts = CacheLoader.load_train_texts(dataset="wikitext")
-    val_texts = CacheLoader.load_validation_texts(dataset="wikitext")
+    # Load data from config paths
+    base_dir = data_config['base_dir']
+    train_path = os.path.join(base_dir, data_config['train_file'])
+    val_path = os.path.join(base_dir, data_config['val_file'])
 
-    if train_texts is None or val_texts is None:
-        raise ValueError(
-            "Cached data not found! "
-            f"Expected at: {CacheLoader.CACHE_BASE_DIR}/{{train,validation}}/wikitext_5to1_texts.pkl"
-        )
+    print(f"Loading data from: {base_dir}")
+
+    # Load train texts
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"Train data not found: {train_path}")
+    with open(train_path, 'rb') as f:
+        train_texts = pickle.load(f)
+
+    # Load validation texts
+    if not os.path.exists(val_path):
+        raise FileNotFoundError(f"Validation data not found: {val_path}")
+    with open(val_path, 'rb') as f:
+        val_texts = pickle.load(f)
 
     print(f"Loaded {len(train_texts)} train texts, {len(val_texts)} val texts")
 
@@ -997,9 +994,10 @@ def main():
 
     # Load data
     print(f"\n{'='*60}")
-    print("Loading cached WikiText data...")
+    print("Loading data...")
     print(f"{'='*60}")
-    train_loader, val_loader, tokenizer = load_cached_data(
+    train_loader, val_loader, tokenizer = load_data(
+        data_config=cfg['data'],
         max_length=args.max_seq_len,
         batch_size=args.batch_size
     )

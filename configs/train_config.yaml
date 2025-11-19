@@ -1,5 +1,11 @@
 # DAWN Training Configuration
 
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_file: train/wikitext_5to1_texts.pkl
+  val_file: validation/wikitext_5to1_texts.pkl
+
 # Model Architecture
 model:
   d_model: 512
@@ -31,6 +37,6 @@ router:
 # Mixed precision
 use_amp: true
 
-# Paths
-checkpoint_dir: ./checkpoints
-log_dir: ./logs
+# Paths (체크포인트와 로그를 같은 폴더에 저장)
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints
+log_dir: /content/drive/MyDrive/dawn/checkpoints
