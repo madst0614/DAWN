@@ -267,7 +267,7 @@ def analyze_neuron_usage(model, val_loader, device, max_batches=50):
 
             for layer_idx, layer in enumerate(model.layers):
                 k_input = layer.block.n_input // 2
-                _, weights, _, _ = layer.block.router(x, k_input)
+                _, weights, _ = layer.block.router(x, k_input)
 
                 # Accumulate weights
                 layer_weights[layer_idx] += weights.sum(dim=0)
@@ -322,7 +322,7 @@ def analyze_neuron_specialization(model, val_loader, tokenizer, device, max_batc
             # Analyze first layer routing
             layer = model.layers[0]
             k_input = layer.block.n_input // 2
-            indices, _, _, _ = layer.block.router(x, k_input)
+            indices, _, _ = layer.block.router(x, k_input)
 
             # Track token-neuron associations
             for b in range(B):
