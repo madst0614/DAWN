@@ -63,9 +63,10 @@ def compute_routing_aux_loss(
     batch_size = weights.shape[0]
 
     # 1. Entropy loss (encourage diversity)
-    # Higher entropy = more uniform distribution
-    entropy = -(weights * torch.log(weights + 1e-10)).sum(dim=-1)
-    entropy_loss = -entropy.mean()  # Maximize entropy = minimize negative
+    # Normalized to [0, 1]: 0 = max entropy (good), 1 = min entropy (bad)
+    entropy = -(weights * torch.log(weights + 1e-10)).sum(dim=-1).mean()
+    max_entropy = math.log(n_neurons)
+    entropy_loss = 1.0 - (entropy / max_entropy)  # Low = good diversity
 
     # 2. Usage loss (encourage all neurons to be used)
     # Average usage across batch
@@ -79,13 +80,13 @@ def compute_routing_aux_loss(
     # We want low coefficient of variation (uniform usage)
     usage_loss = cv
 
-    # 3. Weight sparsity loss (within selected neurons)
+    # 3. Weight variance loss (within selected neurons)
     # Encourage selected neurons to have meaningful weights
     selected_weights = torch.gather(weights, 1, indices)
-
-    # Variance of selected weights (higher is better)
     weight_variance = selected_weights.var(dim=-1).mean()
-    variance_loss = -weight_variance  # Maximize variance
+    # Normalize: high variance is good, so invert
+    # Approximate max variance for k selected from uniform is ~0.25
+    variance_loss = torch.clamp(0.25 - weight_variance, min=0.0) / 0.25  # [0, 1]
 
     # 4. Load balance loss (across batches)
     # Count how many times each neuron is selected
