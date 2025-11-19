@@ -639,8 +639,8 @@ def update_temperature(model, epoch, total_epochs):
         total_epochs: Total number of epochs
     """
     progress = (epoch - 1) / max(total_epochs - 1, 1)
-    # Start: 2.0 (explore), End: 0.5 (exploit)
-    temperature = 2.0 * (1 - progress) + 0.5 * progress
+    # Start: 2.0 (explore), End: 1.0 (mild exploit) - keep higher for diversity
+    temperature = 2.0 * (1 - progress) + 1.0 * progress
 
     for layer in model.layers:
         layer.block.router.temperature.fill_(temperature)
@@ -740,14 +740,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         optimizer.zero_grad()
 
         # Mixed precision training
-        # Dynamic aux weight: MUCH stronger to overcome tiny loss values
-        # aux_loss is ~0.0008 due to normalization by n_neurons, so need 100x+ multiplier
-        if epoch <= 3:
-            aux_weight = 100.0  # Very strong routing signal initially
-        elif epoch <= 10:
-            aux_weight = 50.0   # Strong routing signal
-        else:
-            aux_weight = 10.0   # Moderate routing signal
+        # Aux weight: start disabled, enable gradually
+        # Focus on entropy (diversity) over load_balance (uniform usage)
+        aux_weight = 0.1  # Keep low to not overwhelm main loss
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -761,8 +756,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 logits = outputs['logits']
                 model_aux = outputs['aux_loss']
 
-                # Combined auxiliary loss (load_balance + entropy)
-                aux_loss = model_aux['load_balance'] * 0.5 + model_aux['entropy'] * 0.5
+                # Combined auxiliary loss: prioritize entropy (diversity) over load_balance
+                aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
                 total_loss_combined = loss + aux_weight * aux_loss
 
             if debug_mode:
@@ -809,8 +804,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             logits = outputs['logits']
             model_aux = outputs['aux_loss']
 
-            # Combined auxiliary loss (load_balance + entropy)
-            aux_loss = model_aux['load_balance'] * 0.5 + model_aux['entropy'] * 0.5
+            # Combined auxiliary loss: prioritize entropy (diversity) over load_balance
+            aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
             total_loss_combined = loss + aux_weight * aux_loss
 
             if debug_mode:

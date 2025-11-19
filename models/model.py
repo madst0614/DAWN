@@ -96,9 +96,17 @@ class DynamicRouter(nn.Module):
         # Temperature scaling
         scores = scores / self.temperature
 
-        # Select top-k neurons
+        # Compute routing probabilities
         routing_probs = F.softmax(scores, dim=-1)
-        _, indices = scores.topk(k, dim=-1)
+
+        # Add exploration noise for diversity (only during training)
+        if self.training:
+            noise = torch.rand_like(routing_probs) * 0.1
+            noisy_probs = routing_probs + noise
+            noisy_probs = noisy_probs / noisy_probs.sum(dim=-1, keepdim=True)
+            _, indices = noisy_probs.topk(k, dim=-1)
+        else:
+            _, indices = scores.topk(k, dim=-1)
         # [batch, k]
 
         # Create routing weights with straight-through estimator
