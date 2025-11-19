@@ -93,27 +93,28 @@ class DynamicRouter(nn.Module):
         scores, _ = affinity.max(dim=1)
         # [batch, n_neurons]
 
-        # Temperature scaling
-        scores = scores / self.temperature
-
-        # Compute routing probabilities
-        routing_probs = F.softmax(scores, dim=-1)
-
-        # Add exploration noise for diversity (only during training)
+        # Gumbel-Softmax for differentiable discrete selection
         if self.training:
-            noise = torch.rand_like(routing_probs) * 0.1
-            noisy_probs = routing_probs + noise
-            noisy_probs = noisy_probs / noisy_probs.sum(dim=-1, keepdim=True)
-            _, indices = noisy_probs.topk(k, dim=-1)
-        else:
-            _, indices = scores.topk(k, dim=-1)
-        # [batch, k]
+            # Training: soft selection with Gumbel-Softmax
+            logits = scores / self.temperature
+            gumbel_weights = F.gumbel_softmax(logits, tau=1.0, hard=False)
 
-        # Create routing weights with straight-through estimator
-        one_hot = torch.zeros_like(routing_probs)
-        one_hot.scatter_(1, indices, 1.0)
-        weights = (one_hot - routing_probs).detach() + routing_probs
-        # [batch, n_neurons]
+            # Top-k masking
+            _, indices = scores.topk(k, dim=-1)
+            mask = torch.zeros_like(gumbel_weights)
+            mask.scatter_(1, indices, 1.0)
+            weights = gumbel_weights * mask
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # Keep routing_probs for aux loss calculation
+            routing_probs = F.softmax(logits, dim=-1)
+        else:
+            # Inference: hard selection
+            routing_probs = F.softmax(scores / self.temperature, dim=-1)
+            _, indices = scores.topk(k, dim=-1)
+            weights = torch.zeros_like(routing_probs)
+            weights.scatter_(1, indices, 1.0)
+        # [batch, k]
 
         return indices, weights, context, routing_probs
 
