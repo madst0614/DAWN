@@ -41,6 +41,123 @@ MLM_CONFIG = {
 
 
 # ============================================================
+# Routing Auxiliary Loss Functions
+# ============================================================
+
+def compute_routing_aux_loss(
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    n_neurons: int
+) -> dict:
+    """
+    Compute auxiliary losses for routing.
+
+    Args:
+        weights: Routing weights [batch, n_neurons]
+        indices: Selected indices [batch, k]
+        n_neurons: Total number of neurons
+
+    Returns:
+        Dictionary of auxiliary losses
+    """
+    batch_size = weights.shape[0]
+
+    # 1. Entropy loss (encourage diversity)
+    # Higher entropy = more uniform distribution
+    entropy = -(weights * torch.log(weights + 1e-10)).sum(dim=-1)
+    entropy_loss = -entropy.mean()  # Maximize entropy = minimize negative
+
+    # 2. Usage loss (encourage all neurons to be used)
+    # Average usage across batch
+    avg_usage = weights.mean(dim=0)  # [n_neurons]
+
+    # Coefficient of variation (std / mean)
+    usage_std = avg_usage.std()
+    usage_mean = avg_usage.mean()
+    cv = usage_std / (usage_mean + 1e-8)
+
+    # We want low coefficient of variation (uniform usage)
+    usage_loss = cv
+
+    # 3. Weight sparsity loss (within selected neurons)
+    # Encourage selected neurons to have meaningful weights
+    selected_weights = torch.gather(weights, 1, indices)
+
+    # Variance of selected weights (higher is better)
+    weight_variance = selected_weights.var(dim=-1).mean()
+    variance_loss = -weight_variance  # Maximize variance
+
+    # 4. Load balance loss (across batches)
+    # Count how many times each neuron is selected
+    neuron_usage = torch.zeros(n_neurons, device=weights.device)
+    neuron_usage.scatter_add_(
+        0,
+        indices.flatten(),
+        torch.ones_like(indices.flatten(), dtype=torch.float32)
+    )
+
+    # Normalize by batch size and k
+    neuron_usage = neuron_usage / (batch_size * indices.shape[1])
+
+    # Gini coefficient (0 = perfect equality, 1 = perfect inequality)
+    sorted_usage, _ = torch.sort(neuron_usage)
+    n = len(sorted_usage)
+    index = torch.arange(1, n + 1, device=weights.device, dtype=torch.float32)
+    gini = (2 * (index * sorted_usage).sum()) / (n * sorted_usage.sum() + 1e-8) - (n + 1) / n
+
+    load_balance_loss = gini
+
+    return {
+        'entropy': entropy_loss,
+        'usage': usage_loss,
+        'variance': variance_loss,
+        'load_balance': load_balance_loss,
+        'gini': gini.detach(),  # For monitoring
+    }
+
+
+def aggregate_aux_losses(
+    aux_losses_list: list,
+    weights: dict = None
+) -> tuple:
+    """
+    Aggregate auxiliary losses from all layers.
+
+    Args:
+        aux_losses_list: List of aux loss dicts from each layer
+        weights: Weights for each loss component
+
+    Returns:
+        total_aux_loss: Weighted sum
+        aux_metrics: Individual loss values (for logging)
+    """
+    if weights is None:
+        weights = {
+            'entropy': 0.01,      # Diversity
+            'usage': 0.01,        # Uniform usage
+            'variance': 0.001,    # Meaningful weights
+            'load_balance': 0.01, # Cross-batch balance
+        }
+
+    # Aggregate across layers
+    total_aux = 0.0
+    aux_metrics = {}
+
+    for key in ['entropy', 'usage', 'variance', 'load_balance']:
+        values = [aux[key] for aux in aux_losses_list]
+        mean_value = sum(values) / len(values)
+
+        total_aux = total_aux + weights[key] * mean_value
+        aux_metrics[key] = mean_value.item()
+
+    # Add Gini for monitoring
+    gini_values = [aux['gini'] for aux in aux_losses_list]
+    aux_metrics['gini'] = (sum(gini_values) / len(gini_values)).item()
+
+    return total_aux, aux_metrics
+
+
+# ============================================================
 # Comprehensive Debugging Function
 # ============================================================
 
@@ -740,9 +857,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         optimizer.zero_grad()
 
         # Mixed precision training
-        # Aux weight: start disabled, enable gradually
-        # Focus on entropy (diversity) over load_balance (uniform usage)
-        aux_weight = 0.1  # Keep low to not overwhelm main loss
+        # Aux weight configuration
+        aux_weight = 0.01  # Overall aux loss weight
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -750,21 +866,38 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     input_ids=input_ids,
                     labels=labels,
                     k_input=args.k_input,
-                    k_process=args.k_process
+                    k_process=args.k_process,
+                    return_routing_info=True
                 )
                 loss = outputs['loss']
                 logits = outputs['logits']
-                model_aux = outputs['aux_loss']
 
-                # Combined auxiliary loss: prioritize entropy (diversity) over load_balance
-                aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+                # Compute new aux losses from routing info
+                if 'routing_info' in outputs:
+                    aux_losses_list = []
+                    for layer_info in outputs['routing_info']:
+                        layer_aux = compute_routing_aux_loss(
+                            weights=layer_info['weights'],
+                            indices=layer_info['indices'],
+                            n_neurons=args.n_input
+                        )
+                        aux_losses_list.append(layer_aux)
+
+                    aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
+                    gini = aux_metrics.get('gini', 0.0)
+                else:
+                    # Fallback to legacy aux loss
+                    model_aux = outputs['aux_loss']
+                    aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+                    gini = 0.0
+
                 total_loss_combined = loss + aux_weight * aux_loss
 
             if debug_mode:
                 print(f"\nAfter Forward:")
                 print(f"  Logits shape: {logits.shape}")
                 print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
-                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') else aux_loss:.4f}")
 
             scaler.scale(total_loss_combined).backward()
 
@@ -798,21 +931,38 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 input_ids=input_ids,
                 labels=labels,
                 k_input=args.k_input,
-                k_process=args.k_process
+                k_process=args.k_process,
+                return_routing_info=True
             )
             loss = outputs['loss']
             logits = outputs['logits']
-            model_aux = outputs['aux_loss']
 
-            # Combined auxiliary loss: prioritize entropy (diversity) over load_balance
-            aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+            # Compute new aux losses from routing info
+            if 'routing_info' in outputs:
+                aux_losses_list = []
+                for layer_info in outputs['routing_info']:
+                    layer_aux = compute_routing_aux_loss(
+                        weights=layer_info['weights'],
+                        indices=layer_info['indices'],
+                        n_neurons=args.n_input
+                    )
+                    aux_losses_list.append(layer_aux)
+
+                aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
+                gini = aux_metrics.get('gini', 0.0)
+            else:
+                # Fallback to legacy aux loss
+                model_aux = outputs['aux_loss']
+                aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+                gini = 0.0
+
             total_loss_combined = loss + aux_weight * aux_loss
 
             if debug_mode:
                 print(f"\nAfter Forward:")
                 print(f"  Logits shape: {logits.shape}")
                 print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
-                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') else aux_loss:.4f}")
 
             total_loss_combined.backward()
 
@@ -873,10 +1023,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         total_loss += loss.item() * num_tokens
         total_tokens += num_tokens
 
+        aux_loss_val = aux_loss.item() if hasattr(aux_loss, 'item') else aux_loss
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
-            "aux": f"{aux_loss.item():.4f}",
-            "w_aux": f"{(aux_weight * aux_loss).item():.5f}",
+            "aux": f"{aux_loss_val:.4f}",
+            "gini": f"{gini:.3f}",
             "acc": f"{correct / valid_tokens:.4f}" if valid_tokens > 0 else "0.0000"
         })
 

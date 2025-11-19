@@ -6,7 +6,7 @@ A neural architecture with attention-guided dynamic neuron routing
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, Dict
 import math
 
 
@@ -16,10 +16,10 @@ import math
 
 class DynamicRouter(nn.Module):
     """
-    Attention-based dynamic neuron router.
+    Attention-based dynamic neuron router with Gumbel-Softmax.
 
-    Selects relevant neurons based on input content using multi-head
-    attention and max-pooling aggregation strategy.
+    Uses Gumbel-Softmax for differentiable sampling instead of
+    straight-through estimator to prevent collapse.
 
     Args:
         d_model: Model dimension
@@ -52,8 +52,8 @@ class DynamicRouter(nn.Module):
         # Content-to-neuron affinity projection
         self.affinity_proj = nn.Linear(d_model, n_neurons)
 
-        # Temperature for routing (annealing: high→low)
-        self.register_buffer('temperature', torch.tensor(1.0))
+        # Temperature parameter (fixed high for exploration)
+        self.register_buffer('temperature', torch.tensor(2.0))
 
         self._init_weights()
 
@@ -61,12 +61,72 @@ class DynamicRouter(nn.Module):
         nn.init.xavier_normal_(self.affinity_proj.weight)
         nn.init.zeros_(self.affinity_proj.bias)
 
+    def _gumbel_softmax_topk(
+        self,
+        logits: torch.Tensor,
+        k: int,
+        tau: float = 1.0,
+        hard: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gumbel-Softmax with top-k constraint.
+
+        Args:
+            logits: Logits [batch, n_neurons]
+            k: Number of neurons to select
+            tau: Gumbel temperature
+            hard: Use straight-through in forward (but soft in backward)
+
+        Returns:
+            indices: Top-k indices [batch, k]
+            weights: Soft weights [batch, n_neurons]
+        """
+        # Apply Gumbel-Softmax
+        if self.training:
+            # Sample Gumbel noise
+            gumbel_noise = -torch.log(-torch.log(
+                torch.rand_like(logits) + 1e-10
+            ) + 1e-10)
+
+            # Add noise to logits
+            logits_with_noise = (logits + gumbel_noise) / tau
+
+            # Softmax
+            soft_weights = F.softmax(logits_with_noise, dim=-1)
+        else:
+            # Inference: no noise
+            soft_weights = F.softmax(logits / tau, dim=-1)
+
+        # Get top-k indices (based on original logits)
+        _, indices = logits.topk(k, dim=-1)
+
+        # Create top-k mask
+        topk_mask = torch.zeros_like(soft_weights)
+        topk_mask.scatter_(1, indices, 1.0)
+
+        # Apply mask to weights
+        masked_weights = soft_weights * topk_mask
+
+        # Renormalize
+        weights = masked_weights / (
+            masked_weights.sum(dim=-1, keepdim=True) + 1e-8
+        )
+
+        if hard and self.training:
+            # Straight-through: discrete forward, continuous backward
+            hard_weights = torch.zeros_like(weights)
+            hard_weights.scatter_(1, indices, 1.0)
+            # Trick: detach difference
+            weights = hard_weights + (weights - weights.detach())
+
+        return indices, weights
+
     def forward(
         self,
         x: torch.Tensor,
         k: int,
         mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Route to top-k neurons based on input content.
 
@@ -79,7 +139,6 @@ class DynamicRouter(nn.Module):
             indices: Selected neuron indices [batch, k]
             weights: Routing weights [batch, n_neurons]
             context: Attended representations [batch, seq_len, d_model]
-            routing_probs: Softmax probabilities for aux loss [batch, n_neurons]
         """
         # Apply attention for context modeling
         context, _ = self.attention(x, x, x, key_padding_mask=mask)
@@ -93,30 +152,20 @@ class DynamicRouter(nn.Module):
         scores, _ = affinity.max(dim=1)
         # [batch, n_neurons]
 
-        # Gumbel-Softmax for differentiable discrete selection
+        # Add exploration noise during training
         if self.training:
-            # Training: soft selection with Gumbel-Softmax
-            logits = scores / self.temperature
-            gumbel_weights = F.gumbel_softmax(logits, tau=1.0, hard=False)
+            noise = torch.randn_like(scores) * 0.1
+            scores = scores + noise
 
-            # Top-k masking
-            _, indices = scores.topk(k, dim=-1)
-            mask = torch.zeros_like(gumbel_weights)
-            mask.scatter_(1, indices, 1.0)
-            weights = gumbel_weights * mask
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # Route using Gumbel-Softmax
+        indices, weights = self._gumbel_softmax_topk(
+            logits=scores / self.temperature,
+            k=k,
+            tau=1.0,
+            hard=False  # Soft selection
+        )
 
-            # Keep routing_probs for aux loss calculation
-            routing_probs = F.softmax(logits, dim=-1)
-        else:
-            # Inference: hard selection
-            routing_probs = F.softmax(scores / self.temperature, dim=-1)
-            _, indices = scores.topk(k, dim=-1)
-            weights = torch.zeros_like(routing_probs)
-            weights.scatter_(1, indices, 1.0)
-        # [batch, k]
-
-        return indices, weights, context, routing_probs
+        return indices, weights, context
 
 
 class InputNeurons(nn.Module):
@@ -403,8 +452,9 @@ class DAWNBlock(nn.Module):
         x: torch.Tensor,
         k_input: Optional[int] = None,
         k_process: Optional[int] = None,
-        mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, dict]:
+        mask: Optional[torch.Tensor] = None,
+        return_routing_info: bool = False
+    ) -> Union[Tuple[torch.Tensor, Dict], Tuple[torch.Tensor, Dict, Dict]]:
         """
         Forward pass through DAWN block.
 
@@ -413,10 +463,12 @@ class DAWNBlock(nn.Module):
             k_input: Number of input neurons to select (default: n_input // 2)
             k_process: Number of process neurons to select (default: n_process // 2)
             mask: Optional attention mask [batch, seq_len]
+            return_routing_info: Whether to return routing info for aux loss
 
         Returns:
             output: Processed tensor [batch, seq_len, d_model]
-            aux_loss: Dictionary of auxiliary losses
+            aux_loss: Dictionary of auxiliary losses (legacy, kept for compatibility)
+            routing_info: (optional) Dictionary with indices and weights
         """
         batch_size, seq_len, _ = x.shape
 
@@ -427,22 +479,19 @@ class DAWNBlock(nn.Module):
             k_process = self.n_process // 2
 
         # Route to relevant neurons
-        indices, weights, context, routing_probs = self.router(x, k_input, mask)
+        indices, weights, context = self.router(x, k_input, mask)
         # indices: [batch, k_input]
         # weights: [batch, n_input]
         # context: [batch, seq_len, d_model]
-        # routing_probs: [batch, n_input]
 
-        # === Auxiliary Losses ===
-        # 1. Load Balancing Loss - encourage even neuron usage
+        # === Legacy Auxiliary Losses (for backward compatibility) ===
+        # These are simple losses; better ones computed in train.py
         neuron_usage = weights.mean(dim=0)  # [n_input]
         load_balance_loss = neuron_usage.std()
 
-        # 2. Entropy Loss - encourage diverse routing
-        # Normalized to [0, 1]: 0 = max entropy (good), 1 = min entropy (bad)
-        entropy = -(routing_probs * torch.log(routing_probs + 1e-10)).sum(dim=-1).mean()
-        max_entropy = math.log(self.n_input)  # Maximum possible entropy
-        entropy_loss = 1.0 - (entropy / max_entropy)  # Low = good diversity
+        entropy = -(weights * torch.log(weights + 1e-10)).sum(dim=-1).mean()
+        max_entropy = math.log(self.n_input)
+        entropy_loss = 1.0 - (entropy / max_entropy)
 
         aux_loss = {
             'load_balance': load_balance_loss,
@@ -470,7 +519,16 @@ class DAWNBlock(nn.Module):
         )
         # [batch, seq_len, d_model]
 
-        return self.dropout(output), aux_loss
+        output = self.dropout(output)
+
+        if return_routing_info:
+            routing_info = {
+                'indices': indices,  # [batch, k]
+                'weights': weights,  # [batch, n_neurons]
+            }
+            return output, aux_loss, routing_info
+
+        return output, aux_loss
 
 
 # ============================================================
@@ -514,8 +572,9 @@ class DAWNLayer(nn.Module):
         x: torch.Tensor,
         k_input: Optional[int] = None,
         k_process: Optional[int] = None,
-        mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, dict]:
+        mask: Optional[torch.Tensor] = None,
+        return_routing_info: bool = False
+    ) -> Union[Tuple[torch.Tensor, dict], Tuple[torch.Tensor, dict, dict]]:
         """
         Forward pass with residual connection.
 
@@ -524,11 +583,19 @@ class DAWNLayer(nn.Module):
             k_input: Number of input neurons to select
             k_process: Number of process neurons to select
             mask: Optional attention mask
+            return_routing_info: Whether to return routing info
 
         Returns:
             output: Layer output [batch, seq_len, d_model]
             aux_loss: Auxiliary losses from block
+            routing_info: (optional) Routing information
         """
+        if return_routing_info:
+            output, aux_loss, routing_info = self.block(
+                x, k_input, k_process, mask, return_routing_info=True
+            )
+            return self.norm(x + output), aux_loss, routing_info
+
         output, aux_loss = self.block(x, k_input, k_process, mask)
         return self.norm(x + output), aux_loss
 
@@ -606,7 +673,8 @@ class DAWNLanguageModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         k_input: Optional[int] = None,
-        k_process: Optional[int] = None
+        k_process: Optional[int] = None,
+        return_routing_info: bool = False
     ) -> dict:
         """
         Forward pass through the model.
@@ -617,12 +685,14 @@ class DAWNLanguageModel(nn.Module):
             labels: Target labels for language modeling [batch, seq_len]
             k_input: Number of input neurons to select
             k_process: Number of process neurons to select
+            return_routing_info: Whether to return routing info for aux loss
 
         Returns:
             Dictionary containing:
                 - logits: Output logits [batch, seq_len, vocab_size]
                 - loss: Cross-entropy loss (if labels provided)
                 - aux_loss: Aggregated auxiliary losses
+                - routing_info: (optional) List of routing info per layer
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -638,8 +708,17 @@ class DAWNLanguageModel(nn.Module):
 
         # Process through DAWN layers and collect aux losses
         all_aux_losses = []
+        routing_info_list = [] if return_routing_info else None
+
         for layer in self.layers:
-            x, aux_loss = layer(x, k_input, k_process, mask=attention_mask)
+            if return_routing_info:
+                x, aux_loss, routing_info = layer(
+                    x, k_input, k_process, mask=attention_mask,
+                    return_routing_info=True
+                )
+                routing_info_list.append(routing_info)
+            else:
+                x, aux_loss = layer(x, k_input, k_process, mask=attention_mask)
             all_aux_losses.append(aux_loss)
 
         # Output projection
@@ -661,7 +740,12 @@ class DAWNLanguageModel(nn.Module):
             'entropy': sum(l['entropy'] for l in all_aux_losses) / len(all_aux_losses)
         }
 
-        return {'logits': logits, 'loss': loss, 'aux_loss': aggregated_aux}
+        result = {'logits': logits, 'loss': loss, 'aux_loss': aggregated_aux}
+
+        if return_routing_info:
+            result['routing_info'] = routing_info_list
+
+        return result
 
     def get_model_stats(self) -> dict:
         """Get model statistics."""
