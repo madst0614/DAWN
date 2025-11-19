@@ -395,6 +395,55 @@ class DAWNFFN(nn.Module):
         self.process_neuron_counts = None
         self.last_routing_scores = None
 
+    def get_routing_entropy(self) -> float:
+        """현재 routing의 entropy 계산"""
+        if self.last_routing_scores is None:
+            return 0.0
+
+        # 평균 routing 확률
+        avg_probs = self.last_routing_scores.mean(dim=0) + 1e-8
+        avg_probs = avg_probs / avg_probs.sum()  # 정규화
+
+        # Entropy 계산
+        entropy = -(avg_probs * avg_probs.log()).sum()
+        return entropy.item()
+
+    def get_usage_statistics(self) -> dict:
+        """뉴런 사용 통계 반환"""
+        if self.input_neuron_counts is None:
+            return {
+                'total': self.n_input,
+                'dead_count': self.n_input,
+                'usage_counts': None
+            }
+
+        counts = self.input_neuron_counts.cpu()
+        dead_count = (counts == 0).sum().item()
+
+        # Gini coefficient 계산
+        sorted_counts = counts.sort()[0]
+        n = len(counts)
+        cumsum = torch.cumsum(sorted_counts, dim=0)
+        total = counts.sum()
+        if total > 0:
+            gini = (2 * cumsum.sum() / (n * total) - (n + 1) / n).item()
+        else:
+            gini = 1.0
+
+        # Top-k concentration
+        top_k = min(10, self.n_input)
+        top_counts = counts.topk(top_k)[0]
+        concentration = (top_counts.sum() / total).item() if total > 0 else 0
+
+        return {
+            'total': self.n_input,
+            'dead_count': dead_count,
+            'dead_ratio': dead_count / self.n_input,
+            'gini': gini,
+            'top10_concentration': concentration,
+            'usage_counts': counts.numpy()
+        }
+
     def get_neuron_stats(
         self,
         x: torch.Tensor,
