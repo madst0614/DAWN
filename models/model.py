@@ -16,10 +16,10 @@ import math
 
 class DynamicRouter(nn.Module):
     """
-    Attention-based dynamic neuron router with Gumbel-Softmax.
+    Attention-based dynamic neuron router.
 
-    Uses Gumbel-Softmax for differentiable sampling instead of
-    straight-through estimator to prevent collapse.
+    Uses direct attention to neuron patterns for stable routing.
+    No Gumbel, no STE - just pure attention mechanism.
 
     Args:
         d_model: Model dimension
@@ -42,84 +42,34 @@ class DynamicRouter(nn.Module):
         self.n_heads = n_heads
 
         # Multi-head attention for context modeling
-        self.attention = nn.MultiheadAttention(
+        self.context_attention = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=n_heads,
             dropout=dropout,
             batch_first=True
         )
 
-        # Content-to-neuron affinity projection
-        self.affinity_proj = nn.Linear(d_model, n_neurons)
+        # Learnable neuron patterns (what each neuron responds to)
+        self.neuron_patterns = nn.Parameter(
+            torch.empty(n_neurons, d_model)
+        )
 
-        # Temperature parameter (fixed high for exploration)
+        # Direct attention to neurons for routing
+        self.neuron_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=0.0,  # No dropout for routing stability
+            batch_first=True
+        )
+
+        # Temperature for routing (fixed high for exploration)
         self.register_buffer('temperature', torch.tensor(2.0))
 
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_normal_(self.affinity_proj.weight)
-        nn.init.zeros_(self.affinity_proj.bias)
-
-    def _gumbel_softmax_topk(
-        self,
-        logits: torch.Tensor,
-        k: int,
-        tau: float = 1.0,
-        hard: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Gumbel-Softmax with top-k constraint.
-
-        Args:
-            logits: Logits [batch, n_neurons]
-            k: Number of neurons to select
-            tau: Gumbel temperature
-            hard: Use straight-through in forward (but soft in backward)
-
-        Returns:
-            indices: Top-k indices [batch, k]
-            weights: Soft weights [batch, n_neurons]
-        """
-        # Apply Gumbel-Softmax
-        if self.training:
-            # Sample Gumbel noise
-            gumbel_noise = -torch.log(-torch.log(
-                torch.rand_like(logits) + 1e-10
-            ) + 1e-10)
-
-            # Add noise to logits
-            logits_with_noise = (logits + gumbel_noise) / tau
-
-            # Softmax
-            soft_weights = F.softmax(logits_with_noise, dim=-1)
-        else:
-            # Inference: no noise
-            soft_weights = F.softmax(logits / tau, dim=-1)
-
-        # Get top-k indices (based on original logits)
-        _, indices = logits.topk(k, dim=-1)
-
-        # Create top-k mask
-        topk_mask = torch.zeros_like(soft_weights)
-        topk_mask.scatter_(1, indices, 1.0)
-
-        # Apply mask to weights
-        masked_weights = soft_weights * topk_mask
-
-        # Renormalize
-        weights = masked_weights / (
-            masked_weights.sum(dim=-1, keepdim=True) + 1e-8
-        )
-
-        if hard and self.training:
-            # Straight-through: discrete forward, continuous backward
-            hard_weights = torch.zeros_like(weights)
-            hard_weights.scatter_(1, indices, 1.0)
-            # Trick: detach difference
-            weights = hard_weights + (weights - weights.detach())
-
-        return indices, weights
+        # Orthogonal initialization for neuron patterns
+        nn.init.orthogonal_(self.neuron_patterns, gain=1.0)
 
     def forward(
         self,
@@ -128,7 +78,7 @@ class DynamicRouter(nn.Module):
         mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Route to top-k neurons based on input content.
+        Route to top-k neurons based on attention to neuron patterns.
 
         Args:
             x: Input tensor [batch, seq_len, d_model]
@@ -140,30 +90,64 @@ class DynamicRouter(nn.Module):
             weights: Routing weights [batch, n_neurons]
             context: Attended representations [batch, seq_len, d_model]
         """
-        # Apply attention for context modeling
-        context, _ = self.attention(x, x, x, key_padding_mask=mask)
+        batch_size, seq_len, d_model = x.shape
+
+        # Step 1: Context modeling
+        # Self-attention to understand input relationships
+        context, _ = self.context_attention(
+            x, x, x,
+            key_padding_mask=mask
+        )
         # [batch, seq_len, d_model]
 
-        # Compute neuron affinity scores
-        affinity = self.affinity_proj(context)
-        # [batch, seq_len, n_neurons]
+        # Step 2: Attend to neuron patterns
+        # Query: "What do we have?" (context)
+        # Key/Value: "What patterns exist?" (neuron_patterns)
 
-        # Max-pooling: select based on maximum need across sequence
-        scores, _ = affinity.max(dim=1)
+        # Expand neuron patterns for batch dimension
+        neuron_kv = self.neuron_patterns.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )  # [batch, n_neurons, d_model]
+
+        # Cross-attention: context queries neuron patterns
+        neuron_responses, attn_weights = self.neuron_attention(
+            context,       # query: [batch, seq_len, d_model]
+            neuron_kv,     # key:   [batch, n_neurons, d_model]
+            neuron_kv,     # value: [batch, n_neurons, d_model]
+            need_weights=True,
+            average_attn_weights=True  # Average across heads
+        )
+        # attn_weights: [batch, seq_len, n_neurons]
+        # Each position's attention to each neuron
+
+        # Step 3: Aggregate across sequence
+        # "If ANY position needs this neuron, activate it"
+        # Using max-pooling (consistent with original design)
+        scores, _ = attn_weights.max(dim=1)
         # [batch, n_neurons]
 
-        # Add exploration noise during training
-        if self.training:
-            noise = torch.randn_like(scores) * 0.1
-            scores = scores + noise
+        # Alternative: could use mean or learnable aggregation
+        # scores = attn_weights.mean(dim=1)  # "average need"
+        # scores = (attn_weights.max(dim=1)[0] + attn_weights.mean(dim=1)) / 2
 
-        # Route using Gumbel-Softmax
-        indices, weights = self._gumbel_softmax_topk(
-            logits=scores / self.temperature,
-            k=k,
-            tau=1.0,
-            hard=False  # Soft selection
-        )
+        # Step 4: Soft top-k selection (stable!)
+        # Apply temperature for exploration/exploitation balance
+        probs = F.softmax(scores / self.temperature, dim=-1)
+        # [batch, n_neurons]
+
+        # Get top-k indices based on scores
+        _, indices = scores.topk(k, dim=-1)
+        # [batch, k]
+
+        # Create routing weights
+        # Only selected neurons get non-zero weights
+        weights = torch.zeros_like(probs)
+        selected_probs = torch.gather(probs, 1, indices)
+        weights.scatter_(1, indices, selected_probs)
+
+        # Renormalize (only among selected neurons)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # [batch, n_neurons]
 
         return indices, weights, context
 
@@ -227,7 +211,7 @@ class InputNeurons(nn.Module):
         activations = F.gelu(context @ self.patterns.T)
         # [batch, seq_len, n_neurons]
 
-        # Neuron self-attention
+        # Neuron self-attention (lateral connections)
         attn_output, _ = self.self_attention(
             activations, activations, activations
         )
@@ -281,8 +265,6 @@ class ProcessNeurons(nn.Module):
         )
 
         # Learned combination analyzer
-        # Analyzes which input neurons are selected and predicts
-        # which process neurons should be relevant
         self.combination_analyzer = nn.Sequential(
             nn.Linear(n_input, hidden_dim),
             nn.GELU(),
@@ -295,7 +277,6 @@ class ProcessNeurons(nn.Module):
         nn.init.orthogonal_(self.combination_weights, gain=math.sqrt(2.0))
         nn.init.orthogonal_(self.output_projections, gain=math.sqrt(2.0))
 
-        # Initialize analyzer
         for module in self.combination_analyzer:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_normal_(module.weight)
@@ -339,7 +320,6 @@ class ProcessNeurons(nn.Module):
         )  # [batch, seq_len, n_process]
 
         # Create binary selection pattern
-        # This encodes which input neurons were selected
         input_selection = torch.zeros(
             batch_size, self.n_input,
             dtype=torch.float32,
@@ -348,9 +328,7 @@ class ProcessNeurons(nn.Module):
         input_selection.scatter_(1, selected_indices, 1.0)
         # [batch, n_input]
 
-        # Analyze this combination pattern
-        # The MLP learns: "Given this input selection,
-        # which process neurons are likely to be useful?"
+        # Analyze combination pattern
         combination_relevance = self.combination_analyzer(input_selection)
         # [batch, n_process]
 
@@ -467,7 +445,7 @@ class DAWNBlock(nn.Module):
 
         Returns:
             output: Processed tensor [batch, seq_len, d_model]
-            aux_loss: Dictionary of auxiliary losses (legacy, kept for compatibility)
+            aux_loss: Dictionary of auxiliary losses
             routing_info: (optional) Dictionary with indices and weights
         """
         batch_size, seq_len, _ = x.shape
@@ -484,12 +462,13 @@ class DAWNBlock(nn.Module):
         # weights: [batch, n_input]
         # context: [batch, seq_len, d_model]
 
-        # === Legacy Auxiliary Losses (for backward compatibility) ===
-        # These are simple losses; better ones computed in train.py
+        # Compute auxiliary losses
         neuron_usage = weights.mean(dim=0)  # [n_input]
         load_balance_loss = neuron_usage.std()
 
-        entropy = -(weights * torch.log(weights + 1e-10)).sum(dim=-1).mean()
+        # Safe entropy calculation
+        weights_clamped = weights.clamp(min=1e-10)
+        entropy = -(weights_clamped * torch.log(weights_clamped)).sum(dim=-1).mean()
         max_entropy = math.log(self.n_input)
         entropy_loss = 1.0 - (entropy / max_entropy)
 
@@ -523,8 +502,8 @@ class DAWNBlock(nn.Module):
 
         if return_routing_info:
             routing_info = {
-                'indices': indices,  # [batch, k]
-                'weights': weights,  # [batch, n_neurons]
+                'indices': indices,
+                'weights': weights,
             }
             return output, aux_loss, routing_info
 
@@ -629,7 +608,7 @@ class DAWNLanguageModel(nn.Module):
         n_heads: int = 8,
         max_seq_len: int = 2048,
         dropout: float = 0.1,
-        **kwargs  # For compatibility
+        **kwargs
     ):
         super().__init__()
 
@@ -706,7 +685,7 @@ class DAWNLanguageModel(nn.Module):
 
         x = self.dropout(token_emb + position_emb)
 
-        # Process through DAWN layers and collect aux losses
+        # Process through DAWN layers
         all_aux_losses = []
         routing_info_list = [] if return_routing_info else None
 
@@ -764,16 +743,7 @@ class DAWNLanguageModel(nn.Module):
 
     @classmethod
     def from_config(cls, config: dict, vocab_size: int):
-        """
-        Create model from config dict.
-
-        Args:
-            config: Config dict with 'model' section
-            vocab_size: Vocabulary size
-
-        Returns:
-            DAWNLanguageModel instance
-        """
+        """Create model from config dict."""
         model_cfg = config['model']
         return cls(
             vocab_size=vocab_size,
@@ -787,28 +757,20 @@ class DAWNLanguageModel(nn.Module):
         )
 
 
-# ============================================================
-# Aliases for backward compatibility
-# ============================================================
-
-# Keep old names as aliases
+# Backward compatibility
 GlobalRouter = DynamicRouter
 HierarchicalDynamicFFN = DAWNBlock
 TransformerLayerWithHierarchicalFFN = DAWNLayer
 HierarchicalLanguageModel = DAWNLanguageModel
 
 
-# ============================================================
-# Testing
-# ============================================================
-
 if __name__ == '__main__':
     print("=" * 60)
-    print("DAWN: Dynamic Activation in Weighted Networks")
+    print("DAWN: Dynamic Architecture With Neurons")
+    print("Attention-based routing (no Gumbel)")
     print("=" * 60)
     print()
 
-    # Initialize model
     model = DAWNLanguageModel(
         vocab_size=30000,
         d_model=512,
@@ -820,9 +782,7 @@ if __name__ == '__main__':
         dropout=0.1
     )
 
-    # Print model statistics
     stats = model.get_model_stats()
-
     print("Model Configuration:")
     print(f"  Layers: {stats['n_layers']}")
     print(f"  Model dimension: {stats['d_model']}")
@@ -830,20 +790,19 @@ if __name__ == '__main__':
     print(f"  Trainable parameters: {stats['trainable_parameters']:,}")
     print()
 
-    # Test forward pass
     batch_size = 4
     seq_len = 128
-
     input_ids = torch.randint(0, 30000, (batch_size, seq_len))
     labels = torch.randint(0, 30000, (batch_size, seq_len))
 
     print("Testing forward pass...")
     with torch.no_grad():
-        output = model(input_ids, labels=labels)
+        output = model(input_ids, labels=labels, return_routing_info=True)
 
     print(f"  Input shape: {input_ids.shape}")
     print(f"  Output logits shape: {output['logits'].shape}")
     print(f"  Loss: {output['loss'].item():.4f}")
+    print(f"  Routing info layers: {len(output['routing_info'])}")
     print()
 
-    print("✓ Tests passed successfully!")
+    print("✓ Attention-based router ready!")
