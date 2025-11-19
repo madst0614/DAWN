@@ -973,9 +973,8 @@ def main():
     print(f"Using device: {device}")
 
     # Create directories
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = Path(args.checkpoint_dir) / "dawn" / timestamp
-    log_dir = Path(args.log_dir) / "dawn" / timestamp
+    checkpoint_dir = Path(args.checkpoint_dir)
+    log_dir = Path(args.log_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
