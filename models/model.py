@@ -176,27 +176,34 @@ class InputNeurons(nn.Module):
 
 class ProcessNeurons(nn.Module):
     """
-    Process neuron layer.
+    Process neuron layer with learned input combination analysis.
 
-    Combines selected input neurons to produce output representations.
+    Uses a small MLP to analyze input neuron selection patterns
+    and predict process neuron relevance.
 
     Args:
         d_model: Model dimension
         n_input: Number of input neurons
         n_process: Number of process neurons
+        hidden_dim: Hidden dimension for combination analyzer
     """
 
     def __init__(
         self,
         d_model: int,
         n_input: int,
-        n_process: int
+        n_process: int,
+        hidden_dim: Optional[int] = None
     ):
         super().__init__()
 
         self.d_model = d_model
         self.n_input = n_input
         self.n_process = n_process
+
+        # Hidden dimension for combination analyzer
+        if hidden_dim is None:
+            hidden_dim = n_input * 2
 
         # Combination weights: how process neurons combine input neurons
         self.combination_weights = nn.Parameter(
@@ -208,11 +215,26 @@ class ProcessNeurons(nn.Module):
             torch.empty(n_process, d_model)
         )
 
+        # Learned combination analyzer
+        # Analyzes which input neurons are selected and predicts
+        # which process neurons should be relevant
+        self.combination_analyzer = nn.Sequential(
+            nn.Linear(n_input, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, n_process)
+        )
+
         self._init_weights()
 
     def _init_weights(self):
         nn.init.orthogonal_(self.combination_weights, gain=math.sqrt(2.0))
         nn.init.orthogonal_(self.output_projections, gain=math.sqrt(2.0))
+
+        # Initialize analyzer
+        for module in self.combination_analyzer:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def forward(
         self,
@@ -221,7 +243,7 @@ class ProcessNeurons(nn.Module):
         k: int
     ) -> torch.Tensor:
         """
-        Process selected input neurons.
+        Process selected input neurons with learned combination analysis.
 
         Args:
             selected_activations: Selected neuron activations [batch, seq_len, k_in]
@@ -251,9 +273,33 @@ class ProcessNeurons(nn.Module):
             torch.bmm(selected_activations, selected_weights.transpose(1, 2))
         )  # [batch, seq_len, n_process]
 
-        # Select top-k process neurons based on activation magnitude
-        process_scores = process_activations.mean(dim=1)  # [batch, n_process]
-        _, process_indices = process_scores.topk(k, dim=-1)  # [batch, k]
+        # Create binary selection pattern
+        # This encodes which input neurons were selected
+        input_selection = torch.zeros(
+            batch_size, self.n_input,
+            dtype=torch.float32,
+            device=selected_indices.device
+        )
+        input_selection.scatter_(1, selected_indices, 1.0)
+        # [batch, n_input]
+
+        # Analyze this combination pattern
+        # The MLP learns: "Given this input selection,
+        # which process neurons are likely to be useful?"
+        combination_relevance = self.combination_analyzer(input_selection)
+        # [batch, n_process]
+
+        # Compute activation-based scores
+        activation_scores, _ = process_activations.max(dim=1)
+        # [batch, n_process]
+
+        # Combine: activation magnitude × combination relevance
+        final_scores = activation_scores * torch.sigmoid(combination_relevance)
+        # [batch, n_process]
+
+        # Select top-k process neurons
+        _, process_indices = final_scores.topk(k, dim=-1)
+        # [batch, k]
 
         # Gather selected process activations
         process_indices_expanded = process_indices.unsqueeze(1).expand(
