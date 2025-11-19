@@ -1178,9 +1178,11 @@ def main():
                 latest_best_checkpoint = best_ckpt
                 print(f"\nFound latest checkpoint: {latest_best_checkpoint}")
 
-    # Create new run folder with timestamp and random number
+    # Create new run folder with Korean timestamp and random number
     import random
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    from datetime import timezone, timedelta
+    kst = timezone(timedelta(hours=9))
+    timestamp = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
     random_suffix = random.randint(1000, 9999)
     run_name = f"run_{timestamp}_{random_suffix}"
     checkpoint_dir = base_checkpoint_dir / run_name
