@@ -1,7 +1,7 @@
 """
-Hierarchical Dynamic Neuron FFN Training Script
+DAWN (Dynamic Architecture With Neurons) Training Script
 
-계층적 동적 뉴런 FFN 모델 학습
+DAWN 모델 학습
 
 Usage:
     # 기본 학습
@@ -43,7 +43,7 @@ from datetime import datetime
 import time
 import numpy as np
 
-from models.three_stage_ffn import HierarchicalLanguageModel
+from models.three_stage_ffn import DAWNLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import CacheLoader
 
@@ -347,7 +347,7 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_f
     학습 과정의 본질적 정보 추출 - 정보 흐름, gradient 흐름, 라우팅, weight 분포 등 심층 분석
 
     Args:
-        model: HierarchicalLanguageModel
+        model: DAWNLanguageModel
         x: Input token IDs [B, S]
         labels: Labels [B, S]
         step: Current step
@@ -1302,7 +1302,7 @@ def evaluate(model, dataloader, device, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Hierarchical Dynamic Neuron FFN')
+    parser = argparse.ArgumentParser(description='Train DAWN (Dynamic Architecture With Neurons)')
 
     # Model architecture
     parser.add_argument('--d_model', type=int, default=512,
@@ -1369,7 +1369,7 @@ def main():
         json.dump(config, f, indent=2)
 
     print(f"\n{'='*60}")
-    print(f"Hierarchical Dynamic Neuron FFN Training")
+    print(f"DAWN (Dynamic Architecture With Neurons) Training")
     print(f"{'='*60}")
     print(f"\nConfiguration:")
     for key, value in config.items():
@@ -1391,10 +1391,10 @@ def main():
 
     # Create model
     print(f"\n{'='*60}")
-    print("Creating Hierarchical FFN model...")
+    print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    model = HierarchicalLanguageModel(
+    model = DAWNLanguageModel(
         vocab_size=vocab_size,
         d_model=args.d_model,
         n_heads=args.n_heads,

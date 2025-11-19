@@ -1,9 +1,19 @@
 """
-SPROUT Models
+DAWN: Dynamic Architecture With Neurons
 
-Neural network models for SPROUT.
+Neural network models for DAWN.
 """
 
-from .neuron_based import NeuronBasedLanguageModel
+from .three_stage_ffn import (
+    DAWNRouter,
+    DAWNFFN,
+    DAWNTransformerLayer,
+    DAWNLanguageModel,
+)
 
-__all__ = ["NeuronBasedLanguageModel"]
+__all__ = [
+    "DAWNRouter",
+    "DAWNFFN",
+    "DAWNTransformerLayer",
+    "DAWNLanguageModel",
+]
