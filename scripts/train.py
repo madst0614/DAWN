@@ -1014,17 +1014,7 @@ def main():
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    model = HierarchicalLanguageModel(
-        vocab_size=vocab_size,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        max_seq_len=args.max_seq_len,
-        n_input=args.n_input,
-        n_process=args.n_process,
-        dropout=args.dropout
-    )
-
+    model = HierarchicalLanguageModel.from_config(cfg, vocab_size)
     model = model.to(device)
 
     # Model statistics

@@ -588,6 +588,30 @@ class DAWNLanguageModel(nn.Module):
             'd_model': self.d_model
         }
 
+    @classmethod
+    def from_config(cls, config: dict, vocab_size: int):
+        """
+        Create model from config dict.
+
+        Args:
+            config: Config dict with 'model' section
+            vocab_size: Vocabulary size
+
+        Returns:
+            DAWNLanguageModel instance
+        """
+        model_cfg = config['model']
+        return cls(
+            vocab_size=vocab_size,
+            d_model=model_cfg['d_model'],
+            n_layers=model_cfg['n_layers'],
+            n_input=model_cfg['n_input'],
+            n_process=model_cfg['n_process'],
+            n_heads=model_cfg['n_heads'],
+            max_seq_len=model_cfg['max_seq_len'],
+            dropout=model_cfg['dropout']
+        )
+
 
 # ============================================================
 # Aliases for backward compatibility
