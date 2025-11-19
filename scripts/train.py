@@ -721,9 +721,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             with torch.amp.autocast('cuda'):
                 outputs = model(
                     input_ids=input_ids,
-                    labels=labels,
-                    k_input=args.k_input,
-                    k_process=args.k_process
+                    labels=labels
                 )
                 loss = outputs['loss']
                 logits = outputs['logits']
@@ -768,9 +766,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         else:
             outputs = model(
                 input_ids=input_ids,
-                labels=labels,
-                k_input=args.k_input,
-                k_process=args.k_process
+                labels=labels
             )
             loss = outputs['loss']
             logits = outputs['logits']
@@ -887,9 +883,7 @@ def evaluate(model, dataloader, device, args):
 
             outputs = model(
                 input_ids=input_ids,
-                labels=labels,
-                k_input=args.k_input,
-                k_process=args.k_process
+                labels=labels
             )
             loss = outputs['loss']
             logits = outputs['logits']
@@ -930,17 +924,11 @@ def main():
     parser.add_argument('--max_seq_len', type=int, default=128,  # CHANGED: 512 → 128 (Scenario B)
                         help='Maximum sequence length')
 
-    # DAWN FFN specific
-    parser.add_argument('--n_input', type=int, default=2048,
-                        help='Number of input neurons')
-    parser.add_argument('--n_process', type=int, default=1024,
-                        help='Number of process neurons')
-
-    # Sparsity control (runtime)
-    parser.add_argument('--k_input', type=int, default=None,
-                        help='Number of input neurons to activate (None = n_input//8)')
-    parser.add_argument('--k_process', type=int, default=None,
-                        help='Number of process neurons to activate (None = n_process//8)')
+    # DAWN neuron configuration
+    parser.add_argument('--n_input', type=int, default=64,
+                        help='Number of input neurons per layer')
+    parser.add_argument('--n_process', type=int, default=128,
+                        help='Number of process neurons per layer')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=128,  # CHANGED: 32 → 128 (Scenario B)
@@ -1028,22 +1016,13 @@ def main():
     print(f"  Trainable parameters: {stats['trainable_parameters']:,}")
     print(f"  Number of layers: {stats['n_layers']}")
 
-    # Sparsity info
-    # Start with less aggressive sparsity to verify architecture works
-    # Then gradually increase sparsity if training succeeds
-    if args.k_input is None:
-        k_input_actual = args.n_input // 2  # 50% (was 12.5%)
-    else:
-        k_input_actual = args.k_input
+    # Sparsity info (DAWN uses 50% by default)
+    k_input_default = args.n_input // 2
+    k_process_default = args.n_process // 2
 
-    if args.k_process is None:
-        k_process_actual = args.n_process // 2  # 50%
-    else:
-        k_process_actual = args.k_process
-
-    print(f"\nSparsity Configuration:")
-    print(f"  Input neurons: {k_input_actual}/{args.n_input} ({k_input_actual/args.n_input*100:.1f}%)")
-    print(f"  Process neurons: {k_process_actual}/{args.n_process} ({k_process_actual/args.n_process*100:.1f}%)")
+    print(f"\nSparsity Configuration (default):")
+    print(f"  Input neurons: {k_input_default}/{args.n_input} ({k_input_default/args.n_input*100:.1f}%)")
+    print(f"  Process neurons: {k_process_default}/{args.n_process} ({k_process_default/args.n_process*100:.1f}%)")
 
     # Optimizer & Scheduler
     # Separate parameter groups: Router gets higher LR for faster learning
