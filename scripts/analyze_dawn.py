@@ -2,10 +2,9 @@
 DAWN (Dynamic Architecture With Neurons) 종합 분석 스크립트
 
 학습된 DAWN 모델의 상세 분석:
-- Router entropy 및 routing 패턴
-- 뉴런 사용 분포 및 특화
 - 레이어별 특성 분석
 - 성능 breakdown
+- 예측 분포 분석
 
 Usage:
     python scripts/analyze_dawn.py --checkpoint path/to/checkpoint.pt
@@ -107,9 +106,8 @@ def load_checkpoint(checkpoint_path, device='cuda'):
             'n_heads': 8,
             'n_layers': 6,
             'max_seq_len': 128,
-            'n_input_neurons': 2048,
-            'n_process_neurons': 1024,
-            'd_routing': 256,
+            'n_input': 2048,
+            'n_process': 1024,
             'dropout': 0.1
         }
 
@@ -135,9 +133,8 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         n_heads=config.get('n_heads', 8),
         n_layers=config.get('n_layers', 6),
         max_seq_len=config.get('max_seq_len', 128),
-        n_input_neurons=config.get('n_input_neurons', 2048),
-        n_process_neurons=config.get('n_process_neurons', 1024),
-        d_routing=config.get('d_routing', 256),
+        n_input=config.get('n_input', config.get('n_input_neurons', 2048)),
+        n_process=config.get('n_process', config.get('n_process_neurons', 1024)),
         dropout=config.get('dropout', 0.1)
     )
 
@@ -164,171 +161,51 @@ def load_checkpoint(checkpoint_path, device='cuda'):
 # ============================================================
 
 def analyze_routing_patterns(model, val_loader, device):
-    """Router 패턴 분석"""
+    """Router 패턴 분석 (simplified for new architecture)"""
     print("\n📊 Analyzing Routing Patterns...")
 
-    layer_entropies = defaultdict(list)
-    layer_routing_scores = defaultdict(list)
-
-    for batch in tqdm(val_loader, desc="Routing analysis"):
-        input_ids = batch['input_ids'].to(device)
-
-        with torch.no_grad():
-            # Forward pass to collect routing stats
-            _ = model(input_ids)
-
-            # 각 레이어의 routing 정보 수집
-            for layer_idx, layer in enumerate(model.layers):
-                entropy = layer.ffn.get_routing_entropy()
-                layer_entropies[layer_idx].append(entropy)
-
-                if layer.ffn.last_routing_scores is not None:
-                    scores = layer.ffn.last_routing_scores.cpu()
-                    layer_routing_scores[layer_idx].append(scores)
-
-    # 통계 계산
-    n_input = model.layers[0].ffn.n_input
-    max_entropy = np.log(n_input)
-
+    # New architecture doesn't expose routing stats directly
+    # Return basic info
     results = {
-        'max_entropy': max_entropy,
+        'n_layers': len(model.layers),
         'layers': {}
     }
 
     for layer_idx in range(len(model.layers)):
-        entropies = layer_entropies[layer_idx]
-        avg_entropy = np.mean(entropies)
-
         results['layers'][layer_idx] = {
-            'avg_entropy': avg_entropy,
-            'std_entropy': np.std(entropies),
-            'entropy_ratio': avg_entropy / max_entropy,
-            'min_entropy': np.min(entropies),
-            'max_entropy': np.max(entropies)
+            'info': 'Routing analysis not available in simplified architecture'
         }
 
     return results
 
 
 def analyze_neuron_usage(model, val_loader, device):
-    """뉴런 사용 분포 분석"""
+    """뉴런 사용 분포 분석 (simplified for new architecture)"""
     print("\n🧠 Analyzing Neuron Usage...")
 
-    # Reset counts
-    for layer in model.layers:
-        layer.ffn.reset_routing_counts()
-
-    # Forward pass to collect usage stats
-    for batch in tqdm(val_loader, desc="Usage analysis"):
-        input_ids = batch['input_ids'].to(device)
-
-        with torch.no_grad():
-            model.train()  # Enable stats collection
-            _ = model(input_ids)
-            model.eval()
-
-    # 각 레이어의 사용 통계 수집
+    # New architecture doesn't track usage stats
     results = {'layers': {}}
 
-    for layer_idx, layer in enumerate(model.layers):
-        usage_stats = layer.ffn.get_usage_statistics()
-
+    for layer_idx in range(len(model.layers)):
         results['layers'][layer_idx] = {
-            'total_neurons': usage_stats['total'],
-            'dead_neurons': usage_stats['dead_count'],
-            'dead_ratio': usage_stats['dead_ratio'],
-            'gini_coefficient': usage_stats['gini'],
-            'top10_concentration': usage_stats['top10_concentration']
+            'info': 'Usage analysis not available in simplified architecture'
         }
-
-        # 사용량 분포 저장 (첫 레이어만)
-        if layer_idx == 0 and usage_stats['usage_counts'] is not None:
-            counts = usage_stats['usage_counts']
-            sorted_counts = np.sort(counts)[::-1]
-            results['layer0_top20_counts'] = sorted_counts[:20].tolist()
 
     return results
 
 
 def analyze_neuron_specialization(model, val_loader, tokenizer, device, max_batches=50):
-    """뉴런 특화 분석"""
+    """뉴런 특화 분석 (simplified for new architecture)"""
     print("\n💎 Analyzing Neuron Specialization...")
 
-    neuron_tokens = defaultdict(list)
-    n_input = model.layers[0].ffn.n_input
-
-    batch_count = 0
-    for batch in tqdm(val_loader, desc="Specialization analysis"):
-        if batch_count >= max_batches:
-            break
-
-        input_ids = batch['input_ids'].to(device)
-
-        with torch.no_grad():
-            # Embedding
-            B, S = input_ids.shape
-            token_emb = model.token_embedding(input_ids)
-            positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = model.position_embedding(positions)
-            x = token_emb + pos_emb
-
-            # 첫 번째 레이어의 routing 정보
-            layer = model.layers[0]
-            x_norm = layer.norm1(x)
-
-            # Attention
-            attn_out, _ = layer.attention(x_norm, x_norm, x_norm)
-            x = x + layer.dropout(attn_out)
-
-            # FFN routing
-            x_norm = layer.norm2(x)
-            input_idx, _ = layer.ffn.router(x_norm, k_input=1024)
-
-            # 각 배치의 선택된 뉴런과 토큰 매핑
-            for b in range(B):
-                selected = input_idx[b].cpu().tolist()
-                tokens = input_ids[b].cpu().tolist()
-
-                for neuron_id in set(selected):
-                    neuron_tokens[neuron_id].extend(tokens)
-
-        batch_count += 1
-
-    # 각 뉴런의 다양성 계산
-    diversities = []
-    specialized_neurons = []
-
-    for neuron_id in range(n_input):
-        tokens = neuron_tokens.get(neuron_id, [])
-        if len(tokens) == 0:
-            continue
-
-        unique_tokens = len(set(tokens))
-        total_tokens = len(tokens)
-        diversity = unique_tokens / total_tokens
-
-        diversities.append(diversity)
-
-        # Diversity < 0.3이면 특화되었다고 판단
-        if diversity < 0.3 and total_tokens > 100:
-            # 가장 빈번한 토큰들
-            token_counts = Counter(tokens)
-            top_tokens = token_counts.most_common(5)
-            top_words = [(tokenizer.decode([t]), c) for t, c in top_tokens]
-
-            specialized_neurons.append({
-                'neuron_id': neuron_id,
-                'diversity': diversity,
-                'total_tokens': total_tokens,
-                'top_tokens': top_words
-            })
-
+    # New architecture doesn't expose neuron routing for analysis
     results = {
-        'total_analyzed': len(diversities),
-        'avg_diversity': np.mean(diversities) if diversities else 0,
-        'std_diversity': np.std(diversities) if diversities else 0,
-        'specialized_count': len(specialized_neurons),
-        'specialized_neurons': specialized_neurons[:20]  # Top 20
+        'info': 'Specialization analysis not available in simplified architecture',
+        'total_analyzed': 0,
+        'avg_diversity': 0,
+        'std_diversity': 0,
+        'specialized_count': 0,
+        'specialized_neurons': []
     }
 
     return results
@@ -349,7 +226,7 @@ def analyze_layer_differences(model, val_loader, device):
             token_emb = model.token_embedding(input_ids)
             positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
             pos_emb = model.position_embedding(positions)
-            x = token_emb + pos_emb
+            x = model.dropout(token_emb + pos_emb)
 
             # 각 레이어 통과
             for layer_idx, layer in enumerate(model.layers):
@@ -431,44 +308,27 @@ def analyze_performance(model, val_loader, device):
 
 
 def analyze_aux_loss_components(model, val_loader, device):
-    """Aux loss 구성 요소 분석"""
-    print("\n⚖️  Analyzing Aux Loss Components...")
+    """Aux loss 구성 요소 분석 (simplified for new architecture)"""
+    print("\n⚖️  Analyzing Loss Components...")
 
-    # Reset counts
-    for layer in model.layers:
-        layer.ffn.reset_routing_counts()
-
-    # Forward pass
     total_main_loss = 0
-    total_aux_loss = 0
     n_batches = 0
 
-    for batch in tqdm(val_loader, desc="Aux loss analysis"):
+    for batch in tqdm(val_loader, desc="Loss analysis"):
         input_ids = batch['input_ids'].to(device)
         labels = input_ids.clone()
 
         with torch.no_grad():
-            model.train()
             outputs = model(input_ids, labels=labels)
             main_loss = outputs['loss']
 
-            # Aux loss 계산
-            aux_losses = []
-            for layer in model.layers:
-                aux_losses.append(layer.ffn.get_load_balance_loss())
-
-            avg_aux = torch.stack(aux_losses).mean()
-
             total_main_loss += main_loss.item()
-            total_aux_loss += avg_aux.item()
             n_batches += 1
-
-            model.eval()
 
     results = {
         'avg_main_loss': total_main_loss / n_batches,
-        'avg_aux_loss': total_aux_loss / n_batches,
-        'aux_to_main_ratio': (total_aux_loss / n_batches) / (total_main_loss / n_batches)
+        'avg_aux_loss': 0.0,
+        'aux_to_main_ratio': 0.0
     }
 
     return results
@@ -489,40 +349,30 @@ def comprehensive_analysis(model, val_loader, tokenizer, device):
         'model_config': model.get_model_stats()
     }
 
-    # 1. Routing Patterns
+    # 1. Routing Patterns (simplified)
     routing_results = analyze_routing_patterns(model, val_loader, device)
     results['routing'] = routing_results
 
     print("\n📊 ROUTING STATISTICS")
     print("-" * 40)
-    for layer_idx, stats in routing_results['layers'].items():
-        print(f"  Layer {layer_idx}: entropy={stats['avg_entropy']:.3f} "
-              f"({stats['entropy_ratio']*100:.1f}% of max)")
+    print(f"  Number of layers: {routing_results['n_layers']}")
+    print("  (Detailed routing analysis not available in simplified architecture)")
 
-    # 2. Neuron Usage
+    # 2. Neuron Usage (simplified)
     usage_results = analyze_neuron_usage(model, val_loader, device)
     results['usage'] = usage_results
 
     print("\n🧠 NEURON USAGE")
     print("-" * 40)
-    for layer_idx, stats in usage_results['layers'].items():
-        print(f"  Layer {layer_idx}: dead={stats['dead_neurons']}/{stats['total_neurons']} "
-              f"({stats['dead_ratio']*100:.1f}%), "
-              f"gini={stats['gini_coefficient']:.3f}")
+    print("  (Usage analysis not available in simplified architecture)")
 
-    # 3. Specialization
+    # 3. Specialization (simplified)
     spec_results = analyze_neuron_specialization(model, val_loader, tokenizer, device)
     results['specialization'] = spec_results
 
     print("\n💎 NEURON SPECIALIZATION")
     print("-" * 40)
-    print(f"  Specialized neurons: {spec_results['specialized_count']}")
-    print(f"  Average diversity: {spec_results['avg_diversity']:.3f}")
-    if spec_results['specialized_neurons']:
-        print("  Examples:")
-        for neuron in spec_results['specialized_neurons'][:3]:
-            tokens_str = ", ".join([f"'{w}'" for w, c in neuron['top_tokens'][:3]])
-            print(f"    Neuron {neuron['neuron_id']}: {tokens_str}")
+    print("  (Specialization analysis not available in simplified architecture)")
 
     # 4. Layer Differences
     layer_results = analyze_layer_differences(model, val_loader, device)
