@@ -1,27 +1,23 @@
 """
-Hierarchical Dynamic Neuron FFN Training Script
+DAWN (Dynamic Architecture With Neurons) Training Script
 
-계층적 동적 뉴런 FFN 모델 학습
+DAWN 모델 학습
 
 Usage:
     # 기본 학습
-    python scripts/train_three_stage.py
+    python scripts/train.py
 
     # 커스텀 설정
-    python scripts/train_three_stage.py \
+    python scripts/train.py \
         --d_model 768 \
-        --n_input_neurons 4096 \
-        --n_process_neurons 2048 \
-        --d_routing 512 \
+        --n_input 4096 \
+        --n_process 2048 \
         --batch_size 16 \
         --num_epochs 30 \
         --lr 3e-4
 
     # Mixed precision training
-    python scripts/train_three_stage.py --use_amp
-
-    # Gradient checkpointing (메모리 절약)
-    python scripts/train_three_stage.py --gradient_checkpointing
+    python scripts/train.py --use_amp
 """
 
 import sys
@@ -43,7 +39,7 @@ from datetime import datetime
 import time
 import numpy as np
 
-from models.three_stage_ffn import HierarchicalLanguageModel
+from models.model import HierarchicalLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import CacheLoader
 
@@ -344,10 +340,10 @@ def comprehensive_debug(
 
 def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_file=None):
     """
-    학습 과정의 본질적 정보 추출 - 정보 흐름, gradient 흐름, 라우팅, weight 분포 등 심층 분석
+    Simplified learning analysis for new DAWN architecture.
 
     Args:
-        model: HierarchicalLanguageModel
+        model: DAWNLanguageModel
         x: Input token IDs [B, S]
         labels: Labels [B, S]
         step: Current step
@@ -357,16 +353,13 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_f
     if step > debug_first_n_steps:
         return
 
-    # Redirect all output to file
     if log_file is None:
-        return  # Skip debug output if no log file specified
+        return
 
     import sys
     from io import StringIO
-    import torch.nn.functional as F
     from collections import Counter
 
-    # Capture stdout
     old_stdout = sys.stdout
     sys.stdout = StringIO()
 
@@ -374,14 +367,7 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_f
     print(f"🔬 DEEP LEARNING ANALYSIS - Step {step}")
     print(f"{'='*70}")
 
-    # ============================================================
-    # 1. 정보 흐름 분석 (Information Flow)
-    # ============================================================
-    print("\n📊 1. INFORMATION FLOW ANALYSIS")
-    print("-" * 70)
-
     with torch.no_grad():
-        # Embedding 출력
         B, S = x.shape
         token_emb = model.token_embedding(x)
         positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
@@ -392,211 +378,38 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_f
         print(f"  Token emb norm: {token_emb.norm(dim=-1).mean():.4f}")
         print(f"  Pos emb norm: {pos_emb.norm(dim=-1).mean():.4f}")
         print(f"  Combined std: {x_emb.std():.4f}")
-        print(f"  Combined range: [{x_emb.min():.4f}, {x_emb.max():.4f}]")
 
-        # 각 레이어별 출력 분석
-        x_layer = x_emb
-        for i, layer in enumerate(model.layers):
-            # Attention block (uses _attention_block method)
-            attn_out = layer._attention_block(x_layer, None)
-            print(f"\n[Layer {i} - Attention]")
-            print(f"  Output norm: {attn_out.norm(dim=-1).mean():.4f}")
-            print(f"  Output std: {attn_out.std():.4f}")
-            print(f"  Signal strength: {attn_out.abs().mean():.4f}")
-
-            x_layer = x_layer + attn_out
-
-            # FFN block (uses _ffn_block method)
-            ffn_out = layer._ffn_block(x_layer, None, None)
-            print(f"\n[Layer {i} - FFN]")
-            print(f"  Output norm: {ffn_out.norm(dim=-1).mean():.4f}")
-            print(f"  Output std: {ffn_out.std():.4f}")
-            print(f"  Signal strength: {ffn_out.abs().mean():.4f}")
-
-            # FFN 내부 분석
-            ffn = layer.ffn
-            ffn_input = layer.norm2(x_layer)  # Get normalized input for analysis
-            with torch.no_grad():
-                # Input neuron activations
-                input_acts = F.gelu(ffn_input @ ffn.input_patterns.T)
-                print(f"  Input neurons:")
-                print(f"    Activation mean: {input_acts.mean():.4f}")
-                print(f"    Activation std: {input_acts.std():.4f}")
-                print(f"    Dead neurons (act < 0.01): {(input_acts.abs() < 0.01).float().mean()*100:.1f}%")
-                print(f"    Active neurons: {(input_acts.abs() > 0.1).float().mean()*100:.1f}%")
-
-            x_layer = x_layer + ffn_out
-
-            print(f"\n[Layer {i} - Residual Output]")
-            print(f"  Output norm: {x_layer.norm(dim=-1).mean():.4f}")
-            print(f"  Output std: {x_layer.std():.4f}")
-
-    # ============================================================
-    # 2. Gradient Flow 분석
-    # ============================================================
-    print(f"\n📈 2. GRADIENT FLOW ANALYSIS")
-    print("-" * 70)
-
-    # Forward pass with gradient tracking
+    # Forward and backward for gradient analysis
     model.zero_grad()
     output = model(x, labels=labels)
     loss = output['loss']
     loss.backward()
 
-    print(f"\n[Loss Value]")
-    print(f"  Total loss: {loss.item():.4f}")
+    print(f"\n[Loss]")
+    print(f"  Value: {loss.item():.4f}")
 
-    # 각 레이어별 gradient 분석
-    for i, layer in enumerate(model.layers):
-        ffn = layer.ffn
+    # Gradient analysis
+    print(f"\n[Gradient Analysis]")
+    for name, param in model.named_parameters():
+        if param.grad is not None and 'router' in name:
+            grad = param.grad
+            print(f"  {name}: norm={grad.norm():.6f}, mean={grad.abs().mean():.6f}")
 
-        print(f"\n[Layer {i} - Gradient Magnitudes]")
+    # Logits analysis
+    logits = output['logits']
+    print(f"\n[Logits Distribution]")
+    print(f"  Mean: {logits.mean():.4f}, Std: {logits.std():.4f}")
+    print(f"  Range: [{logits.min():.4f}, {logits.max():.4f}]")
 
-        # Neuron keys (routing)
-        if ffn.global_router.neuron_keys.grad is not None:
-            grad = ffn.global_router.neuron_keys.grad
-            print(f"  Router neuron_keys:")
-            print(f"    Grad norm: {grad.norm():.6f}")
-            print(f"    Grad mean (abs): {grad.abs().mean():.6f}")
-            print(f"    Grad max: {grad.abs().max():.6f}")
-            print(f"    Non-zero grads: {(grad.abs() > 1e-8).sum()}/{grad.numel()}")
-
-        # Input patterns
-        if ffn.input_patterns.grad is not None:
-            grad = ffn.input_patterns.grad
-            print(f"  Input patterns:")
-            print(f"    Grad norm: {grad.norm():.6f}")
-            print(f"    Grad mean (abs): {grad.abs().mean():.6f}")
-            print(f"    Dead neurons (grad < 1e-6): {(grad.abs().mean(dim=1) < 1e-6).sum()}/{grad.shape[0]}")
-
-        # Process weights
-        if ffn.process_weights.grad is not None:
-            grad = ffn.process_weights.grad
-            print(f"  Process weights:")
-            print(f"    Grad norm: {grad.norm():.6f}")
-            print(f"    Grad mean (abs): {grad.abs().mean():.6f}")
-            print(f"    Dead neurons (grad < 1e-6): {(grad.abs().mean(dim=1) < 1e-6).sum()}/{grad.shape[0]}")
-
-    # ============================================================
-    # 3. 학습 역학 분석 (Learning Dynamics)
-    # ============================================================
-    print(f"\n🎯 3. LEARNING DYNAMICS")
-    print("-" * 70)
-
+    # Prediction diversity
     with torch.no_grad():
-        # Routing pattern 변화
-        layer0_ffn = model.layers[0].ffn
-        B, S = x.shape
-        token_emb = model.token_embedding(x)
-        positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
-        pos_emb = model.position_embedding(positions)
-        x_emb = token_emb + pos_emb
-
-        # Get routing info
-        input_idx, routing_weights = layer0_ffn.global_router(x_emb, k_input=1024)
-
-        print(f"\n[Routing Behavior]")
-        print(f"  Selected neurons (first batch, first 10): {input_idx[0, :10].tolist()}")
-        top_weights = routing_weights[0].topk(10)
-        print(f"  Top 10 routing weights: {top_weights.values.tolist()}")
-        print(f"  Top 10 neuron indices: {top_weights.indices.tolist()}")
-
-        # Routing entropy
-        routing_probs = routing_weights[0] / routing_weights[0].sum()
-        entropy = -(routing_probs * torch.log(routing_probs + 1e-8)).sum()
-        max_entropy = torch.log(torch.tensor(float(routing_weights.shape[1])))
-        print(f"  Routing entropy: {entropy:.4f} (max: {max_entropy:.4f})")
-        print(f"  Normalized entropy: {(entropy / max_entropy):.4f}")
-
-        # Logits 분포
-        logits = output['logits']
-        print(f"\n[Logits Distribution]")
-        print(f"  Mean: {logits.mean():.4f}")
-        print(f"  Std: {logits.std():.4f}")
-        print(f"  Max: {logits.max():.4f}")
-        print(f"  Min: {logits.min():.4f}")
-
-        # Softmax 후 확률 분포
-        probs = F.softmax(logits, dim=-1)
-        max_probs, _ = probs.max(dim=-1)
-        print(f"\n[Prediction Confidence]")
-        print(f"  Mean max probability: {max_probs.mean():.4f}")
-        print(f"  Min max probability: {max_probs.min():.4f}")
-        print(f"  Max max probability: {max_probs.max():.4f}")
-
-        # Entropy of predictions
-        entropy_pred = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
-        max_vocab_entropy = torch.log(torch.tensor(float(model.vocab_size)))
-        print(f"\n[Prediction Entropy]")
-        print(f"  Mean entropy: {entropy_pred.mean():.4f}")
-        print(f"  Max possible entropy: {max_vocab_entropy:.4f}")
-        print(f"  Normalized entropy: {(entropy_pred.mean() / max_vocab_entropy):.4f}")
-
-    # ============================================================
-    # 4. Weight 분포 분석
-    # ============================================================
-    print(f"\n⚖️  4. WEIGHT DISTRIBUTION ANALYSIS")
-    print("-" * 70)
-
-    for i, layer in enumerate(model.layers):
-        ffn = layer.ffn
-
-        print(f"\n[Layer {i}]")
-
-        # Input patterns
-        print(f"  Input patterns:")
-        print(f"    Mean: {ffn.input_patterns.mean():.6f}")
-        print(f"    Std: {ffn.input_patterns.std():.6f}")
-        print(f"    Norm: {ffn.input_patterns.norm():.6f}")
-
-        # Process weights
-        print(f"  Process weights:")
-        print(f"    Mean: {ffn.process_weights.mean():.6f}")
-        print(f"    Std: {ffn.process_weights.std():.6f}")
-        print(f"    Norm: {ffn.process_weights.norm():.6f}")
-
-        # Neuron keys
-        print(f"  Neuron keys:")
-        print(f"    Mean: {ffn.global_router.neuron_keys.mean():.6f}")
-        print(f"    Std: {ffn.global_router.neuron_keys.std():.6f}")
-        print(f"    Norm: {ffn.global_router.neuron_keys.norm():.6f}")
-
-    # ============================================================
-    # 5. 학습 진전도 (Learning Progress)
-    # ============================================================
-    print(f"\n📉 5. LEARNING PROGRESS INDICATORS")
-    print("-" * 70)
-
-    with torch.no_grad():
-        # Token prediction diversity
-        _, preds = logits.max(dim=-1)
+        preds = logits.argmax(dim=-1)
         unique_preds = preds.unique().numel()
         print(f"\n[Prediction Diversity]")
-        print(f"  Unique tokens predicted: {unique_preds}/{model.vocab_size}")
-        print(f"  Diversity ratio: {unique_preds/model.vocab_size*100:.2f}%")
-
-        # Most common predictions
-        pred_counts = Counter(preds.flatten().tolist())
-        top_10_preds = pred_counts.most_common(10)
-        print(f"\n[Top 10 Most Predicted Tokens]")
-        for token, count in top_10_preds:
-            pct = count/preds.numel()*100
-            print(f"    Token {token}: {count} times ({pct:.2f}%)")
-
-        # Label distribution (for comparison)
-        if labels is not None:
-            valid_labels = labels[labels != -100]
-            if valid_labels.numel() > 0:
-                label_counts = Counter(valid_labels.tolist())
-                top_10_labels = label_counts.most_common(10)
-                print(f"\n[Top 10 Most Frequent True Labels]")
-                for token, count in top_10_labels:
-                    pct = count/valid_labels.numel()*100
-                    print(f"    Token {token}: {count} times ({pct:.2f}%)")
+        print(f"  Unique tokens: {unique_preds}/{model.vocab_size} ({unique_preds/model.vocab_size*100:.2f}%)")
 
     print(f"\n{'='*70}\n")
 
-    # Restore stdout and write to file
     captured = sys.stdout.getvalue()
     sys.stdout = old_stdout
 
@@ -797,46 +610,26 @@ def load_cached_data(tokenizer_path=None, max_length=128, batch_size=128):  # CH
 
 def compute_load_balance_loss(model):
     """
-    모든 레이어의 load balancing loss를 계산합니다.
-
-    Args:
-        model: HierarchicalFFNModel
-
-    Returns:
-        total_loss: 전체 레이어의 평균 load balance loss
+    Placeholder for load balancing loss (simplified architecture).
+    Returns zero as the new DAWN architecture handles balance internally.
     """
-    total_loss = 0
-    count = 0
-
-    for layer in model.layers:
-        # 각 layer의 ffn에서 load balance loss 계산
-        lb_loss = layer.ffn.get_load_balance_loss()
-        total_loss = total_loss + lb_loss
-        count += 1
-
-    return total_loss / count if count > 0 else torch.tensor(0.0)
+    return torch.tensor(0.0, device=next(model.parameters()).device)
 
 
 def reset_routing_stats(model):
-    """모든 레이어의 routing 통계를 초기화합니다."""
-    for layer in model.layers:
-        layer.ffn.reset_routing_counts()
+    """Placeholder - new architecture doesn't track routing stats."""
+    pass
 
 
 def print_diagnostic_metrics(model, epoch):
     """
-    학습 진단 메트릭 출력
-
-    - Gradient norm (exploding/vanishing 체크)
-    - Neuron 사용률 (input neurons)
-    - Router entropy (다양성)
-    - Process neuron 사용률
+    학습 진단 메트릭 출력 (simplified for new DAWN architecture)
     """
     print(f"\n{'='*60}")
     print(f"Diagnostic Metrics (Epoch {epoch})")
     print(f"{'='*60}")
 
-    # 1. Gradient norm
+    # Gradient norm
     grad_norm = 0.0
     grad_count = 0
     for p in model.parameters():
@@ -855,47 +648,6 @@ def print_diagnostic_metrics(model, epoch):
         print(f"  Expected: 0.1 ~ 10 | < 0.01 = vanishing | > 100 = exploding")
     else:
         print(f"Gradient Norm: N/A (no gradients)")
-
-    # 첫 번째 레이어의 FFN 분석 (대표값)
-    first_ffn = model.layers[0].ffn
-
-    # 2. Input Neuron 사용률
-    if first_ffn.input_neuron_counts is not None:
-        active_input = (first_ffn.input_neuron_counts > 0).sum().item()
-        total_input = first_ffn.n_input
-        usage_pct = active_input / total_input * 100
-
-        status = "✓ OK" if usage_pct > 50 else "⚠ LOW"
-        print(f"\nInput Neurons (Layer 0): {active_input}/{total_input} ({usage_pct:.1f}%) {status}")
-        print(f"  Expected: > 50% for good diversity")
-    else:
-        print(f"\nInput Neurons: N/A (no stats collected)")
-
-    # 3. Router Entropy (다양성)
-    neuron_keys = first_ffn.global_router.neuron_keys  # [n_input, d_routing]
-    # 각 뉴런의 key를 확률 분포로 변환 (softmax over neurons)
-    # 높은 entropy = 다양한 뉴런이 선택될 가능성
-    routing_logits = neuron_keys.norm(dim=1)  # [n_input] - 각 뉴런의 key 크기
-    routing_probs = F.softmax(routing_logits, dim=0)
-    entropy = -(routing_probs * (routing_probs + 1e-10).log()).sum().item()
-    max_entropy = torch.log(torch.tensor(float(first_ffn.n_input))).item()
-    entropy_pct = entropy / max_entropy * 100
-
-    status = "✓ OK" if entropy_pct > 50 else "⚠ LOW"
-    print(f"\nRouter Entropy (Layer 0): {entropy_pct:.1f}% of max {status}")
-    print(f"  Expected: > 50% for diverse routing")
-
-    # 4. Process Neuron 사용률
-    if first_ffn.process_neuron_counts is not None:
-        active_process = (first_ffn.process_neuron_counts > 0).sum().item()
-        total_process = first_ffn.n_process
-        process_pct = active_process / total_process * 100
-
-        status = "✓ OK" if process_pct > 50 else "⚠ LOW"
-        print(f"\nProcess Neurons (Layer 0): {active_process}/{total_process} ({process_pct:.1f}%) {status}")
-        print(f"  Expected: ~100% if k_process=n_process (no selection)")
-    else:
-        print(f"\nProcess Neurons: N/A (no stats collected)")
 
     print(f"{'='*60}\n")
 
@@ -986,87 +738,19 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
                 print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
 
-                # Routing debug
-                print(f"\n[Routing Debug - Step {step+1}]")
-                first_ffn = model.layers[0].ffn
-
-                if first_ffn.last_routing_scores is not None:
-                    routing_weights = first_ffn.last_routing_scores  # [B, n_input]
-
-                    # Top-k pattern analysis
-                    topk_vals, topk_idx = routing_weights[0].topk(10)
-                    print(f"  Top 10 routing weights: {topk_vals.cpu().numpy()}")
-
-                    # Distribution stats
-                    print(f"  Distribution: min={routing_weights.min():.6f}, max={routing_weights.max():.6f}, mean={routing_weights.mean():.6f}")
-
-                    # Sparsity check
-                    nonzero = (routing_weights[0] > 1e-6).sum()
-                    print(f"  Non-zero weights: {nonzero}/{len(routing_weights[0])}")
-
-                    # Usage stats
-                    if first_ffn.input_neuron_counts is not None:
-                        counts = first_ffn.input_neuron_counts
-                        active_neurons = (counts > 0).sum()
-                        print(f"  Active input neurons: {active_neurons}/{len(counts)}")
-                else:
-                    print(f"  No routing scores available")
-
             scaler.scale(total_loss_combined).backward()
 
-            # Router-specific gradient clipping to prevent vanishing gradients
-            for name, param in model.named_parameters():
-                if param.grad is not None and ('neuron_keys' in name or 'query_net' in name):
-                    # Ensure router gradients stay in reasonable range
-                    param.grad.data.clamp_(-0.01, 0.01)
-
             if debug_mode:
-                print(f"\n[Additional Debug Info - After Backward]")
-
-                # CRITICAL: Check neuron_keys gradient specifically
-                print(f"\n[Critical Gradient Check - neuron_keys]")
-                neuron_keys = model.layers[0].ffn.global_router.neuron_keys
-                if neuron_keys.grad is not None:
-                    grad_norm = neuron_keys.grad.norm().item()
-                    grad_mean = neuron_keys.grad.abs().mean().item()
-                    nonzero = (neuron_keys.grad.abs() > 1e-10).sum().item()
-                    total = neuron_keys.grad.numel()
-
-                    print(f"  ✓ neuron_keys HAS gradient!")
-                    print(f"    Shape: {neuron_keys.grad.shape}")
-                    print(f"    Grad norm: {grad_norm:.6f}")
-                    print(f"    Grad mean (abs): {grad_mean:.8f}")
-                    print(f"    Non-zero grads: {nonzero}/{total} ({nonzero/total*100:.1f}%)")
-
-                    if grad_norm < 1e-7:
-                        print(f"    ⚠ WARNING: Gradient too small (vanishing)")
-                    elif grad_norm > 100:
-                        print(f"    ⚠ WARNING: Gradient too large (exploding)")
-                    else:
-                        print(f"    ✓ Gradient magnitude OK")
-                else:
-                    print(f"  ✗ neuron_keys has NO GRADIENT - PROBLEM!")
-
-                # Check other parameters
-                grad_issues = []
+                print(f"\n[Gradient Check - After Backward]")
+                # Check router gradients
                 for name, param in model.named_parameters():
-                    if param.grad is not None:
+                    if param.grad is not None and 'router' in name:
                         grad_norm = param.grad.norm().item()
+                        print(f"  {name}: grad_norm={grad_norm:.6f}")
                         if grad_norm < 1e-7:
-                            grad_issues.append(f"  ⚠ {name}: grad too small ({grad_norm:.2e})")
+                            print(f"    ⚠ WARNING: Gradient too small")
                         elif grad_norm > 100:
-                            grad_issues.append(f"  ⚠ {name}: grad too large ({grad_norm:.2e})")
-                    else:
-                        # Skip neuron_keys since we already checked it above
-                        if 'neuron_keys' not in name:
-                            grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
-
-                if grad_issues:
-                    print("\n  Other Gradient Issues:")
-                    for issue in grad_issues[:10]:  # Show first 10 issues
-                        print(issue)
-                else:
-                    print("\n  ✓ All other gradients OK")
+                            print(f"    ⚠ WARNING: Gradient too large")
 
             scaler.unscale_(optimizer)
 
@@ -1101,87 +785,19 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
                 print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
 
-                # Routing debug
-                print(f"\n[Routing Debug - Step {step+1}]")
-                first_ffn = model.layers[0].ffn
-
-                if first_ffn.last_routing_scores is not None:
-                    routing_weights = first_ffn.last_routing_scores  # [B, n_input]
-
-                    # Top-k pattern analysis
-                    topk_vals, topk_idx = routing_weights[0].topk(10)
-                    print(f"  Top 10 routing weights: {topk_vals.cpu().numpy()}")
-
-                    # Distribution stats
-                    print(f"  Distribution: min={routing_weights.min():.6f}, max={routing_weights.max():.6f}, mean={routing_weights.mean():.6f}")
-
-                    # Sparsity check
-                    nonzero = (routing_weights[0] > 1e-6).sum()
-                    print(f"  Non-zero weights: {nonzero}/{len(routing_weights[0])}")
-
-                    # Usage stats
-                    if first_ffn.input_neuron_counts is not None:
-                        counts = first_ffn.input_neuron_counts
-                        active_neurons = (counts > 0).sum()
-                        print(f"  Active input neurons: {active_neurons}/{len(counts)}")
-                else:
-                    print(f"  No routing scores available")
-
             total_loss_combined.backward()
 
-            # Router-specific gradient clipping to prevent vanishing gradients
-            for name, param in model.named_parameters():
-                if param.grad is not None and ('neuron_keys' in name or 'query_net' in name):
-                    # Ensure router gradients stay in reasonable range
-                    param.grad.data.clamp_(-0.01, 0.01)
-
             if debug_mode:
-                print(f"\n[Additional Debug Info - After Backward]")
-
-                # CRITICAL: Check neuron_keys gradient specifically
-                print(f"\n[Critical Gradient Check - neuron_keys]")
-                neuron_keys = model.layers[0].ffn.global_router.neuron_keys
-                if neuron_keys.grad is not None:
-                    grad_norm = neuron_keys.grad.norm().item()
-                    grad_mean = neuron_keys.grad.abs().mean().item()
-                    nonzero = (neuron_keys.grad.abs() > 1e-10).sum().item()
-                    total = neuron_keys.grad.numel()
-
-                    print(f"  ✓ neuron_keys HAS gradient!")
-                    print(f"    Shape: {neuron_keys.grad.shape}")
-                    print(f"    Grad norm: {grad_norm:.6f}")
-                    print(f"    Grad mean (abs): {grad_mean:.8f}")
-                    print(f"    Non-zero grads: {nonzero}/{total} ({nonzero/total*100:.1f}%)")
-
-                    if grad_norm < 1e-7:
-                        print(f"    ⚠ WARNING: Gradient too small (vanishing)")
-                    elif grad_norm > 100:
-                        print(f"    ⚠ WARNING: Gradient too large (exploding)")
-                    else:
-                        print(f"    ✓ Gradient magnitude OK")
-                else:
-                    print(f"  ✗ neuron_keys has NO GRADIENT - PROBLEM!")
-
-                # Check other parameters
-                grad_issues = []
+                print(f"\n[Gradient Check - After Backward]")
+                # Check router gradients
                 for name, param in model.named_parameters():
-                    if param.grad is not None:
+                    if param.grad is not None and 'router' in name:
                         grad_norm = param.grad.norm().item()
+                        print(f"  {name}: grad_norm={grad_norm:.6f}")
                         if grad_norm < 1e-7:
-                            grad_issues.append(f"  ⚠ {name}: grad too small ({grad_norm:.2e})")
+                            print(f"    ⚠ WARNING: Gradient too small")
                         elif grad_norm > 100:
-                            grad_issues.append(f"  ⚠ {name}: grad too large ({grad_norm:.2e})")
-                    else:
-                        # Skip neuron_keys since we already checked it above
-                        if 'neuron_keys' not in name:
-                            grad_issues.append(f"  ⚠ {name}: NO GRADIENT")
-
-                if grad_issues:
-                    print("\n  Other Gradient Issues:")
-                    for issue in grad_issues[:10]:  # Show first 10 issues
-                        print(issue)
-                else:
-                    print("\n  ✓ All other gradients OK")
+                            print(f"    ⚠ WARNING: Gradient too large")
 
             # Gradient clipping with verification
             grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1302,7 +918,7 @@ def evaluate(model, dataloader, device, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Hierarchical Dynamic Neuron FFN')
+    parser = argparse.ArgumentParser(description='Train DAWN (Dynamic Architecture With Neurons)')
 
     # Model architecture
     parser.add_argument('--d_model', type=int, default=512,
@@ -1314,13 +930,11 @@ def main():
     parser.add_argument('--max_seq_len', type=int, default=128,  # CHANGED: 512 → 128 (Scenario B)
                         help='Maximum sequence length')
 
-    # Hierarchical FFN specific
-    parser.add_argument('--n_input_neurons', type=int, default=2048,
+    # DAWN FFN specific
+    parser.add_argument('--n_input', type=int, default=2048,
                         help='Number of input neurons')
-    parser.add_argument('--n_process_neurons', type=int, default=1024,
+    parser.add_argument('--n_process', type=int, default=1024,
                         help='Number of process neurons')
-    parser.add_argument('--d_routing', type=int, default=256,
-                        help='Routing dimension for global router')
 
     # Sparsity control (runtime)
     parser.add_argument('--k_input', type=int, default=None,
@@ -1358,8 +972,8 @@ def main():
 
     # Create directories
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = Path(args.checkpoint_dir) / "three_stage" / timestamp
-    log_dir = Path(args.log_dir) / "three_stage" / timestamp
+    checkpoint_dir = Path(args.checkpoint_dir) / "dawn" / timestamp
+    log_dir = Path(args.log_dir) / "dawn" / timestamp
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1369,7 +983,7 @@ def main():
         json.dump(config, f, indent=2)
 
     print(f"\n{'='*60}")
-    print(f"Hierarchical Dynamic Neuron FFN Training")
+    print(f"DAWN (Dynamic Architecture With Neurons) Training")
     print(f"{'='*60}")
     print(f"\nConfiguration:")
     for key, value in config.items():
@@ -1391,7 +1005,7 @@ def main():
 
     # Create model
     print(f"\n{'='*60}")
-    print("Creating Hierarchical FFN model...")
+    print("Creating DAWN model...")
     print(f"{'='*60}")
 
     model = HierarchicalLanguageModel(
@@ -1400,11 +1014,9 @@ def main():
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         max_seq_len=args.max_seq_len,
-        n_input_neurons=args.n_input_neurons,
-        n_process_neurons=args.n_process_neurons,
-        d_routing=args.d_routing,
-        dropout=args.dropout,
-        gradient_checkpointing=args.gradient_checkpointing
+        n_input=args.n_input,
+        n_process=args.n_process,
+        dropout=args.dropout
     )
 
     model = model.to(device)
@@ -1414,46 +1026,44 @@ def main():
     print(f"\nModel Statistics:")
     print(f"  Total parameters: {stats['total_parameters']:,}")
     print(f"  Trainable parameters: {stats['trainable_parameters']:,}")
-    print(f"  FFN parameters: {stats['ffn_parameters']:,} ({stats['ffn_percentage']:.1f}%)")
-    print(f"  Router parameters: {stats['router_parameters']:,} ({stats['router_percentage']:.1f}%)")
     print(f"  Number of layers: {stats['n_layers']}")
 
     # Sparsity info
     # Start with less aggressive sparsity to verify architecture works
     # Then gradually increase sparsity if training succeeds
     if args.k_input is None:
-        k_input_actual = args.n_input_neurons // 2  # 50% (was 12.5%)
+        k_input_actual = args.n_input // 2  # 50% (was 12.5%)
     else:
         k_input_actual = args.k_input
 
     if args.k_process is None:
-        k_process_actual = args.n_process_neurons  # 100% - no selection (was 12.5%)
+        k_process_actual = args.n_process // 2  # 50%
     else:
         k_process_actual = args.k_process
 
     print(f"\nSparsity Configuration:")
-    print(f"  Input neurons: {k_input_actual}/{args.n_input_neurons} ({k_input_actual/args.n_input_neurons*100:.1f}%)")
-    print(f"  Process neurons: {k_process_actual}/{args.n_process_neurons} ({k_process_actual/args.n_process_neurons*100:.1f}%)")
+    print(f"  Input neurons: {k_input_actual}/{args.n_input} ({k_input_actual/args.n_input*100:.1f}%)")
+    print(f"  Process neurons: {k_process_actual}/{args.n_process} ({k_process_actual/args.n_process*100:.1f}%)")
 
     # Optimizer & Scheduler
-    # Separate parameter groups: Router gets 10x higher LR for faster learning
+    # Separate parameter groups: Router gets higher LR for faster learning
     router_params = []
     other_params = []
 
     for name, param in model.named_parameters():
-        if 'neuron_keys' in name or 'query_net' in name:
+        if 'router' in name or 'affinity_proj' in name:
             router_params.append(param)
         else:
             other_params.append(param)
 
     print(f"\nOptimizer parameter groups:")
-    print(f"  Router params: {len(router_params)} tensors (neuron_keys, query_net)")
+    print(f"  Router params: {len(router_params)} tensors")
     print(f"  Other params: {len(other_params)} tensors")
-    print(f"  Router LR: {args.lr * 10.0:.2e} (10x base)")
+    print(f"  Router LR: {args.lr * 5.0:.2e} (5x base)")
     print(f"  Other LR: {args.lr:.2e}")
 
     optimizer = torch.optim.AdamW([
-        {'params': router_params, 'lr': args.lr * 10.0, 'weight_decay': 0.001},  # 10x LR, less decay
+        {'params': router_params, 'lr': args.lr * 5.0, 'weight_decay': 0.001},  # 5x LR, less decay
         {'params': other_params, 'lr': args.lr, 'weight_decay': 0.01}
     ],
         betas=(0.9, 0.98),
