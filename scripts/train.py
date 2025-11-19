@@ -1158,11 +1158,36 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Create directories
-    checkpoint_dir = Path(args.checkpoint_dir)
-    log_dir = Path(args.log_dir)
+    # Create directories with timestamp for each run
+    base_checkpoint_dir = Path(args.checkpoint_dir)
+    base_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find latest run folder and best checkpoint for auto-resume
+    latest_best_checkpoint = None
+    if not cli_args.resume:
+        # Look for existing run folders
+        run_folders = sorted([
+            d for d in base_checkpoint_dir.iterdir()
+            if d.is_dir() and d.name.startswith('run_')
+        ], reverse=True)
+
+        if run_folders:
+            latest_folder = run_folders[0]
+            best_ckpt = latest_folder / 'best_model.pt'
+            if best_ckpt.exists():
+                latest_best_checkpoint = best_ckpt
+                print(f"\nFound latest checkpoint: {latest_best_checkpoint}")
+
+    # Create new run folder with timestamp and random number
+    import random
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    random_suffix = random.randint(1000, 9999)
+    run_name = f"run_{timestamp}_{random_suffix}"
+    checkpoint_dir = base_checkpoint_dir / run_name
+    log_dir = checkpoint_dir  # Same folder for simplicity
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Run folder: {checkpoint_dir}")
 
     # Save config
     with open(checkpoint_dir / 'config.json', 'w') as f:
@@ -1268,25 +1293,32 @@ def main():
     if args.use_amp:
         print(f"\nUsing Automatic Mixed Precision (AMP)")
 
-    # Resume from checkpoint if specified
+    # Resume from checkpoint if specified or auto-resume from latest best
     start_epoch = 1
+    resume_checkpoint = None
+
     if cli_args.resume:
-        checkpoint_path = Path(cli_args.resume)
-        if checkpoint_path.exists():
-            print(f"\nResuming from checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if 'scheduler_state_dict' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            if 'scaler_state_dict' in checkpoint and scaler is not None:
-                scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            print(f"  Resumed from epoch {start_epoch - 1}")
-            print(f"  Starting from epoch {start_epoch}")
-        else:
-            print(f"\nWarning: Checkpoint not found: {checkpoint_path}")
-            print(f"Starting from scratch...")
+        resume_checkpoint = Path(cli_args.resume)
+    elif latest_best_checkpoint:
+        resume_checkpoint = latest_best_checkpoint
+
+    if resume_checkpoint and resume_checkpoint.exists():
+        print(f"\nResuming from checkpoint: {resume_checkpoint}")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scaler_state_dict' in checkpoint and scaler is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        print(f"  Resumed from epoch {start_epoch - 1}")
+        print(f"  Starting from epoch {start_epoch}")
+    elif cli_args.resume:
+        print(f"\nWarning: Checkpoint not found: {cli_args.resume}")
+        print(f"Starting from scratch...")
+    else:
+        print(f"\nStarting fresh training (no previous checkpoint found)")
 
     # Checkpoint & Monitor
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
@@ -1369,7 +1401,8 @@ def main():
             print(f"  New best model! (val_loss: {best_val_loss:.4f})")
 
         ckpt_manager.save_checkpoint(
-            model, optimizer, epoch, val_loss, metrics, is_best=is_best
+            model, optimizer, epoch, val_loss, metrics, is_best=is_best,
+            scheduler=scheduler, scaler=scaler
         )
 
     print(f"\n{'='*60}")

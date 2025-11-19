@@ -37,7 +37,9 @@ class CheckpointManager:
         epoch: int,
         loss: float,
         metrics: dict,
-        is_best: bool = False
+        is_best: bool = False,
+        scheduler=None,
+        scaler=None
     ) -> str:
         """
         Save checkpoint.
@@ -49,16 +51,14 @@ class CheckpointManager:
             loss: Current loss
             metrics: Training metrics
             is_best: Whether this is the best model so far
+            scheduler: Optional scheduler state
+            scaler: Optional AMP scaler state
 
         Returns:
             Path to saved checkpoint
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"checkpoint_epoch{epoch}_{timestamp}.pt"
-
-        if is_best:
-            filename = f"best_{filename}"
-
+        filename = f"checkpoint_epoch{epoch}.pt"
         checkpoint_path = os.path.join(self.checkpoint_dir, filename)
 
         checkpoint = {
@@ -70,7 +70,18 @@ class CheckpointManager:
             'timestamp': timestamp
         }
 
+        if scheduler is not None:
+            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+        if scaler is not None:
+            checkpoint['scaler_state_dict'] = scaler.state_dict()
+
         torch.save(checkpoint, checkpoint_path)
+
+        # Also save as best_model.pt if this is the best
+        if is_best:
+            best_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
+            torch.save(checkpoint, best_path)
+            print(f"💾 Saved best model: best_model.pt")
 
         # Track checkpoints
         self.checkpoints.append((loss, checkpoint_path))
