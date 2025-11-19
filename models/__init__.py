@@ -4,7 +4,7 @@ DAWN: Dynamic Architecture With Neurons
 Neural network models for DAWN.
 """
 
-from .three_stage_ffn import (
+from .model import (
     DAWNRouter,
     DAWNFFN,
     DAWNTransformerLayer,

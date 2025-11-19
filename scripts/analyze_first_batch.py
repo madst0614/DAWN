@@ -2,7 +2,7 @@
 첫 배치 데이터 분석 스크립트
 
 학습 데이터의 실제 길이, 패딩 비율, 마스킹 패턴을 확인합니다.
-train_three_stage.py의 데이터 로더를 그대로 사용합니다.
+train.py의 데이터 로더를 그대로 사용합니다.
 """
 
 import sys
@@ -19,7 +19,7 @@ from transformers import AutoTokenizer
 import importlib.util
 spec = importlib.util.spec_from_file_location(
     "train_module",
-    PROJECT_ROOT / "scripts" / "train_three_stage.py"
+    PROJECT_ROOT / "scripts" / "train.py"
 )
 train_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(train_module)

@@ -5,10 +5,10 @@ DAWN 모델 학습
 
 Usage:
     # 기본 학습
-    python scripts/train_three_stage.py
+    python scripts/train.py
 
     # 커스텀 설정
-    python scripts/train_three_stage.py \
+    python scripts/train.py \
         --d_model 768 \
         --n_input_neurons 4096 \
         --n_process_neurons 2048 \
@@ -18,10 +18,10 @@ Usage:
         --lr 3e-4
 
     # Mixed precision training
-    python scripts/train_three_stage.py --use_amp
+    python scripts/train.py --use_amp
 
     # Gradient checkpointing (메모리 절약)
-    python scripts/train_three_stage.py --gradient_checkpointing
+    python scripts/train.py --gradient_checkpointing
 """
 
 import sys
@@ -43,7 +43,7 @@ from datetime import datetime
 import time
 import numpy as np
 
-from models.three_stage_ffn import DAWNLanguageModel
+from models.model import DAWNLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import CacheLoader
 
@@ -1358,8 +1358,8 @@ def main():
 
     # Create directories
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = Path(args.checkpoint_dir) / "three_stage" / timestamp
-    log_dir = Path(args.log_dir) / "three_stage" / timestamp
+    checkpoint_dir = Path(args.checkpoint_dir) / "dawn" / timestamp
+    log_dir = Path(args.log_dir) / "dawn" / timestamp
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
