@@ -1109,6 +1109,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train DAWN (Dynamic Architecture With Neurons)')
     parser.add_argument('--config', type=str, default='configs/train_config.yaml',
                         help='Path to config file')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
     cli_args = parser.parse_args()
 
     # Load config
@@ -1266,6 +1268,26 @@ def main():
     if args.use_amp:
         print(f"\nUsing Automatic Mixed Precision (AMP)")
 
+    # Resume from checkpoint if specified
+    start_epoch = 1
+    if cli_args.resume:
+        checkpoint_path = Path(cli_args.resume)
+        if checkpoint_path.exists():
+            print(f"\nResuming from checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if 'scaler_state_dict' in checkpoint and scaler is not None:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            print(f"  Resumed from epoch {start_epoch - 1}")
+            print(f"  Starting from epoch {start_epoch}")
+        else:
+            print(f"\nWarning: Checkpoint not found: {checkpoint_path}")
+            print(f"Starting from scratch...")
+
     # Checkpoint & Monitor
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
     monitor = TrainingMonitor(str(log_dir))
@@ -1292,7 +1314,7 @@ def main():
     print(f"{'='*60}")
     best_val_loss = float('inf')
 
-    for epoch in range(1, args.num_epochs + 1):
+    for epoch in range(start_epoch, args.num_epochs + 1):
         epoch_start = time.time()
 
         # Curriculum learning: adjust k values (dense → sparse)
