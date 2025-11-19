@@ -1,5 +1,5 @@
 """
-SPROUT Utilities
+DAWN Utilities
 
 Data processing and training utilities.
 """
