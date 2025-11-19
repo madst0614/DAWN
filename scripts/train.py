@@ -721,7 +721,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             with torch.amp.autocast('cuda'):
                 outputs = model(
                     input_ids=input_ids,
-                    labels=labels
+                    labels=labels,
+                    k_input=args.k_input,
+                    k_process=args.k_process
                 )
                 loss = outputs['loss']
                 logits = outputs['logits']
@@ -766,7 +768,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         else:
             outputs = model(
                 input_ids=input_ids,
-                labels=labels
+                labels=labels,
+                k_input=args.k_input,
+                k_process=args.k_process
             )
             loss = outputs['loss']
             logits = outputs['logits']
@@ -883,7 +887,9 @@ def evaluate(model, dataloader, device, args):
 
             outputs = model(
                 input_ids=input_ids,
-                labels=labels
+                labels=labels,
+                k_input=args.k_input,
+                k_process=args.k_process
             )
             loss = outputs['loss']
             logits = outputs['logits']
@@ -911,48 +917,59 @@ def evaluate(model, dataloader, device, args):
     return avg_loss, avg_acc
 
 
+def load_config(config_path):
+    """Load config from YAML file"""
+    import yaml
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train DAWN (Dynamic Architecture With Neurons)')
+    parser.add_argument('--config', type=str, default='configs/train_config.yaml',
+                        help='Path to config file')
+    cli_args = parser.parse_args()
 
-    # Model architecture
-    parser.add_argument('--d_model', type=int, default=512,
-                        help='Model dimension')
-    parser.add_argument('--n_heads', type=int, default=8,
-                        help='Number of attention heads')
-    parser.add_argument('--n_layers', type=int, default=6,
-                        help='Number of transformer layers')
-    parser.add_argument('--max_seq_len', type=int, default=128,  # CHANGED: 512 → 128 (Scenario B)
-                        help='Maximum sequence length')
+    # Load config
+    config_path = Path(PROJECT_ROOT) / cli_args.config
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    # DAWN neuron configuration
-    parser.add_argument('--n_input', type=int, default=64,
-                        help='Number of input neurons per layer')
-    parser.add_argument('--n_process', type=int, default=128,
-                        help='Number of process neurons per layer')
+    cfg = load_config(config_path)
+
+    # Create args namespace from config
+    class Args:
+        pass
+    args = Args()
+
+    # Model
+    args.d_model = cfg['model']['d_model']
+    args.n_heads = cfg['model']['n_heads']
+    args.n_layers = cfg['model']['n_layers']
+    args.n_input = cfg['model']['n_input']
+    args.n_process = cfg['model']['n_process']
+    args.max_seq_len = cfg['model']['max_seq_len']
+    args.dropout = cfg['model']['dropout']
+
+    # Sparsity
+    args.k_input = cfg['sparsity']['k_input']
+    args.k_process = cfg['sparsity']['k_process']
 
     # Training
-    parser.add_argument('--batch_size', type=int, default=128,  # CHANGED: 32 → 128 (Scenario B)
-                        help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=30,
-                        help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate')
-    parser.add_argument('--dropout', type=float, default=0.1,
-                        help='Dropout rate')
+    args.batch_size = cfg['training']['batch_size']
+    args.num_epochs = cfg['training']['num_epochs']
+    args.lr = cfg['training']['lr']
+    args.weight_decay = cfg['training']['weight_decay']
+    args.warmup_epochs = cfg['training']['warmup_epochs']
 
-    # Optimization
-    parser.add_argument('--use_amp', action='store_true',
-                        help='Use automatic mixed precision')
-    parser.add_argument('--gradient_checkpointing', action='store_true',
-                        help='Use gradient checkpointing to save memory')
+    # Router
+    args.router_lr_mult = cfg['router']['lr_multiplier']
+    args.router_weight_decay = cfg['router']['weight_decay']
 
-    # Paths
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
-                        help='Checkpoint directory')
-    parser.add_argument('--log_dir', type=str, default='./logs',
-                        help='Log directory')
-
-    args = parser.parse_args()
+    # Other
+    args.use_amp = cfg['use_amp']
+    args.checkpoint_dir = cfg['checkpoint_dir']
+    args.log_dir = cfg['log_dir']
 
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -966,16 +983,17 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Save config
-    config = vars(args)
     with open(checkpoint_dir / 'config.json', 'w') as f:
-        json.dump(config, f, indent=2)
+        json.dump(cfg, f, indent=2)
 
     print(f"\n{'='*60}")
     print(f"DAWN (Dynamic Architecture With Neurons) Training")
     print(f"{'='*60}")
-    print(f"\nConfiguration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
+    print(f"\nConfig file: {config_path}")
+    print(f"\nModel: d_model={args.d_model}, n_heads={args.n_heads}, n_layers={args.n_layers}")
+    print(f"Neurons: n_input={args.n_input}, n_process={args.n_process}")
+    print(f"Sparsity: k_input={args.k_input or 'auto'}, k_process={args.k_process or 'auto'}")
+    print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
     print(f"\n{'='*60}")
@@ -1038,20 +1056,19 @@ def main():
     print(f"\nOptimizer parameter groups:")
     print(f"  Router params: {len(router_params)} tensors")
     print(f"  Other params: {len(other_params)} tensors")
-    print(f"  Router LR: {args.lr * 5.0:.2e} (5x base)")
+    print(f"  Router LR: {args.lr * args.router_lr_mult:.2e} ({args.router_lr_mult}x base)")
     print(f"  Other LR: {args.lr:.2e}")
 
     optimizer = torch.optim.AdamW([
-        {'params': router_params, 'lr': args.lr * 5.0, 'weight_decay': 0.001},  # 5x LR, less decay
-        {'params': other_params, 'lr': args.lr, 'weight_decay': 0.01}
+        {'params': router_params, 'lr': args.lr * args.router_lr_mult, 'weight_decay': args.router_weight_decay},
+        {'params': other_params, 'lr': args.lr, 'weight_decay': args.weight_decay}
     ],
         betas=(0.9, 0.98),
         eps=1e-9
     )
 
     # Warmup + Cosine Annealing scheduler
-    warmup_epochs = 2
-    warmup_steps = warmup_epochs * len(train_loader)
+    warmup_steps = args.warmup_epochs * len(train_loader)
     total_steps = args.num_epochs * len(train_loader)
 
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
