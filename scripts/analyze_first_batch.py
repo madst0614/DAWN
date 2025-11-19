@@ -175,17 +175,22 @@ def analyze_labels(input_ids, labels, tokenizer):
     masked_tokens = total_tokens - valid_tokens
 
     print(f"\nTotal tokens:   {total_tokens:,}")
-    print(f"Valid tokens:   {valid_tokens:,} ({valid_tokens/total_tokens*100:.1f}%)")
-    print(f"Masked (-100):  {masked_tokens:,} ({masked_tokens/total_tokens*100:.1f}%)")
+    print(f"Valid tokens (for training):    {valid_tokens:,} ({valid_tokens/total_tokens*100:.1f}%)")
+    print(f"Ignored tokens (labeled -100):  {masked_tokens:,} ({masked_tokens/total_tokens*100:.1f}%)")
 
-    if masked_tokens / total_tokens > 0.9:
-        print(f"\n🚨 CRITICAL: Over 90% masked! Training will fail!")
-        print(f"   Expected: ~15% for MLM, ~0% for CLM")
-    elif masked_tokens / total_tokens > 0.5:
-        print(f"\n⚠️  WARNING: Over 50% masked! This is abnormal!")
-        print(f"   Expected: ~15% for MLM, ~0% for CLM")
+    valid_ratio = valid_tokens / total_tokens
+
+    # MLM에서는 15% 선택 → 패딩/special tokens 제외 후 약 10-20%가 정상
+    if valid_ratio < 0.05:
+        print(f"\n🚨 CRITICAL: Too few tokens selected ({valid_ratio*100:.1f}%)")
+        print(f"   Expected: 10-20% for MLM (15% of non-padding tokens)")
+    elif valid_ratio > 0.25:
+        print(f"\n⚠️  WARNING: Too many tokens selected ({valid_ratio*100:.1f}%)")
+        print(f"   Expected: 10-20% for MLM (15% of non-padding tokens)")
     else:
-        print(f"\n✅ Masking ratio looks reasonable")
+        print(f"\n✅ MLM masking ratio is correct!")
+        print(f"   {valid_ratio*100:.1f}% ≈ 15% of (total - padding - special tokens)")
+        print(f"   85-90% labeled as -100 (ignored) is NORMAL for MLM")
 
     # 첫 시퀀스 상세 분석
     print(f"\n{'='*70}")
@@ -217,6 +222,50 @@ def analyze_labels(input_ids, labels, tokenizer):
         input_token = seq_input[idx_item].item()
         label_token = seq_labels[idx_item].item()
         print(f"  Pos {idx_item:3d}: input={input_token:5d}, label={label_token:5d}")
+
+    # 전체 배치 80/10/10 분포 분석
+    print(f"\n{'='*70}")
+    print("80/10/10 DISTRIBUTION ANALYSIS (Full Batch)")
+    print("="*70)
+
+    # 전체 배치에서 유효한 토큰들 분석
+    all_valid_mask = labels != -100
+    num_valid = all_valid_mask.sum().item()
+
+    # [MASK] 토큰 카운트
+    mask_token_id = tokenizer.mask_token_id
+    is_mask = (input_ids == mask_token_id) & all_valid_mask
+    num_mask = is_mask.sum().item()
+
+    # Random 토큰 카운트 (input != label, input != [MASK])
+    is_random = (input_ids != labels) & ~is_mask & all_valid_mask
+    num_random = is_random.sum().item()
+
+    # Keep original 카운트 (input == label)
+    is_keep = (input_ids == labels) & all_valid_mask
+    num_keep = is_keep.sum().item()
+
+    print(f"\nTotal valid tokens: {num_valid:,}")
+    print(f"  [MASK] tokens:     {num_mask:5d} ({num_mask/num_valid*100:.1f}%)")
+    print(f"  Random tokens:     {num_random:5d} ({num_random/num_valid*100:.1f}%)")
+    print(f"  Keep original:     {num_keep:5d} ({num_keep/num_valid*100:.1f}%)")
+
+    print(f"\nExpected distribution (BERT standard):")
+    print(f"  [MASK]: 80%, Random: 10%, Keep: 10%")
+
+    # 검증
+    mask_ratio = num_mask / num_valid if num_valid > 0 else 0
+    random_ratio = num_random / num_valid if num_valid > 0 else 0
+    keep_ratio = num_keep / num_valid if num_valid > 0 else 0
+
+    if 0.75 <= mask_ratio <= 0.85 and 0.05 <= random_ratio <= 0.15 and 0.05 <= keep_ratio <= 0.15:
+        print(f"\n✅ Distribution matches BERT standard (80/10/10)!")
+    else:
+        print(f"\n⚠️  Distribution deviates from expected 80/10/10")
+        if mask_ratio < 0.75:
+            print(f"   - Too few [MASK] tokens ({mask_ratio*100:.1f}% < 75%)")
+        if random_ratio < 0.05 or random_ratio > 0.15:
+            print(f"   - Random ratio out of range ({random_ratio*100:.1f}% not in 5-15%)")
 
 
 def main():
@@ -266,8 +315,8 @@ def main():
         train_module.MLM_CONFIG
     )
 
-    # 라벨 분석
-    analyze_labels(input_ids, labels, tokenizer)
+    # 라벨 분석 (FIXED: Use masked input_ids, not original)
+    analyze_labels(input_ids_masked, labels, tokenizer)
 
     print("\n" + "="*70)
     print("ANALYSIS COMPLETE")

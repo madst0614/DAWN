@@ -29,13 +29,15 @@ class GlobalRouter(nn.Module):
         d_model: int = 512,
         n_input_neurons: int = 2048,
         d_routing: int = 256,
-        use_mlp: bool = True
+        use_mlp: bool = True,
+        temperature: float = 2.0  # Lower temperature = smoother routing
     ):
         super().__init__()
 
         self.d_routing = d_routing
         self.n_input = n_input_neurons
         self.use_mlp = use_mlp
+        self.temperature = temperature
 
         if use_mlp:
             self.query_net = nn.Sequential(
@@ -47,17 +49,26 @@ class GlobalRouter(nn.Module):
         else:
             self.query_net = nn.Linear(d_model, d_routing)
 
+        # Initialized with orthogonal in _init_weights()
         self.neuron_keys = nn.Parameter(
-            torch.randn(n_input_neurons, d_routing) * 0.02
+            torch.empty(n_input_neurons, d_routing)
         )
 
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.orthogonal_(self.neuron_keys)
+        """
+        Initialize router weights.
+
+        Uses gain=sqrt(2) for GELU compatibility and Xavier for linear layers.
+        """
+        import math
+        gain = math.sqrt(2.0)
+
+        nn.init.orthogonal_(self.neuron_keys, gain=gain)
         for module in self.query_net.modules():
             if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
+                nn.init.xavier_normal_(module.weight, gain=gain)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
@@ -87,9 +98,9 @@ class GlobalRouter(nn.Module):
         routing_logits = (query @ self.neuron_keys.T) / (self.d_routing ** 0.5)
         # [B, n_input]
 
-        # Soft routing for gradient flow
-        routing_probs = F.softmax(routing_logits / 1.0, dim=-1)
-        # [B, n_input]
+        # Soft routing for gradient flow (with temperature for smoother distribution)
+        routing_probs = F.softmax(routing_logits / self.temperature, dim=-1)
+        # [B, n_input] - Lower temperature = more uniform, Higher = more peaked
 
         # Hard selection (top-k)
         _, input_idx = routing_logits.topk(k_input, dim=-1)
@@ -123,7 +134,8 @@ class HierarchicalDynamicFFN(nn.Module):
         n_input_neurons: int = 2048,
         n_process_neurons: int = 1024,
         d_routing: int = 256,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        temperature: float = 2.0  # Routing temperature
     ):
         super().__init__()
 
@@ -137,20 +149,23 @@ class HierarchicalDynamicFFN(nn.Module):
             d_model=d_model,
             n_input_neurons=n_input_neurons,
             d_routing=d_routing,
-            use_mlp=True
+            use_mlp=True,
+            temperature=temperature
         )
 
         # ===== Phase 2: Input Neurons =====
+        # Initialized with orthogonal in _init_weights()
         self.input_patterns = nn.Parameter(
-            torch.randn(n_input_neurons, d_model) * 0.02
+            torch.empty(n_input_neurons, d_model)
         )
 
         # ===== Phase 3: Process Neurons =====
+        # Initialized with orthogonal in _init_weights()
         self.process_weights = nn.Parameter(
-            torch.randn(n_process_neurons, n_input_neurons) * 0.02
+            torch.empty(n_process_neurons, n_input_neurons)
         )
         self.process_outputs = nn.Parameter(
-            torch.randn(n_process_neurons, d_model) * 0.02
+            torch.empty(n_process_neurons, d_model)
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -163,9 +178,18 @@ class HierarchicalDynamicFFN(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.orthogonal_(self.input_patterns)
-        nn.init.orthogonal_(self.process_weights)
-        nn.init.orthogonal_(self.process_outputs)
+        """
+        Initialize weights with orthogonal initialization.
+
+        Uses gain=sqrt(2) ≈ 1.414 for GELU activation (recommended by Kaiming He).
+        This prevents vanishing signals through the network depth.
+        """
+        import math
+        gain = math.sqrt(2.0)  # For GELU/ReLU-like activations
+
+        nn.init.orthogonal_(self.input_patterns, gain=gain)
+        nn.init.orthogonal_(self.process_weights, gain=gain)
+        nn.init.orthogonal_(self.process_outputs, gain=gain)
 
     def forward(
         self,
@@ -450,7 +474,8 @@ class TransformerLayerWithHierarchicalFFN(nn.Module):
         n_process_neurons: int = 1024,
         d_routing: int = 256,
         dropout: float = 0.1,
-        use_checkpoint: bool = False
+        use_checkpoint: bool = False,
+        temperature: float = 2.0  # Routing temperature
     ):
         super().__init__()
 
@@ -463,7 +488,8 @@ class TransformerLayerWithHierarchicalFFN(nn.Module):
             n_input_neurons=n_input_neurons,
             n_process_neurons=n_process_neurons,
             d_routing=d_routing,
-            dropout=dropout
+            dropout=dropout,
+            temperature=temperature
         )
 
         self.norm1 = nn.LayerNorm(d_model)
@@ -532,7 +558,8 @@ class HierarchicalLanguageModel(nn.Module):
         n_process_neurons: int = 1024,
         d_routing: int = 256,
         dropout: float = 0.1,
-        gradient_checkpointing: bool = False
+        gradient_checkpointing: bool = False,
+        temperature: float = 2.0  # Routing temperature (lower = smoother)
     ):
         super().__init__()
 
@@ -554,7 +581,8 @@ class HierarchicalLanguageModel(nn.Module):
                 n_process_neurons=n_process_neurons,
                 d_routing=d_routing,
                 dropout=dropout,
-                use_checkpoint=gradient_checkpointing
+                use_checkpoint=gradient_checkpointing,
+                temperature=temperature
             )
             for _ in range(n_layers)
         ])

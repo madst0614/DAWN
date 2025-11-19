@@ -68,7 +68,8 @@ def comprehensive_debug(
     loss,
     aux_loss,
     optimizer,
-    debug_first_n_steps: int = 10
+    debug_first_n_steps: int = 10,
+    log_file: str = None
 ):
     """
     종합 디버깅 함수 - 학습이 안 되는 원인을 찾기 위한 완전한 진단
@@ -83,10 +84,22 @@ def comprehensive_debug(
         aux_loss: 스칼라
         optimizer: 옵티마이저
         debug_first_n_steps: 처음 몇 스텝 디버깅할지
+        log_file: 로그 파일 경로
     """
 
     if step > debug_first_n_steps:
         return
+
+    # Redirect all output to file
+    if log_file is None:
+        return  # Skip debug output if no log file specified
+
+    import sys
+    from io import StringIO
+
+    # Capture stdout
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()
 
     print("\n" + "="*70)
     print(f"🔍 COMPREHENSIVE DEBUG - STEP {step}")
@@ -315,6 +328,281 @@ def comprehensive_debug(
 
     print("\n" + "="*70)
     print()
+
+    # Restore stdout and write to file
+    captured = sys.stdout.getvalue()
+    sys.stdout = old_stdout
+
+    if log_file:
+        with open(log_file, 'a') as f:
+            f.write(captured)
+
+
+# ============================================================
+# Deep Learning Analysis Function
+# ============================================================
+
+def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_file=None):
+    """
+    학습 과정의 본질적 정보 추출 - 정보 흐름, gradient 흐름, 라우팅, weight 분포 등 심층 분석
+
+    Args:
+        model: HierarchicalLanguageModel
+        x: Input token IDs [B, S]
+        labels: Labels [B, S]
+        step: Current step
+        debug_first_n_steps: Debug first N steps only
+        log_file: Log file path for redirecting output
+    """
+    if step > debug_first_n_steps:
+        return
+
+    # Redirect all output to file
+    if log_file is None:
+        return  # Skip debug output if no log file specified
+
+    import sys
+    from io import StringIO
+    import torch.nn.functional as F
+    from collections import Counter
+
+    # Capture stdout
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()
+
+    print(f"\n{'='*70}")
+    print(f"🔬 DEEP LEARNING ANALYSIS - Step {step}")
+    print(f"{'='*70}")
+
+    # ============================================================
+    # 1. 정보 흐름 분석 (Information Flow)
+    # ============================================================
+    print("\n📊 1. INFORMATION FLOW ANALYSIS")
+    print("-" * 70)
+
+    with torch.no_grad():
+        # Embedding 출력
+        B, S = x.shape
+        token_emb = model.token_embedding(x)
+        positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
+        pos_emb = model.position_embedding(positions)
+        x_emb = token_emb + pos_emb
+
+        print(f"\n[Embedding Layer]")
+        print(f"  Token emb norm: {token_emb.norm(dim=-1).mean():.4f}")
+        print(f"  Pos emb norm: {pos_emb.norm(dim=-1).mean():.4f}")
+        print(f"  Combined std: {x_emb.std():.4f}")
+        print(f"  Combined range: [{x_emb.min():.4f}, {x_emb.max():.4f}]")
+
+        # 각 레이어별 출력 분석
+        x_layer = x_emb
+        for i, layer in enumerate(model.layers):
+            # Attention block (uses _attention_block method)
+            attn_out = layer._attention_block(x_layer, None)
+            print(f"\n[Layer {i} - Attention]")
+            print(f"  Output norm: {attn_out.norm(dim=-1).mean():.4f}")
+            print(f"  Output std: {attn_out.std():.4f}")
+            print(f"  Signal strength: {attn_out.abs().mean():.4f}")
+
+            x_layer = x_layer + attn_out
+
+            # FFN block (uses _ffn_block method)
+            ffn_out = layer._ffn_block(x_layer, None, None)
+            print(f"\n[Layer {i} - FFN]")
+            print(f"  Output norm: {ffn_out.norm(dim=-1).mean():.4f}")
+            print(f"  Output std: {ffn_out.std():.4f}")
+            print(f"  Signal strength: {ffn_out.abs().mean():.4f}")
+
+            # FFN 내부 분석
+            ffn = layer.ffn
+            ffn_input = layer.norm2(x_layer)  # Get normalized input for analysis
+            with torch.no_grad():
+                # Input neuron activations
+                input_acts = F.gelu(ffn_input @ ffn.input_patterns.T)
+                print(f"  Input neurons:")
+                print(f"    Activation mean: {input_acts.mean():.4f}")
+                print(f"    Activation std: {input_acts.std():.4f}")
+                print(f"    Dead neurons (act < 0.01): {(input_acts.abs() < 0.01).float().mean()*100:.1f}%")
+                print(f"    Active neurons: {(input_acts.abs() > 0.1).float().mean()*100:.1f}%")
+
+            x_layer = x_layer + ffn_out
+
+            print(f"\n[Layer {i} - Residual Output]")
+            print(f"  Output norm: {x_layer.norm(dim=-1).mean():.4f}")
+            print(f"  Output std: {x_layer.std():.4f}")
+
+    # ============================================================
+    # 2. Gradient Flow 분석
+    # ============================================================
+    print(f"\n📈 2. GRADIENT FLOW ANALYSIS")
+    print("-" * 70)
+
+    # Forward pass with gradient tracking
+    model.zero_grad()
+    output = model(x, labels=labels)
+    loss = output['loss']
+    loss.backward()
+
+    print(f"\n[Loss Value]")
+    print(f"  Total loss: {loss.item():.4f}")
+
+    # 각 레이어별 gradient 분석
+    for i, layer in enumerate(model.layers):
+        ffn = layer.ffn
+
+        print(f"\n[Layer {i} - Gradient Magnitudes]")
+
+        # Neuron keys (routing)
+        if ffn.global_router.neuron_keys.grad is not None:
+            grad = ffn.global_router.neuron_keys.grad
+            print(f"  Router neuron_keys:")
+            print(f"    Grad norm: {grad.norm():.6f}")
+            print(f"    Grad mean (abs): {grad.abs().mean():.6f}")
+            print(f"    Grad max: {grad.abs().max():.6f}")
+            print(f"    Non-zero grads: {(grad.abs() > 1e-8).sum()}/{grad.numel()}")
+
+        # Input patterns
+        if ffn.input_patterns.grad is not None:
+            grad = ffn.input_patterns.grad
+            print(f"  Input patterns:")
+            print(f"    Grad norm: {grad.norm():.6f}")
+            print(f"    Grad mean (abs): {grad.abs().mean():.6f}")
+            print(f"    Dead neurons (grad < 1e-6): {(grad.abs().mean(dim=1) < 1e-6).sum()}/{grad.shape[0]}")
+
+        # Process weights
+        if ffn.process_weights.grad is not None:
+            grad = ffn.process_weights.grad
+            print(f"  Process weights:")
+            print(f"    Grad norm: {grad.norm():.6f}")
+            print(f"    Grad mean (abs): {grad.abs().mean():.6f}")
+            print(f"    Dead neurons (grad < 1e-6): {(grad.abs().mean(dim=1) < 1e-6).sum()}/{grad.shape[0]}")
+
+    # ============================================================
+    # 3. 학습 역학 분석 (Learning Dynamics)
+    # ============================================================
+    print(f"\n🎯 3. LEARNING DYNAMICS")
+    print("-" * 70)
+
+    with torch.no_grad():
+        # Routing pattern 변화
+        layer0_ffn = model.layers[0].ffn
+        B, S = x.shape
+        token_emb = model.token_embedding(x)
+        positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
+        pos_emb = model.position_embedding(positions)
+        x_emb = token_emb + pos_emb
+
+        # Get routing info
+        input_idx, routing_weights = layer0_ffn.global_router(x_emb, k_input=1024)
+
+        print(f"\n[Routing Behavior]")
+        print(f"  Selected neurons (first batch, first 10): {input_idx[0, :10].tolist()}")
+        top_weights = routing_weights[0].topk(10)
+        print(f"  Top 10 routing weights: {top_weights.values.tolist()}")
+        print(f"  Top 10 neuron indices: {top_weights.indices.tolist()}")
+
+        # Routing entropy
+        routing_probs = routing_weights[0] / routing_weights[0].sum()
+        entropy = -(routing_probs * torch.log(routing_probs + 1e-8)).sum()
+        max_entropy = torch.log(torch.tensor(float(routing_weights.shape[1])))
+        print(f"  Routing entropy: {entropy:.4f} (max: {max_entropy:.4f})")
+        print(f"  Normalized entropy: {(entropy / max_entropy):.4f}")
+
+        # Logits 분포
+        logits = output['logits']
+        print(f"\n[Logits Distribution]")
+        print(f"  Mean: {logits.mean():.4f}")
+        print(f"  Std: {logits.std():.4f}")
+        print(f"  Max: {logits.max():.4f}")
+        print(f"  Min: {logits.min():.4f}")
+
+        # Softmax 후 확률 분포
+        probs = F.softmax(logits, dim=-1)
+        max_probs, _ = probs.max(dim=-1)
+        print(f"\n[Prediction Confidence]")
+        print(f"  Mean max probability: {max_probs.mean():.4f}")
+        print(f"  Min max probability: {max_probs.min():.4f}")
+        print(f"  Max max probability: {max_probs.max():.4f}")
+
+        # Entropy of predictions
+        entropy_pred = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
+        max_vocab_entropy = torch.log(torch.tensor(float(model.vocab_size)))
+        print(f"\n[Prediction Entropy]")
+        print(f"  Mean entropy: {entropy_pred.mean():.4f}")
+        print(f"  Max possible entropy: {max_vocab_entropy:.4f}")
+        print(f"  Normalized entropy: {(entropy_pred.mean() / max_vocab_entropy):.4f}")
+
+    # ============================================================
+    # 4. Weight 분포 분석
+    # ============================================================
+    print(f"\n⚖️  4. WEIGHT DISTRIBUTION ANALYSIS")
+    print("-" * 70)
+
+    for i, layer in enumerate(model.layers):
+        ffn = layer.ffn
+
+        print(f"\n[Layer {i}]")
+
+        # Input patterns
+        print(f"  Input patterns:")
+        print(f"    Mean: {ffn.input_patterns.mean():.6f}")
+        print(f"    Std: {ffn.input_patterns.std():.6f}")
+        print(f"    Norm: {ffn.input_patterns.norm():.6f}")
+
+        # Process weights
+        print(f"  Process weights:")
+        print(f"    Mean: {ffn.process_weights.mean():.6f}")
+        print(f"    Std: {ffn.process_weights.std():.6f}")
+        print(f"    Norm: {ffn.process_weights.norm():.6f}")
+
+        # Neuron keys
+        print(f"  Neuron keys:")
+        print(f"    Mean: {ffn.global_router.neuron_keys.mean():.6f}")
+        print(f"    Std: {ffn.global_router.neuron_keys.std():.6f}")
+        print(f"    Norm: {ffn.global_router.neuron_keys.norm():.6f}")
+
+    # ============================================================
+    # 5. 학습 진전도 (Learning Progress)
+    # ============================================================
+    print(f"\n📉 5. LEARNING PROGRESS INDICATORS")
+    print("-" * 70)
+
+    with torch.no_grad():
+        # Token prediction diversity
+        _, preds = logits.max(dim=-1)
+        unique_preds = preds.unique().numel()
+        print(f"\n[Prediction Diversity]")
+        print(f"  Unique tokens predicted: {unique_preds}/{model.vocab_size}")
+        print(f"  Diversity ratio: {unique_preds/model.vocab_size*100:.2f}%")
+
+        # Most common predictions
+        pred_counts = Counter(preds.flatten().tolist())
+        top_10_preds = pred_counts.most_common(10)
+        print(f"\n[Top 10 Most Predicted Tokens]")
+        for token, count in top_10_preds:
+            pct = count/preds.numel()*100
+            print(f"    Token {token}: {count} times ({pct:.2f}%)")
+
+        # Label distribution (for comparison)
+        if labels is not None:
+            valid_labels = labels[labels != -100]
+            if valid_labels.numel() > 0:
+                label_counts = Counter(valid_labels.tolist())
+                top_10_labels = label_counts.most_common(10)
+                print(f"\n[Top 10 Most Frequent True Labels]")
+                for token, count in top_10_labels:
+                    pct = count/valid_labels.numel()*100
+                    print(f"    Token {token}: {count} times ({pct:.2f}%)")
+
+    print(f"\n{'='*70}\n")
+
+    # Restore stdout and write to file
+    captured = sys.stdout.getvalue()
+    sys.stdout = old_stdout
+
+    if log_file:
+        with open(log_file, 'a') as f:
+            f.write(captured)
 
 
 # ============================================================
@@ -612,7 +900,7 @@ def print_diagnostic_metrics(model, epoch):
     print(f"{'='*60}\n")
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None):
+def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None, debug_log_file=None):
     """Train for one epoch"""
     model.train()
 
@@ -638,6 +926,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Detailed debugging for first 10 steps of epoch 1
         debug_mode = (epoch == 1 and step < 10)
 
+        # Capture debug output to file
+        debug_output_buffer = None
+        old_stdout = None
+        if debug_mode and debug_log_file:
+            import sys
+            from io import StringIO
+            old_stdout = sys.stdout
+            debug_output_buffer = StringIO()
+            sys.stdout = debug_output_buffer
+
         if debug_mode:
             print(f"\n{'='*60}")
             print(f"Step {step + 1} Debugging")
@@ -658,11 +956,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         optimizer.zero_grad()
 
         # Mixed precision training
-        # Dynamic aux weight: stronger in early epochs
-        if epoch <= 5:
-            aux_weight = 0.5  # Strong regularization initially (was 0.05)
+        # Dynamic aux weight: MUCH stronger to overcome tiny loss values
+        # aux_loss is ~0.0008 due to normalization by n_neurons, so need 100x+ multiplier
+        if epoch <= 3:
+            aux_weight = 100.0  # Very strong routing signal initially
+        elif epoch <= 10:
+            aux_weight = 50.0   # Strong routing signal
         else:
-            aux_weight = 0.1  # Moderate regularization later (was 0.01)
+            aux_weight = 10.0   # Moderate routing signal
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -713,18 +1014,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             scaler.scale(total_loss_combined).backward()
 
-            # 🔥 COMPREHENSIVE DEBUGGING (first 10 steps)
-            comprehensive_debug(
-                step=step + 1,
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                logits=logits,
-                loss=loss,
-                aux_loss=aux_loss,
-                optimizer=optimizer,
-                debug_first_n_steps=10
-            )
+            # Router-specific gradient clipping to prevent vanishing gradients
+            for name, param in model.named_parameters():
+                if param.grad is not None and ('neuron_keys' in name or 'query_net' in name):
+                    # Ensure router gradients stay in reasonable range
+                    param.grad.data.clamp_(-0.01, 0.01)
 
             if debug_mode:
                 print(f"\n[Additional Debug Info - After Backward]")
@@ -835,18 +1129,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             total_loss_combined.backward()
 
-            # 🔥 COMPREHENSIVE DEBUGGING (first 10 steps)
-            comprehensive_debug(
-                step=step + 1,
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                logits=logits,
-                loss=loss,
-                aux_loss=aux_loss,
-                optimizer=optimizer,
-                debug_first_n_steps=10
-            )
+            # Router-specific gradient clipping to prevent vanishing gradients
+            for name, param in model.named_parameters():
+                if param.grad is not None and ('neuron_keys' in name or 'query_net' in name):
+                    # Ensure router gradients stay in reasonable range
+                    param.grad.data.clamp_(-0.01, 0.01)
 
             if debug_mode:
                 print(f"\n[Additional Debug Info - After Backward]")
@@ -947,6 +1234,22 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             "w_aux": f"{(aux_weight * aux_loss).item():.5f}",
             "acc": f"{correct / valid_tokens:.4f}" if valid_tokens > 0 else "0.0000"
         })
+
+        # Log to file every step
+        if log_file:
+            with open(log_file, 'a') as f:
+                acc_val = correct / valid_tokens if valid_tokens > 0 else 0.0
+                f.write(f"epoch={epoch},step={step+1},loss={loss.item():.6f},"
+                       f"aux_loss={aux_loss.item():.6f},weighted_aux={(aux_weight * aux_loss).item():.6f},"
+                       f"acc={acc_val:.6f}\n")
+
+        # Restore stdout and write debug output to file
+        if debug_mode and debug_log_file and old_stdout is not None:
+            captured = debug_output_buffer.getvalue()
+            sys.stdout = old_stdout
+            if captured:
+                with open(debug_log_file, 'a') as f:
+                    f.write(captured)
 
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
@@ -1133,12 +1436,28 @@ def main():
     print(f"  Process neurons: {k_process_actual}/{args.n_process_neurons} ({k_process_actual/args.n_process_neurons*100:.1f}%)")
 
     # Optimizer & Scheduler
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
+    # Separate parameter groups: Router gets 10x higher LR for faster learning
+    router_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if 'neuron_keys' in name or 'query_net' in name:
+            router_params.append(param)
+        else:
+            other_params.append(param)
+
+    print(f"\nOptimizer parameter groups:")
+    print(f"  Router params: {len(router_params)} tensors (neuron_keys, query_net)")
+    print(f"  Other params: {len(other_params)} tensors")
+    print(f"  Router LR: {args.lr * 10.0:.2e} (10x base)")
+    print(f"  Other LR: {args.lr:.2e}")
+
+    optimizer = torch.optim.AdamW([
+        {'params': router_params, 'lr': args.lr * 10.0, 'weight_decay': 0.001},  # 10x LR, less decay
+        {'params': other_params, 'lr': args.lr, 'weight_decay': 0.01}
+    ],
         betas=(0.9, 0.98),
-        eps=1e-9,
-        weight_decay=0.01
+        eps=1e-9
     )
 
     # Warmup + Cosine Annealing scheduler
@@ -1174,9 +1493,25 @@ def main():
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
     monitor = TrainingMonitor(str(log_dir))
 
+    # Training log file (append mode)
+    training_log_file = checkpoint_dir / "training_log.txt"
+    debug_log_file = checkpoint_dir / "debug_log.txt"
+
+    # Write header to training log
+    with open(training_log_file, 'w') as f:
+        f.write("# Training Log\n")
+        f.write("# Format: epoch,step,loss,aux_loss,weighted_aux,acc\n")
+
+    # Write header to debug log
+    with open(debug_log_file, 'w') as f:
+        f.write("# Debug Log\n")
+        f.write("# Contains detailed debugging information for first 10 steps of epoch 1\n\n")
+
     # Training loop
     print(f"\n{'='*60}")
     print(f"Starting training...")
+    print(f"  Training log: {training_log_file}")
+    print(f"  Debug log: {debug_log_file}")
     print(f"{'='*60}")
     best_val_loss = float('inf')
 
@@ -1185,7 +1520,9 @@ def main():
 
         # Train
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, device, epoch, args, scaler, tokenizer
+            model, train_loader, optimizer, scheduler, device, epoch, args, scaler, tokenizer,
+            log_file=str(training_log_file),
+            debug_log_file=str(debug_log_file)
         )
 
         # Evaluate
