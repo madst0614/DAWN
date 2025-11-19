@@ -11,8 +11,8 @@ model:
   d_model: 512
   n_heads: 8
   n_layers: 6
-  n_input: 64          # Input neurons per layer
-  n_process: 128       # Process neurons per layer
+  n_input: 128         # Input neurons per layer
+  n_process: 256       # Process neurons per layer
   max_seq_len: 128
   dropout: 0.1
 
@@ -24,7 +24,7 @@ sparsity:
 # Training
 training:
   batch_size: 128
-  num_epochs: 30
+  num_epochs: 5
   lr: 1e-4
   weight_decay: 0.01
   warmup_epochs: 2
