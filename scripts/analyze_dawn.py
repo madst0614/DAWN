@@ -30,7 +30,7 @@ from tqdm import tqdm
 from collections import Counter, defaultdict
 from datetime import datetime
 
-from models.model import DAWNLanguageModel
+from models.model import HierarchicalLanguageModel
 from utils.training import CheckpointManager
 from utils.data import CacheLoader
 
@@ -90,12 +90,17 @@ def load_data(tokenizer_path="bert-base-uncased", max_length=128, batch_size=64)
 def load_checkpoint(checkpoint_path, device='cuda'):
     """체크포인트에서 모델 로드"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint_dir = Path(checkpoint_path).parent
 
-    # Config 추출
-    if 'config' in checkpoint:
-        config = checkpoint['config']
+    # Config 로드 (config.json 파일에서)
+    config_path = checkpoint_dir / 'config.json'
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        print(f"Loaded config from: {config_path}")
     else:
         # 기본값 사용
+        print("Config file not found, using defaults")
         config = {
             'vocab_size': 30522,
             'd_model': 512,
@@ -108,8 +113,23 @@ def load_checkpoint(checkpoint_path, device='cuda'):
             'dropout': 0.1
         }
 
+    # 가중치 로드
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+
+    # vocab_size를 state_dict에서 추론 (token_embedding.weight shape)
+    if 'vocab_size' not in config:
+        if 'token_embedding.weight' in state_dict:
+            vocab_size = state_dict['token_embedding.weight'].shape[0]
+            config['vocab_size'] = vocab_size
+            print(f"Inferred vocab_size from state_dict: {vocab_size}")
+        else:
+            config['vocab_size'] = 30522  # Default for bert-base-uncased
+
     # 모델 생성
-    model = DAWNLanguageModel(
+    model = HierarchicalLanguageModel(
         vocab_size=config.get('vocab_size', 30522),
         d_model=config.get('d_model', 512),
         n_heads=config.get('n_heads', 8),
@@ -121,14 +141,20 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         dropout=config.get('dropout', 0.1)
     )
 
-    # 가중치 로드
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
+    model.load_state_dict(state_dict)
 
     model = model.to(device)
     model.eval()
+
+    # 체크포인트 정보 출력
+    if 'epoch' in checkpoint:
+        print(f"Checkpoint epoch: {checkpoint['epoch']}")
+    if 'loss' in checkpoint:
+        print(f"Checkpoint loss: {checkpoint['loss']:.4f}")
+    if 'metrics' in checkpoint:
+        metrics = checkpoint['metrics']
+        if 'val_acc' in metrics:
+            print(f"Checkpoint val_acc: {metrics['val_acc']:.4f}")
 
     return model, config
 

@@ -1,15 +1,16 @@
 """
 DAWN: Dynamic Architecture With Neurons
 
-핵심 특징:
-- DAWNRouter: 전역 맥락 기반 동적 뉴런 선택
-- DAWNFFN: Input → Process 2단계 뉴런 구조
-- 완전 병렬화: torch.gather + torch.bmm 활용
+Hierarchical Dynamic Neuron FFN with Global Router
+
+핵심 구조:
+- GlobalRouter: 전역 맥락 기반 동적 뉴런 선택
+- HierarchicalDynamicFFN: Input → Process 2단계 뉴런 구조
 
 최적화:
 - For loop 완전 제거
 - 배치 차원 병렬 처리
-- 5-15배 속도 향상
+- torch.gather + torch.bmm 활용
 """
 
 import torch
@@ -20,12 +21,12 @@ from torch.utils.checkpoint import checkpoint
 
 
 # ============================================================
-# DAWN Router (QKV-based)
+# Global Router (QKV-based) - UNCHANGED
 # ============================================================
 
-class DAWNRouter(nn.Module):
+class GlobalRouter(nn.Module):
     """
-    DAWN 전역 라우터: 시퀀스 전체 맥락 파악하여 입력 뉴런 선택
+    전역 라우터: 시퀀스 전체 맥락 파악하여 입력 뉴런 선택
     """
 
     def __init__(
@@ -122,12 +123,12 @@ class DAWNRouter(nn.Module):
 
 
 # ============================================================
-# DAWN FFN - Optimized (No For Loop!)
+# Hierarchical Dynamic FFN - OPTIMIZED (No For Loop!)
 # ============================================================
 
-class DAWNFFN(nn.Module):
+class HierarchicalDynamicFFN(nn.Module):
     """
-    DAWN FFN: Dynamic Architecture With Neurons - 완전 병렬화 버전
+    계층적 동적 FFN - 완전 병렬화 버전
 
     For loop 제거 → torch.gather + torch.bmm 사용
     """
@@ -148,8 +149,8 @@ class DAWNFFN(nn.Module):
         self.n_process = n_process_neurons
         self.d_routing = d_routing
 
-        # ===== Phase 1: DAWN Router =====
-        self.router = DAWNRouter(
+        # ===== Phase 1: Global Router =====
+        self.global_router = GlobalRouter(
             d_model=d_model,
             n_input_neurons=n_input_neurons,
             d_routing=d_routing,
@@ -218,8 +219,8 @@ class DAWNFFN(nn.Module):
         if k_process is None:
             k_process = self.n_process  # 100%
 
-        # ===== Phase 1: DAWN Router =====
-        input_idx, routing_weights = self.router(x, k_input)
+        # ===== Phase 1: Global Router =====
+        input_idx, routing_weights = self.global_router(x, k_input)
         # input_idx: [B, k_input]
         # routing_weights: [B, n_input]
 
@@ -460,7 +461,7 @@ class DAWNFFN(nn.Module):
 
         with torch.no_grad():
             # Global Router
-            input_idx, routing_weights = self.router(x, k_input)
+            input_idx, routing_weights = self.global_router(x, k_input)
 
             # Input Neurons
             input_acts = F.gelu(x @ self.input_patterns.T)
@@ -513,11 +514,11 @@ class DAWNFFN(nn.Module):
 
 
 # ============================================================
-# DAWN Transformer Layer
+# Transformer Layer - UNCHANGED
 # ============================================================
 
-class DAWNTransformerLayer(nn.Module):
-    """Transformer layer with DAWN FFN"""
+class TransformerLayerWithHierarchicalFFN(nn.Module):
+    """Transformer layer with Hierarchical Dynamic FFN"""
 
     def __init__(
         self,
@@ -536,7 +537,7 @@ class DAWNTransformerLayer(nn.Module):
             d_model, n_heads, dropout=dropout, batch_first=True
         )
 
-        self.ffn = DAWNFFN(
+        self.ffn = HierarchicalDynamicFFN(
             d_model=d_model,
             n_input_neurons=n_input_neurons,
             n_process_neurons=n_process_neurons,
@@ -594,11 +595,11 @@ class DAWNTransformerLayer(nn.Module):
 
 
 # ============================================================
-# DAWN Language Model
+# Language Model - UNCHANGED
 # ============================================================
 
-class DAWNLanguageModel(nn.Module):
-    """Language Model with DAWN (Dynamic Architecture With Neurons)"""
+class HierarchicalLanguageModel(nn.Module):
+    """Language Model with Hierarchical Dynamic Neuron FFN"""
 
     def __init__(
         self,
@@ -627,7 +628,7 @@ class DAWNLanguageModel(nn.Module):
 
         # Transformer Layers
         self.layers = nn.ModuleList([
-            DAWNTransformerLayer(
+            TransformerLayerWithHierarchicalFFN(
                 d_model=d_model,
                 n_heads=n_heads,
                 n_input_neurons=n_input_neurons,
@@ -735,11 +736,11 @@ class DAWNLanguageModel(nn.Module):
 # ============================================================
 
 def benchmark_ffn(device='cuda', n_runs=100):
-    """DAWN FFN 성능 벤치마크"""
+    """FFN 성능 벤치마크"""
     import time
 
     print("=" * 60)
-    print("DAWN FFN Performance Benchmark")
+    print("FFN Performance Benchmark")
     print("=" * 60)
 
     # 설정
@@ -748,7 +749,7 @@ def benchmark_ffn(device='cuda', n_runs=100):
     n_process = 1024
 
     # 모델 생성
-    ffn = DAWNFFN(
+    ffn = HierarchicalDynamicFFN(
         d_model=d_model,
         n_input_neurons=n_input,
         n_process_neurons=n_process
@@ -800,11 +801,11 @@ def benchmark_ffn(device='cuda', n_runs=100):
 # ============================================================
 
 if __name__ == '__main__':
-    print("Testing DAWN (Dynamic Architecture With Neurons)...")
+    print("Testing Optimized Hierarchical Dynamic Neuron FFN...")
     print()
 
     # 모델 생성
-    model = DAWNLanguageModel(
+    model = HierarchicalLanguageModel(
         vocab_size=30000,
         d_model=512,
         n_heads=8,

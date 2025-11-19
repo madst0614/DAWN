@@ -43,7 +43,7 @@ from datetime import datetime
 import time
 import numpy as np
 
-from models.model import DAWNLanguageModel
+from models.model import HierarchicalLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import CacheLoader
 
@@ -347,7 +347,7 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_f
     학습 과정의 본질적 정보 추출 - 정보 흐름, gradient 흐름, 라우팅, weight 분포 등 심층 분석
 
     Args:
-        model: DAWNLanguageModel
+        model: HierarchicalLanguageModel
         x: Input token IDs [B, S]
         labels: Labels [B, S]
         step: Current step
@@ -1394,7 +1394,7 @@ def main():
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    model = DAWNLanguageModel(
+    model = HierarchicalLanguageModel(
         vocab_size=vocab_size,
         d_model=args.d_model,
         n_heads=args.n_heads,

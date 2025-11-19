@@ -5,15 +5,15 @@ Neural network models for DAWN.
 """
 
 from .model import (
-    DAWNRouter,
-    DAWNFFN,
-    DAWNTransformerLayer,
-    DAWNLanguageModel,
+    GlobalRouter,
+    HierarchicalDynamicFFN,
+    TransformerLayerWithHierarchicalFFN,
+    HierarchicalLanguageModel,
 )
 
 __all__ = [
-    "DAWNRouter",
-    "DAWNFFN",
-    "DAWNTransformerLayer",
-    "DAWNLanguageModel",
+    "GlobalRouter",
+    "HierarchicalDynamicFFN",
+    "TransformerLayerWithHierarchicalFFN",
+    "HierarchicalLanguageModel",
 ]
