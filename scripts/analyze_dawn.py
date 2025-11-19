@@ -31,27 +31,35 @@ from datetime import datetime
 
 from models.model import HierarchicalLanguageModel
 from utils.training import CheckpointManager
-from utils.data import CacheLoader
 
 
 # ============================================================
 # Data Loading
 # ============================================================
 
-def load_data(tokenizer_path="bert-base-uncased", max_length=128, batch_size=64):
-    """데이터 로드"""
+def load_data_from_config(config_path, batch_size=64):
+    """Config에서 데이터 로드"""
+    import yaml
+    import pickle
     from transformers import AutoTokenizer
     from torch.utils.data import DataLoader, Dataset
-    from functools import partial
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    # Load config
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
 
-    # Load cached texts
-    train_texts = CacheLoader.load_train_texts(dataset="wikitext")
-    val_texts = CacheLoader.load_validation_texts(dataset="wikitext")
+    data_cfg = cfg['data']
+    model_cfg = cfg['model']
 
-    if train_texts is None or val_texts is None:
-        raise ValueError("Cached data not found!")
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    # Load validation texts
+    val_path = os.path.join(data_cfg['base_dir'], data_cfg['val_file'])
+    if not os.path.exists(val_path):
+        raise FileNotFoundError(f"Validation data not found: {val_path}")
+
+    with open(val_path, 'rb') as f:
+        val_texts = pickle.load(f)
 
     # Simple dataset
     class TextDataset(Dataset):
@@ -76,10 +84,10 @@ def load_data(tokenizer_path="bert-base-uncased", max_length=128, batch_size=64)
                 'attention_mask': encoding['attention_mask'].squeeze(0)
             }
 
-    val_dataset = TextDataset(val_texts, tokenizer, max_length)
+    val_dataset = TextDataset(val_texts, tokenizer, model_cfg['max_seq_len'])
     val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=2)
 
-    return val_loader, tokenizer
+    return val_loader, tokenizer, cfg
 
 
 # ============================================================
@@ -101,14 +109,15 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         # 기본값 사용
         print("Config file not found, using defaults")
         config = {
-            'vocab_size': 30522,
-            'd_model': 512,
-            'n_heads': 8,
-            'n_layers': 6,
-            'max_seq_len': 128,
-            'n_input': 2048,
-            'n_process': 1024,
-            'dropout': 0.1
+            'model': {
+                'd_model': 512,
+                'n_heads': 8,
+                'n_layers': 6,
+                'max_seq_len': 128,
+                'n_input': 128,
+                'n_process': 256,
+                'dropout': 0.1
+            }
         }
 
     # 가중치 로드
@@ -118,24 +127,28 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         state_dict = checkpoint
 
     # vocab_size를 state_dict에서 추론 (token_embedding.weight shape)
-    if 'vocab_size' not in config:
-        if 'token_embedding.weight' in state_dict:
-            vocab_size = state_dict['token_embedding.weight'].shape[0]
-            config['vocab_size'] = vocab_size
-            print(f"Inferred vocab_size from state_dict: {vocab_size}")
-        else:
-            config['vocab_size'] = 30522  # Default for bert-base-uncased
+    vocab_size = 30522  # Default for bert-base-uncased
+    if 'token_embedding.weight' in state_dict:
+        vocab_size = state_dict['token_embedding.weight'].shape[0]
+        print(f"Inferred vocab_size from state_dict: {vocab_size}")
+
+    # config가 새 형식인지 확인
+    if 'model' in config:
+        model_cfg = config['model']
+    else:
+        # 구 형식 호환
+        model_cfg = config
 
     # 모델 생성
     model = HierarchicalLanguageModel(
-        vocab_size=config.get('vocab_size', 30522),
-        d_model=config.get('d_model', 512),
-        n_heads=config.get('n_heads', 8),
-        n_layers=config.get('n_layers', 6),
-        max_seq_len=config.get('max_seq_len', 128),
-        n_input=config.get('n_input', config.get('n_input_neurons', 2048)),
-        n_process=config.get('n_process', config.get('n_process_neurons', 1024)),
-        dropout=config.get('dropout', 0.1)
+        vocab_size=vocab_size,
+        d_model=model_cfg.get('d_model', 512),
+        n_heads=model_cfg.get('n_heads', 8),
+        n_layers=model_cfg.get('n_layers', 6),
+        max_seq_len=model_cfg.get('max_seq_len', 128),
+        n_input=model_cfg.get('n_input', 128),
+        n_process=model_cfg.get('n_process', 256),
+        dropout=model_cfg.get('dropout', 0.1)
     )
 
     model.load_state_dict(state_dict)
@@ -414,12 +427,12 @@ def main():
 
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
+    parser.add_argument('--config', type=str, default='configs/train_config.yaml',
+                        help='Path to config file for data loading')
     parser.add_argument('--output', type=str, default=None,
                         help='Output JSON file path')
     parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size for analysis')
-    parser.add_argument('--max_length', type=int, default=128,
-                        help='Maximum sequence length')
 
     args = parser.parse_args()
 
@@ -432,10 +445,11 @@ def main():
     model, config = load_checkpoint(args.checkpoint, device)
     print(f"Model loaded successfully!")
 
-    # Load data
-    print(f"\nLoading validation data...")
-    val_loader, tokenizer = load_data(
-        max_length=args.max_length,
+    # Load data from config
+    config_path = Path(PROJECT_ROOT) / args.config
+    print(f"\nLoading validation data from config: {config_path}")
+    val_loader, tokenizer, _ = load_data_from_config(
+        config_path=config_path,
         batch_size=args.batch_size
     )
     print(f"Loaded {len(val_loader)} batches")
