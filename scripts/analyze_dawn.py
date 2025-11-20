@@ -31,6 +31,7 @@ from datetime import datetime
 
 from models.model import HierarchicalLanguageModel
 from utils.training import CheckpointManager
+from utils.data import apply_mlm_masking, compute_mlm_accuracy
 
 
 # ============================================================
@@ -415,8 +416,8 @@ def analyze_layer_differences(model, val_loader, device):
     return results
 
 
-def analyze_performance(model, val_loader, device):
-    """성능 세부 분석"""
+def analyze_performance(model, val_loader, tokenizer, device):
+    """성능 세부 분석 - MLM masking 적용"""
     print("\n🎯 Analyzing Performance...")
 
     all_losses = []
@@ -424,25 +425,35 @@ def analyze_performance(model, val_loader, device):
 
     for batch in tqdm(val_loader, desc="Performance analysis"):
         input_ids = batch['input_ids'].to(device)
-        labels = input_ids.clone()
+
+        # Apply MLM masking (CRITICAL FIX: 기존에는 labels = input_ids.clone()으로 순환 논리 발생)
+        masked_input_ids, labels = apply_mlm_masking(input_ids.clone(), tokenizer)
 
         with torch.no_grad():
-            outputs = model(input_ids, labels=labels)
+            outputs = model(masked_input_ids, labels=labels)
             logits = outputs['logits']
 
-            # Per-token loss
+            # Per-token loss (only on masked tokens)
             loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
             per_token_loss = loss_fct(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1)
             )
 
-            # Accuracy
-            preds = logits.argmax(dim=-1)
-            correct = (preds == labels).float()
+            # Accuracy using unified function
+            num_correct, num_valid = compute_mlm_accuracy(logits, labels)
 
-            all_losses.extend(per_token_loss.cpu().tolist())
-            all_corrects.extend(correct.view(-1).cpu().tolist())
+            # Collect per-token data (only valid tokens)
+            valid_mask = (labels.view(-1) != -100)
+            valid_losses = per_token_loss[valid_mask].cpu().tolist()
+
+            # Get per-token correctness for valid tokens only
+            preds = logits.argmax(dim=-1)
+            correct = ((preds == labels) & (labels != -100)).view(-1)
+            valid_corrects = correct[valid_mask].float().cpu().tolist()
+
+            all_losses.extend(valid_losses)
+            all_corrects.extend(valid_corrects)
 
     losses = np.array(all_losses)
     corrects = np.array(all_corrects)
@@ -463,7 +474,8 @@ def analyze_performance(model, val_loader, device):
             'p25': float(easy_threshold),
             'p50': float(np.percentile(losses, 50)),
             'p75': float(hard_threshold)
-        }
+        },
+        'total_valid_tokens': len(losses)
     }
 
     return results
@@ -567,7 +579,7 @@ def comprehensive_analysis(model, val_loader, tokenizer, device):
               f"std={stats['avg_std']:.4f}")
 
     # 5. Performance
-    perf_results = analyze_performance(model, val_loader, device)
+    perf_results = analyze_performance(model, val_loader, tokenizer, device)
     results['performance'] = perf_results
 
     print("\n🎯 PERFORMANCE BREAKDOWN")

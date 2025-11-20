@@ -31,7 +31,7 @@ import math
 
 from models.model import HierarchicalLanguageModel, debug_logger
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
-from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data
+from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
 
 # ============================================================

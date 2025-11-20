@@ -586,3 +586,66 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
     )
 
     return train_loader, val_loader, tokenizer
+
+
+# ============================================================
+# MLM Accuracy Calculation
+# ============================================================
+
+def compute_mlm_accuracy(logits, labels):
+    """
+    Compute accuracy for MLM task (only on masked tokens).
+
+    Args:
+        logits: Model output logits [B, S, V]
+        labels: Labels with -100 for non-masked tokens [B, S]
+
+    Returns:
+        Tuple of (num_correct, num_valid_tokens)
+    """
+    predictions = logits.argmax(dim=-1)  # [B, S]
+
+    # Only count tokens that are not masked (-100)
+    valid_mask = (labels != -100)  # [B, S]
+    correct_predictions = (predictions == labels) & valid_mask
+
+    num_correct = correct_predictions.sum().item()
+    num_valid = valid_mask.sum().item()
+
+    return num_correct, num_valid
+
+
+def evaluate_mlm_batch(model, input_ids, tokenizer, device, config=None):
+    """
+    Evaluate a single batch with MLM masking.
+
+    Args:
+        model: The model to evaluate
+        input_ids: Input token IDs [B, S]
+        tokenizer: Tokenizer for masking
+        device: Device to use
+        config: MLM config (optional)
+
+    Returns:
+        Dict with loss, correct, valid_tokens
+    """
+    # Apply MLM masking
+    masked_input_ids, labels = apply_mlm_masking(input_ids.clone(), tokenizer, config)
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=masked_input_ids,
+            labels=labels
+        )
+        loss = outputs['loss']
+        logits = outputs['logits']
+
+        num_correct, num_valid = compute_mlm_accuracy(logits, labels)
+
+    return {
+        'loss': loss.item(),
+        'correct': num_correct,
+        'valid_tokens': num_valid,
+        'logits': logits,
+        'labels': labels
+    }
