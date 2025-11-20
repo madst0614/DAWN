@@ -16,19 +16,6 @@ model:
   max_seq_len: 128
   dropout: 0.1
 
-# ============================================================
-# Sparsity - FULLY LEARNABLE! (Zero manual intervention)
-# ============================================================
-sparsity:
-  k_input: null        # null = MODEL DECIDES automatically
-  k_process: null      # null = MODEL DECIDES automatically
-
-  # Learned sparsity guidance (soft constraints)
-  guidance:
-    min_ratio: 0.2     # Don't go below 20% (maintain capacity)
-    max_ratio: 0.8     # Don't go above 80% (ensure specialization)
-    prefer_moderate: true  # Soft penalty for extremes (Gini 0.2-0.6)
-
 # Training
 training:
   batch_size: 128
@@ -37,27 +24,17 @@ training:
   weight_decay: 0.01
   warmup_epochs: 2
 
-# ============================================================
-# Router - FULLY LEARNABLE! (Zero manual intervention)
-# ============================================================
+# Router (learned parameters: temperature, threshold, steepness)
 router:
   lr_multiplier: 5.0   # Router LR = lr * multiplier
-  weight_decay: 0.0    # No weight decay for router (learns k_ratio, temperature)
-  # REMOVED: temperature - now a LEARNED parameter!
-  # REMOVED: curriculum - model decides k automatically!
+  weight_decay: 0.0    # No weight decay for learned sparsity params
 
-# Auxiliary loss
+# Auxiliary loss weights
 aux_loss_weight: 0.01
-aux_loss_weights:
-  entropy: 0.01        # Diversity
-  usage: 0.01          # Uniform usage
-  variance: 0.001      # Meaningful weights
-  load_balance: 0.01   # Cross-batch balance
-  sparsity_guidance: 0.005  # NEW: Guide learned sparsity (very small)
 
 # Mixed precision
 use_amp: true
 
-# Paths (체크포인트와 로그를 같은 폴더에 저장)
+# Paths
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints
 log_dir: /content/drive/MyDrive/dawn/checkpoints
