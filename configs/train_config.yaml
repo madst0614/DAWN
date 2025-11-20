@@ -16,11 +16,6 @@ model:
   max_seq_len: 128
   dropout: 0.1
 
-# Sparsity (active neurons)
-sparsity:
-  k_input: null        # null = n_input // 2
-  k_process: null      # null = n_process // 2
-
 # Training
 training:
   batch_size: 128
@@ -29,23 +24,17 @@ training:
   weight_decay: 0.01
   warmup_epochs: 2
 
-# Router specific
+# Router (learned parameters: temperature, threshold, steepness)
 router:
   lr_multiplier: 5.0   # Router LR = lr * multiplier
-  weight_decay: 0.001
-  temperature: 2.0     # Fixed high for exploration
+  weight_decay: 0.0    # No weight decay for learned sparsity params
 
-# Auxiliary loss
+# Auxiliary loss weights
 aux_loss_weight: 0.01
-aux_loss_weights:
-  entropy: 0.01        # Diversity
-  usage: 0.01          # Uniform usage
-  variance: 0.001      # Meaningful weights
-  load_balance: 0.01   # Cross-batch balance
 
 # Mixed precision
 use_amp: true
 
-# Paths (체크포인트와 로그를 같은 폴더에 저장)
+# Paths
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints
 log_dir: /content/drive/MyDrive/dawn/checkpoints

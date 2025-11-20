@@ -35,124 +35,6 @@ from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dy
 
 
 # ============================================================
-# Routing Auxiliary Loss Functions
-# ============================================================
-
-def compute_routing_aux_loss(
-    weights: torch.Tensor,
-    indices: torch.Tensor,
-    n_neurons: int
-) -> dict:
-    """
-    Compute auxiliary losses for routing.
-
-    Args:
-        weights: Routing weights [batch, n_neurons]
-        indices: Selected indices [batch, k]
-        n_neurons: Total number of neurons
-
-    Returns:
-        Dictionary of auxiliary losses
-    """
-    batch_size = weights.shape[0]
-
-    # 1. Entropy loss (encourage diversity)
-    # Normalized to [0, 1]: 0 = max entropy (good), 1 = min entropy (bad)
-    entropy = -(weights * torch.log(weights + 1e-10)).sum(dim=-1).mean()
-    max_entropy = math.log(n_neurons)
-    entropy_loss = 1.0 - (entropy / max_entropy)  # Low = good diversity
-
-    # 2. Usage loss (encourage all neurons to be used)
-    # Average usage across batch
-    avg_usage = weights.mean(dim=0)  # [n_neurons]
-
-    # Coefficient of variation (std / mean)
-    usage_std = avg_usage.std()
-    usage_mean = avg_usage.mean()
-    cv = usage_std / (usage_mean + 1e-8)
-
-    # We want low coefficient of variation (uniform usage)
-    usage_loss = cv
-
-    # 3. Weight variance loss (within selected neurons)
-    # Encourage selected neurons to have meaningful weights
-    selected_weights = torch.gather(weights, 1, indices)
-    weight_variance = selected_weights.var(dim=-1).mean()
-    # Normalize: high variance is good, so invert
-    # Approximate max variance for k selected from uniform is ~0.25
-    variance_loss = torch.clamp(0.25 - weight_variance, min=0.0) / 0.25  # [0, 1]
-
-    # 4. Load balance loss (across batches)
-    # Count how many times each neuron is selected
-    neuron_usage = torch.zeros(n_neurons, device=weights.device)
-    neuron_usage.scatter_add_(
-        0,
-        indices.flatten(),
-        torch.ones_like(indices.flatten(), dtype=torch.float32)
-    )
-
-    # Normalize by batch size and k
-    neuron_usage = neuron_usage / (batch_size * indices.shape[1])
-
-    # Gini coefficient (0 = perfect equality, 1 = perfect inequality)
-    sorted_usage, _ = torch.sort(neuron_usage)
-    n = len(sorted_usage)
-    index = torch.arange(1, n + 1, device=weights.device, dtype=torch.float32)
-    gini = (2 * (index * sorted_usage).sum()) / (n * sorted_usage.sum() + 1e-8) - (n + 1) / n
-
-    load_balance_loss = gini
-
-    return {
-        'entropy': entropy_loss,
-        'usage': usage_loss,
-        'variance': variance_loss,
-        'load_balance': load_balance_loss,
-        'gini': gini.detach(),  # For monitoring
-    }
-
-
-def aggregate_aux_losses(
-    aux_losses_list: list,
-    weights: dict = None
-) -> tuple:
-    """
-    Aggregate auxiliary losses from all layers.
-
-    Args:
-        aux_losses_list: List of aux loss dicts from each layer
-        weights: Weights for each loss component
-
-    Returns:
-        total_aux_loss: Weighted sum
-        aux_metrics: Individual loss values (for logging)
-    """
-    if weights is None:
-        weights = {
-            'entropy': 0.01,      # Diversity
-            'usage': 0.01,        # Uniform usage
-            'variance': 0.001,    # Meaningful weights
-            'load_balance': 0.01, # Cross-batch balance
-        }
-
-    # Aggregate across layers
-    total_aux = 0.0
-    aux_metrics = {}
-
-    for key in ['entropy', 'usage', 'variance', 'load_balance']:
-        values = [aux[key] for aux in aux_losses_list]
-        mean_value = sum(values) / len(values)
-
-        total_aux = total_aux + weights[key] * mean_value
-        aux_metrics[key] = mean_value.item()
-
-    # Add Gini for monitoring
-    gini_values = [aux['gini'] for aux in aux_losses_list]
-    aux_metrics['gini'] = (sum(gini_values) / len(gini_values)).item()
-
-    return total_aux, aux_metrics
-
-
-# ============================================================
 # Comprehensive Debugging Function
 # ============================================================
 
@@ -523,53 +405,6 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_f
 # Training Functions
 # ============================================================
 
-def get_curriculum_k_values(epoch, total_epochs, n_input, n_process):
-    """
-    Curriculum learning: Dense → Sparse scheduling.
-
-    Args:
-        epoch: Current epoch (1-indexed)
-        total_epochs: Total number of epochs
-        n_input: Total input neurons
-        n_process: Total process neurons
-
-    Returns:
-        k_input, k_process for this epoch
-    """
-    # Cosine schedule: start dense (75%), end sparse (25%)
-    progress = (epoch - 1) / max(total_epochs - 1, 1)
-    sparsity = 0.5 * (1 + math.cos(math.pi * progress))
-
-    k_input = int(n_input * (0.25 + 0.5 * sparsity))
-    k_process = int(n_process * (0.25 + 0.5 * sparsity))
-
-    return k_input, k_process
-
-
-def update_temperature(model, epoch, total_epochs):
-    """
-    Temperature annealing: high (explore) → low (exploit).
-
-    Args:
-        model: DAWN model
-        epoch: Current epoch (1-indexed)
-        total_epochs: Total number of epochs
-    """
-    progress = (epoch - 1) / max(total_epochs - 1, 1)
-    # Start: 2.0 (explore), End: 1.0 (mild exploit) - keep higher for diversity
-    temperature = 2.0 * (1 - progress) + 1.0 * progress
-
-    for layer in model.layers:
-        layer.block.router.temperature.fill_(temperature)
-
-    return temperature
-
-
-def reset_routing_stats(model):
-    """Placeholder - new architecture doesn't track routing stats."""
-    pass
-
-
 def print_diagnostic_metrics(model, epoch):
     """
     학습 진단 메트릭 출력 (simplified for new DAWN architecture)
@@ -696,40 +531,42 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 outputs = model(
                     input_ids=input_ids,
                     labels=labels,
-                    k_input=args.k_input,
-                    k_process=args.k_process,
                     return_routing_info=True
                 )
                 loss = outputs['loss']
                 logits = outputs['logits']
 
-                # Compute new aux losses from routing info
+                # Use model's built-in aux losses (from DAWNBlock)
+                model_aux = outputs['aux_loss']
+                aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+
+                # Compute Gini from soft weights for monitoring
                 if 'routing_info' in outputs:
-                    aux_losses_list = []
                     layer_ginis = []
                     for layer_info in outputs['routing_info']:
-                        layer_aux = compute_routing_aux_loss(
-                            weights=layer_info['weights'],
-                            indices=layer_info['indices'],
-                            n_neurons=args.n_input
-                        )
-                        aux_losses_list.append(layer_aux)
-                        layer_ginis.append(layer_aux['gini'].item())
-
-                    aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
-                    gini = aux_metrics.get('gini', 0.0)
+                        weights = layer_info['weights']
+                        # Compute Gini coefficient from soft weights
+                        avg_weights = weights.mean(dim=0)
+                        sorted_weights, _ = torch.sort(avg_weights)
+                        n = len(sorted_weights)
+                        index = torch.arange(1, n + 1, device=weights.device, dtype=torch.float32)
+                        gini = (2 * (index * sorted_weights).sum()) / (n * sorted_weights.sum() + 1e-8) - (n + 1) / n
+                        layer_ginis.append(gini.item())
 
                     # Accumulate per-layer Gini
                     for i, lg in enumerate(layer_ginis):
                         layer_gini_totals[i] += lg
+
+                    gini = sum(layer_ginis) / len(layer_ginis)
                 else:
-                    # Fallback to legacy aux loss
-                    model_aux = outputs['aux_loss']
-                    aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
                     gini = 0.0
                     layer_ginis = [0.0] * n_layers
 
-                total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss
+                # NEW: Add learned sparsity guidance from model
+                sparsity_guidance = outputs.get('aux_loss', {}).get('sparsity_guidance', 0.0)
+                sparsity_weight = 0.05  # STRONG guidance for pure soft selection
+
+                total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss + sparsity_weight * sparsity_guidance
 
             # NaN/Inf detection - STOP immediately
             if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
@@ -795,40 +632,42 @@ Router weights check:
             outputs = model(
                 input_ids=input_ids,
                 labels=labels,
-                k_input=args.k_input,
-                k_process=args.k_process,
                 return_routing_info=True
             )
             loss = outputs['loss']
             logits = outputs['logits']
 
-            # Compute new aux losses from routing info
+            # Use model's built-in aux losses (from DAWNBlock)
+            model_aux = outputs['aux_loss']
+            aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+
+            # Compute Gini from soft weights for monitoring
             if 'routing_info' in outputs:
-                aux_losses_list = []
                 layer_ginis = []
                 for layer_info in outputs['routing_info']:
-                    layer_aux = compute_routing_aux_loss(
-                        weights=layer_info['weights'],
-                        indices=layer_info['indices'],
-                        n_neurons=args.n_input
-                    )
-                    aux_losses_list.append(layer_aux)
-                    layer_ginis.append(layer_aux['gini'].item())
-
-                aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
-                gini = aux_metrics.get('gini', 0.0)
+                    weights = layer_info['weights']
+                    # Compute Gini coefficient from soft weights
+                    avg_weights = weights.mean(dim=0)
+                    sorted_weights, _ = torch.sort(avg_weights)
+                    n = len(sorted_weights)
+                    index = torch.arange(1, n + 1, device=weights.device, dtype=torch.float32)
+                    gini = (2 * (index * sorted_weights).sum()) / (n * sorted_weights.sum() + 1e-8) - (n + 1) / n
+                    layer_ginis.append(gini.item())
 
                 # Accumulate per-layer Gini
                 for i, lg in enumerate(layer_ginis):
                     layer_gini_totals[i] += lg
+
+                gini = sum(layer_ginis) / len(layer_ginis)
             else:
-                # Fallback to legacy aux loss
-                model_aux = outputs['aux_loss']
-                aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
                 gini = 0.0
                 layer_ginis = [0.0] * n_layers
 
-            total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss
+            # NEW: Add learned sparsity guidance from model
+            sparsity_guidance = outputs.get('aux_loss', {}).get('sparsity_guidance', 0.0)
+            sparsity_weight = 0.05  # STRONG guidance for pure soft selection
+
+            total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss + sparsity_weight * sparsity_guidance
 
             # NaN/Inf detection - STOP immediately
             if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
@@ -962,10 +801,44 @@ Router weights check:
             # Format layer gini as comma-separated
             layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
 
+            # NEW: Collect learned parameters from each layer
+            learned_thresholds = []
+            learned_temps = []
+            learned_steepnesses = []
+            effective_ks = []
+            effective_k_ratios = []
+
+            # Get from routing info if available
+            if 'routing_info' in outputs:
+                for layer_info in outputs['routing_info']:
+                    learned_thresholds.append(layer_info.get('learned_threshold', 0.5))
+                    learned_temps.append(layer_info.get('learned_temp', 1.0))
+                    learned_steepnesses.append(layer_info.get('learned_steepness', 3.0))
+                    effective_ks.append(layer_info.get('effective_k', 64))
+                    effective_k_ratios.append(layer_info.get('effective_k_ratio', 0.5))
+            else:
+                # Fallback: get from router directly
+                for layer in model.layers:
+                    router = layer.block.router
+                    learned_thresholds.append(router.get_threshold().item())
+                    learned_temps.append(router.get_temperature().item())
+                    learned_steepnesses.append(router.get_steepness().item())
+                    effective_ks.append(64)  # Default
+                    effective_k_ratios.append(0.5)  # Default
+
+            threshold_str = ",".join([f"{t:.3f}" for t in learned_thresholds])
+            temp_str = ",".join([f"{t:.2f}" for t in learned_temps])
+            steep_str = ",".join([f"{s:.2f}" for s in learned_steepnesses])
+            eff_k_str = ",".join([f"{k:.1f}" for k in effective_ks])
+            eff_k_ratio_str = ",".join([f"{r:.3f}" for r in effective_k_ratios])
+
             with open(log_file, 'a') as f:
                 f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
                        f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
-                       f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}]\n")
+                       f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}],"
+                       f"learned_threshold=[{threshold_str}],learned_steepness=[{steep_str}],"
+                       f"effective_k=[{eff_k_str}],effective_k_ratio=[{eff_k_ratio_str}],"
+                       f"learned_temp=[{temp_str}]\n")
 
             # Reset window accumulators
             window_loss = 0.0
@@ -993,10 +866,26 @@ Router weights check:
         avg_window_layer_gini = [g / window_count for g in window_layer_gini]
         layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
 
+        # NEW: Collect learned parameters from each layer
+        learned_thresholds = []
+        learned_temps = []
+        learned_steepnesses = []
+        for layer in model.layers:
+            router = layer.block.router
+            learned_thresholds.append(router.get_threshold().item())
+            learned_temps.append(router.get_temperature().item())
+            learned_steepnesses.append(router.get_steepness().item())
+
+        threshold_str = ",".join([f"{t:.3f}" for t in learned_thresholds])
+        temp_str = ",".join([f"{t:.2f}" for t in learned_temps])
+        steep_str = ",".join([f"{s:.2f}" for s in learned_steepnesses])
+
         with open(log_file, 'a') as f:
             f.write(f"epoch={epoch},step={num_batches},loss={avg_window_loss:.6f},"
                    f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
-                   f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}]\n")
+                   f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}],"
+                   f"learned_threshold=[{threshold_str}],learned_steepness=[{steep_str}],"
+                   f"learned_temp=[{temp_str}]\n")
 
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
@@ -1037,9 +926,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
             outputs = model(
                 input_ids=masked_input_ids,
-                labels=labels,
-                k_input=args.k_input,
-                k_process=args.k_process
+                labels=labels
             )
             loss = outputs['loss']
             logits = outputs['logits']
@@ -1105,10 +992,6 @@ def main():
     args.max_seq_len = cfg['model']['max_seq_len']
     args.dropout = cfg['model']['dropout']
 
-    # Sparsity
-    args.k_input = cfg['sparsity']['k_input']
-    args.k_process = cfg['sparsity']['k_process']
-
     # Training
     args.batch_size = cfg['training']['batch_size']
     args.num_epochs = cfg['training']['num_epochs']
@@ -1171,8 +1054,7 @@ def main():
     print(f"{'='*60}")
     print(f"\nConfig file: {config_path}")
     print(f"\nModel: d_model={args.d_model}, n_heads={args.n_heads}, n_layers={args.n_layers}")
-    print(f"Neurons: n_input={args.n_input}, n_process={args.n_process}")
-    print(f"Sparsity: k_input={args.k_input or 'auto'}, k_process={args.k_process or 'auto'}")
+    print(f"Neurons: n_input={args.n_input}, n_process={args.n_process} (learned sparsity)")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -1204,14 +1086,6 @@ def main():
     print(f"  Total parameters: {stats['total_parameters']:,}")
     print(f"  Trainable parameters: {stats['trainable_parameters']:,}")
     print(f"  Number of layers: {stats['n_layers']}")
-
-    # Sparsity info (DAWN uses 50% by default)
-    k_input_default = args.n_input // 2
-    k_process_default = args.n_process // 2
-
-    print(f"\nSparsity Configuration (default):")
-    print(f"  Input neurons: {k_input_default}/{args.n_input} ({k_input_default/args.n_input*100:.1f}%)")
-    print(f"  Process neurons: {k_process_default}/{args.n_process} ({k_process_default/args.n_process*100:.1f}%)")
 
     # Optimizer & Scheduler
     # Separate parameter groups: Router gets higher LR for faster learning
@@ -1278,7 +1152,29 @@ def main():
     if resume_checkpoint and resume_checkpoint.exists():
         print(f"\nResuming from checkpoint: {resume_checkpoint}")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Load with strict=False to handle architecture changes
+        missing_keys, unexpected_keys = model.load_state_dict(
+            checkpoint['model_state_dict'], strict=False
+        )
+
+        if missing_keys:
+            print(f"⚠️  Missing keys (new parameters, will be randomly initialized):")
+            for key in missing_keys[:10]:  # Show first 10
+                print(f"    - {key}")
+            if len(missing_keys) > 10:
+                print(f"    ... and {len(missing_keys) - 10} more")
+
+        if unexpected_keys:
+            print(f"⚠️  Unexpected keys (old parameters, will be ignored):")
+            for key in unexpected_keys[:10]:  # Show first 10
+                print(f"    - {key}")
+            if len(unexpected_keys) > 10:
+                print(f"    ... and {len(unexpected_keys) - 10} more")
+
+        if not missing_keys and not unexpected_keys:
+            print("✓ All parameters loaded successfully!")
+
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -1304,7 +1200,7 @@ def main():
     # Write header to training log
     with open(training_log_file, 'w') as f:
         f.write("# Training Log (aggregated every 100 steps)\n")
-        f.write("# Format: epoch,step,loss,aux_loss,acc,gini,layer_gini=[L0,L1,...]\n")
+        f.write("# Format: epoch,step,loss,aux_loss,acc,gini,layer_gini=[L0,L1,...],learned_threshold=[...],learned_steepness=[...],effective_k=[...],effective_k_ratio=[...],learned_temp=[...]\n")
 
     # Write header to debug log
     with open(debug_log_file, 'w') as f:
@@ -1322,18 +1218,13 @@ def main():
     for epoch in range(start_epoch, args.num_epochs + 1):
         epoch_start = time.time()
 
-        # Curriculum learning: adjust k values (dense → sparse)
-        k_input, k_process = get_curriculum_k_values(
-            epoch, args.num_epochs, args.n_input, args.n_process
-        )
-        args.k_input = k_input
-        args.k_process = k_process
-
-        # Temperature annealing: update router temperature (explore → exploit)
-        temperature = update_temperature(model, epoch, args.num_epochs)
-
         if epoch == 1 or epoch % 5 == 0:
-            print(f"\nEpoch {epoch}: k_input={k_input}, k_process={k_process}, temp={temperature:.2f}")
+            # Log learned parameters instead
+            sample_router = model.layers[0].block.router
+            learned_threshold = sample_router.get_threshold().item()
+            learned_temp = sample_router.get_temperature().item()
+            learned_steepness = sample_router.get_steepness().item()
+            print(f"\nEpoch {epoch}: Learned threshold={learned_threshold:.3f}, temp={learned_temp:.2f}, steepness={learned_steepness:.2f} (Layer 0 sample)")
 
         # Train
         train_loss, train_acc, routing_metrics = train_epoch(
