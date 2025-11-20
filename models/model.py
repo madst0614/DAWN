@@ -73,6 +73,86 @@ debug_logger = DebugLogger()
 
 
 # ============================================================
+# Regularization Functions
+# ============================================================
+
+def compute_orthogonality_loss(weight_matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Compute orthogonality regularization loss for weight matrix.
+
+    Encourages weight vectors to be orthogonal to prevent rank collapse.
+    W @ W^T should be close to scaled identity.
+
+    Args:
+        weight_matrix: Weight matrix [n_vectors, dim]
+
+    Returns:
+        Orthogonality loss (scalar)
+    """
+    # Normalize to unit vectors
+    normalized = F.normalize(weight_matrix, p=2, dim=1)
+
+    # Compute gram matrix (cosine similarities)
+    gram = normalized @ normalized.T
+
+    # Off-diagonal elements should be zero (orthogonal)
+    n = gram.size(0)
+    identity = torch.eye(n, device=gram.device)
+    off_diagonal_mask = 1 - identity
+
+    # Loss: sum of squared off-diagonal elements
+    ortho_loss = (gram * off_diagonal_mask).pow(2).sum() / (n * (n - 1) + 1e-8)
+
+    return ortho_loss
+
+
+def compute_model_orthogonality_loss(model) -> dict:
+    """
+    Compute orthogonality loss for all relevant weight matrices in DAWN model.
+
+    Args:
+        model: DAWNLanguageModel
+
+    Returns:
+        Dictionary with orthogonality losses per component
+    """
+    router_losses = []
+    input_losses = []
+    process_comb_losses = []
+    process_proj_losses = []
+
+    for layer in model.layers:
+        block = layer.block
+
+        # Router neuron patterns
+        router_ortho = compute_orthogonality_loss(block.router.neuron_patterns)
+        router_losses.append(router_ortho)
+
+        # Input neuron patterns
+        input_ortho = compute_orthogonality_loss(block.input_neurons.patterns)
+        input_losses.append(input_ortho)
+
+        # Process neuron combination weights
+        comb_ortho = compute_orthogonality_loss(block.process_neurons.combination_weights)
+        process_comb_losses.append(comb_ortho)
+
+        # Process neuron output projections
+        proj_ortho = compute_orthogonality_loss(block.process_neurons.output_projections)
+        process_proj_losses.append(proj_ortho)
+
+    n_layers = len(model.layers)
+
+    return {
+        'router_ortho': sum(router_losses) / n_layers,
+        'input_ortho': sum(input_losses) / n_layers,
+        'process_comb_ortho': sum(process_comb_losses) / n_layers,
+        'process_proj_ortho': sum(process_proj_losses) / n_layers,
+        'total_ortho': (sum(router_losses) + sum(input_losses) +
+                       sum(process_comb_losses) + sum(process_proj_losses)) / (4 * n_layers)
+    }
+
+
+# ============================================================
 # Core Components
 # ============================================================
 

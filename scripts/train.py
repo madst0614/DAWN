@@ -29,7 +29,7 @@ import time
 import numpy as np
 import math
 
-from models.model import HierarchicalLanguageModel, debug_logger
+from models.model import HierarchicalLanguageModel, debug_logger, compute_model_orthogonality_loss
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
@@ -683,8 +683,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         optimizer.zero_grad()
 
         # Mixed precision training
-        # Aux weight configuration
+        # Loss weight configuration
         aux_weight = 0.01  # Overall aux loss weight
+        ortho_weight = 0.001  # Orthogonality regularization weight
+
+        # Compute orthogonality loss (outside autocast for stability)
+        ortho_losses = compute_model_orthogonality_loss(model)
+        ortho_loss = ortho_losses['total_ortho']
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -724,7 +729,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     gini = 0.0
                     layer_ginis = [0.0] * n_layers
 
-                total_loss_combined = loss + aux_weight * aux_loss
+                total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss
 
             # NaN/Inf detection - STOP immediately
             if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
@@ -735,6 +740,7 @@ NaN/Inf DETECTED - STOPPING TRAINING
 Epoch: {epoch}, Step: {step}
 Loss: {loss.item() if not torch.isnan(loss) else 'NaN'}
 Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') and not torch.isnan(aux_loss) else aux_loss}
+Ortho Loss: {ortho_loss.item() if hasattr(ortho_loss, 'item') else ortho_loss}
 Total Loss: {total_loss_combined.item() if not torch.isnan(total_loss_combined) else 'NaN'}
 Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]
 Logits has NaN: {torch.isnan(logits).any().item()}
@@ -822,7 +828,7 @@ Router weights check:
                 gini = 0.0
                 layer_ginis = [0.0] * n_layers
 
-            total_loss_combined = loss + aux_weight * aux_loss
+            total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss
 
             # NaN/Inf detection - STOP immediately
             if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
@@ -833,6 +839,7 @@ NaN/Inf DETECTED - STOPPING TRAINING
 Epoch: {epoch}, Step: {step}
 Loss: {loss.item() if not torch.isnan(loss) else 'NaN'}
 Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') and not torch.isnan(aux_loss) else aux_loss}
+Ortho Loss: {ortho_loss.item() if hasattr(ortho_loss, 'item') else ortho_loss}
 Total Loss: {total_loss_combined.item() if not torch.isnan(total_loss_combined) else 'NaN'}
 Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]
 Logits has NaN: {torch.isnan(logits).any().item()}
