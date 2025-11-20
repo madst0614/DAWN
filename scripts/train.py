@@ -20,7 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 import argparse
 from tqdm import tqdm
 import json
@@ -31,13 +31,7 @@ import math
 
 from models.model import HierarchicalLanguageModel, debug_logger
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
-
-# MLM 마스킹 설정
-MLM_CONFIG = {
-    "mask_prob": 0.15,
-    "mask_token_ratio": 0.8,
-    "random_token_ratio": 0.5
-}
+from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data
 
 
 # ============================================================
@@ -523,201 +517,6 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_f
     if log_file:
         with open(log_file, 'a') as f:
             f.write(captured)
-
-
-# ============================================================
-# MLM Masking Function
-# ============================================================
-
-def apply_mlm_masking(input_ids, tokenizer, config=None):
-    """
-    Apply MLM-style masking (80% [MASK], 10% random, 10% keep).
-    Based on dawn/utils/data_utils.py MaskingStrategy.apply_mlm_masking
-
-    Args:
-        input_ids: [B, S] Token IDs to mask
-        tokenizer: Tokenizer instance
-        config: Optional config dict with mask_prob, mask_token_ratio, random_token_ratio
-
-    Returns:
-        Tuple of (masked_input_ids, labels)
-    """
-    if config is None:
-        config = MLM_CONFIG
-
-    labels = input_ids.clone()
-    mask_prob = config.get("mask_prob", 0.15)
-    device = input_ids.device
-
-    probability_matrix = torch.full(labels.shape, mask_prob, device=device)
-
-    # ✅ Exclude special tokens (CLS, SEP, PAD, etc.) - Dawn style
-    # labels is [B, S], need to preserve batch dimension
-    special_tokens_mask = []
-    for seq in labels.tolist():  # Iterate over batch
-        seq_mask = [
-            tokenizer.get_special_tokens_mask([val], already_has_special_tokens=True)[0]
-            for val in seq
-        ]
-        special_tokens_mask.append(seq_mask)
-    special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool, device=device)
-    probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
-
-    # ✅ Exclude padding tokens (belt and suspenders)
-    padding_mask = input_ids == tokenizer.pad_token_id
-    probability_matrix.masked_fill_(padding_mask, value=0.0)
-
-    # Sample masked positions
-    masked_indices = torch.bernoulli(probability_matrix).bool()
-    labels[~masked_indices] = -100  # Only compute loss on masked tokens
-
-    # Apply masking strategy
-    mask_ratio = config.get("mask_token_ratio", 0.8)
-    random_ratio = config.get("random_token_ratio", 0.5)
-
-    # 80% [MASK]
-    indices_replaced = masked_indices & (torch.rand(labels.shape, device=device) < mask_ratio)
-    input_ids[indices_replaced] = tokenizer.mask_token_id
-
-    # 10% random (of remaining)
-    indices_random = (
-        masked_indices
-        & ~indices_replaced
-        & (torch.rand(labels.shape, device=device) < random_ratio)
-    )
-    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long, device=device)
-    input_ids[indices_random] = random_words[indices_random]
-
-    # 10% keep original (implicit)
-    return input_ids, labels
-
-
-# ============================================================
-# Dataset
-# ============================================================
-
-class TextDataset(Dataset):
-    """Dataset for tokenized texts"""
-    def __init__(self, texts, tokenizer, max_length=128):  # CHANGED: 512 → 128
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-
-        # Tokenize (NO padding here - will be done dynamically in collate_fn)
-        encoding = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
-
-        return {
-            'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0)
-        }
-
-
-def collate_fn_dynamic_padding(batch, tokenizer):
-    """
-    Collate function with DYNAMIC padding (배치별 최대 길이만큼만 padding)
-
-    큰 개선:
-    - Before: 모든 시퀀스를 512로 padding → 90% padding!
-    - After: 배치 내 최대 길이로만 padding → ~10-30% padding
-    """
-    # Find max length in this batch
-    max_len = max(item['input_ids'].size(0) for item in batch)
-
-    input_ids_list = []
-    attention_mask_list = []
-
-    for item in batch:
-        input_ids = item['input_ids']
-        attention_mask = item['attention_mask']
-        seq_len = input_ids.size(0)
-
-        # Pad to batch max length
-        if seq_len < max_len:
-            padding_len = max_len - seq_len
-            input_ids = torch.cat([
-                input_ids,
-                torch.full((padding_len,), tokenizer.pad_token_id, dtype=torch.long)
-            ])
-            attention_mask = torch.cat([
-                attention_mask,
-                torch.zeros(padding_len, dtype=torch.long)
-            ])
-
-        input_ids_list.append(input_ids)
-        attention_mask_list.append(attention_mask)
-
-    return {
-        'input_ids': torch.stack(input_ids_list),
-        'attention_mask': torch.stack(attention_mask_list)
-    }
-
-
-def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
-    """Load data from config paths with DYNAMIC padding"""
-    from transformers import AutoTokenizer
-    from functools import partial
-    import pickle
-
-    # Load tokenizer
-    if tokenizer_path is None:
-        tokenizer_path = "bert-base-uncased"
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
-    # Load data from config paths
-    base_dir = data_config['base_dir']
-    train_path = os.path.join(base_dir, data_config['train_file'])
-    val_path = os.path.join(base_dir, data_config['val_file'])
-
-    print(f"Loading data from: {base_dir}")
-
-    # Load train texts
-    if not os.path.exists(train_path):
-        raise FileNotFoundError(f"Train data not found: {train_path}")
-    with open(train_path, 'rb') as f:
-        train_texts = pickle.load(f)
-
-    # Load validation texts
-    if not os.path.exists(val_path):
-        raise FileNotFoundError(f"Validation data not found: {val_path}")
-    with open(val_path, 'rb') as f:
-        val_texts = pickle.load(f)
-
-    print(f"Loaded {len(train_texts)} train texts, {len(val_texts)} val texts")
-
-    # Create datasets
-    train_dataset = TextDataset(train_texts, tokenizer, max_length)
-    val_dataset = TextDataset(val_texts, tokenizer, max_length)
-
-    # Create collate function with tokenizer
-    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
-
-    # Create dataloaders with DYNAMIC padding
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=2,
-        collate_fn=collate_fn  # ← Dynamic padding!
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        num_workers=2,
-        collate_fn=collate_fn  # ← Dynamic padding!
-    )
-
-    return train_loader, val_loader, tokenizer
 
 
 # ============================================================
