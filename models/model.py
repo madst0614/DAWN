@@ -195,9 +195,13 @@ class DynamicRouter(nn.Module):
         # scores = attn_weights.mean(dim=1)  # "average need"
         # scores = (attn_weights.max(dim=1)[0] + attn_weights.mean(dim=1)) / 2
 
-        # Step 4: Soft top-k selection (stable!)
+        # Step 4: Score normalization for numerical stability
+        scores_normalized = (scores - scores.mean(dim=-1, keepdim=True)) / \
+                           (scores.std(dim=-1, keepdim=True) + 1e-6)
+
+        # Step 5: Soft top-k selection (stable!)
         # Apply temperature for exploration/exploitation balance
-        probs = F.softmax(scores / self.temperature, dim=-1)
+        probs = F.softmax(scores_normalized / self.temperature, dim=-1)
         # [batch, n_neurons]
 
         # Debug: log probs
@@ -287,16 +291,19 @@ class InputNeurons(nn.Module):
         # Debug: log activations before attention
         debug_logger.log_tensor("InputNeurons", "activations_pre", activations)
 
+        # Pre-LN: Normalize BEFORE attention
+        normalized = self.norm(activations)
+
         # Neuron self-attention (lateral connections)
         attn_output, _ = self.self_attention(
-            activations, activations, activations
+            normalized, normalized, normalized
         )
 
-        # Residual connection and normalization
-        activations = self.norm(activations + self.dropout(attn_output))
+        # Residual WITHOUT additional norm
+        activations = activations + self.dropout(attn_output)
         # [batch, seq_len, n_neurons]
 
-        # Debug: log activations after norm
+        # Debug: log activations after residual
         debug_logger.log_tensor("InputNeurons", "activations_post", activations)
 
         return activations
@@ -654,14 +661,18 @@ class DAWNLayer(nn.Module):
             aux_loss: Auxiliary losses from block
             routing_info: (optional) Routing information
         """
+        # Pre-LN: Normalize BEFORE block
+        normed = self.norm(x)
+
         if return_routing_info:
             output, aux_loss, routing_info = self.block(
-                x, k_input, k_process, mask, return_routing_info=True
+                normed, k_input, k_process, mask, return_routing_info=True
             )
-            return self.norm(x + output), aux_loss, routing_info
+            # Residual WITHOUT additional norm
+            return x + output, aux_loss, routing_info
 
-        output, aux_loss = self.block(x, k_input, k_process, mask)
-        return self.norm(x + output), aux_loss
+        output, aux_loss = self.block(normed, k_input, k_process, mask)
+        return x + output, aux_loss
 
 
 # ============================================================
