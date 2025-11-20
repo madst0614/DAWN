@@ -1037,7 +1037,7 @@ def comprehensive_analysis(model, val_loader, tokenizer, device):
     }
 
     # 1. Routing Patterns
-    routing_results = analyze_routing_patterns(model, val_loader, device)
+    routing_results = analyze_routing_patterns(model, val_loader, device, max_batches=10)
     results['routing'] = routing_results
 
     print("\n📊 ROUTING STATISTICS (Soft Weights)")
@@ -1053,7 +1053,7 @@ def comprehensive_analysis(model, val_loader, tokenizer, device):
         print(f"    Effective k: {lp['effective_k']:.1f} ({lp['effective_k_ratio']:.1%})")
 
     # 2. Neuron Usage (Load Balance)
-    usage_results = analyze_neuron_usage(model, val_loader, device)
+    usage_results = analyze_neuron_usage(model, val_loader, device, max_batches=10)
     results['usage'] = usage_results
 
     print("\n🧠 NEURON USAGE (Load Balance)")
@@ -1065,7 +1065,7 @@ def comprehensive_analysis(model, val_loader, tokenizer, device):
     # 3. Specialization (PMI-based)
     spec_results = analyze_neuron_specialization(
         model, val_loader, tokenizer, device,
-        max_batches=100,  # More batches for better PMI estimates
+        max_batches=10,  # Reduced for faster analysis
         layer_idx=3  # Middle layer (can be adjusted)
     )
     results['specialization'] = spec_results
