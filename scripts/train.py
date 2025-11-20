@@ -696,8 +696,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 outputs = model(
                     input_ids=input_ids,
                     labels=labels,
-                    k_input=None,  # Let model learn k automatically!
-                    k_process=None,  # Let model learn k automatically!
                     return_routing_info=True
                 )
                 loss = outputs['loss']
@@ -731,7 +729,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # NEW: Add learned sparsity guidance from model
                 sparsity_guidance = outputs.get('aux_loss', {}).get('sparsity_guidance', 0.0)
-                sparsity_weight = 0.005  # Small weight for soft guidance
+                sparsity_weight = 0.05  # STRONG guidance for pure soft selection
 
                 total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss + sparsity_weight * sparsity_guidance
 
@@ -799,8 +797,6 @@ Router weights check:
             outputs = model(
                 input_ids=input_ids,
                 labels=labels,
-                k_input=None,  # Let model learn k automatically!
-                k_process=None,  # Let model learn k automatically!
                 return_routing_info=True
             )
             loss = outputs['loss']
@@ -834,7 +830,7 @@ Router weights check:
 
             # NEW: Add learned sparsity guidance from model
             sparsity_guidance = outputs.get('aux_loss', {}).get('sparsity_guidance', 0.0)
-            sparsity_weight = 0.005  # Small weight for soft guidance
+            sparsity_weight = 0.05  # STRONG guidance for pure soft selection
 
             total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss + sparsity_weight * sparsity_guidance
 
@@ -1095,9 +1091,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
             outputs = model(
                 input_ids=masked_input_ids,
-                labels=labels,
-                k_input=None,  # Let model learn k automatically!
-                k_process=None  # Let model learn k automatically!
+                labels=labels
             )
             loss = outputs['loss']
             logits = outputs['logits']

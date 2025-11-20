@@ -1,12 +1,18 @@
 """
 DAWN: Dynamic Architecture With Neurons
-A neural architecture with attention-guided dynamic neuron routing
+A neural architecture with FULLY LEARNABLE soft neuron routing
+
+Key principles:
+- Zero manual configuration
+- Pure soft selection (no hard top-k)
+- All parameters learned from data
+- Complete gradient flow
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union, Dict
+from typing import Optional, Tuple, Dict
 import math
 
 
@@ -24,7 +30,7 @@ class DebugLogger:
             cls._instance.enabled = False
             cls._instance.log_file = None
             cls._instance.step = 0
-            cls._instance.verbose_steps = set()  # Steps to log in detail
+            cls._instance.verbose_steps = set()
         return cls._instance
 
     def setup(self, log_file: str, enabled: bool = True):
@@ -36,7 +42,6 @@ class DebugLogger:
 
     def set_step(self, step: int):
         self.step = step
-        # Log detail every 100 steps
         if step % 100 == 0:
             self.verbose_steps.add(step)
 
@@ -53,7 +58,6 @@ class DebugLogger:
         has_nan = torch.isnan(tensor).any().item()
         has_inf = torch.isinf(tensor).any().item()
 
-        # Always log if NaN/Inf detected, or every 100 steps
         should_log_detail = has_nan or has_inf or (self.step in self.verbose_steps)
 
         if should_log_detail:
@@ -63,12 +67,10 @@ class DebugLogger:
                    f"nan: {has_nan}, inf: {has_inf}")
             self.log(component, msg)
 
-        # Alert on NaN/Inf
         if has_nan or has_inf:
             self.log(component, f"🔥 {'NaN' if has_nan else 'Inf'} DETECTED in {name}!")
 
 
-# Global logger instance
 debug_logger = DebugLogger()
 
 
@@ -79,42 +81,19 @@ debug_logger = DebugLogger()
 def compute_orthogonality_loss(weight_matrix: torch.Tensor) -> torch.Tensor:
     """
     Compute orthogonality regularization loss for weight matrix.
-
-    Encourages weight vectors to be orthogonal to prevent rank collapse.
-    W @ W^T should be close to scaled identity.
-
-    Args:
-        weight_matrix: Weight matrix [n_vectors, dim]
-
-    Returns:
-        Orthogonality loss (scalar)
     """
-    # Normalize to unit vectors
     normalized = F.normalize(weight_matrix, p=2, dim=1)
-
-    # Compute gram matrix (cosine similarities)
     gram = normalized @ normalized.T
-
-    # Off-diagonal elements should be zero (orthogonal)
     n = gram.size(0)
     identity = torch.eye(n, device=gram.device)
     off_diagonal_mask = 1 - identity
-
-    # Loss: sum of squared off-diagonal elements
     ortho_loss = (gram * off_diagonal_mask).pow(2).sum() / (n * (n - 1) + 1e-8)
-
     return ortho_loss
 
 
 def compute_model_orthogonality_loss(model) -> dict:
     """
-    Compute orthogonality loss for all relevant weight matrices in DAWN model.
-
-    Args:
-        model: DAWNLanguageModel
-
-    Returns:
-        Dictionary with orthogonality losses per component
+    Compute orthogonality loss for all weight matrices in DAWN model.
     """
     router_losses = []
     input_losses = []
@@ -124,19 +103,15 @@ def compute_model_orthogonality_loss(model) -> dict:
     for layer in model.layers:
         block = layer.block
 
-        # Router neuron patterns
         router_ortho = compute_orthogonality_loss(block.router.neuron_patterns)
         router_losses.append(router_ortho)
 
-        # Input neuron patterns
         input_ortho = compute_orthogonality_loss(block.input_neurons.patterns)
         input_losses.append(input_ortho)
 
-        # Process neuron combination weights
         comb_ortho = compute_orthogonality_loss(block.process_neurons.combination_weights)
         process_comb_losses.append(comb_ortho)
 
-        # Process neuron output projections
         proj_ortho = compute_orthogonality_loss(block.process_neurons.output_projections)
         process_proj_losses.append(proj_ortho)
 
@@ -157,74 +132,46 @@ def compute_learned_sparsity_loss(
     selection_info: dict
 ) -> torch.Tensor:
     """
-    Guide model to learn reasonable sparsity.
+    STRONG sparsity guidance with progressive penalties.
 
-    Now uses effective_k_ratio from soft selection.
-
-    Args:
-        weights: Routing weights [batch, n_neurons]
-        selection_info: Dict with 'effective_k_ratio', etc.
-
-    Returns:
-        Sparsity guidance loss (penalty for extremes)
+    Target: 30-70% active neurons
+    Progressive penalty: stronger when further from target
     """
-    # Get effective sparsity from soft selection
     effective_k_ratio = selection_info.get('effective_k_ratio', 0.5)
 
-    # Target: moderate sparsity (30-70% active neurons)
-    # Soft penalty for extremes
-    if effective_k_ratio < 0.3:
-        # Too sparse
-        penalty = (0.3 - effective_k_ratio) ** 2
-    elif effective_k_ratio > 0.7:
-        # Too dense (not sparse enough)
-        penalty = (effective_k_ratio - 0.7) ** 2
+    # Target range
+    target_min = 0.3
+    target_max = 0.7
+    target_center = 0.5
+
+    # STRONG penalties for extremes (2x multiplier)
+    if effective_k_ratio < target_min:
+        deviation = target_min - effective_k_ratio
+        sparsity_penalty = (deviation * 2.0) ** 2
+    elif effective_k_ratio > target_max:
+        deviation = effective_k_ratio - target_max
+        sparsity_penalty = (deviation * 2.0) ** 2
     else:
-        # Sweet spot
-        penalty = 0.0
+        # Gentle centering toward 0.5
+        sparsity_penalty = 0.1 * (effective_k_ratio - target_center) ** 2
 
-    penalty_tensor = torch.tensor(penalty, device=weights.device, dtype=weights.dtype)
+    penalty_tensor = torch.tensor(sparsity_penalty, device=weights.device, dtype=weights.dtype)
 
-    # Also encourage diversity (Gini)
+    # Gini diversity penalty (also stronger)
     avg_weights = weights.mean(dim=0)
     sorted_weights, _ = torch.sort(avg_weights)
     n = len(sorted_weights)
     index = torch.arange(1, n + 1, device=weights.device, dtype=torch.float32)
     gini = (2 * (index * sorted_weights).sum()) / (n * sorted_weights.sum() + 1e-8) - (n + 1) / n
 
-    # Penalty for extreme Gini
     if gini < 0.2:
-        gini_penalty = (0.2 - gini) ** 2
+        gini_penalty = ((0.2 - gini) * 2.0) ** 2
     elif gini > 0.6:
-        gini_penalty = (gini - 0.6) ** 2
+        gini_penalty = ((gini - 0.6) * 2.0) ** 2
     else:
         gini_penalty = torch.tensor(0.0, device=weights.device)
 
     return penalty_tensor + gini_penalty
-
-
-def compute_efficiency_bonus(weights: torch.Tensor) -> torch.Tensor:
-    """
-    Encourage efficient neuron usage (using fewer neurons is better).
-
-    But not too few - maintain minimum capacity.
-
-    Args:
-        weights: Routing weights [batch, n_neurons]
-
-    Returns:
-        Efficiency bonus (negative = reduce loss)
-    """
-    # Count "active" neurons (weight > threshold)
-    active_count = (weights > 0.01).float().sum(dim=-1).mean()
-    total = weights.shape[-1]
-    actual_ratio = active_count / total
-
-    # Efficiency bonus: prefer using fewer neurons
-    # But not less than 20% (maintain capacity)
-    efficiency_bonus = torch.relu(actual_ratio - 0.2)
-
-    return efficiency_bonus * 0.01  # Small weight
 
 
 # ============================================================
@@ -233,16 +180,14 @@ def compute_efficiency_bonus(weights: torch.Tensor) -> torch.Tensor:
 
 class DynamicRouter(nn.Module):
     """
-    Attention-based dynamic neuron router.
+    Fully differentiable attention-based dynamic neuron router.
 
-    Uses direct attention to neuron patterns for stable routing.
-    No Gumbel, no STE - just pure attention mechanism.
+    ALL sparsity parameters are learned:
+    - temperature: controls softmax distribution
+    - threshold: controls selection cutoff
+    - steepness: controls transition sharpness
 
-    Args:
-        d_model: Model dimension
-        n_neurons: Number of available neurons to route
-        n_heads: Number of attention heads
-        dropout: Dropout probability
+    NO clamps, NO hard limits - pure learning!
     """
 
     def __init__(
@@ -258,7 +203,7 @@ class DynamicRouter(nn.Module):
         self.n_neurons = n_neurons
         self.n_heads = n_heads
 
-        # Multi-head attention for context modeling
+        # Context attention
         self.context_attention = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=n_heads,
@@ -266,178 +211,111 @@ class DynamicRouter(nn.Module):
             batch_first=True
         )
 
-        # Learnable neuron patterns (what each neuron responds to)
+        # Learnable neuron patterns
         self.neuron_patterns = nn.Parameter(
             torch.empty(n_neurons, d_model)
         )
 
-        # Direct attention to neurons for routing
+        # Neuron attention for routing
         self.neuron_attention = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=n_heads,
-            dropout=0.0,  # No dropout for routing stability
+            dropout=0.0,
             batch_first=True
         )
 
         # ============================================================
-        # Learnable sparsity controller (FULLY DIFFERENTIABLE!)
+        # THREE Learnable parameters (NO CLAMPS!)
         # ============================================================
 
-        # Learnable temperature (controls softmax sharpness)
-        # High temp = soft (many neurons), Low temp = hard (few neurons)
+        # Temperature: softmax sharpness
+        # Let model learn any value - will naturally stabilize
         self.log_temperature = nn.Parameter(torch.tensor(0.0))  # exp(0) = 1.0
 
-        # Learnable sparsity threshold (SOFT SELECTION!)
-        # Higher value = higher threshold = fewer neurons (more sparse)
-        # Lower value = lower threshold = more neurons (less sparse)
+        # Threshold: where to cut
+        # Sigmoid naturally bounds to (0, 1)
         self.sparsity_threshold = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
 
-        # Learnable steepness (controls sigmoid sharpness around threshold)
-        # Higher = sharper transition, Lower = smoother transition
+        # Steepness: transition sharpness
+        # Let model learn - will find optimal steepness
         self.log_steepness = nn.Parameter(torch.tensor(math.log(3.0)))  # exp(log(3)) = 3.0
 
         self._init_weights()
 
     def _init_weights(self):
-        # Orthogonal initialization for neuron patterns
         nn.init.orthogonal_(self.neuron_patterns, gain=1.0)
 
     def get_temperature(self) -> torch.Tensor:
-        """Get learned temperature, constrained to reasonable range."""
-        # exp: always positive, clamped to [0.5, 5.0]
-        temp = torch.exp(self.log_temperature)
-        return torch.clamp(temp, 0.5, 5.0)
+        """Get learned temperature (unclamped!)"""
+        return torch.exp(self.log_temperature)
 
     def get_threshold(self) -> torch.Tensor:
-        """Get learned threshold for sparsity control."""
-        # Sigmoid maps to (0, 1)
-        # Will learn optimal threshold automatically
+        """Get learned threshold (naturally bounded by sigmoid)"""
         return torch.sigmoid(self.sparsity_threshold)
 
     def get_steepness(self) -> torch.Tensor:
-        """Get learned steepness for sigmoid transition sharpness."""
-        # exp: always positive, clamped to [1.0, 10.0]
-        # 1.0 = very smooth, 10.0 = very sharp
-        steep = torch.exp(self.log_steepness)
-        return torch.clamp(steep, 1.0, 10.0)
+        """Get learned steepness (unclamped!)"""
+        return torch.exp(self.log_steepness)
 
     def forward(
         self,
         x: torch.Tensor,
-        k: Optional[int] = None,
         mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
-        Route to neurons with FULLY DIFFERENTIABLE soft selection.
-
-        Args:
-            x: Input tensor [batch, seq_len, d_model]
-            k: Optional hard k for inference/analysis (ignored during training)
-            mask: Optional attention mask [batch, seq_len]
+        Pure soft selection - NO hard k!
 
         Returns:
-            indices: Top-k neuron indices [batch, k] (for compatibility)
-            weights: SOFT routing weights [batch, n_neurons] (differentiable!)
+            weights: Soft routing weights [batch, n_neurons]
             context: Attended representations [batch, seq_len, d_model]
-            selection_info: Dict with sparsity metrics
+            selection_info: Dict with learned parameters
         """
         batch_size, seq_len, d_model = x.shape
 
-        # Step 1: Context modeling
-        # Self-attention to understand input relationships
-        context, _ = self.context_attention(
-            x, x, x,
-            key_padding_mask=mask
-        )
-        # [batch, seq_len, d_model]
+        # Context modeling
+        context, _ = self.context_attention(x, x, x, key_padding_mask=mask)
 
-        # Step 2: Attend to neuron patterns
-        # Query: "What do we have?" (context)
-        # Key/Value: "What patterns exist?" (neuron_patterns)
-
-        # Expand neuron patterns for batch dimension
-        neuron_kv = self.neuron_patterns.unsqueeze(0).expand(
-            batch_size, -1, -1
-        )  # [batch, n_neurons, d_model]
-
-        # Cross-attention: context queries neuron patterns
+        # Attend to neuron patterns
+        neuron_kv = self.neuron_patterns.unsqueeze(0).expand(batch_size, -1, -1)
         neuron_responses, attn_weights = self.neuron_attention(
-            context,       # query: [batch, seq_len, d_model]
-            neuron_kv,     # key:   [batch, n_neurons, d_model]
-            neuron_kv,     # value: [batch, n_neurons, d_model]
+            context, neuron_kv, neuron_kv,
             need_weights=True,
-            average_attn_weights=True  # Average across heads
+            average_attn_weights=True
         )
-        # attn_weights: [batch, seq_len, n_neurons]
-        # Each position's attention to each neuron
 
-        # Step 3: Aggregate across sequence
-        # "If ANY position needs this neuron, activate it"
-        # Using max-pooling (consistent with original design)
+        # Aggregate scores
         scores, _ = attn_weights.max(dim=1)
-        # [batch, n_neurons]
 
-        # Debug: log scores
         debug_logger.log_tensor("Router", "scores", scores)
 
-        # Alternative: could use mean or learnable aggregation
-        # scores = attn_weights.mean(dim=1)  # "average need"
-        # scores = (attn_weights.max(dim=1)[0] + attn_weights.mean(dim=1)) / 2
-
-        # Step 4: Score normalization for numerical stability
+        # Normalize scores
         scores_normalized = (scores - scores.mean(dim=-1, keepdim=True)) / \
                            (scores.std(dim=-1, keepdim=True) + 1e-6)
 
-        # ============================================================
-        # Step 5: SOFT DIFFERENTIABLE SELECTION (NEW!)
-        # ============================================================
-
-        # Get learned parameters
+        # Get learned parameters (NO CLAMPS!)
         temperature = self.get_temperature()
         learned_threshold = self.get_threshold()
         steepness = self.get_steepness()
 
-        # Compute base probabilities
+        # Base probabilities
         probs = F.softmax(scores_normalized / temperature, dim=-1)
-        # [batch, n_neurons]
 
-        # Soft thresholding for sparsity
-        # Normalize scores to [0, 1] range for comparison with threshold
+        # Normalize scores to [0, 1]
         scores_min = scores_normalized.min(dim=-1, keepdim=True)[0]
         scores_max = scores_normalized.max(dim=-1, keepdim=True)[0]
         scores_01 = (scores_normalized - scores_min) / (scores_max - scores_min + 1e-8)
 
-        # Soft mask: sigmoid around learned threshold
-        # steepness controls how sharp the transition is (learned!)
+        # Soft mask with learned threshold and steepness
         soft_mask = torch.sigmoid(steepness * (scores_01 - learned_threshold))
-        # soft_mask: ~0 for scores below threshold, ~1 for scores above
 
-        # Apply soft mask to probabilities (DIFFERENTIABLE!)
+        # Apply soft mask
         masked_probs = probs * soft_mask
-
-        # Renormalize
         weights = masked_probs / (masked_probs.sum(dim=-1, keepdim=True) + 1e-8)
-        # [batch, n_neurons]
 
-        # ============================================================
-        # For compatibility: compute "effective k" and top-k indices
-        # ============================================================
-
-        # Measure effective sparsity (for logging/analysis)
+        # Measure effective sparsity (for logging)
         active_neurons = (weights > 1e-3).float().sum(dim=-1).mean()
         effective_k_ratio = active_neurons / self.n_neurons
 
-        # Get top-k indices based on weights (for compatibility with downstream code)
-        # This is just for index selection, gradient flows through weights
-        if k is None:
-            # Use effective k
-            k = max(int(active_neurons.item()), 8)
-        k = min(k, self.n_neurons)  # Ensure k <= n_neurons
-
-        _, indices = weights.topk(k, dim=-1)
-        # [batch, k]
-
-        # Selection info for logging
         selection_info = {
             'learned_threshold': learned_threshold.item(),
             'learned_steepness': steepness.item(),
@@ -446,27 +324,19 @@ class DynamicRouter(nn.Module):
             'temperature': temperature.item()
         }
 
-        # Debug: log
         debug_logger.log_tensor("Router", "weights", weights)
         debug_logger.log("Router", f"weights sum: {weights.sum(dim=-1).mean().item():.4f}")
-        debug_logger.log("Router", f"threshold: {learned_threshold.item():.3f}, eff_k: {active_neurons.item():.1f}")
+        debug_logger.log("Router",
+            f"threshold: {learned_threshold.item():.3f}, "
+            f"steepness: {steepness.item():.2f}, "
+            f"temp: {temperature.item():.2f}, "
+            f"eff_k: {active_neurons.item():.1f}")
 
-        return indices, weights, context, selection_info
+        return weights, context, selection_info
 
 
 class InputNeurons(nn.Module):
-    """
-    Input neuron layer with self-attention.
-
-    Transforms input representations into neuron activations,
-    with neurons communicating via self-attention mechanism.
-
-    Args:
-        d_model: Model dimension
-        n_neurons: Number of neurons
-        n_heads: Number of attention heads for neuron communication
-        dropout: Dropout probability
-    """
+    """Input neuron layer with self-attention."""
 
     def __init__(
         self,
@@ -480,10 +350,8 @@ class InputNeurons(nn.Module):
         self.d_model = d_model
         self.n_neurons = n_neurons
 
-        # Learnable neuron patterns
         self.patterns = nn.Parameter(torch.empty(n_neurons, d_model))
 
-        # Self-attention for neuron communication
         self.self_attention = nn.MultiheadAttention(
             embed_dim=n_neurons,
             num_heads=n_heads,
@@ -503,32 +371,17 @@ class InputNeurons(nn.Module):
         """
         Compute neuron activations.
 
-        Args:
-            context: Attended input [batch, seq_len, d_model]
-
         Returns:
-            activations: Neuron activations [batch, seq_len, n_neurons]
+            activations: [batch, seq_len, n_neurons]
         """
-        # Transform to neuron space
         activations = F.gelu(context @ self.patterns.T)
-        # [batch, seq_len, n_neurons]
 
-        # Debug: log activations before attention
         debug_logger.log_tensor("InputNeurons", "activations_pre", activations)
 
-        # Pre-LN: Normalize BEFORE attention
         normalized = self.norm(activations)
-
-        # Neuron self-attention (lateral connections)
-        attn_output, _ = self.self_attention(
-            normalized, normalized, normalized
-        )
-
-        # Residual WITHOUT additional norm
+        attn_output, _ = self.self_attention(normalized, normalized, normalized)
         activations = activations + self.dropout(attn_output)
-        # [batch, seq_len, n_neurons]
 
-        # Debug: log activations after residual
         debug_logger.log_tensor("InputNeurons", "activations_post", activations)
 
         return activations
@@ -536,24 +389,16 @@ class InputNeurons(nn.Module):
 
 class ProcessNeurons(nn.Module):
     """
-    Process neuron layer with learned input combination analysis.
+    SIMPLIFIED process neuron layer.
 
-    Uses a small MLP to analyze input neuron selection patterns
-    and predict process neuron relevance.
-
-    Args:
-        d_model: Model dimension
-        n_input: Number of input neurons
-        n_process: Number of process neurons
-        hidden_dim: Hidden dimension for combination analyzer
+    No indexing, no hard selection - just clean matrix multiplication!
     """
 
     def __init__(
         self,
         d_model: int,
         n_input: int,
-        n_process: int,
-        hidden_dim: Optional[int] = None
+        n_process: int
     ):
         super().__init__()
 
@@ -561,25 +406,14 @@ class ProcessNeurons(nn.Module):
         self.n_input = n_input
         self.n_process = n_process
 
-        # Hidden dimension for combination analyzer
-        if hidden_dim is None:
-            hidden_dim = n_input * 2
-
-        # Combination weights: how process neurons combine input neurons
+        # How process neurons combine input neurons
         self.combination_weights = nn.Parameter(
             torch.empty(n_process, n_input)
         )
 
-        # Output projections: process neurons to model space
+        # Process neurons to output space
         self.output_projections = nn.Parameter(
             torch.empty(n_process, d_model)
-        )
-
-        # Learned combination analyzer
-        self.combination_analyzer = nn.Sequential(
-            nn.Linear(n_input, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, n_process)
         )
 
         self._init_weights()
@@ -588,103 +422,28 @@ class ProcessNeurons(nn.Module):
         nn.init.orthogonal_(self.combination_weights, gain=math.sqrt(2.0))
         nn.init.orthogonal_(self.output_projections, gain=math.sqrt(2.0))
 
-        for module in self.combination_analyzer:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
-                nn.init.zeros_(module.bias)
-
-    def forward(
-        self,
-        selected_activations: torch.Tensor,
-        selected_indices: torch.Tensor,
-        k: int
-    ) -> torch.Tensor:
+    def forward(self, weighted_activations: torch.Tensor) -> torch.Tensor:
         """
-        Process selected input neurons with learned combination analysis.
+        SIMPLE soft processing - just matmul!
 
         Args:
-            selected_activations: Selected neuron activations [batch, seq_len, k_in]
-            selected_indices: Indices of selected neurons [batch, k_in]
-            k: Number of process neurons to select
+            weighted_activations: [batch, seq_len, n_input]
 
         Returns:
-            output: Processed output [batch, seq_len, d_model]
+            output: [batch, seq_len, d_model]
         """
-        batch_size, seq_len, k_in = selected_activations.shape
-
-        # Gather relevant combination weights
-        combination_weights_expanded = self.combination_weights.unsqueeze(0).expand(
-            batch_size, -1, -1
-        )  # [batch, n_process, n_input]
-
-        indices_expanded = selected_indices.unsqueeze(1).expand(
-            -1, self.n_process, -1
-        )  # [batch, n_process, k_in]
-
-        selected_weights = torch.gather(
-            combination_weights_expanded, 2, indices_expanded
-        )  # [batch, n_process, k_in]
-
         # Compute process neuron activations
+        # [batch, seq_len, n_input] @ [n_input, n_process] = [batch, seq_len, n_process]
         process_activations = F.gelu(
-            torch.bmm(selected_activations, selected_weights.transpose(1, 2))
-        )  # [batch, seq_len, n_process]
+            weighted_activations @ self.combination_weights.T
+        )
 
-        # Debug: log process activations
         debug_logger.log_tensor("ProcessNeurons", "process_activations", process_activations)
 
-        # Create binary selection pattern
-        input_selection = torch.zeros(
-            batch_size, self.n_input,
-            dtype=torch.float32,
-            device=selected_indices.device
-        )
-        input_selection.scatter_(1, selected_indices, 1.0)
-        # [batch, n_input]
+        # Project to output
+        # [batch, seq_len, n_process] @ [n_process, d_model] = [batch, seq_len, d_model]
+        output = process_activations @ self.output_projections
 
-        # Analyze combination pattern
-        combination_relevance = self.combination_analyzer(input_selection)
-        # [batch, n_process]
-
-        # Compute activation-based scores
-        activation_scores, _ = process_activations.max(dim=1)
-        # [batch, n_process]
-
-        # Combine: activation magnitude × combination relevance
-        final_scores = activation_scores * torch.sigmoid(combination_relevance)
-        # [batch, n_process]
-
-        # Select top-k process neurons
-        _, process_indices = final_scores.topk(k, dim=-1)
-        # [batch, k]
-
-        # Gather selected process activations
-        process_indices_expanded = process_indices.unsqueeze(1).expand(
-            -1, seq_len, -1
-        )  # [batch, seq_len, k]
-
-        selected_process_activations = torch.gather(
-            process_activations, 2, process_indices_expanded
-        )  # [batch, seq_len, k]
-
-        # Gather corresponding output projections
-        output_projections_expanded = self.output_projections.unsqueeze(0).expand(
-            batch_size, -1, -1
-        )  # [batch, n_process, d_model]
-
-        process_indices_for_output = process_indices.unsqueeze(2).expand(
-            -1, -1, self.d_model
-        )  # [batch, k, d_model]
-
-        selected_projections = torch.gather(
-            output_projections_expanded, 1, process_indices_for_output
-        )  # [batch, k, d_model]
-
-        # Combine to produce output
-        output = torch.bmm(selected_process_activations, selected_projections)
-        # [batch, seq_len, d_model]
-
-        # Debug: log output
         debug_logger.log_tensor("ProcessNeurons", "output", output)
 
         return output
@@ -696,21 +455,16 @@ class ProcessNeurons(nn.Module):
 
 class DAWNBlock(nn.Module):
     """
-    Complete DAWN block combining routing, input neurons, and process neurons.
+    Complete DAWN block with PURE SOFT selection.
 
-    Args:
-        d_model: Model dimension
-        n_input: Number of input neurons
-        n_process: Number of process neurons
-        n_heads: Number of attention heads
-        dropout: Dropout probability
+    No k parameters, no hard selection - fully differentiable!
     """
 
     def __init__(
         self,
         d_model: int,
-        n_input: int = 64,
-        n_process: int = 128,
+        n_input: int = 128,
+        n_process: int = 256,
         n_heads: int = 8,
         dropout: float = 0.1
     ):
@@ -745,52 +499,27 @@ class DAWNBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        k_input: Optional[int] = None,
-        k_process: Optional[int] = None,
         mask: Optional[torch.Tensor] = None,
         return_routing_info: bool = False
-    ) -> Union[Tuple[torch.Tensor, Dict], Tuple[torch.Tensor, Dict, Dict]]:
+    ) -> Tuple[torch.Tensor, Dict] or Tuple[torch.Tensor, Dict, Dict]:
         """
-        Forward pass through DAWN block.
+        Forward with PURE soft selection.
 
-        Args:
-            x: Input tensor [batch, seq_len, d_model]
-            k_input: Number of input neurons to select (default: n_input // 2)
-            k_process: Number of process neurons to select (default: n_process // 2)
-            mask: Optional attention mask [batch, seq_len]
-            return_routing_info: Whether to return routing info for aux loss
-
-        Returns:
-            output: Processed tensor [batch, seq_len, d_model]
-            aux_loss: Dictionary of auxiliary losses
-            routing_info: (optional) Dictionary with indices and weights
+        NO k parameters - model decides everything!
         """
-        batch_size, seq_len, _ = x.shape
+        # Route with pure soft selection (no k!)
+        weights, context, selection_info = self.router(x, mask)
+        # weights: [batch, n_input] - ALL neurons, soft weights
 
-        # Set default k values
-        if k_input is None:
-            k_input = self.n_input // 2
-        if k_process is None:
-            k_process = self.n_process // 2
-
-        # Route to relevant neurons with SOFT selection
-        indices, weights, context, selection_info = self.router(x, k_input, mask)
-        # indices: [batch, k_input] (top-k for compatibility)
-        # weights: [batch, n_input] (SOFT weights, fully differentiable!)
-        # context: [batch, seq_len, d_model]
-        # selection_info: dict with sparsity metrics
-
-        # Compute auxiliary losses
-        neuron_usage = weights.mean(dim=0)  # [n_input]
+        # Compute aux losses
+        neuron_usage = weights.mean(dim=0)
         load_balance_loss = neuron_usage.std()
 
-        # Safe entropy calculation
         weights_clamped = weights.clamp(min=1e-10)
         entropy = -(weights_clamped * torch.log(weights_clamped)).sum(dim=-1).mean()
         max_entropy = math.log(self.n_input)
         entropy_loss = 1.0 - (entropy / max_entropy)
 
-        # Sparsity guidance with selection info
         sparsity_guidance = compute_learned_sparsity_loss(weights, selection_info)
 
         aux_loss = {
@@ -799,38 +528,29 @@ class DAWNBlock(nn.Module):
             'sparsity_guidance': sparsity_guidance
         }
 
-        # Compute input neuron activations
+        # Compute activations
         activations = self.input_neurons(context)
         # [batch, seq_len, n_input]
 
-        # Apply routing weights
+        # Apply soft routing (ALL neurons!)
         weighted_activations = activations * weights.unsqueeze(1)
         # [batch, seq_len, n_input]
+        # Gradient flows to ALL neurons!
 
-        # Select routed neurons
-        indices_expanded = indices.unsqueeze(1).expand(-1, seq_len, -1)
-        selected_activations = torch.gather(
-            weighted_activations, 2, indices_expanded
-        )
-        # [batch, seq_len, k_input]
-
-        # Process neurons
-        output = self.process_neurons(
-            selected_activations, indices, k_process
-        )
+        # Process (simple matmul!)
+        output = self.process_neurons(weighted_activations)
         # [batch, seq_len, d_model]
 
         output = self.dropout(output)
 
         if return_routing_info:
             routing_info = {
-                'indices': indices,
                 'weights': weights,
                 'learned_threshold': selection_info['learned_threshold'],
                 'learned_steepness': selection_info['learned_steepness'],
                 'effective_k': selection_info['effective_k'],
                 'effective_k_ratio': selection_info['effective_k_ratio'],
-                'learned_temp': selection_info['temperature']
+                'temperature': selection_info['temperature']
             }
             return output, aux_loss, routing_info
 
@@ -842,22 +562,13 @@ class DAWNBlock(nn.Module):
 # ============================================================
 
 class DAWNLayer(nn.Module):
-    """
-    DAWN layer with residual connection and layer normalization.
-
-    Args:
-        d_model: Model dimension
-        n_input: Number of input neurons
-        n_process: Number of process neurons
-        n_heads: Number of attention heads
-        dropout: Dropout probability
-    """
+    """DAWN layer with residual connection and layer normalization."""
 
     def __init__(
         self,
         d_model: int,
-        n_input: int = 64,
-        n_process: int = 128,
+        n_input: int = 128,
+        n_process: int = 256,
         n_heads: int = 8,
         dropout: float = 0.1
     ):
@@ -876,37 +587,19 @@ class DAWNLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        k_input: Optional[int] = None,
-        k_process: Optional[int] = None,
         mask: Optional[torch.Tensor] = None,
         return_routing_info: bool = False
-    ) -> Union[Tuple[torch.Tensor, dict], Tuple[torch.Tensor, dict, dict]]:
-        """
-        Forward pass with residual connection.
-
-        Args:
-            x: Input tensor [batch, seq_len, d_model]
-            k_input: Number of input neurons to select
-            k_process: Number of process neurons to select
-            mask: Optional attention mask
-            return_routing_info: Whether to return routing info
-
-        Returns:
-            output: Layer output [batch, seq_len, d_model]
-            aux_loss: Auxiliary losses from block
-            routing_info: (optional) Routing information
-        """
-        # Pre-LN: Normalize BEFORE block
+    ) -> Tuple[torch.Tensor, dict] or Tuple[torch.Tensor, dict, dict]:
+        """Forward with residual connection."""
         normed = self.norm(x)
 
         if return_routing_info:
             output, aux_loss, routing_info = self.block(
-                normed, k_input, k_process, mask, return_routing_info=True
+                normed, mask, return_routing_info=True
             )
-            # Residual WITHOUT additional norm
             return x + output, aux_loss, routing_info
 
-        output, aux_loss = self.block(normed, k_input, k_process, mask)
+        output, aux_loss = self.block(normed, mask)
         return x + output, aux_loss
 
 
@@ -915,29 +608,17 @@ class DAWNLayer(nn.Module):
 # ============================================================
 
 class DAWNLanguageModel(nn.Module):
-    """
-    DAWN-based language model.
-
-    Args:
-        vocab_size: Vocabulary size
-        d_model: Model dimension
-        n_layers: Number of DAWN layers
-        n_input: Number of input neurons per layer
-        n_process: Number of process neurons per layer
-        n_heads: Number of attention heads
-        max_seq_len: Maximum sequence length
-        dropout: Dropout probability
-    """
+    """DAWN-based language model with PURE SOFT selection."""
 
     def __init__(
         self,
         vocab_size: int,
         d_model: int = 512,
-        n_layers: int = 12,
-        n_input: int = 64,
-        n_process: int = 128,
+        n_layers: int = 6,
+        n_input: int = 128,
+        n_process: int = 256,
         n_heads: int = 8,
-        max_seq_len: int = 2048,
+        max_seq_len: int = 512,
         dropout: float = 0.1,
         **kwargs
     ):
@@ -982,63 +663,40 @@ class DAWNLanguageModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        k_input: Optional[int] = None,
-        k_process: Optional[int] = None,
         return_routing_info: bool = False
     ) -> dict:
-        """
-        Forward pass through the model.
-
-        Args:
-            input_ids: Input token IDs [batch, seq_len]
-            attention_mask: Attention mask [batch, seq_len]
-            labels: Target labels for language modeling [batch, seq_len]
-            k_input: Number of input neurons to select
-            k_process: Number of process neurons to select
-            return_routing_info: Whether to return routing info for aux loss
-
-        Returns:
-            Dictionary containing:
-                - logits: Output logits [batch, seq_len, vocab_size]
-                - loss: Cross-entropy loss (if labels provided)
-                - aux_loss: Aggregated auxiliary losses
-                - routing_info: (optional) List of routing info per layer
-        """
+        """Forward pass - NO k parameters!"""
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
         # Embeddings
         token_emb = self.token_embedding(input_ids)
-        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(
-            batch_size, -1
-        )
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         position_emb = self.position_embedding(positions)
 
         x = self.dropout(token_emb + position_emb)
 
-        # Process through DAWN layers
+        # Process through layers
         all_aux_losses = []
         routing_info_list = [] if return_routing_info else None
 
         for layer in self.layers:
             if return_routing_info:
                 x, aux_loss, routing_info = layer(
-                    x, k_input, k_process, mask=attention_mask,
-                    return_routing_info=True
+                    x, mask=attention_mask, return_routing_info=True
                 )
                 routing_info_list.append(routing_info)
             else:
-                x, aux_loss = layer(x, k_input, k_process, mask=attention_mask)
+                x, aux_loss = layer(x, mask=attention_mask)
             all_aux_losses.append(aux_loss)
 
-        # Output projection
+        # Output
         x = self.norm(x)
         logits = self.output(x)
 
-        # Debug: log logits
         debug_logger.log_tensor("Model", "logits", logits)
 
-        # Compute loss if labels provided
+        # Loss
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
@@ -1046,18 +704,16 @@ class DAWNLanguageModel(nn.Module):
                 labels.view(-1),
                 ignore_index=-100
             )
-            # Debug: log loss
             debug_logger.log("Model", f"loss: {loss.item():.4f}, nan: {torch.isnan(loss).item()}")
 
-        # Aggregate auxiliary losses
+        # Aggregate aux losses
         aggregated_aux = {
             'load_balance': sum(l['load_balance'] for l in all_aux_losses) / len(all_aux_losses),
             'entropy': sum(l['entropy'] for l in all_aux_losses) / len(all_aux_losses),
             'sparsity_guidance': sum(l['sparsity_guidance'] for l in all_aux_losses) / len(all_aux_losses)
         }
 
-        # Debug: log aux losses
-        debug_logger.log("Model", f"aux_loss - load_balance: {aggregated_aux['load_balance']:.4f}, entropy: {aggregated_aux['entropy']:.4f}")
+        debug_logger.log("Model", f"aux_loss - lb: {aggregated_aux['load_balance']:.4f}, ent: {aggregated_aux['entropy']:.4f}, sp: {aggregated_aux['sparsity_guidance']:.4f}")
 
         result = {'logits': logits, 'loss': loss, 'aux_loss': aggregated_aux}
 
@@ -1069,9 +725,7 @@ class DAWNLanguageModel(nn.Module):
     def get_model_stats(self) -> dict:
         """Get model statistics."""
         total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(
-            p.numel() for p in self.parameters() if p.requires_grad
-        )
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
         return {
             'total_parameters': total_params,
@@ -1107,7 +761,7 @@ HierarchicalLanguageModel = DAWNLanguageModel
 if __name__ == '__main__':
     print("=" * 60)
     print("DAWN: Dynamic Architecture With Neurons")
-    print("Attention-based routing (no Gumbel)")
+    print("Pure soft selection - Zero manual configuration")
     print("=" * 60)
     print()
 
@@ -1115,8 +769,8 @@ if __name__ == '__main__':
         vocab_size=30000,
         d_model=512,
         n_layers=6,
-        n_input=64,
-        n_process=128,
+        n_input=128,
+        n_process=256,
         n_heads=8,
         max_seq_len=512,
         dropout=0.1
@@ -1126,6 +780,8 @@ if __name__ == '__main__':
     print("Model Configuration:")
     print(f"  Layers: {stats['n_layers']}")
     print(f"  Model dimension: {stats['d_model']}")
+    print(f"  Input neurons: {128} (learned sparsity)")
+    print(f"  Process neurons: {256} (learned sparsity)")
     print(f"  Total parameters: {stats['total_parameters']:,}")
     print(f"  Trainable parameters: {stats['trainable_parameters']:,}")
     print()
@@ -1145,4 +801,6 @@ if __name__ == '__main__':
     print(f"  Routing info layers: {len(output['routing_info'])}")
     print()
 
-    print("✓ Attention-based router ready!")
+    print("✓ Pure soft selection ready!")
+    print("✓ Zero manual configuration!")
+    print("✓ All parameters learned from data!")
