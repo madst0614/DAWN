@@ -297,17 +297,33 @@ def analyze_neuron_usage(model, val_loader, device, max_batches=50):
     return results
 
 
-def analyze_neuron_specialization(model, val_loader, tokenizer, device, max_batches=30):
-    """뉴런 특화 분석 - 어떤 토큰이 어떤 뉴런을 활성화하는지"""
-    print("\n💎 Analyzing Neuron Specialization...")
+def analyze_neuron_specialization(model, val_loader, tokenizer, device, max_batches=100, layer_idx=3):
+    """
+    뉴런 특화 분석 - PMI 기반 개선 버전
 
-    n_input = model.layers[0].block.n_input
+    개선점:
+    - PMI (Pointwise Mutual Information) 사용으로 frequent token bias 제거
+    - 모든 tokens 고려 (not just first 10)
+    - 특정 layer 분석 (default: layer 3)
+    - 더 많은 batches (100)
 
-    # Track which tokens activate which neurons (first layer only for simplicity)
+    Args:
+        layer_idx: 분석할 layer (기본값: 3, middle layer)
+    """
+    print(f"\n💎 Analyzing Neuron Specialization (Layer {layer_idx}, PMI-based)...")
+
+    n_input = model.layers[layer_idx].block.n_input
+
+    # Global token frequency (전체 토큰 빈도)
+    global_token_counts = defaultdict(int)
+
+    # Per-neuron token co-occurrence
     neuron_token_counts = defaultdict(lambda: defaultdict(int))
-    total_activations = defaultdict(int)
+    neuron_activation_counts = defaultdict(int)
 
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc="Specialization analysis")):
+    total_tokens = 0
+
+    for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Specialization analysis (L{layer_idx})")):
         if batch_idx >= max_batches:
             break
 
@@ -320,55 +336,92 @@ def analyze_neuron_specialization(model, val_loader, tokenizer, device, max_batc
             pos_emb = model.position_embedding(positions)
             x = model.dropout(token_emb + pos_emb)
 
-            # Analyze first layer routing
-            layer = model.layers[0]
+            # Forward through layers up to target layer
+            for i in range(layer_idx):
+                x, _ = model.layers[i](x)
+
+            # Get routing for target layer
+            layer = model.layers[layer_idx]
             k_input = layer.block.n_input // 2
             indices, _, _ = layer.block.router(x, k_input)
 
-            # Track token-neuron associations
+            # Track ALL tokens (not just first 10!)
             for b in range(B):
                 for neuron_idx in indices[b].cpu().tolist():
-                    total_activations[neuron_idx] += 1
-                    # Sample some tokens from this batch
-                    for token_id in input_ids[b, :10].cpu().tolist():  # First 10 tokens
-                        neuron_token_counts[neuron_idx][token_id] += 1
+                    neuron_activation_counts[neuron_idx] += 1
 
-    # Compute specialization metrics
-    specialized_neurons = []
-    diversities = []
+                    # Count ALL tokens in sequence
+                    for pos in range(S):
+                        token_id = input_ids[b, pos].item()
+                        # Skip special tokens (PAD, CLS, SEP)
+                        if token_id not in [0, 101, 102]:
+                            neuron_token_counts[neuron_idx][token_id] += 1
+                            global_token_counts[token_id] += 1
+                            total_tokens += 1
+
+    # Compute PMI for each neuron
+    total_activations = sum(neuron_activation_counts.values())
+
+    neuron_specializations = []
 
     for neuron_idx in range(n_input):
-        if total_activations[neuron_idx] == 0:
-            continue
+        if neuron_activation_counts[neuron_idx] < 10:
+            continue  # Skip rarely activated neurons
 
-        token_counts = neuron_token_counts[neuron_idx]
-        if not token_counts:
-            continue
+        token_pmi_scores = {}
 
-        # Compute diversity (number of unique tokens)
-        diversity = len(token_counts)
-        diversities.append(diversity)
+        for token_id, count in neuron_token_counts[neuron_idx].items():
+            # P(token, neuron) = joint probability
+            p_joint = count / total_tokens
 
-        # Find most common tokens
-        top_tokens = sorted(token_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        top_token_ids = [t[0] for t in top_tokens]
-        top_token_words = [tokenizer.decode([t]) for t in top_token_ids]
+            # P(token) = marginal probability
+            p_token = global_token_counts[token_id] / total_tokens
 
-        # Check if specialized (low diversity = specialized)
-        if diversity < 50:  # Threshold for specialization
-            specialized_neurons.append({
+            # P(neuron) = marginal probability
+            p_neuron = neuron_activation_counts[neuron_idx] / total_activations
+
+            # PMI = log(P(token, neuron) / (P(token) * P(neuron)))
+            # Higher PMI = stronger association (not just frequency!)
+            if p_token > 0 and p_neuron > 0 and p_joint > 0:
+                pmi = np.log((p_joint / (p_token * p_neuron)) + 1e-10)
+                token_pmi_scores[token_id] = pmi
+
+        # Sort by PMI (not raw count!)
+        top_tokens_pmi = sorted(token_pmi_scores.items(), key=lambda x: x[1], reverse=True)[:10]
+
+        if top_tokens_pmi:
+            top_token_words = []
+            for token_id, pmi_score in top_tokens_pmi:
+                try:
+                    word = tokenizer.decode([token_id])
+                except:
+                    word = f"[{token_id}]"
+                top_token_words.append({
+                    'token': word,
+                    'pmi': float(pmi_score),
+                    'raw_count': neuron_token_counts[neuron_idx][token_id]
+                })
+
+            # Compute specialization strength (avg PMI of top tokens)
+            avg_pmi = np.mean([pmi for _, pmi in top_tokens_pmi[:5]])
+
+            neuron_specializations.append({
                 'neuron_idx': neuron_idx,
-                'diversity': diversity,
-                'top_tokens': top_token_words,
-                'activation_count': total_activations[neuron_idx]
+                'specialization_strength': float(avg_pmi),
+                'top_tokens_pmi': top_token_words,
+                'activation_count': neuron_activation_counts[neuron_idx],
+                'unique_tokens': len(token_pmi_scores)
             })
 
+    # Sort by specialization strength
+    neuron_specializations.sort(key=lambda x: x['specialization_strength'], reverse=True)
+
     results = {
-        'total_analyzed': len(diversities),
-        'avg_diversity': float(np.mean(diversities)) if diversities else 0,
-        'std_diversity': float(np.std(diversities)) if diversities else 0,
-        'specialized_count': len(specialized_neurons),
-        'specialized_neurons': specialized_neurons[:10]  # Top 10
+        'layer_idx': layer_idx,
+        'total_analyzed': len(neuron_specializations),
+        'avg_specialization': float(np.mean([n['specialization_strength'] for n in neuron_specializations])) if neuron_specializations else 0,
+        'specialized_neurons': neuron_specializations[:20],  # Top 20 most specialized
+        'total_tokens_analyzed': total_tokens
     }
 
     return results
@@ -980,19 +1033,25 @@ def comprehensive_analysis(model, val_loader, tokenizer, device):
         print(f"  Layer {layer_idx}: balance_score={stats['load_balance_score']:.3f}, "
               f"gini={stats['gini_coefficient']:.3f}")
 
-    # 3. Specialization
-    spec_results = analyze_neuron_specialization(model, val_loader, tokenizer, device)
+    # 3. Specialization (PMI-based)
+    spec_results = analyze_neuron_specialization(
+        model, val_loader, tokenizer, device,
+        max_batches=100,  # More batches for better PMI estimates
+        layer_idx=3  # Middle layer (can be adjusted)
+    )
     results['specialization'] = spec_results
 
-    print("\n💎 NEURON SPECIALIZATION")
+    print("\n💎 NEURON SPECIALIZATION (PMI-based)")
     print("-" * 40)
+    print(f"  Layer: {spec_results['layer_idx']}")
     print(f"  Analyzed neurons: {spec_results['total_analyzed']}")
-    print(f"  Avg diversity: {spec_results['avg_diversity']:.1f}±{spec_results['std_diversity']:.1f}")
-    print(f"  Specialized neurons: {spec_results['specialized_count']}")
+    print(f"  Avg specialization (PMI): {spec_results['avg_specialization']:.3f}")
+    print(f"  Total tokens: {spec_results['total_tokens_analyzed']:,}")
     if spec_results['specialized_neurons']:
-        print(f"  Top specialized:")
-        for neuron in spec_results['specialized_neurons'][:3]:
-            print(f"    Neuron {neuron['neuron_idx']}: {neuron['top_tokens'][:3]}")
+        print(f"  Top specialized neurons:")
+        for neuron in spec_results['specialized_neurons'][:5]:
+            tokens = [f"{t['token']}({t['pmi']:.2f})" for t in neuron['top_tokens_pmi'][:3]]
+            print(f"    Neuron {neuron['neuron_idx']}: {', '.join(tokens)}")
 
     # 4. Layer Differences
     layer_results = analyze_layer_differences(model, val_loader, device)
