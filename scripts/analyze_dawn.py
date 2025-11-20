@@ -175,14 +175,15 @@ def load_checkpoint(checkpoint_path, device='cuda'):
 # ============================================================
 
 def analyze_routing_patterns(model, val_loader, device, max_batches=50):
-    """Router 패턴 분석 - 각 레이어의 라우팅 통계"""
+    """Router 패턴 분석 - 각 레이어의 소프트 라우팅 통계"""
     print("\n📊 Analyzing Routing Patterns...")
 
     n_layers = len(model.layers)
     n_input = model.layers[0].block.n_input
 
-    # Track neuron selection counts per layer
-    layer_selection_counts = [torch.zeros(n_input, device=device) for _ in range(n_layers)]
+    # Track soft weight accumulation per layer
+    layer_weight_sums = [torch.zeros(n_input, device=device) for _ in range(n_layers)]
+    layer_learned_params = [[] for _ in range(n_layers)]
     total_samples = 0
 
     for batch_idx, batch in enumerate(tqdm(val_loader, desc="Routing analysis")):
@@ -203,15 +204,20 @@ def analyze_routing_patterns(model, val_loader, device, max_batches=50):
 
             # Track routing through layers
             for layer_idx, layer in enumerate(model.layers):
-                # Get router output
-                k_input = layer.block.n_input // 2
-                indices, weights, context = layer.block.router(x, k_input)
+                # Get router output (pure soft selection!)
+                weights, context, selection_info = layer.block.router(x)
 
-                # Count selections
-                for b in range(batch_size):
-                    layer_selection_counts[layer_idx].scatter_add_(
-                        0, indices[b], torch.ones(k_input, device=device)
-                    )
+                # Accumulate soft weights
+                layer_weight_sums[layer_idx] += weights.sum(dim=0)
+
+                # Track learned parameters
+                layer_learned_params[layer_idx].append({
+                    'threshold': selection_info['learned_threshold'],
+                    'steepness': selection_info['learned_steepness'],
+                    'temperature': selection_info['temperature'],
+                    'effective_k': selection_info['effective_k'],
+                    'effective_k_ratio': selection_info['effective_k_ratio']
+                })
 
                 # Forward through layer for next iteration
                 x, _ = layer(x)
@@ -225,16 +231,31 @@ def analyze_routing_patterns(model, val_loader, device, max_batches=50):
     }
 
     for layer_idx in range(n_layers):
-        counts = layer_selection_counts[layer_idx].cpu().numpy()
-        usage_ratio = counts / (total_samples * (n_input // 2))
+        # Average soft weights
+        avg_weights = (layer_weight_sums[layer_idx] / total_samples).cpu().numpy()
+
+        # Average learned parameters
+        params = layer_learned_params[layer_idx]
+        avg_threshold = sum(p['threshold'] for p in params) / len(params)
+        avg_steepness = sum(p['steepness'] for p in params) / len(params)
+        avg_temperature = sum(p['temperature'] for p in params) / len(params)
+        avg_effective_k = sum(p['effective_k'] for p in params) / len(params)
+        avg_effective_k_ratio = sum(p['effective_k_ratio'] for p in params) / len(params)
 
         results['layers'][layer_idx] = {
-            'mean_usage': float(usage_ratio.mean()),
-            'std_usage': float(usage_ratio.std()),
-            'min_usage': float(usage_ratio.min()),
-            'max_usage': float(usage_ratio.max()),
-            'unused_neurons': int((counts == 0).sum()),
-            'top_5_neurons': counts.argsort()[-5:][::-1].tolist()
+            'mean_weight': float(avg_weights.mean()),
+            'std_weight': float(avg_weights.std()),
+            'min_weight': float(avg_weights.min()),
+            'max_weight': float(avg_weights.max()),
+            'low_weight_neurons': int((avg_weights < 0.001).sum()),
+            'top_5_neurons': avg_weights.argsort()[-5:][::-1].tolist(),
+            'learned_params': {
+                'threshold': avg_threshold,
+                'steepness': avg_steepness,
+                'temperature': avg_temperature,
+                'effective_k': avg_effective_k,
+                'effective_k_ratio': avg_effective_k_ratio
+            }
         }
 
     return results
@@ -267,8 +288,7 @@ def analyze_neuron_usage(model, val_loader, device, max_batches=50):
             x = model.dropout(token_emb + pos_emb)
 
             for layer_idx, layer in enumerate(model.layers):
-                k_input = layer.block.n_input // 2
-                _, weights, _ = layer.block.router(x, k_input)
+                weights, _, _ = layer.block.router(x)
 
                 # Accumulate weights
                 layer_weights[layer_idx] += weights.sum(dim=0)
@@ -342,12 +362,15 @@ def analyze_neuron_specialization(model, val_loader, tokenizer, device, max_batc
 
             # Get routing for target layer
             layer = model.layers[layer_idx]
-            k_input = layer.block.n_input // 2
-            indices, _, _ = layer.block.router(x, k_input)
+            weights, _, selection_info = layer.block.router(x)
+
+            # Get top-k neurons based on soft weights (for analysis)
+            k_eff = int(selection_info['effective_k'])
+            _, top_indices = weights.topk(k_eff, dim=-1)
 
             # Track ALL tokens (not just first 10!)
             for b in range(B):
-                for neuron_idx in indices[b].cpu().tolist():
+                for neuron_idx in top_indices[b].cpu().tolist():
                     neuron_activation_counts[neuron_idx] += 1
 
                     # Count ALL tokens in sequence
@@ -879,17 +902,18 @@ def analyze_top_neurons(model, val_loader, tokenizer, device, layer_idx=None, to
 
             # Get routing for target layer
             layer = model.layers[layer_idx]
-            k_input = layer.block.n_input // 2
-            indices, weights, _ = layer.block.router(x, k_input)
+            weights, _, selection_info = layer.block.router(x)
 
-            # Count neuron usage
+            # Accumulate soft weights
+            neuron_counts += weights.sum(dim=0)
+
+            # Get top neurons for token association tracking
+            k_eff = int(selection_info['effective_k'])
+            _, top_indices = weights.topk(k_eff, dim=-1)
+
+            # Track token-neuron associations
             for b in range(B):
-                neuron_counts.scatter_add_(
-                    0, indices[b], torch.ones(k_input, device=device)
-                )
-
-                # Track token-neuron associations
-                for neuron_idx in indices[b].cpu().tolist():
+                for neuron_idx in top_indices[b].cpu().tolist():
                     for token_id in input_ids[b, :20].cpu().tolist():  # First 20 tokens
                         neuron_token_affinity[neuron_idx][token_id] += 1
 
