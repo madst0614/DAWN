@@ -148,10 +148,7 @@ class TrainingMonitor:
         os.makedirs(log_dir, exist_ok=True)
 
         # Create log file
-        self.log_file = os.path.join(
-            log_dir,
-            f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-        )
+        self.log_file = os.path.join(log_dir, "training_log.jsonl")
 
     def log_epoch(self, epoch: int, metrics: Dict):
         """
