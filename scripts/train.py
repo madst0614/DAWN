@@ -696,8 +696,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 outputs = model(
                     input_ids=input_ids,
                     labels=labels,
-                    k_input=args.k_input,
-                    k_process=args.k_process,
+                    k_input=None,  # Let model learn k automatically!
+                    k_process=None,  # Let model learn k automatically!
                     return_routing_info=True
                 )
                 loss = outputs['loss']
@@ -729,7 +729,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     gini = 0.0
                     layer_ginis = [0.0] * n_layers
 
-                total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss
+                # NEW: Add learned sparsity guidance from model
+                sparsity_guidance = outputs.get('aux_loss', {}).get('sparsity_guidance', 0.0)
+                sparsity_weight = 0.005  # Small weight for soft guidance
+
+                total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss + sparsity_weight * sparsity_guidance
 
             # NaN/Inf detection - STOP immediately
             if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
@@ -795,8 +799,8 @@ Router weights check:
             outputs = model(
                 input_ids=input_ids,
                 labels=labels,
-                k_input=args.k_input,
-                k_process=args.k_process,
+                k_input=None,  # Let model learn k automatically!
+                k_process=None,  # Let model learn k automatically!
                 return_routing_info=True
             )
             loss = outputs['loss']
@@ -828,7 +832,11 @@ Router weights check:
                 gini = 0.0
                 layer_ginis = [0.0] * n_layers
 
-            total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss
+            # NEW: Add learned sparsity guidance from model
+            sparsity_guidance = outputs.get('aux_loss', {}).get('sparsity_guidance', 0.0)
+            sparsity_weight = 0.005  # Small weight for soft guidance
+
+            total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss + sparsity_weight * sparsity_guidance
 
             # NaN/Inf detection - STOP immediately
             if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
@@ -962,10 +970,27 @@ Router weights check:
             # Format layer gini as comma-separated
             layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
 
+            # NEW: Collect learned parameters from each layer
+            learned_k_ratios = []
+            learned_temps = []
+            learned_ks = []
+            for layer in model.layers:
+                router = layer.block.router
+                learned_k_ratios.append(router.get_k_ratio().item())
+                learned_temps.append(router.get_temperature().item())
+                # Compute actual k from k_ratio
+                actual_k = max(int(router.n_neurons * router.get_k_ratio().item()), 8)
+                learned_ks.append(actual_k)
+
+            k_ratio_str = ",".join([f"{r:.3f}" for r in learned_k_ratios])
+            temp_str = ",".join([f"{t:.2f}" for t in learned_temps])
+            k_str = ",".join([f"{k}" for k in learned_ks])
+
             with open(log_file, 'a') as f:
                 f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
                        f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
-                       f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}]\n")
+                       f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}],"
+                       f"learned_k=[{k_str}],learned_k_ratio=[{k_ratio_str}],learned_temp=[{temp_str}]\n")
 
             # Reset window accumulators
             window_loss = 0.0
@@ -993,10 +1018,26 @@ Router weights check:
         avg_window_layer_gini = [g / window_count for g in window_layer_gini]
         layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
 
+        # NEW: Collect learned parameters from each layer
+        learned_k_ratios = []
+        learned_temps = []
+        learned_ks = []
+        for layer in model.layers:
+            router = layer.block.router
+            learned_k_ratios.append(router.get_k_ratio().item())
+            learned_temps.append(router.get_temperature().item())
+            actual_k = max(int(router.n_neurons * router.get_k_ratio().item()), 8)
+            learned_ks.append(actual_k)
+
+        k_ratio_str = ",".join([f"{r:.3f}" for r in learned_k_ratios])
+        temp_str = ",".join([f"{t:.2f}" for t in learned_temps])
+        k_str = ",".join([f"{k}" for k in learned_ks])
+
         with open(log_file, 'a') as f:
             f.write(f"epoch={epoch},step={num_batches},loss={avg_window_loss:.6f},"
                    f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
-                   f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}]\n")
+                   f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}],"
+                   f"learned_k=[{k_str}],learned_k_ratio=[{k_ratio_str}],learned_temp=[{temp_str}]\n")
 
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
@@ -1038,8 +1079,8 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
             outputs = model(
                 input_ids=masked_input_ids,
                 labels=labels,
-                k_input=args.k_input,
-                k_process=args.k_process
+                k_input=None,  # Let model learn k automatically!
+                k_process=None  # Let model learn k automatically!
             )
             loss = outputs['loss']
             logits = outputs['logits']
@@ -1322,18 +1363,19 @@ def main():
     for epoch in range(start_epoch, args.num_epochs + 1):
         epoch_start = time.time()
 
-        # Curriculum learning: adjust k values (dense → sparse)
-        k_input, k_process = get_curriculum_k_values(
-            epoch, args.num_epochs, args.n_input, args.n_process
-        )
-        args.k_input = k_input
-        args.k_process = k_process
-
-        # Temperature annealing: update router temperature (explore → exploit)
-        temperature = update_temperature(model, epoch, args.num_epochs)
+        # ============================================================
+        # NEW: No manual curriculum or temperature scheduling!
+        # Model learns k_ratio and temperature automatically
+        # ============================================================
+        # REMOVED: get_curriculum_k_values() - model decides k
+        # REMOVED: update_temperature() - model learns temperature
 
         if epoch == 1 or epoch % 5 == 0:
-            print(f"\nEpoch {epoch}: k_input={k_input}, k_process={k_process}, temp={temperature:.2f}")
+            # Log learned parameters instead
+            sample_router = model.layers[0].block.router
+            learned_k_ratio = sample_router.get_k_ratio().item()
+            learned_temp = sample_router.get_temperature().item()
+            print(f"\nEpoch {epoch}: Learned k_ratio={learned_k_ratio:.3f}, temp={learned_temp:.2f} (Layer 0 sample)")
 
         # Train
         train_loss, train_acc, routing_metrics = train_epoch(

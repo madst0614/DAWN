@@ -16,10 +16,18 @@ model:
   max_seq_len: 128
   dropout: 0.1
 
-# Sparsity (active neurons)
+# ============================================================
+# Sparsity - FULLY LEARNABLE! (Zero manual intervention)
+# ============================================================
 sparsity:
-  k_input: null        # null = n_input // 2
-  k_process: null      # null = n_process // 2
+  k_input: null        # null = MODEL DECIDES automatically
+  k_process: null      # null = MODEL DECIDES automatically
+
+  # Learned sparsity guidance (soft constraints)
+  guidance:
+    min_ratio: 0.2     # Don't go below 20% (maintain capacity)
+    max_ratio: 0.8     # Don't go above 80% (ensure specialization)
+    prefer_moderate: true  # Soft penalty for extremes (Gini 0.2-0.6)
 
 # Training
 training:
@@ -29,11 +37,14 @@ training:
   weight_decay: 0.01
   warmup_epochs: 2
 
-# Router specific
+# ============================================================
+# Router - FULLY LEARNABLE! (Zero manual intervention)
+# ============================================================
 router:
   lr_multiplier: 5.0   # Router LR = lr * multiplier
-  weight_decay: 0.001
-  temperature: 2.0     # Fixed high for exploration
+  weight_decay: 0.0    # No weight decay for router (learns k_ratio, temperature)
+  # REMOVED: temperature - now a LEARNED parameter!
+  # REMOVED: curriculum - model decides k automatically!
 
 # Auxiliary loss
 aux_loss_weight: 0.01
@@ -42,6 +53,7 @@ aux_loss_weights:
   usage: 0.01          # Uniform usage
   variance: 0.001      # Meaningful weights
   load_balance: 0.01   # Cross-batch balance
+  sparsity_guidance: 0.005  # NEW: Guide learned sparsity (very small)
 
 # Mixed precision
 use_amp: true
