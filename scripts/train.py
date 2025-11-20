@@ -894,6 +894,37 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 total_loss_combined = loss + aux_weight * aux_loss
 
+            # NaN/Inf detection - STOP immediately
+            if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
+                nan_info = f"""
+{'='*60}
+NaN/Inf DETECTED - STOPPING TRAINING
+{'='*60}
+Epoch: {epoch}, Step: {step}
+Loss: {loss.item() if not torch.isnan(loss) else 'NaN'}
+Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') and not torch.isnan(aux_loss) else aux_loss}
+Total Loss: {total_loss_combined.item() if not torch.isnan(total_loss_combined) else 'NaN'}
+Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]
+Logits has NaN: {torch.isnan(logits).any().item()}
+Logits has Inf: {torch.isinf(logits).any().item()}
+
+Router weights check:
+"""
+                for name, param in model.named_parameters():
+                    if 'router' in name:
+                        has_nan = torch.isnan(param).any().item()
+                        has_inf = torch.isinf(param).any().item()
+                        nan_info += f"  {name}: NaN={has_nan}, Inf={has_inf}, norm={param.norm().item():.4f}\n"
+
+                nan_info += f"{'='*60}\n"
+
+                # Log to debug file
+                if debug_log_file:
+                    with open(debug_log_file, 'a') as f:
+                        f.write(nan_info)
+
+                raise RuntimeError(f"NaN/Inf detected at epoch {epoch}, step {step}. Check debug log for details.")
+
             if debug_mode:
                 print(f"\nAfter Forward:")
                 print(f"  Logits shape: {logits.shape}")
@@ -958,6 +989,37 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 gini = 0.0
 
             total_loss_combined = loss + aux_weight * aux_loss
+
+            # NaN/Inf detection - STOP immediately
+            if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
+                nan_info = f"""
+{'='*60}
+NaN/Inf DETECTED - STOPPING TRAINING
+{'='*60}
+Epoch: {epoch}, Step: {step}
+Loss: {loss.item() if not torch.isnan(loss) else 'NaN'}
+Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') and not torch.isnan(aux_loss) else aux_loss}
+Total Loss: {total_loss_combined.item() if not torch.isnan(total_loss_combined) else 'NaN'}
+Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]
+Logits has NaN: {torch.isnan(logits).any().item()}
+Logits has Inf: {torch.isinf(logits).any().item()}
+
+Router weights check:
+"""
+                for name, param in model.named_parameters():
+                    if 'router' in name:
+                        has_nan = torch.isnan(param).any().item()
+                        has_inf = torch.isinf(param).any().item()
+                        nan_info += f"  {name}: NaN={has_nan}, Inf={has_inf}, norm={param.norm().item():.4f}\n"
+
+                nan_info += f"{'='*60}\n"
+
+                # Log to debug file
+                if debug_log_file:
+                    with open(debug_log_file, 'a') as f:
+                        f.write(nan_info)
+
+                raise RuntimeError(f"NaN/Inf detected at epoch {epoch}, step {step}. Check debug log for details.")
 
             if debug_mode:
                 print(f"\nAfter Forward:")

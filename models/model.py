@@ -104,11 +104,8 @@ class DynamicRouter(nn.Module):
         # Query: "What do we have?" (context)
         # Key/Value: "What patterns exist?" (neuron_patterns)
 
-        # Normalize neuron patterns for stability (weight normalization)
-        neuron_patterns_normalized = F.normalize(self.neuron_patterns, p=2, dim=-1)
-
         # Expand neuron patterns for batch dimension
-        neuron_kv = neuron_patterns_normalized.unsqueeze(0).expand(
+        neuron_kv = self.neuron_patterns.unsqueeze(0).expand(
             batch_size, -1, -1
         )  # [batch, n_neurons, d_model]
 
@@ -133,15 +130,9 @@ class DynamicRouter(nn.Module):
         # scores = attn_weights.mean(dim=1)  # "average need"
         # scores = (attn_weights.max(dim=1)[0] + attn_weights.mean(dim=1)) / 2
 
-        # Step 4: Score normalization for numerical stability
-        # Normalize to mean 0, std 1 to prevent softmax overflow
-        scores_mean = scores.mean(dim=-1, keepdim=True)
-        scores_std = scores.std(dim=-1, keepdim=True) + 1e-8
-        scores_normalized = (scores - scores_mean) / scores_std
-
-        # Step 5: Soft top-k selection (stable!)
+        # Step 4: Soft top-k selection (stable!)
         # Apply temperature for exploration/exploitation balance
-        probs = F.softmax(scores_normalized / self.temperature, dim=-1)
+        probs = F.softmax(scores / self.temperature, dim=-1)
         # [batch, n_neurons]
 
         # Get top-k indices based on scores
@@ -216,11 +207,8 @@ class InputNeurons(nn.Module):
         Returns:
             activations: Neuron activations [batch, seq_len, n_neurons]
         """
-        # Normalize patterns for stability (weight normalization)
-        patterns_normalized = F.normalize(self.patterns, p=2, dim=-1)
-
         # Transform to neuron space
-        activations = F.gelu(context @ patterns_normalized.T)
+        activations = F.gelu(context @ self.patterns.T)
         # [batch, seq_len, n_neurons]
 
         # Neuron self-attention (lateral connections)
@@ -313,11 +301,8 @@ class ProcessNeurons(nn.Module):
         """
         batch_size, seq_len, k_in = selected_activations.shape
 
-        # Normalize weights for stability (weight normalization)
-        combination_weights_normalized = F.normalize(self.combination_weights, p=2, dim=-1)
-
         # Gather relevant combination weights
-        combination_weights_expanded = combination_weights_normalized.unsqueeze(0).expand(
+        combination_weights_expanded = self.combination_weights.unsqueeze(0).expand(
             batch_size, -1, -1
         )  # [batch, n_process, n_input]
 
@@ -368,11 +353,8 @@ class ProcessNeurons(nn.Module):
             process_activations, 2, process_indices_expanded
         )  # [batch, seq_len, k]
 
-        # Normalize output projections for stability (weight normalization)
-        output_projections_normalized = F.normalize(self.output_projections, p=2, dim=-1)
-
         # Gather corresponding output projections
-        output_projections_expanded = output_projections_normalized.unsqueeze(0).expand(
+        output_projections_expanded = self.output_projections.unsqueeze(0).expand(
             batch_size, -1, -1
         )  # [batch, n_process, d_model]
 
