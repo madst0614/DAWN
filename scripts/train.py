@@ -818,6 +818,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     total_tokens = 0
     total_correct = 0
     total_valid_tokens = 0  # CRITICAL FIX: Track valid tokens only (labels != -100)
+    total_gini = 0
+    total_aux = 0
+    num_batches = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for step, batch in enumerate(pbar):
@@ -947,17 +950,18 @@ Router weights check:
             # Gradient clipping with verification
             grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            # Debug: log gradients
-            debug_logger.log("Gradients", f"total_norm: {grad_norm_before:.4f}")
-            if grad_norm_before > 10.0:
-                debug_logger.log("Gradients", f"⚠️ Gradient exploding! norm={grad_norm_before:.2f}")
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        g_norm = param.grad.norm().item()
-                        if g_norm > 1.0:
-                            has_nan = torch.isnan(param.grad).any().item()
-                            has_inf = torch.isinf(param.grad).any().item()
-                            debug_logger.log("Gradients", f"  {name}: norm={g_norm:.4f}, nan={has_nan}, inf={has_inf}")
+            # Debug: log gradients (only if debug mode)
+            if debug_log_file:
+                debug_logger.log("Gradients", f"total_norm: {grad_norm_before:.4f}")
+                if grad_norm_before > 10.0:
+                    debug_logger.log("Gradients", f"⚠️ Gradient exploding! norm={grad_norm_before:.2f}")
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            g_norm = param.grad.norm().item()
+                            if g_norm > 1.0:
+                                has_nan = torch.isnan(param.grad).any().item()
+                                has_inf = torch.isinf(param.grad).any().item()
+                                debug_logger.log("Gradients", f"  {name}: norm={g_norm:.4f}, nan={has_nan}, inf={has_inf}")
 
             scaler.step(optimizer)
             scaler.update()
@@ -1035,17 +1039,18 @@ Router weights check:
             # Gradient clipping with verification
             grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            # Debug: log gradients
-            debug_logger.log("Gradients", f"total_norm: {grad_norm_before:.4f}")
-            if grad_norm_before > 10.0:
-                debug_logger.log("Gradients", f"⚠️ Gradient exploding! norm={grad_norm_before:.2f}")
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        g_norm = param.grad.norm().item()
-                        if g_norm > 1.0:
-                            has_nan = torch.isnan(param.grad).any().item()
-                            has_inf = torch.isinf(param.grad).any().item()
-                            debug_logger.log("Gradients", f"  {name}: norm={g_norm:.4f}, nan={has_nan}, inf={has_inf}")
+            # Debug: log gradients (only if debug mode)
+            if debug_log_file:
+                debug_logger.log("Gradients", f"total_norm: {grad_norm_before:.4f}")
+                if grad_norm_before > 10.0:
+                    debug_logger.log("Gradients", f"⚠️ Gradient exploding! norm={grad_norm_before:.2f}")
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            g_norm = param.grad.norm().item()
+                            if g_norm > 1.0:
+                                has_nan = torch.isnan(param.grad).any().item()
+                                has_inf = torch.isinf(param.grad).any().item()
+                                debug_logger.log("Gradients", f"  {name}: norm={g_norm:.4f}, nan={has_nan}, inf={has_inf}")
 
             optimizer.step()
 
@@ -1084,6 +1089,11 @@ Router weights check:
         total_tokens += num_tokens
 
         aux_loss_val = aux_loss.item() if hasattr(aux_loss, 'item') else aux_loss
+
+        # Accumulate routing metrics
+        total_gini += gini
+        total_aux += aux_loss_val
+        num_batches += 1
         step_acc = correct / valid_tokens if valid_tokens > 0 else 0.0
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
@@ -1093,7 +1103,7 @@ Router weights check:
         })
 
         # Debug: log step summary (every 10 steps to reduce log size)
-        if step % 10 == 0:
+        if debug_log_file and step % 10 == 0:
             debug_logger.log("Summary", f"loss={loss.item():.4f}, aux={aux_loss_val:.4f}, acc={step_acc:.4f}, grad_norm={grad_norm_before:.4f}")
             debug_logger.log("Summary", "-" * 40)
 
@@ -1115,7 +1125,15 @@ Router weights check:
 
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
-    return avg_loss, avg_acc
+    avg_gini = total_gini / num_batches if num_batches > 0 else 0.0
+    avg_aux = total_aux / num_batches if num_batches > 0 else 0.0
+
+    routing_metrics = {
+        'gini': avg_gini,
+        'aux_loss': avg_aux
+    }
+
+    return avg_loss, avg_acc, routing_metrics
 
 
 def evaluate(model, dataloader, device, args, tokenizer=None):
@@ -1183,6 +1201,8 @@ def main():
                         help='Path to config file')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug logging to file')
     cli_args = parser.parse_args()
 
     # Load config
@@ -1437,10 +1457,10 @@ def main():
             print(f"\nEpoch {epoch}: k_input={k_input}, k_process={k_process}, temp={temperature:.2f}")
 
         # Train
-        train_loss, train_acc = train_epoch(
+        train_loss, train_acc, routing_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args, scaler, tokenizer,
             log_file=str(training_log_file),
-            debug_log_file=str(debug_log_file)
+            debug_log_file=str(debug_log_file) if cli_args.debug else None
         )
 
         # Evaluate
@@ -1454,6 +1474,8 @@ def main():
             'train_acc': train_acc,
             'val_loss': val_loss,
             'val_acc': val_acc,
+            'gini': routing_metrics['gini'],
+            'aux_loss': routing_metrics['aux_loss'],
             'learning_rate': optimizer.param_groups[0]['lr'],
             'epoch_time': epoch_time
         }
@@ -1462,6 +1484,7 @@ def main():
         print(f"\nEpoch {epoch}/{args.num_epochs}")
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+        print(f"  Gini: {routing_metrics['gini']:.4f} | Aux Loss: {routing_metrics['aux_loss']:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
 
         # Print diagnostic metrics every 100 epochs (or first epoch)
