@@ -701,29 +701,29 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 loss = outputs['loss']
                 logits = outputs['logits']
 
-                # Compute new aux losses from routing info
+                # Use model's built-in aux losses (from DAWNBlock)
+                model_aux = outputs['aux_loss']
+                aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+
+                # Compute Gini from soft weights for monitoring
                 if 'routing_info' in outputs:
-                    aux_losses_list = []
                     layer_ginis = []
                     for layer_info in outputs['routing_info']:
-                        layer_aux = compute_routing_aux_loss(
-                            weights=layer_info['weights'],
-                            indices=layer_info['indices'],
-                            n_neurons=args.n_input
-                        )
-                        aux_losses_list.append(layer_aux)
-                        layer_ginis.append(layer_aux['gini'].item())
-
-                    aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
-                    gini = aux_metrics.get('gini', 0.0)
+                        weights = layer_info['weights']
+                        # Compute Gini coefficient from soft weights
+                        avg_weights = weights.mean(dim=0)
+                        sorted_weights, _ = torch.sort(avg_weights)
+                        n = len(sorted_weights)
+                        index = torch.arange(1, n + 1, device=weights.device, dtype=torch.float32)
+                        gini = (2 * (index * sorted_weights).sum()) / (n * sorted_weights.sum() + 1e-8) - (n + 1) / n
+                        layer_ginis.append(gini.item())
 
                     # Accumulate per-layer Gini
                     for i, lg in enumerate(layer_ginis):
                         layer_gini_totals[i] += lg
+
+                    gini = sum(layer_ginis) / len(layer_ginis)
                 else:
-                    # Fallback to legacy aux loss
-                    model_aux = outputs['aux_loss']
-                    aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
                     gini = 0.0
                     layer_ginis = [0.0] * n_layers
 
@@ -802,29 +802,29 @@ Router weights check:
             loss = outputs['loss']
             logits = outputs['logits']
 
-            # Compute new aux losses from routing info
+            # Use model's built-in aux losses (from DAWNBlock)
+            model_aux = outputs['aux_loss']
+            aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+
+            # Compute Gini from soft weights for monitoring
             if 'routing_info' in outputs:
-                aux_losses_list = []
                 layer_ginis = []
                 for layer_info in outputs['routing_info']:
-                    layer_aux = compute_routing_aux_loss(
-                        weights=layer_info['weights'],
-                        indices=layer_info['indices'],
-                        n_neurons=args.n_input
-                    )
-                    aux_losses_list.append(layer_aux)
-                    layer_ginis.append(layer_aux['gini'].item())
-
-                aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
-                gini = aux_metrics.get('gini', 0.0)
+                    weights = layer_info['weights']
+                    # Compute Gini coefficient from soft weights
+                    avg_weights = weights.mean(dim=0)
+                    sorted_weights, _ = torch.sort(avg_weights)
+                    n = len(sorted_weights)
+                    index = torch.arange(1, n + 1, device=weights.device, dtype=torch.float32)
+                    gini = (2 * (index * sorted_weights).sum()) / (n * sorted_weights.sum() + 1e-8) - (n + 1) / n
+                    layer_ginis.append(gini.item())
 
                 # Accumulate per-layer Gini
                 for i, lg in enumerate(layer_ginis):
                     layer_gini_totals[i] += lg
+
+                gini = sum(layer_ginis) / len(layer_ginis)
             else:
-                # Fallback to legacy aux loss
-                model_aux = outputs['aux_loss']
-                aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
                 gini = 0.0
                 layer_ginis = [0.0] * n_layers
 
@@ -1330,7 +1330,29 @@ def main():
     if resume_checkpoint and resume_checkpoint.exists():
         print(f"\nResuming from checkpoint: {resume_checkpoint}")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Load with strict=False to handle architecture changes
+        missing_keys, unexpected_keys = model.load_state_dict(
+            checkpoint['model_state_dict'], strict=False
+        )
+
+        if missing_keys:
+            print(f"⚠️  Missing keys (new parameters, will be randomly initialized):")
+            for key in missing_keys[:10]:  # Show first 10
+                print(f"    - {key}")
+            if len(missing_keys) > 10:
+                print(f"    ... and {len(missing_keys) - 10} more")
+
+        if unexpected_keys:
+            print(f"⚠️  Unexpected keys (old parameters, will be ignored):")
+            for key in unexpected_keys[:10]:  # Show first 10
+                print(f"    - {key}")
+            if len(unexpected_keys) > 10:
+                print(f"    ... and {len(unexpected_keys) - 10} more")
+
+        if not missing_keys and not unexpected_keys:
+            print("✓ All parameters loaded successfully!")
+
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
