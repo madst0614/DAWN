@@ -11,6 +11,68 @@ import math
 
 
 # ============================================================
+# Debug Logger
+# ============================================================
+
+class DebugLogger:
+    """Global debug logger for DAWN model."""
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.enabled = False
+            cls._instance.log_file = None
+            cls._instance.step = 0
+            cls._instance.verbose_steps = set()  # Steps to log in detail
+        return cls._instance
+
+    def setup(self, log_file: str, enabled: bool = True):
+        self.log_file = log_file
+        self.enabled = enabled
+        if enabled and log_file:
+            with open(log_file, 'a') as f:
+                f.write(f"\n{'='*60}\nDebug logging started\n{'='*60}\n")
+
+    def set_step(self, step: int):
+        self.step = step
+        # Log detail every 100 steps
+        if step % 100 == 0:
+            self.verbose_steps.add(step)
+
+    def log(self, component: str, message: str):
+        if not self.enabled or not self.log_file:
+            return
+        with open(self.log_file, 'a') as f:
+            f.write(f"[Step {self.step}][{component}] {message}\n")
+
+    def log_tensor(self, component: str, name: str, tensor: torch.Tensor):
+        if not self.enabled or not self.log_file:
+            return
+
+        has_nan = torch.isnan(tensor).any().item()
+        has_inf = torch.isinf(tensor).any().item()
+
+        # Always log if NaN/Inf detected, or every 100 steps
+        should_log_detail = has_nan or has_inf or (self.step in self.verbose_steps)
+
+        if should_log_detail:
+            msg = (f"{name} - shape: {list(tensor.shape)}, "
+                   f"min: {tensor.min().item():.4f}, max: {tensor.max().item():.4f}, "
+                   f"mean: {tensor.mean().item():.4f}, std: {tensor.std().item():.4f}, "
+                   f"nan: {has_nan}, inf: {has_inf}")
+            self.log(component, msg)
+
+        # Alert on NaN/Inf
+        if has_nan or has_inf:
+            self.log(component, f"🔥 {'NaN' if has_nan else 'Inf'} DETECTED in {name}!")
+
+
+# Global logger instance
+debug_logger = DebugLogger()
+
+
+# ============================================================
 # Core Components
 # ============================================================
 
@@ -126,6 +188,9 @@ class DynamicRouter(nn.Module):
         scores, _ = attn_weights.max(dim=1)
         # [batch, n_neurons]
 
+        # Debug: log scores
+        debug_logger.log_tensor("Router", "scores", scores)
+
         # Alternative: could use mean or learnable aggregation
         # scores = attn_weights.mean(dim=1)  # "average need"
         # scores = (attn_weights.max(dim=1)[0] + attn_weights.mean(dim=1)) / 2
@@ -134,6 +199,10 @@ class DynamicRouter(nn.Module):
         # Apply temperature for exploration/exploitation balance
         probs = F.softmax(scores / self.temperature, dim=-1)
         # [batch, n_neurons]
+
+        # Debug: log probs
+        debug_logger.log_tensor("Router", "probs", probs)
+        debug_logger.log("Router", f"probs sum: {probs.sum(dim=-1).mean().item():.4f}")
 
         # Get top-k indices based on scores
         _, indices = scores.topk(k, dim=-1)
@@ -148,6 +217,10 @@ class DynamicRouter(nn.Module):
         # Renormalize (only among selected neurons)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
         # [batch, n_neurons]
+
+        # Debug: log weights
+        debug_logger.log_tensor("Router", "weights", weights)
+        debug_logger.log("Router", f"weights sum: {weights.sum(dim=-1).mean().item():.4f}")
 
         return indices, weights, context
 
@@ -211,6 +284,9 @@ class InputNeurons(nn.Module):
         activations = F.gelu(context @ self.patterns.T)
         # [batch, seq_len, n_neurons]
 
+        # Debug: log activations before attention
+        debug_logger.log_tensor("InputNeurons", "activations_pre", activations)
+
         # Neuron self-attention (lateral connections)
         attn_output, _ = self.self_attention(
             activations, activations, activations
@@ -219,6 +295,9 @@ class InputNeurons(nn.Module):
         # Residual connection and normalization
         activations = self.norm(activations + self.dropout(attn_output))
         # [batch, seq_len, n_neurons]
+
+        # Debug: log activations after norm
+        debug_logger.log_tensor("InputNeurons", "activations_post", activations)
 
         return activations
 
@@ -319,6 +398,9 @@ class ProcessNeurons(nn.Module):
             torch.bmm(selected_activations, selected_weights.transpose(1, 2))
         )  # [batch, seq_len, n_process]
 
+        # Debug: log process activations
+        debug_logger.log_tensor("ProcessNeurons", "process_activations", process_activations)
+
         # Create binary selection pattern
         input_selection = torch.zeros(
             batch_size, self.n_input,
@@ -369,6 +451,9 @@ class ProcessNeurons(nn.Module):
         # Combine to produce output
         output = torch.bmm(selected_process_activations, selected_projections)
         # [batch, seq_len, d_model]
+
+        # Debug: log output
+        debug_logger.log_tensor("ProcessNeurons", "output", output)
 
         return output
 
@@ -704,6 +789,9 @@ class DAWNLanguageModel(nn.Module):
         x = self.norm(x)
         logits = self.output(x)
 
+        # Debug: log logits
+        debug_logger.log_tensor("Model", "logits", logits)
+
         # Compute loss if labels provided
         loss = None
         if labels is not None:
@@ -712,12 +800,17 @@ class DAWNLanguageModel(nn.Module):
                 labels.view(-1),
                 ignore_index=-100
             )
+            # Debug: log loss
+            debug_logger.log("Model", f"loss: {loss.item():.4f}, nan: {torch.isnan(loss).item()}")
 
         # Aggregate auxiliary losses
         aggregated_aux = {
             'load_balance': sum(l['load_balance'] for l in all_aux_losses) / len(all_aux_losses),
             'entropy': sum(l['entropy'] for l in all_aux_losses) / len(all_aux_losses)
         }
+
+        # Debug: log aux losses
+        debug_logger.log("Model", f"aux_loss - load_balance: {aggregated_aux['load_balance']:.4f}, entropy: {aggregated_aux['entropy']:.4f}")
 
         result = {'logits': logits, 'loss': loss, 'aux_loss': aggregated_aux}
 

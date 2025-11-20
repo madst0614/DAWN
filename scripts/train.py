@@ -29,7 +29,7 @@ import time
 import numpy as np
 import math
 
-from models.model import HierarchicalLanguageModel
+from models.model import HierarchicalLanguageModel, debug_logger
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 
 # MLM 마스킹 설정
@@ -806,6 +806,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     """Train for one epoch"""
     model.train()
 
+    # Setup debug logger
+    if debug_log_file:
+        debug_logger.setup(debug_log_file, enabled=True)
+        debug_logger.log("Train", f"\n{'='*60}\nEpoch {epoch} started\n{'='*60}")
+
     # Epoch 시작 시 routing 통계 초기화
     reset_routing_stats(model)
 
@@ -816,6 +821,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for step, batch in enumerate(pbar):
+        # Update debug logger step
+        global_step = (epoch - 1) * len(dataloader) + step
+        debug_logger.set_step(global_step)
+
         input_ids = batch["input_ids"].to(device)
 
         # Apply MLM masking
@@ -933,28 +942,22 @@ Router weights check:
 
             scaler.scale(total_loss_combined).backward()
 
-            if debug_mode:
-                print(f"\n[Gradient Check - After Backward]")
-                # Check router gradients
-                for name, param in model.named_parameters():
-                    if param.grad is not None and 'router' in name:
-                        grad_norm = param.grad.norm().item()
-                        print(f"  {name}: grad_norm={grad_norm:.6f}")
-                        if grad_norm < 1e-7:
-                            print(f"    ⚠ WARNING: Gradient too small")
-                        elif grad_norm > 100:
-                            print(f"    ⚠ WARNING: Gradient too large")
-
             scaler.unscale_(optimizer)
 
             # Gradient clipping with verification
             grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            if debug_mode:
-                print(f"\n[Gradient Clipping]")
-                print(f"  Grad norm before clipping: {grad_norm_before:.2f}")
-                if grad_norm_before > 10.0:
-                    print(f"  ⚠ WARNING: Gradient exploding! (>{10.0})")
+            # Debug: log gradients
+            debug_logger.log("Gradients", f"total_norm: {grad_norm_before:.4f}")
+            if grad_norm_before > 10.0:
+                debug_logger.log("Gradients", f"⚠️ Gradient exploding! norm={grad_norm_before:.2f}")
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        g_norm = param.grad.norm().item()
+                        if g_norm > 1.0:
+                            has_nan = torch.isnan(param.grad).any().item()
+                            has_inf = torch.isinf(param.grad).any().item()
+                            debug_logger.log("Gradients", f"  {name}: norm={g_norm:.4f}, nan={has_nan}, inf={has_inf}")
 
             scaler.step(optimizer)
             scaler.update()
@@ -1029,26 +1032,20 @@ Router weights check:
 
             total_loss_combined.backward()
 
-            if debug_mode:
-                print(f"\n[Gradient Check - After Backward]")
-                # Check router gradients
-                for name, param in model.named_parameters():
-                    if param.grad is not None and 'router' in name:
-                        grad_norm = param.grad.norm().item()
-                        print(f"  {name}: grad_norm={grad_norm:.6f}")
-                        if grad_norm < 1e-7:
-                            print(f"    ⚠ WARNING: Gradient too small")
-                        elif grad_norm > 100:
-                            print(f"    ⚠ WARNING: Gradient too large")
-
             # Gradient clipping with verification
             grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            if debug_mode:
-                print(f"\n[Gradient Clipping]")
-                print(f"  Grad norm before clipping: {grad_norm_before:.2f}")
-                if grad_norm_before > 10.0:
-                    print(f"  ⚠ WARNING: Gradient exploding! (>{10.0})")
+            # Debug: log gradients
+            debug_logger.log("Gradients", f"total_norm: {grad_norm_before:.4f}")
+            if grad_norm_before > 10.0:
+                debug_logger.log("Gradients", f"⚠️ Gradient exploding! norm={grad_norm_before:.2f}")
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        g_norm = param.grad.norm().item()
+                        if g_norm > 1.0:
+                            has_nan = torch.isnan(param.grad).any().item()
+                            has_inf = torch.isinf(param.grad).any().item()
+                            debug_logger.log("Gradients", f"  {name}: norm={g_norm:.4f}, nan={has_nan}, inf={has_inf}")
 
             optimizer.step()
 
@@ -1087,12 +1084,18 @@ Router weights check:
         total_tokens += num_tokens
 
         aux_loss_val = aux_loss.item() if hasattr(aux_loss, 'item') else aux_loss
+        step_acc = correct / valid_tokens if valid_tokens > 0 else 0.0
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
             "aux": f"{aux_loss_val:.4f}",
             "gini": f"{gini:.3f}",
-            "acc": f"{correct / valid_tokens:.4f}" if valid_tokens > 0 else "0.0000"
+            "acc": f"{step_acc:.4f}"
         })
+
+        # Debug: log step summary (every 10 steps to reduce log size)
+        if step % 10 == 0:
+            debug_logger.log("Summary", f"loss={loss.item():.4f}, aux={aux_loss_val:.4f}, acc={step_acc:.4f}, grad_norm={grad_norm_before:.4f}")
+            debug_logger.log("Summary", "-" * 40)
 
         # Log to file every step
         if log_file:
