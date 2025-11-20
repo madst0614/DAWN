@@ -1053,21 +1053,28 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     return avg_loss, avg_acc
 
 
-def evaluate(model, dataloader, device, args):
-    """Evaluate model"""
+def evaluate(model, dataloader, device, args, tokenizer=None):
+    """Evaluate model with MLM masking"""
     model.eval()
     total_loss = 0
     total_tokens = 0
     total_correct = 0
-    total_valid_tokens = 0  # CRITICAL FIX: Track valid tokens only
+    total_valid_tokens = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
             input_ids = batch["input_ids"].to(device)
-            labels = input_ids.clone()
+
+            # Apply same MLM masking as training
+            if tokenizer is not None:
+                masked_input_ids, labels = apply_mlm_masking(input_ids, tokenizer)
+            else:
+                # Fallback: use all tokens (not recommended)
+                masked_input_ids = input_ids
+                labels = input_ids.clone()
 
             outputs = model(
-                input_ids=input_ids,
+                input_ids=masked_input_ids,
                 labels=labels,
                 k_input=args.k_input,
                 k_process=args.k_process
@@ -1372,7 +1379,7 @@ def main():
         )
 
         # Evaluate
-        val_loss, val_acc = evaluate(model, val_loader, device, args)
+        val_loss, val_acc = evaluate(model, val_loader, device, args, tokenizer)
 
         epoch_time = time.time() - epoch_start
 
