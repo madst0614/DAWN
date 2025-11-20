@@ -1040,12 +1040,17 @@ def comprehensive_analysis(model, val_loader, tokenizer, device):
     routing_results = analyze_routing_patterns(model, val_loader, device)
     results['routing'] = routing_results
 
-    print("\n📊 ROUTING STATISTICS")
+    print("\n📊 ROUTING STATISTICS (Soft Weights)")
     print("-" * 40)
     print(f"  Layers: {routing_results['n_layers']}, Input neurons: {routing_results['n_input']}")
     for layer_idx, stats in routing_results['layers'].items():
-        print(f"  Layer {layer_idx}: usage={stats['mean_usage']:.3f}±{stats['std_usage']:.3f}, "
-              f"unused={stats['unused_neurons']}")
+        lp = stats['learned_params']
+        print(f"  Layer {layer_idx}:")
+        print(f"    Soft weights: mean={stats['mean_weight']:.4f}±{stats['std_weight']:.4f}")
+        print(f"    Low-weight neurons (<0.001): {stats['low_weight_neurons']}")
+        print(f"    Learned params: threshold={lp['threshold']:.3f}, steepness={lp['steepness']:.2f}, "
+              f"temp={lp['temperature']:.2f}")
+        print(f"    Effective k: {lp['effective_k']:.1f} ({lp['effective_k_ratio']:.1%})")
 
     # 2. Neuron Usage (Load Balance)
     usage_results = analyze_neuron_usage(model, val_loader, device)
