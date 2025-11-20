@@ -621,6 +621,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     total_aux = 0
     num_batches = 0
 
+    # Per-layer Gini tracking
+    n_layers = len(model.layers)
+    layer_gini_totals = [0.0] * n_layers
+
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for step, batch in enumerate(pbar):
         # Update debug logger step
@@ -687,6 +691,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Compute new aux losses from routing info
                 if 'routing_info' in outputs:
                     aux_losses_list = []
+                    layer_ginis = []
                     for layer_info in outputs['routing_info']:
                         layer_aux = compute_routing_aux_loss(
                             weights=layer_info['weights'],
@@ -694,14 +699,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             n_neurons=args.n_input
                         )
                         aux_losses_list.append(layer_aux)
+                        layer_ginis.append(layer_aux['gini'].item())
 
                     aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
                     gini = aux_metrics.get('gini', 0.0)
+
+                    # Accumulate per-layer Gini
+                    for i, lg in enumerate(layer_ginis):
+                        layer_gini_totals[i] += lg
                 else:
                     # Fallback to legacy aux loss
                     model_aux = outputs['aux_loss']
                     aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
                     gini = 0.0
+                    layer_ginis = [0.0] * n_layers
 
                 total_loss_combined = loss + aux_weight * aux_loss
 
@@ -778,6 +789,7 @@ Router weights check:
             # Compute new aux losses from routing info
             if 'routing_info' in outputs:
                 aux_losses_list = []
+                layer_ginis = []
                 for layer_info in outputs['routing_info']:
                     layer_aux = compute_routing_aux_loss(
                         weights=layer_info['weights'],
@@ -785,14 +797,20 @@ Router weights check:
                         n_neurons=args.n_input
                     )
                     aux_losses_list.append(layer_aux)
+                    layer_ginis.append(layer_aux['gini'].item())
 
                 aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
                 gini = aux_metrics.get('gini', 0.0)
+
+                # Accumulate per-layer Gini
+                for i, lg in enumerate(layer_ginis):
+                    layer_gini_totals[i] += lg
             else:
                 # Fallback to legacy aux loss
                 model_aux = outputs['aux_loss']
                 aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
                 gini = 0.0
+                layer_ginis = [0.0] * n_layers
 
             total_loss_combined = loss + aux_weight * aux_loss
 
@@ -927,9 +945,13 @@ Router weights check:
     avg_gini = total_gini / num_batches if num_batches > 0 else 0.0
     avg_aux = total_aux / num_batches if num_batches > 0 else 0.0
 
+    # Compute per-layer average Gini
+    layer_gini_avgs = [g / num_batches if num_batches > 0 else 0.0 for g in layer_gini_totals]
+
     routing_metrics = {
         'gini': avg_gini,
-        'aux_loss': avg_aux
+        'aux_loss': avg_aux,
+        'layer_gini': layer_gini_avgs
     }
 
     return avg_loss, avg_acc, routing_metrics
@@ -1275,6 +1297,7 @@ def main():
             'val_acc': val_acc,
             'gini': routing_metrics['gini'],
             'aux_loss': routing_metrics['aux_loss'],
+            'layer_gini': routing_metrics['layer_gini'],
             'learning_rate': optimizer.param_groups[0]['lr'],
             'epoch_time': epoch_time
         }
@@ -1284,6 +1307,11 @@ def main():
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  Gini: {routing_metrics['gini']:.4f} | Aux Loss: {routing_metrics['aux_loss']:.4f}")
+
+        # Per-layer Gini
+        layer_gini_str = " | ".join([f"L{i}:{g:.3f}" for i, g in enumerate(routing_metrics['layer_gini'])])
+        print(f"  Layer Gini: {layer_gini_str}")
+
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
 
         # Print diagnostic metrics every 100 epochs (or first epoch)
