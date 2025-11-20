@@ -564,7 +564,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # NEW: Add learned sparsity guidance from model
                 sparsity_guidance = outputs.get('aux_loss', {}).get('sparsity_guidance', 0.0)
-                sparsity_weight = 0.05  # STRONG guidance for pure soft selection
+                sparsity_weight = 0.5  # EXPONENTIAL penalty - MUCH stronger!
 
                 total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss + sparsity_weight * sparsity_guidance
 
@@ -665,7 +665,7 @@ Router weights check:
 
             # NEW: Add learned sparsity guidance from model
             sparsity_guidance = outputs.get('aux_loss', {}).get('sparsity_guidance', 0.0)
-            sparsity_weight = 0.05  # STRONG guidance for pure soft selection
+            sparsity_weight = 0.5  # EXPONENTIAL penalty - MUCH stronger!
 
             total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss + sparsity_weight * sparsity_guidance
 
