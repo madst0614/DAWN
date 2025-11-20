@@ -6,8 +6,150 @@ A neural architecture with attention-guided dynamic neuron routing
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, Dict
 import math
+
+
+# ============================================================
+# Debug Logger
+# ============================================================
+
+class DebugLogger:
+    """Global debug logger for DAWN model."""
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.enabled = False
+            cls._instance.log_file = None
+            cls._instance.step = 0
+            cls._instance.verbose_steps = set()  # Steps to log in detail
+        return cls._instance
+
+    def setup(self, log_file: str, enabled: bool = True):
+        self.log_file = log_file
+        self.enabled = enabled
+        if enabled and log_file:
+            with open(log_file, 'a') as f:
+                f.write(f"\n{'='*60}\nDebug logging started\n{'='*60}\n")
+
+    def set_step(self, step: int):
+        self.step = step
+        # Log detail every 100 steps
+        if step % 100 == 0:
+            self.verbose_steps.add(step)
+
+    def log(self, component: str, message: str):
+        if not self.enabled or not self.log_file:
+            return
+        with open(self.log_file, 'a') as f:
+            f.write(f"[Step {self.step}][{component}] {message}\n")
+
+    def log_tensor(self, component: str, name: str, tensor: torch.Tensor):
+        if not self.enabled or not self.log_file:
+            return
+
+        has_nan = torch.isnan(tensor).any().item()
+        has_inf = torch.isinf(tensor).any().item()
+
+        # Always log if NaN/Inf detected, or every 100 steps
+        should_log_detail = has_nan or has_inf or (self.step in self.verbose_steps)
+
+        if should_log_detail:
+            msg = (f"{name} - shape: {list(tensor.shape)}, "
+                   f"min: {tensor.min().item():.4f}, max: {tensor.max().item():.4f}, "
+                   f"mean: {tensor.mean().item():.4f}, std: {tensor.std().item():.4f}, "
+                   f"nan: {has_nan}, inf: {has_inf}")
+            self.log(component, msg)
+
+        # Alert on NaN/Inf
+        if has_nan or has_inf:
+            self.log(component, f"🔥 {'NaN' if has_nan else 'Inf'} DETECTED in {name}!")
+
+
+# Global logger instance
+debug_logger = DebugLogger()
+
+
+# ============================================================
+# Regularization Functions
+# ============================================================
+
+def compute_orthogonality_loss(weight_matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Compute orthogonality regularization loss for weight matrix.
+
+    Encourages weight vectors to be orthogonal to prevent rank collapse.
+    W @ W^T should be close to scaled identity.
+
+    Args:
+        weight_matrix: Weight matrix [n_vectors, dim]
+
+    Returns:
+        Orthogonality loss (scalar)
+    """
+    # Normalize to unit vectors
+    normalized = F.normalize(weight_matrix, p=2, dim=1)
+
+    # Compute gram matrix (cosine similarities)
+    gram = normalized @ normalized.T
+
+    # Off-diagonal elements should be zero (orthogonal)
+    n = gram.size(0)
+    identity = torch.eye(n, device=gram.device)
+    off_diagonal_mask = 1 - identity
+
+    # Loss: sum of squared off-diagonal elements
+    ortho_loss = (gram * off_diagonal_mask).pow(2).sum() / (n * (n - 1) + 1e-8)
+
+    return ortho_loss
+
+
+def compute_model_orthogonality_loss(model) -> dict:
+    """
+    Compute orthogonality loss for all relevant weight matrices in DAWN model.
+
+    Args:
+        model: DAWNLanguageModel
+
+    Returns:
+        Dictionary with orthogonality losses per component
+    """
+    router_losses = []
+    input_losses = []
+    process_comb_losses = []
+    process_proj_losses = []
+
+    for layer in model.layers:
+        block = layer.block
+
+        # Router neuron patterns
+        router_ortho = compute_orthogonality_loss(block.router.neuron_patterns)
+        router_losses.append(router_ortho)
+
+        # Input neuron patterns
+        input_ortho = compute_orthogonality_loss(block.input_neurons.patterns)
+        input_losses.append(input_ortho)
+
+        # Process neuron combination weights
+        comb_ortho = compute_orthogonality_loss(block.process_neurons.combination_weights)
+        process_comb_losses.append(comb_ortho)
+
+        # Process neuron output projections
+        proj_ortho = compute_orthogonality_loss(block.process_neurons.output_projections)
+        process_proj_losses.append(proj_ortho)
+
+    n_layers = len(model.layers)
+
+    return {
+        'router_ortho': sum(router_losses) / n_layers,
+        'input_ortho': sum(input_losses) / n_layers,
+        'process_comb_ortho': sum(process_comb_losses) / n_layers,
+        'process_proj_ortho': sum(process_proj_losses) / n_layers,
+        'total_ortho': (sum(router_losses) + sum(input_losses) +
+                       sum(process_comb_losses) + sum(process_proj_losses)) / (4 * n_layers)
+    }
 
 
 # ============================================================
@@ -18,8 +160,8 @@ class DynamicRouter(nn.Module):
     """
     Attention-based dynamic neuron router.
 
-    Selects relevant neurons based on input content using multi-head
-    attention and max-pooling aggregation strategy.
+    Uses direct attention to neuron patterns for stable routing.
+    No Gumbel, no STE - just pure attention mechanism.
 
     Args:
         d_model: Model dimension
@@ -42,21 +184,34 @@ class DynamicRouter(nn.Module):
         self.n_heads = n_heads
 
         # Multi-head attention for context modeling
-        self.attention = nn.MultiheadAttention(
+        self.context_attention = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=n_heads,
             dropout=dropout,
             batch_first=True
         )
 
-        # Content-to-neuron affinity projection
-        self.affinity_proj = nn.Linear(d_model, n_neurons)
+        # Learnable neuron patterns (what each neuron responds to)
+        self.neuron_patterns = nn.Parameter(
+            torch.empty(n_neurons, d_model)
+        )
+
+        # Direct attention to neurons for routing
+        self.neuron_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=0.0,  # No dropout for routing stability
+            batch_first=True
+        )
+
+        # Temperature for routing (fixed high for exploration)
+        self.register_buffer('temperature', torch.tensor(2.0))
 
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_normal_(self.affinity_proj.weight)
-        nn.init.zeros_(self.affinity_proj.bias)
+        # Orthogonal initialization for neuron patterns
+        nn.init.orthogonal_(self.neuron_patterns, gain=1.0)
 
     def forward(
         self,
@@ -65,7 +220,7 @@ class DynamicRouter(nn.Module):
         mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Route to top-k neurons based on input content.
+        Route to top-k neurons based on attention to neuron patterns.
 
         Args:
             x: Input tensor [batch, seq_len, d_model]
@@ -77,28 +232,79 @@ class DynamicRouter(nn.Module):
             weights: Routing weights [batch, n_neurons]
             context: Attended representations [batch, seq_len, d_model]
         """
-        # Apply attention for context modeling
-        context, _ = self.attention(x, x, x, key_padding_mask=mask)
+        batch_size, seq_len, d_model = x.shape
+
+        # Step 1: Context modeling
+        # Self-attention to understand input relationships
+        context, _ = self.context_attention(
+            x, x, x,
+            key_padding_mask=mask
+        )
         # [batch, seq_len, d_model]
 
-        # Compute neuron affinity scores
-        affinity = self.affinity_proj(context)
-        # [batch, seq_len, n_neurons]
+        # Step 2: Attend to neuron patterns
+        # Query: "What do we have?" (context)
+        # Key/Value: "What patterns exist?" (neuron_patterns)
 
-        # Max-pooling: select based on maximum need across sequence
-        scores, _ = affinity.max(dim=1)
+        # Expand neuron patterns for batch dimension
+        neuron_kv = self.neuron_patterns.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )  # [batch, n_neurons, d_model]
+
+        # Cross-attention: context queries neuron patterns
+        neuron_responses, attn_weights = self.neuron_attention(
+            context,       # query: [batch, seq_len, d_model]
+            neuron_kv,     # key:   [batch, n_neurons, d_model]
+            neuron_kv,     # value: [batch, n_neurons, d_model]
+            need_weights=True,
+            average_attn_weights=True  # Average across heads
+        )
+        # attn_weights: [batch, seq_len, n_neurons]
+        # Each position's attention to each neuron
+
+        # Step 3: Aggregate across sequence
+        # "If ANY position needs this neuron, activate it"
+        # Using max-pooling (consistent with original design)
+        scores, _ = attn_weights.max(dim=1)
         # [batch, n_neurons]
 
-        # Select top-k neurons
-        routing_probs = F.softmax(scores, dim=-1)
+        # Debug: log scores
+        debug_logger.log_tensor("Router", "scores", scores)
+
+        # Alternative: could use mean or learnable aggregation
+        # scores = attn_weights.mean(dim=1)  # "average need"
+        # scores = (attn_weights.max(dim=1)[0] + attn_weights.mean(dim=1)) / 2
+
+        # Step 4: Score normalization for numerical stability
+        scores_normalized = (scores - scores.mean(dim=-1, keepdim=True)) / \
+                           (scores.std(dim=-1, keepdim=True) + 1e-6)
+
+        # Step 5: Soft top-k selection (stable!)
+        # Apply temperature for exploration/exploitation balance
+        probs = F.softmax(scores_normalized / self.temperature, dim=-1)
+        # [batch, n_neurons]
+
+        # Debug: log probs
+        debug_logger.log_tensor("Router", "probs", probs)
+        debug_logger.log("Router", f"probs sum: {probs.sum(dim=-1).mean().item():.4f}")
+
+        # Get top-k indices based on scores
         _, indices = scores.topk(k, dim=-1)
         # [batch, k]
 
-        # Create routing weights with straight-through estimator
-        one_hot = torch.zeros_like(routing_probs)
-        one_hot.scatter_(1, indices, 1.0)
-        weights = (one_hot - routing_probs).detach() + routing_probs
+        # Create routing weights
+        # Only selected neurons get non-zero weights
+        weights = torch.zeros_like(probs)
+        selected_probs = torch.gather(probs, 1, indices)
+        weights.scatter_(1, indices, selected_probs)
+
+        # Renormalize (only among selected neurons)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
         # [batch, n_neurons]
+
+        # Debug: log weights
+        debug_logger.log_tensor("Router", "weights", weights)
+        debug_logger.log("Router", f"weights sum: {weights.sum(dim=-1).mean().item():.4f}")
 
         return indices, weights, context
 
@@ -162,41 +368,57 @@ class InputNeurons(nn.Module):
         activations = F.gelu(context @ self.patterns.T)
         # [batch, seq_len, n_neurons]
 
-        # Neuron self-attention
+        # Debug: log activations before attention
+        debug_logger.log_tensor("InputNeurons", "activations_pre", activations)
+
+        # Pre-LN: Normalize BEFORE attention
+        normalized = self.norm(activations)
+
+        # Neuron self-attention (lateral connections)
         attn_output, _ = self.self_attention(
-            activations, activations, activations
+            normalized, normalized, normalized
         )
 
-        # Residual connection and normalization
-        activations = self.norm(activations + self.dropout(attn_output))
+        # Residual WITHOUT additional norm
+        activations = activations + self.dropout(attn_output)
         # [batch, seq_len, n_neurons]
+
+        # Debug: log activations after residual
+        debug_logger.log_tensor("InputNeurons", "activations_post", activations)
 
         return activations
 
 
 class ProcessNeurons(nn.Module):
     """
-    Process neuron layer.
+    Process neuron layer with learned input combination analysis.
 
-    Combines selected input neurons to produce output representations.
+    Uses a small MLP to analyze input neuron selection patterns
+    and predict process neuron relevance.
 
     Args:
         d_model: Model dimension
         n_input: Number of input neurons
         n_process: Number of process neurons
+        hidden_dim: Hidden dimension for combination analyzer
     """
 
     def __init__(
         self,
         d_model: int,
         n_input: int,
-        n_process: int
+        n_process: int,
+        hidden_dim: Optional[int] = None
     ):
         super().__init__()
 
         self.d_model = d_model
         self.n_input = n_input
         self.n_process = n_process
+
+        # Hidden dimension for combination analyzer
+        if hidden_dim is None:
+            hidden_dim = n_input * 2
 
         # Combination weights: how process neurons combine input neurons
         self.combination_weights = nn.Parameter(
@@ -208,11 +430,23 @@ class ProcessNeurons(nn.Module):
             torch.empty(n_process, d_model)
         )
 
+        # Learned combination analyzer
+        self.combination_analyzer = nn.Sequential(
+            nn.Linear(n_input, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, n_process)
+        )
+
         self._init_weights()
 
     def _init_weights(self):
         nn.init.orthogonal_(self.combination_weights, gain=math.sqrt(2.0))
         nn.init.orthogonal_(self.output_projections, gain=math.sqrt(2.0))
+
+        for module in self.combination_analyzer:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def forward(
         self,
@@ -221,7 +455,7 @@ class ProcessNeurons(nn.Module):
         k: int
     ) -> torch.Tensor:
         """
-        Process selected input neurons.
+        Process selected input neurons with learned combination analysis.
 
         Args:
             selected_activations: Selected neuron activations [batch, seq_len, k_in]
@@ -251,9 +485,33 @@ class ProcessNeurons(nn.Module):
             torch.bmm(selected_activations, selected_weights.transpose(1, 2))
         )  # [batch, seq_len, n_process]
 
-        # Select top-k process neurons based on activation magnitude
-        process_scores = process_activations.mean(dim=1)  # [batch, n_process]
-        _, process_indices = process_scores.topk(k, dim=-1)  # [batch, k]
+        # Debug: log process activations
+        debug_logger.log_tensor("ProcessNeurons", "process_activations", process_activations)
+
+        # Create binary selection pattern
+        input_selection = torch.zeros(
+            batch_size, self.n_input,
+            dtype=torch.float32,
+            device=selected_indices.device
+        )
+        input_selection.scatter_(1, selected_indices, 1.0)
+        # [batch, n_input]
+
+        # Analyze combination pattern
+        combination_relevance = self.combination_analyzer(input_selection)
+        # [batch, n_process]
+
+        # Compute activation-based scores
+        activation_scores, _ = process_activations.max(dim=1)
+        # [batch, n_process]
+
+        # Combine: activation magnitude × combination relevance
+        final_scores = activation_scores * torch.sigmoid(combination_relevance)
+        # [batch, n_process]
+
+        # Select top-k process neurons
+        _, process_indices = final_scores.topk(k, dim=-1)
+        # [batch, k]
 
         # Gather selected process activations
         process_indices_expanded = process_indices.unsqueeze(1).expand(
@@ -280,6 +538,9 @@ class ProcessNeurons(nn.Module):
         # Combine to produce output
         output = torch.bmm(selected_process_activations, selected_projections)
         # [batch, seq_len, d_model]
+
+        # Debug: log output
+        debug_logger.log_tensor("ProcessNeurons", "output", output)
 
         return output
 
@@ -341,8 +602,9 @@ class DAWNBlock(nn.Module):
         x: torch.Tensor,
         k_input: Optional[int] = None,
         k_process: Optional[int] = None,
-        mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        mask: Optional[torch.Tensor] = None,
+        return_routing_info: bool = False
+    ) -> Union[Tuple[torch.Tensor, Dict], Tuple[torch.Tensor, Dict, Dict]]:
         """
         Forward pass through DAWN block.
 
@@ -351,9 +613,12 @@ class DAWNBlock(nn.Module):
             k_input: Number of input neurons to select (default: n_input // 2)
             k_process: Number of process neurons to select (default: n_process // 2)
             mask: Optional attention mask [batch, seq_len]
+            return_routing_info: Whether to return routing info for aux loss
 
         Returns:
             output: Processed tensor [batch, seq_len, d_model]
+            aux_loss: Dictionary of auxiliary losses
+            routing_info: (optional) Dictionary with indices and weights
         """
         batch_size, seq_len, _ = x.shape
 
@@ -368,6 +633,21 @@ class DAWNBlock(nn.Module):
         # indices: [batch, k_input]
         # weights: [batch, n_input]
         # context: [batch, seq_len, d_model]
+
+        # Compute auxiliary losses
+        neuron_usage = weights.mean(dim=0)  # [n_input]
+        load_balance_loss = neuron_usage.std()
+
+        # Safe entropy calculation
+        weights_clamped = weights.clamp(min=1e-10)
+        entropy = -(weights_clamped * torch.log(weights_clamped)).sum(dim=-1).mean()
+        max_entropy = math.log(self.n_input)
+        entropy_loss = 1.0 - (entropy / max_entropy)
+
+        aux_loss = {
+            'load_balance': load_balance_loss,
+            'entropy': entropy_loss
+        }
 
         # Compute input neuron activations
         activations = self.input_neurons(context)
@@ -390,7 +670,16 @@ class DAWNBlock(nn.Module):
         )
         # [batch, seq_len, d_model]
 
-        return self.dropout(output)
+        output = self.dropout(output)
+
+        if return_routing_info:
+            routing_info = {
+                'indices': indices,
+                'weights': weights,
+            }
+            return output, aux_loss, routing_info
+
+        return output, aux_loss
 
 
 # ============================================================
@@ -434,8 +723,9 @@ class DAWNLayer(nn.Module):
         x: torch.Tensor,
         k_input: Optional[int] = None,
         k_process: Optional[int] = None,
-        mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        mask: Optional[torch.Tensor] = None,
+        return_routing_info: bool = False
+    ) -> Union[Tuple[torch.Tensor, dict], Tuple[torch.Tensor, dict, dict]]:
         """
         Forward pass with residual connection.
 
@@ -444,12 +734,25 @@ class DAWNLayer(nn.Module):
             k_input: Number of input neurons to select
             k_process: Number of process neurons to select
             mask: Optional attention mask
+            return_routing_info: Whether to return routing info
 
         Returns:
             output: Layer output [batch, seq_len, d_model]
+            aux_loss: Auxiliary losses from block
+            routing_info: (optional) Routing information
         """
-        output = self.block(x, k_input, k_process, mask)
-        return self.norm(x + output)
+        # Pre-LN: Normalize BEFORE block
+        normed = self.norm(x)
+
+        if return_routing_info:
+            output, aux_loss, routing_info = self.block(
+                normed, k_input, k_process, mask, return_routing_info=True
+            )
+            # Residual WITHOUT additional norm
+            return x + output, aux_loss, routing_info
+
+        output, aux_loss = self.block(normed, k_input, k_process, mask)
+        return x + output, aux_loss
 
 
 # ============================================================
@@ -481,7 +784,7 @@ class DAWNLanguageModel(nn.Module):
         n_heads: int = 8,
         max_seq_len: int = 2048,
         dropout: float = 0.1,
-        **kwargs  # For compatibility
+        **kwargs
     ):
         super().__init__()
 
@@ -525,7 +828,8 @@ class DAWNLanguageModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         k_input: Optional[int] = None,
-        k_process: Optional[int] = None
+        k_process: Optional[int] = None,
+        return_routing_info: bool = False
     ) -> dict:
         """
         Forward pass through the model.
@@ -536,11 +840,14 @@ class DAWNLanguageModel(nn.Module):
             labels: Target labels for language modeling [batch, seq_len]
             k_input: Number of input neurons to select
             k_process: Number of process neurons to select
+            return_routing_info: Whether to return routing info for aux loss
 
         Returns:
             Dictionary containing:
                 - logits: Output logits [batch, seq_len, vocab_size]
                 - loss: Cross-entropy loss (if labels provided)
+                - aux_loss: Aggregated auxiliary losses
+                - routing_info: (optional) List of routing info per layer
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -555,12 +862,26 @@ class DAWNLanguageModel(nn.Module):
         x = self.dropout(token_emb + position_emb)
 
         # Process through DAWN layers
+        all_aux_losses = []
+        routing_info_list = [] if return_routing_info else None
+
         for layer in self.layers:
-            x = layer(x, k_input, k_process, mask=attention_mask)
+            if return_routing_info:
+                x, aux_loss, routing_info = layer(
+                    x, k_input, k_process, mask=attention_mask,
+                    return_routing_info=True
+                )
+                routing_info_list.append(routing_info)
+            else:
+                x, aux_loss = layer(x, k_input, k_process, mask=attention_mask)
+            all_aux_losses.append(aux_loss)
 
         # Output projection
         x = self.norm(x)
         logits = self.output(x)
+
+        # Debug: log logits
+        debug_logger.log_tensor("Model", "logits", logits)
 
         # Compute loss if labels provided
         loss = None
@@ -570,8 +891,24 @@ class DAWNLanguageModel(nn.Module):
                 labels.view(-1),
                 ignore_index=-100
             )
+            # Debug: log loss
+            debug_logger.log("Model", f"loss: {loss.item():.4f}, nan: {torch.isnan(loss).item()}")
 
-        return {'logits': logits, 'loss': loss}
+        # Aggregate auxiliary losses
+        aggregated_aux = {
+            'load_balance': sum(l['load_balance'] for l in all_aux_losses) / len(all_aux_losses),
+            'entropy': sum(l['entropy'] for l in all_aux_losses) / len(all_aux_losses)
+        }
+
+        # Debug: log aux losses
+        debug_logger.log("Model", f"aux_loss - load_balance: {aggregated_aux['load_balance']:.4f}, entropy: {aggregated_aux['entropy']:.4f}")
+
+        result = {'logits': logits, 'loss': loss, 'aux_loss': aggregated_aux}
+
+        if return_routing_info:
+            result['routing_info'] = routing_info_list
+
+        return result
 
     def get_model_stats(self) -> dict:
         """Get model statistics."""
@@ -588,29 +925,36 @@ class DAWNLanguageModel(nn.Module):
             'd_model': self.d_model
         }
 
+    @classmethod
+    def from_config(cls, config: dict, vocab_size: int):
+        """Create model from config dict."""
+        model_cfg = config['model']
+        return cls(
+            vocab_size=vocab_size,
+            d_model=model_cfg['d_model'],
+            n_layers=model_cfg['n_layers'],
+            n_input=model_cfg['n_input'],
+            n_process=model_cfg['n_process'],
+            n_heads=model_cfg['n_heads'],
+            max_seq_len=model_cfg['max_seq_len'],
+            dropout=model_cfg['dropout']
+        )
 
-# ============================================================
-# Aliases for backward compatibility
-# ============================================================
 
-# Keep old names as aliases
+# Backward compatibility
 GlobalRouter = DynamicRouter
 HierarchicalDynamicFFN = DAWNBlock
 TransformerLayerWithHierarchicalFFN = DAWNLayer
 HierarchicalLanguageModel = DAWNLanguageModel
 
 
-# ============================================================
-# Testing
-# ============================================================
-
 if __name__ == '__main__':
     print("=" * 60)
-    print("DAWN: Dynamic Activation in Weighted Networks")
+    print("DAWN: Dynamic Architecture With Neurons")
+    print("Attention-based routing (no Gumbel)")
     print("=" * 60)
     print()
 
-    # Initialize model
     model = DAWNLanguageModel(
         vocab_size=30000,
         d_model=512,
@@ -622,9 +966,7 @@ if __name__ == '__main__':
         dropout=0.1
     )
 
-    # Print model statistics
     stats = model.get_model_stats()
-
     print("Model Configuration:")
     print(f"  Layers: {stats['n_layers']}")
     print(f"  Model dimension: {stats['d_model']}")
@@ -632,20 +974,19 @@ if __name__ == '__main__':
     print(f"  Trainable parameters: {stats['trainable_parameters']:,}")
     print()
 
-    # Test forward pass
     batch_size = 4
     seq_len = 128
-
     input_ids = torch.randint(0, 30000, (batch_size, seq_len))
     labels = torch.randint(0, 30000, (batch_size, seq_len))
 
     print("Testing forward pass...")
     with torch.no_grad():
-        output = model(input_ids, labels=labels)
+        output = model(input_ids, labels=labels, return_routing_info=True)
 
     print(f"  Input shape: {input_ids.shape}")
     print(f"  Output logits shape: {output['logits'].shape}")
     print(f"  Loss: {output['loss'].item():.4f}")
+    print(f"  Routing info layers: {len(output['routing_info'])}")
     print()
 
-    print("✓ Tests passed successfully!")
+    print("✓ Attention-based router ready!")

@@ -1,23 +1,12 @@
 """
 DAWN (Dynamic Architecture With Neurons) Training Script
 
-DAWN 모델 학습
-
 Usage:
-    # 기본 학습
+    # 기본 학습 (configs/train_config.yaml 사용)
     python scripts/train.py
 
-    # 커스텀 설정
-    python scripts/train.py \
-        --d_model 768 \
-        --n_input 4096 \
-        --n_process 2048 \
-        --batch_size 16 \
-        --num_epochs 30 \
-        --lr 3e-4
-
-    # Mixed precision training
-    python scripts/train.py --use_amp
+    # 커스텀 config 파일 사용
+    python scripts/train.py --config configs/my_config.yaml
 """
 
 import sys
@@ -31,24 +20,136 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 import argparse
 from tqdm import tqdm
 import json
 from datetime import datetime
 import time
 import numpy as np
+import math
 
-from models.model import HierarchicalLanguageModel
+from models.model import HierarchicalLanguageModel, debug_logger, compute_model_orthogonality_loss
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
-from utils.data import CacheLoader
+from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
-# MLM 마스킹 설정
-MLM_CONFIG = {
-    "mask_prob": 0.15,
-    "mask_token_ratio": 0.8,
-    "random_token_ratio": 0.5
-}
+
+# ============================================================
+# Routing Auxiliary Loss Functions
+# ============================================================
+
+def compute_routing_aux_loss(
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    n_neurons: int
+) -> dict:
+    """
+    Compute auxiliary losses for routing.
+
+    Args:
+        weights: Routing weights [batch, n_neurons]
+        indices: Selected indices [batch, k]
+        n_neurons: Total number of neurons
+
+    Returns:
+        Dictionary of auxiliary losses
+    """
+    batch_size = weights.shape[0]
+
+    # 1. Entropy loss (encourage diversity)
+    # Normalized to [0, 1]: 0 = max entropy (good), 1 = min entropy (bad)
+    entropy = -(weights * torch.log(weights + 1e-10)).sum(dim=-1).mean()
+    max_entropy = math.log(n_neurons)
+    entropy_loss = 1.0 - (entropy / max_entropy)  # Low = good diversity
+
+    # 2. Usage loss (encourage all neurons to be used)
+    # Average usage across batch
+    avg_usage = weights.mean(dim=0)  # [n_neurons]
+
+    # Coefficient of variation (std / mean)
+    usage_std = avg_usage.std()
+    usage_mean = avg_usage.mean()
+    cv = usage_std / (usage_mean + 1e-8)
+
+    # We want low coefficient of variation (uniform usage)
+    usage_loss = cv
+
+    # 3. Weight variance loss (within selected neurons)
+    # Encourage selected neurons to have meaningful weights
+    selected_weights = torch.gather(weights, 1, indices)
+    weight_variance = selected_weights.var(dim=-1).mean()
+    # Normalize: high variance is good, so invert
+    # Approximate max variance for k selected from uniform is ~0.25
+    variance_loss = torch.clamp(0.25 - weight_variance, min=0.0) / 0.25  # [0, 1]
+
+    # 4. Load balance loss (across batches)
+    # Count how many times each neuron is selected
+    neuron_usage = torch.zeros(n_neurons, device=weights.device)
+    neuron_usage.scatter_add_(
+        0,
+        indices.flatten(),
+        torch.ones_like(indices.flatten(), dtype=torch.float32)
+    )
+
+    # Normalize by batch size and k
+    neuron_usage = neuron_usage / (batch_size * indices.shape[1])
+
+    # Gini coefficient (0 = perfect equality, 1 = perfect inequality)
+    sorted_usage, _ = torch.sort(neuron_usage)
+    n = len(sorted_usage)
+    index = torch.arange(1, n + 1, device=weights.device, dtype=torch.float32)
+    gini = (2 * (index * sorted_usage).sum()) / (n * sorted_usage.sum() + 1e-8) - (n + 1) / n
+
+    load_balance_loss = gini
+
+    return {
+        'entropy': entropy_loss,
+        'usage': usage_loss,
+        'variance': variance_loss,
+        'load_balance': load_balance_loss,
+        'gini': gini.detach(),  # For monitoring
+    }
+
+
+def aggregate_aux_losses(
+    aux_losses_list: list,
+    weights: dict = None
+) -> tuple:
+    """
+    Aggregate auxiliary losses from all layers.
+
+    Args:
+        aux_losses_list: List of aux loss dicts from each layer
+        weights: Weights for each loss component
+
+    Returns:
+        total_aux_loss: Weighted sum
+        aux_metrics: Individual loss values (for logging)
+    """
+    if weights is None:
+        weights = {
+            'entropy': 0.01,      # Diversity
+            'usage': 0.01,        # Uniform usage
+            'variance': 0.001,    # Meaningful weights
+            'load_balance': 0.01, # Cross-batch balance
+        }
+
+    # Aggregate across layers
+    total_aux = 0.0
+    aux_metrics = {}
+
+    for key in ['entropy', 'usage', 'variance', 'load_balance']:
+        values = [aux[key] for aux in aux_losses_list]
+        mean_value = sum(values) / len(values)
+
+        total_aux = total_aux + weights[key] * mean_value
+        aux_metrics[key] = mean_value.item()
+
+    # Add Gini for monitoring
+    gini_values = [aux['gini'] for aux in aux_losses_list]
+    aux_metrics['gini'] = (sum(gini_values) / len(gini_values)).item()
+
+    return total_aux, aux_metrics
 
 
 # ============================================================
@@ -419,201 +520,49 @@ def deep_learning_analysis(model, x, labels, step, debug_first_n_steps=10, log_f
 
 
 # ============================================================
-# MLM Masking Function
-# ============================================================
-
-def apply_mlm_masking(input_ids, tokenizer, config=None):
-    """
-    Apply MLM-style masking (80% [MASK], 10% random, 10% keep).
-    Based on dawn/utils/data_utils.py MaskingStrategy.apply_mlm_masking
-
-    Args:
-        input_ids: [B, S] Token IDs to mask
-        tokenizer: Tokenizer instance
-        config: Optional config dict with mask_prob, mask_token_ratio, random_token_ratio
-
-    Returns:
-        Tuple of (masked_input_ids, labels)
-    """
-    if config is None:
-        config = MLM_CONFIG
-
-    labels = input_ids.clone()
-    mask_prob = config.get("mask_prob", 0.15)
-    device = input_ids.device
-
-    probability_matrix = torch.full(labels.shape, mask_prob, device=device)
-
-    # ✅ Exclude special tokens (CLS, SEP, PAD, etc.) - Dawn style
-    # labels is [B, S], need to preserve batch dimension
-    special_tokens_mask = []
-    for seq in labels.tolist():  # Iterate over batch
-        seq_mask = [
-            tokenizer.get_special_tokens_mask([val], already_has_special_tokens=True)[0]
-            for val in seq
-        ]
-        special_tokens_mask.append(seq_mask)
-    special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool, device=device)
-    probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
-
-    # ✅ Exclude padding tokens (belt and suspenders)
-    padding_mask = input_ids == tokenizer.pad_token_id
-    probability_matrix.masked_fill_(padding_mask, value=0.0)
-
-    # Sample masked positions
-    masked_indices = torch.bernoulli(probability_matrix).bool()
-    labels[~masked_indices] = -100  # Only compute loss on masked tokens
-
-    # Apply masking strategy
-    mask_ratio = config.get("mask_token_ratio", 0.8)
-    random_ratio = config.get("random_token_ratio", 0.5)
-
-    # 80% [MASK]
-    indices_replaced = masked_indices & (torch.rand(labels.shape, device=device) < mask_ratio)
-    input_ids[indices_replaced] = tokenizer.mask_token_id
-
-    # 10% random (of remaining)
-    indices_random = (
-        masked_indices
-        & ~indices_replaced
-        & (torch.rand(labels.shape, device=device) < random_ratio)
-    )
-    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long, device=device)
-    input_ids[indices_random] = random_words[indices_random]
-
-    # 10% keep original (implicit)
-    return input_ids, labels
-
-
-# ============================================================
-# Dataset
-# ============================================================
-
-class TextDataset(Dataset):
-    """Dataset for tokenized texts"""
-    def __init__(self, texts, tokenizer, max_length=128):  # CHANGED: 512 → 128
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-
-        # Tokenize (NO padding here - will be done dynamically in collate_fn)
-        encoding = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
-
-        return {
-            'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0)
-        }
-
-
-def collate_fn_dynamic_padding(batch, tokenizer):
-    """
-    Collate function with DYNAMIC padding (배치별 최대 길이만큼만 padding)
-
-    큰 개선:
-    - Before: 모든 시퀀스를 512로 padding → 90% padding!
-    - After: 배치 내 최대 길이로만 padding → ~10-30% padding
-    """
-    # Find max length in this batch
-    max_len = max(item['input_ids'].size(0) for item in batch)
-
-    input_ids_list = []
-    attention_mask_list = []
-
-    for item in batch:
-        input_ids = item['input_ids']
-        attention_mask = item['attention_mask']
-        seq_len = input_ids.size(0)
-
-        # Pad to batch max length
-        if seq_len < max_len:
-            padding_len = max_len - seq_len
-            input_ids = torch.cat([
-                input_ids,
-                torch.full((padding_len,), tokenizer.pad_token_id, dtype=torch.long)
-            ])
-            attention_mask = torch.cat([
-                attention_mask,
-                torch.zeros(padding_len, dtype=torch.long)
-            ])
-
-        input_ids_list.append(input_ids)
-        attention_mask_list.append(attention_mask)
-
-    return {
-        'input_ids': torch.stack(input_ids_list),
-        'attention_mask': torch.stack(attention_mask_list)
-    }
-
-
-def load_cached_data(tokenizer_path=None, max_length=128, batch_size=128):  # CHANGED: defaults
-    """Load cached WikiText data with DYNAMIC padding"""
-    from transformers import AutoTokenizer
-    from functools import partial
-
-    # Load tokenizer
-    if tokenizer_path is None:
-        tokenizer_path = "bert-base-uncased"
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
-    # Load cached texts
-    print("Loading cached WikiText data...")
-    train_texts = CacheLoader.load_train_texts(dataset="wikitext")
-    val_texts = CacheLoader.load_validation_texts(dataset="wikitext")
-
-    if train_texts is None or val_texts is None:
-        raise ValueError(
-            "Cached data not found! "
-            f"Expected at: {CacheLoader.CACHE_BASE_DIR}/{{train,validation}}/wikitext_5to1_texts.pkl"
-        )
-
-    print(f"Loaded {len(train_texts)} train texts, {len(val_texts)} val texts")
-
-    # Create datasets
-    train_dataset = TextDataset(train_texts, tokenizer, max_length)
-    val_dataset = TextDataset(val_texts, tokenizer, max_length)
-
-    # Create collate function with tokenizer
-    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
-
-    # Create dataloaders with DYNAMIC padding
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=2,
-        collate_fn=collate_fn  # ← Dynamic padding!
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        num_workers=2,
-        collate_fn=collate_fn  # ← Dynamic padding!
-    )
-
-    return train_loader, val_loader, tokenizer
-
-
-# ============================================================
 # Training Functions
 # ============================================================
 
-def compute_load_balance_loss(model):
+def get_curriculum_k_values(epoch, total_epochs, n_input, n_process):
     """
-    Placeholder for load balancing loss (simplified architecture).
-    Returns zero as the new DAWN architecture handles balance internally.
+    Curriculum learning: Dense → Sparse scheduling.
+
+    Args:
+        epoch: Current epoch (1-indexed)
+        total_epochs: Total number of epochs
+        n_input: Total input neurons
+        n_process: Total process neurons
+
+    Returns:
+        k_input, k_process for this epoch
     """
-    return torch.tensor(0.0, device=next(model.parameters()).device)
+    # Cosine schedule: start dense (75%), end sparse (25%)
+    progress = (epoch - 1) / max(total_epochs - 1, 1)
+    sparsity = 0.5 * (1 + math.cos(math.pi * progress))
+
+    k_input = int(n_input * (0.25 + 0.5 * sparsity))
+    k_process = int(n_process * (0.25 + 0.5 * sparsity))
+
+    return k_input, k_process
+
+
+def update_temperature(model, epoch, total_epochs):
+    """
+    Temperature annealing: high (explore) → low (exploit).
+
+    Args:
+        model: DAWN model
+        epoch: Current epoch (1-indexed)
+        total_epochs: Total number of epochs
+    """
+    progress = (epoch - 1) / max(total_epochs - 1, 1)
+    # Start: 2.0 (explore), End: 1.0 (mild exploit) - keep higher for diversity
+    temperature = 2.0 * (1 - progress) + 1.0 * progress
+
+    for layer in model.layers:
+        layer.block.router.temperature.fill_(temperature)
+
+    return temperature
 
 
 def reset_routing_stats(model):
@@ -656,6 +605,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     """Train for one epoch"""
     model.train()
 
+    # Setup debug logger
+    if debug_log_file:
+        debug_logger.setup(debug_log_file, enabled=True)
+        debug_logger.log("Train", f"\n{'='*60}\nEpoch {epoch} started\n{'='*60}")
+
     # Epoch 시작 시 routing 통계 초기화
     reset_routing_stats(model)
 
@@ -663,9 +617,30 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     total_tokens = 0
     total_correct = 0
     total_valid_tokens = 0  # CRITICAL FIX: Track valid tokens only (labels != -100)
+    total_gini = 0
+    total_aux = 0
+    num_batches = 0
+
+    # Per-layer Gini tracking
+    n_layers = len(model.layers)
+    layer_gini_totals = [0.0] * n_layers
+
+    # Window accumulators for aggregated logging (every 100 steps)
+    log_interval = 100
+    window_loss = 0.0
+    window_aux = 0.0
+    window_acc_correct = 0
+    window_acc_valid = 0
+    window_gini = 0.0
+    window_layer_gini = [0.0] * n_layers
+    window_count = 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for step, batch in enumerate(pbar):
+        # Update debug logger step
+        global_step = (epoch - 1) * len(dataloader) + step
+        debug_logger.set_step(global_step)
+
         input_ids = batch["input_ids"].to(device)
 
         # Apply MLM masking
@@ -675,13 +650,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Fallback: no masking
             labels = input_ids.clone()
 
-        # Detailed debugging for first 10 steps of epoch 1
-        debug_mode = (epoch == 1 and step < 10)
+        # Detailed debugging for first 10 steps of epoch 1 (only if --debug flag)
+        debug_mode = debug_log_file and (epoch == 1 and step < 10)
 
         # Capture debug output to file
         debug_output_buffer = None
         old_stdout = None
-        if debug_mode and debug_log_file:
+        if debug_mode:
             import sys
             from io import StringIO
             old_stdout = sys.stdout
@@ -708,14 +683,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         optimizer.zero_grad()
 
         # Mixed precision training
-        # Dynamic aux weight: MUCH stronger to overcome tiny loss values
-        # aux_loss is ~0.0008 due to normalization by n_neurons, so need 100x+ multiplier
-        if epoch <= 3:
-            aux_weight = 100.0  # Very strong routing signal initially
-        elif epoch <= 10:
-            aux_weight = 50.0   # Strong routing signal
-        else:
-            aux_weight = 10.0   # Moderate routing signal
+        # Loss weight configuration
+        aux_weight = 0.01  # Overall aux loss weight
+        ortho_weight = 0.001  # Orthogonality regularization weight
+
+        # Compute orthogonality loss (outside autocast for stability)
+        ortho_losses = compute_model_orthogonality_loss(model)
+        ortho_loss = ortho_losses['total_ortho']
 
         if scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -723,45 +697,97 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     input_ids=input_ids,
                     labels=labels,
                     k_input=args.k_input,
-                    k_process=args.k_process
+                    k_process=args.k_process,
+                    return_routing_info=True
                 )
                 loss = outputs['loss']
                 logits = outputs['logits']
 
-                # Load balancing loss 추가
-                aux_loss = compute_load_balance_loss(model)
-                total_loss_combined = loss + aux_weight * aux_loss
+                # Compute new aux losses from routing info
+                if 'routing_info' in outputs:
+                    aux_losses_list = []
+                    layer_ginis = []
+                    for layer_info in outputs['routing_info']:
+                        layer_aux = compute_routing_aux_loss(
+                            weights=layer_info['weights'],
+                            indices=layer_info['indices'],
+                            n_neurons=args.n_input
+                        )
+                        aux_losses_list.append(layer_aux)
+                        layer_ginis.append(layer_aux['gini'].item())
+
+                    aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
+                    gini = aux_metrics.get('gini', 0.0)
+
+                    # Accumulate per-layer Gini
+                    for i, lg in enumerate(layer_ginis):
+                        layer_gini_totals[i] += lg
+                else:
+                    # Fallback to legacy aux loss
+                    model_aux = outputs['aux_loss']
+                    aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+                    gini = 0.0
+                    layer_ginis = [0.0] * n_layers
+
+                total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss
+
+            # NaN/Inf detection - STOP immediately
+            if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
+                nan_info = f"""
+{'='*60}
+NaN/Inf DETECTED - STOPPING TRAINING
+{'='*60}
+Epoch: {epoch}, Step: {step}
+Loss: {loss.item() if not torch.isnan(loss) else 'NaN'}
+Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') and not torch.isnan(aux_loss) else aux_loss}
+Ortho Loss: {ortho_loss.item() if hasattr(ortho_loss, 'item') else ortho_loss}
+Total Loss: {total_loss_combined.item() if not torch.isnan(total_loss_combined) else 'NaN'}
+Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]
+Logits has NaN: {torch.isnan(logits).any().item()}
+Logits has Inf: {torch.isinf(logits).any().item()}
+
+Router weights check:
+"""
+                for name, param in model.named_parameters():
+                    if 'router' in name:
+                        has_nan = torch.isnan(param).any().item()
+                        has_inf = torch.isinf(param).any().item()
+                        nan_info += f"  {name}: NaN={has_nan}, Inf={has_inf}, norm={param.norm().item():.4f}\n"
+
+                nan_info += f"{'='*60}\n"
+
+                # Log to debug file
+                if debug_log_file:
+                    with open(debug_log_file, 'a') as f:
+                        f.write(nan_info)
+
+                raise RuntimeError(f"NaN/Inf detected at epoch {epoch}, step {step}. Check debug log for details.")
 
             if debug_mode:
                 print(f"\nAfter Forward:")
                 print(f"  Logits shape: {logits.shape}")
                 print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
-                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') else aux_loss:.4f}")
 
             scaler.scale(total_loss_combined).backward()
-
-            if debug_mode:
-                print(f"\n[Gradient Check - After Backward]")
-                # Check router gradients
-                for name, param in model.named_parameters():
-                    if param.grad is not None and 'router' in name:
-                        grad_norm = param.grad.norm().item()
-                        print(f"  {name}: grad_norm={grad_norm:.6f}")
-                        if grad_norm < 1e-7:
-                            print(f"    ⚠ WARNING: Gradient too small")
-                        elif grad_norm > 100:
-                            print(f"    ⚠ WARNING: Gradient too large")
 
             scaler.unscale_(optimizer)
 
             # Gradient clipping with verification
             grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            if debug_mode:
-                print(f"\n[Gradient Clipping]")
-                print(f"  Grad norm before clipping: {grad_norm_before:.2f}")
+            # Debug: log gradients (only if debug mode)
+            if debug_log_file:
+                debug_logger.log("Gradients", f"total_norm: {grad_norm_before:.4f}")
                 if grad_norm_before > 10.0:
-                    print(f"  ⚠ WARNING: Gradient exploding! (>{10.0})")
+                    debug_logger.log("Gradients", f"⚠️ Gradient exploding! norm={grad_norm_before:.2f}")
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            g_norm = param.grad.norm().item()
+                            if g_norm > 1.0:
+                                has_nan = torch.isnan(param.grad).any().item()
+                                has_inf = torch.isinf(param.grad).any().item()
+                                debug_logger.log("Gradients", f"  {name}: norm={g_norm:.4f}, nan={has_nan}, inf={has_inf}")
 
             scaler.step(optimizer)
             scaler.update()
@@ -770,43 +796,95 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 input_ids=input_ids,
                 labels=labels,
                 k_input=args.k_input,
-                k_process=args.k_process
+                k_process=args.k_process,
+                return_routing_info=True
             )
             loss = outputs['loss']
             logits = outputs['logits']
 
-            # Load balancing loss 추가
-            aux_loss = compute_load_balance_loss(model)
-            total_loss_combined = loss + aux_weight * aux_loss
+            # Compute new aux losses from routing info
+            if 'routing_info' in outputs:
+                aux_losses_list = []
+                layer_ginis = []
+                for layer_info in outputs['routing_info']:
+                    layer_aux = compute_routing_aux_loss(
+                        weights=layer_info['weights'],
+                        indices=layer_info['indices'],
+                        n_neurons=args.n_input
+                    )
+                    aux_losses_list.append(layer_aux)
+                    layer_ginis.append(layer_aux['gini'].item())
+
+                aux_loss, aux_metrics = aggregate_aux_losses(aux_losses_list)
+                gini = aux_metrics.get('gini', 0.0)
+
+                # Accumulate per-layer Gini
+                for i, lg in enumerate(layer_ginis):
+                    layer_gini_totals[i] += lg
+            else:
+                # Fallback to legacy aux loss
+                model_aux = outputs['aux_loss']
+                aux_loss = model_aux['load_balance'] * 0.001 + model_aux['entropy'] * 0.1
+                gini = 0.0
+                layer_ginis = [0.0] * n_layers
+
+            total_loss_combined = loss + aux_weight * aux_loss + ortho_weight * ortho_loss
+
+            # NaN/Inf detection - STOP immediately
+            if torch.isnan(total_loss_combined) or torch.isinf(total_loss_combined):
+                nan_info = f"""
+{'='*60}
+NaN/Inf DETECTED - STOPPING TRAINING
+{'='*60}
+Epoch: {epoch}, Step: {step}
+Loss: {loss.item() if not torch.isnan(loss) else 'NaN'}
+Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') and not torch.isnan(aux_loss) else aux_loss}
+Ortho Loss: {ortho_loss.item() if hasattr(ortho_loss, 'item') else ortho_loss}
+Total Loss: {total_loss_combined.item() if not torch.isnan(total_loss_combined) else 'NaN'}
+Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]
+Logits has NaN: {torch.isnan(logits).any().item()}
+Logits has Inf: {torch.isinf(logits).any().item()}
+
+Router weights check:
+"""
+                for name, param in model.named_parameters():
+                    if 'router' in name:
+                        has_nan = torch.isnan(param).any().item()
+                        has_inf = torch.isinf(param).any().item()
+                        nan_info += f"  {name}: NaN={has_nan}, Inf={has_inf}, norm={param.norm().item():.4f}\n"
+
+                nan_info += f"{'='*60}\n"
+
+                # Log to debug file
+                if debug_log_file:
+                    with open(debug_log_file, 'a') as f:
+                        f.write(nan_info)
+
+                raise RuntimeError(f"NaN/Inf detected at epoch {epoch}, step {step}. Check debug log for details.")
 
             if debug_mode:
                 print(f"\nAfter Forward:")
                 print(f"  Logits shape: {logits.shape}")
                 print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
-                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}")
+                print(f"  Loss: {loss.item():.4f}, Aux Loss: {aux_loss.item() if hasattr(aux_loss, 'item') else aux_loss:.4f}")
 
             total_loss_combined.backward()
-
-            if debug_mode:
-                print(f"\n[Gradient Check - After Backward]")
-                # Check router gradients
-                for name, param in model.named_parameters():
-                    if param.grad is not None and 'router' in name:
-                        grad_norm = param.grad.norm().item()
-                        print(f"  {name}: grad_norm={grad_norm:.6f}")
-                        if grad_norm < 1e-7:
-                            print(f"    ⚠ WARNING: Gradient too small")
-                        elif grad_norm > 100:
-                            print(f"    ⚠ WARNING: Gradient too large")
 
             # Gradient clipping with verification
             grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            if debug_mode:
-                print(f"\n[Gradient Clipping]")
-                print(f"  Grad norm before clipping: {grad_norm_before:.2f}")
+            # Debug: log gradients (only if debug mode)
+            if debug_log_file:
+                debug_logger.log("Gradients", f"total_norm: {grad_norm_before:.4f}")
                 if grad_norm_before > 10.0:
-                    print(f"  ⚠ WARNING: Gradient exploding! (>{10.0})")
+                    debug_logger.log("Gradients", f"⚠️ Gradient exploding! norm={grad_norm_before:.2f}")
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            g_norm = param.grad.norm().item()
+                            if g_norm > 1.0:
+                                has_nan = torch.isnan(param.grad).any().item()
+                                has_inf = torch.isinf(param.grad).any().item()
+                                debug_logger.log("Gradients", f"  {name}: norm={g_norm:.4f}, nan={has_nan}, inf={has_inf}")
 
             optimizer.step()
 
@@ -844,20 +922,59 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         total_loss += loss.item() * num_tokens
         total_tokens += num_tokens
 
+        aux_loss_val = aux_loss.item() if hasattr(aux_loss, 'item') else aux_loss
+
+        # Accumulate routing metrics
+        total_gini += gini
+        total_aux += aux_loss_val
+        num_batches += 1
+        step_acc = correct / valid_tokens if valid_tokens > 0 else 0.0
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
-            "aux": f"{aux_loss.item():.4f}",
-            "w_aux": f"{(aux_weight * aux_loss).item():.5f}",
-            "acc": f"{correct / valid_tokens:.4f}" if valid_tokens > 0 else "0.0000"
+            "aux": f"{aux_loss_val:.4f}",
+            "gini": f"{gini:.3f}",
+            "acc": f"{step_acc:.4f}"
         })
 
-        # Log to file every step
-        if log_file:
+        # Debug: log step summary (every 10 steps to reduce log size)
+        if debug_log_file and step % 10 == 0:
+            debug_logger.log("Summary", f"loss={loss.item():.4f}, aux={aux_loss_val:.4f}, acc={step_acc:.4f}, grad_norm={grad_norm_before:.4f}")
+            debug_logger.log("Summary", "-" * 40)
+
+        # Accumulate for window logging
+        window_loss += loss.item()
+        window_aux += aux_loss_val
+        window_acc_correct += correct
+        window_acc_valid += valid_tokens
+        window_gini += gini
+        for i, lg in enumerate(layer_ginis):
+            window_layer_gini[i] += lg
+        window_count += 1
+
+        # Log aggregated metrics every 100 steps
+        if log_file and (step + 1) % log_interval == 0:
+            avg_window_loss = window_loss / window_count
+            avg_window_aux = window_aux / window_count
+            avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
+            avg_window_gini = window_gini / window_count
+            avg_window_layer_gini = [g / window_count for g in window_layer_gini]
+
+            # Format layer gini as comma-separated
+            layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
+
             with open(log_file, 'a') as f:
-                acc_val = correct / valid_tokens if valid_tokens > 0 else 0.0
-                f.write(f"epoch={epoch},step={step+1},loss={loss.item():.6f},"
-                       f"aux_loss={aux_loss.item():.6f},weighted_aux={(aux_weight * aux_loss).item():.6f},"
-                       f"acc={acc_val:.6f}\n")
+                f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
+                       f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
+                       f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}]\n")
+
+            # Reset window accumulators
+            window_loss = 0.0
+            window_aux = 0.0
+            window_acc_correct = 0
+            window_acc_valid = 0
+            window_gini = 0.0
+            window_layer_gini = [0.0] * n_layers
+            window_count = 0
 
         # Restore stdout and write debug output to file
         if debug_mode and debug_log_file and old_stdout is not None:
@@ -867,26 +984,59 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 with open(debug_log_file, 'a') as f:
                     f.write(captured)
 
+    # Log remaining steps at end of epoch
+    if log_file and window_count > 0:
+        avg_window_loss = window_loss / window_count
+        avg_window_aux = window_aux / window_count
+        avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
+        avg_window_gini = window_gini / window_count
+        avg_window_layer_gini = [g / window_count for g in window_layer_gini]
+        layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
+
+        with open(log_file, 'a') as f:
+            f.write(f"epoch={epoch},step={num_batches},loss={avg_window_loss:.6f},"
+                   f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
+                   f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}]\n")
+
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
-    return avg_loss, avg_acc
+    avg_gini = total_gini / num_batches if num_batches > 0 else 0.0
+    avg_aux = total_aux / num_batches if num_batches > 0 else 0.0
+
+    # Compute per-layer average Gini
+    layer_gini_avgs = [round(g / num_batches, 4) if num_batches > 0 else 0.0 for g in layer_gini_totals]
+
+    routing_metrics = {
+        'gini': round(avg_gini, 4),
+        'aux_loss': round(avg_aux, 4),
+        'layer_gini': layer_gini_avgs
+    }
+
+    return avg_loss, avg_acc, routing_metrics
 
 
-def evaluate(model, dataloader, device, args):
-    """Evaluate model"""
+def evaluate(model, dataloader, device, args, tokenizer=None):
+    """Evaluate model with MLM masking"""
     model.eval()
     total_loss = 0
     total_tokens = 0
     total_correct = 0
-    total_valid_tokens = 0  # CRITICAL FIX: Track valid tokens only
+    total_valid_tokens = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
             input_ids = batch["input_ids"].to(device)
-            labels = input_ids.clone()
+
+            # Apply same MLM masking as training
+            if tokenizer is not None:
+                masked_input_ids, labels = apply_mlm_masking(input_ids, tokenizer)
+            else:
+                # Fallback: use all tokens (not recommended)
+                masked_input_ids = input_ids
+                labels = input_ids.clone()
 
             outputs = model(
-                input_ids=input_ids,
+                input_ids=masked_input_ids,
                 labels=labels,
                 k_input=args.k_input,
                 k_process=args.k_process
@@ -917,83 +1067,120 @@ def evaluate(model, dataloader, device, args):
     return avg_loss, avg_acc
 
 
+def load_config(config_path):
+    """Load config from YAML file"""
+    import yaml
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train DAWN (Dynamic Architecture With Neurons)')
+    parser.add_argument('--config', type=str, default='configs/train_config.yaml',
+                        help='Path to config file')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug logging to file')
+    cli_args = parser.parse_args()
 
-    # Model architecture
-    parser.add_argument('--d_model', type=int, default=512,
-                        help='Model dimension')
-    parser.add_argument('--n_heads', type=int, default=8,
-                        help='Number of attention heads')
-    parser.add_argument('--n_layers', type=int, default=6,
-                        help='Number of transformer layers')
-    parser.add_argument('--max_seq_len', type=int, default=128,  # CHANGED: 512 → 128 (Scenario B)
-                        help='Maximum sequence length')
+    # Load config
+    config_path = Path(PROJECT_ROOT) / cli_args.config
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    # DAWN FFN specific
-    parser.add_argument('--n_input', type=int, default=2048,
-                        help='Number of input neurons')
-    parser.add_argument('--n_process', type=int, default=1024,
-                        help='Number of process neurons')
+    cfg = load_config(config_path)
 
-    # Sparsity control (runtime)
-    parser.add_argument('--k_input', type=int, default=None,
-                        help='Number of input neurons to activate (None = n_input//8)')
-    parser.add_argument('--k_process', type=int, default=None,
-                        help='Number of process neurons to activate (None = n_process//8)')
+    # Create args namespace from config
+    class Args:
+        pass
+    args = Args()
+
+    # Model
+    args.d_model = cfg['model']['d_model']
+    args.n_heads = cfg['model']['n_heads']
+    args.n_layers = cfg['model']['n_layers']
+    args.n_input = cfg['model']['n_input']
+    args.n_process = cfg['model']['n_process']
+    args.max_seq_len = cfg['model']['max_seq_len']
+    args.dropout = cfg['model']['dropout']
+
+    # Sparsity
+    args.k_input = cfg['sparsity']['k_input']
+    args.k_process = cfg['sparsity']['k_process']
 
     # Training
-    parser.add_argument('--batch_size', type=int, default=128,  # CHANGED: 32 → 128 (Scenario B)
-                        help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=30,
-                        help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate')
-    parser.add_argument('--dropout', type=float, default=0.1,
-                        help='Dropout rate')
+    args.batch_size = cfg['training']['batch_size']
+    args.num_epochs = cfg['training']['num_epochs']
+    args.lr = cfg['training']['lr']
+    args.weight_decay = cfg['training']['weight_decay']
+    args.warmup_epochs = cfg['training']['warmup_epochs']
 
-    # Optimization
-    parser.add_argument('--use_amp', action='store_true',
-                        help='Use automatic mixed precision')
-    parser.add_argument('--gradient_checkpointing', action='store_true',
-                        help='Use gradient checkpointing to save memory')
+    # Router
+    args.router_lr_mult = cfg['router']['lr_multiplier']
+    args.router_weight_decay = cfg['router']['weight_decay']
 
-    # Paths
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
-                        help='Checkpoint directory')
-    parser.add_argument('--log_dir', type=str, default='./logs',
-                        help='Log directory')
-
-    args = parser.parse_args()
+    # Other
+    args.use_amp = cfg['use_amp']
+    args.checkpoint_dir = cfg['checkpoint_dir']
+    args.log_dir = cfg['log_dir']
 
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Create directories
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = Path(args.checkpoint_dir) / "dawn" / timestamp
-    log_dir = Path(args.log_dir) / "dawn" / timestamp
+    # Create directories with timestamp for each run
+    base_checkpoint_dir = Path(args.checkpoint_dir)
+    base_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find latest run folder and best checkpoint for auto-resume
+    latest_best_checkpoint = None
+    if not cli_args.resume:
+        # Look for existing run folders
+        run_folders = sorted([
+            d for d in base_checkpoint_dir.iterdir()
+            if d.is_dir() and d.name.startswith('run_')
+        ], reverse=True)
+
+        if run_folders:
+            latest_folder = run_folders[0]
+            best_ckpt = latest_folder / 'best_model.pt'
+            if best_ckpt.exists():
+                latest_best_checkpoint = best_ckpt
+                print(f"\nFound latest checkpoint: {latest_best_checkpoint}")
+
+    # Create new run folder with Korean timestamp and random number
+    import random
+    from datetime import timezone, timedelta
+    kst = timezone(timedelta(hours=9))
+    timestamp = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
+    random_suffix = random.randint(1000, 9999)
+    run_name = f"run_{timestamp}_{random_suffix}"
+    checkpoint_dir = base_checkpoint_dir / run_name
+    log_dir = checkpoint_dir  # Same folder for simplicity
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Run folder: {checkpoint_dir}")
 
     # Save config
-    config = vars(args)
     with open(checkpoint_dir / 'config.json', 'w') as f:
-        json.dump(config, f, indent=2)
+        json.dump(cfg, f, indent=2)
 
     print(f"\n{'='*60}")
     print(f"DAWN (Dynamic Architecture With Neurons) Training")
     print(f"{'='*60}")
-    print(f"\nConfiguration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
+    print(f"\nConfig file: {config_path}")
+    print(f"\nModel: d_model={args.d_model}, n_heads={args.n_heads}, n_layers={args.n_layers}")
+    print(f"Neurons: n_input={args.n_input}, n_process={args.n_process}")
+    print(f"Sparsity: k_input={args.k_input or 'auto'}, k_process={args.k_process or 'auto'}")
+    print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
     print(f"\n{'='*60}")
-    print("Loading cached WikiText data...")
+    print("Loading data...")
     print(f"{'='*60}")
-    train_loader, val_loader, tokenizer = load_cached_data(
+    train_loader, val_loader, tokenizer = load_data(
+        data_config=cfg['data'],
         max_length=args.max_seq_len,
         batch_size=args.batch_size
     )
@@ -1008,17 +1195,7 @@ def main():
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    model = HierarchicalLanguageModel(
-        vocab_size=vocab_size,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        max_seq_len=args.max_seq_len,
-        n_input=args.n_input,
-        n_process=args.n_process,
-        dropout=args.dropout
-    )
-
+    model = HierarchicalLanguageModel.from_config(cfg, vocab_size)
     model = model.to(device)
 
     # Model statistics
@@ -1028,22 +1205,13 @@ def main():
     print(f"  Trainable parameters: {stats['trainable_parameters']:,}")
     print(f"  Number of layers: {stats['n_layers']}")
 
-    # Sparsity info
-    # Start with less aggressive sparsity to verify architecture works
-    # Then gradually increase sparsity if training succeeds
-    if args.k_input is None:
-        k_input_actual = args.n_input // 2  # 50% (was 12.5%)
-    else:
-        k_input_actual = args.k_input
+    # Sparsity info (DAWN uses 50% by default)
+    k_input_default = args.n_input // 2
+    k_process_default = args.n_process // 2
 
-    if args.k_process is None:
-        k_process_actual = args.n_process // 2  # 50%
-    else:
-        k_process_actual = args.k_process
-
-    print(f"\nSparsity Configuration:")
-    print(f"  Input neurons: {k_input_actual}/{args.n_input} ({k_input_actual/args.n_input*100:.1f}%)")
-    print(f"  Process neurons: {k_process_actual}/{args.n_process} ({k_process_actual/args.n_process*100:.1f}%)")
+    print(f"\nSparsity Configuration (default):")
+    print(f"  Input neurons: {k_input_default}/{args.n_input} ({k_input_default/args.n_input*100:.1f}%)")
+    print(f"  Process neurons: {k_process_default}/{args.n_process} ({k_process_default/args.n_process*100:.1f}%)")
 
     # Optimizer & Scheduler
     # Separate parameter groups: Router gets higher LR for faster learning
@@ -1059,20 +1227,19 @@ def main():
     print(f"\nOptimizer parameter groups:")
     print(f"  Router params: {len(router_params)} tensors")
     print(f"  Other params: {len(other_params)} tensors")
-    print(f"  Router LR: {args.lr * 5.0:.2e} (5x base)")
+    print(f"  Router LR: {args.lr * args.router_lr_mult:.2e} ({args.router_lr_mult}x base)")
     print(f"  Other LR: {args.lr:.2e}")
 
     optimizer = torch.optim.AdamW([
-        {'params': router_params, 'lr': args.lr * 5.0, 'weight_decay': 0.001},  # 5x LR, less decay
-        {'params': other_params, 'lr': args.lr, 'weight_decay': 0.01}
+        {'params': router_params, 'lr': args.lr * args.router_lr_mult, 'weight_decay': args.router_weight_decay},
+        {'params': other_params, 'lr': args.lr, 'weight_decay': args.weight_decay}
     ],
         betas=(0.9, 0.98),
         eps=1e-9
     )
 
     # Warmup + Cosine Annealing scheduler
-    warmup_epochs = 2
-    warmup_steps = warmup_epochs * len(train_loader)
+    warmup_steps = args.warmup_epochs * len(train_loader)
     total_steps = args.num_epochs * len(train_loader)
 
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -1099,6 +1266,33 @@ def main():
     if args.use_amp:
         print(f"\nUsing Automatic Mixed Precision (AMP)")
 
+    # Resume from checkpoint if specified or auto-resume from latest best
+    start_epoch = 1
+    resume_checkpoint = None
+
+    if cli_args.resume:
+        resume_checkpoint = Path(cli_args.resume)
+    elif latest_best_checkpoint:
+        resume_checkpoint = latest_best_checkpoint
+
+    if resume_checkpoint and resume_checkpoint.exists():
+        print(f"\nResuming from checkpoint: {resume_checkpoint}")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scaler_state_dict' in checkpoint and scaler is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        print(f"  Resumed from epoch {start_epoch - 1}")
+        print(f"  Starting from epoch {start_epoch}")
+    elif cli_args.resume:
+        print(f"\nWarning: Checkpoint not found: {cli_args.resume}")
+        print(f"Starting from scratch...")
+    else:
+        print(f"\nStarting fresh training (no previous checkpoint found)")
+
     # Checkpoint & Monitor
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
     monitor = TrainingMonitor(str(log_dir))
@@ -1109,8 +1303,8 @@ def main():
 
     # Write header to training log
     with open(training_log_file, 'w') as f:
-        f.write("# Training Log\n")
-        f.write("# Format: epoch,step,loss,aux_loss,weighted_aux,acc\n")
+        f.write("# Training Log (aggregated every 100 steps)\n")
+        f.write("# Format: epoch,step,loss,aux_loss,acc,gini,layer_gini=[L0,L1,...]\n")
 
     # Write header to debug log
     with open(debug_log_file, 'w') as f:
@@ -1125,18 +1319,31 @@ def main():
     print(f"{'='*60}")
     best_val_loss = float('inf')
 
-    for epoch in range(1, args.num_epochs + 1):
+    for epoch in range(start_epoch, args.num_epochs + 1):
         epoch_start = time.time()
 
+        # Curriculum learning: adjust k values (dense → sparse)
+        k_input, k_process = get_curriculum_k_values(
+            epoch, args.num_epochs, args.n_input, args.n_process
+        )
+        args.k_input = k_input
+        args.k_process = k_process
+
+        # Temperature annealing: update router temperature (explore → exploit)
+        temperature = update_temperature(model, epoch, args.num_epochs)
+
+        if epoch == 1 or epoch % 5 == 0:
+            print(f"\nEpoch {epoch}: k_input={k_input}, k_process={k_process}, temp={temperature:.2f}")
+
         # Train
-        train_loss, train_acc = train_epoch(
+        train_loss, train_acc, routing_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args, scaler, tokenizer,
             log_file=str(training_log_file),
-            debug_log_file=str(debug_log_file)
+            debug_log_file=str(debug_log_file) if cli_args.debug else None
         )
 
         # Evaluate
-        val_loss, val_acc = evaluate(model, val_loader, device, args)
+        val_loss, val_acc = evaluate(model, val_loader, device, args, tokenizer)
 
         epoch_time = time.time() - epoch_start
 
@@ -1146,6 +1353,9 @@ def main():
             'train_acc': train_acc,
             'val_loss': val_loss,
             'val_acc': val_acc,
+            'gini': routing_metrics['gini'],
+            'aux_loss': routing_metrics['aux_loss'],
+            'layer_gini': routing_metrics['layer_gini'],
             'learning_rate': optimizer.param_groups[0]['lr'],
             'epoch_time': epoch_time
         }
@@ -1154,6 +1364,12 @@ def main():
         print(f"\nEpoch {epoch}/{args.num_epochs}")
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+        print(f"  Gini: {routing_metrics['gini']:.4f} | Aux Loss: {routing_metrics['aux_loss']:.4f}")
+
+        # Per-layer Gini
+        layer_gini_str = " | ".join([f"L{i}:{g:.3f}" for i, g in enumerate(routing_metrics['layer_gini'])])
+        print(f"  Layer Gini: {layer_gini_str}")
+
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
 
         # Print diagnostic metrics every 100 epochs (or first epoch)
@@ -1167,7 +1383,8 @@ def main():
             print(f"  New best model! (val_loss: {best_val_loss:.4f})")
 
         ckpt_manager.save_checkpoint(
-            model, optimizer, epoch, val_loss, metrics, is_best=is_best
+            model, optimizer, epoch, val_loss, metrics, is_best=is_best,
+            scheduler=scheduler, scaler=scaler
         )
 
     print(f"\n{'='*60}")

@@ -385,3 +385,267 @@ class CacheLoader:
             List of training texts, or None if not available
         """
         return CacheLoader.load_texts(split="train", dataset=dataset)
+
+
+# ============================================================
+# MLM Configuration
+# ============================================================
+
+MLM_CONFIG = {
+    "mask_prob": 0.15,
+    "mask_token_ratio": 0.8,
+    "random_token_ratio": 0.5
+}
+
+
+# ============================================================
+# MLM Masking Function
+# ============================================================
+
+def apply_mlm_masking(input_ids, tokenizer, config=None):
+    """
+    Apply MLM-style masking (80% [MASK], 10% random, 10% keep).
+
+    Args:
+        input_ids: [B, S] Token IDs to mask
+        tokenizer: Tokenizer instance
+        config: Optional config dict with mask_prob, mask_token_ratio, random_token_ratio
+
+    Returns:
+        Tuple of (masked_input_ids, labels)
+    """
+    if config is None:
+        config = MLM_CONFIG
+
+    labels = input_ids.clone()
+    mask_prob = config.get("mask_prob", 0.15)
+    device = input_ids.device
+
+    probability_matrix = torch.full(labels.shape, mask_prob, device=device)
+
+    # Exclude special tokens (CLS, SEP, PAD, etc.)
+    special_tokens_mask = []
+    for seq in labels.tolist():
+        seq_mask = [
+            tokenizer.get_special_tokens_mask([val], already_has_special_tokens=True)[0]
+            for val in seq
+        ]
+        special_tokens_mask.append(seq_mask)
+    special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool, device=device)
+    probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+
+    # Exclude padding tokens
+    padding_mask = input_ids == tokenizer.pad_token_id
+    probability_matrix.masked_fill_(padding_mask, value=0.0)
+
+    # Sample masked positions
+    masked_indices = torch.bernoulli(probability_matrix).bool()
+    labels[~masked_indices] = -100  # Only compute loss on masked tokens
+
+    # Apply masking strategy
+    mask_ratio = config.get("mask_token_ratio", 0.8)
+    random_ratio = config.get("random_token_ratio", 0.5)
+
+    # 80% [MASK]
+    indices_replaced = masked_indices & (torch.rand(labels.shape, device=device) < mask_ratio)
+    input_ids[indices_replaced] = tokenizer.mask_token_id
+
+    # 10% random (of remaining)
+    indices_random = (
+        masked_indices
+        & ~indices_replaced
+        & (torch.rand(labels.shape, device=device) < random_ratio)
+    )
+    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long, device=device)
+    input_ids[indices_random] = random_words[indices_random]
+
+    # 10% keep original (implicit)
+    return input_ids, labels
+
+
+# ============================================================
+# Dataset Classes
+# ============================================================
+
+from torch.utils.data import DataLoader, Dataset
+
+class TextDataset(Dataset):
+    """Dataset for tokenized texts"""
+    def __init__(self, texts, tokenizer, max_length=128):
+        self.texts = texts
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+
+        # Tokenize (NO padding here - will be done dynamically in collate_fn)
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0)
+        }
+
+
+def collate_fn_dynamic_padding(batch, tokenizer):
+    """
+    Collate function with DYNAMIC padding (배치별 최대 길이만큼만 padding)
+    """
+    # Find max length in this batch
+    max_len = max(item['input_ids'].size(0) for item in batch)
+
+    input_ids_list = []
+    attention_mask_list = []
+
+    for item in batch:
+        input_ids = item['input_ids']
+        attention_mask = item['attention_mask']
+        seq_len = input_ids.size(0)
+
+        # Pad to batch max length
+        if seq_len < max_len:
+            padding_len = max_len - seq_len
+            input_ids = torch.cat([
+                input_ids,
+                torch.full((padding_len,), tokenizer.pad_token_id, dtype=torch.long)
+            ])
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.zeros(padding_len, dtype=torch.long)
+            ])
+
+        input_ids_list.append(input_ids)
+        attention_mask_list.append(attention_mask)
+
+    return {
+        'input_ids': torch.stack(input_ids_list),
+        'attention_mask': torch.stack(attention_mask_list)
+    }
+
+
+def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
+    """Load data from config paths with DYNAMIC padding"""
+    from transformers import AutoTokenizer
+    from functools import partial
+
+    # Load tokenizer
+    if tokenizer_path is None:
+        tokenizer_path = "bert-base-uncased"
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    # Load data from config paths
+    base_dir = data_config['base_dir']
+    train_path = os.path.join(base_dir, data_config['train_file'])
+    val_path = os.path.join(base_dir, data_config['val_file'])
+
+    print(f"Loading data from: {base_dir}")
+
+    # Load train texts
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"Train data not found: {train_path}")
+    with open(train_path, 'rb') as f:
+        train_texts = pickle.load(f)
+
+    # Load validation texts
+    if not os.path.exists(val_path):
+        raise FileNotFoundError(f"Validation data not found: {val_path}")
+    with open(val_path, 'rb') as f:
+        val_texts = pickle.load(f)
+
+    print(f"Loaded {len(train_texts)} train texts, {len(val_texts)} val texts")
+
+    # Create datasets
+    train_dataset = TextDataset(train_texts, tokenizer, max_length)
+    val_dataset = TextDataset(val_texts, tokenizer, max_length)
+
+    # Create collate function with tokenizer
+    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+
+    # Create dataloaders with DYNAMIC padding
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        collate_fn=collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        num_workers=2,
+        collate_fn=collate_fn
+    )
+
+    return train_loader, val_loader, tokenizer
+
+
+# ============================================================
+# MLM Accuracy Calculation
+# ============================================================
+
+def compute_mlm_accuracy(logits, labels):
+    """
+    Compute accuracy for MLM task (only on masked tokens).
+
+    Args:
+        logits: Model output logits [B, S, V]
+        labels: Labels with -100 for non-masked tokens [B, S]
+
+    Returns:
+        Tuple of (num_correct, num_valid_tokens)
+    """
+    predictions = logits.argmax(dim=-1)  # [B, S]
+
+    # Only count tokens that are not masked (-100)
+    valid_mask = (labels != -100)  # [B, S]
+    correct_predictions = (predictions == labels) & valid_mask
+
+    num_correct = correct_predictions.sum().item()
+    num_valid = valid_mask.sum().item()
+
+    return num_correct, num_valid
+
+
+def evaluate_mlm_batch(model, input_ids, tokenizer, device, config=None):
+    """
+    Evaluate a single batch with MLM masking.
+
+    Args:
+        model: The model to evaluate
+        input_ids: Input token IDs [B, S]
+        tokenizer: Tokenizer for masking
+        device: Device to use
+        config: MLM config (optional)
+
+    Returns:
+        Dict with loss, correct, valid_tokens
+    """
+    # Apply MLM masking
+    masked_input_ids, labels = apply_mlm_masking(input_ids.clone(), tokenizer, config)
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=masked_input_ids,
+            labels=labels
+        )
+        loss = outputs['loss']
+        logits = outputs['logits']
+
+        num_correct, num_valid = compute_mlm_accuracy(logits, labels)
+
+    return {
+        'loss': loss.item(),
+        'correct': num_correct,
+        'valid_tokens': num_valid,
+        'logits': logits,
+        'labels': labels
+    }

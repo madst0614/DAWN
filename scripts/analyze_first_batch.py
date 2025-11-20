@@ -269,17 +269,26 @@ def analyze_labels(input_ids, labels, tokenizer):
 
 
 def main():
+    import yaml
+
     print("="*70)
     print("FIRST BATCH DATA ANALYZER")
     print("="*70)
 
+    # Config 로드
+    config_path = PROJECT_ROOT / "configs" / "train_config.yaml"
+    print(f"\nLoading config from: {config_path}")
+
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+
     # 데이터 로더 생성
     print("\nLoading data...")
     try:
-        train_loader, val_loader, tokenizer = train_module.load_cached_data(
-            tokenizer_path="bert-base-uncased",
-            max_length=128,  # 현재 설정
-            batch_size=128   # 현재 설정
+        train_loader, val_loader, tokenizer = train_module.load_data(
+            data_config=cfg['data'],
+            max_length=cfg['model']['max_seq_len'],
+            batch_size=cfg['training']['batch_size']
         )
 
         print(f"✅ Data loaded successfully!")
@@ -292,8 +301,7 @@ def main():
 
     except Exception as e:
         print(f"❌ Error loading data: {e}")
-        print("\nMake sure WikiText cache exists at:")
-        print("  /content/drive/MyDrive/dawn_v4/cache/train/wikitext_5to1_texts.pkl")
+        print(f"\nMake sure data exists at: {cfg['data']['base_dir']}")
         return
 
     # 첫 배치 가져오기 (MLM 마스킹 전)
