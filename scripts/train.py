@@ -837,13 +837,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Fallback: no masking
             labels = input_ids.clone()
 
-        # Detailed debugging for first 10 steps of epoch 1
-        debug_mode = (epoch == 1 and step < 10)
+        # Detailed debugging for first 10 steps of epoch 1 (only if --debug flag)
+        debug_mode = debug_log_file and (epoch == 1 and step < 10)
 
         # Capture debug output to file
         debug_output_buffer = None
         old_stdout = None
-        if debug_mode and debug_log_file:
+        if debug_mode:
             import sys
             from io import StringIO
             old_stdout = sys.stdout
