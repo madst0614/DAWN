@@ -971,26 +971,38 @@ Router weights check:
             layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
 
             # NEW: Collect learned parameters from each layer
-            learned_k_ratios = []
+            learned_thresholds = []
             learned_temps = []
-            learned_ks = []
-            for layer in model.layers:
-                router = layer.block.router
-                learned_k_ratios.append(router.get_k_ratio().item())
-                learned_temps.append(router.get_temperature().item())
-                # Compute actual k from k_ratio
-                actual_k = max(int(router.n_neurons * router.get_k_ratio().item()), 8)
-                learned_ks.append(actual_k)
+            effective_ks = []
+            effective_k_ratios = []
 
-            k_ratio_str = ",".join([f"{r:.3f}" for r in learned_k_ratios])
+            # Get from routing info if available
+            if 'routing_info' in outputs:
+                for layer_info in outputs['routing_info']:
+                    learned_thresholds.append(layer_info.get('learned_threshold', 0.5))
+                    learned_temps.append(layer_info.get('learned_temp', 1.0))
+                    effective_ks.append(layer_info.get('effective_k', 64))
+                    effective_k_ratios.append(layer_info.get('effective_k_ratio', 0.5))
+            else:
+                # Fallback: get from router directly
+                for layer in model.layers:
+                    router = layer.block.router
+                    learned_thresholds.append(router.get_threshold().item())
+                    learned_temps.append(router.get_temperature().item())
+                    effective_ks.append(64)  # Default
+                    effective_k_ratios.append(0.5)  # Default
+
+            threshold_str = ",".join([f"{t:.3f}" for t in learned_thresholds])
             temp_str = ",".join([f"{t:.2f}" for t in learned_temps])
-            k_str = ",".join([f"{k}" for k in learned_ks])
+            eff_k_str = ",".join([f"{k:.1f}" for k in effective_ks])
+            eff_k_ratio_str = ",".join([f"{r:.3f}" for r in effective_k_ratios])
 
             with open(log_file, 'a') as f:
                 f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
                        f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
                        f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}],"
-                       f"learned_k=[{k_str}],learned_k_ratio=[{k_ratio_str}],learned_temp=[{temp_str}]\n")
+                       f"learned_threshold=[{threshold_str}],effective_k=[{eff_k_str}],"
+                       f"effective_k_ratio=[{eff_k_ratio_str}],learned_temp=[{temp_str}]\n")
 
             # Reset window accumulators
             window_loss = 0.0
@@ -1019,25 +1031,21 @@ Router weights check:
         layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
 
         # NEW: Collect learned parameters from each layer
-        learned_k_ratios = []
+        learned_thresholds = []
         learned_temps = []
-        learned_ks = []
         for layer in model.layers:
             router = layer.block.router
-            learned_k_ratios.append(router.get_k_ratio().item())
+            learned_thresholds.append(router.get_threshold().item())
             learned_temps.append(router.get_temperature().item())
-            actual_k = max(int(router.n_neurons * router.get_k_ratio().item()), 8)
-            learned_ks.append(actual_k)
 
-        k_ratio_str = ",".join([f"{r:.3f}" for r in learned_k_ratios])
+        threshold_str = ",".join([f"{t:.3f}" for t in learned_thresholds])
         temp_str = ",".join([f"{t:.2f}" for t in learned_temps])
-        k_str = ",".join([f"{k}" for k in learned_ks])
 
         with open(log_file, 'a') as f:
             f.write(f"epoch={epoch},step={num_batches},loss={avg_window_loss:.6f},"
                    f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
                    f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}],"
-                   f"learned_k=[{k_str}],learned_k_ratio=[{k_ratio_str}],learned_temp=[{temp_str}]\n")
+                   f"learned_threshold=[{threshold_str}],learned_temp=[{temp_str}]\n")
 
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
@@ -1345,7 +1353,7 @@ def main():
     # Write header to training log
     with open(training_log_file, 'w') as f:
         f.write("# Training Log (aggregated every 100 steps)\n")
-        f.write("# Format: epoch,step,loss,aux_loss,acc,gini,layer_gini=[L0,L1,...]\n")
+        f.write("# Format: epoch,step,loss,aux_loss,acc,gini,layer_gini=[L0,L1,...],learned_threshold=[...],effective_k=[...],effective_k_ratio=[...],learned_temp=[...]\n")
 
     # Write header to debug log
     with open(debug_log_file, 'w') as f:
@@ -1373,9 +1381,9 @@ def main():
         if epoch == 1 or epoch % 5 == 0:
             # Log learned parameters instead
             sample_router = model.layers[0].block.router
-            learned_k_ratio = sample_router.get_k_ratio().item()
+            learned_threshold = sample_router.get_threshold().item()
             learned_temp = sample_router.get_temperature().item()
-            print(f"\nEpoch {epoch}: Learned k_ratio={learned_k_ratio:.3f}, temp={learned_temp:.2f} (Layer 0 sample)")
+            print(f"\nEpoch {epoch}: Learned threshold={learned_threshold:.3f}, temp={learned_temp:.2f} (Layer 0 sample)")
 
         # Train
         train_loss, train_acc, routing_metrics = train_epoch(

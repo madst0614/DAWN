@@ -152,45 +152,55 @@ def compute_model_orthogonality_loss(model) -> dict:
     }
 
 
-def compute_learned_sparsity_loss(weights: torch.Tensor) -> torch.Tensor:
+def compute_learned_sparsity_loss(
+    weights: torch.Tensor,
+    selection_info: dict
+) -> torch.Tensor:
     """
-    Guide model to learn reasonable sparsity (not too sparse, not too dense).
+    Guide model to learn reasonable sparsity.
 
-    Uses Gini coefficient to measure sparsity:
-    - Gini = 0: perfectly uniform (no specialization)
-    - Gini = 1: maximally sparse (potential collapse)
-    - Target: 0.3-0.6 (moderate specialization)
+    Now uses effective_k_ratio from soft selection.
 
     Args:
         weights: Routing weights [batch, n_neurons]
+        selection_info: Dict with 'effective_k_ratio', etc.
 
     Returns:
         Sparsity guidance loss (penalty for extremes)
     """
-    # Compute Gini coefficient
-    # Average weights across batch first
-    avg_weights = weights.mean(dim=0)  # [n_neurons]
+    # Get effective sparsity from soft selection
+    effective_k_ratio = selection_info.get('effective_k_ratio', 0.5)
 
-    # Sort weights
+    # Target: moderate sparsity (30-70% active neurons)
+    # Soft penalty for extremes
+    if effective_k_ratio < 0.3:
+        # Too sparse
+        penalty = (0.3 - effective_k_ratio) ** 2
+    elif effective_k_ratio > 0.7:
+        # Too dense (not sparse enough)
+        penalty = (effective_k_ratio - 0.7) ** 2
+    else:
+        # Sweet spot
+        penalty = 0.0
+
+    penalty_tensor = torch.tensor(penalty, device=weights.device, dtype=weights.dtype)
+
+    # Also encourage diversity (Gini)
+    avg_weights = weights.mean(dim=0)
     sorted_weights, _ = torch.sort(avg_weights)
     n = len(sorted_weights)
-
-    # Gini formula: (2 * sum(i * w_i)) / (n * sum(w_i)) - (n+1)/n
     index = torch.arange(1, n + 1, device=weights.device, dtype=torch.float32)
     gini = (2 * (index * sorted_weights).sum()) / (n * sorted_weights.sum() + 1e-8) - (n + 1) / n
 
-    # Soft penalty for extremes (no hard target!)
+    # Penalty for extreme Gini
     if gini < 0.2:
-        # Too uniform, encourage specialization
-        penalty = (0.2 - gini) ** 2
+        gini_penalty = (0.2 - gini) ** 2
     elif gini > 0.6:
-        # Too sparse, encourage diversity
-        penalty = (gini - 0.6) ** 2
+        gini_penalty = (gini - 0.6) ** 2
     else:
-        # Sweet spot [0.2, 0.6], no penalty
-        penalty = torch.tensor(0.0, device=weights.device)
+        gini_penalty = torch.tensor(0.0, device=weights.device)
 
-    return penalty
+    return penalty_tensor + gini_penalty
 
 
 def compute_efficiency_bonus(weights: torch.Tensor) -> torch.Tensor:
@@ -270,16 +280,17 @@ class DynamicRouter(nn.Module):
         )
 
         # ============================================================
-        # Learnable sparsity controller (zero manual intervention!)
+        # Learnable sparsity controller (FULLY DIFFERENTIABLE!)
         # ============================================================
 
         # Learnable temperature (controls softmax sharpness)
         # High temp = soft (many neurons), Low temp = hard (few neurons)
         self.log_temperature = nn.Parameter(torch.tensor(0.0))  # exp(0) = 1.0
 
-        # Learnable top-k ratio
-        # Will learn optimal k automatically per layer
-        self.k_ratio_logit = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
+        # Learnable sparsity threshold (SOFT SELECTION!)
+        # Higher value = higher threshold = fewer neurons (more sparse)
+        # Lower value = lower threshold = more neurons (less sparse)
+        self.sparsity_threshold = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
 
         self._init_weights()
 
@@ -293,37 +304,33 @@ class DynamicRouter(nn.Module):
         temp = torch.exp(self.log_temperature)
         return torch.clamp(temp, 0.5, 5.0)
 
-    def get_k_ratio(self) -> torch.Tensor:
-        """Get learned k ratio, constrained to [0.2, 0.8]."""
-        # Sigmoid maps to (0, 1), scale to [0.2, 0.8]
-        ratio = torch.sigmoid(self.k_ratio_logit)
-        return 0.2 + 0.6 * ratio
+    def get_threshold(self) -> torch.Tensor:
+        """Get learned threshold for sparsity control."""
+        # Sigmoid maps to (0, 1)
+        # Will learn optimal threshold automatically
+        return torch.sigmoid(self.sparsity_threshold)
 
     def forward(
         self,
         x: torch.Tensor,
         k: Optional[int] = None,
         mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
-        Route to top-k neurons with LEARNED sparsity.
+        Route to neurons with FULLY DIFFERENTIABLE soft selection.
 
         Args:
             x: Input tensor [batch, seq_len, d_model]
-            k: Number of neurons to select (None = use learned k_ratio)
+            k: Optional hard k for inference/analysis (ignored during training)
             mask: Optional attention mask [batch, seq_len]
 
         Returns:
-            indices: Selected neuron indices [batch, k]
-            weights: Routing weights [batch, n_neurons]
+            indices: Top-k neuron indices [batch, k] (for compatibility)
+            weights: SOFT routing weights [batch, n_neurons] (differentiable!)
             context: Attended representations [batch, seq_len, d_model]
+            selection_info: Dict with sparsity metrics
         """
         batch_size, seq_len, d_model = x.shape
-
-        # Determine k: use learned value if not specified
-        if k is None:
-            k_ratio = self.get_k_ratio()
-            k = max(int(self.n_neurons * k_ratio), 8)  # min 8 neurons
 
         # Step 1: Context modeling
         # Self-attention to understand input relationships
@@ -370,35 +377,69 @@ class DynamicRouter(nn.Module):
         scores_normalized = (scores - scores.mean(dim=-1, keepdim=True)) / \
                            (scores.std(dim=-1, keepdim=True) + 1e-6)
 
-        # Step 5: Soft top-k selection with LEARNED temperature
-        # Apply learned temperature for exploration/exploitation balance
+        # ============================================================
+        # Step 5: SOFT DIFFERENTIABLE SELECTION (NEW!)
+        # ============================================================
+
+        # Get learned parameters
         temperature = self.get_temperature()
+        learned_threshold = self.get_threshold()
+
+        # Compute base probabilities
         probs = F.softmax(scores_normalized / temperature, dim=-1)
         # [batch, n_neurons]
 
-        # Debug: log probs
-        debug_logger.log_tensor("Router", "probs", probs)
-        debug_logger.log("Router", f"probs sum: {probs.sum(dim=-1).mean().item():.4f}")
+        # Soft thresholding for sparsity
+        # Normalize scores to [0, 1] range for comparison with threshold
+        scores_min = scores_normalized.min(dim=-1, keepdim=True)[0]
+        scores_max = scores_normalized.max(dim=-1, keepdim=True)[0]
+        scores_01 = (scores_normalized - scores_min) / (scores_max - scores_min + 1e-8)
 
-        # Get top-k indices based on scores
-        _, indices = scores.topk(k, dim=-1)
-        # [batch, k]
+        # Soft mask: sigmoid around learned threshold
+        # steepness=10 makes it relatively sharp but still differentiable
+        steepness = 10.0
+        soft_mask = torch.sigmoid(steepness * (scores_01 - learned_threshold))
+        # soft_mask: ~0 for scores below threshold, ~1 for scores above
 
-        # Create routing weights
-        # Only selected neurons get non-zero weights
-        weights = torch.zeros_like(probs)
-        selected_probs = torch.gather(probs, 1, indices)
-        weights.scatter_(1, indices, selected_probs)
+        # Apply soft mask to probabilities (DIFFERENTIABLE!)
+        masked_probs = probs * soft_mask
 
-        # Renormalize (only among selected neurons)
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # Renormalize
+        weights = masked_probs / (masked_probs.sum(dim=-1, keepdim=True) + 1e-8)
         # [batch, n_neurons]
 
-        # Debug: log weights
+        # ============================================================
+        # For compatibility: compute "effective k" and top-k indices
+        # ============================================================
+
+        # Measure effective sparsity (for logging/analysis)
+        active_neurons = (weights > 1e-3).float().sum(dim=-1).mean()
+        effective_k_ratio = active_neurons / self.n_neurons
+
+        # Get top-k indices based on weights (for compatibility with downstream code)
+        # This is just for index selection, gradient flows through weights
+        if k is None:
+            # Use effective k
+            k = max(int(active_neurons.item()), 8)
+        k = min(k, self.n_neurons)  # Ensure k <= n_neurons
+
+        _, indices = weights.topk(k, dim=-1)
+        # [batch, k]
+
+        # Selection info for logging
+        selection_info = {
+            'learned_threshold': learned_threshold.item(),
+            'effective_k': active_neurons.item(),
+            'effective_k_ratio': effective_k_ratio.item(),
+            'temperature': temperature.item()
+        }
+
+        # Debug: log
         debug_logger.log_tensor("Router", "weights", weights)
         debug_logger.log("Router", f"weights sum: {weights.sum(dim=-1).mean().item():.4f}")
+        debug_logger.log("Router", f"threshold: {learned_threshold.item():.3f}, eff_k: {active_neurons.item():.1f}")
 
-        return indices, weights, context
+        return indices, weights, context, selection_info
 
 
 class InputNeurons(nn.Module):
@@ -720,11 +761,12 @@ class DAWNBlock(nn.Module):
         if k_process is None:
             k_process = self.n_process // 2
 
-        # Route to relevant neurons
-        indices, weights, context = self.router(x, k_input, mask)
-        # indices: [batch, k_input]
-        # weights: [batch, n_input]
+        # Route to relevant neurons with SOFT selection
+        indices, weights, context, selection_info = self.router(x, k_input, mask)
+        # indices: [batch, k_input] (top-k for compatibility)
+        # weights: [batch, n_input] (SOFT weights, fully differentiable!)
         # context: [batch, seq_len, d_model]
+        # selection_info: dict with sparsity metrics
 
         # Compute auxiliary losses
         neuron_usage = weights.mean(dim=0)  # [n_input]
@@ -736,8 +778,8 @@ class DAWNBlock(nn.Module):
         max_entropy = math.log(self.n_input)
         entropy_loss = 1.0 - (entropy / max_entropy)
 
-        # NEW: Learned sparsity guidance
-        sparsity_guidance = compute_learned_sparsity_loss(weights)
+        # Sparsity guidance with selection info
+        sparsity_guidance = compute_learned_sparsity_loss(weights, selection_info)
 
         aux_loss = {
             'load_balance': load_balance_loss,
@@ -772,9 +814,10 @@ class DAWNBlock(nn.Module):
             routing_info = {
                 'indices': indices,
                 'weights': weights,
-                'learned_k': len(indices[0]),  # Actual k used
-                'learned_temp': self.router.get_temperature().item(),
-                'learned_k_ratio': self.router.get_k_ratio().item()
+                'learned_threshold': selection_info['learned_threshold'],
+                'effective_k': selection_info['effective_k'],
+                'effective_k_ratio': selection_info['effective_k_ratio'],
+                'learned_temp': selection_info['temperature']
             }
             return output, aux_loss, routing_info
 
