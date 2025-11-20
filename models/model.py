@@ -292,6 +292,10 @@ class DynamicRouter(nn.Module):
         # Lower value = lower threshold = more neurons (less sparse)
         self.sparsity_threshold = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
 
+        # Learnable steepness (controls sigmoid sharpness around threshold)
+        # Higher = sharper transition, Lower = smoother transition
+        self.log_steepness = nn.Parameter(torch.tensor(math.log(3.0)))  # exp(log(3)) = 3.0
+
         self._init_weights()
 
     def _init_weights(self):
@@ -309,6 +313,13 @@ class DynamicRouter(nn.Module):
         # Sigmoid maps to (0, 1)
         # Will learn optimal threshold automatically
         return torch.sigmoid(self.sparsity_threshold)
+
+    def get_steepness(self) -> torch.Tensor:
+        """Get learned steepness for sigmoid transition sharpness."""
+        # exp: always positive, clamped to [1.0, 10.0]
+        # 1.0 = very smooth, 10.0 = very sharp
+        steep = torch.exp(self.log_steepness)
+        return torch.clamp(steep, 1.0, 10.0)
 
     def forward(
         self,
@@ -384,6 +395,7 @@ class DynamicRouter(nn.Module):
         # Get learned parameters
         temperature = self.get_temperature()
         learned_threshold = self.get_threshold()
+        steepness = self.get_steepness()
 
         # Compute base probabilities
         probs = F.softmax(scores_normalized / temperature, dim=-1)
@@ -396,8 +408,7 @@ class DynamicRouter(nn.Module):
         scores_01 = (scores_normalized - scores_min) / (scores_max - scores_min + 1e-8)
 
         # Soft mask: sigmoid around learned threshold
-        # steepness=10 makes it relatively sharp but still differentiable
-        steepness = 10.0
+        # steepness controls how sharp the transition is (learned!)
         soft_mask = torch.sigmoid(steepness * (scores_01 - learned_threshold))
         # soft_mask: ~0 for scores below threshold, ~1 for scores above
 
@@ -429,6 +440,7 @@ class DynamicRouter(nn.Module):
         # Selection info for logging
         selection_info = {
             'learned_threshold': learned_threshold.item(),
+            'learned_steepness': steepness.item(),
             'effective_k': active_neurons.item(),
             'effective_k_ratio': effective_k_ratio.item(),
             'temperature': temperature.item()
@@ -815,6 +827,7 @@ class DAWNBlock(nn.Module):
                 'indices': indices,
                 'weights': weights,
                 'learned_threshold': selection_info['learned_threshold'],
+                'learned_steepness': selection_info['learned_steepness'],
                 'effective_k': selection_info['effective_k'],
                 'effective_k_ratio': selection_info['effective_k_ratio'],
                 'learned_temp': selection_info['temperature']

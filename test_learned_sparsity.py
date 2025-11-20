@@ -52,21 +52,26 @@ def test_learned_sparsity():
         # Check parameters exist
         assert hasattr(router, 'log_temperature'), f"Layer {i}: log_temperature missing"
         assert hasattr(router, 'sparsity_threshold'), f"Layer {i}: sparsity_threshold missing"
+        assert hasattr(router, 'log_steepness'), f"Layer {i}: log_steepness missing"
         assert isinstance(router.log_temperature, torch.nn.Parameter), f"Layer {i}: log_temperature not Parameter"
         assert isinstance(router.sparsity_threshold, torch.nn.Parameter), f"Layer {i}: sparsity_threshold not Parameter"
+        assert isinstance(router.log_steepness, torch.nn.Parameter), f"Layer {i}: log_steepness not Parameter"
 
         # Check methods exist
         assert hasattr(router, 'get_temperature'), f"Layer {i}: get_temperature method missing"
         assert hasattr(router, 'get_threshold'), f"Layer {i}: get_threshold method missing"
+        assert hasattr(router, 'get_steepness'), f"Layer {i}: get_steepness method missing"
 
         # Check values are in valid range
         temp = router.get_temperature().item()
         threshold = router.get_threshold().item()
+        steepness = router.get_steepness().item()
 
         assert 0.5 <= temp <= 5.0, f"Layer {i}: temperature {temp} out of range [0.5, 5.0]"
         assert 0.0 <= threshold <= 1.0, f"Layer {i}: threshold {threshold} out of range [0.0, 1.0]"
+        assert 1.0 <= steepness <= 10.0, f"Layer {i}: steepness {steepness} out of range [1.0, 10.0]"
 
-        print(f"   Layer {i}: temp={temp:.2f}, threshold={threshold:.3f} ✓")
+        print(f"   Layer {i}: temp={temp:.2f}, threshold={threshold:.3f}, steepness={steepness:.2f} ✓")
 
     print("\n3. Testing forward pass without k specified...")
     batch_size = 4
@@ -107,16 +112,18 @@ def test_learned_sparsity():
 
     for i, layer_info in enumerate(routing_info):
         assert 'learned_threshold' in layer_info, f"Layer {i}: learned_threshold missing"
+        assert 'learned_steepness' in layer_info, f"Layer {i}: learned_steepness missing"
         assert 'effective_k' in layer_info, f"Layer {i}: effective_k missing"
         assert 'effective_k_ratio' in layer_info, f"Layer {i}: effective_k_ratio missing"
         assert 'learned_temp' in layer_info, f"Layer {i}: learned_temp missing"
 
         learned_threshold = layer_info['learned_threshold']
+        learned_steepness = layer_info['learned_steepness']
         effective_k = layer_info['effective_k']
         effective_k_ratio = layer_info['effective_k_ratio']
         learned_temp = layer_info['learned_temp']
 
-        print(f"   Layer {i}: threshold={learned_threshold:.3f}, eff_k={effective_k:.1f} ({effective_k_ratio:.1%}), temp={learned_temp:.2f} ✓")
+        print(f"   Layer {i}: threshold={learned_threshold:.3f}, steepness={learned_steepness:.2f}, eff_k={effective_k:.1f} ({effective_k_ratio:.1%}), temp={learned_temp:.2f} ✓")
 
     # Test backward pass (gradient flow to THRESHOLD!)
     print("\n6. Testing backward pass (gradient flow to threshold)...")
@@ -129,11 +136,13 @@ def test_learned_sparsity():
 
         assert router.log_temperature.grad is not None, f"Layer {i}: no grad for log_temperature"
         assert router.sparsity_threshold.grad is not None, f"Layer {i}: no grad for sparsity_threshold"
+        assert router.log_steepness.grad is not None, f"Layer {i}: no grad for log_steepness"
 
         temp_grad_norm = router.log_temperature.grad.norm().item()
         threshold_grad_norm = router.sparsity_threshold.grad.norm().item()
+        steepness_grad_norm = router.log_steepness.grad.norm().item()
 
-        print(f"   Layer {i}: temp_grad={temp_grad_norm:.6f}, threshold_grad={threshold_grad_norm:.6f} ✓")
+        print(f"   Layer {i}: temp_grad={temp_grad_norm:.6f}, threshold_grad={threshold_grad_norm:.6f}, steepness_grad={steepness_grad_norm:.6f} ✓")
 
     # Test sparsity loss function with selection_info
     print("\n7. Testing sparsity loss function (with selection_info)...")
@@ -144,6 +153,7 @@ def test_learned_sparsity():
         'effective_k_ratio': 0.5,
         'effective_k': 32,
         'learned_threshold': 0.5,
+        'learned_steepness': 3.0,
         'temperature': 1.0
     }
     sparsity_loss = compute_learned_sparsity_loss(weights, dummy_selection_info)
@@ -164,12 +174,12 @@ def test_learned_sparsity():
     print("=" * 70)
     print("\nSOFT THRESHOLD learned sparsity is working correctly!")
     print("\nKey features verified:")
-    print("  ✓ Learnable temperature and THRESHOLD parameters")
+    print("  ✓ Learnable temperature, THRESHOLD, and STEEPNESS parameters")
     print("  ✓ Fully differentiable soft selection (no hard top-k!)")
     print("  ✓ Effective k measured from soft weights")
     print("  ✓ Sparsity guidance with selection_info")
-    print("  ✓ Gradient flow to threshold parameter")
-    print("  ✓ Routing info includes threshold and effective_k")
+    print("  ✓ Gradient flow to all learned parameters (temp, threshold, steepness)")
+    print("  ✓ Routing info includes all learned parameters")
     print("\n🚀 Ready to train with FULLY DIFFERENTIABLE learned sparsity!")
 
 
