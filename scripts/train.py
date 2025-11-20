@@ -1004,11 +1004,11 @@ Router weights check:
     avg_aux = total_aux / num_batches if num_batches > 0 else 0.0
 
     # Compute per-layer average Gini
-    layer_gini_avgs = [g / num_batches if num_batches > 0 else 0.0 for g in layer_gini_totals]
+    layer_gini_avgs = [round(g / num_batches, 4) if num_batches > 0 else 0.0 for g in layer_gini_totals]
 
     routing_metrics = {
-        'gini': avg_gini,
-        'aux_loss': avg_aux,
+        'gini': round(avg_gini, 4),
+        'aux_loss': round(avg_aux, 4),
         'layer_gini': layer_gini_avgs
     }
 
