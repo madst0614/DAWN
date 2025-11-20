@@ -625,6 +625,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     n_layers = len(model.layers)
     layer_gini_totals = [0.0] * n_layers
 
+    # Window accumulators for aggregated logging (every 100 steps)
+    log_interval = 100
+    window_loss = 0.0
+    window_aux = 0.0
+    window_acc_correct = 0
+    window_acc_valid = 0
+    window_gini = 0.0
+    window_layer_gini = [0.0] * n_layers
+    window_count = 0
+
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for step, batch in enumerate(pbar):
         # Update debug logger step
@@ -924,13 +934,40 @@ Router weights check:
             debug_logger.log("Summary", f"loss={loss.item():.4f}, aux={aux_loss_val:.4f}, acc={step_acc:.4f}, grad_norm={grad_norm_before:.4f}")
             debug_logger.log("Summary", "-" * 40)
 
-        # Log to file every step
-        if log_file:
+        # Accumulate for window logging
+        window_loss += loss.item()
+        window_aux += aux_loss_val
+        window_acc_correct += correct
+        window_acc_valid += valid_tokens
+        window_gini += gini
+        for i, lg in enumerate(layer_ginis):
+            window_layer_gini[i] += lg
+        window_count += 1
+
+        # Log aggregated metrics every 100 steps
+        if log_file and (step + 1) % log_interval == 0:
+            avg_window_loss = window_loss / window_count
+            avg_window_aux = window_aux / window_count
+            avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
+            avg_window_gini = window_gini / window_count
+            avg_window_layer_gini = [g / window_count for g in window_layer_gini]
+
+            # Format layer gini as comma-separated
+            layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
+
             with open(log_file, 'a') as f:
-                acc_val = correct / valid_tokens if valid_tokens > 0 else 0.0
-                f.write(f"epoch={epoch},step={step+1},loss={loss.item():.6f},"
-                       f"aux_loss={aux_loss.item():.6f},weighted_aux={(aux_weight * aux_loss).item():.6f},"
-                       f"acc={acc_val:.6f}\n")
+                f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
+                       f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
+                       f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}]\n")
+
+            # Reset window accumulators
+            window_loss = 0.0
+            window_aux = 0.0
+            window_acc_correct = 0
+            window_acc_valid = 0
+            window_gini = 0.0
+            window_layer_gini = [0.0] * n_layers
+            window_count = 0
 
         # Restore stdout and write debug output to file
         if debug_mode and debug_log_file and old_stdout is not None:
@@ -939,6 +976,20 @@ Router weights check:
             if captured:
                 with open(debug_log_file, 'a') as f:
                     f.write(captured)
+
+    # Log remaining steps at end of epoch
+    if log_file and window_count > 0:
+        avg_window_loss = window_loss / window_count
+        avg_window_aux = window_aux / window_count
+        avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
+        avg_window_gini = window_gini / window_count
+        avg_window_layer_gini = [g / window_count for g in window_layer_gini]
+        layer_gini_str = ",".join([f"{g:.4f}" for g in avg_window_layer_gini])
+
+        with open(log_file, 'a') as f:
+            f.write(f"epoch={epoch},step={num_batches},loss={avg_window_loss:.6f},"
+                   f"aux_loss={avg_window_aux:.6f},acc={avg_window_acc:.6f},"
+                   f"gini={avg_window_gini:.4f},layer_gini=[{layer_gini_str}]\n")
 
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
@@ -1245,8 +1296,8 @@ def main():
 
     # Write header to training log
     with open(training_log_file, 'w') as f:
-        f.write("# Training Log\n")
-        f.write("# Format: epoch,step,loss,aux_loss,weighted_aux,acc\n")
+        f.write("# Training Log (aggregated every 100 steps)\n")
+        f.write("# Format: epoch,step,loss,aux_loss,acc,gini,layer_gini=[L0,L1,...]\n")
 
     # Write header to debug log
     with open(debug_log_file, 'w') as f:
