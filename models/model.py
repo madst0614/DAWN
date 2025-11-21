@@ -57,6 +57,8 @@ class ProcessNeurons(nn.Module):
     """
     InputNeuron의 활성 패턴을 보고 선택적으로 활성화
     전체 시퀀스를 엮어서 토큰 풍부화
+
+    최적화: Causal Conv로 시퀀스 패턴 추출 + 병렬 cumsum
     """
     def __init__(self, hidden_dim, num_input_neurons, num_process_neurons):
         super().__init__()
@@ -69,11 +71,19 @@ class ProcessNeurons(nn.Module):
             torch.randn(num_process_neurons, num_input_neurons)
         )
 
-        # 각 ProcessNeuron의 변환 (Linear로 최적화!)
-        self.neuron_transforms = nn.Linear(
-            hidden_dim,
-            hidden_dim,
+        # Causal conv로 시퀀스 패턴 추출 (매우 빠름!)
+        # kernel_size=5면 각 위치에서 이전 5토큰의 활성화 패턴을 봄
+        self.activation_refiner = nn.Conv1d(
+            num_input_neurons,
+            num_input_neurons,
+            kernel_size=5,
+            padding=4,  # Left padding for causality
             bias=False
+        )
+
+        # 각 ProcessNeuron의 변환 (병렬)
+        self.neuron_transforms = nn.Parameter(
+            torch.randn(num_process_neurons, hidden_dim, hidden_dim) * 0.02
         )
 
     def forward(self, intermediate, input_activations):
@@ -81,32 +91,49 @@ class ProcessNeurons(nn.Module):
         # input_activations: [B, S, N_in] - InputNeurons의 활성 패턴
 
         B, S, H = intermediate.shape
+        N_in = input_activations.shape[-1]
         N_proc = self.num_process_neurons
 
-        # 1. 패턴 매칭: 어떤 ProcessNeuron을 활성화할지
-        act_norm = F.normalize(input_activations, dim=-1)
+        # 1. Causal conv로 활성화 패턴 정제
+        # "이전 토큰들의 활성화 패턴을 보고 현재 패턴을 강화"
+        # [B, S, N_in] → [B, N_in, S] (Conv1d는 channel이 두번째 차원)
+        acts = input_activations.transpose(1, 2)
+
+        # Causal conv (left padding으로 causality 보장)
+        refined = self.activation_refiner(acts)  # [B, N_in, S+4]
+        refined = refined[:, :, :-4]  # Remove right padding → [B, N_in, S]
+
+        # [B, N_in, S] → [B, S, N_in]
+        refined = refined.transpose(1, 2)
+
+        # 원래 활성화 + 정제된 패턴
+        enhanced_activations = input_activations + 0.3 * torch.tanh(refined)
+
+        # 2. 패턴 매칭: 어떤 ProcessNeuron을 활성화할지
+        act_norm = F.normalize(enhanced_activations, dim=-1)
         template_norm = F.normalize(self.pattern_templates, dim=-1)
         pattern_matches = torch.matmul(act_norm, template_norm.t())  # [B, S, N_proc]
         process_activations = torch.sigmoid(pattern_matches)
 
-        # 2. 각 ProcessNeuron이 보는 context 계산
-        # 활성화된 토큰들의 정보만 모음
+        # 3. 각 ProcessNeuron이 보는 context 계산 (완전 병렬화!)
+        # 활성화된 토큰들의 정보를 causal하게 누적
         weighted = intermediate.unsqueeze(2) * process_activations.unsqueeze(-1)  # [B, S, N_proc, H]
 
-        # 시퀀스 통합 (각 ProcessNeuron별로)
-        contexts = weighted.sum(dim=1)  # [B, N_proc, H]
-        normalization = process_activations.sum(dim=1).unsqueeze(-1) + 1e-8  # [B, N_proc, 1]
-        contexts = contexts / normalization  # [B, N_proc, H]
+        # Causal cumulative sum (각 위치는 자기 이전까지만 봄)
+        causal_context = torch.cumsum(weighted, dim=1)  # [B, S, N_proc, H]
 
-        # 3. 모든 ProcessNeuron 변환 병렬 실행 (Linear 사용으로 최적화!)
-        contexts_flat = contexts.reshape(B * N_proc, H)  # [B*N_proc, H]
-        transformed_flat = self.neuron_transforms(contexts_flat)  # [B*N_proc, H]
-        transformed = transformed_flat.view(B, N_proc, H)  # [B, N_proc, H]
+        # Normalize by count
+        counts = torch.arange(1, S+1, device=intermediate.device).view(1, -1, 1, 1)
+        contexts = causal_context / counts  # [B, S, N_proc, H]
 
-        # 4. 각 토큰에 분배 (expand 없이 직접 broadcasting)
-        distributed = transformed.unsqueeze(1) * process_activations.unsqueeze(-1)  # [B, 1, N_proc, H] * [B, S, N_proc, 1]
+        # 4. 모든 ProcessNeuron 변환 병렬 실행
+        # [B, S, N_proc, H] @ [N_proc, H, H] = [B, S, N_proc, H]
+        transformed = torch.einsum('bsnh,nhd->bsnd', contexts, self.neuron_transforms)
 
-        # 5. 모든 ProcessNeuron 출력 통합
+        # 5. 각 토큰에 분배 (활성화 강도만큼)
+        distributed = transformed * process_activations.unsqueeze(-1)
+
+        # 6. 모든 ProcessNeuron 출력 통합
         combined = distributed.sum(dim=2)  # [B, S, H]
 
         return combined, process_activations
@@ -198,6 +225,8 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv1d):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids, return_activations=False):
         """
