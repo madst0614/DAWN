@@ -93,12 +93,12 @@ class ProcessNeurons(nn.Module):
 
         # 시퀀스 통합 (각 ProcessNeuron별로)
         contexts = weighted.sum(dim=1)  # [B, N_proc, H]
-        normalization = process_activations.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-8
-        contexts = contexts / normalization
+        normalization = process_activations.sum(dim=1).unsqueeze(-1) + 1e-8  # [B, N_proc, 1]
+        contexts = contexts / normalization  # [B, N_proc, H]
 
         # 3. 모든 ProcessNeuron 변환 병렬 실행
         # [B, N_proc, H] @ [N_proc, H, H] = [B, N_proc, H]
-        transformed = torch.einsum('bnh,nhd->bnd', contexts, self.neuron_transforms)
+        transformed = torch.einsum('bni,nio->bno', contexts, self.neuron_transforms)
 
         # 4. 각 토큰에 분배 (활성화 강도만큼)
         transformed = transformed.unsqueeze(1).expand(-1, S, -1, -1)  # [B, S, N_proc, H]
