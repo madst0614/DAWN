@@ -7,7 +7,8 @@ New simplified architecture with InputNeurons and ProcessNeurons.
 
 from .model import (
     # Core components
-    RelationalInputNeurons,
+    InputNeurons,
+    LateralConnections,
     ProcessNeurons,
     DAWNLayer,
     DAWN,
@@ -18,7 +19,8 @@ from .model import (
 )
 
 __all__ = [
-    "RelationalInputNeurons",
+    "InputNeurons",
+    "LateralConnections",
     "ProcessNeurons",
     "DAWNLayer",
     "DAWN",
