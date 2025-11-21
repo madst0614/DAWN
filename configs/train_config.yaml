@@ -1,4 +1,5 @@
 # DAWN Training Configuration
+# New simplified architecture with InputNeurons and ProcessNeurons
 
 # Data
 data:
@@ -8,31 +9,22 @@ data:
 
 # Model Architecture
 model:
-  d_model: 512
-  n_heads: 8
-  n_layers: 6
-  n_input: 128         # Input neurons per layer
-  n_process: 256       # Process neurons per layer
-  max_seq_len: 128
-  dropout: 0.1
+  d_model: 512            # Hidden dimension
+  n_layers: 6             # Number of DAWN layers
+  n_input: 64             # InputNeurons per layer (pattern-based activation)
+  n_process: 128          # ProcessNeurons per layer (context aggregation)
+  max_seq_len: 128        # Maximum sequence length
+  dropout: 0.1            # Dropout rate
 
 # Training
 training:
-  batch_size: 128
-  num_epochs: 30
-  lr: 0.0001
-  weight_decay: 0.01
-  warmup_epochs: 2
+  batch_size: 128         # Batch size
+  num_epochs: 30          # Total epochs
+  lr: 0.0003              # Learning rate (increased for faster convergence)
+  weight_decay: 0.1       # Weight decay for regularization
+  warmup_epochs: 2        # Warmup epochs
 
-# Router (learned parameters: temperature, threshold, steepness)
-router:
-  lr_multiplier: 5.0   # Router LR = lr * multiplier
-  weight_decay: 0.0    # No weight decay for learned sparsity params
-
-# Auxiliary loss weights
-aux_loss_weight: 0.01
-
-# Mixed precision
+# Mixed precision (faster training on GPU)
 use_amp: true
 
 # Paths
