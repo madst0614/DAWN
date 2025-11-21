@@ -39,6 +39,9 @@ from scipy import stats
 
 from models.model import DAWN
 from transformers import BertTokenizer
+from utils.data import CacheLoader, TextDataset, collate_fn_dynamic_padding, apply_mlm_masking
+from torch.utils.data import DataLoader
+from functools import partial
 
 
 # ============================================================
@@ -536,9 +539,11 @@ def analyze_prediction_quality(model, dataloader, tokenizer, num_samples=100):
                 break
 
             input_ids = batch['input_ids'].cuda()
-            targets = batch['labels'].cuda()
 
-            logits = model(input_ids)
+            # Apply MLM masking on the fly
+            masked_input_ids, targets = apply_mlm_masking(input_ids.clone(), tokenizer)
+
+            logits = model(masked_input_ids)
             preds = logits.argmax(dim=-1)
 
             # 마스킹된 위치만
@@ -661,7 +666,7 @@ def create_visualizations(input_acts, process_acts, attn_patterns, df_norms, out
 def main():
     parser = argparse.ArgumentParser(description='DAWN Checkpoint Comprehensive Analysis')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint file')
-    parser.add_argument('--data', type=str, required=True, help='Path to validation data')
+    parser.add_argument('--data', type=str, default=None, help='Path to validation data (optional)')
     parser.add_argument('--num-batches', type=int, default=20, help='Number of batches for analysis')
     parser.add_argument('--output-dir', type=str, default='.', help='Output directory for visualizations')
 
@@ -695,17 +700,39 @@ def main():
     model.eval()
     print("✓ Model loaded")
 
-    # Load data
-    print("\nLoading data...")
-    # Placeholder - user should implement their own data loading
-    # from utils.data import get_dataloader
-    # dataloader = get_dataloader(args.data)
-    print("⚠️  Please implement data loading for your dataset")
-    print("    Expected format: {'input_ids': Tensor, 'labels': Tensor}")
-    return
-
     # Load tokenizer
+    print("\nLoading tokenizer...")
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    print("✓ Tokenizer loaded")
+
+    # Load data
+    print("\nLoading validation data...")
+
+    if args.data:
+        # Load from provided path
+        import pickle
+        with open(args.data, 'rb') as f:
+            val_texts = pickle.load(f)
+        print(f"✓ Loaded {len(val_texts)} texts from {args.data}")
+    else:
+        # Use cached data
+        val_texts = CacheLoader.load_validation_texts(dataset="wikitext")
+        if val_texts is None:
+            print("❌ Failed to load validation data from cache")
+            print("   Please provide --data argument with path to validation data")
+            return
+
+    # Create dataset and dataloader
+    val_dataset = TextDataset(val_texts, tokenizer, max_length=128)
+    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+    dataloader = DataLoader(
+        val_dataset,
+        batch_size=32,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn
+    )
+    print(f"✓ Created dataloader with {len(val_dataset)} samples")
 
     # Run all analyses
     print("\nRunning comprehensive analysis...")
