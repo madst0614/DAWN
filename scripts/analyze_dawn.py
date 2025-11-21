@@ -695,7 +695,14 @@ def main():
         max_seq_len=2048,
         dropout=0.1
     )
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Handle torch.compile() state_dict (remove _orig_mod. prefix)
+    state_dict = checkpoint['model_state_dict']
+    if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+        print("Detected torch.compile() checkpoint, removing _orig_mod. prefix...")
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
     model = model.cuda()
     model.eval()
     print("✓ Model loaded")
