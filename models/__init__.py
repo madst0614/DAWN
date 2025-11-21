@@ -15,7 +15,6 @@ from .model import (
     DAWNTrainer,
     # Utilities
     create_model,
-    example_usage,
 )
 
 __all__ = [
@@ -26,5 +25,4 @@ __all__ = [
     "DAWNLanguageModel",
     "DAWNTrainer",
     "create_model",
-    "example_usage",
 ]
