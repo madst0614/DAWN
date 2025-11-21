@@ -6,21 +6,20 @@ import math
 
 class InputNeurons(nn.Module):
     """
-    각 토큰이 자기 패턴에 맞는 input neuron을 선택적으로 활성화
-    기본 feature detection 수행
+    각 토큰 → 활성화 패턴 변환
+    [B, S, H] → [B, S, N] 활성화 지형
     """
     def __init__(self, hidden_dim, num_input_neurons):
         super().__init__()
-
         self.num_neurons = num_input_neurons
         self.hidden_dim = hidden_dim
 
-        # 모든 뉴런의 패턴을 하나의 행렬로
+        # 패턴 템플릿
         self.patterns = nn.Parameter(
             torch.randn(num_input_neurons, hidden_dim)
         )
 
-        # 모든 뉴런의 feature extractor를 하나로
+        # Feature extractor
         self.feature_extractors = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
@@ -28,129 +27,95 @@ class InputNeurons(nn.Module):
         )
 
     def forward(self, x):
-        # x: [B, S, H]
         B, S, H = x.shape
         N = self.num_neurons
 
-        # 1. 모든 패턴 매칭 병렬 계산
-        x_norm = F.normalize(x, dim=-1)  # [B, S, H]
-        patterns_norm = F.normalize(self.patterns, dim=-1)  # [N, H]
+        # 1. 패턴 매칭 → 활성화
+        x_norm = F.normalize(x, dim=-1)
+        patterns_norm = F.normalize(self.patterns, dim=-1)
+        pattern_matches = torch.matmul(x_norm, patterns_norm.t())
+        activations = torch.sigmoid(pattern_matches)  # [B, S, N]
 
-        # 배치 행렬곱
-        pattern_matches = torch.matmul(x_norm, patterns_norm.t())  # [B, S, N]
-        activations = torch.sigmoid(pattern_matches)
-
-        # 2. 모든 feature 추출 병렬
-        all_features = self.feature_extractors(x)  # [B, S, H*N]
-        all_features = all_features.view(B, S, N, H)  # [B, S, N, H]
+        # 2. Feature 추출
+        all_features = self.feature_extractors(x)
+        all_features = all_features.view(B, S, N, H)
 
         # 3. 활성화 적용
-        activated_features = all_features * activations.unsqueeze(-1)  # [B, S, N, H]
-
-        # 4. 중간 표현 (모든 input neuron의 기여 합산)
-        intermediate = activated_features.sum(dim=2)  # [B, S, H]
+        activated_features = all_features * activations.unsqueeze(-1)
+        intermediate = activated_features.sum(dim=2)
 
         return intermediate, activations
 
 
 class ProcessNeurons(nn.Module):
     """
-    InputNeuron의 활성 패턴을 보고 선택적으로 활성화
-    전체 시퀀스를 엮어서 토큰 풍부화
-
-    최적화: Causal Conv로 시퀀스 패턴 추출 + 병렬 cumsum
+    활성화 지형 → 패턴 인식 → 토큰 풍부화
+    2D Conv로 지형의 패턴을 병렬 감지
     """
     def __init__(self, hidden_dim, num_input_neurons, num_process_neurons):
         super().__init__()
-
         self.hidden_dim = hidden_dim
         self.num_process_neurons = num_process_neurons
 
-        # 각 ProcessNeuron이 반응하는 InputNeuron 활성 패턴
-        self.pattern_templates = nn.Parameter(
-            torch.randn(num_process_neurons, num_input_neurons)
+        # 2D 패턴 감지기
+        # 활성화 지형 [S, N_in]에서 패턴 찾기
+        self.pattern_detector = nn.Conv2d(
+            in_channels=1,
+            out_channels=num_process_neurons,
+            kernel_size=(5, num_input_neurons),  # 5토큰 윈도우, 모든 뉴런
+            padding=(2, 0),  # 시퀀스 길이 유지
+            bias=True
         )
 
-        # Causal conv로 시퀀스 패턴 추출 (매우 빠름!)
-        # kernel_size=5면 각 위치에서 이전 5토큰의 활성화 패턴을 봄
-        self.activation_refiner = nn.Conv1d(
-            num_input_neurons,
-            num_input_neurons,
-            kernel_size=5,
-            padding=4,  # Left padding for causality
-            bias=False
-        )
-
-        # 각 ProcessNeuron의 변환 (병렬)
+        # 각 ProcessNeuron의 변환
         self.neuron_transforms = nn.Parameter(
             torch.randn(num_process_neurons, hidden_dim, hidden_dim) * 0.02
         )
 
     def forward(self, intermediate, input_activations):
-        # intermediate: [B, S, H] - InputNeurons의 출력
-        # input_activations: [B, S, N_in] - InputNeurons의 활성 패턴
-
-        B, S, H = intermediate.shape
-        N_in = input_activations.shape[-1]
+        B, S, N_in = input_activations.shape
         N_proc = self.num_process_neurons
+        H = self.hidden_dim
 
-        # 1. Causal conv로 활성화 패턴 정제
-        # "이전 토큰들의 활성화 패턴을 보고 현재 패턴을 강화"
-        # [B, S, N_in] → [B, N_in, S] (Conv1d는 channel이 두번째 차원)
-        acts = input_activations.transpose(1, 2)
+        # 1. 활성화 지형을 2D 이미지로
+        # [B, S, N_in] → [B, 1, S, N_in]
+        act_map = input_activations.unsqueeze(1)
 
-        # Causal conv (left padding으로 causality 보장)
-        refined = self.activation_refiner(acts)  # [B, N_in, S+4]
-        refined = refined[:, :, :-4]  # Remove right padding → [B, N_in, S]
+        # 2. 2D Conv로 패턴 감지 (완전 병렬!)
+        # [B, 1, S, N_in] → [B, N_proc, S, 1]
+        pattern_responses = self.pattern_detector(act_map)
 
-        # [B, N_in, S] → [B, S, N_in]
-        refined = refined.transpose(1, 2)
+        # [B, N_proc, S, 1] → [B, S, N_proc]
+        process_activations = torch.sigmoid(pattern_responses.squeeze(-1).transpose(1, 2))
 
-        # 원래 활성화 + 정제된 패턴
-        enhanced_activations = input_activations + 0.3 * torch.tanh(refined)
+        # 3. 각 ProcessNeuron의 변환 적용
+        # intermediate: [B, S, H]
+        # 각 위치에서 활성화된 ProcessNeuron들의 변환을 적용
 
-        # 2. 패턴 매칭: 어떤 ProcessNeuron을 활성화할지
-        act_norm = F.normalize(enhanced_activations, dim=-1)
-        template_norm = F.normalize(self.pattern_templates, dim=-1)
-        pattern_matches = torch.matmul(act_norm, template_norm.t())  # [B, S, N_proc]
-        process_activations = torch.sigmoid(pattern_matches)
+        # [B, S, H] → [B, S, 1, H] → [B, S, N_proc, H]
+        x_expanded = intermediate.unsqueeze(2).expand(-1, -1, N_proc, -1)
 
-        # 3. 각 ProcessNeuron이 보는 context 계산 (완전 병렬화!)
-        # 활성화된 토큰들의 정보를 causal하게 누적
-        weighted = intermediate.unsqueeze(2) * process_activations.unsqueeze(-1)  # [B, S, N_proc, H]
+        # [B, S, N_proc, H] @ [N_proc, H, H] → [B, S, N_proc, H]
+        transformed = torch.einsum('bsnh,nhd->bsnd', x_expanded, self.neuron_transforms)
 
-        # Causal cumulative sum (각 위치는 자기 이전까지만 봄)
-        causal_context = torch.cumsum(weighted, dim=1)  # [B, S, N_proc, H]
+        # 4. 활성화 가중치 적용
+        weighted = transformed * process_activations.unsqueeze(-1)
 
-        # Normalize by count
-        counts = torch.arange(1, S+1, device=intermediate.device).view(1, -1, 1, 1)
-        contexts = causal_context / counts  # [B, S, N_proc, H]
+        # 5. 합산
+        output = weighted.sum(dim=2)  # [B, S, H]
 
-        # 4. 모든 ProcessNeuron 변환 병렬 실행
-        # [B, S, N_proc, H] @ [N_proc, H, H] = [B, S, N_proc, H]
-        transformed = torch.einsum('bsnh,nhd->bsnd', contexts, self.neuron_transforms)
-
-        # 5. 각 토큰에 분배 (활성화 강도만큼)
-        distributed = transformed * process_activations.unsqueeze(-1)
-
-        # 6. 모든 ProcessNeuron 출력 통합
-        combined = distributed.sum(dim=2)  # [B, S, H]
-
-        return combined, process_activations
+        return output, process_activations
 
 
 class DAWNLayer(nn.Module):
     """
-    단일 DAWN 레이어
-    InputNeurons → ProcessNeurons → 토큰 풍부화
+    InputNeurons → ProcessNeurons
+    활성화 지형 생성 → 지형 패턴 인식
     """
     def __init__(self, hidden_dim, num_input_neurons=64, num_process_neurons=128):
         super().__init__()
 
-        # 1단계: 선택적 feature 추출
         self.input_neurons = InputNeurons(hidden_dim, num_input_neurons)
-
-        # 2단계: 전체 맥락 보고 토큰 풍부화
         self.process_neurons = ProcessNeurons(
             hidden_dim,
             num_input_neurons,
@@ -161,13 +126,11 @@ class DAWNLayer(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
 
     def forward(self, x):
-        # x: [B, S, H]
-
-        # InputNeurons: 기본 feature 추출 + 활성 패턴
+        # 1. 활성화 지형 생성
         intermediate, input_acts = self.input_neurons(x)
         x = self.norm1(x + intermediate)
 
-        # ProcessNeurons: 활성 패턴 보고 토큰들 엮어서 풍부화
+        # 2. 지형 패턴 인식 & 토큰 풍부화
         enriched, process_acts = self.process_neurons(x, input_acts)
         x = self.norm2(x + enriched)
 
@@ -192,29 +155,23 @@ class DAWN(nn.Module):
         dropout=0.1
     ):
         super().__init__()
-
         self.hidden_dim = hidden_dim
 
-        # 임베딩
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(max_seq_len, hidden_dim)
         self.embedding_dropout = nn.Dropout(dropout)
 
-        # DAWN 레이어들
         self.layers = nn.ModuleList([
             DAWNLayer(hidden_dim, num_input_neurons, num_process_neurons)
             for _ in range(num_layers)
         ])
 
-        # 출력
         self.output_norm = nn.LayerNorm(hidden_dim)
         self.output_projection = nn.Linear(hidden_dim, vocab_size)
 
-        # 가중치 초기화
         self._init_weights()
 
     def _init_weights(self):
-        """가중치 초기화"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -225,41 +182,32 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Conv1d):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            elif isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, input_ids, return_activations=False):
-        """
-        Args:
-            input_ids: [B, S] - 토큰 ID
-            return_activations: bool - 활성 패턴 반환 여부
-
-        Returns:
-            logits: [B, S, vocab_size]
-            activations: (선택적) 각 레이어의 활성 패턴
-        """
         B, S = input_ids.shape
 
         # 임베딩
-        token_emb = self.token_embedding(input_ids)  # [B, S, H]
-
-        # 위치 임베딩
-        positions = torch.arange(S, device=input_ids.device).unsqueeze(0)  # [1, S]
-        pos_emb = self.position_embedding(positions)  # [1, S, H]
+        token_emb = self.token_embedding(input_ids)
+        positions = torch.arange(S, device=input_ids.device).unsqueeze(0)
+        pos_emb = self.position_embedding(positions)
 
         x = token_emb + pos_emb
         x = self.embedding_dropout(x)
 
-        # 레이어별 처리 (점진적 풍부화)
+        # 레이어별 처리
         all_activations = []
         for layer in self.layers:
             x, activations = layer(x)
             if return_activations:
                 all_activations.append(activations)
 
-        # 최종 출력
+        # 출력
         x = self.output_norm(x)
-        logits = self.output_projection(x)  # [B, S, vocab_size]
+        logits = self.output_projection(x)
 
         if return_activations:
             return logits, all_activations
@@ -267,38 +215,18 @@ class DAWN(nn.Module):
             return logits
 
     def generate(self, input_ids, max_new_tokens=50, temperature=1.0, top_k=None):
-        """
-        자동회귀 생성
-
-        Args:
-            input_ids: [B, S] - 초기 시퀀스
-            max_new_tokens: int - 생성할 토큰 수
-            temperature: float - 샘플링 온도
-            top_k: int - top-k 샘플링
-
-        Returns:
-            generated: [B, S + max_new_tokens]
-        """
         self.eval()
-
         with torch.no_grad():
             for _ in range(max_new_tokens):
-                # 현재 시퀀스로 예측
-                logits = self.forward(input_ids)  # [B, S, vocab]
+                logits = self.forward(input_ids)
+                next_token_logits = logits[:, -1, :] / temperature
 
-                # 마지막 토큰의 logits
-                next_token_logits = logits[:, -1, :] / temperature  # [B, vocab]
-
-                # Top-k 필터링
                 if top_k is not None:
                     v, _ = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1)))
                     next_token_logits[next_token_logits < v[:, [-1]]] = -float('Inf')
 
-                # 샘플링
                 probs = F.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
-
-                # 시퀀스에 추가
+                next_token = torch.multinomial(probs, num_samples=1)
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
         return input_ids
@@ -307,31 +235,15 @@ class DAWN(nn.Module):
 # ========== 학습 유틸리티 ==========
 
 class DAWNTrainer:
-    """
-    DAWN 학습을 위한 헬퍼 클래스
-    """
     def __init__(self, model, optimizer, device='cuda'):
         self.model = model
         self.optimizer = optimizer
         self.device = device
 
     def train_step(self, input_ids, targets):
-        """
-        단일 학습 스텝
-
-        Args:
-            input_ids: [B, S]
-            targets: [B, S]
-
-        Returns:
-            loss: float
-        """
         self.model.train()
 
-        # Forward
-        logits = self.model(input_ids)  # [B, S, vocab]
-
-        # Loss 계산
+        logits = self.model(input_ids)
         B, S, V = logits.shape
         loss = F.cross_entropy(
             logits.view(B * S, V),
@@ -339,36 +251,22 @@ class DAWNTrainer:
             ignore_index=-100
         )
 
-        # Backward
         self.optimizer.zero_grad()
         loss.backward()
-
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-
         self.optimizer.step()
 
         return loss.item()
 
     def analyze_activations(self, input_ids):
-        """
-        활성 패턴 분석
-
-        Args:
-            input_ids: [B, S]
-
-        Returns:
-            analysis: dict - 각 레이어의 활성 통계
-        """
         self.model.eval()
-
         with torch.no_grad():
             _, all_activations = self.model(input_ids, return_activations=True)
 
         analysis = {}
         for layer_idx, acts in enumerate(all_activations):
-            input_acts = acts['input_activations']  # [B, S, N_in]
-            process_acts = acts['process_activations']  # [B, S, N_proc]
+            input_acts = acts['input_activations']
+            process_acts = acts['process_activations']
 
             analysis[f'layer_{layer_idx}'] = {
                 'input_mean': input_acts.mean().item(),
@@ -382,84 +280,11 @@ class DAWNTrainer:
         return analysis
 
 
-# ========== 사용 예시 ==========
+# ========== 호환성 ==========
 
-def create_model(vocab_size=50000):
-    """
-    DAWN 모델 생성
-    """
-    model = DAWN(
-        vocab_size=vocab_size,
-        hidden_dim=512,
-        num_layers=6,
-        num_input_neurons=64,
-        num_process_neurons=128,
-        max_seq_len=2048,
-        dropout=0.1
-    )
-
-    # 파라미터 수 출력
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-
-    return model
-
-
-def example_usage():
-    """
-    사용 예시
-    """
-    # 모델 생성
-    model = create_model(vocab_size=10000)
-    model = model.cuda()
-
-    # 옵티마이저
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=3e-4,
-        betas=(0.9, 0.95),
-        weight_decay=0.1
-    )
-
-    # 트레이너
-    trainer = DAWNTrainer(model, optimizer)
-
-    # 더미 데이터
-    batch_size = 8
-    seq_len = 128
-
-    input_ids = torch.randint(0, 10000, (batch_size, seq_len)).cuda()
-    targets = torch.randint(0, 10000, (batch_size, seq_len)).cuda()
-
-    # 학습 스텝
-    loss = trainer.train_step(input_ids, targets)
-    print(f"Loss: {loss:.4f}")
-
-    # 활성 분석
-    analysis = trainer.analyze_activations(input_ids[:1])
-    print("\nActivation Analysis:")
-    for layer, stats in analysis.items():
-        print(f"\n{layer}:")
-        for key, value in stats.items():
-            print(f"  {key}: {value:.4f}")
-
-    # 생성
-    prompt = torch.randint(0, 10000, (1, 10)).cuda()
-    generated = model.generate(prompt, max_new_tokens=20, temperature=0.8, top_k=50)
-    print(f"\nGenerated shape: {generated.shape}")
-
-
-# ========== 하위 호환성을 위한 별칭 ==========
-
-# 기존 코드와의 호환성을 위해 별칭 제공
 DAWNLanguageModel = DAWN
 
-# from_config 메서드 추가
 def _from_config(cls, config, vocab_size):
-    """Create model from config dict."""
     model_cfg = config.get('model', {})
     return cls(
         vocab_size=vocab_size,
@@ -474,5 +299,24 @@ def _from_config(cls, config, vocab_size):
 DAWN.from_config = classmethod(_from_config)
 
 
+def create_model(vocab_size=50000):
+    model = DAWN(
+        vocab_size=vocab_size,
+        hidden_dim=512,
+        num_layers=6,
+        num_input_neurons=64,
+        num_process_neurons=128,
+        max_seq_len=2048,
+        dropout=0.1
+    )
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
+
+    return model
+
+
 if __name__ == "__main__":
-    example_usage()
+    model = create_model(vocab_size=10000)
+    print("\nDAWN model created successfully!")
+    print("Architecture: Activation Landscape → 2D Pattern Recognition")
