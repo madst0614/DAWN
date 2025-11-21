@@ -4,10 +4,10 @@ import torch.nn.functional as F
 import math
 
 
-class InputNeurons(nn.Module):
+class RelationalInputNeurons(nn.Module):
     """
-    각 토큰 → 활성화 패턴 변환
-    [B, S, H] → [B, S, N] 활성화 지형
+    각 토큰 → 활성화 패턴 변환 (관계 정보 포함)
+    [B, S, H] → [B, S, N] 관계 반영된 활성화 지형
     """
     def __init__(self, hidden_dim, num_input_neurons):
         super().__init__()
@@ -26,25 +26,47 @@ class InputNeurons(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim * num_input_neurons)
         )
 
+        # 관계 계산용 경량 Attention
+        self.relation_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=1,
+            batch_first=True
+        )
+
     def forward(self, x):
         B, S, H = x.shape
         N = self.num_neurons
 
-        # 1. 패턴 매칭 → 활성화
+        # 1. 기본 활성화 (의미 패턴)
         x_norm = F.normalize(x, dim=-1)
         patterns_norm = F.normalize(self.patterns, dim=-1)
         pattern_matches = torch.matmul(x_norm, patterns_norm.t())
-        activations = torch.sigmoid(pattern_matches)  # [B, S, N]
+        base_activations = torch.sigmoid(pattern_matches)  # [B, S, N]
 
-        # 2. Feature 추출
+        # 2. 관계 계산 (Causal Attention)
+        # 미래 토큰을 보지 않도록 causal mask
+        causal_mask = torch.triu(
+            torch.ones(S, S, device=x.device) * float('-inf'),
+            diagonal=1
+        )
+        _, attn_weights = self.relation_attn(x, x, x, attn_mask=causal_mask)
+        # attn_weights: [B, S, S] - 토큰 간 관계 행렬
+
+        # 3. 관계를 통한 활성화 전파
+        # 각 토큰이 관련있는 토큰들의 활성화를 받아옴
+        relational_activations = torch.matmul(attn_weights, base_activations)
+        # [B, S, S] @ [B, S, N] = [B, S, N]
+
+        # 4. 기본 활성화 + 관계 활성화
+        combined_activations = base_activations + 0.5 * relational_activations
+
+        # 5. Feature 추출 (관계 반영된 활성화로)
         all_features = self.feature_extractors(x)
         all_features = all_features.view(B, S, N, H)
-
-        # 3. 활성화 적용
-        activated_features = all_features * activations.unsqueeze(-1)
+        activated_features = all_features * combined_activations.unsqueeze(-1)
         intermediate = activated_features.sum(dim=2)
 
-        return intermediate, activations
+        return intermediate, combined_activations
 
 
 class ProcessNeurons(nn.Module):
@@ -109,13 +131,15 @@ class ProcessNeurons(nn.Module):
 
 class DAWNLayer(nn.Module):
     """
-    InputNeurons → ProcessNeurons
-    활성화 지형 생성 → 지형 패턴 인식
+    RelationalInputNeurons → ProcessNeurons
+    관계 반영 활성화 지형 생성 → 지형 패턴 인식
     """
     def __init__(self, hidden_dim, num_input_neurons=64, num_process_neurons=128):
         super().__init__()
 
-        self.input_neurons = InputNeurons(hidden_dim, num_input_neurons)
+        # 관계 정보를 포함하는 InputNeurons
+        self.input_neurons = RelationalInputNeurons(hidden_dim, num_input_neurons)
+
         self.process_neurons = ProcessNeurons(
             hidden_dim,
             num_input_neurons,
@@ -126,7 +150,7 @@ class DAWNLayer(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
 
     def forward(self, x):
-        # 1. 활성화 지형 생성
+        # 1. 관계 반영된 활성화 지형 생성
         intermediate, input_acts = self.input_neurons(x)
         x = self.norm1(x + intermediate)
 
@@ -143,6 +167,7 @@ class DAWNLayer(nn.Module):
 class DAWN(nn.Module):
     """
     전체 DAWN 모델
+    위치 + 의미 + 관계 정보를 활성화 지형으로 통합
     """
     def __init__(
         self,
@@ -190,7 +215,7 @@ class DAWN(nn.Module):
     def forward(self, input_ids, return_activations=False):
         B, S = input_ids.shape
 
-        # 임베딩
+        # 임베딩 (위치 + 의미)
         token_emb = self.token_embedding(input_ids)
         positions = torch.arange(S, device=input_ids.device).unsqueeze(0)
         pos_emb = self.position_embedding(positions)
@@ -198,7 +223,7 @@ class DAWN(nn.Module):
         x = token_emb + pos_emb
         x = self.embedding_dropout(x)
 
-        # 레이어별 처리
+        # 레이어별 처리 (관계 정보 점진적 추가)
         all_activations = []
         for layer in self.layers:
             x, activations = layer(x)
@@ -319,4 +344,4 @@ def create_model(vocab_size=50000):
 if __name__ == "__main__":
     model = create_model(vocab_size=10000)
     print("\nDAWN model created successfully!")
-    print("Architecture: Activation Landscape → 2D Pattern Recognition")
+    print("Architecture: Relational Activation Landscape → 2D Pattern Recognition")

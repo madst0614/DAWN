@@ -29,6 +29,9 @@ import time
 import numpy as np
 import math
 
+# Enable TensorFloat32 for better performance on Ampere+ GPUs
+torch.set_float32_matmul_precision('high')
+
 from models.model import DAWN, DAWNLanguageModel
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
