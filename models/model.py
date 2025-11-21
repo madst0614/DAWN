@@ -69,9 +69,11 @@ class ProcessNeurons(nn.Module):
             torch.randn(num_process_neurons, num_input_neurons)
         )
 
-        # 각 ProcessNeuron의 변환 (병렬)
-        self.neuron_transforms = nn.Parameter(
-            torch.randn(num_process_neurons, hidden_dim, hidden_dim) * 0.02
+        # 각 ProcessNeuron의 변환 (Linear로 최적화!)
+        self.neuron_transforms = nn.Linear(
+            hidden_dim,
+            hidden_dim * num_process_neurons,
+            bias=False
         )
 
     def forward(self, intermediate, input_activations):
@@ -96,13 +98,12 @@ class ProcessNeurons(nn.Module):
         normalization = process_activations.sum(dim=1).unsqueeze(-1) + 1e-8  # [B, N_proc, 1]
         contexts = contexts / normalization  # [B, N_proc, H]
 
-        # 3. 모든 ProcessNeuron 변환 병렬 실행
-        # [B, N_proc, H] @ [N_proc, H, H] = [B, N_proc, H]
-        transformed = torch.einsum('bni,nio->bno', contexts, self.neuron_transforms)
+        # 3. 모든 ProcessNeuron 변환 병렬 실행 (Linear 사용으로 최적화!)
+        all_transformed = self.neuron_transforms(contexts)  # [B, H*N_proc]
+        transformed = all_transformed.view(B, N_proc, H)  # [B, N_proc, H]
 
-        # 4. 각 토큰에 분배 (활성화 강도만큼)
-        transformed = transformed.unsqueeze(1).expand(-1, S, -1, -1)  # [B, S, N_proc, H]
-        distributed = transformed * process_activations.unsqueeze(-1)
+        # 4. 각 토큰에 분배 (expand 없이 직접 broadcasting)
+        distributed = transformed.unsqueeze(1) * process_activations.unsqueeze(-1)  # [B, 1, N_proc, H] * [B, S, N_proc, 1]
 
         # 5. 모든 ProcessNeuron 출력 통합
         combined = distributed.sum(dim=2)  # [B, S, H]

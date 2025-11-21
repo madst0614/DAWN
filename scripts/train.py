@@ -360,6 +360,12 @@ def main():
     )
     model = model.to(device)
 
+    # PyTorch 2.0+ compilation for speed boost
+    if hasattr(torch, 'compile'):
+        print(f"\nCompiling model with torch.compile...")
+        model = torch.compile(model, mode='reduce-overhead')
+        print(f"  Model compiled successfully!")
+
     # Model statistics
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
