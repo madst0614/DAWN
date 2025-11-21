@@ -682,25 +682,51 @@ def main():
     print("\nLoading checkpoint...")
     checkpoint = torch.load(args.checkpoint)
 
-    # Load model
-    print("Loading model...")
-    model = DAWN(
-        vocab_size=checkpoint.get('vocab_size', 30522),
-        hidden_dim=512,
-        num_layers=6,
-        num_input_neurons=64,
-        num_process_neurons=128,
-        adapt_rank=16,
-        process_rank=128,
-        max_seq_len=2048,
-        dropout=0.1
-    )
-
     # Handle torch.compile() state_dict (remove _orig_mod. prefix)
     state_dict = checkpoint['model_state_dict']
     if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
         print("Detected torch.compile() checkpoint, removing _orig_mod. prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    # Infer model hyperparameters from state_dict
+    print("Inferring model hyperparameters from checkpoint...")
+    vocab_size = state_dict['token_embedding.weight'].shape[0]
+    hidden_dim = state_dict['token_embedding.weight'].shape[1]
+    max_seq_len = state_dict['position_embedding.weight'].shape[0]
+
+    # Count number of layers
+    num_layers = sum(1 for key in state_dict.keys() if key.startswith('layers.') and '.input_neurons.patterns' in key)
+
+    # Get neuron counts from first layer
+    num_input_neurons = state_dict['layers.0.input_neurons.patterns'].shape[0]
+    num_process_neurons = state_dict['layers.0.process_neurons.down_proj'].shape[0]
+
+    # Get rank parameters
+    adapt_rank = state_dict['layers.0.input_neurons.neuron_adapt_down'].shape[2]
+    process_rank = state_dict['layers.0.process_neurons.down_proj'].shape[2]
+
+    print(f"  vocab_size: {vocab_size}")
+    print(f"  hidden_dim: {hidden_dim}")
+    print(f"  max_seq_len: {max_seq_len}")
+    print(f"  num_layers: {num_layers}")
+    print(f"  num_input_neurons: {num_input_neurons}")
+    print(f"  num_process_neurons: {num_process_neurons}")
+    print(f"  adapt_rank: {adapt_rank}")
+    print(f"  process_rank: {process_rank}")
+
+    # Load model with inferred hyperparameters
+    print("\nLoading model...")
+    model = DAWN(
+        vocab_size=vocab_size,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        num_input_neurons=num_input_neurons,
+        num_process_neurons=num_process_neurons,
+        adapt_rank=adapt_rank,
+        process_rank=process_rank,
+        max_seq_len=max_seq_len,
+        dropout=0.1
+    )
 
     model.load_state_dict(state_dict)
     model = model.cuda()
