@@ -7,7 +7,8 @@ New simplified architecture with InputNeurons and ProcessNeurons.
 
 from .model import (
     # Core components
-    InputNeurons,
+    BalancedInputNeurons,
+    InputNeurons,  # Alias for backward compatibility
     LateralConnections,
     LowRankProcessNeurons,
     ProcessNeurons,  # Alias for backward compatibility
@@ -20,6 +21,7 @@ from .model import (
 )
 
 __all__ = [
+    "BalancedInputNeurons",
     "InputNeurons",
     "LateralConnections",
     "LowRankProcessNeurons",
