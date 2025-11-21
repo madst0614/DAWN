@@ -9,7 +9,8 @@ from .model import (
     # Core components
     InputNeurons,
     LateralConnections,
-    ProcessNeurons,
+    LowRankProcessNeurons,
+    ProcessNeurons,  # Alias for backward compatibility
     DAWNLayer,
     DAWN,
     DAWNLanguageModel,
@@ -21,6 +22,7 @@ from .model import (
 __all__ = [
     "InputNeurons",
     "LateralConnections",
+    "LowRankProcessNeurons",
     "ProcessNeurons",
     "DAWNLayer",
     "DAWN",
