@@ -72,7 +72,7 @@ class ProcessNeurons(nn.Module):
         # 각 ProcessNeuron의 변환 (Linear로 최적화!)
         self.neuron_transforms = nn.Linear(
             hidden_dim,
-            hidden_dim * num_process_neurons,
+            hidden_dim,
             bias=False
         )
 
@@ -99,8 +99,9 @@ class ProcessNeurons(nn.Module):
         contexts = contexts / normalization  # [B, N_proc, H]
 
         # 3. 모든 ProcessNeuron 변환 병렬 실행 (Linear 사용으로 최적화!)
-        all_transformed = self.neuron_transforms(contexts)  # [B, H*N_proc]
-        transformed = all_transformed.view(B, N_proc, H)  # [B, N_proc, H]
+        contexts_flat = contexts.reshape(B * N_proc, H)  # [B*N_proc, H]
+        transformed_flat = self.neuron_transforms(contexts_flat)  # [B*N_proc, H]
+        transformed = transformed_flat.view(B, N_proc, H)  # [B, N_proc, H]
 
         # 4. 각 토큰에 분배 (expand 없이 직접 broadcasting)
         distributed = transformed.unsqueeze(1) * process_activations.unsqueeze(-1)  # [B, 1, N_proc, H] * [B, S, N_proc, 1]
