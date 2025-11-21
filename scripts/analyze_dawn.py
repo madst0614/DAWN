@@ -678,6 +678,36 @@ def main():
     print(f"\nCheckpoint: {args.checkpoint}")
     print(f"Data: {args.data}")
 
+    # Load config from checkpoint directory
+    checkpoint_path = Path(args.checkpoint)
+    config_path = checkpoint_path.parent / 'config.json'
+
+    if not config_path.exists():
+        print(f"❌ Config file not found: {config_path}")
+        print("   Expected config.json in same directory as checkpoint")
+        return
+
+    print(f"\nLoading config from: {config_path}")
+    import json
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
+
+    # Extract model hyperparameters from config
+    d_model = cfg['model'].get('d_model', 512)
+    n_layers = cfg['model'].get('n_layers', 6)
+    n_input = cfg['model'].get('n_input', 64)
+    n_process = cfg['model'].get('n_process', 128)
+    max_seq_len = cfg['model'].get('max_seq_len', 2048)
+    dropout = cfg['model'].get('dropout', 0.1)
+
+    print(f"Model config:")
+    print(f"  d_model: {d_model}")
+    print(f"  n_layers: {n_layers}")
+    print(f"  n_input: {n_input}")
+    print(f"  n_process: {n_process}")
+    print(f"  max_seq_len: {max_seq_len}")
+    print(f"  dropout: {dropout}")
+
     # Load checkpoint
     print("\nLoading checkpoint...")
     checkpoint = torch.load(args.checkpoint)
@@ -688,44 +718,20 @@ def main():
         print("Detected torch.compile() checkpoint, removing _orig_mod. prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Infer model hyperparameters from state_dict
-    print("Inferring model hyperparameters from checkpoint...")
+    # Get vocab_size from state_dict (not in config)
     vocab_size = state_dict['token_embedding.weight'].shape[0]
-    hidden_dim = state_dict['token_embedding.weight'].shape[1]
-    max_seq_len = state_dict['position_embedding.weight'].shape[0]
-
-    # Count number of layers
-    num_layers = sum(1 for key in state_dict.keys() if key.startswith('layers.') and '.input_neurons.patterns' in key)
-
-    # Get neuron counts from first layer
-    num_input_neurons = state_dict['layers.0.input_neurons.patterns'].shape[0]
-    num_process_neurons = state_dict['layers.0.process_neurons.down_proj'].shape[0]
-
-    # Get rank parameters
-    adapt_rank = state_dict['layers.0.input_neurons.neuron_adapt_down'].shape[2]
-    process_rank = state_dict['layers.0.process_neurons.down_proj'].shape[2]
-
     print(f"  vocab_size: {vocab_size}")
-    print(f"  hidden_dim: {hidden_dim}")
-    print(f"  max_seq_len: {max_seq_len}")
-    print(f"  num_layers: {num_layers}")
-    print(f"  num_input_neurons: {num_input_neurons}")
-    print(f"  num_process_neurons: {num_process_neurons}")
-    print(f"  adapt_rank: {adapt_rank}")
-    print(f"  process_rank: {process_rank}")
 
-    # Load model with inferred hyperparameters
-    print("\nLoading model...")
+    # Load model with config hyperparameters
+    print("\nCreating model...")
     model = DAWN(
         vocab_size=vocab_size,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        num_input_neurons=num_input_neurons,
-        num_process_neurons=num_process_neurons,
-        adapt_rank=adapt_rank,
-        process_rank=process_rank,
+        hidden_dim=d_model,
+        num_layers=n_layers,
+        num_input_neurons=n_input,
+        num_process_neurons=n_process,
         max_seq_len=max_seq_len,
-        dropout=0.1
+        dropout=dropout
     )
 
     model.load_state_dict(state_dict)
