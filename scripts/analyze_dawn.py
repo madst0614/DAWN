@@ -433,9 +433,9 @@ def analyze_rank_efficiency(model):
 # 7. 학습 곡선 분석
 # ============================================================
 
-def analyze_training_curves(log_path):
+def analyze_training_curves(log_path, output_path=None):
     """
-    학습 로그 분석
+    학습 로그 분석 및 시각화
     - Loss/Acc 추세
     - 예측
     - 과적합 여부
@@ -446,73 +446,99 @@ def analyze_training_curves(log_path):
 
     if not Path(log_path).exists():
         print(f"\n⚠️  Log file not found: {log_path}")
-        return
+        return None
 
     # 로그 파싱 (training_log.txt)
-    epochs = []
-    train_losses = []
-    val_losses = []
-    train_accs = []
-    val_accs = []
-
+    # Format: epoch=1,step=100,loss=3.456789,acc=0.123456
+    data = []
     with open(log_path, 'r') as f:
         for line in f:
-            if 'Epoch' in line and 'Train Loss' in line:
-                # 파싱
-                match = re.search(r'Epoch (\d+)/\d+', line)
-                if match:
-                    epoch = int(match.group(1))
-                    epochs.append(epoch)
+            if line.startswith('#') or not line.strip():
+                continue
 
-                match = re.search(r'Train Loss: ([\d.]+)', line)
-                if match:
-                    train_losses.append(float(match.group(1)))
+            # Parse epoch=X,step=Y,loss=Z,acc=W
+            parts = {}
+            for part in line.strip().split(','):
+                if '=' in part:
+                    key, val = part.split('=')
+                    parts[key] = float(val)
 
-                match = re.search(r'Val Loss: ([\d.]+)', line)
-                if match:
-                    val_losses.append(float(match.group(1)))
+            if 'epoch' in parts and 'loss' in parts:
+                data.append(parts)
 
-                match = re.search(r'Train Acc: ([\d.]+)', line)
-                if match:
-                    train_accs.append(float(match.group(1)))
-
-                match = re.search(r'Val Acc: ([\d.]+)', line)
-                if match:
-                    val_accs.append(float(match.group(1)))
-
-    if not epochs:
+    if not data:
         print("\n⚠️  No training data found in log")
-        return
+        return None
 
-    # 추세
-    slope_loss, _, _, _, _ = stats.linregress(epochs, val_losses)
-    slope_acc, _, _, _, _ = stats.linregress(epochs, val_accs)
+    # Convert to DataFrame for easier analysis
+    df = pd.DataFrame(data)
 
-    print(f"\nCurrent epoch: {epochs[-1]}")
-    print(f"Val Loss: {val_losses[-1]:.4f}")
-    print(f"Val Acc: {val_accs[-1]:.4f}")
+    # Group by epoch to get epoch-level statistics
+    epoch_stats = df.groupby('epoch').agg({
+        'loss': 'mean',
+        'acc': 'mean'
+    }).reset_index()
 
-    print(f"\nTrends:")
-    print(f"  Loss slope: {slope_loss:.6f} per epoch")
-    print(f"  Acc slope: {slope_acc:.6f} per epoch")
+    epochs = epoch_stats['epoch'].values
+    train_losses = epoch_stats['loss'].values
+    train_accs = epoch_stats['acc'].values
 
-    # Epoch 30 예측
-    pred_loss_30 = val_losses[-1] + slope_loss * (30 - epochs[-1])
-    pred_acc_30 = val_accs[-1] + slope_acc * (30 - epochs[-1])
+    print(f"\nTraining progress:")
+    print(f"  Total epochs: {int(epochs[-1])}")
+    print(f"  Total steps: {int(df['step'].max())}")
+    print(f"  Final train loss: {train_losses[-1]:.4f}")
+    print(f"  Final train acc: {train_accs[-1]:.4f}")
 
-    print(f"\nPredicted at epoch 30:")
-    print(f"  Loss: {pred_loss_30:.4f}")
-    print(f"  Acc: {pred_acc_30:.4f}")
+    # 추세 분석
+    if len(epochs) > 1:
+        slope_loss, _, _, _, _ = stats.linregress(epochs, train_losses)
+        slope_acc, _, _, _, _ = stats.linregress(epochs, train_accs)
 
-    # 과적합
-    gap = np.array(train_losses) - np.array(val_losses)
-    print(f"\nOverfitting check:")
-    print(f"  Train-Val gap: {gap[-1]:.4f}")
-    print(f"  Gap trend: {gap[-1] - gap[0]:.4f}")
-    if gap[-1] > 0.5:
-        print("  ⚠️  Warning: Large train-val gap")
-    else:
-        print("  ✓ Healthy learning")
+        print(f"\nTrends:")
+        print(f"  Loss slope: {slope_loss:.6f} per epoch")
+        print(f"  Acc slope: {slope_acc:.6f} per epoch")
+
+        # Epoch 30 예측
+        if epochs[-1] < 30:
+            pred_loss_30 = train_losses[-1] + slope_loss * (30 - epochs[-1])
+            pred_acc_30 = train_accs[-1] + slope_acc * (30 - epochs[-1])
+
+            print(f"\nPredicted at epoch 30:")
+            print(f"  Loss: {pred_loss_30:.4f}")
+            print(f"  Acc: {pred_acc_30:.4f}")
+
+    # 학습 곡선 시각화
+    if output_path:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Loss curve
+        ax = axes[0]
+        ax.plot(epochs, train_losses, 'o-', linewidth=2, markersize=6, label='Train Loss')
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.set_title('Training Loss Curve', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=11)
+
+        # Accuracy curve
+        ax = axes[1]
+        ax.plot(epochs, train_accs, 's-', linewidth=2, markersize=6, label='Train Acc', color='green')
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Accuracy', fontsize=12)
+        ax.set_title('Training Accuracy Curve', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=11)
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"\n💾 Saved training curves: {output_path}")
+        plt.close()
+
+    return {
+        'epochs': epochs,
+        'train_losses': train_losses,
+        'train_accs': train_accs
+    }
 
 
 # ============================================================
@@ -665,7 +691,8 @@ def create_visualizations(input_acts, process_acts, attn_patterns, df_norms, out
 
 def main():
     parser = argparse.ArgumentParser(description='DAWN Checkpoint Comprehensive Analysis')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint file')
+    parser.add_argument('--checkpoint', type=str, required=True,
+                        help='Path to checkpoint file or directory (will auto-find best_model.pt)')
     parser.add_argument('--data', type=str, default=None, help='Path to validation data (optional)')
     parser.add_argument('--num-batches', type=int, default=20, help='Number of batches for analysis')
     parser.add_argument('--output-dir', type=str, default='.', help='Output directory for visualizations')
@@ -675,12 +702,38 @@ def main():
     print("\n" + "="*70)
     print("DAWN COMPREHENSIVE CHECKPOINT ANALYSIS")
     print("="*70)
-    print(f"\nCheckpoint: {args.checkpoint}")
+
+    # Handle directory vs file input
+    checkpoint_input = Path(args.checkpoint)
+
+    if checkpoint_input.is_dir():
+        # Directory provided - find best_model.pt
+        checkpoint_dir = checkpoint_input
+        checkpoint_path = checkpoint_dir / 'best_model.pt'
+
+        if not checkpoint_path.exists():
+            print(f"❌ best_model.pt not found in directory: {checkpoint_dir}")
+            print("   Please provide a valid checkpoint directory or file path")
+            return
+
+        print(f"\n📁 Checkpoint directory: {checkpoint_dir}")
+        print(f"📄 Using checkpoint: {checkpoint_path.name}")
+    else:
+        # File provided directly
+        checkpoint_path = checkpoint_input
+        checkpoint_dir = checkpoint_path.parent
+
+        if not checkpoint_path.exists():
+            print(f"❌ Checkpoint file not found: {checkpoint_path}")
+            return
+
+        print(f"\n📁 Checkpoint directory: {checkpoint_dir}")
+        print(f"📄 Checkpoint file: {checkpoint_path.name}")
+
     print(f"Data: {args.data}")
 
     # Load config from checkpoint directory
-    checkpoint_path = Path(args.checkpoint)
-    config_path = checkpoint_path.parent / 'config.json'
+    config_path = checkpoint_dir / 'config.json'
 
     if not config_path.exists():
         print(f"❌ Config file not found: {config_path}")
@@ -710,7 +763,7 @@ def main():
 
     # Load checkpoint
     print("\nLoading checkpoint...")
-    checkpoint = torch.load(args.checkpoint)
+    checkpoint = torch.load(str(checkpoint_path))
 
     # Handle torch.compile() state_dict (remove _orig_mod. prefix)
     state_dict = checkpoint['model_state_dict']
@@ -795,19 +848,24 @@ def main():
     analyze_rank_efficiency(model)
 
     # 7. 학습 곡선
-    log_path = Path(args.checkpoint).parent / 'training_log.txt'
-    analyze_training_curves(str(log_path))
+    log_path = checkpoint_dir / 'training_log.txt'
+    curve_output_path = checkpoint_dir / 'training_curves.png'
+    training_data = analyze_training_curves(str(log_path), output_path=str(curve_output_path))
 
     # 8. 예측 품질
     token_accs = analyze_prediction_quality(model, dataloader, tokenizer, num_samples=100)
 
     # 9. 시각화
-    output_path = Path(args.output_dir) / 'dawn_analysis.png'
+    output_path = checkpoint_dir / 'dawn_analysis.png'
     create_visualizations(input_acts, process_acts, attn_patterns, df_norms, output_path=str(output_path))
 
     print("\n" + "="*70)
     print("ANALYSIS COMPLETE!")
     print("="*70)
+    print(f"\n📊 Results saved to:")
+    print(f"  Training curves: {curve_output_path}")
+    print(f"  Analysis visualization: {output_path}")
+    print(f"\n✨ Analysis finished successfully!")
 
 
 if __name__ == "__main__":
