@@ -132,6 +132,10 @@ class LowRankProcessNeurons(nn.Module):
             padding=(2, 0)
         )
 
+        # Pattern detector 초기화: 더 활발한 초기 활성화
+        nn.init.xavier_uniform_(self.pattern_detector.weight, gain=0.5)
+        nn.init.constant_(self.pattern_detector.bias, 2.0)
+
         # Low-Rank 분해
         self.down_proj = nn.Parameter(
             torch.randn(num_process_neurons, hidden_dim, rank) * 0.02
@@ -281,10 +285,7 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+            # Conv2d 초기화는 각 모듈에서 직접 수행 (LowRankProcessNeurons 참조)
 
     def forward(self, input_ids, return_activations=False):
         """
