@@ -304,11 +304,11 @@ class CacheLoader:
     """
     Load cached datasets from pickle files.
 
-    Uses the cache system at /content/drive/MyDrive/dawn_v4/cache/
+    Uses the cache system at /content/drive/MyDrive/data/
     Uses wikitext_5to1_texts.pkl which has train/validation already split 5:1
     """
 
-    CACHE_BASE_DIR = "/content/drive/MyDrive/dawn_v4/cache"
+    CACHE_BASE_DIR = "/content/drive/MyDrive/data"
 
     @staticmethod
     def load_texts(
