@@ -132,10 +132,13 @@ def compute_learned_sparsity_loss(
     selection_info: dict
 ) -> torch.Tensor:
     """
-    STRONG sparsity guidance with progressive penalties.
+    EXPONENTIAL penalty for extreme sparsity violations.
+
+    The further from target, the exponentially worse it gets.
+    This forces the model to RESPECT sparsity constraints!
 
     Target: 30-70% active neurons
-    Progressive penalty: stronger when further from target
+    Exponential penalty: e^(k*deviation) - 1
     """
     effective_k_ratio = selection_info.get('effective_k_ratio', 0.5)
 
@@ -144,20 +147,24 @@ def compute_learned_sparsity_loss(
     target_max = 0.7
     target_center = 0.5
 
-    # STRONG penalties for extremes (2x multiplier)
     if effective_k_ratio < target_min:
+        # Too sparse - moderate exponential
         deviation = target_min - effective_k_ratio
-        sparsity_penalty = (deviation * 2.0) ** 2
+        # e^(5*deviation) - 1
+        sparsity_penalty = torch.exp(torch.tensor(5.0 * deviation, device=weights.device)) - 1.0
+
     elif effective_k_ratio > target_max:
+        # Too dense - CRITICAL! Much stronger exponential
         deviation = effective_k_ratio - target_max
-        sparsity_penalty = (deviation * 2.0) ** 2
+        # e^(10*deviation) - 1
+        # At 100%: e^(10*0.3) - 1 = 19.09
+        sparsity_penalty = torch.exp(torch.tensor(10.0 * deviation, device=weights.device)) - 1.0
+
     else:
-        # Gentle centering toward 0.5
+        # In range - gentle quadratic centering
         sparsity_penalty = 0.1 * (effective_k_ratio - target_center) ** 2
 
-    penalty_tensor = torch.tensor(sparsity_penalty, device=weights.device, dtype=weights.dtype)
-
-    # Gini diversity penalty (also stronger)
+    # Gini diversity penalty (also exponential for extremes)
     avg_weights = weights.mean(dim=0)
     sorted_weights, _ = torch.sort(avg_weights)
     n = len(sorted_weights)
@@ -165,13 +172,15 @@ def compute_learned_sparsity_loss(
     gini = (2 * (index * sorted_weights).sum()) / (n * sorted_weights.sum() + 1e-8) - (n + 1) / n
 
     if gini < 0.2:
-        gini_penalty = ((0.2 - gini) * 2.0) ** 2
+        # Too uniform - exponential penalty
+        gini_penalty = torch.exp(torch.tensor(5.0 * (0.2 - gini), device=weights.device)) - 1.0
     elif gini > 0.6:
-        gini_penalty = ((gini - 0.6) * 2.0) ** 2
+        # Too concentrated - exponential penalty
+        gini_penalty = torch.exp(torch.tensor(5.0 * (gini - 0.6), device=weights.device)) - 1.0
     else:
         gini_penalty = torch.tensor(0.0, device=weights.device)
 
-    return penalty_tensor + gini_penalty
+    return sparsity_penalty + gini_penalty
 
 
 # ============================================================
@@ -225,20 +234,22 @@ class DynamicRouter(nn.Module):
         )
 
         # ============================================================
-        # THREE Learnable parameters (NO CLAMPS!)
+        # THREE Learnable parameters - HIGHER INITIAL VALUES!
         # ============================================================
 
         # Temperature: softmax sharpness
-        # Let model learn any value - will naturally stabilize
-        self.log_temperature = nn.Parameter(torch.tensor(0.0))  # exp(0) = 1.0
+        # Start at 1.0 (exp(0) = 1.0)
+        self.log_temperature = nn.Parameter(torch.tensor(0.0))
 
         # Threshold: where to cut
-        # Sigmoid naturally bounds to (0, 1)
-        self.sparsity_threshold = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
+        # START HIGHER! sigmoid(1.5) = 0.82 (82%)
+        # Forces model to be sparse from the beginning!
+        self.sparsity_threshold = nn.Parameter(torch.tensor(1.5))  # WAS: 0.0
 
         # Steepness: transition sharpness
-        # Let model learn - will find optimal steepness
-        self.log_steepness = nn.Parameter(torch.tensor(math.log(3.0)))  # exp(log(3)) = 3.0
+        # START HIGHER! exp(log(5)) = 5.0
+        # Sharper transitions = clearer selection!
+        self.log_steepness = nn.Parameter(torch.tensor(math.log(5.0)))  # WAS: log(3.0)
 
         self._init_weights()
 
