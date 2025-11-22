@@ -325,9 +325,10 @@ def main():
 
     # Checkpoint loading logic
     latest_best_checkpoint = None
+    checkpoint_dir = None
 
     if cli_args.resume:
-        # Explicit resume from folder
+        # Explicit resume from folder - use existing folder
         resume_folder = Path(cli_args.resume)
         if not resume_folder.is_absolute():
             resume_folder = Path(args.checkpoint_dir) / resume_folder.name
@@ -335,13 +336,15 @@ def main():
         best_ckpt = resume_folder / 'best_model.pt'
         if best_ckpt.exists():
             latest_best_checkpoint = best_ckpt
+            checkpoint_dir = resume_folder  # Use existing folder
             print(f"\n✓ Resuming from: {latest_best_checkpoint}")
+            print(f"✓ Continuing in same folder: {checkpoint_dir}")
         else:
             print(f"\n⚠️  Warning: Checkpoint not found at {best_ckpt}")
             print(f"    Starting from scratch instead.")
 
     elif not cli_args.from_scratch:
-        # Auto-resume: find latest checkpoint
+        # Auto-resume: find latest checkpoint and use its folder
         run_folders = sorted([
             d for d in base_checkpoint_dir.iterdir()
             if d.is_dir() and d.name.startswith('run_')
@@ -352,27 +355,31 @@ def main():
             best_ckpt = latest_folder / 'best_model.pt'
             if best_ckpt.exists():
                 latest_best_checkpoint = best_ckpt
+                checkpoint_dir = latest_folder  # Use existing folder
                 print(f"\n✓ Auto-resume: Found latest checkpoint: {latest_best_checkpoint}")
+                print(f"✓ Continuing in same folder: {checkpoint_dir}")
 
     if cli_args.from_scratch:
         print(f"\n✓ Starting from scratch (--from-scratch)")
 
-    # Create new run folder
-    import random
-    from datetime import timezone, timedelta
-    kst = timezone(timedelta(hours=9))
-    timestamp = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
-    random_suffix = random.randint(1000, 9999)
-    run_name = f"run_{timestamp}_{random_suffix}"
-    checkpoint_dir = base_checkpoint_dir / run_name
+    # Create new run folder only if not resuming
+    if checkpoint_dir is None:
+        import random
+        from datetime import timezone, timedelta
+        kst = timezone(timedelta(hours=9))
+        timestamp = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
+        random_suffix = random.randint(1000, 9999)
+        run_name = f"run_{timestamp}_{random_suffix}"
+        checkpoint_dir = base_checkpoint_dir / run_name
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n✓ Created new run folder: {checkpoint_dir}")
+
+        # Save config for new runs
+        with open(checkpoint_dir / 'config.json', 'w') as f:
+            json.dump(cfg, f, indent=2)
+
     log_dir = checkpoint_dir
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"Run folder: {checkpoint_dir}")
-
-    # Save config
-    with open(checkpoint_dir / 'config.json', 'w') as f:
-        json.dump(cfg, f, indent=2)
 
     print(f"\n{'='*60}")
     print(f"DAWN (Dynamic Neuron Transformer) Training")
@@ -504,12 +511,21 @@ def main():
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
     monitor = TrainingMonitor(str(log_dir))
 
-    # Training log file
+    # Training log file (append mode if resuming)
     training_log_file = checkpoint_dir / "training_log.txt"
 
-    with open(training_log_file, 'w') as f:
-        f.write("# Training Log (aggregated every 100 steps)\n")
-        f.write("# Format: epoch,step,loss,acc\n")
+    # Open in append mode if resuming, write mode if new
+    log_mode = 'a' if latest_best_checkpoint else 'w'
+    if log_mode == 'w':
+        with open(training_log_file, 'w') as f:
+            f.write("# Training Log\n")
+            f.write("# Step logs: epoch,step,loss,acc\n")
+            f.write("# Epoch summaries: EPOCH,epoch,train_loss,train_acc,val_loss,val_acc,lr,time\n")
+            f.write("\n")
+    else:
+        # Append separator for resumed training
+        with open(training_log_file, 'a') as f:
+            f.write(f"\n# === Resumed training at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
 
     # Training loop
     print(f"\n{'='*60}")
@@ -547,6 +563,12 @@ def main():
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
+
+        # Write epoch summary to log
+        with open(training_log_file, 'a') as f:
+            f.write(f"EPOCH,{epoch},{train_loss:.6f},{train_acc:.6f},"
+                   f"{val_loss:.6f},{val_acc:.6f},"
+                   f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}\n")
 
         # Analyze activations periodically
         if epoch % 10 == 0:
