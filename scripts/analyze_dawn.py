@@ -594,7 +594,7 @@ def analyze_pattern_usage(collector, n_patterns, n_layers):
     results = {}
 
     for layer_idx in range(n_layers):
-        if not collector.pattern_selections[layer_idx]:
+        if len(collector.pattern_selections[layer_idx]) == 0:
             continue
 
         pattern_weights = collector.pattern_selections[layer_idx]  # [N, n_patterns]
