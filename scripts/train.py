@@ -423,6 +423,9 @@ def main():
     )
     model = model.to(device)
 
+    # Display model version
+    print(f"\n📌 Model version: {DAWN.__version__}")
+
     # PyTorch 2.0+ compilation for speed boost
     if hasattr(torch, 'compile'):
         print(f"\nCompiling model with torch.compile...")

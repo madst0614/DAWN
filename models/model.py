@@ -27,8 +27,9 @@ class NeuronRouter(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
 
-        # 뉴런 선택용
-        self.select_proj = nn.Linear(d_model, d_model)
+        # 뉴런 선택용 (gating)
+        self.gate_proj = nn.Linear(d_model, n_neurons)
+        nn.init.zeros_(self.gate_proj.bias)  # 초기엔 gate ≈ 0.5
 
         # 이전 레이어와의 connection (있으면)
         self.has_connection = prev_n_neurons is not None
@@ -53,24 +54,29 @@ class NeuronRouter(nn.Module):
         context = torch.matmul(attn, v)
         context = context.transpose(1, 2).contiguous().view(B, S, D)
 
-        # 2. 문맥 기반 뉴런 점수
-        select_q = self.select_proj(context)
-        scores = torch.matmul(select_q, self.neurons.T)  # [B, S, n_neurons]
+        # 2. Bottom-up: 토큰 기반 뉴런 점수
+        token_scores = torch.matmul(x, self.neurons.T)  # [B, S, n_neurons]
 
-        # 3. 이전 레이어 selection이 현재 점수 조절
+        # 3. Top-down: 문맥 기반 게이트
+        gate = torch.sigmoid(self.gate_proj(context))  # [B, S, n_neurons]
+
+        # 4. 결합: gated scores
+        scores = token_scores * gate  # [B, S, n_neurons]
+
+        # 5. Lateral: 이전 레이어 selection이 현재 점수 조절
         if self.has_connection and prev_selection is not None:
             influence = self.connection(prev_selection)  # [B, S, n_neurons]
             scores = scores + influence
 
-        # 4. top-k 선택
+        # 6. Top-k 선택
         topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)
         topk_weights = F.softmax(topk_scores, dim=-1)
 
-        # 5. 선택된 뉴런 조합
+        # 7. 선택된 뉴런 조합
         selected = self.neurons[topk_idx]
         output = torch.sum(topk_weights.unsqueeze(-1) * selected, dim=2)
 
-        # 6. 다음 레이어로 전달할 selection (soft version)
+        # 8. 다음 레이어로 전달할 selection (soft version)
         selection_out = torch.zeros(B, S, self.n_neurons, device=x.device)
         selection_out.scatter_(-1, topk_idx, topk_weights)
 
@@ -169,11 +175,11 @@ class Layer(nn.Module):
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
-    __version__ = "2.1"  # 버전 관리
+    __version__ = "3.0"  # 버전 관리
     # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
     # v2.0: Unified NeuronRouter (no connections)
     # v2.1: NeuronRouter with inter-layer connections
-    # v3.0: NeuronRouter with gating mechanism (planned)
+    # v3.0: NeuronRouter with bottom-up/top-down gating
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=256, n_patterns=128, neuron_k=8, pattern_k=16,
