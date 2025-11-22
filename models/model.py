@@ -10,7 +10,8 @@ import math
 class NeuronRouter(nn.Module):
     """문맥 기반 뉴런 라우팅"""
 
-    def __init__(self, n_neurons=256, d_model=256, n_heads=4, k=8):
+    def __init__(self, n_neurons=256, d_model=256, n_heads=4, k=8,
+                 prev_n_neurons=None):
         super().__init__()
         self.n_neurons = n_neurons
         self.d_model = d_model
@@ -29,7 +30,13 @@ class NeuronRouter(nn.Module):
         # 뉴런 선택용
         self.select_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x, mask=None):
+        # 이전 레이어와의 connection (있으면)
+        self.has_connection = prev_n_neurons is not None
+        if self.has_connection:
+            self.connection = nn.Linear(prev_n_neurons, n_neurons, bias=False)
+            nn.init.zeros_(self.connection.weight)  # 처음엔 영향 없게
+
+    def forward(self, x, mask=None, prev_selection=None):
         B, S, D = x.shape
 
         # 1. cross-token attention (문맥 수집)
@@ -43,21 +50,31 @@ class NeuronRouter(nn.Module):
             attn = attn.masked_fill(mask == 0, float('-inf'))
 
         attn = F.softmax(attn, dim=-1)
-        context = torch.matmul(attn, v)  # [B, n_heads, S, d_head]
+        context = torch.matmul(attn, v)
         context = context.transpose(1, 2).contiguous().view(B, S, D)
 
-        # 2. 문맥 기반 뉴런 선택
-        select_q = self.select_proj(context)  # [B, S, D]
+        # 2. 문맥 기반 뉴런 점수
+        select_q = self.select_proj(context)
         scores = torch.matmul(select_q, self.neurons.T)  # [B, S, n_neurons]
 
+        # 3. 이전 레이어 selection이 현재 점수 조절
+        if self.has_connection and prev_selection is not None:
+            influence = self.connection(prev_selection)  # [B, S, n_neurons]
+            scores = scores + influence
+
+        # 4. top-k 선택
         topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)
         topk_weights = F.softmax(topk_scores, dim=-1)
 
-        # 3. 선택된 뉴런 조합
-        selected = self.neurons[topk_idx]  # [B, S, k, D]
+        # 5. 선택된 뉴런 조합
+        selected = self.neurons[topk_idx]
         output = torch.sum(topk_weights.unsqueeze(-1) * selected, dim=2)
 
-        return output, topk_idx, topk_weights
+        # 6. 다음 레이어로 전달할 selection (soft version)
+        selection_out = torch.zeros(B, S, self.n_neurons, device=x.device)
+        selection_out.scatter_(-1, topk_idx, topk_weights)
+
+        return output, topk_idx, topk_weights, selection_out
 
 
 # ============================================
@@ -113,19 +130,23 @@ class Layer(nn.Module):
     """단일 레이어"""
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
-                 n_neurons=256, n_patterns=128, neuron_k=8, pattern_k=16):
+                 n_neurons=256, n_patterns=128, neuron_k=8, pattern_k=16,
+                 prev_n_neurons=None):
         super().__init__()
 
-        self.router = NeuronRouter(n_neurons, d_model, n_heads, neuron_k)
+        self.router = NeuronRouter(n_neurons, d_model, n_heads, neuron_k,
+                                   prev_n_neurons=prev_n_neurons)
         self.ffn = PatternFFN(d_model, d_ff, n_patterns, pattern_k)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, x, mask=None, return_details=False):
-        # 1. 뉴런 라우팅 (문맥 기반)
+    def forward(self, x, mask=None, prev_selection=None, return_details=False):
+        # 1. 뉴런 라우팅 (문맥 기반 + 이전 레이어 영향)
         normed = self.norm1(x)
-        router_out, topk_idx, topk_weights = self.router(normed, mask)
+        router_out, topk_idx, topk_weights, selection_out = self.router(
+            normed, mask, prev_selection
+        )
         x = x + router_out
 
         # 2. 패턴 FFN
@@ -138,8 +159,8 @@ class Layer(nn.Module):
         x = x + ffn_out
 
         if return_details:
-            return x, topk_idx, pattern_weights
-        return x, topk_idx
+            return x, topk_idx, pattern_weights, selection_out
+        return x, topk_idx, selection_out
 
 
 # ============================================
@@ -172,17 +193,21 @@ class DAWN(nn.Module):
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.n_layers = n_layers
+        self.n_neurons = n_neurons
 
         # Embedding
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.dropout = nn.Dropout(dropout)
 
-        # Layers
-        self.layers = nn.ModuleList([
-            Layer(d_model, d_ff, n_heads, n_neurons, n_patterns, neuron_k, pattern_k)
-            for _ in range(n_layers)
-        ])
+        # Layers (with connection)
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            prev_n = n_neurons if i > 0 else None  # 첫 레이어는 connection 없음
+            self.layers.append(
+                Layer(d_model, d_ff, n_heads, n_neurons, n_patterns,
+                      neuron_k, pattern_k, prev_n_neurons=prev_n)
+            )
 
         # Output
         self.norm = nn.LayerNorm(d_model)
@@ -218,16 +243,24 @@ class DAWN(nn.Module):
         mask = torch.tril(torch.ones(S, S, device=input_ids.device))
         mask = mask.unsqueeze(0).unsqueeze(0)
 
-        # Layers
+        # Layers (with connection propagation)
         all_selected = []
         all_patterns = []
+        prev_selection = None
+
         for layer in self.layers:
             if return_activations:
-                x, selected_idx, pattern_weights = layer(x, mask, return_details=True)
+                x, selected_idx, pattern_weights, selection_out = layer(
+                    x, mask, prev_selection, return_details=True
+                )
                 all_selected.append(selected_idx)
                 all_patterns.append(pattern_weights)
             else:
-                x, selected_idx = layer(x, mask, return_details=False)
+                x, selected_idx, selection_out = layer(
+                    x, mask, prev_selection, return_details=False
+                )
+
+            prev_selection = selection_out  # 다음 레이어로 전달
 
         # Output
         x = self.norm(x)
@@ -253,6 +286,21 @@ class DAWN(nn.Module):
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
         return input_ids
+
+    def get_connection_stats(self):
+        """레이어 간 connection 분석"""
+        stats = {}
+        for i, layer in enumerate(self.layers):
+            if layer.router.has_connection:
+                weight = layer.router.connection.weight.data
+                stats[f'layer_{i}'] = {
+                    'mean': weight.mean().item(),
+                    'std': weight.std().item(),
+                    'max': weight.max().item(),
+                    'min': weight.min().item(),
+                    'sparsity': (weight.abs() < 0.01).float().mean().item()
+                }
+        return stats
 
 
 # ============================================
@@ -314,6 +362,12 @@ class DAWNTrainer:
             }
 
         return analysis
+
+    def analyze_connections(self):
+        """레이어 간 connection 분석"""
+        if hasattr(self.model, '_orig_mod'):
+            return self.model._orig_mod.get_connection_stats()
+        return self.model.get_connection_stats()
 
 
 # ============================================

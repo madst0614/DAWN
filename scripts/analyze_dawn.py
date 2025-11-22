@@ -868,6 +868,105 @@ def analyze_position_patterns(collector, n_layers, max_positions=128):
     return results
 
 
+def visualize_connections(model, output_dir):
+    """레이어 간 connection 행렬 시각화"""
+    print("\n=== Visualizing Connection Matrices ===")
+
+    output_dir = Path(output_dir)
+    conn_dir = output_dir / 'connections'
+    conn_dir.mkdir(exist_ok=True)
+
+    for i, layer in enumerate(model.layers):
+        if layer.router.has_connection:
+            weight = layer.router.connection.weight.data.cpu().numpy()
+
+            plt.figure(figsize=(12, 10))
+            im = plt.imshow(weight, cmap='RdBu', vmin=-0.1, vmax=0.1, aspect='auto')
+            plt.title(f'Layer {i-1} → Layer {i} Connection Weights', fontsize=14, fontweight='bold')
+            plt.xlabel(f'Layer {i-1} Neurons', fontsize=12)
+            plt.ylabel(f'Layer {i} Neurons', fontsize=12)
+            plt.colorbar(im, label='Connection Weight')
+
+            # 통계 정보 추가
+            stats_text = f'Mean: {weight.mean():.4f}\nStd: {weight.std():.4f}\n'
+            stats_text += f'Max: {weight.max():.4f}\nMin: {weight.min():.4f}'
+            plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+            plt.tight_layout()
+            plt.savefig(conn_dir / f'connection_layer_{i-1}_to_{i}.png', dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"  Saved: connection_layer_{i-1}_to_{i}.png")
+
+
+def analyze_connection_patterns(model, collector, n_layers, output_dir):
+    """실제 활성화에서 connection 효과 분석"""
+    print("\n=== Analyzing Connection Effects ===")
+
+    results = {}
+
+    for layer_idx in range(1, n_layers):  # Skip first layer (no connection)
+        layer = model.layers[layer_idx]
+        if not layer.router.has_connection:
+            continue
+
+        # 이전 레이어와 현재 레이어의 선택 패턴
+        prev_selected = collector.neuron_selections[layer_idx - 1]  # [N, S, k]
+        curr_selected = collector.neuron_selections[layer_idx]  # [N, S, k]
+
+        # Connection weight 가져오기
+        weight = layer.router.connection.weight.data.cpu()  # [n_neurons, prev_n_neurons]
+
+        # 각 현재 뉴런에 대해, 가장 강하게 연결된 이전 뉴런 찾기
+        strong_connections = []
+        for curr_neuron in range(weight.shape[0]):
+            top_weights, top_prev_neurons = torch.topk(weight[curr_neuron].abs(), k=5)
+            if top_weights[0] > 0.01:  # 의미있는 연결만
+                strong_connections.append({
+                    'current': curr_neuron,
+                    'previous': top_prev_neurons.tolist(),
+                    'weights': top_weights.tolist()
+                })
+
+        # 실제로 함께 활성화되는 패턴 찾기
+        co_activation = torch.zeros(weight.shape[0], weight.shape[1])  # [curr, prev]
+
+        for batch_idx in range(prev_selected.shape[0]):
+            for seq_idx in range(prev_selected.shape[1]):
+                prev_neurons = prev_selected[batch_idx, seq_idx].cpu()  # [k]
+                curr_neurons = curr_selected[batch_idx, seq_idx].cpu()  # [k]
+
+                for cn in curr_neurons:
+                    for pn in prev_neurons:
+                        co_activation[cn, pn] += 1
+
+        # Normalize
+        co_activation = co_activation / (prev_selected.shape[0] * prev_selected.shape[1])
+
+        # Connection weight와 co-activation 상관관계
+        weight_flat = weight.abs().flatten()
+        coact_flat = co_activation.flatten()
+        correlation = torch.corrcoef(torch.stack([weight_flat, coact_flat]))[0, 1].item()
+
+        results[f'layer_{layer_idx}'] = {
+            'num_strong_connections': len(strong_connections),
+            'weight_coactivation_corr': correlation,
+            'strong_connections': strong_connections[:10]  # Top 10만 저장
+        }
+
+        print(f"\n  Layer {layer_idx}:")
+        print(f"    Strong connections (>0.01): {len(strong_connections)}")
+        print(f"    Weight-CoActivation correlation: {correlation:.4f}")
+
+        if abs(correlation) > 0.3:
+            print(f"    ✓ Connection weights align with actual activation patterns!")
+        elif abs(correlation) < 0.1:
+            print(f"    ⚠️  Connection weights don't match activation patterns")
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze DAWN checkpoint')
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -986,6 +1085,11 @@ def main():
     confidence_results = analyze_selection_confidence(collector, n_layers)
     position_pattern_results = analyze_position_patterns(collector, n_layers)
 
+    # 🔗 Connection 분석
+    visualize_connections(model, output_dir)
+    connection_pattern_results = analyze_connection_patterns(model, collector, n_layers, output_dir)
+    connection_stats = model.get_connection_stats()
+
     all_results = {
         'neuron_usage': neuron_usage_results,
         'token_neuron_specialization': token_spec_results,
@@ -996,6 +1100,8 @@ def main():
         'neuron_pattern_correlation': neuron_pattern_corr_results,  # ⭐ NEW
         'selection_confidence': confidence_results,  # ⭐ NEW
         'position_patterns': position_pattern_results,  # ⭐ NEW
+        'connection_patterns': connection_pattern_results,  # 🔗 NEW
+        'connection_stats': connection_stats,  # 🔗 NEW
     }
 
     # 저장
@@ -1019,6 +1125,7 @@ def main():
     print("  - neuron_usage_distribution.png")
     print("  - layer_statistics.png")
     print("  - neuron_heatmap.png")
+    print("  - connections/ (connection matrices)")
 
 
 if __name__ == "__main__":
