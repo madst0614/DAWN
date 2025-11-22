@@ -67,39 +67,50 @@ class ActivationCollector:
         self.incorrect_selections = [[] for _ in range(n_layers)]
 
     def collect(self, input_ids, labels, logits, all_selected, all_patterns=None):
-        """한 배치의 선택 패턴 수집 (확장)"""
+        """한 배치의 선택 패턴 수집 (최적화)"""
         B, S = input_ids.shape
 
         # 예측 정확도
         predictions = logits.argmax(dim=-1)  # [B, S]
         correct_mask = (predictions == labels) & (labels != -100)  # [B, S]
 
+        # CPU로 한 번에 이동 (매 루프마다 하지 않고)
+        input_ids_cpu = input_ids.cpu()
+
         for layer_idx, selected_idx in enumerate(all_selected):
             # selected_idx: [B, S, k]
 
-            # 1. 전체 뉴런 선택 기록
-            self.neuron_selections[layer_idx].append(selected_idx.cpu())
+            # CPU로 한 번에 이동
+            selected_cpu = selected_idx.cpu()
 
-            # 2. 패턴 선택 기록 ⭐ NEW
+            # 1. 전체 뉴런 선택 기록
+            self.neuron_selections[layer_idx].append(selected_cpu)
+
+            # 2. 패턴 선택 기록
             if all_patterns is not None:
                 pattern_weights = all_patterns[layer_idx]  # [B, S, n_patterns]
                 self.pattern_selections[layer_idx].append(pattern_weights.cpu())
 
-            # 3. 토큰별 + 위치별 뉴런 선택
-            for b in range(B):
-                for s in range(S):
-                    token_id = input_ids[b, s].item()
-                    neurons = selected_idx[b, s].cpu().tolist()
+            # 3. 토큰별 + 위치별 뉴런 선택 (vectorized)
+            # Flatten: [B, S, k] → [B*S, k]
+            selected_flat = selected_cpu.reshape(-1, selected_cpu.shape[-1])  # [B*S, k]
+            tokens_flat = input_ids_cpu.reshape(-1)  # [B*S]
 
-                    # 토큰별
-                    self.token_neuron_map[token_id][layer_idx].extend(neurons)
+            # 토큰별: 각 unique token에 대해 뉴런 수집
+            for token_id in tokens_flat.unique().tolist():
+                mask = tokens_flat == token_id
+                neurons = selected_flat[mask].reshape(-1).tolist()
+                self.token_neuron_map[token_id][layer_idx].extend(neurons)
 
-                    # 위치별 ⭐ NEW
-                    self.position_neuron_map[s][layer_idx].extend(neurons)
+            # 위치별: 각 위치에 대해 뉴런 수집
+            for s in range(S):
+                # 모든 배치의 s번째 위치
+                neurons = selected_cpu[:, s, :].reshape(-1).tolist()
+                self.position_neuron_map[s][layer_idx].extend(neurons)
 
             # 4. 정확도별 뉴런 선택
-            correct_neurons = selected_idx[correct_mask].cpu()
-            incorrect_neurons = selected_idx[~correct_mask].cpu()
+            correct_neurons = selected_cpu[correct_mask.cpu()]
+            incorrect_neurons = selected_cpu[~correct_mask.cpu()]
 
             if len(correct_neurons) > 0:
                 self.correct_selections[layer_idx].append(correct_neurons)
