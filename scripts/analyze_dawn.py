@@ -157,6 +157,18 @@ def analyze_neuron_usage(collector, n_neurons, n_layers):
         print(f"  Top-10 neurons: {top_10_ratio:.2%}")
         print(f"  Top-50 neurons: {top_50_ratio:.2%}")
 
+        # ⚠️ 경고 시스템
+        warnings = []
+        if usage_ratio < 0.2:
+            warnings.append(f"⚠️  SPARSE: Only {usage_ratio:.1%} neurons used - potential bottleneck!")
+        if gini > 0.8:
+            warnings.append(f"⚠️  UNEQUAL: Gini={gini:.2f} - heavily concentrated usage!")
+        if top_10_ratio > 0.5:
+            warnings.append(f"⚠️  DOMINATED: Top-10 neurons = {top_10_ratio:.1%} of usage!")
+
+        for warning in warnings:
+            print(f"  {warning}")
+
         results[f'layer_{layer_idx}'] = {
             'neuron_counts': neuron_counts.tolist(),
             'neuron_freq': neuron_freq.tolist(),
@@ -293,15 +305,37 @@ def analyze_uncertainty_accuracy(collector, n_layers):
         correct_unique = len(torch.unique(correct_sel))
         incorrect_unique = len(torch.unique(incorrect_sel))
 
+        # 중복 뉴런 (정답과 오답 모두 사용)
+        correct_neurons_set = set(torch.unique(correct_sel).tolist())
+        incorrect_neurons_set = set(torch.unique(incorrect_sel).tolist())
+        overlap = correct_neurons_set & incorrect_neurons_set
+        overlap_ratio = len(overlap) / len(correct_neurons_set | incorrect_neurons_set)
+
+        # 뉴런 다양성 (평균 유니크 뉴런 수)
+        correct_diversity = correct_unique / len(correct_sel) if len(correct_sel) > 0 else 0
+        incorrect_diversity = incorrect_unique / len(incorrect_sel) if len(incorrect_sel) > 0 else 0
+
         print(f"\nLayer {layer_idx}:")
         print(f"  Correct: {len(correct_sel):,} samples, {correct_unique} unique neurons")
         print(f"  Incorrect: {len(incorrect_sel):,} samples, {incorrect_unique} unique neurons")
+        print(f"  Overlap: {len(overlap)} neurons ({overlap_ratio:.2%})")
+        print(f"  Diversity: Correct={correct_diversity:.4f}, Incorrect={incorrect_diversity:.4f}")
+
+        # ⚠️ 불확실성 신호 체크
+        if overlap_ratio > 0.9:
+            print(f"  ⚠️  WEAK SIGNAL: {overlap_ratio:.1%} overlap - can't distinguish correct/incorrect!")
+        elif abs(correct_unique - incorrect_unique) / max(correct_unique, incorrect_unique) < 0.1:
+            print(f"  ⚠️  SIMILAR PATTERNS: Correct and incorrect use similar neurons!")
 
         results[f'layer_{layer_idx}'] = {
             'correct_samples': len(correct_sel),
             'incorrect_samples': len(incorrect_sel),
             'correct_unique_neurons': int(correct_unique),
             'incorrect_unique_neurons': int(incorrect_unique),
+            'overlap_neurons': len(overlap),
+            'overlap_ratio': float(overlap_ratio),
+            'correct_diversity': float(correct_diversity),
+            'incorrect_diversity': float(incorrect_diversity),
         }
 
     return results
@@ -338,6 +372,7 @@ def visualize_results(neuron_usage_results, output_dir):
 
     plt.tight_layout()
     plt.savefig(output_dir / 'neuron_usage_distribution.png', dpi=150, bbox_inches='tight')
+    plt.show()  # Colab에서 바로 표시
     plt.close()
     print("  ✓ neuron_usage_distribution.png")
 
@@ -370,6 +405,7 @@ def visualize_results(neuron_usage_results, output_dir):
 
     plt.tight_layout()
     plt.savefig(output_dir / 'layer_statistics.png', dpi=150, bbox_inches='tight')
+    plt.show()  # Colab에서 바로 표시
     plt.close()
     print("  ✓ layer_statistics.png")
 
@@ -393,6 +429,7 @@ def visualize_results(neuron_usage_results, output_dir):
 
     plt.tight_layout()
     plt.savefig(output_dir / 'neuron_heatmap.png', dpi=150, bbox_inches='tight')
+    plt.show()  # Colab에서 바로 표시
     plt.close()
     print("  ✓ neuron_heatmap.png")
 
@@ -467,8 +504,51 @@ def generate_report(all_results, output_dir, checkpoint_path):
         uncertainty = all_results['uncertainty_accuracy']
         for layer_key in sorted(uncertainty.keys()):
             layer_data = uncertainty[layer_key]
-            f.write(f"\n{layer_key}: Correct={layer_data['correct_unique_neurons']} neurons, "
-                   f"Incorrect={layer_data['incorrect_unique_neurons']} neurons\n")
+            f.write(f"\n{layer_key}:\n")
+            f.write(f"  Correct: {layer_data['correct_unique_neurons']} neurons\n")
+            f.write(f"  Incorrect: {layer_data['incorrect_unique_neurons']} neurons\n")
+            f.write(f"  Overlap: {layer_data['overlap_neurons']} ({layer_data['overlap_ratio']:.2%})\n")
+            f.write(f"  Diversity: Correct={layer_data['correct_diversity']:.4f}, "
+                   f"Incorrect={layer_data['incorrect_diversity']:.4f}\n")
+
+        # 5. 권장사항
+        f.write("\n\n5. RECOMMENDATIONS\n")
+        f.write("-" * 80 + "\n\n")
+
+        recommendations = []
+
+        # 뉴런 희소성 체크
+        neuron_results = all_results['neuron_usage']
+        for layer_key in sorted(neuron_results.keys()):
+            layer_data = neuron_results[layer_key]
+            if layer_data['usage_ratio'] < 0.2:
+                recommendations.append(
+                    f"⚠️  {layer_key}: Only {layer_data['usage_ratio']:.1%} neurons used\n"
+                    f"   → Consider increasing n_neurons (currently {layer_data['total_neurons']})\n"
+                    f"   → Or reducing k (top-k selection parameter)"
+                )
+            if layer_data['gini_coefficient'] > 0.8:
+                recommendations.append(
+                    f"⚠️  {layer_key}: High inequality (Gini={layer_data['gini_coefficient']:.2f})\n"
+                    f"   → Few neurons dominate - may need better initialization\n"
+                    f"   → Or add regularization to encourage uniform usage"
+                )
+
+        # 불확실성 신호 체크
+        for layer_key in sorted(uncertainty.keys()):
+            layer_data = uncertainty[layer_key]
+            if layer_data['overlap_ratio'] > 0.9:
+                recommendations.append(
+                    f"⚠️  {layer_key}: Weak uncertainty signal (overlap={layer_data['overlap_ratio']:.1%})\n"
+                    f"   → Model can't distinguish correct/incorrect predictions\n"
+                    f"   → May need more training or larger model capacity"
+                )
+
+        if recommendations:
+            for i, rec in enumerate(recommendations, 1):
+                f.write(f"{i}. {rec}\n\n")
+        else:
+            f.write("✓ No critical issues detected!\n")
 
         f.write("\n" + "=" * 80 + "\n")
 
