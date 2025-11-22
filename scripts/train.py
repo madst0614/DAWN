@@ -239,12 +239,12 @@ def analyze_activations(model, input_ids, device):
         # selected_idx: [B, S, k]
         unique_neurons = torch.unique(selected_idx).numel()
 
-        # Get total neurons from model
+        # Get total neurons from model (updated for NeuronRouter)
         if hasattr(model, '_orig_mod'):
             # Compiled model
-            total_neurons = model._orig_mod.layers[layer_idx].attention.neuron_pool.n_neurons
+            total_neurons = model._orig_mod.layers[layer_idx].router.n_neurons
         else:
-            total_neurons = model.layers[layer_idx].attention.neuron_pool.n_neurons
+            total_neurons = model.layers[layer_idx].router.n_neurons
 
         usage_ratio = unique_neurons / total_neurons
 
