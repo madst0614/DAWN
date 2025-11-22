@@ -1,14 +1,20 @@
 """
-DAWN (Dynamic Architecture With Neurons) 종합 분석 스크립트
+DAWN Checkpoint Comprehensive Analysis
+체크포인트 상세 분석 스크립트
 
-학습된 DAWN 모델의 상세 분석:
-- 레이어별 특성 분석
-- 성능 breakdown
-- 예측 분포 분석
+분석 항목:
+1. 활성화 패턴 분석 (희소성, 뉴런 사용률)
+2. 뉴런 특화도 분석 (Dead neurons, 균등 사용)
+3. Attention Weights 분석 (거리, 패턴)
+4. 레이어별 표현 변화 (Norm, 유사도)
+5. 패턴 템플릿 분석 (학습된 패턴)
+6. Rank 효율성 분석 (Low-rank 효과)
+7. 학습 곡선 분석 (추세, 예측)
+8. 토큰 예측 품질 (잘/못 맞추는 토큰)
+9. 시각화 종합
 
 Usage:
-    python scripts/analyze_dawn.py --checkpoint path/to/checkpoint.pt
-    python scripts/analyze_dawn.py --checkpoint path/to/checkpoint.pt --output results.json
+    python scripts/analyze_dawn.py --checkpoint path/to/checkpoint.pt --data path/to/data
 """
 
 import sys
@@ -23,1277 +29,844 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import json
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 import argparse
 from tqdm import tqdm
-from collections import Counter, defaultdict
-from datetime import datetime
+import re
+from scipy import stats
 
-from models.model import HierarchicalLanguageModel
-from utils.training import CheckpointManager
-from utils.data import apply_mlm_masking, compute_mlm_accuracy
-
-
-# ============================================================
-# Data Loading
-# ============================================================
-
-def load_data_from_config(config_path, batch_size=64):
-    """Config에서 데이터 로드"""
-    import yaml
-    import pickle
-    from transformers import AutoTokenizer
-    from torch.utils.data import DataLoader, Dataset
-
-    # Load config
-    with open(config_path, 'r') as f:
-        cfg = yaml.safe_load(f)
-
-    data_cfg = cfg['data']
-    model_cfg = cfg['model']
-
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-
-    # Load validation texts
-    val_path = os.path.join(data_cfg['base_dir'], data_cfg['val_file'])
-    if not os.path.exists(val_path):
-        raise FileNotFoundError(f"Validation data not found: {val_path}")
-
-    with open(val_path, 'rb') as f:
-        val_texts = pickle.load(f)
-
-    # Simple dataset
-    class TextDataset(Dataset):
-        def __init__(self, texts, tokenizer, max_length):
-            self.texts = texts
-            self.tokenizer = tokenizer
-            self.max_length = max_length
-
-        def __len__(self):
-            return len(self.texts)
-
-        def __getitem__(self, idx):
-            encoding = self.tokenizer(
-                self.texts[idx],
-                truncation=True,
-                max_length=self.max_length,
-                padding='max_length',
-                return_tensors='pt'
-            )
-            return {
-                'input_ids': encoding['input_ids'].squeeze(0),
-                'attention_mask': encoding['attention_mask'].squeeze(0)
-            }
-
-    val_dataset = TextDataset(val_texts, tokenizer, model_cfg['max_seq_len'])
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=2)
-
-    return val_loader, tokenizer, cfg
+from models.model import DAWN
+from transformers import BertTokenizer
+from utils.data import CacheLoader, TextDataset, collate_fn_dynamic_padding, apply_mlm_masking
+from torch.utils.data import DataLoader
+from functools import partial
 
 
 # ============================================================
-# Model Loading
+# 1. 활성화 패턴 분석
 # ============================================================
 
-def load_checkpoint(checkpoint_path, device='cuda'):
-    """체크포인트에서 모델 로드"""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    checkpoint_dir = Path(checkpoint_path).parent
-
-    # Config 로드 (config.json 파일에서)
-    config_path = checkpoint_dir / 'config.json'
-    if config_path.exists():
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        print(f"Loaded config from: {config_path}")
-    else:
-        # 기본값 사용
-        print("Config file not found, using defaults")
-        config = {
-            'model': {
-                'd_model': 512,
-                'n_heads': 8,
-                'n_layers': 6,
-                'max_seq_len': 128,
-                'n_input': 128,
-                'n_process': 256,
-                'dropout': 0.1
-            }
-        }
-
-    # 가중치 로드
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    else:
-        state_dict = checkpoint
-
-    # vocab_size를 state_dict에서 추론 (token_embedding.weight shape)
-    vocab_size = 30522  # Default for bert-base-uncased
-    if 'token_embedding.weight' in state_dict:
-        vocab_size = state_dict['token_embedding.weight'].shape[0]
-        print(f"Inferred vocab_size from state_dict: {vocab_size}")
-
-    # config가 새 형식인지 확인
-    if 'model' in config:
-        model_cfg = config['model']
-    else:
-        # 구 형식 호환
-        model_cfg = config
-
-    # 모델 생성
-    model = HierarchicalLanguageModel(
-        vocab_size=vocab_size,
-        d_model=model_cfg.get('d_model', 512),
-        n_heads=model_cfg.get('n_heads', 8),
-        n_layers=model_cfg.get('n_layers', 6),
-        max_seq_len=model_cfg.get('max_seq_len', 128),
-        n_input=model_cfg.get('n_input', 128),
-        n_process=model_cfg.get('n_process', 256),
-        dropout=model_cfg.get('dropout', 0.1)
-    )
-
-    model.load_state_dict(state_dict)
-
-    model = model.to(device)
-    model.eval()
-
-    # 체크포인트 정보 출력
-    if 'epoch' in checkpoint:
-        print(f"Checkpoint epoch: {checkpoint['epoch']}")
-    if 'loss' in checkpoint:
-        print(f"Checkpoint loss: {checkpoint['loss']:.4f}")
-    if 'metrics' in checkpoint:
-        metrics = checkpoint['metrics']
-        if 'val_acc' in metrics:
-            print(f"Checkpoint val_acc: {metrics['val_acc']:.4f}")
-
-    return model, config
-
-
-# ============================================================
-# Analysis Functions
-# ============================================================
-
-def analyze_routing_patterns(model, val_loader, device, max_batches=50):
-    """Router 패턴 분석 - 각 레이어의 소프트 라우팅 통계"""
-    print("\n📊 Analyzing Routing Patterns...")
-
-    n_layers = len(model.layers)
-    n_input = model.layers[0].block.n_input
-
-    # Track soft weight accumulation per layer
-    layer_weight_sums = [torch.zeros(n_input, device=device) for _ in range(n_layers)]
-    layer_learned_params = [[] for _ in range(n_layers)]
-    total_samples = 0
-
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc="Routing analysis")):
-        if batch_idx >= max_batches:
-            break
-
-        input_ids = batch['input_ids'].to(device)
-        batch_size = input_ids.shape[0]
-        total_samples += batch_size
-
-        with torch.no_grad():
-            # Get embeddings
-            B, S = input_ids.shape
-            token_emb = model.token_embedding(input_ids)
-            positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = model.position_embedding(positions)
-            x = model.dropout(token_emb + pos_emb)
-
-            # Track routing through layers
-            for layer_idx, layer in enumerate(model.layers):
-                # Get router output (pure soft selection!)
-                weights, context, selection_info = layer.block.router(x)
-
-                # Accumulate soft weights
-                layer_weight_sums[layer_idx] += weights.sum(dim=0)
-
-                # Track learned parameters
-                layer_learned_params[layer_idx].append({
-                    'threshold': selection_info['learned_threshold'],
-                    'steepness': selection_info['learned_steepness'],
-                    'temperature': selection_info['temperature'],
-                    'effective_k': selection_info['effective_k'],
-                    'effective_k_ratio': selection_info['effective_k_ratio']
-                })
-
-                # Forward through layer for next iteration
-                x, _ = layer(x)
-
-    # Compute statistics
-    results = {
-        'n_layers': n_layers,
-        'n_input': n_input,
-        'total_samples': total_samples,
-        'layers': {}
-    }
-
-    for layer_idx in range(n_layers):
-        # Average soft weights
-        avg_weights = (layer_weight_sums[layer_idx] / total_samples).cpu().numpy()
-
-        # Average learned parameters
-        params = layer_learned_params[layer_idx]
-        avg_threshold = sum(p['threshold'] for p in params) / len(params)
-        avg_steepness = sum(p['steepness'] for p in params) / len(params)
-        avg_temperature = sum(p['temperature'] for p in params) / len(params)
-        avg_effective_k = sum(p['effective_k'] for p in params) / len(params)
-        avg_effective_k_ratio = sum(p['effective_k_ratio'] for p in params) / len(params)
-
-        results['layers'][layer_idx] = {
-            'mean_weight': float(avg_weights.mean()),
-            'std_weight': float(avg_weights.std()),
-            'min_weight': float(avg_weights.min()),
-            'max_weight': float(avg_weights.max()),
-            'low_weight_neurons': int((avg_weights < 0.001).sum()),
-            'top_5_neurons': avg_weights.argsort()[-5:][::-1].tolist(),
-            'learned_params': {
-                'threshold': avg_threshold,
-                'steepness': avg_steepness,
-                'temperature': avg_temperature,
-                'effective_k': avg_effective_k,
-                'effective_k_ratio': avg_effective_k_ratio
-            }
-        }
-
-    return results
-
-
-def analyze_neuron_usage(model, val_loader, device, max_batches=50):
-    """뉴런 사용 분포 분석 - Load balancing 확인"""
-    print("\n🧠 Analyzing Neuron Usage...")
-
-    n_layers = len(model.layers)
-    n_input = model.layers[0].block.n_input
-
-    # Accumulate routing weights per layer
-    layer_weights = [torch.zeros(n_input, device=device) for _ in range(n_layers)]
-    total_samples = 0
-
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc="Usage analysis")):
-        if batch_idx >= max_batches:
-            break
-
-        input_ids = batch['input_ids'].to(device)
-        batch_size = input_ids.shape[0]
-        total_samples += batch_size
-
-        with torch.no_grad():
-            B, S = input_ids.shape
-            token_emb = model.token_embedding(input_ids)
-            positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = model.position_embedding(positions)
-            x = model.dropout(token_emb + pos_emb)
-
-            for layer_idx, layer in enumerate(model.layers):
-                weights, _, _ = layer.block.router(x)
-
-                # Accumulate weights
-                layer_weights[layer_idx] += weights.sum(dim=0)
-
-                x, _ = layer(x)
-
-    results = {'layers': {}}
-
-    for layer_idx in range(n_layers):
-        weights = layer_weights[layer_idx].cpu().numpy()
-        weights = weights / total_samples  # Normalize
-
-        # Compute Gini coefficient for load balance
-        sorted_weights = np.sort(weights)
-        n = len(sorted_weights)
-        cumsum = np.cumsum(sorted_weights)
-        gini = (2 * np.sum((np.arange(1, n+1) * sorted_weights))) / (n * np.sum(sorted_weights)) - (n + 1) / n
-
-        results['layers'][layer_idx] = {
-            'mean_weight': float(weights.mean()),
-            'std_weight': float(weights.std()),
-            'gini_coefficient': float(gini),
-            'load_balance_score': float(1 - abs(gini))  # 1 = perfectly balanced
-        }
-
-    return results
-
-
-def analyze_neuron_specialization(model, val_loader, tokenizer, device, max_batches=100, layer_idx=3):
+def analyze_activation_patterns(model, dataloader, num_batches=10):
     """
-    뉴런 특화 분석 - PMI 기반, GPU 최적화 버전
-
-    개선점:
-    - PMI (Pointwise Mutual Information) 사용으로 frequent token bias 제거
-    - 모든 tokens 고려 (not just first 10)
-    - GPU 텐서 연산으로 벡터화 (100x faster!)
-    - 특정 layer 분석 (default: layer 3)
-
-    Args:
-        layer_idx: 분석할 layer (기본값: 3, middle layer)
+    활성화 패턴 상세 분석
+    - Sparsity (희소성)
+    - 뉴런별 사용률
+    - 레이어별 통계
     """
-    print(f"\n💎 Analyzing Neuron Specialization (Layer {layer_idx}, PMI-based, GPU-accelerated)...")
+    all_layer_stats = []
 
-    n_input = model.layers[layer_idx].block.n_input
-    vocab_size = tokenizer.vocab_size
+    print("\n" + "="*70)
+    print("1. ACTIVATION PATTERN ANALYSIS")
+    print("="*70)
 
-    # Initialize GPU tensors for counting
-    # [n_input, vocab_size] - neuron-token co-occurrence counts
-    neuron_token_counts = torch.zeros(n_input, vocab_size, dtype=torch.float32, device=device)
-    # [vocab_size] - global token frequency
-    global_token_counts = torch.zeros(vocab_size, dtype=torch.float32, device=device)
-    # [n_input] - neuron activation counts
-    neuron_activation_counts = torch.zeros(n_input, dtype=torch.float32, device=device)
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Analyzing activations")):
+            if batch_idx >= num_batches:
+                break
+
+            input_ids = batch['input_ids'].cuda()
+            logits, all_activations = model(input_ids, return_activations=True)
+
+            for layer_idx, acts in enumerate(all_activations):
+                input_acts = acts['input_activations']  # [B, S, N_in]
+                relational_acts = acts['relational_activations']
+                enriched_acts = acts['enriched_activations']
+                process_acts = acts['process_activations']  # [B, S, N_proc]
+
+                stats_dict = {
+                    'layer': layer_idx,
+                    'batch': batch_idx,
+
+                    # InputNeurons
+                    'input_mean': input_acts.mean().item(),
+                    'input_std': input_acts.std().item(),
+                    'input_sparsity_01': (input_acts < 0.1).float().mean().item(),
+                    'input_sparsity_05': (input_acts < 0.5).float().mean().item(),
+                    'input_active_05': (input_acts > 0.5).float().mean().item(),
+                    'input_active_08': (input_acts > 0.8).float().mean().item(),
+
+                    # Relational
+                    'relational_mean': relational_acts.mean().item(),
+                    'relational_std': relational_acts.std().item(),
+
+                    # ProcessNeurons
+                    'process_mean': process_acts.mean().item(),
+                    'process_std': process_acts.std().item(),
+                    'process_sparsity_01': (process_acts < 0.1).float().mean().item(),
+                    'process_sparsity_05': (process_acts < 0.5).float().mean().item(),
+                    'process_active_05': (process_acts > 0.5).float().mean().item(),
+                    'process_active_08': (process_acts > 0.8).float().mean().item(),
+                }
+
+                all_layer_stats.append(stats_dict)
+
+    # DataFrame으로 변환
+    df = pd.DataFrame(all_layer_stats)
+
+    # 레이어별 평균
+    layer_summary = df.groupby('layer').mean()
+
+    print("\nInputNeurons (per layer):")
+    print(layer_summary[['input_mean', 'input_std', 'input_active_05', 'input_active_08']])
+
+    print("\nProcessNeurons (per layer):")
+    print(layer_summary[['process_mean', 'process_std', 'process_active_05', 'process_active_08']])
+
+    print("\nSparsity (per layer):")
+    print(layer_summary[['input_sparsity_01', 'process_sparsity_01']])
+
+    return df, layer_summary
+
+
+# ============================================================
+# 2. 뉴런 특화도 분석
+# ============================================================
+
+def analyze_neuron_specialization(model, dataloader, num_batches=50):
+    """
+    뉴런별 활성화율 분석
+    - 각 뉴런이 얼마나 자주 활성화?
+    - Dead neurons?
+    - 균등하게 사용?
+    """
+    print("\n" + "="*70)
+    print("2. NEURON SPECIALIZATION ANALYSIS")
+    print("="*70)
+
+    num_layers = len(model.layers)
+    num_input = 64
+    num_process = 128
+
+    # 뉴런별 활성화 누적
+    input_neuron_acts = [torch.zeros(num_input).cuda() for _ in range(num_layers)]
+    process_neuron_acts = [torch.zeros(num_process).cuda() for _ in range(num_layers)]
 
     total_tokens = 0
 
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Specialization analysis (L{layer_idx})")):
-        if batch_idx >= max_batches:
-            break
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Analyzing neurons")):
+            if batch_idx >= num_batches:
+                break
 
-        input_ids = batch['input_ids'].to(device)
-
-        with torch.no_grad():
+            input_ids = batch['input_ids'].cuda()
             B, S = input_ids.shape
-            token_emb = model.token_embedding(input_ids)
-            positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = model.position_embedding(positions)
-            x = model.dropout(token_emb + pos_emb)
+            total_tokens += B * S
 
-            # Forward through layers up to target layer
-            for i in range(layer_idx):
-                x, _ = model.layers[i](x)
+            _, all_activations = model(input_ids, return_activations=True)
 
-            # Get routing for target layer
-            layer = model.layers[layer_idx]
-            weights, _, selection_info = layer.block.router(x)
+            for layer_idx, acts in enumerate(all_activations):
+                # [B, S, N] → 토큰별 활성화 (> 0.5) 평균
+                input_acts = acts['input_activations']
+                process_acts = acts['process_activations']
 
-            # Get top-k neurons based on soft weights (for analysis)
-            k_eff = int(selection_info['effective_k'])
-            _, top_indices = weights.topk(k_eff, dim=-1)  # [B, k_eff]
+                # 뉴런별 평균 활성화
+                input_active = (input_acts > 0.5).float().mean(dim=[0, 1])  # [N_in]
+                process_active = (process_acts > 0.5).float().mean(dim=[0, 1])  # [N_proc]
 
-            # Filter out special tokens (PAD=0, CLS=101, SEP=102) - GPU vectorized!
-            valid_mask = (input_ids != 0) & (input_ids != 101) & (input_ids != 102)  # [B, S]
+                input_neuron_acts[layer_idx] += input_active
+                process_neuron_acts[layer_idx] += process_active
 
-            # Count neuron activations (vectorized) - scatter_add on GPU!
-            flat_neurons = top_indices.view(-1)  # [B * k_eff]
-            neuron_activation_counts.scatter_add_(0, flat_neurons,
-                                                   torch.ones_like(flat_neurons, dtype=torch.float32))
+    # 평균
+    for layer_idx in range(num_layers):
+        input_neuron_acts[layer_idx] /= num_batches
+        process_neuron_acts[layer_idx] /= num_batches
 
-            # Count global token frequency (vectorized)
-            valid_tokens = input_ids[valid_mask]  # [num_valid_tokens]
-            global_token_counts.scatter_add_(0, valid_tokens,
-                                             torch.ones_like(valid_tokens, dtype=torch.float32))
-            total_tokens += valid_tokens.numel()
+    # 분석
+    for layer_idx in range(num_layers):
+        input_rates = input_neuron_acts[layer_idx].cpu().numpy()
+        process_rates = process_neuron_acts[layer_idx].cpu().numpy()
 
-            # Count neuron-token co-occurrence (GPU VECTORIZED! 🚀)
-            # Broadcasting magic: [B, k_eff] × [B, S] → [B, k_eff, S] → single scatter_add!
-            # This eliminates 8,960 kernel calls (B=128 × k_eff=70) → just 1 call!
+        print(f"\nLayer {layer_idx}:")
+        print(f"  InputNeurons (64):")
+        print(f"    Mean activation: {input_rates.mean():.4f}")
+        print(f"    Std: {input_rates.std():.4f}")
+        print(f"    Max: {input_rates.max():.4f}")
+        print(f"    Min: {input_rates.min():.4f}")
+        print(f"    Dead (< 0.01): {(input_rates < 0.01).sum()}/64")
+        print(f"    Underused (< 0.1): {(input_rates < 0.1).sum()}/64")
 
-            # Expand to [B, k_eff, S] for all combinations
-            neuron_indices = top_indices.unsqueeze(2).expand(B, k_eff, S)  # [B, k_eff, S]
-            token_indices = input_ids.unsqueeze(1).expand(B, k_eff, S)     # [B, k_eff, S]
-            valid_expanded = valid_mask.unsqueeze(1).expand(B, k_eff, S)   # [B, k_eff, S]
+        print(f"  ProcessNeurons (128):")
+        print(f"    Mean activation: {process_rates.mean():.4f}")
+        print(f"    Std: {process_rates.std():.4f}")
+        print(f"    Max: {process_rates.max():.4f}")
+        print(f"    Min: {process_rates.min():.4f}")
+        print(f"    Dead (< 0.01): {(process_rates < 0.01).sum()}/128")
+        print(f"    Underused (< 0.1): {(process_rates < 0.1).sum()}/128")
 
-            # Filter valid tokens only
-            valid_neurons = neuron_indices[valid_expanded]  # [total_valid]
-            valid_tokens = token_indices[valid_expanded]    # [total_valid]
-
-            # 2D index (neuron, token) → 1D: neuron * vocab_size + token
-            flat_indices = valid_neurons * vocab_size + valid_tokens  # [total_valid]
-
-            # Single scatter_add on flattened view! (100x faster!)
-            flat_counts = neuron_token_counts.view(-1)  # [n_input * vocab_size]
-            flat_counts.scatter_add_(
-                0, flat_indices,
-                torch.ones_like(flat_indices, dtype=torch.float32)
-            )
-            # neuron_token_counts is already updated in-place via view
-
-    # Compute PMI for each neuron (GPU vectorized!)
-    total_activations = neuron_activation_counts.sum()
-
-    # P(neuron) for all neurons: [n_input]
-    p_neuron = neuron_activation_counts / (total_activations + 1e-10)
-
-    # P(token) for all tokens: [vocab_size]
-    p_token = global_token_counts / (total_tokens + 1e-10)
-
-    # P(token, neuron) for all pairs: [n_input, vocab_size]
-    p_joint = neuron_token_counts / (total_tokens + 1e-10)
-
-    # PMI = log(P(token, neuron) / (P(token) * P(neuron)))
-    # Broadcasting: [n_input, vocab_size] / ([n_input, 1] * [1, vocab_size])
-    pmi_matrix = torch.log(
-        (p_joint + 1e-10) / (p_neuron.unsqueeze(1) * p_token.unsqueeze(0) + 1e-10)
-    )  # [n_input, vocab_size]
-
-    # Extract top specialized neurons
-    neuron_specializations = []
-
-    for neuron_idx in range(n_input):
-        if neuron_activation_counts[neuron_idx] < 10:
-            continue  # Skip rarely activated neurons
-
-        # Get PMI scores for this neuron - GPU tensor!
-        neuron_pmi = pmi_matrix[neuron_idx]  # [vocab_size]
-        neuron_counts = neuron_token_counts[neuron_idx]  # [vocab_size]
-
-        # Get top 10 tokens by PMI (GPU topk!)
-        top_pmi_values, top_token_ids = torch.topk(neuron_pmi, k=min(10, vocab_size))
-
-        # Convert to CPU for tokenizer decode
-        top_pmi_values = top_pmi_values.cpu().numpy()
-        top_token_ids = top_token_ids.cpu().numpy()
-        top_counts = neuron_counts[top_token_ids].cpu().numpy()
-
-        top_token_words = []
-        for i, (token_id, pmi_score, count) in enumerate(zip(top_token_ids, top_pmi_values, top_counts)):
-            if count < 1:  # Skip tokens with no co-occurrence
-                continue
-            try:
-                word = tokenizer.decode([int(token_id)])
-            except:
-                word = f"[{token_id}]"
-            top_token_words.append({
-                'token': word,
-                'pmi': float(pmi_score),
-                'raw_count': int(count)
-            })
-
-        if top_token_words:
-            # Compute specialization strength (avg PMI of top tokens)
-            avg_pmi = float(np.mean([t['pmi'] for t in top_token_words[:5]]))
-
-            neuron_specializations.append({
-                'neuron_idx': int(neuron_idx),
-                'specialization_strength': avg_pmi,
-                'top_tokens_pmi': top_token_words,
-                'activation_count': int(neuron_activation_counts[neuron_idx].item()),
-                'unique_tokens': int((neuron_counts > 0).sum().item())
-            })
-
-    # Sort by specialization strength
-    neuron_specializations.sort(key=lambda x: x['specialization_strength'], reverse=True)
-
-    results = {
-        'layer_idx': layer_idx,
-        'total_analyzed': len(neuron_specializations),
-        'avg_specialization': float(np.mean([n['specialization_strength'] for n in neuron_specializations])) if neuron_specializations else 0,
-        'specialized_neurons': neuron_specializations[:20],  # Top 20 most specialized
-        'total_tokens_analyzed': total_tokens
-    }
-
-    return results
+    return input_neuron_acts, process_neuron_acts
 
 
-def analyze_layer_differences(model, val_loader, device):
-    """레이어별 특성 분석"""
-    print("\n📈 Analyzing Layer Differences...")
+# ============================================================
+# 3. Attention Weights 분석
+# ============================================================
 
-    layer_outputs = defaultdict(list)
+def analyze_attention_patterns(model, dataloader, num_samples=5):
+    """
+    Attention weights 시각화
+    - 인접 토큰에 집중?
+    - 장거리 의존성?
+    - 레이어별 차이?
+    """
+    print("\n" + "="*70)
+    print("3. ATTENTION PATTERN ANALYSIS")
+    print("="*70)
 
-    for batch in tqdm(val_loader, desc="Layer analysis"):
-        input_ids = batch['input_ids'].to(device)
+    attention_patterns = []
 
-        with torch.no_grad():
-            # Embedding
-            B, S = input_ids.shape
-            token_emb = model.token_embedding(input_ids)
-            positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = model.position_embedding(positions)
-            x = model.dropout(token_emb + pos_emb)
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=num_samples, desc="Analyzing attention")):
+            if batch_idx >= num_samples:
+                break
 
-            # 각 레이어 통과
-            for layer_idx, layer in enumerate(model.layers):
-                x, _ = layer(x)
+            input_ids = batch['input_ids'][:1].cuda()  # 1개만
+            _, all_activations = model(input_ids, return_activations=True)
 
-                # 출력 통계
-                layer_outputs[layer_idx].append({
-                    'norm': x.norm().item(),
-                    'mean': x.mean().item(),
-                    'std': x.std().item()
+            for layer_idx, acts in enumerate(all_activations):
+                attn_weights = acts['attention_weights']  # [B=1, S, S]
+                attn_weights = attn_weights[0].cpu().numpy()  # [S, S]
+
+                attention_patterns.append({
+                    'layer': layer_idx,
+                    'sample': batch_idx,
+                    'weights': attn_weights
                 })
 
-    # 평균 계산
-    results = {'layers': {}}
+    # 평균 패턴 계산
+    for layer_idx in range(6):
+        layer_attn = [p['weights'] for p in attention_patterns if p['layer'] == layer_idx]
 
-    for layer_idx in range(len(model.layers)):
-        outputs = layer_outputs[layer_idx]
-        results['layers'][layer_idx] = {
-            'avg_norm': np.mean([o['norm'] for o in outputs]),
-            'avg_mean': np.mean([o['mean'] for o in outputs]),
-            'avg_std': np.mean([o['std'] for o in outputs])
-        }
+        if layer_attn:
+            # 평균 attention 거리
+            avg_attn = np.mean(layer_attn, axis=0)
+            seq_len = avg_attn.shape[0]
 
-    return results
+            # 각 토큰이 평균적으로 몇 칸 떨어진 토큰을 보는가?
+            distances = []
+            for i in range(seq_len):
+                if i > 0:  # causal이므로
+                    attn_dist = avg_attn[i, :i] * np.arange(1, i+1)[::-1]
+                    avg_distance = attn_dist.sum() if attn_dist.sum() > 0 else 0
+                    distances.append(avg_distance)
 
+            print(f"\nLayer {layer_idx}:")
+            print(f"  Average attention distance: {np.mean(distances):.2f} tokens")
+            print(f"  Max attention distance: {np.max(distances):.2f} tokens")
 
-def analyze_performance(model, val_loader, tokenizer, device):
-    """성능 세부 분석 - MLM masking 적용"""
-    print("\n🎯 Analyzing Performance...")
+            # 인접 토큰 집중도 (1-2 토큰 거리)
+            adjacent_focus = []
+            for i in range(1, seq_len):
+                if i >= 2:
+                    adjacent = avg_attn[i, i-2:i].sum()
+                    adjacent_focus.append(adjacent)
+            print(f"  Adjacent focus (1-2 tokens): {np.mean(adjacent_focus):.4f}")
 
-    all_losses = []
-    all_corrects = []
-
-    for batch in tqdm(val_loader, desc="Performance analysis"):
-        input_ids = batch['input_ids'].to(device)
-
-        # Apply MLM masking (CRITICAL FIX: 기존에는 labels = input_ids.clone()으로 순환 논리 발생)
-        masked_input_ids, labels = apply_mlm_masking(input_ids.clone(), tokenizer)
-
-        with torch.no_grad():
-            outputs = model(masked_input_ids, labels=labels)
-            logits = outputs['logits']
-
-            # Per-token loss (only on masked tokens)
-            loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
-            per_token_loss = loss_fct(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1)
-            )
-
-            # Accuracy using unified function
-            num_correct, num_valid = compute_mlm_accuracy(logits, labels)
-
-            # Collect per-token data (only valid tokens)
-            valid_mask = (labels.view(-1) != -100)
-            valid_losses = per_token_loss[valid_mask].cpu().tolist()
-
-            # Get per-token correctness for valid tokens only
-            preds = logits.argmax(dim=-1)
-            correct = ((preds == labels) & (labels != -100)).view(-1)
-            valid_corrects = correct[valid_mask].float().cpu().tolist()
-
-            all_losses.extend(valid_losses)
-            all_corrects.extend(valid_corrects)
-
-    losses = np.array(all_losses)
-    corrects = np.array(all_corrects)
-
-    # Percentile 분석
-    easy_threshold = np.percentile(losses, 25)
-    hard_threshold = np.percentile(losses, 75)
-
-    easy_mask = losses < easy_threshold
-    hard_mask = losses > hard_threshold
-
-    results = {
-        'overall_loss': float(np.mean(losses)),
-        'overall_acc': float(np.mean(corrects)),
-        'easy_samples_acc': float(np.mean(corrects[easy_mask])) if easy_mask.sum() > 0 else 0,
-        'hard_samples_acc': float(np.mean(corrects[hard_mask])) if hard_mask.sum() > 0 else 0,
-        'loss_percentiles': {
-            'p25': float(easy_threshold),
-            'p50': float(np.percentile(losses, 50)),
-            'p75': float(hard_threshold)
-        },
-        'total_valid_tokens': len(losses)
-    }
-
-    return results
-
-
-def analyze_aux_loss_components(model, val_loader, device):
-    """Aux loss 구성 요소 분석"""
-    print("\n⚖️  Analyzing Loss Components...")
-
-    total_main_loss = 0
-    total_load_balance = 0
-    total_entropy = 0
-    n_batches = 0
-
-    for batch in tqdm(val_loader, desc="Loss analysis"):
-        input_ids = batch['input_ids'].to(device)
-        labels = input_ids.clone()
-
-        with torch.no_grad():
-            outputs = model(input_ids, labels=labels)
-            main_loss = outputs['loss']
-            aux_loss = outputs['aux_loss']
-
-            total_main_loss += main_loss.item()
-            total_load_balance += aux_loss['load_balance'].item()
-            total_entropy += aux_loss['entropy'].item()
-            n_batches += 1
-
-    avg_aux = (total_load_balance + total_entropy) / (2 * n_batches)
-    avg_main = total_main_loss / n_batches
-
-    results = {
-        'avg_main_loss': avg_main,
-        'avg_load_balance': total_load_balance / n_batches,
-        'avg_entropy': total_entropy / n_batches,
-        'avg_aux_loss': avg_aux,
-        'aux_to_main_ratio': avg_aux / avg_main if avg_main > 0 else 0
-    }
-
-    return results
+    return attention_patterns
 
 
 # ============================================================
-# Advanced Analysis Functions
+# 4. 레이어별 표현 변화
 # ============================================================
 
-def analyze_weight_matrices(model):
+def analyze_layer_representations(model, dataloader, num_samples=10):
     """
-    Weight matrix 자체의 구조 분석
-    - Singular values (rank)
-    - Condition number (stability)
-    - Weight norm 분포
+    레이어별 hidden state 분석
+    - Norm 변화
+    - 코사인 유사도
+    - 정보 흐름
     """
-    print("\n📐 Analyzing Weight Matrices...")
+    print("\n" + "="*70)
+    print("4. LAYER REPRESENTATION ANALYSIS")
+    print("="*70)
 
-    results = {'layers': {}}
+    layer_norms = []
+    layer_similarities = []
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=num_samples, desc="Analyzing layers")):
+            if batch_idx >= num_samples:
+                break
+
+            input_ids = batch['input_ids'].cuda()
+
+            # 각 레이어 출력 저장
+            layer_outputs = []
+            x = model.token_embedding(input_ids)
+            positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+            pos_emb = model.position_embedding(positions)
+            x = x + pos_emb
+            x = model.embedding_dropout(x)
+
+            layer_outputs.append(x.clone())
+
+            for layer in model.layers:
+                x, _ = layer(x)
+                layer_outputs.append(x.clone())
+
+            # 분석
+            for i in range(len(layer_outputs)):
+                norm = layer_outputs[i].norm(dim=-1).mean().item()
+                layer_norms.append({'layer': i, 'norm': norm})
+
+                if i > 0:
+                    # 이전 레이어와 코사인 유사도
+                    prev = layer_outputs[i-1].flatten(0, 1)  # [B*S, H]
+                    curr = layer_outputs[i].flatten(0, 1)
+
+                    cos_sim = F.cosine_similarity(prev, curr, dim=-1).mean().item()
+                    layer_similarities.append({
+                        'from_layer': i-1,
+                        'to_layer': i,
+                        'similarity': cos_sim
+                    })
+
+    df_norms = pd.DataFrame(layer_norms)
+    df_sims = pd.DataFrame(layer_similarities)
+
+    print("\nNorm per layer:")
+    print(df_norms.groupby('layer').mean())
+
+    print("\nCosine similarity (layer → layer+1):")
+    print(df_sims.groupby(['from_layer', 'to_layer']).mean())
+
+    return df_norms, df_sims
+
+
+# ============================================================
+# 5. 패턴 템플릿 분석
+# ============================================================
+
+def analyze_pattern_templates(model):
+    """
+    학습된 패턴 템플릿 분석
+    - InputNeurons의 patterns
+    - 뉴런 간 유사도
+    - 클러스터링
+    """
+    print("\n" + "="*70)
+    print("5. PATTERN TEMPLATE ANALYSIS")
+    print("="*70)
 
     for layer_idx, layer in enumerate(model.layers):
-        layer_results = {}
-
-        # Router patterns analysis
-        if hasattr(layer.block.router, 'neuron_patterns'):
-            patterns = layer.block.router.neuron_patterns.data
-
-            # SVD 분석
-            U, S, V = torch.svd(patterns)
-
-            layer_results['router'] = {
-                'singular_values_top5': S[:5].cpu().tolist(),
-                'effective_rank': (S.sum() / S.max()).item() if S.max() > 0 else 0,
-                'condition_number': (S.max() / (S.min() + 1e-8)).item(),
-                'frobenius_norm': patterns.norm().item(),
-            }
-
-        # InputNeurons patterns
-        if hasattr(layer.block, 'input_neurons') and hasattr(layer.block.input_neurons, 'patterns'):
-            layer_results['input_pattern_norm'] = layer.block.input_neurons.patterns.norm().item()
-
-        # ProcessNeurons weights
-        if hasattr(layer.block, 'process_neurons') and hasattr(layer.block.process_neurons, 'combination_weights'):
-            layer_results['process_weight_norm'] = layer.block.process_neurons.combination_weights.norm().item()
-
-        results['layers'][layer_idx] = layer_results
-
-    return results
-
-
-def analyze_prediction_confidence(model, val_loader, tokenizer, device):
-    """
-    모델이 얼마나 확신하는지
-    - Softmax entropy 분포
-    - Calibration (confidence vs accuracy)
-    """
-    print("\n🎲 Analyzing Prediction Confidence...")
-
-    confidences = []
-    accuracies = []
-
-    for batch in tqdm(val_loader, desc="Confidence analysis"):
-        input_ids = batch['input_ids'].to(device)
-
-        # Apply MLM masking
-        masked_input_ids, labels = apply_mlm_masking(input_ids.clone(), tokenizer)
-
-        with torch.no_grad():
-            outputs = model(masked_input_ids, labels=labels)
-            logits = outputs['logits']
-
-            probs = F.softmax(logits, dim=-1)
-            confidence, preds = probs.max(dim=-1)
-
-            # Only count masked tokens
-            valid_mask = (labels != -100)
-            valid_confidence = confidence[valid_mask].cpu().tolist()
-            valid_correct = ((preds == labels) & valid_mask)[valid_mask].cpu().tolist()
-
-            confidences.extend(valid_confidence)
-            accuracies.extend(valid_correct)
-
-    confidences = np.array(confidences)
-    accuracies = np.array(accuracies)
-
-    # Compute calibration bins
-    n_bins = 10
-    bin_boundaries = np.linspace(0, 1, n_bins + 1)
-    calibration = []
-
-    for i in range(n_bins):
-        bin_mask = (confidences >= bin_boundaries[i]) & (confidences < bin_boundaries[i+1])
-        if bin_mask.sum() > 0:
-            bin_acc = accuracies[bin_mask].mean()
-            bin_conf = confidences[bin_mask].mean()
-            calibration.append({
-                'bin': i,
-                'confidence': float(bin_conf),
-                'accuracy': float(bin_acc),
-                'count': int(bin_mask.sum())
-            })
-
-    # Compute ECE (Expected Calibration Error)
-    ece = 0.0
-    total = len(confidences)
-    for cal in calibration:
-        ece += (cal['count'] / total) * abs(cal['confidence'] - cal['accuracy'])
-
-    correct_mask = np.array(accuracies) == 1
-    wrong_mask = ~correct_mask
-
-    results = {
-        'avg_confidence': float(np.mean(confidences)),
-        'confidence_when_correct': float(np.mean(confidences[correct_mask])) if correct_mask.sum() > 0 else 0,
-        'confidence_when_wrong': float(np.mean(confidences[wrong_mask])) if wrong_mask.sum() > 0 else 0,
-        'calibration_error': float(ece),
-        'calibration_bins': calibration,
-        'overconfident_ratio': float(((confidences > 0.8) & wrong_mask).sum() / max(1, wrong_mask.sum()))
-    }
-
-    return results
-
-
-def analyze_error_patterns(model, val_loader, tokenizer, device, max_batches=50):
-    """
-    어떤 종류의 토큰을 틀리나?
-    - Frequency별 accuracy (rare vs common)
-    - Position별 accuracy (시작/중간/끝)
-    """
-    print("\n❌ Analyzing Error Patterns...")
-
-    token_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
-    position_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
-
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc="Error analysis")):
-        if batch_idx >= max_batches:
-            break
-
-        input_ids = batch['input_ids'].to(device)
-
-        # Apply MLM masking
-        masked_input_ids, labels = apply_mlm_masking(input_ids.clone(), tokenizer)
-
-        with torch.no_grad():
-            outputs = model(masked_input_ids, labels=labels)
-            preds = outputs['logits'].argmax(dim=-1)
-
-            for b in range(input_ids.size(0)):
-                for pos in range(input_ids.size(1)):
-                    if labels[b, pos].item() == -100:
-                        continue
-
-                    token_id = labels[b, pos].item()
-                    is_correct = (preds[b, pos] == labels[b, pos]).item()
-
-                    # Token stats
-                    token_stats[token_id]['total'] += 1
-                    if is_correct:
-                        token_stats[token_id]['correct'] += 1
-
-                    # Position stats (normalized to 0-9 bins)
-                    seq_len = (labels[b] != -100).sum().item()
-                    if seq_len > 0:
-                        pos_bin = min(9, int(pos * 10 / input_ids.size(1)))
-                        position_stats[pos_bin]['total'] += 1
-                        if is_correct:
-                            position_stats[pos_bin]['correct'] += 1
-
-    # Compute token accuracy
-    token_acc = []
-    for token_id, stats in token_stats.items():
-        if stats['total'] >= 5:  # Minimum samples
-            acc = stats['correct'] / stats['total']
-            token_acc.append((token_id, acc, stats['total']))
-
-    token_acc.sort(key=lambda x: x[1])
-
-    # Worst tokens
-    worst_tokens = []
-    for token_id, acc, count in token_acc[:10]:
-        try:
-            word = tokenizer.decode([token_id])
-        except:
-            word = f"[{token_id}]"
-        worst_tokens.append({'token': word, 'accuracy': acc, 'count': count})
-
-    # Best tokens
-    best_tokens = []
-    for token_id, acc, count in token_acc[-10:]:
-        try:
-            word = tokenizer.decode([token_id])
-        except:
-            word = f"[{token_id}]"
-        best_tokens.append({'token': word, 'accuracy': acc, 'count': count})
-
-    # Position accuracy
-    position_accuracy = {}
-    for pos_bin in range(10):
-        stats = position_stats[pos_bin]
-        if stats['total'] > 0:
-            position_accuracy[pos_bin] = stats['correct'] / stats['total']
-        else:
-            position_accuracy[pos_bin] = 0.0
-
-    results = {
-        'worst_tokens': worst_tokens,
-        'best_tokens': best_tokens,
-        'position_accuracy': position_accuracy,
-        'total_tokens_analyzed': sum(s['total'] for s in token_stats.values())
-    }
-
-    return results
-
-
-def analyze_gradient_flow(model, val_loader, tokenizer, device, n_batches=10):
-    """
-    Gradient가 레이어별로 얼마나 잘 흐르는지
-    - Gradient norm per layer
-    """
-    print("\n🌊 Analyzing Gradient Flow...")
-
-    model.train()  # Enable gradient
-
-    layer_gradients = defaultdict(list)
-    router_gradients = defaultdict(list)
-
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc="Gradient analysis")):
-        if batch_idx >= n_batches:
-            break
-
-        input_ids = batch['input_ids'].to(device)
-        masked_input_ids, labels = apply_mlm_masking(input_ids.clone(), tokenizer)
-
-        model.zero_grad()
-
-        outputs = model(masked_input_ids, labels=labels)
-        loss = outputs['loss']
-        loss.backward()
-
-        # Collect gradients per layer
-        for layer_idx, layer in enumerate(model.layers):
-            # Overall layer gradient
-            layer_grad_norm = 0.0
-            param_count = 0
-            for param in layer.parameters():
-                if param.grad is not None:
-                    layer_grad_norm += param.grad.norm().item() ** 2
-                    param_count += 1
-            if param_count > 0:
-                layer_grad_norm = (layer_grad_norm / param_count) ** 0.5
-                layer_gradients[layer_idx].append(layer_grad_norm)
-
-            # Router specific gradient
-            if hasattr(layer.block.router, 'neuron_patterns') and layer.block.router.neuron_patterns.grad is not None:
-                grad_norm = layer.block.router.neuron_patterns.grad.norm().item()
-                router_gradients[layer_idx].append(grad_norm)
-
-    model.eval()
-
-    results = {
-        'layer_gradient_norms': {
-            idx: float(np.mean(grads)) for idx, grads in layer_gradients.items()
-        },
-        'router_gradient_norms': {
-            idx: float(np.mean(grads)) for idx, grads in router_gradients.items()
-        }
-    }
-
-    # Compute gradient ratio (early vs late)
-    if len(layer_gradients) >= 2:
-        early_grad = np.mean([np.mean(layer_gradients[i]) for i in range(len(layer_gradients)//2)])
-        late_grad = np.mean([np.mean(layer_gradients[i]) for i in range(len(layer_gradients)//2, len(layer_gradients))])
-        results['early_late_ratio'] = float(early_grad / (late_grad + 1e-8))
-
-    return results
-
-
-def analyze_top_neurons(model, val_loader, tokenizer, device, layer_idx=None, top_k=10, max_batches=30):
-    """
-    특정 레이어의 top-k neurons가 무엇을 하는지 상세 분석
-    """
-    # Find layer with highest Gini if not specified
-    if layer_idx is None:
-        # Default to middle layer
-        layer_idx = len(model.layers) // 2
-
-    print(f"\n🔬 Deep Dive: Layer {layer_idx} Top-{top_k} Neurons...")
-
-    n_input = model.layers[layer_idx].block.n_input
-
-    # Track neuron activations
-    neuron_counts = torch.zeros(n_input, device=device)
-    neuron_token_affinity = defaultdict(lambda: defaultdict(float))
-
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Layer {layer_idx} analysis")):
-        if batch_idx >= max_batches:
-            break
-
-        input_ids = batch['input_ids'].to(device)
-
-        with torch.no_grad():
-            # Get embeddings and pass through layers up to target
-            B, S = input_ids.shape
-            token_emb = model.token_embedding(input_ids)
-            positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-            pos_emb = model.position_embedding(positions)
-            x = model.dropout(token_emb + pos_emb)
-
-            for i in range(layer_idx):
-                x, _ = model.layers[i](x)
-
-            # Get routing for target layer
-            layer = model.layers[layer_idx]
-            weights, _, selection_info = layer.block.router(x)
-
-            # Accumulate soft weights
-            neuron_counts += weights.sum(dim=0)
-
-            # Get top neurons for token association tracking
-            k_eff = int(selection_info['effective_k'])
-            _, top_indices = weights.topk(k_eff, dim=-1)
-
-            # Track token-neuron associations
-            for b in range(B):
-                for neuron_idx in top_indices[b].cpu().tolist():
-                    for token_id in input_ids[b, :20].cpu().tolist():  # First 20 tokens
-                        neuron_token_affinity[neuron_idx][token_id] += 1
-
-    # Get top neurons
-    top_neuron_indices = neuron_counts.topk(top_k).indices.cpu().tolist()
-
-    top_neurons = []
-    for neuron_idx in top_neuron_indices:
-        token_counts = neuron_token_affinity[neuron_idx]
-        if not token_counts:
-            continue
-
-        # Top tokens for this neuron
-        top_tokens = sorted(token_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        top_token_words = []
-        for token_id, count in top_tokens:
-            try:
-                word = tokenizer.decode([token_id])
-            except:
-                word = f"[{token_id}]"
-            top_token_words.append({'token': word, 'count': int(count)})
-
-        top_neurons.append({
-            'neuron_idx': neuron_idx,
-            'activation_count': int(neuron_counts[neuron_idx].item()),
-            'top_tokens': top_token_words
-        })
-
-    # Compute co-activation matrix for top neurons
-    coactivation = np.zeros((top_k, top_k))
-    # (Simplified - would need another pass for full co-activation)
-
-    results = {
-        'layer_idx': layer_idx,
-        'top_neurons': top_neurons,
-        'total_activations': int(neuron_counts.sum().item())
-    }
-
-    return results
-
-
-def analyze_process_neurons(model, val_loader, device, max_batches=30):
-    """
-    Process neurons 분석
-    - 어떤 process neurons이 자주 사용되나?
-    """
-    print("\n⚙️  Analyzing Process Neurons...")
-
-    n_layers = len(model.layers)
-    if not hasattr(model.layers[0].block, 'process_neurons'):
-        print("  No process neurons found in model")
-        return {'error': 'No process neurons'}
-
-    n_process = model.layers[0].block.n_process
-
-    # Track process neuron usage per layer
-    layer_process_counts = [torch.zeros(n_process, device=device) for _ in range(n_layers)]
-    total_samples = 0
-
-    for batch_idx, batch in enumerate(tqdm(val_loader, desc="Process neuron analysis")):
-        if batch_idx >= max_batches:
-            break
-
-        input_ids = batch['input_ids'].to(device)
-        B = input_ids.size(0)
-        total_samples += B
-
-        with torch.no_grad():
-            # Forward pass with routing info
-            outputs = model(input_ids, return_routing_info=True)
-
-            if 'routing_info' in outputs:
-                for layer_idx, layer_info in enumerate(outputs['routing_info']):
-                    if 'process_indices' in layer_info:
-                        indices = layer_info['process_indices']
-                        k = indices.size(1)
-                        for b in range(B):
-                            layer_process_counts[layer_idx].scatter_add_(
-                                0, indices[b], torch.ones(k, device=device)
-                            )
-
-    results = {'layers': {}}
-
-    for layer_idx in range(n_layers):
-        counts = layer_process_counts[layer_idx].cpu().numpy()
-        if counts.sum() == 0:
-            continue
-
-        # Compute Gini for process neurons
-        sorted_counts = np.sort(counts)
-        n = len(sorted_counts)
-        cumsum = np.cumsum(sorted_counts)
-        gini = (2 * np.sum((np.arange(1, n+1) * sorted_counts))) / (n * np.sum(sorted_counts) + 1e-8) - (n + 1) / n
-
-        # Top process neurons
-        top_indices = counts.argsort()[-5:][::-1].tolist()
-
-        results['layers'][layer_idx] = {
-            'gini': float(gini),
-            'top_process_neurons': top_indices,
-            'usage_std': float(counts.std()),
-            'unused_count': int((counts == 0).sum())
-        }
-
-    return results
+        patterns = layer.input_neurons.patterns.data  # [64, 512]
+
+        # 패턴 간 코사인 유사도
+        patterns_norm = F.normalize(patterns, dim=-1)
+        similarity = torch.matmul(patterns_norm, patterns_norm.t())  # [64, 64]
+
+        # 대각선 제외
+        similarity_off_diag = similarity.clone()
+        similarity_off_diag.fill_diagonal_(0)
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Pattern norm mean: {patterns.norm(dim=-1).mean():.4f}")
+        print(f"  Pattern norm std: {patterns.norm(dim=-1).std():.4f}")
+        print(f"  Inter-pattern similarity:")
+        print(f"    Mean: {similarity_off_diag.mean():.4f}")
+        print(f"    Max: {similarity_off_diag.max():.4f}")
+        print(f"    Min: {similarity_off_diag.min():.4f}")
+
+        # 유사한 패턴 쌍 찾기
+        high_sim = (similarity_off_diag > 0.9).sum().item()
+        print(f"  Highly similar pairs (> 0.9): {high_sim}/4032")
 
 
 # ============================================================
-# Main Analysis
+# 6. Rank 효율성 분석
 # ============================================================
 
-def comprehensive_analysis(model, val_loader, tokenizer, device):
-    """DAWN 모델 종합 분석"""
-    print("=" * 60)
-    print("DAWN Comprehensive Analysis")
-    print("=" * 60)
+def analyze_rank_efficiency(model):
+    """
+    Low-rank 분해의 효율성
+    - Effective rank
+    - 정보 손실
+    """
+    print("\n" + "="*70)
+    print("6. RANK EFFICIENCY ANALYSIS")
+    print("="*70)
 
-    results = {
-        'timestamp': datetime.now().isoformat(),
-        'model_config': model.get_model_stats()
+    for layer_idx, layer in enumerate(model.layers):
+        # InputNeurons adapt
+        down = layer.input_neurons.neuron_adapt_down.data  # [64, 512, 16]
+        up = layer.input_neurons.neuron_adapt_up.data  # [64, 16, 512]
+
+        # 각 뉴런의 effective rank (샘플링)
+        effective_ranks = []
+        for n in range(0, 64, 8):  # 샘플링
+            full_matrix = torch.matmul(down[n], up[n])  # [512, 512]
+            U, S, V = torch.svd(full_matrix)
+
+            # Effective rank (Shannon entropy)
+            S_norm = S / S.sum()
+            S_norm = S_norm[S_norm > 1e-10]
+            entropy = -(S_norm * torch.log(S_norm)).sum()
+            eff_rank = torch.exp(entropy).item()
+            effective_ranks.append(eff_rank)
+
+        print(f"\nLayer {layer_idx} InputNeurons:")
+        print(f"  Nominal rank: 16")
+        print(f"  Effective rank mean: {np.mean(effective_ranks):.2f}")
+        print(f"  Effective rank std: {np.std(effective_ranks):.2f}")
+
+        # ProcessNeurons (샘플링)
+        down_proc = layer.process_neurons.down_proj.data  # [128, 512, 128]
+        up_proc = layer.process_neurons.up_proj.data  # [128, 128, 512]
+
+        effective_ranks_proc = []
+        for n in range(0, 128, 16):  # 샘플링
+            full_matrix = torch.matmul(down_proc[n], up_proc[n])
+            U, S, V = torch.svd(full_matrix)
+            S_norm = S / S.sum()
+            S_norm = S_norm[S_norm > 1e-10]
+            entropy = -(S_norm * torch.log(S_norm)).sum()
+            eff_rank = torch.exp(entropy).item()
+            effective_ranks_proc.append(eff_rank)
+
+        print(f"  ProcessNeurons:")
+        print(f"    Nominal rank: 128")
+        print(f"    Effective rank mean: {np.mean(effective_ranks_proc):.2f}")
+        print(f"    Effective rank std: {np.std(effective_ranks_proc):.2f}")
+
+
+# ============================================================
+# 7. 학습 곡선 분석
+# ============================================================
+
+def analyze_training_curves(log_path, output_path=None):
+    """
+    학습 로그 분석 및 시각화
+    - Loss/Acc 추세
+    - 예측
+    - 과적합 여부
+    """
+    print("\n" + "="*70)
+    print("7. TRAINING CURVE ANALYSIS")
+    print("="*70)
+
+    if not Path(log_path).exists():
+        print(f"\n⚠️  Log file not found: {log_path}")
+        return None
+
+    # 로그 파싱 (training_log.txt)
+    # Format: epoch=1,step=100,loss=3.456789,acc=0.123456
+    data = []
+    with open(log_path, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+
+            # Parse epoch=X,step=Y,loss=Z,acc=W
+            parts = {}
+            for part in line.strip().split(','):
+                if '=' in part:
+                    key, val = part.split('=')
+                    parts[key] = float(val)
+
+            if 'epoch' in parts and 'loss' in parts:
+                data.append(parts)
+
+    if not data:
+        print("\n⚠️  No training data found in log")
+        return None
+
+    # Convert to DataFrame for easier analysis
+    df = pd.DataFrame(data)
+
+    # Group by epoch to get epoch-level statistics
+    epoch_stats = df.groupby('epoch').agg({
+        'loss': 'mean',
+        'acc': 'mean'
+    }).reset_index()
+
+    epochs = epoch_stats['epoch'].values
+    train_losses = epoch_stats['loss'].values
+    train_accs = epoch_stats['acc'].values
+
+    print(f"\nTraining progress:")
+    print(f"  Total epochs: {int(epochs[-1])}")
+    print(f"  Total steps: {int(df['step'].max())}")
+    print(f"  Final train loss: {train_losses[-1]:.4f}")
+    print(f"  Final train acc: {train_accs[-1]:.4f}")
+
+    # 추세 분석
+    if len(epochs) > 1:
+        slope_loss, _, _, _, _ = stats.linregress(epochs, train_losses)
+        slope_acc, _, _, _, _ = stats.linregress(epochs, train_accs)
+
+        print(f"\nTrends:")
+        print(f"  Loss slope: {slope_loss:.6f} per epoch")
+        print(f"  Acc slope: {slope_acc:.6f} per epoch")
+
+        # Epoch 30 예측
+        if epochs[-1] < 30:
+            pred_loss_30 = train_losses[-1] + slope_loss * (30 - epochs[-1])
+            pred_acc_30 = train_accs[-1] + slope_acc * (30 - epochs[-1])
+
+            print(f"\nPredicted at epoch 30:")
+            print(f"  Loss: {pred_loss_30:.4f}")
+            print(f"  Acc: {pred_acc_30:.4f}")
+
+    # 학습 곡선 시각화
+    if output_path:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Loss curve
+        ax = axes[0]
+        ax.plot(epochs, train_losses, 'o-', linewidth=2, markersize=6, label='Train Loss')
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.set_title('Training Loss Curve', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=11)
+
+        # Accuracy curve
+        ax = axes[1]
+        ax.plot(epochs, train_accs, 's-', linewidth=2, markersize=6, label='Train Acc', color='green')
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Accuracy', fontsize=12)
+        ax.set_title('Training Accuracy Curve', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=11)
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"\n💾 Saved training curves: {output_path}")
+        plt.close()
+
+    return {
+        'epochs': epochs,
+        'train_losses': train_losses,
+        'train_accs': train_accs
     }
 
-    # 1. Routing Patterns
-    routing_results = analyze_routing_patterns(model, val_loader, device, max_batches=100)
-    results['routing'] = routing_results
 
-    print("\n📊 ROUTING STATISTICS (Soft Weights)")
-    print("-" * 40)
-    print(f"  Layers: {routing_results['n_layers']}, Input neurons: {routing_results['n_input']}")
-    for layer_idx, stats in routing_results['layers'].items():
-        lp = stats['learned_params']
-        print(f"  Layer {layer_idx}:")
-        print(f"    Soft weights: mean={stats['mean_weight']:.4f}±{stats['std_weight']:.4f}")
-        print(f"    Low-weight neurons (<0.001): {stats['low_weight_neurons']}")
-        print(f"    Learned params: threshold={lp['threshold']:.3f}, steepness={lp['steepness']:.2f}, "
-              f"temp={lp['temperature']:.2f}")
-        print(f"    Effective k: {lp['effective_k']:.1f} ({lp['effective_k_ratio']:.1%})")
+# ============================================================
+# 8. 토큰 예측 품질
+# ============================================================
 
-    # 2. Neuron Usage (Load Balance)
-    usage_results = analyze_neuron_usage(model, val_loader, device, max_batches=100)
-    results['usage'] = usage_results
+def analyze_prediction_quality(model, dataloader, tokenizer, num_samples=100):
+    """
+    예측 품질 분석
+    - 자주 맞추는 토큰?
+    - 자주 틀리는 토큰?
+    """
+    print("\n" + "="*70)
+    print("8. PREDICTION QUALITY ANALYSIS")
+    print("="*70)
 
-    print("\n🧠 NEURON USAGE (Load Balance)")
-    print("-" * 40)
-    for layer_idx, stats in usage_results['layers'].items():
-        print(f"  Layer {layer_idx}: balance_score={stats['load_balance_score']:.3f}, "
-              f"gini={stats['gini_coefficient']:.3f}")
+    correct_tokens = {}
+    incorrect_tokens = {}
+    total_per_token = {}
 
-    # 3. Specialization (PMI-based) - ALL 6 LAYERS!
-    results['specialization'] = {}
-    print("\n💎 NEURON SPECIALIZATION (PMI-based, GPU-accelerated)")
-    print("-" * 40)
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=num_samples, desc="Analyzing predictions")):
+            if batch_idx >= num_samples:
+                break
 
-    n_layers = len(model.layers)
-    for layer_idx in range(n_layers):
-        spec_results = analyze_neuron_specialization(
-            model, val_loader, tokenizer, device,
-            max_batches=100,  # GPU-optimized, can handle 100 batches fast!
-            layer_idx=layer_idx
-        )
-        results['specialization'][layer_idx] = spec_results
+            input_ids = batch['input_ids'].cuda()
 
-        print(f"\n  Layer {layer_idx}:")
-        print(f"    Analyzed neurons: {spec_results['total_analyzed']}")
-        print(f"    Avg specialization (PMI): {spec_results['avg_specialization']:.3f}")
-        print(f"    Total tokens: {spec_results['total_tokens_analyzed']:,}")
-        if spec_results['specialized_neurons']:
-            print(f"    Top specialized neurons:")
-            for neuron in spec_results['specialized_neurons'][:3]:  # Top 3 per layer
-                tokens = [f"{t['token']}({t['pmi']:.2f})" for t in neuron['top_tokens_pmi'][:3]]
-                print(f"      Neuron {neuron['neuron_idx']}: {', '.join(tokens)}")
+            # Apply MLM masking on the fly
+            masked_input_ids, targets = apply_mlm_masking(input_ids.clone(), tokenizer)
 
-    # 4. Layer Differences
-    layer_results = analyze_layer_differences(model, val_loader, device)
-    results['layers'] = layer_results
+            logits = model(masked_input_ids)
+            preds = logits.argmax(dim=-1)
 
-    print("\n📈 LAYER-WISE ANALYSIS")
-    print("-" * 40)
-    for layer_idx, stats in layer_results['layers'].items():
-        print(f"  Layer {layer_idx}: norm={stats['avg_norm']:.2f}, "
-              f"std={stats['avg_std']:.4f}")
+            # 마스킹된 위치만
+            mask = targets != -100
 
-    # 5. Performance
-    perf_results = analyze_performance(model, val_loader, tokenizer, device)
-    results['performance'] = perf_results
+            correct = (preds == targets) & mask
 
-    print("\n🎯 PERFORMANCE BREAKDOWN")
-    print("-" * 40)
-    print(f"  Overall accuracy: {perf_results['overall_acc']*100:.2f}%")
-    print(f"  Easy samples (top 25%): {perf_results['easy_samples_acc']*100:.2f}%")
-    print(f"  Hard samples (bottom 25%): {perf_results['hard_samples_acc']*100:.2f}%")
+            for i in range(input_ids.shape[0]):
+                for j in range(input_ids.shape[1]):
+                    if mask[i, j]:
+                        token_id = targets[i, j].item()
 
-    # 6. Aux Loss
-    aux_results = analyze_aux_loss_components(model, val_loader, device)
-    results['aux_loss'] = aux_results
+                        total_per_token[token_id] = total_per_token.get(token_id, 0) + 1
 
-    print("\n⚖️  AUX LOSS ANALYSIS")
-    print("-" * 40)
-    print(f"  Main loss: {aux_results['avg_main_loss']:.4f}")
-    print(f"  Load balance loss: {aux_results['avg_load_balance']:.6f}")
-    print(f"  Entropy loss: {aux_results['avg_entropy']:.6f}")
-    print(f"  Total aux loss: {aux_results['avg_aux_loss']:.6f}")
-    print(f"  Aux/Main ratio: {aux_results['aux_to_main_ratio']:.4f}")
+                        if correct[i, j]:
+                            correct_tokens[token_id] = correct_tokens.get(token_id, 0) + 1
+                        else:
+                            incorrect_tokens[token_id] = incorrect_tokens.get(token_id, 0) + 1
 
-    # 7. Weight Matrices
-    weight_results = analyze_weight_matrices(model)
-    results['weight_matrices'] = weight_results
+    # 정확도 계산
+    token_accuracies = {}
+    for token_id, total in total_per_token.items():
+        correct_count = correct_tokens.get(token_id, 0)
+        token_accuracies[token_id] = correct_count / total
 
-    print("\n📐 WEIGHT MATRIX ANALYSIS")
-    print("-" * 40)
-    for layer_idx, stats in weight_results['layers'].items():
-        if 'router' in stats:
-            print(f"  Layer {layer_idx}: eff_rank={stats['router']['effective_rank']:.1f}, "
-                  f"cond={stats['router']['condition_number']:.1f}, "
-                  f"norm={stats['router']['frobenius_norm']:.2f}")
+    # Top/Bottom 토큰
+    sorted_tokens = sorted(token_accuracies.items(), key=lambda x: x[1], reverse=True)
 
-    # 8. Prediction Confidence
-    conf_results = analyze_prediction_confidence(model, val_loader, tokenizer, device)
-    results['confidence'] = conf_results
+    print("\nTop 20 most accurate tokens:")
+    for token_id, acc in sorted_tokens[:20]:
+        token_str = tokenizer.decode([token_id])
+        count = total_per_token[token_id]
+        print(f"  '{token_str}': {acc:.4f} ({count} samples)")
 
-    print("\n🎲 PREDICTION CONFIDENCE")
-    print("-" * 40)
-    print(f"  Avg confidence: {conf_results['avg_confidence']:.3f}")
-    print(f"  When correct: {conf_results['confidence_when_correct']:.3f}")
-    print(f"  When wrong: {conf_results['confidence_when_wrong']:.3f}")
-    print(f"  Calibration error (ECE): {conf_results['calibration_error']:.4f}")
-    print(f"  Overconfident ratio: {conf_results['overconfident_ratio']:.3f}")
+    print("\nBottom 20 least accurate tokens:")
+    for token_id, acc in sorted_tokens[-20:]:
+        token_str = tokenizer.decode([token_id])
+        count = total_per_token[token_id]
+        print(f"  '{token_str}': {acc:.4f} ({count} samples)")
 
-    # 9. Error Patterns
-    error_results = analyze_error_patterns(model, val_loader, tokenizer, device)
-    results['error_patterns'] = error_results
+    return token_accuracies
 
-    print("\n❌ ERROR PATTERNS")
-    print("-" * 40)
-    print(f"  Total tokens analyzed: {error_results['total_tokens_analyzed']}")
-    if error_results['worst_tokens']:
-        print(f"  Worst tokens:")
-        for t in error_results['worst_tokens'][:5]:
-            print(f"    '{t['token']}': {t['accuracy']*100:.1f}% ({t['count']} samples)")
-    print(f"  Position accuracy (start→end):")
-    pos_accs = [error_results['position_accuracy'].get(i, 0) for i in range(10)]
-    print(f"    {' '.join([f'{a*100:.0f}%' for a in pos_accs])}")
 
-    # 10. Gradient Flow
-    grad_results = analyze_gradient_flow(model, val_loader, tokenizer, device)
-    results['gradient_flow'] = grad_results
+# ============================================================
+# 9. 시각화 종합
+# ============================================================
 
-    print("\n🌊 GRADIENT FLOW")
-    print("-" * 40)
-    for layer_idx, grad_norm in grad_results['layer_gradient_norms'].items():
-        router_grad = grad_results['router_gradient_norms'].get(layer_idx, 0)
-        print(f"  Layer {layer_idx}: grad={grad_norm:.4f}, router_grad={router_grad:.4f}")
-    if 'early_late_ratio' in grad_results:
-        print(f"  Early/Late ratio: {grad_results['early_late_ratio']:.2f}")
+def create_visualizations(input_acts, process_acts, attn_patterns, df_norms, output_path='dawn_analysis.png'):
+    """
+    종합 시각화
+    """
+    print("\n" + "="*70)
+    print("9. CREATING VISUALIZATIONS")
+    print("="*70)
 
-    # 11. Top Neurons Deep Dive
-    top_results = analyze_top_neurons(model, val_loader, tokenizer, device)
-    results['top_neurons'] = top_results
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
-    print(f"\n🔬 TOP NEURONS (Layer {top_results['layer_idx']})")
-    print("-" * 40)
-    for neuron in top_results['top_neurons'][:5]:
-        tokens = [t['token'] for t in neuron['top_tokens'][:3]]
-        print(f"  Neuron {neuron['neuron_idx']}: {neuron['activation_count']} activations")
-        print(f"    Top tokens: {tokens}")
+    # 1. 뉴런 활성화율 (Layer 0)
+    ax = axes[0, 0]
+    ax.bar(range(64), input_acts[0].cpu().numpy())
+    ax.set_title('InputNeuron Activation (Layer 0)')
+    ax.set_xlabel('Neuron ID')
+    ax.set_ylabel('Activation Rate')
 
-    # 12. Process Neurons
-    process_results = analyze_process_neurons(model, val_loader, device)
-    results['process_neurons'] = process_results
+    # 2. ProcessNeuron 활성화율 (Layer 0)
+    ax = axes[0, 1]
+    ax.bar(range(128), process_acts[0].cpu().numpy())
+    ax.set_title('ProcessNeuron Activation (Layer 0)')
+    ax.set_xlabel('Neuron ID')
+    ax.set_ylabel('Activation Rate')
 
-    if 'error' not in process_results:
-        print("\n⚙️  PROCESS NEURONS")
-        print("-" * 40)
-        for layer_idx, stats in process_results['layers'].items():
-            print(f"  Layer {layer_idx}: gini={stats['gini']:.3f}, "
-                  f"unused={stats['unused_count']}")
+    # 3. Attention heatmap (Layer 0, Sample 0)
+    ax = axes[0, 2]
+    attn = [p for p in attn_patterns if p['layer'] == 0 and p['sample'] == 0]
+    if attn:
+        attn_data = attn[0]['weights']
+        size = min(50, attn_data.shape[0])
+        sns.heatmap(attn_data[:size, :size], ax=ax, cmap='viridis')
+        ax.set_title('Attention Weights (Layer 0)')
 
-    print("\n" + "=" * 60)
+    # 4. 레이어별 평균 활성화
+    ax = axes[1, 0]
+    input_means = [input_acts[i].mean().item() for i in range(6)]
+    process_means = [process_acts[i].mean().item() for i in range(6)]
+    ax.plot(input_means, 'o-', label='InputNeurons')
+    ax.plot(process_means, 's-', label='ProcessNeurons')
+    ax.set_title('Mean Activation per Layer')
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Activation')
+    ax.legend()
 
-    return results
+    # 5. Norm per layer
+    ax = axes[1, 1]
+    layer_norms = df_norms.groupby('layer')['norm'].mean()
+    ax.plot(layer_norms.values, 'o-')
+    ax.set_title('Hidden State Norm per Layer')
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Norm')
 
+    # 6. Dead neurons
+    ax = axes[1, 2]
+    dead_input = [(input_acts[i] < 0.01).sum().item() for i in range(6)]
+    dead_process = [(process_acts[i] < 0.01).sum().item() for i in range(6)]
+    ax.plot(dead_input, 'o-', label='InputNeurons')
+    ax.plot(dead_process, 's-', label='ProcessNeurons')
+    ax.set_title('Dead Neurons per Layer')
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Count')
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"\n💾 Saved visualization: {output_path}")
+
+
+# ============================================================
+# Main Analysis Pipeline
+# ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='DAWN Model Analysis')
-
+    parser = argparse.ArgumentParser(description='DAWN Checkpoint Comprehensive Analysis')
     parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to model checkpoint')
-    parser.add_argument('--config', type=str, default='configs/train_config.yaml',
-                        help='Path to config file for data loading')
-    parser.add_argument('--output', type=str, default=None,
-                        help='Output JSON file path')
-    parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size for analysis')
+                        help='Path to checkpoint file or directory (will auto-find best_model.pt)')
+    parser.add_argument('--data', type=str, default=None, help='Path to validation data (optional)')
+    parser.add_argument('--num-batches', type=int, default=20, help='Number of batches for analysis')
+    parser.add_argument('--output-dir', type=str, default='.', help='Output directory for visualizations')
 
     args = parser.parse_args()
 
-    # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print("\n" + "="*70)
+    print("DAWN COMPREHENSIVE CHECKPOINT ANALYSIS")
+    print("="*70)
 
-    # Load model
-    print(f"\nLoading checkpoint: {args.checkpoint}")
-    model, config = load_checkpoint(args.checkpoint, device)
-    print(f"Model loaded successfully!")
+    # Handle directory vs file input
+    checkpoint_input = Path(args.checkpoint)
 
-    # Load data from config
-    config_path = Path(PROJECT_ROOT) / args.config
-    print(f"\nLoading validation data from config: {config_path}")
-    val_loader, tokenizer, _ = load_data_from_config(
-        config_path=config_path,
-        batch_size=args.batch_size
-    )
-    print(f"Loaded {len(val_loader)} batches")
+    if checkpoint_input.is_dir():
+        # Directory provided - find best_model.pt
+        checkpoint_dir = checkpoint_input
+        checkpoint_path = checkpoint_dir / 'best_model.pt'
 
-    # Run analysis
-    results = comprehensive_analysis(model, val_loader, tokenizer, device)
+        if not checkpoint_path.exists():
+            print(f"❌ best_model.pt not found in directory: {checkpoint_dir}")
+            print("   Please provide a valid checkpoint directory or file path")
+            return
 
-    # Save results
-    if args.output:
-        output_path = args.output
+        print(f"\n📁 Checkpoint directory: {checkpoint_dir}")
+        print(f"📄 Using checkpoint: {checkpoint_path.name}")
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"dawn_analysis_{timestamp}.json"
+        # File provided directly
+        checkpoint_path = checkpoint_input
+        checkpoint_dir = checkpoint_path.parent
 
-    # Convert numpy arrays to lists for JSON serialization
-    def convert_to_serializable(obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, dict):
-            return {k: convert_to_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_to_serializable(v) for v in obj]
-        return obj
+        if not checkpoint_path.exists():
+            print(f"❌ Checkpoint file not found: {checkpoint_path}")
+            return
 
-    results = convert_to_serializable(results)
+        print(f"\n📁 Checkpoint directory: {checkpoint_dir}")
+        print(f"📄 Checkpoint file: {checkpoint_path.name}")
 
-    with open(output_path, 'w') as f:
-        json.dump(results, f, indent=2)
+    print(f"Data: {args.data}")
 
-    print(f"\n✅ Analysis complete! Results saved to: {output_path}")
+    # Load config from checkpoint directory
+    config_path = checkpoint_dir / 'config.json'
+
+    if not config_path.exists():
+        print(f"❌ Config file not found: {config_path}")
+        print("   Expected config.json in same directory as checkpoint")
+        return
+
+    print(f"\nLoading config from: {config_path}")
+    import json
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
+
+    # Extract model hyperparameters from config
+    d_model = cfg['model'].get('d_model', 512)
+    n_layers = cfg['model'].get('n_layers', 6)
+    n_input = cfg['model'].get('n_input', 64)
+    n_process = cfg['model'].get('n_process', 128)
+    max_seq_len = cfg['model'].get('max_seq_len', 2048)
+    dropout = cfg['model'].get('dropout', 0.1)
+
+    print(f"Model config:")
+    print(f"  d_model: {d_model}")
+    print(f"  n_layers: {n_layers}")
+    print(f"  n_input: {n_input}")
+    print(f"  n_process: {n_process}")
+    print(f"  max_seq_len: {max_seq_len}")
+    print(f"  dropout: {dropout}")
+
+    # Load checkpoint
+    print("\nLoading checkpoint...")
+    checkpoint = torch.load(str(checkpoint_path))
+
+    # Handle torch.compile() state_dict (remove _orig_mod. prefix)
+    state_dict = checkpoint['model_state_dict']
+    if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+        print("Detected torch.compile() checkpoint, removing _orig_mod. prefix...")
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    # Get vocab_size from state_dict (not in config)
+    vocab_size = state_dict['token_embedding.weight'].shape[0]
+    print(f"  vocab_size: {vocab_size}")
+
+    # Load model with config hyperparameters
+    print("\nCreating model...")
+    model = DAWN(
+        vocab_size=vocab_size,
+        hidden_dim=d_model,
+        num_layers=n_layers,
+        num_input_neurons=n_input,
+        num_process_neurons=n_process,
+        max_seq_len=max_seq_len,
+        dropout=dropout
+    )
+
+    model.load_state_dict(state_dict)
+    model = model.cuda()
+    model.eval()
+    print("✓ Model loaded")
+
+    # Load tokenizer
+    print("\nLoading tokenizer...")
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    print("✓ Tokenizer loaded")
+
+    # Load data
+    print("\nLoading validation data...")
+
+    if args.data:
+        # Load from provided path
+        import pickle
+        with open(args.data, 'rb') as f:
+            val_texts = pickle.load(f)
+        print(f"✓ Loaded {len(val_texts)} texts from {args.data}")
+    else:
+        # Use cached data
+        val_texts = CacheLoader.load_validation_texts(dataset="wikitext")
+        if val_texts is None:
+            print("❌ Failed to load validation data from cache")
+            print("   Please provide --data argument with path to validation data")
+            return
+
+    # Create dataset and dataloader
+    val_dataset = TextDataset(val_texts, tokenizer, max_length=128)
+    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+    dataloader = DataLoader(
+        val_dataset,
+        batch_size=32,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn
+    )
+    print(f"✓ Created dataloader with {len(val_dataset)} samples")
+
+    # Run all analyses
+    print("\nRunning comprehensive analysis...")
+
+    # 1. 활성화 패턴 분석
+    df_acts, summary_acts = analyze_activation_patterns(model, dataloader, num_batches=args.num_batches)
+
+    # 2. 뉴런 특화도 분석
+    input_acts, process_acts = analyze_neuron_specialization(model, dataloader, num_batches=args.num_batches)
+
+    # 3. Attention 패턴
+    attn_patterns = analyze_attention_patterns(model, dataloader, num_samples=10)
+
+    # 4. 레이어 표현
+    df_norms, df_sims = analyze_layer_representations(model, dataloader, num_samples=20)
+
+    # 5. 패턴 템플릿
+    analyze_pattern_templates(model)
+
+    # 6. Rank 효율성
+    analyze_rank_efficiency(model)
+
+    # 7. 학습 곡선
+    log_path = checkpoint_dir / 'training_log.txt'
+    curve_output_path = checkpoint_dir / 'training_curves.png'
+    training_data = analyze_training_curves(str(log_path), output_path=str(curve_output_path))
+
+    # 8. 예측 품질
+    token_accs = analyze_prediction_quality(model, dataloader, tokenizer, num_samples=100)
+
+    # 9. 시각화
+    output_path = checkpoint_dir / 'dawn_analysis.png'
+    create_visualizations(input_acts, process_acts, attn_patterns, df_norms, output_path=str(output_path))
+
+    print("\n" + "="*70)
+    print("ANALYSIS COMPLETE!")
+    print("="*70)
+    print(f"\n📊 Results saved to:")
+    print(f"  Training curves: {curve_output_path}")
+    print(f"  Analysis visualization: {output_path}")
+    print(f"\n✨ Analysis finished successfully!")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
