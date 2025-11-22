@@ -188,6 +188,8 @@ class DynamicNeuronLayer(nn.Module):
 # 5. 전체 모델 (DAWN 호환 인터페이스)
 # ============================================
 class DynamicNeuronTransformer(nn.Module):
+    __version__ = "2.0"  # Pre-connection version
+
     def __init__(self, vocab_size=50257, d_model=768, d_ff=3072,
                  n_layers=6, n_heads=8, n_neurons=1024,
                  n_patterns=512, k=8, pattern_k=16, max_seq_len=512, dropout=0.1):

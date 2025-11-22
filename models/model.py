@@ -169,6 +169,12 @@ class Layer(nn.Module):
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
+    __version__ = "2.1"  # 버전 관리
+    # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
+    # v2.0: Unified NeuronRouter (no connections)
+    # v2.1: NeuronRouter with inter-layer connections
+    # v3.0: NeuronRouter with gating mechanism (planned)
+
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=256, n_patterns=128, neuron_k=8, pattern_k=16,
                  max_seq_len=512, dropout=0.1,

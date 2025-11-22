@@ -1027,8 +1027,19 @@ def main():
     print(f"Loading checkpoint: {best_model_path}")
     checkpoint = torch.load(best_model_path, map_location=device)
 
+    # 버전 감지
+    checkpoint_version = checkpoint.get('model_version', 'unknown')
+    current_version = DAWN.__version__
+    print(f"\n📌 Checkpoint version: {checkpoint_version}")
+    print(f"📌 Current model version: {current_version}")
+
+    if checkpoint_version == 'unknown':
+        print("   ⚠️  Old checkpoint (pre-versioning)")
+    elif checkpoint_version != current_version:
+        print(f"   ⚠️  Version mismatch - will attempt backward compatible loading")
+
     # 모델 생성
-    print("Creating model...")
+    print("\nCreating model...")
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     vocab_size = tokenizer.vocab_size
 
