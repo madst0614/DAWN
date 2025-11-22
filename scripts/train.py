@@ -232,7 +232,7 @@ def analyze_activations(model, input_ids, device):
     model.eval()
 
     with torch.no_grad():
-        _, all_selected = model(input_ids, return_activations=True)
+        _, all_selected, all_patterns = model(input_ids, return_activations=True)
 
     stats = {}
     for layer_idx, selected_idx in enumerate(all_selected):
