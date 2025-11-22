@@ -597,10 +597,11 @@ def analyze_pattern_usage(collector, n_patterns, n_layers):
         if len(collector.pattern_selections[layer_idx]) == 0:
             continue
 
-        pattern_weights = collector.pattern_selections[layer_idx]  # [N, n_patterns]
+        pattern_weights = collector.pattern_selections[layer_idx]  # [N, S, n_patterns]
 
         # Top-k 패턴 선택 (가장 높은 가중치)
-        top_patterns = pattern_weights.argmax(dim=-1).numpy()  # [N]
+        top_patterns = pattern_weights.argmax(dim=-1).numpy()  # [N, S]
+        top_patterns = top_patterns.flatten()  # [N * S]
         pattern_counts = np.bincount(top_patterns, minlength=n_patterns)
         pattern_freq = pattern_counts / pattern_counts.sum()
 
