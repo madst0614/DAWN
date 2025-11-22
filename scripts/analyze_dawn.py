@@ -879,6 +879,71 @@ def analyze_position_patterns(collector, n_layers, max_positions=128):
     return results
 
 
+def analyze_neuron_diversity(model, n_layers):
+    """뉴런 간 유사도 및 effective rank 분석"""
+    print("\n" + "="*70)
+    print("NEURON DIVERSITY ANALYSIS")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        if hasattr(model, '_orig_mod'):
+            neurons = model._orig_mod.layers[layer_idx].router.neurons.data
+        else:
+            neurons = model.layers[layer_idx].router.neurons.data
+
+        # 정규화
+        neurons_norm = F.normalize(neurons, p=2, dim=1)
+
+        # 뉴런 간 유사도 (코사인)
+        similarity = torch.matmul(neurons_norm, neurons_norm.T)  # [n_neurons, n_neurons]
+
+        # 자기 자신 제외하고 유사도 계산
+        mask = ~torch.eye(similarity.shape[0], dtype=torch.bool, device=similarity.device)
+        off_diag_sim = similarity[mask]
+
+        # Effective rank (SVD 기반)
+        U, S, V = torch.svd(neurons)
+        # Normalized singular values
+        S_normalized = S / S.sum()
+        # Entropy-based effective rank
+        entropy_val = -(S_normalized * torch.log(S_normalized + 1e-10)).sum()
+        effective_rank = torch.exp(entropy_val).item()
+
+        # 통계
+        mean_sim = off_diag_sim.mean().item()
+        max_sim = off_diag_sim.max().item()
+        std_sim = off_diag_sim.std().item()
+
+        # Rank ratio
+        rank_ratio = effective_rank / neurons.shape[0]
+
+        results[f'layer_{layer_idx}'] = {
+            'mean_similarity': mean_sim,
+            'max_similarity': max_sim,
+            'std_similarity': std_sim,
+            'effective_rank': effective_rank,
+            'total_neurons': neurons.shape[0],
+            'rank_ratio': rank_ratio
+        }
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Mean similarity: {mean_sim:.4f}")
+        print(f"  Max similarity: {max_sim:.4f}")
+        print(f"  Std similarity: {std_sim:.4f}")
+        print(f"  Effective rank: {effective_rank:.1f} / {neurons.shape[0]}")
+        print(f"  Rank ratio: {rank_ratio:.2%}")
+
+        # 경고
+        if mean_sim > 0.5:
+            print(f"  ⚠️  HIGH SIMILARITY: Neurons are redundant!")
+        if rank_ratio < 0.5:
+            print(f"  ⚠️  LOW RANK: Limited neuron diversity!")
+
+    return results
+
+
 def visualize_connections(model, output_dir):
     """레이어 간 connection 행렬 시각화"""
     print("\n=== Visualizing Connection Matrices ===")
@@ -1131,6 +1196,9 @@ def main():
     confidence_results = analyze_selection_confidence(collector, n_layers)
     position_pattern_results = analyze_position_patterns(collector, n_layers)
 
+    # 🧬 Neuron diversity 분석
+    diversity_results = analyze_neuron_diversity(model, n_layers)
+
     # 🔗 Connection 분석 (있고 학습된 경우만)
     has_connections = any(layer.router.has_connection for layer in model.layers)
     if has_connections:
@@ -1161,6 +1229,7 @@ def main():
         'neuron_pattern_correlation': neuron_pattern_corr_results,  # ⭐ NEW
         'selection_confidence': confidence_results,  # ⭐ NEW
         'position_patterns': position_pattern_results,  # ⭐ NEW
+        'neuron_diversity': diversity_results,  # 🧬 NEW
         'connection_patterns': connection_pattern_results,  # 🔗 NEW
         'connection_stats': connection_stats,  # 🔗 NEW
     }
