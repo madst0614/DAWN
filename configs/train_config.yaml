@@ -26,6 +26,7 @@ training:
   lr: 0.0003              # Learning rate (increased for faster convergence)
   weight_decay: 0.1       # Weight decay for regularization
   warmup_epochs: 2        # Warmup epochs
+  lb_weight: 0.01         # Load balancing loss weight (prevents pattern/neuron collapse)
 
 # Mixed precision (faster training on GPU)
 use_amp: true

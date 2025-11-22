@@ -219,17 +219,68 @@ class DynamicNeuronTransformer(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, return_activations=False):
+    def compute_load_balancing_loss(self, all_selected, all_patterns):
+        """
+        Load balancing loss to prevent collapse
+
+        Args:
+            all_selected: List of [B, S, k] neuron indices per layer
+            all_patterns: List of [B, S, n_patterns] pattern weights per layer
+
+        Returns:
+            neuron_lb_loss: Load balancing loss for neurons
+            pattern_lb_loss: Load balancing loss for patterns
+        """
+        neuron_lb_loss = 0.0
+        pattern_lb_loss = 0.0
+
+        # Neuron load balancing
+        for layer_idx, selected_idx in enumerate(all_selected):
+            B, S, k = selected_idx.shape
+            n_neurons = self.layers[layer_idx].attention.neuron_pool.n_neurons
+
+            # Count neuron usage
+            flat_idx = selected_idx.reshape(-1)  # [B*S*k]
+            counts = torch.bincount(flat_idx, minlength=n_neurons).float()
+
+            # Target: uniform distribution
+            usage_freq = counts / counts.sum()
+            target_freq = 1.0 / n_neurons
+
+            # L2 loss from uniform
+            neuron_lb_loss += ((usage_freq - target_freq) ** 2).sum()
+
+        # Pattern load balancing
+        for pattern_weights in all_patterns:
+            # pattern_weights: [B, S, n_patterns]
+            B, S, n_patterns = pattern_weights.shape
+
+            # Average usage across all positions
+            avg_usage = pattern_weights.mean(dim=(0, 1))  # [n_patterns]
+            target_usage = 1.0 / n_patterns
+
+            # L2 loss from uniform
+            pattern_lb_loss += ((avg_usage - target_usage) ** 2).sum()
+
+        # Normalize by number of layers
+        neuron_lb_loss = neuron_lb_loss / len(all_selected)
+        pattern_lb_loss = pattern_lb_loss / len(all_patterns)
+
+        return neuron_lb_loss, pattern_lb_loss
+
+    def forward(self, input_ids, return_activations=False, compute_aux_loss=False):
         """
         순전파
 
         Args:
             input_ids: [B, S]
             return_activations: bool - 뉴런 선택 정보 반환 여부
+            compute_aux_loss: bool - Load balancing loss 계산 여부
 
         Returns:
             logits: [B, S, vocab_size]
             all_selected: (선택적) 레이어별 선택된 뉴런 인덱스
+            aux_losses: (선택적) 보조 손실 딕셔너리
         """
         B, S = input_ids.shape
 
@@ -242,11 +293,11 @@ class DynamicNeuronTransformer(nn.Module):
         mask = torch.tril(torch.ones(S, S, device=input_ids.device))
         mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
 
-        # 3. Layers
+        # 3. Layers - always collect for aux loss if needed
         all_selected = []
         all_patterns = []
         for layer in self.layers:
-            if return_activations:
+            if return_activations or compute_aux_loss:
                 x, selected_idx, pattern_weights = layer(x, mask, return_details=True)
                 all_selected.append(selected_idx)
                 all_patterns.append(pattern_weights)
@@ -257,7 +308,21 @@ class DynamicNeuronTransformer(nn.Module):
         x = self.norm(x)
         logits = self.lm_head(x)
 
-        if return_activations:
+        # 5. Compute auxiliary losses if requested
+        if compute_aux_loss:
+            neuron_lb_loss, pattern_lb_loss = self.compute_load_balancing_loss(
+                all_selected, all_patterns
+            )
+            aux_losses = {
+                'neuron_lb_loss': neuron_lb_loss,
+                'pattern_lb_loss': pattern_lb_loss,
+            }
+
+            if return_activations:
+                return logits, all_selected, all_patterns, aux_losses
+            else:
+                return logits, aux_losses
+        elif return_activations:
             # Return both neuron selections and pattern weights
             return logits, all_selected, all_patterns
         else:
@@ -344,29 +409,44 @@ class DAWN(DynamicNeuronTransformer):
 
 class DAWNTrainer:
     """DAWN 학습 헬퍼 (Dynamic Neuron Transformer 호환)"""
-    def __init__(self, model, optimizer, device='cuda'):
+    def __init__(self, model, optimizer, device='cuda', lb_weight=0.01):
         self.model = model
         self.optimizer = optimizer
         self.device = device
+        self.lb_weight = lb_weight  # Load balancing weight
 
     def train_step(self, input_ids, targets):
         self.model.train()
 
-        logits = self.model(input_ids)
+        # Forward with auxiliary losses
+        logits, aux_losses = self.model(input_ids, compute_aux_loss=True)
         B, S, V = logits.shape
 
-        loss = F.cross_entropy(
+        # Main MLM loss
+        mlm_loss = F.cross_entropy(
             logits.view(B * S, V),
             targets.view(B * S),
             ignore_index=-100
         )
 
+        # Load balancing losses
+        neuron_lb_loss = aux_losses['neuron_lb_loss']
+        pattern_lb_loss = aux_losses['pattern_lb_loss']
+
+        # Total loss
+        total_loss = mlm_loss + self.lb_weight * (neuron_lb_loss + pattern_lb_loss)
+
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
-        return loss.item()
+        return {
+            'total_loss': total_loss.item(),
+            'mlm_loss': mlm_loss.item(),
+            'neuron_lb_loss': neuron_lb_loss.item(),
+            'pattern_lb_loss': pattern_lb_loss.item(),
+        }
 
     def analyze_activations(self, input_ids):
         """뉴런 선택 패턴 분석"""

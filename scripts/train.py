@@ -69,15 +69,22 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Mixed precision training
         if scaler is not None:
             with torch.amp.autocast('cuda'):
-                logits = model(input_ids)  # [B, S, vocab_size]
+                # Forward with aux losses
+                logits, aux_losses = model(input_ids, compute_aux_loss=True)  # [B, S, vocab_size]
 
                 # Loss 계산
                 B, S, V = logits.shape
-                loss = F.cross_entropy(
+                mlm_loss = F.cross_entropy(
                     logits.view(B * S, V),
                     labels.view(B * S),
                     ignore_index=-100
                 )
+
+                # Load balancing losses
+                lb_weight = getattr(args, 'lb_weight', 0.01)
+                neuron_lb = aux_losses['neuron_lb_loss']
+                pattern_lb = aux_losses['pattern_lb_loss']
+                loss = mlm_loss + lb_weight * (neuron_lb + pattern_lb)
 
             scaler.scale(loss).backward()
 
@@ -88,14 +95,21 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits = model(input_ids)
+            # Forward with aux losses
+            logits, aux_losses = model(input_ids, compute_aux_loss=True)
 
             B, S, V = logits.shape
-            loss = F.cross_entropy(
+            mlm_loss = F.cross_entropy(
                 logits.view(B * S, V),
                 labels.view(B * S),
                 ignore_index=-100
             )
+
+            # Load balancing losses
+            lb_weight = getattr(args, 'lb_weight', 0.01)
+            neuron_lb = aux_losses['neuron_lb_loss']
+            pattern_lb = aux_losses['pattern_lb_loss']
+            loss = mlm_loss + lb_weight * (neuron_lb + pattern_lb)
 
             loss.backward()
 
@@ -295,6 +309,7 @@ def main():
     args.lr = cfg['training']['lr']
     args.weight_decay = cfg['training']['weight_decay']
     args.warmup_epochs = cfg['training'].get('warmup_epochs', 1)
+    args.lb_weight = cfg['training'].get('lb_weight', 0.01)  # Load balancing weight
 
     # Other
     args.use_amp = cfg.get('use_amp', True)

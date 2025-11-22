@@ -641,6 +641,184 @@ def analyze_pattern_usage(collector, n_patterns, n_layers):
     return results
 
 
+def analyze_pattern_collapse_detail(collector, n_patterns, n_layers):
+    """패턴 collapse 상세 분석 - 어떤 패턴들이 지배하는가?"""
+    print("\n" + "="*70)
+    print("PATTERN COLLAPSE DETAIL ANALYSIS")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        if len(collector.pattern_selections[layer_idx]) == 0:
+            continue
+
+        pattern_weights = collector.pattern_selections[layer_idx]  # [N, S, n_patterns]
+        top_patterns = pattern_weights.argmax(dim=-1).numpy().flatten()  # [N * S]
+
+        # 패턴별 카운트
+        pattern_counts = np.bincount(top_patterns, minlength=n_patterns)
+        total_selections = pattern_counts.sum()
+
+        # Top-10 패턴 찾기
+        top_indices = np.argsort(pattern_counts)[::-1][:10]
+        top_counts = pattern_counts[top_indices]
+        top_ratios = top_counts / total_selections
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Total selections: {total_selections}")
+        print(f"  Top-10 patterns:")
+        for rank, (idx, count, ratio) in enumerate(zip(top_indices, top_counts, top_ratios), 1):
+            print(f"    #{rank}: Pattern {idx:3d} - {count:7d} times ({ratio:6.2%})")
+
+        # 평균 gate 값 분석 (상위 5개 vs 하위 5개)
+        avg_weights = pattern_weights.mean(dim=(0, 1)).numpy()  # [n_patterns]
+        top5_avg = avg_weights[top_indices[:5]].mean()
+        bottom5_indices = np.argsort(pattern_counts)[:5]
+        bottom5_avg = avg_weights[bottom5_indices].mean()
+
+        print(f"  Average gate values:")
+        print(f"    Top-5 patterns: {top5_avg:.6f}")
+        print(f"    Bottom-5 patterns: {bottom5_avg:.6f}")
+        print(f"    Ratio: {top5_avg / (bottom5_avg + 1e-10):.2f}x")
+
+        # Collapse 경고
+        top1_ratio = top_ratios[0]
+        top5_ratio = top_ratios[:5].sum()
+        if top1_ratio > 0.5:
+            print(f"  🔴 SEVERE COLLAPSE: Top-1 pattern dominates {top1_ratio:.1%}!")
+        elif top5_ratio > 0.8:
+            print(f"  ⚠️  COLLAPSE: Top-5 patterns dominate {top5_ratio:.1%}!")
+
+        results[f'layer_{layer_idx}'] = {
+            'top_10_patterns': top_indices.tolist(),
+            'top_10_counts': top_counts.tolist(),
+            'top_10_ratios': top_ratios.tolist(),
+            'top5_avg_gate': float(top5_avg),
+            'bottom5_avg_gate': float(bottom5_avg),
+        }
+
+    return results
+
+
+def analyze_neuron_pattern_correlation(collector, n_layers, sample_size=1000):
+    """뉴런 Set → 패턴 매핑 일관성 분석"""
+    print("\n" + "="*70)
+    print("NEURON-PATTERN CORRELATION ANALYSIS")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        if len(collector.neuron_selections[layer_idx]) == 0:
+            continue
+        if len(collector.pattern_selections[layer_idx]) == 0:
+            continue
+
+        neuron_sel = collector.neuron_selections[layer_idx]  # [N, S, k]
+        pattern_weights = collector.pattern_selections[layer_idx]  # [N, S, n_patterns]
+
+        N, S, k = neuron_sel.shape
+        total_samples = N * S
+
+        # 샘플링 (너무 크면)
+        if total_samples > sample_size:
+            indices = np.random.choice(total_samples, sample_size, replace=False)
+        else:
+            indices = np.arange(total_samples)
+
+        # Flatten
+        neuron_sel_flat = neuron_sel.reshape(-1, k).numpy()[indices]  # [sample, k]
+        pattern_sel_flat = pattern_weights.argmax(dim=-1).reshape(-1).numpy()[indices]  # [sample]
+
+        # 뉴런 Set → 패턴 매핑 빈도
+        neuron_pattern_map = defaultdict(lambda: defaultdict(int))
+
+        for neuron_set, pattern in zip(neuron_sel_flat, pattern_sel_flat):
+            neuron_key = tuple(sorted(neuron_set.tolist()))
+            neuron_pattern_map[neuron_key][pattern] += 1
+
+        # 일관성 측정: 같은 뉴런 Set이 항상 같은 패턴 선택?
+        consistency_scores = []
+        for neuron_key, pattern_counts in neuron_pattern_map.items():
+            total = sum(pattern_counts.values())
+            if total > 1:  # 2번 이상 나타난 Set만
+                max_count = max(pattern_counts.values())
+                consistency = max_count / total
+                consistency_scores.append(consistency)
+
+        if consistency_scores:
+            avg_consistency = np.mean(consistency_scores)
+            median_consistency = np.median(consistency_scores)
+
+            print(f"\nLayer {layer_idx}:")
+            print(f"  Unique neuron sets: {len(neuron_pattern_map)}")
+            print(f"  Sets appearing >1 time: {len(consistency_scores)}")
+            print(f"  Avg consistency: {avg_consistency:.4f}")
+            print(f"  Median consistency: {median_consistency:.4f}")
+
+            if avg_consistency > 0.9:
+                print(f"  ✅ HIGH: Same neuron sets → same patterns ({avg_consistency:.1%})")
+            elif avg_consistency < 0.5:
+                print(f"  ⚠️  LOW: Neuron-pattern mapping is inconsistent")
+
+            results[f'layer_{layer_idx}'] = {
+                'unique_neuron_sets': len(neuron_pattern_map),
+                'repeated_sets': len(consistency_scores),
+                'avg_consistency': float(avg_consistency),
+                'median_consistency': float(median_consistency),
+            }
+
+    return results
+
+
+def analyze_selection_confidence(collector, n_layers):
+    """선택 confidence 분석 (softmax score 분포)"""
+    print("\n" + "="*70)
+    print("SELECTION CONFIDENCE ANALYSIS")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        if len(collector.pattern_selections[layer_idx]) == 0:
+            continue
+
+        pattern_weights = collector.pattern_selections[layer_idx]  # [N, S, n_patterns]
+
+        # Top-k 점수 분석
+        top_scores, _ = pattern_weights.topk(k=3, dim=-1)  # [N, S, 3]
+        top1_scores = top_scores[:, :, 0].numpy().flatten()
+        top2_scores = top_scores[:, :, 1].numpy().flatten()
+        top3_scores = top_scores[:, :, 2].numpy().flatten()
+
+        # Gap 분석
+        gap_1_2 = top1_scores - top2_scores
+        gap_2_3 = top2_scores - top3_scores
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Top-1 score: {top1_scores.mean():.6f} ± {top1_scores.std():.6f}")
+        print(f"  Top-2 score: {top2_scores.mean():.6f} ± {top2_scores.std():.6f}")
+        print(f"  Top-3 score: {top3_scores.mean():.6f} ± {top3_scores.std():.6f}")
+        print(f"  Gap (1-2): {gap_1_2.mean():.6f} ± {gap_1_2.std():.6f}")
+        print(f"  Gap (2-3): {gap_2_3.mean():.6f} ± {gap_2_3.std():.6f}")
+
+        # Confidence 해석
+        if gap_1_2.mean() < 0.01:
+            print(f"  ⚠️  LOW CONFIDENCE: Top-1/2 gap very small ({gap_1_2.mean():.6f})")
+        elif gap_1_2.mean() > 0.1:
+            print(f"  ✅ HIGH CONFIDENCE: Clear winner (gap={gap_1_2.mean():.4f})")
+
+        results[f'layer_{layer_idx}'] = {
+            'top1_mean': float(top1_scores.mean()),
+            'top1_std': float(top1_scores.std()),
+            'gap_1_2_mean': float(gap_1_2.mean()),
+            'gap_1_2_std': float(gap_1_2.std()),
+        }
+
+    return results
+
+
 def analyze_position_patterns(collector, n_layers, max_positions=128):
     """시퀀스 위치별 뉴런 패턴 분석 ⭐"""
     print("\n" + "="*70)
@@ -803,6 +981,9 @@ def main():
 
     # ⭐ 새로운 분석
     pattern_usage_results = analyze_pattern_usage(collector, n_patterns, n_layers)
+    pattern_collapse_results = analyze_pattern_collapse_detail(collector, n_patterns, n_layers)
+    neuron_pattern_corr_results = analyze_neuron_pattern_correlation(collector, n_layers)
+    confidence_results = analyze_selection_confidence(collector, n_layers)
     position_pattern_results = analyze_position_patterns(collector, n_layers)
 
     all_results = {
@@ -811,6 +992,9 @@ def main():
         'layer_differences': layer_diff_results,
         'uncertainty_accuracy': uncertainty_results,
         'pattern_usage': pattern_usage_results,  # ⭐ NEW
+        'pattern_collapse_detail': pattern_collapse_results,  # ⭐ NEW
+        'neuron_pattern_correlation': neuron_pattern_corr_results,  # ⭐ NEW
+        'selection_confidence': confidence_results,  # ⭐ NEW
         'position_patterns': position_pattern_results,  # ⭐ NEW
     }
 
