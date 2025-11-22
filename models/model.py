@@ -43,13 +43,15 @@ class NeuronPool(nn.Module):
 
 
 # ============================================
-# 2. 패턴 기반 동적 FFN
+# 2. 패턴 기반 동적 FFN (Top-k 선택)
 # ============================================
 class PatternFFN(nn.Module):
-    def __init__(self, d_model=768, d_ff=3072, n_patterns=512):
+    def __init__(self, d_model=768, d_ff=3072, n_patterns=512, pattern_k=16):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
+        self.n_patterns = n_patterns
+        self.pattern_k = pattern_k
 
         # 패턴 저장소
         self.pattern_keys = nn.Parameter(torch.randn(n_patterns, d_model) * 0.02)
@@ -65,10 +67,16 @@ class PatternFFN(nn.Module):
 
         B, S, D = x.shape
 
-        # 1. Set 기반 패턴 retrieval
+        # 1. Set 기반 패턴 retrieval (Top-k!)
         scores = torch.matmul(set_repr, self.pattern_keys.T)  # [B, S, n_patterns]
-        weights = F.softmax(scores, dim=-1)
-        gate = torch.matmul(weights, self.pattern_gates)  # [B, S, d_ff]
+
+        # Top-k 선택 (뉴런처럼!)
+        topk_scores, topk_idx = torch.topk(scores, self.pattern_k, dim=-1)  # [B, S, k]
+        topk_weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
+
+        # 선택된 패턴 gate 가져오기
+        selected_gates = self.pattern_gates[topk_idx]  # [B, S, k, d_ff]
+        gate = torch.sum(topk_weights.unsqueeze(-1) * selected_gates, dim=2)  # [B, S, d_ff]
 
         # 2. 확장
         h = self.up_proj(x)  # [B, S, d_ff]
@@ -81,7 +89,10 @@ class PatternFFN(nn.Module):
         output = self.down_proj(h)  # [B, S, D]
 
         if return_pattern_weights:
-            return output, weights  # weights: [B, S, n_patterns]
+            # 전체 weights 복원 (분석용)
+            full_weights = torch.zeros(B, S, self.n_patterns, device=x.device)
+            full_weights.scatter_(-1, topk_idx, topk_weights)
+            return output, full_weights
         return output
 
 
@@ -139,14 +150,14 @@ class NeuronAttention(nn.Module):
 # ============================================
 class DynamicNeuronLayer(nn.Module):
     def __init__(self, d_model=768, d_ff=3072, n_heads=8,
-                 n_neurons=1024, n_patterns=512, k=8):
+                 n_neurons=1024, n_patterns=512, k=8, pattern_k=16):
         super().__init__()
 
         # Attention (뉴런 기반)
         self.attention = NeuronAttention(d_model, n_heads, n_neurons, k)
 
-        # FFN (패턴 기반)
-        self.ffn = PatternFFN(d_model, d_ff, n_patterns)
+        # FFN (패턴 기반 Top-k)
+        self.ffn = PatternFFN(d_model, d_ff, n_patterns, pattern_k)
 
         # LayerNorm
         self.norm1 = nn.LayerNorm(d_model)
@@ -179,7 +190,7 @@ class DynamicNeuronLayer(nn.Module):
 class DynamicNeuronTransformer(nn.Module):
     def __init__(self, vocab_size=50257, d_model=768, d_ff=3072,
                  n_layers=6, n_heads=8, n_neurons=1024,
-                 n_patterns=512, k=8, max_seq_len=512, dropout=0.1):
+                 n_patterns=512, k=8, pattern_k=16, max_seq_len=512, dropout=0.1):
         super().__init__()
 
         self.d_model = d_model
@@ -191,9 +202,9 @@ class DynamicNeuronTransformer(nn.Module):
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.embedding_dropout = nn.Dropout(dropout)
 
-        # Layers
+        # Layers (뉴런 top-k + 패턴 top-k)
         self.layers = nn.ModuleList([
-            DynamicNeuronLayer(d_model, d_ff, n_heads, n_neurons, n_patterns, k)
+            DynamicNeuronLayer(d_model, d_ff, n_heads, n_neurons, n_patterns, k, pattern_k)
             for _ in range(n_layers)
         ])
 
@@ -309,6 +320,7 @@ class DAWN(DynamicNeuronTransformer):
         n_neurons=1024,
         n_patterns=512,
         k=8,
+        pattern_k=16,
         d_ff=None
     ):
         # Map old params to new architecture
@@ -333,6 +345,7 @@ class DAWN(DynamicNeuronTransformer):
             n_neurons=n_neurons,
             n_patterns=n_patterns,
             k=k,
+            pattern_k=pattern_k,
             max_seq_len=max_seq_len,
             dropout=dropout
         )
