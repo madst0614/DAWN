@@ -217,22 +217,31 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
 
 def analyze_activations(model, input_ids, device):
-    """새 DAWN 모델의 활성화 패턴 분석"""
+    """Dynamic Neuron Transformer 활성화 패턴 분석"""
     model.eval()
 
     with torch.no_grad():
-        _, all_activations = model(input_ids, return_activations=True)
+        _, all_selected = model(input_ids, return_activations=True)
 
     stats = {}
-    for layer_idx, acts in enumerate(all_activations):
-        input_acts = acts['input_activations']
-        process_acts = acts['process_activations']
+    for layer_idx, selected_idx in enumerate(all_selected):
+        # selected_idx: [B, S, k]
+        unique_neurons = torch.unique(selected_idx).numel()
+
+        # Get total neurons from model
+        if hasattr(model, '_orig_mod'):
+            # Compiled model
+            total_neurons = model._orig_mod.layers[layer_idx].attention.neuron_pool.n_neurons
+        else:
+            total_neurons = model.layers[layer_idx].attention.neuron_pool.n_neurons
+
+        usage_ratio = unique_neurons / total_neurons
 
         stats[f'layer_{layer_idx}'] = {
-            'input_mean': input_acts.mean().item(),
-            'input_sparsity': (input_acts < 0.1).float().mean().item(),
-            'process_mean': process_acts.mean().item(),
-            'process_sparsity': (process_acts < 0.1).float().mean().item(),
+            'unique_neurons': unique_neurons,
+            'total_neurons': total_neurons,
+            'usage_ratio': usage_ratio,
+            'k': selected_idx.shape[-1],
         }
 
     return stats
@@ -265,13 +274,20 @@ def main():
         pass
     args = Args()
 
-    # Model
+    # Model (Dynamic Neuron Transformer)
     args.d_model = cfg['model'].get('d_model', 512)
     args.n_layers = cfg['model'].get('n_layers', 6)
-    args.n_input = cfg['model'].get('n_input', 64)
-    args.n_process = cfg['model'].get('n_process', 128)
+    args.n_heads = cfg['model'].get('n_heads', 8)
+    args.n_neurons = cfg['model'].get('n_neurons', 1024)
+    args.n_patterns = cfg['model'].get('n_patterns', 512)
+    args.k = cfg['model'].get('k', 8)
+    args.d_ff = cfg['model'].get('d_ff', None)  # Auto-calculate if None
     args.max_seq_len = cfg['model'].get('max_seq_len', 2048)
     args.dropout = cfg['model'].get('dropout', 0.1)
+
+    # Backward compatibility (deprecated)
+    args.n_input = cfg['model'].get('n_input', None)
+    args.n_process = cfg['model'].get('n_process', None)
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -326,10 +342,10 @@ def main():
         json.dump(cfg, f, indent=2)
 
     print(f"\n{'='*60}")
-    print(f"DAWN (Dynamic Architecture With Neurons) Training")
+    print(f"DAWN (Dynamic Neuron Transformer) Training")
     print(f"{'='*60}")
-    print(f"\nModel: hidden_dim={args.d_model}, n_layers={args.n_layers}")
-    print(f"Neurons: n_input={args.n_input}, n_process={args.n_process}")
+    print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
+    print(f"Neurons: pool_size={args.n_neurons}, patterns={args.n_patterns}, top_k={args.k}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -356,8 +372,11 @@ def main():
         vocab_size=vocab_size,
         hidden_dim=args.d_model,
         num_layers=args.n_layers,
-        num_input_neurons=args.n_input,
-        num_process_neurons=args.n_process,
+        n_heads=args.n_heads,
+        n_neurons=args.n_neurons,
+        n_patterns=args.n_patterns,
+        k=args.k,
+        d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
         dropout=args.dropout
     )
@@ -500,10 +519,10 @@ def main():
             sample_batch = next(iter(val_loader))
             sample_ids = sample_batch['input_ids'][:1].to(device)
             act_stats = analyze_activations(model, sample_ids, device)
-            print(f"\n  Activation Analysis (Epoch {epoch}):")
+            print(f"\n  Neuron Usage Analysis (Epoch {epoch}):")
             for layer_name, stats in act_stats.items():
-                print(f"    {layer_name}: input_sparsity={stats['input_sparsity']:.2%}, "
-                      f"process_sparsity={stats['process_sparsity']:.2%}")
+                print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
+                      f"({stats['usage_ratio']:.2%} usage)")
 
         # Save checkpoint
         is_best = val_loss < best_val_loss

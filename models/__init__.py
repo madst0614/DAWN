@@ -2,33 +2,41 @@
 DAWN: Dynamic Architecture With Neurons
 
 Neural network models for DAWN.
-New simplified architecture with InputNeurons and ProcessNeurons.
+Dynamic Neuron Transformer architecture with QK-based retrieval.
 """
 
 from .model import (
-    # Core components
-    BalancedInputNeurons,
-    InputNeurons,  # Alias for backward compatibility
-    LateralConnections,
-    LowRankProcessNeurons,
-    ProcessNeurons,  # Alias for backward compatibility
-    DAWNLayer,
+    # Dynamic Neuron Transformer components
+    NeuronPool,
+    PatternFFN,
+    NeuronAttention,
+    DynamicNeuronLayer,
+    DynamicNeuronTransformer,
+    # Main model
     DAWN,
     DAWNLanguageModel,
     DAWNTrainer,
     # Utilities
     create_model,
+    # Backward compatibility aliases
+    InputNeurons,
+    ProcessNeurons,
 )
 
 __all__ = [
-    "BalancedInputNeurons",
-    "InputNeurons",
-    "LateralConnections",
-    "LowRankProcessNeurons",
-    "ProcessNeurons",
-    "DAWNLayer",
+    # Dynamic Neuron Transformer
+    "NeuronPool",
+    "PatternFFN",
+    "NeuronAttention",
+    "DynamicNeuronLayer",
+    "DynamicNeuronTransformer",
+    # Main model & trainer
     "DAWN",
     "DAWNLanguageModel",
     "DAWNTrainer",
+    # Utilities
     "create_model",
+    # Backward compatibility
+    "InputNeurons",
+    "ProcessNeurons",
 ]
