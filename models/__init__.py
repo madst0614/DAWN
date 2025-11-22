@@ -2,16 +2,14 @@
 DAWN: Dynamic Architecture With Neurons
 
 Neural network models for DAWN.
-Dynamic Neuron Transformer architecture with QK-based retrieval.
+Context-based Neuron Router with Pattern FFN.
 """
 
 from .model import (
-    # Dynamic Neuron Transformer components
-    NeuronPool,
+    # Core components
+    NeuronRouter,
     PatternFFN,
-    NeuronAttention,
-    DynamicNeuronLayer,
-    DynamicNeuronTransformer,
+    Layer,
     # Main model
     DAWN,
     DAWNLanguageModel,
@@ -19,17 +17,16 @@ from .model import (
     # Utilities
     create_model,
     # Backward compatibility aliases
+    DynamicNeuronTransformer,
     InputNeurons,
     ProcessNeurons,
 )
 
 __all__ = [
-    # Dynamic Neuron Transformer
-    "NeuronPool",
+    # Core components
+    "NeuronRouter",
     "PatternFFN",
-    "NeuronAttention",
-    "DynamicNeuronLayer",
-    "DynamicNeuronTransformer",
+    "Layer",
     # Main model & trainer
     "DAWN",
     "DAWNLanguageModel",
@@ -37,6 +34,7 @@ __all__ = [
     # Utilities
     "create_model",
     # Backward compatibility
+    "DynamicNeuronTransformer",
     "InputNeurons",
     "ProcessNeurons",
 ]
