@@ -27,9 +27,8 @@ class NeuronRouter(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
 
-        # 뉴런 선택용 (gating)
-        self.gate_proj = nn.Linear(d_model, n_neurons)
-        nn.init.zeros_(self.gate_proj.bias)  # 초기엔 gate ≈ 0.5
+        # 뉴런 선택용 (dynamic mixing)
+        self.path_proj = nn.Linear(d_model * 2, 2)  # 2 paths: token vs context
 
         # 이전 레이어와의 connection (있으면)
         self.has_connection = prev_n_neurons is not None
@@ -57,11 +56,15 @@ class NeuronRouter(nn.Module):
         # 2. Bottom-up: 토큰 기반 뉴런 점수
         token_scores = torch.matmul(x, self.neurons.T)  # [B, S, n_neurons]
 
-        # 3. Top-down: 문맥 기반 게이트
-        gate = torch.sigmoid(self.gate_proj(context))  # [B, S, n_neurons]
+        # 3. Top-down: 문맥 기반 뉴런 점수
+        context_scores = torch.matmul(context, self.neurons.T)  # [B, S, n_neurons]
 
-        # 4. 결합: gated scores
-        scores = token_scores * gate  # [B, S, n_neurons]
+        # 4. Dynamic mixing: 상황에 따라 bottom-up vs top-down 비율 조절
+        combined = torch.cat([x, context], dim=-1)  # [B, S, 2*D]
+        weights = F.softmax(self.path_proj(combined), dim=-1)  # [B, S, 2]
+
+        scores = weights[:, :, 0:1] * token_scores + \
+                 weights[:, :, 1:2] * context_scores  # [B, S, n_neurons]
 
         # 5. Lateral: 이전 레이어 selection이 현재 점수 조절
         if self.has_connection and prev_selection is not None:
@@ -98,9 +101,8 @@ class PatternFFN(nn.Module):
         self.patterns = nn.Parameter(torch.randn(n_patterns, d_model) * 0.02)
         self.gates = nn.Parameter(torch.randn(n_patterns, d_ff) * 0.02)
 
-        # 패턴 게이팅 (NeuronRouter와 일관성)
-        self.pattern_gate_proj = nn.Linear(d_model, n_patterns)
-        nn.init.zeros_(self.pattern_gate_proj.bias)  # 초기엔 gate ≈ 0.5
+        # 패턴 선택용 (dynamic mixing - NeuronRouter와 일관성)
+        self.path_proj = nn.Linear(d_model * 2, 2)  # 2 paths: input vs router
 
         # FFN
         self.up = nn.Linear(d_model, d_ff)
@@ -112,11 +114,15 @@ class PatternFFN(nn.Module):
         # 1. Bottom-up: 입력 기반 패턴 점수
         pattern_scores = torch.matmul(x, self.patterns.T)  # [B, S, n_patterns]
 
-        # 2. Top-down: 라우터 출력 기반 게이트
-        gate = torch.sigmoid(self.pattern_gate_proj(router_out))  # [B, S, n_patterns]
+        # 2. Top-down: 라우터 출력 기반 패턴 점수
+        router_scores = torch.matmul(router_out, self.patterns.T)  # [B, S, n_patterns]
 
-        # 3. 결합: gated pattern scores
-        scores = pattern_scores * gate  # [B, S, n_patterns]
+        # 3. Dynamic mixing: 상황에 따라 input vs router 비율 조절
+        combined = torch.cat([x, router_out], dim=-1)  # [B, S, 2*D]
+        weights = F.softmax(self.path_proj(combined), dim=-1)  # [B, S, 2]
+
+        scores = weights[:, :, 0:1] * pattern_scores + \
+                 weights[:, :, 1:2] * router_scores  # [B, S, n_patterns]
 
         # 4. Top-k 선택
         topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)
@@ -187,11 +193,12 @@ class Layer(nn.Module):
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
-    __version__ = "3.0"  # 버전 관리
+    __version__ = "3.1"  # 버전 관리
     # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
     # v2.0: Unified NeuronRouter (no connections)
     # v2.1: NeuronRouter with inter-layer connections
     # v3.0: NeuronRouter with bottom-up/top-down gating
+    # v3.1: Dynamic mixing with learned path weights
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=256, n_patterns=128, neuron_k=8, pattern_k=16,
