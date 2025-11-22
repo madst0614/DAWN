@@ -2,11 +2,22 @@
 DAWN (Dynamic Architecture With Neurons) Training Script
 
 Usage:
-    # 기본 학습 (configs/train_config.yaml 사용)
+    # 기본 학습 (자동으로 최신 체크포인트 이어서 학습)
     python scripts/train.py
+
+    # 처음부터 새로 시작
+    python scripts/train.py --from-scratch
+
+    # 특정 체크포인트 폴더에서 이어서 학습
+    python scripts/train.py --resume checkpoints/run_20240101_120000_1234
 
     # 커스텀 config 파일 사용
     python scripts/train.py --config configs/my_config.yaml
+
+Checkpoint Options:
+    (기본)           - 자동으로 최신 best_model.pt 탐색 후 이어서 학습
+    --from-scratch   - 자동 탐색 비활성화, 처음부터 시작
+    --resume <폴더>  - 지정한 폴더의 best_model.pt에서 이어서 학습
 """
 
 import sys
@@ -259,7 +270,9 @@ def main():
     parser.add_argument('--config', type=str, default='configs/train_config.yaml',
                         help='Path to config file')
     parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume from')
+                        help='Path to checkpoint folder to resume from (e.g., checkpoints/run_20240101_120000_1234)')
+    parser.add_argument('--from-scratch', action='store_true',
+                        help='Start training from scratch (disable auto-resume)')
     cli_args = parser.parse_args()
 
     # Load config
@@ -310,9 +323,25 @@ def main():
     base_checkpoint_dir = Path(args.checkpoint_dir)
     base_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find latest checkpoint for auto-resume
+    # Checkpoint loading logic
     latest_best_checkpoint = None
-    if not cli_args.resume:
+
+    if cli_args.resume:
+        # Explicit resume from folder
+        resume_folder = Path(cli_args.resume)
+        if not resume_folder.is_absolute():
+            resume_folder = Path(args.checkpoint_dir) / resume_folder.name
+
+        best_ckpt = resume_folder / 'best_model.pt'
+        if best_ckpt.exists():
+            latest_best_checkpoint = best_ckpt
+            print(f"\n✓ Resuming from: {latest_best_checkpoint}")
+        else:
+            print(f"\n⚠️  Warning: Checkpoint not found at {best_ckpt}")
+            print(f"    Starting from scratch instead.")
+
+    elif not cli_args.from_scratch:
+        # Auto-resume: find latest checkpoint
         run_folders = sorted([
             d for d in base_checkpoint_dir.iterdir()
             if d.is_dir() and d.name.startswith('run_')
@@ -323,7 +352,10 @@ def main():
             best_ckpt = latest_folder / 'best_model.pt'
             if best_ckpt.exists():
                 latest_best_checkpoint = best_ckpt
-                print(f"\nFound latest checkpoint: {latest_best_checkpoint}")
+                print(f"\n✓ Auto-resume: Found latest checkpoint: {latest_best_checkpoint}")
+
+    if cli_args.from_scratch:
+        print(f"\n✓ Starting from scratch (--from-scratch)")
 
     # Create new run folder
     import random
