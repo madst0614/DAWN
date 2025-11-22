@@ -28,6 +28,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Suppress noisy torch inductor warnings
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
+warnings.filterwarnings('ignore', message='.*online softmax.*')
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
