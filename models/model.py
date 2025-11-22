@@ -87,7 +87,7 @@ class NeuronRouter(nn.Module):
 # 2. 패턴 기반 동적 FFN
 # ============================================
 class PatternFFN(nn.Module):
-    """패턴 기반 동적 FFN"""
+    """패턴 기반 동적 FFN (with gating)"""
 
     def __init__(self, d_model=256, d_ff=1024, n_patterns=128, k=16):
         super().__init__()
@@ -98,6 +98,10 @@ class PatternFFN(nn.Module):
         self.patterns = nn.Parameter(torch.randn(n_patterns, d_model) * 0.02)
         self.gates = nn.Parameter(torch.randn(n_patterns, d_ff) * 0.02)
 
+        # 패턴 게이팅 (NeuronRouter와 일관성)
+        self.pattern_gate_proj = nn.Linear(d_model, n_patterns)
+        nn.init.zeros_(self.pattern_gate_proj.bias)  # 초기엔 gate ≈ 0.5
+
         # FFN
         self.up = nn.Linear(d_model, d_ff)
         self.down = nn.Linear(d_ff, d_model)
@@ -105,18 +109,26 @@ class PatternFFN(nn.Module):
     def forward(self, x, router_out, return_pattern_weights=False):
         B, S, D = x.shape
 
-        # 1. 패턴 선택 (라우터 출력 기반)
-        scores = torch.matmul(router_out, self.patterns.T)
+        # 1. Bottom-up: 입력 기반 패턴 점수
+        pattern_scores = torch.matmul(x, self.patterns.T)  # [B, S, n_patterns]
+
+        # 2. Top-down: 라우터 출력 기반 게이트
+        gate = torch.sigmoid(self.pattern_gate_proj(router_out))  # [B, S, n_patterns]
+
+        # 3. 결합: gated pattern scores
+        scores = pattern_scores * gate  # [B, S, n_patterns]
+
+        # 4. Top-k 선택
         topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)
         topk_weights = F.softmax(topk_scores, dim=-1)
 
-        # 2. gate 조합
+        # 5. FFN gate 조합
         selected_gates = self.gates[topk_idx]
-        gate = torch.sum(topk_weights.unsqueeze(-1) * selected_gates, dim=2)
+        ffn_gate = torch.sum(topk_weights.unsqueeze(-1) * selected_gates, dim=2)
 
-        # 3. gated FFN
+        # 6. Gated FFN
         h = self.up(x)
-        h = h * torch.sigmoid(gate)
+        h = h * torch.sigmoid(ffn_gate)
         h = F.gelu(h)
         output = self.down(h)
 
