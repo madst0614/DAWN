@@ -538,7 +538,14 @@ def main():
         dropout=cfg['model']['dropout']
     )
 
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load state dict (handle torch.compile() prefix)
+    state_dict = checkpoint['model_state_dict']
+
+    # Remove _orig_mod. prefix if present (from torch.compile)
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
