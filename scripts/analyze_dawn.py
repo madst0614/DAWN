@@ -929,23 +929,31 @@ def analyze_connection_patterns(model, collector, n_layers, output_dir):
                     'weights': top_weights.tolist()
                 })
 
-        # 실제로 함께 활성화되는 패턴 찾기
-        co_activation = torch.zeros(weight.shape[0], weight.shape[1])  # [curr, prev]
+        # 실제로 함께 활성화되는 패턴 찾기 (완전 vectorized on GPU)
+        N, S, k = prev_selected.shape
+        device = prev_selected.device
+        n_curr, n_prev = weight.shape
 
-        for batch_idx in range(prev_selected.shape[0]):
-            for seq_idx in range(prev_selected.shape[1]):
-                prev_neurons = prev_selected[batch_idx, seq_idx].cpu()  # [k]
-                curr_neurons = curr_selected[batch_idx, seq_idx].cpu()  # [k]
+        # One-hot encode selections
+        # prev_selected: [N, S, k] → [N, S, n_prev]
+        prev_onehot = torch.zeros(N, S, n_prev, device=device)
+        prev_onehot.scatter_add_(2, prev_selected, torch.ones(N, S, k, device=device))
 
-                for cn in curr_neurons:
-                    for pn in prev_neurons:
-                        co_activation[cn, pn] += 1
+        # curr_selected: [N, S, k] → [N, S, n_curr]
+        curr_onehot = torch.zeros(N, S, n_curr, device=device)
+        curr_onehot.scatter_add_(2, curr_selected, torch.ones(N, S, k, device=device))
+
+        # Co-activation: outer product and sum over batch and sequence
+        # [N, S, n_curr, 1] × [N, S, 1, n_prev] → [N, S, n_curr, n_prev]
+        # Then sum over N, S → [n_curr, n_prev]
+        co_activation = torch.einsum('nsc,nsp->cp', curr_onehot, prev_onehot)
 
         # Normalize
-        co_activation = co_activation / (prev_selected.shape[0] * prev_selected.shape[1])
+        co_activation = co_activation / (N * S)
 
         # Connection weight와 co-activation 상관관계
-        weight_flat = weight.abs().flatten()
+        weight_on_device = weight.to(device)
+        weight_flat = weight_on_device.abs().flatten()
         coact_flat = co_activation.flatten()
         correlation = torch.corrcoef(torch.stack([weight_flat, coact_flat]))[0, 1].item()
 
