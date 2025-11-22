@@ -1101,12 +1101,21 @@ def main():
     confidence_results = analyze_selection_confidence(collector, n_layers)
     position_pattern_results = analyze_position_patterns(collector, n_layers)
 
-    # 🔗 Connection 분석 (있는 경우만)
+    # 🔗 Connection 분석 (있고 학습된 경우만)
     has_connections = any(layer.router.has_connection for layer in model.layers)
     if has_connections:
-        visualize_connections(model, output_dir)
-        connection_pattern_results = analyze_connection_patterns(model, collector, n_layers, output_dir)
+        # Connection이 전부 0이면 (학습 안된 경우) 스킵
         connection_stats = model.get_connection_stats()
+        has_learned_connections = any(
+            stats['std'] > 0.001 for stats in connection_stats.values()
+        )
+
+        if has_learned_connections:
+            visualize_connections(model, output_dir)
+            connection_pattern_results = analyze_connection_patterns(model, collector, n_layers, output_dir)
+        else:
+            print("\n⚠️  Connection weights are all zero (not trained) - skipping detailed analysis")
+            connection_pattern_results = {}
     else:
         print("\n⚠️  Model has no inter-layer connections - skipping connection analysis")
         connection_pattern_results = {}
