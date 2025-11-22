@@ -1033,7 +1033,23 @@ def main():
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    model.load_state_dict(state_dict)
+    # Load with strict=False to handle backward compatibility (connection weights)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+    # Check if missing keys are only connection weights (expected for old checkpoints)
+    connection_keys = [k for k in missing_keys if 'connection.weight' in k]
+    other_missing = [k for k in missing_keys if 'connection.weight' not in k]
+
+    if connection_keys:
+        print(f"\n⚠️  Loading checkpoint without inter-layer connections ({len(connection_keys)} layers)")
+        print("   Connection weights initialized to zero (equivalent to pre-connection model)")
+
+    if other_missing:
+        print(f"\n⚠️  Warning: Missing keys (not connection-related): {other_missing}")
+
+    if unexpected_keys:
+        print(f"\n⚠️  Warning: Unexpected keys in checkpoint: {unexpected_keys[:5]}...")
+
     model = model.to(device)
     model.eval()
 
@@ -1085,10 +1101,16 @@ def main():
     confidence_results = analyze_selection_confidence(collector, n_layers)
     position_pattern_results = analyze_position_patterns(collector, n_layers)
 
-    # 🔗 Connection 분석
-    visualize_connections(model, output_dir)
-    connection_pattern_results = analyze_connection_patterns(model, collector, n_layers, output_dir)
-    connection_stats = model.get_connection_stats()
+    # 🔗 Connection 분석 (있는 경우만)
+    has_connections = any(layer.router.has_connection for layer in model.layers)
+    if has_connections:
+        visualize_connections(model, output_dir)
+        connection_pattern_results = analyze_connection_patterns(model, collector, n_layers, output_dir)
+        connection_stats = model.get_connection_stats()
+    else:
+        print("\n⚠️  Model has no inter-layer connections - skipping connection analysis")
+        connection_pattern_results = {}
+        connection_stats = {}
 
     all_results = {
         'neuron_usage': neuron_usage_results,
