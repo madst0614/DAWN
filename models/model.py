@@ -59,7 +59,7 @@ class PatternFFN(nn.Module):
         self.up_proj = nn.Linear(d_model, d_ff)
         self.down_proj = nn.Linear(d_ff, d_model)
 
-    def forward(self, x, set_repr):
+    def forward(self, x, set_repr, return_pattern_weights=False):
         # x: [B, S, D]
         # set_repr: [B, S, D] - 선택된 뉴런 Set의 표현
 
@@ -80,6 +80,8 @@ class PatternFFN(nn.Module):
         # 4. 축소
         output = self.down_proj(h)  # [B, S, D]
 
+        if return_pattern_weights:
+            return output, weights  # weights: [B, S, n_patterns]
         return output
 
 
@@ -150,7 +152,7 @@ class DynamicNeuronLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, return_details=False):
         # 1. Attention with residual
         normed = self.norm1(x)
         attn_out, neuron_repr, selected_idx = self.attention(normed, mask)
@@ -158,9 +160,16 @@ class DynamicNeuronLayer(nn.Module):
 
         # 2. FFN with residual (패턴은 뉴런 표현 기반)
         normed = self.norm2(x)
-        ffn_out = self.ffn(normed, neuron_repr)
+        if return_details:
+            ffn_out, pattern_weights = self.ffn(normed, neuron_repr, return_pattern_weights=True)
+        else:
+            ffn_out = self.ffn(normed, neuron_repr)
+            pattern_weights = None
         x = x + ffn_out
 
+        if return_details:
+            # selected_idx: [B, S, k], pattern_weights: [B, S, n_patterns]
+            return x, selected_idx, pattern_weights
         return x, selected_idx
 
 
@@ -235,17 +244,22 @@ class DynamicNeuronTransformer(nn.Module):
 
         # 3. Layers
         all_selected = []
+        all_patterns = []
         for layer in self.layers:
-            x, selected_idx = layer(x, mask)
             if return_activations:
+                x, selected_idx, pattern_weights = layer(x, mask, return_details=True)
                 all_selected.append(selected_idx)
+                all_patterns.append(pattern_weights)
+            else:
+                x, selected_idx = layer(x, mask, return_details=False)
 
         # 4. Output
         x = self.norm(x)
         logits = self.lm_head(x)
 
         if return_activations:
-            return logits, all_selected
+            # Return both neuron selections and pattern weights
+            return logits, all_selected, all_patterns
         else:
             return logits
 

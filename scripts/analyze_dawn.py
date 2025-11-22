@@ -45,13 +45,19 @@ from transformers import BertTokenizer
 # ============================================================
 
 class ActivationCollector:
-    """뉴런/패턴 선택 패턴 수집"""
+    """뉴런/패턴 선택 패턴 수집 (확장판)"""
     def __init__(self, model, n_layers):
         self.model = model
         self.n_layers = n_layers
 
         # 뉴런 선택 기록
         self.neuron_selections = [[] for _ in range(n_layers)]
+
+        # 패턴 선택 기록 ⭐ NEW
+        self.pattern_selections = [[] for _ in range(n_layers)]
+
+        # 위치별 뉴런 선택 ⭐ NEW
+        self.position_neuron_map = defaultdict(lambda: [[] for _ in range(n_layers)])
 
         # 토큰별 뉴런 선택
         self.token_neuron_map = defaultdict(lambda: [[] for _ in range(n_layers)])
@@ -60,8 +66,8 @@ class ActivationCollector:
         self.correct_selections = [[] for _ in range(n_layers)]
         self.incorrect_selections = [[] for _ in range(n_layers)]
 
-    def collect(self, input_ids, labels, logits, all_selected):
-        """한 배치의 선택 패턴 수집"""
+    def collect(self, input_ids, labels, logits, all_selected, all_patterns=None):
+        """한 배치의 선택 패턴 수집 (확장)"""
         B, S = input_ids.shape
 
         # 예측 정확도
@@ -74,14 +80,24 @@ class ActivationCollector:
             # 1. 전체 뉴런 선택 기록
             self.neuron_selections[layer_idx].append(selected_idx.cpu())
 
-            # 2. 토큰별 뉴런 선택
+            # 2. 패턴 선택 기록 ⭐ NEW
+            if all_patterns is not None:
+                pattern_weights = all_patterns[layer_idx]  # [B, S, n_patterns]
+                self.pattern_selections[layer_idx].append(pattern_weights.cpu())
+
+            # 3. 토큰별 + 위치별 뉴런 선택
             for b in range(B):
                 for s in range(S):
                     token_id = input_ids[b, s].item()
                     neurons = selected_idx[b, s].cpu().tolist()
+
+                    # 토큰별
                     self.token_neuron_map[token_id][layer_idx].extend(neurons)
 
-            # 3. 정확도별 뉴런 선택
+                    # 위치별 ⭐ NEW
+                    self.position_neuron_map[s][layer_idx].extend(neurons)
+
+            # 4. 정확도별 뉴런 선택
             correct_neurons = selected_idx[correct_mask].cpu()
             incorrect_neurons = selected_idx[~correct_mask].cpu()
 
@@ -96,6 +112,12 @@ class ActivationCollector:
             if self.neuron_selections[layer_idx]:
                 self.neuron_selections[layer_idx] = torch.cat(
                     self.neuron_selections[layer_idx], dim=0
+                )
+
+            # 패턴 정보 병합 ⭐ NEW
+            if self.pattern_selections[layer_idx]:
+                self.pattern_selections[layer_idx] = torch.cat(
+                    self.pattern_selections[layer_idx], dim=0
                 )
 
             if self.correct_selections[layer_idx]:
@@ -559,6 +581,114 @@ def generate_report(all_results, output_dir, checkpoint_path):
 # Main
 # ============================================================
 
+# ============================================================
+# 추가 분석: 패턴, 위치
+# ============================================================
+
+def analyze_pattern_usage(collector, n_patterns, n_layers):
+    """FFN 패턴 사용 분석 ⭐"""
+    print("\n" + "="*70)
+    print("PATTERN (FFN) USAGE ANALYSIS")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        if not collector.pattern_selections[layer_idx]:
+            continue
+
+        pattern_weights = collector.pattern_selections[layer_idx]  # [N, n_patterns]
+
+        # Top-k 패턴 선택 (가장 높은 가중치)
+        top_patterns = pattern_weights.argmax(dim=-1).numpy()  # [N]
+        pattern_counts = np.bincount(top_patterns, minlength=n_patterns)
+        pattern_freq = pattern_counts / pattern_counts.sum()
+
+        # Gini coefficient
+        sorted_freq = np.sort(pattern_freq)
+        n = len(sorted_freq)
+        cumsum = np.cumsum(sorted_freq)
+        gini = (2 * np.sum((np.arange(1, n+1)) * sorted_freq) - (n + 1) * cumsum[-1]) / (n * cumsum[-1])
+
+        # 사용률
+        used_patterns = (pattern_counts > 0).sum()
+        usage_ratio = used_patterns / n_patterns
+
+        # Top-k 집중도
+        top_10_ratio = np.sort(pattern_freq)[-10:].sum()
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Used patterns: {used_patterns}/{n_patterns} ({usage_ratio:.2%})")
+        print(f"  Gini: {gini:.4f}, Entropy: {entropy(pattern_freq + 1e-10):.4f}")
+        print(f"  Top-10 patterns: {top_10_ratio:.2%}")
+
+        # 경고
+        if usage_ratio < 0.2:
+            print(f"  ⚠️  SPARSE: Only {usage_ratio:.1%} patterns used!")
+        if gini > 0.8:
+            print(f"  ⚠️  UNEQUAL: Pattern Gini={gini:.2f}!")
+
+        results[f'layer_{layer_idx}'] = {
+            'used_patterns': int(used_patterns),
+            'total_patterns': int(n_patterns),
+            'usage_ratio': float(usage_ratio),
+            'gini_coefficient': float(gini),
+            'entropy': float(entropy(pattern_freq + 1e-10)),
+            'top_10_ratio': float(top_10_ratio),
+        }
+
+    return results
+
+
+def analyze_position_patterns(collector, n_layers, max_positions=128):
+    """시퀀스 위치별 뉴런 패턴 분석 ⭐"""
+    print("\n" + "="*70)
+    print("POSITION-BASED NEURON PATTERNS")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        position_stats = {}
+
+        # 시작 (0-15), 중간 (48-63), 끝 (112-127)
+        ranges = {
+            'start': (0, 16),
+            'middle': (48, 64),
+            'end': (112, 128)
+        }
+
+        for range_name, (start_pos, end_pos) in ranges.items():
+            all_neurons = []
+            for pos in range(start_pos, min(end_pos, max_positions)):
+                if pos in collector.position_neuron_map:
+                    neurons = collector.position_neuron_map[pos][layer_idx]
+                    all_neurons.extend(neurons)
+
+            if all_neurons:
+                unique_neurons = len(set(all_neurons))
+                position_stats[range_name] = unique_neurons
+            else:
+                position_stats[range_name] = 0
+
+        # 위치별 다양성 차이
+        if position_stats['start'] > 0 and position_stats['end'] > 0:
+            diversity_change = (position_stats['end'] - position_stats['start']) / position_stats['start']
+
+            print(f"\nLayer {layer_idx}:")
+            print(f"  Start (0-15): {position_stats['start']} unique neurons")
+            print(f"  Middle (48-63): {position_stats['middle']} unique neurons")
+            print(f"  End (112-127): {position_stats['end']} unique neurons")
+            print(f"  Change: {diversity_change:+.1%}")
+
+            if abs(diversity_change) > 0.5:
+                print(f"  ⚠️  LARGE CHANGE: Position strongly affects neuron selection!")
+
+        results[f'layer_{layer_idx}'] = position_stats
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze DAWN checkpoint')
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -631,6 +761,7 @@ def main():
 
     n_layers = cfg['model']['n_layers']
     n_neurons = cfg['model']['n_neurons']
+    n_patterns = cfg['model']['n_patterns']
 
     print(f"\nModel: {n_layers} layers, {n_neurons} neurons/layer")
     print(f"Validation loss: {checkpoint.get('val_loss', 'N/A')}")
@@ -656,8 +787,8 @@ def main():
             input_ids = batch['input_ids'].to(device)
             input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
 
-            logits, all_selected = model(input_ids, return_activations=True)
-            collector.collect(input_ids, labels, logits, all_selected)
+            logits, all_selected, all_patterns = model(input_ids, return_activations=True)
+            collector.collect(input_ids, labels, logits, all_selected, all_patterns)
 
     collector.finalize()
 
@@ -669,11 +800,17 @@ def main():
     layer_diff_results = analyze_layer_differences(neuron_usage_results)
     uncertainty_results = analyze_uncertainty_accuracy(collector, n_layers)
 
+    # ⭐ 새로운 분석
+    pattern_usage_results = analyze_pattern_usage(collector, n_patterns, n_layers)
+    position_pattern_results = analyze_position_patterns(collector, n_layers)
+
     all_results = {
         'neuron_usage': neuron_usage_results,
         'token_neuron_specialization': token_spec_results,
         'layer_differences': layer_diff_results,
         'uncertainty_accuracy': uncertainty_results,
+        'pattern_usage': pattern_usage_results,  # ⭐ NEW
+        'position_patterns': position_pattern_results,  # ⭐ NEW
     }
 
     # 저장
