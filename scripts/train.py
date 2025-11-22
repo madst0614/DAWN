@@ -475,11 +475,11 @@ def main():
 
     # Resume from checkpoint
     start_epoch = 1
+    best_val_loss = float('inf')
     resume_checkpoint = None
 
-    if cli_args.resume:
-        resume_checkpoint = Path(cli_args.resume)
-    elif latest_best_checkpoint:
+    # Load checkpoint if resuming
+    if latest_best_checkpoint:
         resume_checkpoint = latest_best_checkpoint
 
     if resume_checkpoint and resume_checkpoint.exists():
@@ -503,7 +503,9 @@ def main():
         if 'scaler_state_dict' in checkpoint and scaler is not None:
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
         start_epoch = checkpoint.get('epoch', 0) + 1
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         print(f"  Starting from epoch {start_epoch}")
+        print(f"  Best val loss so far: {best_val_loss:.4f}")
     else:
         print(f"\nStarting fresh training")
 
@@ -532,7 +534,6 @@ def main():
     print(f"Starting training...")
     print(f"  Training log: {training_log_file}")
     print(f"{'='*60}")
-    best_val_loss = float('inf')
 
     for epoch in range(start_epoch, args.num_epochs + 1):
         epoch_start = time.time()
