@@ -298,8 +298,12 @@ def main():
     args.n_heads = cfg['model'].get('n_heads', 8)
     args.n_neurons = cfg['model'].get('n_neurons', 1024)
     args.n_patterns = cfg['model'].get('n_patterns', 512)
-    args.k = cfg['model'].get('k', 8)
+
+    # Backward compatibility: neuron_k (new) vs k (old)
+    args.neuron_k = cfg['model'].get('neuron_k', cfg['model'].get('k', 8))
+    args.k = args.neuron_k  # Keep k for backward compatibility
     args.pattern_k = cfg['model'].get('pattern_k', 16)
+
     args.d_ff = cfg['model'].get('d_ff', None)  # Auto-calculate if None
     args.max_seq_len = cfg['model'].get('max_seq_len', 2048)
     args.dropout = cfg['model'].get('dropout', 0.1)
