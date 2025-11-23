@@ -90,21 +90,24 @@ class NeuronRouter(nn.Module):
 # 2. 패턴 기반 동적 FFN
 # ============================================
 class PatternFFN(nn.Module):
-    """Full-rank pattern-based FFN with increased capacity"""
+    """v3.5: 뉴런 조합 기반 단순 패턴 선택
 
-    def __init__(self, d_model=256, d_ff=1024, n_patterns=256, k=32):
+    핵심 아이디어:
+    - 뉴런 조합이 패턴을 직접 결정 (learnable projection)
+    - patterns.T 매칭 제거 → 단순하고 명확
+    - 87% 파라미터 감소 (328K → 41K)
+    """
+
+    def __init__(self, d_model=256, d_ff=1024, n_patterns=32, k=16):
         super().__init__()
         self.n_patterns = n_patterns
         self.k = k
 
-        # Full-rank 패턴 저장소 (더 많은 패턴으로 다양성)
-        self.patterns = nn.Parameter(torch.randn(n_patterns, d_model) * 0.02)
-
-        # FFN gates도 full-rank
+        # 패턴 = gate 벡터 집합 (32개로 축소)
         self.gates = nn.Parameter(torch.randn(n_patterns, d_ff) * 0.02)
 
-        # 패턴 선택용 (dynamic mixing - NeuronRouter와 일관성)
-        self.path_proj = nn.Linear(d_model * 2, 2)  # 2 paths: input vs router
+        # 뉴런 조합 → 패턴 점수 (learnable mapping)
+        self.pattern_proj = nn.Linear(d_model, n_patterns)
 
         # FFN
         self.up = nn.Linear(d_model, d_ff)
@@ -113,28 +116,18 @@ class PatternFFN(nn.Module):
     def forward(self, x, router_out, return_pattern_weights=False):
         B, S, D = x.shape
 
-        # 1. Bottom-up: 입력 기반 패턴 점수
-        pattern_scores = torch.matmul(x, self.patterns.T)  # [B, S, n_patterns]
+        # 뉴런 조합 → 패턴 점수 (단순!)
+        pattern_scores = self.pattern_proj(router_out)  # [B, S, n_patterns]
 
-        # 2. Top-down: 라우터 출력 기반 패턴 점수
-        router_scores = torch.matmul(router_out, self.patterns.T)  # [B, S, n_patterns]
-
-        # 3. Dynamic mixing: 상황에 따라 input vs router 비율 조절
-        combined = torch.cat([x, router_out], dim=-1)  # [B, S, 2*D]
-        weights = F.softmax(self.path_proj(combined), dim=-1)  # [B, S, 2]
-
-        scores = weights[:, :, 0:1] * pattern_scores + \
-                 weights[:, :, 1:2] * router_scores  # [B, S, n_patterns]
-
-        # 4. Top-k 선택
-        topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)
+        # Top-k 패턴 선택
+        topk_scores, topk_idx = torch.topk(pattern_scores, self.k, dim=-1)
         topk_weights = F.softmax(topk_scores, dim=-1)
 
-        # 5. FFN gate 조합
-        selected_gates = self.gates[topk_idx]
+        # 선택된 gate들 조합
+        selected_gates = self.gates[topk_idx]  # [B, S, k, d_ff]
         ffn_gate = torch.sum(topk_weights.unsqueeze(-1) * selected_gates, dim=2)
 
-        # 6. Gated FFN
+        # Gated FFN
         h = self.up(x)
         h = h * torch.sigmoid(ffn_gate)
         h = F.gelu(h)
@@ -153,10 +146,10 @@ class PatternFFN(nn.Module):
 # 3. 단일 레이어
 # ============================================
 class Layer(nn.Module):
-    """단일 레이어 (Full-rank version with increased capacity)"""
+    """단일 레이어 (v3.5: Simplified pattern selection)"""
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
-                 n_neurons=512, n_patterns=256, neuron_k=16, pattern_k=32,
+                 n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
                  prev_n_neurons=None):
         super().__init__()
 
@@ -195,7 +188,7 @@ class Layer(nn.Module):
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
-    __version__ = "3.4"  # 버전 관리
+    __version__ = "3.5"  # 버전 관리
     # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
     # v2.0: Unified NeuronRouter (no connections)
     # v2.1: NeuronRouter with inter-layer connections
@@ -203,9 +196,10 @@ class DAWN(nn.Module):
     # v3.1: Dynamic mixing with learned path weights
     # v3.2: Low-rank neurons/patterns for forced diversity
     # v3.4: Full-rank with increased capacity (512 neurons, 256 patterns)
+    # v3.5: 뉴런 조합 기반 단순 패턴 선택 (32 patterns, 87% 파라미터 감소)
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
-                 n_neurons=512, n_patterns=256, neuron_k=16, pattern_k=32,
+                 n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
                  max_seq_len=512, dropout=0.1,
                  # Backward compatibility
                  hidden_dim=None, num_layers=None, k=None,

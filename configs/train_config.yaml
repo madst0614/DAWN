@@ -12,10 +12,10 @@ model:
   d_model: 256            # Hidden dimension (reduced for efficiency)
   n_layers: 4             # Number of transformer layers
   n_heads: 4              # Number of attention heads
-  n_neurons: 512          # Size of neuron pool per layer (v3.4: increased capacity)
-  n_patterns: 256         # Size of pattern pool per layer (v3.4: increased capacity)
+  n_neurons: 512          # Size of neuron pool per layer (v3.4: full-rank neurons)
+  n_patterns: 32          # Size of pattern pool per layer (v3.5: simplified, 87% reduction)
   neuron_k: 16            # Top-k neurons to select (v3.4: doubled)
-  pattern_k: 32           # Top-k patterns to select (v3.4: doubled)
+  pattern_k: 16           # Top-k patterns to select (v3.5: halved, simpler selection)
   d_ff: 512               # Feed-forward dimension (2x d_model)
   max_seq_len: 128        # Maximum sequence length
   dropout: 0.1            # Dropout rate
