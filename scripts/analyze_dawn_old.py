@@ -35,7 +35,7 @@ from collections import defaultdict, Counter
 from scipy.stats import entropy
 import yaml
 
-from models.model import DAWN
+from models.model_old import DAWN
 from utils.data import load_data, apply_mlm_masking, MLM_CONFIG
 from transformers import BertTokenizer
 
@@ -67,50 +67,39 @@ class ActivationCollector:
         self.incorrect_selections = [[] for _ in range(n_layers)]
 
     def collect(self, input_ids, labels, logits, all_selected, all_patterns=None):
-        """한 배치의 선택 패턴 수집 (최적화)"""
+        """한 배치의 선택 패턴 수집 (확장)"""
         B, S = input_ids.shape
 
         # 예측 정확도
         predictions = logits.argmax(dim=-1)  # [B, S]
         correct_mask = (predictions == labels) & (labels != -100)  # [B, S]
 
-        # CPU로 한 번에 이동 (매 루프마다 하지 않고)
-        input_ids_cpu = input_ids.cpu()
-
         for layer_idx, selected_idx in enumerate(all_selected):
             # selected_idx: [B, S, k]
 
-            # CPU로 한 번에 이동
-            selected_cpu = selected_idx.cpu()
-
             # 1. 전체 뉴런 선택 기록
-            self.neuron_selections[layer_idx].append(selected_cpu)
+            self.neuron_selections[layer_idx].append(selected_idx.cpu())
 
-            # 2. 패턴 선택 기록
+            # 2. 패턴 선택 기록 ⭐ NEW
             if all_patterns is not None:
                 pattern_weights = all_patterns[layer_idx]  # [B, S, n_patterns]
                 self.pattern_selections[layer_idx].append(pattern_weights.cpu())
 
-            # 3. 토큰별 + 위치별 뉴런 선택 (vectorized)
-            # Flatten: [B, S, k] → [B*S, k]
-            selected_flat = selected_cpu.reshape(-1, selected_cpu.shape[-1])  # [B*S, k]
-            tokens_flat = input_ids_cpu.reshape(-1)  # [B*S]
+            # 3. 토큰별 + 위치별 뉴런 선택
+            for b in range(B):
+                for s in range(S):
+                    token_id = input_ids[b, s].item()
+                    neurons = selected_idx[b, s].cpu().tolist()
 
-            # 토큰별: 각 unique token에 대해 뉴런 수집
-            for token_id in tokens_flat.unique().tolist():
-                mask = tokens_flat == token_id
-                neurons = selected_flat[mask].reshape(-1).tolist()
-                self.token_neuron_map[token_id][layer_idx].extend(neurons)
+                    # 토큰별
+                    self.token_neuron_map[token_id][layer_idx].extend(neurons)
 
-            # 위치별: 각 위치에 대해 뉴런 수집
-            for s in range(S):
-                # 모든 배치의 s번째 위치
-                neurons = selected_cpu[:, s, :].reshape(-1).tolist()
-                self.position_neuron_map[s][layer_idx].extend(neurons)
+                    # 위치별 ⭐ NEW
+                    self.position_neuron_map[s][layer_idx].extend(neurons)
 
             # 4. 정확도별 뉴런 선택
-            correct_neurons = selected_cpu[correct_mask.cpu()]
-            incorrect_neurons = selected_cpu[~correct_mask.cpu()]
+            correct_neurons = selected_idx[correct_mask].cpu()
+            incorrect_neurons = selected_idx[~correct_mask].cpu()
 
             if len(correct_neurons) > 0:
                 self.correct_selections[layer_idx].append(correct_neurons)
@@ -879,510 +868,6 @@ def analyze_position_patterns(collector, n_layers, max_positions=128):
     return results
 
 
-def analyze_neuron_coactivation(collector, n_neurons, n_layers):
-    """뉴런 co-activation 패턴 분석 - 어떤 뉴런들이 함께 선택되나? (병렬 최적화)"""
-    print("\n" + "="*70)
-    print("NEURON CO-ACTIVATION ANALYSIS")
-    print("="*70)
-
-    results = {}
-
-    for layer_idx in range(n_layers):
-        if len(collector.neuron_selections[layer_idx]) == 0:
-            continue
-
-        selected_neurons = collector.neuron_selections[layer_idx]  # [N, S, k]
-        N, S, k = selected_neurons.shape
-
-        # 🚀 Vectorized co-activation counting using one-hot encoding
-        # Create one-hot representation: [N, S, n_neurons]
-        device = selected_neurons.device
-        one_hot = torch.zeros(N, S, n_neurons, dtype=torch.float32, device=device)
-
-        # Scatter ones at selected neuron positions
-        one_hot.scatter_(2, selected_neurons, 1.0)
-
-        # Activation counts: sum over batch and sequence
-        neuron_activation_count = one_hot.sum(dim=(0, 1))  # [n_neurons]
-
-        # Co-activation matrix: outer product then sum
-        # [N, S, n_neurons, 1] @ [N, S, 1, n_neurons] -> [N, S, n_neurons, n_neurons]
-        # Then sum over N, S -> [n_neurons, n_neurons]
-        coactivation = torch.einsum('nsi,nsj->ij', one_hot, one_hot)  # Faster than matmul
-
-        # Remove self-activation (diagonal)
-        coactivation.fill_diagonal_(0)
-
-        # Move to CPU for further processing
-        coactivation = coactivation.cpu()
-        neuron_activation_count = neuron_activation_count.cpu()
-
-        # Normalize to get co-activation probability P(j | i)
-        # Use broadcasting to avoid loop
-        coactivation_prob = coactivation / (neuron_activation_count.unsqueeze(1) + 1e-10)
-
-        # Find strong co-activation patterns (vectorized)
-        threshold = 0.8
-        # Create mask for upper triangle (avoid duplicates)
-        mask = torch.triu(torch.ones_like(coactivation_prob, dtype=torch.bool), diagonal=1)
-        # Mutual high probability: both P(j|i) and P(i|j) > threshold
-        mutual_mask = mask & (coactivation_prob > threshold) & (coactivation_prob.T > threshold)
-
-        # Get indices where condition is true
-        strong_indices = torch.nonzero(mutual_mask, as_tuple=False)
-
-        # Extract probabilities
-        strong_pairs = []
-        for idx in strong_indices:
-            i, j = idx[0].item(), idx[1].item()
-            prob_ij = coactivation_prob[i, j].item()
-            prob_ji = coactivation_prob[j, i].item()
-            strong_pairs.append((i, j, prob_ij, prob_ji))
-
-        # Statistics
-        active_neurons = (neuron_activation_count > 0).sum().item()
-        active_mask = neuron_activation_count > 0
-        avg_coactivation = coactivation_prob[active_mask, :][:, active_mask].mean().item() if active_mask.any() else 0.0
-
-        # Save only summary stats (matrices are too large for JSON)
-        results[f'layer_{layer_idx}'] = {
-            'activation_counts': neuron_activation_count.numpy().tolist(),
-            'strong_pairs': strong_pairs[:20],  # Top 20 strong pairs
-            'active_neurons': int(active_neurons),
-            'avg_coactivation_prob': float(avg_coactivation),
-            # Store matrix shape info instead of full matrix
-            'coactivation_matrix_shape': list(coactivation.shape),
-            'coactivation_prob_shape': list(coactivation_prob.shape),
-        }
-
-        print(f"\nLayer {layer_idx}:")
-        print(f"  Active neurons: {active_neurons}/{n_neurons}")
-        print(f"  Strong co-activation pairs (>{threshold}): {len(strong_pairs)}")
-        print(f"  Avg co-activation probability: {avg_coactivation:.4f}")
-
-        # 경고
-        if len(strong_pairs) > 50:
-            print(f"  ⚠️  STRONG COUPLING: {len(strong_pairs)} neuron pairs almost always activate together!")
-            print(f"     → May indicate redundant neurons or over-specialized combinations")
-
-        # Show top 5 strong pairs
-        if strong_pairs:
-            print(f"  Top 5 co-activation pairs:")
-            for idx, (i, j, prob_ij, prob_ji) in enumerate(strong_pairs[:5], 1):
-                print(f"    #{idx}: Neurons ({i}, {j}) - P(j|i)={prob_ij:.3f}, P(i|j)={prob_ji:.3f}")
-
-    return results
-
-
-def analyze_neuron_diversity(model, n_layers):
-    """뉴런 간 유사도 및 effective rank 분석 (clustering 포함)"""
-    print("\n" + "="*70)
-    print("NEURON DIVERSITY ANALYSIS")
-    print("="*70)
-
-    from scipy.cluster.hierarchy import linkage
-
-    results = {}
-
-    for layer_idx in range(n_layers):
-        if hasattr(model, '_orig_mod'):
-            router = model._orig_mod.layers[layer_idx].router
-        else:
-            router = model.layers[layer_idx].router
-
-        # Get neurons (handle low-rank decomposition)
-        if hasattr(router, 'neuron_codes'):
-            # v3.2: Low-rank neurons
-            neurons = torch.matmul(router.neuron_codes.data, router.neuron_basis.data)
-        else:
-            # v3.1 and earlier: Full-rank neurons
-            neurons = router.neurons.data
-
-        neurons_cpu = neurons.cpu()
-
-        # 정규화
-        neurons_norm = F.normalize(neurons, p=2, dim=1)
-
-        # 뉴런 간 유사도 (코사인)
-        similarity = torch.matmul(neurons_norm, neurons_norm.T)  # [n_neurons, n_neurons]
-
-        # 자기 자신 제외하고 유사도 계산
-        mask = ~torch.eye(similarity.shape[0], dtype=torch.bool, device=similarity.device)
-        off_diag_sim = similarity[mask]
-
-        # Find highly similar pairs (vectorized)
-        threshold = 0.9
-        similarity_cpu = similarity.cpu()
-        n_neurons = similarity.shape[0]
-
-        # Create upper triangular mask (avoid duplicates and diagonal)
-        triu_mask = torch.triu(torch.ones(n_neurons, n_neurons, dtype=torch.bool), diagonal=1)
-
-        # Find pairs with similarity > threshold
-        high_sim_mask = triu_mask & (torch.abs(similarity_cpu) > threshold)
-        pair_indices = torch.nonzero(high_sim_mask, as_tuple=False)
-
-        # Extract pairs with their similarity values
-        similar_pairs = [
-            (i.item(), j.item(), similarity_cpu[i, j].item())
-            for i, j in pair_indices
-        ]
-
-        # Hierarchical clustering
-        try:
-            linkage_matrix = linkage(neurons_cpu.numpy(), method='ward')
-        except Exception as e:
-            print(f"  ⚠️  Clustering failed: {e}")
-            linkage_matrix = None
-
-        # Effective rank (SVD 기반)
-        U, S, V = torch.svd(neurons)
-        # Normalized singular values
-        S_normalized = S / S.sum()
-        # Entropy-based effective rank
-        entropy_val = -(S_normalized * torch.log(S_normalized + 1e-10)).sum()
-        effective_rank = torch.exp(entropy_val).item()
-
-        # 통계
-        mean_sim = off_diag_sim.mean().item()
-        max_sim = off_diag_sim.max().item()
-        std_sim = off_diag_sim.std().item()
-
-        # Rank ratio
-        rank_ratio = effective_rank / neurons.shape[0]
-
-        results[f'layer_{layer_idx}'] = {
-            'mean_similarity': mean_sim,
-            'max_similarity': max_sim,
-            'std_similarity': std_sim,
-            'effective_rank': effective_rank,
-            'total_neurons': neurons.shape[0],
-            'rank_ratio': rank_ratio,
-            'similar_pairs': similar_pairs[:20],  # Top 20 similar pairs
-            'linkage': linkage_matrix.tolist() if linkage_matrix is not None else None
-        }
-
-        print(f"\nLayer {layer_idx}:")
-        print(f"  Mean similarity: {mean_sim:.4f}")
-        print(f"  Max similarity: {max_sim:.4f}")
-        print(f"  Std similarity: {std_sim:.4f}")
-        print(f"  Effective rank: {effective_rank:.1f} / {neurons.shape[0]}")
-        print(f"  Rank ratio: {rank_ratio:.2%}")
-        print(f"  Highly similar pairs (>{threshold}): {len(similar_pairs)}")
-
-        # 경고
-        if mean_sim > 0.5:
-            print(f"  ⚠️  HIGH SIMILARITY: Neurons are redundant!")
-        if rank_ratio < 0.5:
-            print(f"  ⚠️  LOW RANK: Limited neuron diversity!")
-        if len(similar_pairs) > 50:
-            print(f"  ⚠️  REDUNDANCY: {len(similar_pairs)} highly similar neuron pairs!")
-
-    return results
-
-
-def visualize_connections(model, output_dir):
-    """레이어 간 connection 행렬 시각화"""
-    print("\n=== Visualizing Connection Matrices ===")
-
-    output_dir = Path(output_dir)
-    conn_dir = output_dir / 'connections'
-    conn_dir.mkdir(exist_ok=True)
-
-    for i, layer in enumerate(model.layers):
-        if layer.router.has_connection:
-            weight = layer.router.connection.weight.data.cpu().numpy()
-
-            plt.figure(figsize=(12, 10))
-            im = plt.imshow(weight, cmap='RdBu', vmin=-0.1, vmax=0.1, aspect='auto')
-            plt.title(f'Layer {i-1} → Layer {i} Connection Weights', fontsize=14, fontweight='bold')
-            plt.xlabel(f'Layer {i-1} Neurons', fontsize=12)
-            plt.ylabel(f'Layer {i} Neurons', fontsize=12)
-            plt.colorbar(im, label='Connection Weight')
-
-            # 통계 정보 추가
-            stats_text = f'Mean: {weight.mean():.4f}\nStd: {weight.std():.4f}\n'
-            stats_text += f'Max: {weight.max():.4f}\nMin: {weight.min():.4f}'
-            plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-            plt.tight_layout()
-            plt.savefig(conn_dir / f'connection_layer_{i-1}_to_{i}.png', dpi=150, bbox_inches='tight')
-            plt.close()
-
-            print(f"  Saved: connection_layer_{i-1}_to_{i}.png")
-
-
-def analyze_connection_patterns(model, collector, n_layers, output_dir):
-    """실제 활성화에서 connection 효과 분석"""
-    print("\n=== Analyzing Connection Effects ===")
-
-    results = {}
-
-    for layer_idx in range(1, n_layers):  # Skip first layer (no connection)
-        layer = model.layers[layer_idx]
-        if not layer.router.has_connection:
-            continue
-
-        # 이전 레이어와 현재 레이어의 선택 패턴
-        prev_selected = collector.neuron_selections[layer_idx - 1]  # [N, S, k]
-        curr_selected = collector.neuron_selections[layer_idx]  # [N, S, k]
-
-        # Connection weight 가져오기
-        weight = layer.router.connection.weight.data.cpu()  # [n_neurons, prev_n_neurons]
-
-        # 각 현재 뉴런에 대해, 가장 강하게 연결된 이전 뉴런 찾기
-        strong_connections = []
-        for curr_neuron in range(weight.shape[0]):
-            top_weights, top_prev_neurons = torch.topk(weight[curr_neuron].abs(), k=5)
-            if top_weights[0] > 0.01:  # 의미있는 연결만
-                strong_connections.append({
-                    'current': curr_neuron,
-                    'previous': top_prev_neurons.tolist(),
-                    'weights': top_weights.tolist()
-                })
-
-        # 실제로 함께 활성화되는 패턴 찾기 (완전 vectorized on GPU)
-        N, S, k = prev_selected.shape
-        device = prev_selected.device
-        n_curr, n_prev = weight.shape
-
-        # One-hot encode selections
-        # prev_selected: [N, S, k] → [N, S, n_prev]
-        prev_onehot = torch.zeros(N, S, n_prev, device=device)
-        prev_onehot.scatter_add_(2, prev_selected, torch.ones(N, S, k, device=device))
-
-        # curr_selected: [N, S, k] → [N, S, n_curr]
-        curr_onehot = torch.zeros(N, S, n_curr, device=device)
-        curr_onehot.scatter_add_(2, curr_selected, torch.ones(N, S, k, device=device))
-
-        # Co-activation: outer product and sum over batch and sequence
-        # [N, S, n_curr, 1] × [N, S, 1, n_prev] → [N, S, n_curr, n_prev]
-        # Then sum over N, S → [n_curr, n_prev]
-        co_activation = torch.einsum('nsc,nsp->cp', curr_onehot, prev_onehot)
-
-        # Normalize
-        co_activation = co_activation / (N * S)
-
-        # Connection weight와 co-activation 상관관계
-        weight_on_device = weight.to(device)
-        weight_flat = weight_on_device.abs().flatten()
-        coact_flat = co_activation.flatten()
-        correlation = torch.corrcoef(torch.stack([weight_flat, coact_flat]))[0, 1].item()
-
-        results[f'layer_{layer_idx}'] = {
-            'num_strong_connections': len(strong_connections),
-            'weight_coactivation_corr': correlation,
-            'strong_connections': strong_connections[:10]  # Top 10만 저장
-        }
-
-        print(f"\n  Layer {layer_idx}:")
-        print(f"    Strong connections (>0.01): {len(strong_connections)}")
-        print(f"    Weight-CoActivation correlation: {correlation:.4f}")
-
-        if abs(correlation) > 0.3:
-            print(f"    ✓ Connection weights align with actual activation patterns!")
-        elif abs(correlation) < 0.1:
-            print(f"    ⚠️  Connection weights don't match activation patterns")
-
-    return results
-
-
-def visualize_neuron_roles(diversity_results, coactivation_results, model, output_dir):
-    """뉴런 역할 종합 시각화 (similarity, co-activation, clustering)"""
-    print("\n=== Visualizing Neuron Roles ===")
-
-    from scipy.cluster.hierarchy import dendrogram
-    import numpy as np
-
-    output_dir = Path(output_dir)
-    roles_dir = output_dir / 'neuron_roles'
-    roles_dir.mkdir(exist_ok=True)
-
-    n_layers = len([k for k in diversity_results.keys() if k.startswith('layer_')])
-
-    for layer_idx in range(n_layers):
-        layer_key = f'layer_{layer_idx}'
-
-        if layer_key not in diversity_results:
-            continue
-
-        div_data = diversity_results[layer_key]
-        coact_data = coactivation_results.get(layer_key, {})
-
-        # Get neurons
-        if hasattr(model, '_orig_mod'):
-            router = model._orig_mod.layers[layer_idx].router
-        else:
-            router = model.layers[layer_idx].router
-
-        if hasattr(router, 'neuron_codes'):
-            neurons = torch.matmul(router.neuron_codes.data, router.neuron_basis.data)
-        else:
-            neurons = router.neurons.data
-
-        neurons_cpu = neurons.cpu()
-        neurons_norm = F.normalize(neurons, p=2, dim=1)
-        similarity = torch.matmul(neurons_norm, neurons_norm.T).cpu().numpy()
-
-        # Create comprehensive figure
-        fig = plt.figure(figsize=(20, 12))
-
-        # 1. Similarity Matrix
-        ax1 = plt.subplot(2, 3, 1)
-        im1 = ax1.imshow(similarity, cmap='RdBu', vmin=-1, vmax=1)
-        ax1.set_title(f'Layer {layer_idx}: Neuron Similarity Matrix', fontsize=12, fontweight='bold')
-        ax1.set_xlabel('Neuron ID')
-        ax1.set_ylabel('Neuron ID')
-        plt.colorbar(im1, ax=ax1, label='Cosine Similarity')
-
-        # Add stats text
-        stats_text = f"Mean: {div_data['mean_similarity']:.3f}\n"
-        stats_text += f"Effective Rank: {div_data['effective_rank']:.1f}/{div_data['total_neurons']}\n"
-        stats_text += f"Rank Ratio: {div_data['rank_ratio']:.2%}"
-        ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes,
-                verticalalignment='top', fontsize=9,
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
-
-        # 2. Similarity Distribution
-        ax2 = plt.subplot(2, 3, 2)
-        sim_off_diag = similarity[~np.eye(similarity.shape[0], dtype=bool)]
-        ax2.hist(sim_off_diag, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
-        ax2.set_xlabel('Cosine Similarity')
-        ax2.set_ylabel('Count')
-        ax2.set_title('Similarity Distribution (off-diagonal)', fontsize=12, fontweight='bold')
-        ax2.axvline(div_data['mean_similarity'], color='red', linestyle='--',
-                   label=f"Mean: {div_data['mean_similarity']:.3f}")
-        ax2.legend()
-        ax2.grid(alpha=0.3)
-
-        # 3. Dendrogram (if available)
-        ax3 = plt.subplot(2, 3, 3)
-        if div_data['linkage'] is not None:
-            linkage_matrix = np.array(div_data['linkage'])
-            dendrogram(linkage_matrix, ax=ax3, no_labels=True, color_threshold=0)
-            ax3.set_title('Hierarchical Clustering', fontsize=12, fontweight='bold')
-            ax3.set_ylabel('Distance')
-        else:
-            ax3.text(0.5, 0.5, 'Clustering unavailable', ha='center', va='center')
-            ax3.set_title('Hierarchical Clustering', fontsize=12, fontweight='bold')
-
-        # 4. Co-activation Summary (if available)
-        ax4 = plt.subplot(2, 3, 4)
-        if coact_data and 'strong_pairs' in coact_data:
-            # Since we don't store full matrix, visualize strong pairs as network
-            strong_pairs = coact_data.get('strong_pairs', [])
-
-            if strong_pairs:
-                # Create sparse representation of strong pairs
-                n_neurons = div_data['total_neurons']
-                sparse_coact = np.zeros((n_neurons, n_neurons))
-                for i, j, prob_ij, prob_ji in strong_pairs:
-                    sparse_coact[i, j] = prob_ij
-                    sparse_coact[j, i] = prob_ji
-
-                im4 = ax4.imshow(sparse_coact, cmap='YlOrRd', vmin=0, vmax=1)
-                ax4.set_title(f'Strong Co-activation Pairs (>{len(strong_pairs)} pairs)', fontsize=12, fontweight='bold')
-                ax4.set_xlabel('Neuron j')
-                ax4.set_ylabel('Neuron i')
-                plt.colorbar(im4, ax=ax4, label='Probability')
-            else:
-                ax4.text(0.5, 0.5, 'No strong co-activation pairs', ha='center', va='center')
-                ax4.set_title('Strong Co-activation Pairs', fontsize=12, fontweight='bold')
-        else:
-            ax4.text(0.5, 0.5, 'No co-activation data', ha='center', va='center')
-            ax4.set_title('Co-activation Probability', fontsize=12, fontweight='bold')
-
-        # 5. Activation Counts (if available)
-        ax5 = plt.subplot(2, 3, 5)
-        if coact_data and 'activation_counts' in coact_data:
-            activation_counts = np.array(coact_data['activation_counts'])
-            ax5.bar(range(len(activation_counts)), activation_counts, color='coral', alpha=0.7)
-            ax5.set_xlabel('Neuron ID')
-            ax5.set_ylabel('Activation Count')
-            ax5.set_title('Neuron Activation Frequency', fontsize=12, fontweight='bold')
-            ax5.axhline(activation_counts.mean(), color='blue', linestyle='--',
-                       label=f"Mean: {activation_counts.mean():.1f}")
-            ax5.legend()
-            ax5.grid(alpha=0.3, axis='y')
-        else:
-            ax5.text(0.5, 0.5, 'No activation data', ha='center', va='center')
-            ax5.set_title('Neuron Activation Frequency', fontsize=12, fontweight='bold')
-
-        # 6. Singular Value Distribution (Rank Analysis)
-        ax6 = plt.subplot(2, 3, 6)
-        U, S, V = torch.svd(neurons)
-        S_normalized = (S / S.sum()).cpu().numpy()  # Move to CPU before numpy conversion
-        ax6.plot(S_normalized, marker='o', markersize=3, alpha=0.7)
-        ax6.set_xlabel('Singular Value Index')
-        ax6.set_ylabel('Normalized Magnitude')
-        ax6.set_title('Singular Value Spectrum', fontsize=12, fontweight='bold')
-        ax6.set_yscale('log')
-        ax6.grid(alpha=0.3)
-        ax6.axhline(1.0/len(S_normalized), color='red', linestyle='--',
-                   label=f'Uniform (1/{len(S_normalized)})')
-        ax6.legend()
-
-        plt.tight_layout()
-        plt.savefig(roles_dir / f'neuron_roles_layer_{layer_idx}.png', dpi=150, bbox_inches='tight')
-        plt.close()
-
-        print(f"  Saved: neuron_roles_layer_{layer_idx}.png")
-
-    # Summary across layers
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    layers = list(range(n_layers))
-    mean_sims = [diversity_results[f'layer_{i}']['mean_similarity'] for i in layers]
-    rank_ratios = [diversity_results[f'layer_{i}']['rank_ratio'] for i in layers]
-    num_similar_pairs = [len(diversity_results[f'layer_{i}']['similar_pairs']) for i in layers]
-
-    # Mean similarity by layer
-    axes[0, 0].plot(layers, mean_sims, marker='o', linewidth=2, markersize=8)
-    axes[0, 0].set_xlabel('Layer')
-    axes[0, 0].set_ylabel('Mean Cosine Similarity')
-    axes[0, 0].set_title('Neuron Similarity Across Layers', fontweight='bold')
-    axes[0, 0].grid(alpha=0.3)
-    axes[0, 0].axhline(0.5, color='red', linestyle='--', alpha=0.5, label='High redundancy threshold')
-    axes[0, 0].legend()
-
-    # Rank ratio by layer
-    axes[0, 1].plot(layers, rank_ratios, marker='s', linewidth=2, markersize=8, color='green')
-    axes[0, 1].set_xlabel('Layer')
-    axes[0, 1].set_ylabel('Effective Rank Ratio')
-    axes[0, 1].set_title('Neuron Diversity Across Layers', fontweight='bold')
-    axes[0, 1].grid(alpha=0.3)
-    axes[0, 1].axhline(0.5, color='red', linestyle='--', alpha=0.5, label='Low diversity threshold')
-    axes[0, 1].legend()
-    axes[0, 1].set_ylim([0, 1])
-
-    # Highly similar pairs
-    axes[1, 0].bar(layers, num_similar_pairs, color='orange', alpha=0.7, edgecolor='black')
-    axes[1, 0].set_xlabel('Layer')
-    axes[1, 0].set_ylabel('Number of Pairs')
-    axes[1, 0].set_title('Highly Similar Neuron Pairs (>0.9)', fontweight='bold')
-    axes[1, 0].grid(alpha=0.3, axis='y')
-
-    # Co-activation stats (if available)
-    if all(f'layer_{i}' in coactivation_results for i in layers):
-        strong_coact_pairs = [len(coactivation_results[f'layer_{i}'].get('strong_pairs', [])) for i in layers]
-        axes[1, 1].bar(layers, strong_coact_pairs, color='purple', alpha=0.7, edgecolor='black')
-        axes[1, 1].set_xlabel('Layer')
-        axes[1, 1].set_ylabel('Number of Pairs')
-        axes[1, 1].set_title('Strong Co-activation Pairs (>0.8)', fontweight='bold')
-        axes[1, 1].grid(alpha=0.3, axis='y')
-    else:
-        axes[1, 1].text(0.5, 0.5, 'No co-activation data', ha='center', va='center',
-                       transform=axes[1, 1].transAxes)
-        axes[1, 1].set_title('Strong Co-activation Pairs', fontweight='bold')
-
-    plt.tight_layout()
-    plt.savefig(roles_dir / 'neuron_roles_summary.png', dpi=150, bbox_inches='tight')
-    plt.close()
-
-    print(f"  Saved: neuron_roles_summary.png")
-
-
 def main():
     parser = argparse.ArgumentParser(description='Analyze DAWN checkpoint')
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -1424,25 +909,10 @@ def main():
     print(f"Loading checkpoint: {best_model_path}")
     checkpoint = torch.load(best_model_path, map_location=device)
 
-    # 버전 감지
-    checkpoint_version = checkpoint.get('model_version', 'unknown')
-    current_version = DAWN.__version__
-    print(f"\n📌 Checkpoint version: {checkpoint_version}")
-    print(f"📌 Current model version: {current_version}")
-
-    if checkpoint_version == 'unknown':
-        print("   ⚠️  Old checkpoint (pre-versioning)")
-    elif checkpoint_version != current_version:
-        print(f"   ⚠️  Version mismatch - will attempt backward compatible loading")
-
     # 모델 생성
-    print("\nCreating model...")
+    print("Creating model...")
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     vocab_size = tokenizer.vocab_size
-
-    # Backward compatibility for config parameters
-    neuron_k = cfg['model'].get('neuron_k', cfg['model'].get('k', 8))
-    pattern_k = cfg['model'].get('pattern_k', 16)
 
     model = DAWN(
         vocab_size=vocab_size,
@@ -1451,8 +921,7 @@ def main():
         n_heads=cfg['model']['n_heads'],
         n_neurons=cfg['model']['n_neurons'],
         n_patterns=cfg['model']['n_patterns'],
-        neuron_k=neuron_k,
-        pattern_k=pattern_k,
+        k=cfg['model']['k'],
         d_ff=cfg['model'].get('d_ff', None),
         max_seq_len=cfg['model']['max_seq_len'],
         dropout=cfg['model']['dropout']
@@ -1465,23 +934,7 @@ def main():
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Load with strict=False to handle backward compatibility (connection weights)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-
-    # Check if missing keys are only connection weights (expected for old checkpoints)
-    connection_keys = [k for k in missing_keys if 'connection.weight' in k]
-    other_missing = [k for k in missing_keys if 'connection.weight' not in k]
-
-    if connection_keys:
-        print(f"\n⚠️  Loading checkpoint without inter-layer connections ({len(connection_keys)} layers)")
-        print("   Connection weights initialized to zero (equivalent to pre-connection model)")
-
-    if other_missing:
-        print(f"\n⚠️  Warning: Missing keys (not connection-related): {other_missing}")
-
-    if unexpected_keys:
-        print(f"\n⚠️  Warning: Unexpected keys in checkpoint: {unexpected_keys[:5]}...")
-
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
@@ -1533,32 +986,6 @@ def main():
     confidence_results = analyze_selection_confidence(collector, n_layers)
     position_pattern_results = analyze_position_patterns(collector, n_layers)
 
-    # 🧬 Neuron diversity 분석
-    diversity_results = analyze_neuron_diversity(model, n_layers)
-
-    # 🤝 Co-activation 분석
-    coactivation_results = analyze_neuron_coactivation(collector, n_neurons, n_layers)
-
-    # 🔗 Connection 분석 (있고 학습된 경우만)
-    has_connections = any(layer.router.has_connection for layer in model.layers)
-    if has_connections:
-        # Connection이 전부 0이면 (학습 안된 경우) 스킵
-        connection_stats = model.get_connection_stats()
-        has_learned_connections = any(
-            stats['std'] > 0.001 for stats in connection_stats.values()
-        )
-
-        if has_learned_connections:
-            visualize_connections(model, output_dir)
-            connection_pattern_results = analyze_connection_patterns(model, collector, n_layers, output_dir)
-        else:
-            print("\n⚠️  Connection weights are all zero (not trained) - skipping detailed analysis")
-            connection_pattern_results = {}
-    else:
-        print("\n⚠️  Model has no inter-layer connections - skipping connection analysis")
-        connection_pattern_results = {}
-        connection_stats = {}
-
     all_results = {
         'neuron_usage': neuron_usage_results,
         'token_neuron_specialization': token_spec_results,
@@ -1569,10 +996,6 @@ def main():
         'neuron_pattern_correlation': neuron_pattern_corr_results,  # ⭐ NEW
         'selection_confidence': confidence_results,  # ⭐ NEW
         'position_patterns': position_pattern_results,  # ⭐ NEW
-        'neuron_diversity': diversity_results,  # 🧬 NEW
-        'neuron_coactivation': coactivation_results,  # 🤝 NEW
-        'connection_patterns': connection_pattern_results,  # 🔗 NEW
-        'connection_stats': connection_stats,  # 🔗 NEW
     }
 
     # 저장
@@ -1583,9 +1006,6 @@ def main():
 
     # 시각화
     visualize_results(neuron_usage_results, output_dir)
-
-    # 뉴런 역할 시각화 (similarity, co-activation, clustering)
-    visualize_neuron_roles(diversity_results, coactivation_results, model, output_dir)
 
     # 리포트
     generate_report(all_results, output_dir, best_model_path)
@@ -1599,8 +1019,6 @@ def main():
     print("  - neuron_usage_distribution.png")
     print("  - layer_statistics.png")
     print("  - neuron_heatmap.png")
-    print("  - neuron_roles/ (similarity, co-activation, clustering)")
-    print("  - connections/ (connection matrices)")
 
 
 if __name__ == "__main__":

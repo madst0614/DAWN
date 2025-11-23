@@ -61,13 +61,20 @@ class CheckpointManager:
         filename = f"checkpoint_epoch{epoch}.pt"
         checkpoint_path = os.path.join(self.checkpoint_dir, filename)
 
+        # Get model version (handle torch.compile wrapper)
+        if hasattr(model, '_orig_mod'):
+            model_version = getattr(model._orig_mod, '__version__', 'unknown')
+        else:
+            model_version = getattr(model, '__version__', 'unknown')
+
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': loss,
             'metrics': metrics,
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'model_version': model_version  # 버전 저장
         }
 
         if scheduler is not None:

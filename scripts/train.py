@@ -2,11 +2,22 @@
 DAWN (Dynamic Architecture With Neurons) Training Script
 
 Usage:
-    # 기본 학습 (configs/train_config.yaml 사용)
+    # 기본 학습 (자동으로 최신 체크포인트 이어서 학습)
     python scripts/train.py
+
+    # 처음부터 새로 시작
+    python scripts/train.py --from-scratch
+
+    # 특정 체크포인트 폴더에서 이어서 학습
+    python scripts/train.py --resume checkpoints/run_20240101_120000_1234
 
     # 커스텀 config 파일 사용
     python scripts/train.py --config configs/my_config.yaml
+
+Checkpoint Options:
+    (기본)           - 자동으로 최신 best_model.pt 탐색 후 이어서 학습
+    --from-scratch   - 자동 탐색 비활성화, 처음부터 시작
+    --resume <폴더>  - 지정한 폴더의 best_model.pt에서 이어서 학습
 """
 
 import sys
@@ -16,6 +27,11 @@ from pathlib import Path
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# Suppress noisy torch inductor warnings
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
+warnings.filterwarnings('ignore', message='.*online softmax.*')
 
 import torch
 import torch.nn as nn
@@ -217,22 +233,31 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
 
 def analyze_activations(model, input_ids, device):
-    """새 DAWN 모델의 활성화 패턴 분석"""
+    """Dynamic Neuron Transformer 활성화 패턴 분석"""
     model.eval()
 
     with torch.no_grad():
-        _, all_activations = model(input_ids, return_activations=True)
+        _, all_selected, all_patterns = model(input_ids, return_activations=True)
 
     stats = {}
-    for layer_idx, acts in enumerate(all_activations):
-        input_acts = acts['input_activations']
-        process_acts = acts['process_activations']
+    for layer_idx, selected_idx in enumerate(all_selected):
+        # selected_idx: [B, S, k]
+        unique_neurons = torch.unique(selected_idx).numel()
+
+        # Get total neurons from model (updated for NeuronRouter)
+        if hasattr(model, '_orig_mod'):
+            # Compiled model
+            total_neurons = model._orig_mod.layers[layer_idx].router.n_neurons
+        else:
+            total_neurons = model.layers[layer_idx].router.n_neurons
+
+        usage_ratio = unique_neurons / total_neurons
 
         stats[f'layer_{layer_idx}'] = {
-            'input_mean': input_acts.mean().item(),
-            'input_sparsity': (input_acts < 0.1).float().mean().item(),
-            'process_mean': process_acts.mean().item(),
-            'process_sparsity': (process_acts < 0.1).float().mean().item(),
+            'unique_neurons': unique_neurons,
+            'total_neurons': total_neurons,
+            'usage_ratio': usage_ratio,
+            'k': selected_idx.shape[-1],
         }
 
     return stats
@@ -250,7 +275,9 @@ def main():
     parser.add_argument('--config', type=str, default='configs/train_config.yaml',
                         help='Path to config file')
     parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume from')
+                        help='Path to checkpoint folder to resume from (e.g., checkpoints/run_20240101_120000_1234)')
+    parser.add_argument('--from-scratch', action='store_true',
+                        help='Start training from scratch (disable auto-resume)')
     cli_args = parser.parse_args()
 
     # Load config
@@ -265,13 +292,25 @@ def main():
         pass
     args = Args()
 
-    # Model
+    # Model (Dynamic Neuron Transformer)
     args.d_model = cfg['model'].get('d_model', 512)
     args.n_layers = cfg['model'].get('n_layers', 6)
-    args.n_input = cfg['model'].get('n_input', 64)
-    args.n_process = cfg['model'].get('n_process', 128)
+    args.n_heads = cfg['model'].get('n_heads', 8)
+    args.n_neurons = cfg['model'].get('n_neurons', 1024)
+    args.n_patterns = cfg['model'].get('n_patterns', 512)
+
+    # Backward compatibility: neuron_k (new) vs k (old)
+    args.neuron_k = cfg['model'].get('neuron_k', cfg['model'].get('k', 8))
+    args.k = args.neuron_k  # Keep k for backward compatibility
+    args.pattern_k = cfg['model'].get('pattern_k', 16)
+
+    args.d_ff = cfg['model'].get('d_ff', None)  # Auto-calculate if None
     args.max_seq_len = cfg['model'].get('max_seq_len', 2048)
     args.dropout = cfg['model'].get('dropout', 0.1)
+
+    # Backward compatibility (deprecated)
+    args.n_input = cfg['model'].get('n_input', None)
+    args.n_process = cfg['model'].get('n_process', None)
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -293,9 +332,28 @@ def main():
     base_checkpoint_dir = Path(args.checkpoint_dir)
     base_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find latest checkpoint for auto-resume
+    # Checkpoint loading logic
     latest_best_checkpoint = None
-    if not cli_args.resume:
+    checkpoint_dir = None
+
+    if cli_args.resume:
+        # Explicit resume from folder - use existing folder
+        resume_folder = Path(cli_args.resume)
+        if not resume_folder.is_absolute():
+            resume_folder = Path(args.checkpoint_dir) / resume_folder.name
+
+        best_ckpt = resume_folder / 'best_model.pt'
+        if best_ckpt.exists():
+            latest_best_checkpoint = best_ckpt
+            checkpoint_dir = resume_folder  # Use existing folder
+            print(f"\n✓ Resuming from: {latest_best_checkpoint}")
+            print(f"✓ Continuing in same folder: {checkpoint_dir}")
+        else:
+            print(f"\n⚠️  Warning: Checkpoint not found at {best_ckpt}")
+            print(f"    Starting from scratch instead.")
+
+    elif not cli_args.from_scratch:
+        # Auto-resume: find latest checkpoint and use its folder
         run_folders = sorted([
             d for d in base_checkpoint_dir.iterdir()
             if d.is_dir() and d.name.startswith('run_')
@@ -306,30 +364,37 @@ def main():
             best_ckpt = latest_folder / 'best_model.pt'
             if best_ckpt.exists():
                 latest_best_checkpoint = best_ckpt
-                print(f"\nFound latest checkpoint: {latest_best_checkpoint}")
+                checkpoint_dir = latest_folder  # Use existing folder
+                print(f"\n✓ Auto-resume: Found latest checkpoint: {latest_best_checkpoint}")
+                print(f"✓ Continuing in same folder: {checkpoint_dir}")
 
-    # Create new run folder
-    import random
-    from datetime import timezone, timedelta
-    kst = timezone(timedelta(hours=9))
-    timestamp = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
-    random_suffix = random.randint(1000, 9999)
-    run_name = f"run_{timestamp}_{random_suffix}"
-    checkpoint_dir = base_checkpoint_dir / run_name
+    if cli_args.from_scratch:
+        print(f"\n✓ Starting from scratch (--from-scratch)")
+
+    # Create new run folder only if not resuming
+    if checkpoint_dir is None:
+        import random
+        from datetime import timezone, timedelta
+        kst = timezone(timedelta(hours=9))
+        timestamp = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
+        random_suffix = random.randint(1000, 9999)
+        run_name = f"run_{timestamp}_{random_suffix}"
+        checkpoint_dir = base_checkpoint_dir / run_name
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n✓ Created new run folder: {checkpoint_dir}")
+
+        # Save config for new runs
+        with open(checkpoint_dir / 'config.json', 'w') as f:
+            json.dump(cfg, f, indent=2)
+
     log_dir = checkpoint_dir
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"Run folder: {checkpoint_dir}")
 
-    # Save config
-    with open(checkpoint_dir / 'config.json', 'w') as f:
-        json.dump(cfg, f, indent=2)
-
     print(f"\n{'='*60}")
-    print(f"DAWN (Dynamic Architecture With Neurons) Training")
+    print(f"DAWN (Dynamic Neuron Transformer) Training")
     print(f"{'='*60}")
-    print(f"\nModel: hidden_dim={args.d_model}, n_layers={args.n_layers}")
-    print(f"Neurons: n_input={args.n_input}, n_process={args.n_process}")
+    print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
+    print(f"Neurons: pool_size={args.n_neurons}, patterns={args.n_patterns}, neuron_k={args.neuron_k}, pattern_k={args.pattern_k}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -356,12 +421,19 @@ def main():
         vocab_size=vocab_size,
         hidden_dim=args.d_model,
         num_layers=args.n_layers,
-        num_input_neurons=args.n_input,
-        num_process_neurons=args.n_process,
+        n_heads=args.n_heads,
+        n_neurons=args.n_neurons,
+        n_patterns=args.n_patterns,
+        k=args.k,
+        pattern_k=args.pattern_k,
+        d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
         dropout=args.dropout
     )
     model = model.to(device)
+
+    # Display model version
+    print(f"\n📌 Model version: {DAWN.__version__}")
 
     # PyTorch 2.0+ compilation for speed boost
     if hasattr(torch, 'compile'):
@@ -415,11 +487,11 @@ def main():
 
     # Resume from checkpoint
     start_epoch = 1
+    best_val_loss = float('inf')
     resume_checkpoint = None
 
-    if cli_args.resume:
-        resume_checkpoint = Path(cli_args.resume)
-    elif latest_best_checkpoint:
+    # Load checkpoint if resuming
+    if latest_best_checkpoint:
         resume_checkpoint = latest_best_checkpoint
 
     if resume_checkpoint and resume_checkpoint.exists():
@@ -443,7 +515,9 @@ def main():
         if 'scaler_state_dict' in checkpoint and scaler is not None:
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
         start_epoch = checkpoint.get('epoch', 0) + 1
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         print(f"  Starting from epoch {start_epoch}")
+        print(f"  Best val loss so far: {best_val_loss:.4f}")
     else:
         print(f"\nStarting fresh training")
 
@@ -451,19 +525,27 @@ def main():
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
     monitor = TrainingMonitor(str(log_dir))
 
-    # Training log file
+    # Training log file (append mode if resuming)
     training_log_file = checkpoint_dir / "training_log.txt"
 
-    with open(training_log_file, 'w') as f:
-        f.write("# Training Log (aggregated every 100 steps)\n")
-        f.write("# Format: epoch,step,loss,acc\n")
+    # Open in append mode if resuming, write mode if new
+    log_mode = 'a' if latest_best_checkpoint else 'w'
+    if log_mode == 'w':
+        with open(training_log_file, 'w') as f:
+            f.write("# Training Log\n")
+            f.write("# Step logs: epoch,step,loss,acc\n")
+            f.write("# Epoch summaries: EPOCH,epoch,train_loss,train_acc,val_loss,val_acc,lr,time\n")
+            f.write("\n")
+    else:
+        # Append separator for resumed training
+        with open(training_log_file, 'a') as f:
+            f.write(f"\n# === Resumed training at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
 
     # Training loop
     print(f"\n{'='*60}")
     print(f"Starting training...")
     print(f"  Training log: {training_log_file}")
     print(f"{'='*60}")
-    best_val_loss = float('inf')
 
     for epoch in range(start_epoch, args.num_epochs + 1):
         epoch_start = time.time()
@@ -495,15 +577,21 @@ def main():
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
 
+        # Write epoch summary to log
+        with open(training_log_file, 'a') as f:
+            f.write(f"EPOCH,{epoch},{train_loss:.6f},{train_acc:.6f},"
+                   f"{val_loss:.6f},{val_acc:.6f},"
+                   f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}\n")
+
         # Analyze activations periodically
         if epoch % 10 == 0:
             sample_batch = next(iter(val_loader))
             sample_ids = sample_batch['input_ids'][:1].to(device)
             act_stats = analyze_activations(model, sample_ids, device)
-            print(f"\n  Activation Analysis (Epoch {epoch}):")
+            print(f"\n  Neuron Usage Analysis (Epoch {epoch}):")
             for layer_name, stats in act_stats.items():
-                print(f"    {layer_name}: input_sparsity={stats['input_sparsity']:.2%}, "
-                      f"process_sparsity={stats['process_sparsity']:.2%}")
+                print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
+                      f"({stats['usage_ratio']:.2%} usage)")
 
         # Save checkpoint
         is_best = val_loss < best_val_loss
