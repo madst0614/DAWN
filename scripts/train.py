@@ -162,21 +162,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
                        f"acc={avg_window_acc:.6f}\n")
 
-            # Pattern usage analysis (training time)
-            model.eval()
-            with torch.no_grad():
-                sample_batch = input_ids[:1]  # Use first sample from current batch
-                _, _, patterns = model(sample_batch, return_activations=True)
-
-                pattern_usage_str = []
-                for i, p in enumerate(patterns):
-                    # Count active patterns (weight > 0.01)
-                    usage = (p > 0.01).float().sum(dim=-1).mean().item()
-                    pattern_usage_str.append(f"L{i}:{usage:.1f}/32")
-
-                print(f"  [Step {step+1}] Pattern usage: {' | '.join(pattern_usage_str)}")
-            model.train()
-
             # Reset window
             window_loss = 0.0
             window_acc_correct = 0
