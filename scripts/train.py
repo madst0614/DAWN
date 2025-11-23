@@ -54,7 +54,7 @@ from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dy
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                load_balancing_weight=0.1, orthogonality_weight=0.01):
+                orthogonality_weight=0.01):
     """Train for one epoch"""
     model.train()
 
@@ -96,12 +96,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ignore_index=-100
                 )
 
-                # Auxiliary losses (v4.4: configurable regularization)
-                pattern_load_loss = sum(losses['pattern_load'])
+                # Auxiliary losses (v5.0: only neuron orthogonality)
                 neuron_ortho_loss = sum(losses['neuron_ortho'])
 
                 # Total loss
-                loss = ce_loss + load_balancing_weight * pattern_load_loss + orthogonality_weight * neuron_ortho_loss
+                loss = ce_loss + orthogonality_weight * neuron_ortho_loss
 
             scaler.scale(loss).backward()
 
@@ -122,12 +121,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 ignore_index=-100
             )
 
-            # Auxiliary losses (v4.4: configurable regularization)
-            pattern_load_loss = sum(losses['pattern_load'])
+            # Auxiliary losses (v5.0: only neuron orthogonality)
             neuron_ortho_loss = sum(losses['neuron_ortho'])
 
             # Total loss
-            loss = ce_loss + load_balancing_weight * pattern_load_loss + orthogonality_weight * neuron_ortho_loss
+            loss = ce_loss + orthogonality_weight * neuron_ortho_loss
 
             loss.backward()
 
@@ -249,23 +247,23 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
 
 def analyze_activations(model, input_ids, device):
-    """Dynamic Neuron Transformer 활성화 패턴 분석"""
+    """Dynamic Neuron Transformer activation pattern analysis (v5.0)"""
     model.eval()
 
     with torch.no_grad():
-        _, all_selected, all_patterns = model(input_ids, return_activations=True)
+        _, all_selected = model(input_ids, return_activations=True)
 
     stats = {}
     for layer_idx, selected_idx in enumerate(all_selected):
         # selected_idx: [B, S, k]
         unique_neurons = torch.unique(selected_idx).numel()
 
-        # Get total neurons from model (updated for NeuronRouter)
+        # Get total neurons from model
         if hasattr(model, '_orig_mod'):
             # Compiled model
-            total_neurons = model._orig_mod.layers[layer_idx].router.n_neurons
+            total_neurons = model._orig_mod.layers[layer_idx].neuron_router.n_neurons
         else:
-            total_neurons = model.layers[layer_idx].router.n_neurons
+            total_neurons = model.layers[layer_idx].neuron_router.n_neurons
 
         usage_ratio = unique_neurons / total_neurons
 
@@ -325,9 +323,11 @@ def main():
     args.dropout = cfg['model'].get('dropout', 0.1)
     args.pattern_dropout = cfg['model'].get('pattern_dropout', 0.0)
 
-    # v4.5: Pattern-specific projection parameters
-    args.rank = cfg['model'].get('rank', 64)
-    args.use_base = cfg['model'].get('use_base', True)
+    # v5.0: Basis FFN parameters
+    args.neuron_rank = cfg['model'].get('neuron_rank', 16)
+    args.n_basis = cfg['model'].get('n_basis', 16)
+    args.basis_rank = cfg['model'].get('basis_rank', 8)
+    args.mod_rank = cfg['model'].get('mod_rank', 32)
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -340,8 +340,7 @@ def main():
     args.weight_decay = cfg['training']['weight_decay']
     args.warmup_epochs = cfg['training'].get('warmup_epochs', 1)
 
-    # v4.4: Regularization weights
-    args.load_balancing_weight = cfg['training'].get('load_balancing_weight', 0.1)
+    # v5.0: Regularization weights (only orthogonality)
     args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.01)
 
     # Other
@@ -426,7 +425,8 @@ def main():
     if config_version != DAWN.__version__ and config_version != 'not specified':
         print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
-    print(f"Neurons: pool_size={args.n_neurons}, patterns={args.n_patterns}, neuron_k={args.neuron_k}, pattern_k={args.pattern_k}")
+    print(f"Neurons: pool_size={args.n_neurons}, neuron_rank={args.neuron_rank}, neuron_k={args.neuron_k}")
+    print(f"Basis FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}, mod_rank={args.mod_rank}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -455,15 +455,14 @@ def main():
         num_layers=args.n_layers,
         n_heads=args.n_heads,
         n_neurons=args.n_neurons,
-        n_patterns=args.n_patterns,
-        k=args.k,
-        pattern_k=args.pattern_k,
-        rank=args.rank,
+        neuron_rank=args.neuron_rank,
+        neuron_k=args.k,
+        n_basis=args.n_basis,
+        basis_rank=args.basis_rank,
+        mod_rank=args.mod_rank,
         d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
-        dropout=args.dropout,
-        pattern_dropout=args.pattern_dropout,
-        use_base=args.use_base
+        dropout=args.dropout
     )
     model = model.to(device)
 
@@ -609,7 +608,6 @@ def main():
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args,
             scaler, tokenizer, log_file=str(training_log_file),
-            load_balancing_weight=args.load_balancing_weight,
             orthogonality_weight=args.orthogonality_weight
         )
 

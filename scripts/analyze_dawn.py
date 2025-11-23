@@ -45,7 +45,7 @@ from transformers import BertTokenizer
 # ============================================================
 
 class ActivationCollector:
-    """뉴런/패턴 선택 패턴 수집 (확장판)"""
+    """뉴런 선택 패턴 수집 (v5.0: neuron-only)"""
     def __init__(self, model, n_layers):
         self.model = model
         self.n_layers = n_layers
@@ -53,10 +53,7 @@ class ActivationCollector:
         # 뉴런 선택 기록
         self.neuron_selections = [[] for _ in range(n_layers)]
 
-        # 패턴 선택 기록 ⭐ NEW
-        self.pattern_selections = [[] for _ in range(n_layers)]
-
-        # 위치별 뉴런 선택 ⭐ NEW
+        # 위치별 뉴런 선택
         self.position_neuron_map = defaultdict(lambda: [[] for _ in range(n_layers)])
 
         # 토큰별 뉴런 선택
@@ -66,7 +63,7 @@ class ActivationCollector:
         self.correct_selections = [[] for _ in range(n_layers)]
         self.incorrect_selections = [[] for _ in range(n_layers)]
 
-    def collect(self, input_ids, labels, logits, all_selected, all_patterns=None):
+    def collect(self, input_ids, labels, logits, all_selected):
         """한 배치의 선택 패턴 수집 (최적화)"""
         B, S = input_ids.shape
 
@@ -86,12 +83,7 @@ class ActivationCollector:
             # 1. 전체 뉴런 선택 기록
             self.neuron_selections[layer_idx].append(selected_cpu)
 
-            # 2. 패턴 선택 기록
-            if all_patterns is not None:
-                pattern_weights = all_patterns[layer_idx]  # [B, S, n_patterns]
-                self.pattern_selections[layer_idx].append(pattern_weights.cpu())
-
-            # 3. 토큰별 + 위치별 뉴런 선택 (vectorized)
+            # 2. 토큰별 + 위치별 뉴런 선택 (vectorized)
             # Flatten: [B, S, k] → [B*S, k]
             selected_flat = selected_cpu.reshape(-1, selected_cpu.shape[-1])  # [B*S, k]
             tokens_flat = input_ids_cpu.reshape(-1)  # [B*S]
@@ -108,7 +100,7 @@ class ActivationCollector:
                 neurons = selected_cpu[:, s, :].reshape(-1).tolist()
                 self.position_neuron_map[s][layer_idx].extend(neurons)
 
-            # 4. 정확도별 뉴런 선택
+            # 3. 정확도별 뉴런 선택
             correct_neurons = selected_cpu[correct_mask.cpu()]
             incorrect_neurons = selected_cpu[~correct_mask.cpu()]
 
@@ -123,12 +115,6 @@ class ActivationCollector:
             if self.neuron_selections[layer_idx]:
                 self.neuron_selections[layer_idx] = torch.cat(
                     self.neuron_selections[layer_idx], dim=0
-                )
-
-            # 패턴 정보 병합 ⭐ NEW
-            if self.pattern_selections[layer_idx]:
-                self.pattern_selections[layer_idx] = torch.cat(
-                    self.pattern_selections[layer_idx], dim=0
                 )
 
             if self.correct_selections[layer_idx]:
@@ -2165,7 +2151,7 @@ def analyze_neuron_pattern_mapping_quality(model, dataloader, device, n_layers, 
             if tokenizer is not None:
                 input_ids, _ = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
 
-            _, selected_neurons, pattern_weights = model(input_ids, return_activations=True)
+            _, selected_neurons = model(input_ids, return_activations=True)
 
             for layer_idx in range(n_layers):
                 neurons = selected_neurons[layer_idx]  # [B, S, k]
@@ -2581,9 +2567,8 @@ def main():
 
     n_layers = cfg['model']['n_layers']
     n_neurons = cfg['model']['n_neurons']
-    n_patterns = cfg['model']['n_patterns']
 
-    print(f"\nModel: {n_layers} layers, {n_neurons} neurons/layer")
+    print(f"\nModel: {n_layers} layers, {n_neurons} neurons/layer (v5.0)")
     print(f"Validation loss: {checkpoint.get('val_loss', 'N/A')}")
     print(f"Epoch: {checkpoint.get('epoch', 'N/A')}")
 
@@ -2607,8 +2592,8 @@ def main():
             input_ids = batch['input_ids'].to(device)
             input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
 
-            logits, all_selected, all_patterns = model(input_ids, return_activations=True)
-            collector.collect(input_ids, labels, logits, all_selected, all_patterns)
+            logits, all_selected = model(input_ids, return_activations=True)
+            collector.collect(input_ids, labels, logits, all_selected)
 
     collector.finalize()
 
@@ -2620,21 +2605,23 @@ def main():
     layer_diff_results = analyze_layer_differences(neuron_usage_results)
     uncertainty_results = analyze_uncertainty_accuracy(collector, n_layers)
 
-    # ⭐ 새로운 분석
-    pattern_usage_results = analyze_pattern_usage(collector, n_patterns, n_layers)
-    pattern_collapse_results = analyze_pattern_collapse_detail(collector, n_patterns, n_layers)
-    neuron_pattern_corr_results = analyze_neuron_pattern_correlation(collector, n_layers)
-    confidence_results = analyze_selection_confidence(collector, n_layers)
-    position_pattern_results = analyze_position_patterns(collector, n_layers)
+    # ⭐ Pattern analysis (v5.0: disabled - no patterns in v5.0)
+    # pattern_usage_results = analyze_pattern_usage(collector, n_patterns, n_layers)
+    # pattern_collapse_results = analyze_pattern_collapse_detail(collector, n_patterns, n_layers)
+    # neuron_pattern_corr_results = analyze_neuron_pattern_correlation(collector, n_layers)
+    # confidence_results = analyze_selection_confidence(collector, n_layers)
+    # position_pattern_results = analyze_position_patterns(collector, n_layers)
 
-    # 🧬 Neuron diversity 분석
-    diversity_results = analyze_neuron_diversity(model, n_layers)
+    # 🧬 Neuron diversity 분석 (v5.0: disabled for now)
+    # diversity_results = analyze_neuron_diversity(model, n_layers)
 
     # 🤝 Co-activation 분석
     coactivation_results = analyze_neuron_coactivation(collector, n_neurons, n_layers)
 
-    # 🔬 Bottleneck 분석 (optional, can be slow)
-    if not args.skip_bottleneck:
+    print("\n✅ Analysis complete! (v5.0: pattern analyses disabled)")
+
+    # 🔬 Bottleneck 분석 (v5.0: disabled for simplicity)
+    if False and not args.skip_bottleneck:
         print("\n" + "="*70)
         print("🚀 RUNNING UNIFIED BOTTLENECK ANALYSIS (OPTIMIZED)")
         print("="*70)
