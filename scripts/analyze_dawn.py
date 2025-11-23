@@ -1278,12 +1278,484 @@ def visualize_neuron_roles(diversity_results, coactivation_results, model, outpu
     print(f"  Saved: neuron_roles_summary.png")
 
 
+# ============================================================
+# LAYER BOTTLENECK DIAGNOSIS
+# ============================================================
+
+def analyze_layer_bottleneck(model, dataloader, device, num_batches=50, tokenizer=None):
+    """Layer별 gradient 및 activation 분석"""
+    print("\n" + "="*70)
+    print("LAYER BOTTLENECK DIAGNOSIS")
+    print("="*70)
+
+    model.train()  # Enable gradients
+    stats = {
+        'gradients': defaultdict(list),
+        'activations': defaultdict(list),
+    }
+
+    n_layers = len(model.layers) if hasattr(model, 'layers') else len(model._orig_mod.layers)
+
+    for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Analyzing bottleneck")):
+        if batch_idx >= num_batches:
+            break
+
+        input_ids = batch['input_ids'].to(device)
+
+        # Apply MLM masking if tokenizer available
+        if tokenizer is not None:
+            input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+        else:
+            labels = input_ids.clone()
+
+        model.zero_grad()
+
+        # Forward with losses
+        logits, losses = model(input_ids, return_losses=True)
+
+        # Compute loss
+        B, S, V = logits.shape
+        loss = F.cross_entropy(
+            logits.view(B * S, V),
+            labels.view(B * S),
+            ignore_index=-100
+        )
+
+        # Add aux losses
+        aux_loss = sum(losses['pattern_load']) + sum(losses['neuron_ortho'])
+        total_loss = loss + 0.1 * aux_loss
+
+        # Backward
+        total_loss.backward()
+
+        # Collect gradients for each layer
+        for layer_idx in range(n_layers):
+            if hasattr(model, '_orig_mod'):
+                layer = model._orig_mod.layers[layer_idx]
+            else:
+                layer = model.layers[layer_idx]
+
+            # Router gradients
+            if layer.router.neurons.grad is not None:
+                router_grad = layer.router.neurons.grad.norm().item()
+            else:
+                router_grad = 0.0
+
+            # Pattern gradients
+            if layer.ffn.pattern_queries.grad is not None:
+                pattern_grad = layer.ffn.pattern_queries.grad.norm().item()
+            else:
+                pattern_grad = 0.0
+
+            stats['gradients'][layer_idx].append({
+                'router': router_grad,
+                'pattern': pattern_grad
+            })
+
+    model.eval()  # Back to eval
+
+    # Analyze results
+    results = {}
+    print(f"\nGradient Flow Analysis:")
+    print("-" * 70)
+
+    for layer_idx in range(n_layers):
+        router_grads = [s['router'] for s in stats['gradients'][layer_idx]]
+        pattern_grads = [s['pattern'] for s in stats['gradients'][layer_idx]]
+
+        avg_router = np.mean(router_grads)
+        avg_pattern = np.mean(pattern_grads)
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Router grad:  {avg_router:.6f}")
+        print(f"  Pattern grad: {avg_pattern:.6f}")
+
+        if avg_router < 0.001:
+            print(f"  🔴 WEAK GRADIENT: Router gradient very small!")
+        if avg_pattern < 0.001:
+            print(f"  🔴 WEAK GRADIENT: Pattern gradient very small!")
+
+        results[f'layer_{layer_idx}'] = {
+            'router_grad_mean': float(avg_router),
+            'router_grad_std': float(np.std(router_grads)),
+            'pattern_grad_mean': float(avg_pattern),
+            'pattern_grad_std': float(np.std(pattern_grads)),
+        }
+
+    # Compare across layers
+    print(f"\n{'='*70}")
+    print("Gradient Flow Comparison:")
+    print("-" * 70)
+
+    router_means = [results[f'layer_{i}']['router_grad_mean'] for i in range(n_layers)]
+    max_grad = max(router_means) if max(router_means) > 0 else 1.0
+
+    for layer_idx in range(n_layers):
+        ratio = router_means[layer_idx] / max_grad
+        bar = "█" * int(ratio * 50)
+        marker = " 🔴" if ratio < 0.3 else ""
+        print(f"  L{layer_idx}: {ratio:.3f} {bar}{marker}")
+
+    return results
+
+
+def analyze_information_flow(model, dataloader, device, num_batches=50):
+    """Layer간 정보 흐름 분석 (similarity, change, rank)"""
+    print("\n" + "="*70)
+    print("INFORMATION FLOW ANALYSIS")
+    print("="*70)
+
+    model.eval()
+
+    n_layers = len(model.layers) if hasattr(model, 'layers') else len(model._orig_mod.layers)
+    d_model = model.d_model if hasattr(model, 'd_model') else model._orig_mod.d_model
+
+    # Collect representations from each layer
+    representations = [[] for _ in range(n_layers + 1)]  # +1 for input
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Collecting representations")):
+            if batch_idx >= num_batches:
+                break
+
+            input_ids = batch['input_ids'].to(device)
+            B, S = input_ids.shape
+
+            # Get model reference
+            if hasattr(model, '_orig_mod'):
+                m = model._orig_mod
+            else:
+                m = model
+
+            # Embedding
+            pos = torch.arange(S, device=device).unsqueeze(0)
+            x = m.token_emb(input_ids) + m.pos_emb(pos)
+            x = m.dropout(x)
+
+            representations[0].append(x.cpu())
+
+            # Causal mask
+            mask = torch.tril(torch.ones(S, S, device=device)).unsqueeze(0).unsqueeze(0)
+
+            # Through layers
+            for layer_idx, layer in enumerate(m.layers):
+                x, _ = layer(x, mask)
+                representations[layer_idx + 1].append(x.cpu())
+
+    # Stack representations
+    for i in range(n_layers + 1):
+        representations[i] = torch.cat(representations[i], dim=0)  # [N, S, D]
+
+    # Analysis
+    results = {}
+
+    # 1. Cosine similarity to input
+    print(f"\nCosine Similarity to Input:")
+    print("-" * 70)
+
+    x0_flat = representations[0].view(-1, d_model)
+
+    for layer_idx in range(1, n_layers + 1):
+        x_flat = representations[layer_idx].view(-1, d_model)
+
+        # Sample if too large
+        if x0_flat.shape[0] > 10000:
+            idx = torch.randperm(x0_flat.shape[0])[:10000]
+            x0_sample = x0_flat[idx]
+            x_sample = x_flat[idx]
+        else:
+            x0_sample = x0_flat
+            x_sample = x_flat
+
+        cos_sim = F.cosine_similarity(x0_sample, x_sample, dim=-1).mean().item()
+
+        bar = "█" * int(cos_sim * 50)
+        marker = " 🔴" if cos_sim < 0.5 else ""
+        print(f"  After L{layer_idx-1}: {cos_sim:.3f} {bar}{marker}")
+
+        results[f'layer_{layer_idx-1}_input_sim'] = float(cos_sim)
+
+    # 2. Layer-to-layer change
+    print(f"\nLayer-to-Layer Change (L2 distance):")
+    print("-" * 70)
+
+    for layer_idx in range(n_layers):
+        x_prev = representations[layer_idx].view(-1, d_model)
+        x_next = representations[layer_idx + 1].view(-1, d_model)
+
+        # Sample if too large
+        if x_prev.shape[0] > 10000:
+            idx = torch.randperm(x_prev.shape[0])[:10000]
+            x_prev = x_prev[idx]
+            x_next = x_next[idx]
+
+        change = ((x_next - x_prev) ** 2).sum(dim=-1).sqrt().mean().item()
+
+        bar = "█" * int(min(change / 5.0, 1.0) * 50)
+        marker = " 🔴" if change > 8.0 else " ⚠️" if change > 5.0 else ""
+        print(f"  L{layer_idx}: {change:.3f} {bar}{marker}")
+
+        results[f'layer_{layer_idx}_change'] = float(change)
+
+    # 3. Effective rank
+    print(f"\nEffective Rank (representation diversity):")
+    print("-" * 70)
+
+    for layer_idx in range(n_layers + 1):
+        x_flat = representations[layer_idx].view(-1, d_model)
+
+        # Sample for efficiency
+        if x_flat.shape[0] > 5000:
+            idx = torch.randperm(x_flat.shape[0])[:5000]
+            x_flat = x_flat[idx]
+
+        # Compute covariance
+        x_centered = x_flat - x_flat.mean(dim=0, keepdim=True)
+        cov = torch.mm(x_centered.T, x_centered) / x_centered.shape[0]
+
+        # Eigenvalues
+        eigenvalues = torch.linalg.eigvalsh(cov)
+        eigenvalues = eigenvalues[eigenvalues > 1e-8]
+
+        if len(eigenvalues) == 0:
+            eff_rank = 0.0
+            rank_ratio = 0.0
+        else:
+            # Normalize
+            eigenvalues = eigenvalues / eigenvalues.sum()
+
+            # Effective rank
+            entropy_val = -(eigenvalues * torch.log(eigenvalues + 1e-10)).sum()
+            eff_rank = torch.exp(entropy_val).item()
+            rank_ratio = eff_rank / d_model
+
+        bar = "█" * int(rank_ratio * 50)
+        marker = " 🔴" if rank_ratio < 0.3 else " ⚠️" if rank_ratio < 0.5 else ""
+        name = "Input" if layer_idx == 0 else f"L{layer_idx-1}"
+        print(f"  {name:>5s}: {rank_ratio:.3f} ({eff_rank:.1f}/{d_model}) {bar}{marker}")
+
+        key = 'input_rank' if layer_idx == 0 else f'layer_{layer_idx-1}_rank'
+        results[key] = {
+            'effective_rank': float(eff_rank),
+            'rank_ratio': float(rank_ratio)
+        }
+
+    return results
+
+
+def analyze_task_pressure(model, dataloader, device, num_batches=30, tokenizer=None):
+    """각 레이어의 task pressure 측정 (ablation study)"""
+    print("\n" + "="*70)
+    print("TASK PRESSURE ANALYSIS (Ablation Study)")
+    print("="*70)
+
+    model.eval()
+
+    n_layers = len(model.layers) if hasattr(model, 'layers') else len(model._orig_mod.layers)
+    layer_contributions = defaultdict(list)
+
+    # Get model reference
+    if hasattr(model, '_orig_mod'):
+        m = model._orig_mod
+    else:
+        m = model
+
+    # Baseline: all layers
+    print("\nComputing baseline (all layers)...")
+    baseline_losses = []
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= num_batches:
+                break
+
+            input_ids = batch['input_ids'].to(device)
+
+            # Apply MLM masking if tokenizer available
+            if tokenizer is not None:
+                input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+            else:
+                labels = input_ids.clone()
+
+            logits = model(input_ids)
+            B, S, V = logits.shape
+            loss = F.cross_entropy(
+                logits.view(B * S, V),
+                labels.view(B * S),
+                ignore_index=-100
+            ).item()
+            baseline_losses.append(loss)
+
+    baseline_loss = np.mean(baseline_losses)
+    print(f"Baseline loss: {baseline_loss:.4f}")
+
+    # Ablate each layer
+    print("\nAblating each layer (identity function)...")
+
+    for layer_idx in tqdm(range(n_layers), desc="Layer ablation"):
+        # Save original forward
+        original_forward = m.layers[layer_idx].forward
+
+        # Define identity forward
+        def identity_forward(x, mask=None, **kwargs):
+            # Return x unchanged, with dummy outputs
+            return x, None
+
+        # Replace with identity
+        m.layers[layer_idx].forward = identity_forward
+
+        # Measure loss
+        ablated_losses = []
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                if batch_idx >= num_batches:
+                    break
+
+                input_ids = batch['input_ids'].to(device)
+
+                # Apply MLM masking if tokenizer available
+                if tokenizer is not None:
+                    input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+                else:
+                    labels = input_ids.clone()
+
+                logits = model(input_ids)
+                B, S, V = logits.shape
+                loss = F.cross_entropy(
+                    logits.view(B * S, V),
+                    labels.view(B * S),
+                    ignore_index=-100
+                ).item()
+                ablated_losses.append(loss)
+
+        # Restore original
+        m.layers[layer_idx].forward = original_forward
+
+        ablated_loss = np.mean(ablated_losses)
+        contribution = ablated_loss - baseline_loss
+        layer_contributions[layer_idx] = contribution
+
+    # Results
+    print(f"\n{'='*70}")
+    print("Layer Importance (loss increase when removed):")
+    print("-" * 70)
+
+    max_contrib = max(layer_contributions.values()) if layer_contributions else 1.0
+
+    results = {}
+    for layer_idx in range(n_layers):
+        contrib = layer_contributions[layer_idx]
+        importance = contrib / max_contrib if max_contrib > 0 else 0
+
+        bar = "█" * int(importance * 50)
+        marker = " 🔥" if importance > 0.8 else " ⚠️" if importance > 0.5 else ""
+
+        print(f"  L{layer_idx}: {contrib:+.4f} {bar}{marker}")
+
+        results[f'layer_{layer_idx}'] = {
+            'loss_increase': float(contrib),
+            'importance': float(importance)
+        }
+
+    return results
+
+
+def diagnose_bottleneck(all_results, n_layers):
+    """통합 진단: bottleneck 위치 파악"""
+    print("\n" + "="*70)
+    print("BOTTLENECK DIAGNOSIS SUMMARY")
+    print("="*70)
+
+    issues = defaultdict(list)
+
+    # Check each layer
+    for layer_idx in range(n_layers):
+        layer_key = f'layer_{layer_idx}'
+
+        # 1. Gradient flow
+        if 'bottleneck' in all_results:
+            grad_mean = all_results['bottleneck'][layer_key]['router_grad_mean']
+            if grad_mean < 0.001:
+                issues[layer_idx].append(f"Weak gradient ({grad_mean:.6f})")
+
+        # 2. Neuron usage
+        if 'neuron_usage' in all_results:
+            usage_ratio = all_results['neuron_usage'][layer_key]['usage_ratio']
+            if usage_ratio < 0.7:
+                issues[layer_idx].append(f"Low neuron usage ({usage_ratio:.1%})")
+
+        # 3. Pattern usage
+        if 'pattern_usage' in all_results:
+            pattern_gini = all_results['pattern_usage'][layer_key]['gini_coefficient']
+            if pattern_gini > 0.7:
+                issues[layer_idx].append(f"Pattern collapse (Gini={pattern_gini:.2f})")
+
+        # 4. Representation rank
+        if 'information_flow' in all_results:
+            rank_key = f'layer_{layer_idx}_rank'
+            if rank_key in all_results['information_flow']:
+                rank_ratio = all_results['information_flow'][rank_key]['rank_ratio']
+                if rank_ratio < 0.4:
+                    issues[layer_idx].append(f"Low diversity (rank={rank_ratio:.1%})")
+
+        # 5. Task pressure
+        if 'task_pressure' in all_results:
+            importance = all_results['task_pressure'][layer_key]['importance']
+            if importance > 0.8:
+                issues[layer_idx].append(f"High task pressure (importance={importance:.2f})")
+
+    # Report
+    print("\n🔍 Bottleneck Indicators:")
+    print("-" * 70)
+
+    bottleneck_layers = []
+    for layer_idx in range(n_layers):
+        if issues[layer_idx]:
+            print(f"\n  Layer {layer_idx}: 🔴 ISSUES FOUND")
+            for issue in issues[layer_idx]:
+                print(f"    - {issue}")
+            bottleneck_layers.append(layer_idx)
+        else:
+            print(f"\n  Layer {layer_idx}: ✅ OK")
+
+    # Summary
+    print(f"\n{'='*70}")
+    if bottleneck_layers:
+        print(f"⚠️  Potential bottlenecks detected in layers: {bottleneck_layers}")
+        print(f"\nRecommendations:")
+        for layer_idx in bottleneck_layers:
+            print(f"\n  Layer {layer_idx}:")
+            if any("gradient" in i for i in issues[layer_idx]):
+                print(f"    → Increase regularization weights")
+                print(f"    → Check learning rate")
+            if any("usage" in i for i in issues[layer_idx]):
+                print(f"    → Increase capacity (more neurons/patterns)")
+                print(f"    → Strengthen diversity regularization")
+            if any("collapse" in i for i in issues[layer_idx]):
+                print(f"    → Increase load balancing weight (0.1 → 0.2)")
+                print(f"    → Add pattern dropout")
+            if any("diversity" in i for i in issues[layer_idx]):
+                print(f"    → Increase orthogonality weight (0.01 → 0.02)")
+                print(f"    → Consider hard orthogonalization")
+            if any("pressure" in i for i in issues[layer_idx]):
+                print(f"    → This layer is critical - consider increasing its capacity")
+    else:
+        print(f"✅ No critical bottlenecks detected!")
+
+    return {
+        'bottleneck_layers': bottleneck_layers,
+        'issues': dict(issues)
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze DAWN checkpoint')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to checkpoint folder or .pt file')
     parser.add_argument('--num_batches', type=int, default=100,
                        help='Number of batches to analyze')
+    parser.add_argument('--skip_bottleneck', action='store_true',
+                       help='Skip bottleneck analysis (faster)')
     args = parser.parse_args()
 
     # 체크포인트 경로 처리
@@ -1434,6 +1906,17 @@ def main():
     # 🤝 Co-activation 분석
     coactivation_results = analyze_neuron_coactivation(collector, n_neurons, n_layers)
 
+    # 🔬 Bottleneck 분석 (optional, can be slow)
+    if not args.skip_bottleneck:
+        bottleneck_results = analyze_layer_bottleneck(model, val_loader, device, num_batches=50, tokenizer=tokenizer)
+        information_flow_results = analyze_information_flow(model, val_loader, device, num_batches=50)
+        task_pressure_results = analyze_task_pressure(model, val_loader, device, num_batches=30, tokenizer=tokenizer)
+    else:
+        print("\n⏩ Skipping bottleneck analysis (use --skip_bottleneck to skip)")
+        bottleneck_results = {}
+        information_flow_results = {}
+        task_pressure_results = {}
+
     all_results = {
         'neuron_usage': neuron_usage_results,
         'token_neuron_specialization': token_spec_results,
@@ -1446,7 +1929,15 @@ def main():
         'position_patterns': position_pattern_results,  # ⭐ NEW
         'neuron_diversity': diversity_results,  # 🧬 NEW
         'neuron_coactivation': coactivation_results,  # 🤝 NEW
+        'bottleneck': bottleneck_results,  # 🔬 NEW
+        'information_flow': information_flow_results,  # 🔬 NEW
+        'task_pressure': task_pressure_results,  # 🔬 NEW
     }
+
+    # 🎯 통합 진단
+    if not args.skip_bottleneck:
+        diagnosis_results = diagnose_bottleneck(all_results, n_layers)
+        all_results['diagnosis'] = diagnosis_results
 
     # 저장
     print(f"\nSaving results to: {output_dir}")
@@ -1473,6 +1964,14 @@ def main():
     print("  - layer_statistics.png")
     print("  - neuron_heatmap.png")
     print("  - neuron_roles/ (similarity, co-activation, clustering)")
+    if not args.skip_bottleneck:
+        print("\n🔬 Bottleneck Diagnosis:")
+        print("  - Gradient flow analysis")
+        print("  - Information flow (similarity, change, rank)")
+        print("  - Task pressure (layer ablation)")
+        print("  - Integrated bottleneck diagnosis")
+
+    print("\n" + "="*70)
 
 
 if __name__ == "__main__":
