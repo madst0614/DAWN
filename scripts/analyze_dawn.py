@@ -880,7 +880,7 @@ def analyze_position_patterns(collector, n_layers, max_positions=128):
 
 
 def analyze_neuron_coactivation(collector, n_neurons, n_layers):
-    """뉴런 co-activation 패턴 분석 - 어떤 뉴런들이 함께 선택되나?"""
+    """뉴런 co-activation 패턴 분석 - 어떤 뉴런들이 함께 선택되나? (병렬 최적화)"""
     print("\n" + "="*70)
     print("NEURON CO-ACTIVATION ANALYSIS")
     print("="*70)
@@ -894,53 +894,65 @@ def analyze_neuron_coactivation(collector, n_neurons, n_layers):
         selected_neurons = collector.neuron_selections[layer_idx]  # [N, S, k]
         N, S, k = selected_neurons.shape
 
-        # Initialize co-activation matrix
-        coactivation = torch.zeros(n_neurons, n_neurons)
-        neuron_activation_count = torch.zeros(n_neurons)
+        # 🚀 Vectorized co-activation counting using one-hot encoding
+        # Create one-hot representation: [N, S, n_neurons]
+        device = selected_neurons.device
+        one_hot = torch.zeros(N, S, n_neurons, dtype=torch.float32, device=device)
 
-        # Count co-activations
-        for b in range(N):
-            for s in range(S):
-                neurons = selected_neurons[b, s]
+        # Scatter ones at selected neuron positions
+        one_hot.scatter_(2, selected_neurons, 1.0)
 
-                # Count individual activations
-                for n in neurons:
-                    neuron_activation_count[n] += 1
+        # Activation counts: sum over batch and sequence
+        neuron_activation_count = one_hot.sum(dim=(0, 1))  # [n_neurons]
 
-                # Count co-activations
-                for i in range(k):
-                    for j in range(k):
-                        if i != j:
-                            coactivation[neurons[i], neurons[j]] += 1
+        # Co-activation matrix: outer product then sum
+        # [N, S, n_neurons, 1] @ [N, S, 1, n_neurons] -> [N, S, n_neurons, n_neurons]
+        # Then sum over N, S -> [n_neurons, n_neurons]
+        coactivation = torch.einsum('nsi,nsj->ij', one_hot, one_hot)  # Faster than matmul
 
-        # Normalize by activation counts to get co-activation probability
-        # P(j | i) = coactivation[i, j] / activation_count[i]
-        coactivation_prob = torch.zeros_like(coactivation)
-        for i in range(n_neurons):
-            if neuron_activation_count[i] > 0:
-                coactivation_prob[i, :] = coactivation[i, :] / neuron_activation_count[i]
+        # Remove self-activation (diagonal)
+        coactivation.fill_diagonal_(0)
 
-        # Find strong co-activation patterns (mutual high probability)
-        strong_pairs = []
+        # Move to CPU for further processing
+        coactivation = coactivation.cpu()
+        neuron_activation_count = neuron_activation_count.cpu()
+
+        # Normalize to get co-activation probability P(j | i)
+        # Use broadcasting to avoid loop
+        coactivation_prob = coactivation / (neuron_activation_count.unsqueeze(1) + 1e-10)
+
+        # Find strong co-activation patterns (vectorized)
         threshold = 0.8
-        for i in range(n_neurons):
-            for j in range(i+1, n_neurons):
-                prob_ij = coactivation_prob[i, j].item()
-                prob_ji = coactivation_prob[j, i].item()
-                if prob_ij > threshold and prob_ji > threshold:
-                    strong_pairs.append((i, j, prob_ij, prob_ji))
+        # Create mask for upper triangle (avoid duplicates)
+        mask = torch.triu(torch.ones_like(coactivation_prob, dtype=torch.bool), diagonal=1)
+        # Mutual high probability: both P(j|i) and P(i|j) > threshold
+        mutual_mask = mask & (coactivation_prob > threshold) & (coactivation_prob.T > threshold)
+
+        # Get indices where condition is true
+        strong_indices = torch.nonzero(mutual_mask, as_tuple=False)
+
+        # Extract probabilities
+        strong_pairs = []
+        for idx in strong_indices:
+            i, j = idx[0].item(), idx[1].item()
+            prob_ij = coactivation_prob[i, j].item()
+            prob_ji = coactivation_prob[j, i].item()
+            strong_pairs.append((i, j, prob_ij, prob_ji))
 
         # Statistics
         active_neurons = (neuron_activation_count > 0).sum().item()
-        avg_coactivation = coactivation_prob[neuron_activation_count > 0].mean().item()
+        active_mask = neuron_activation_count > 0
+        avg_coactivation = coactivation_prob[active_mask, :][:, active_mask].mean().item() if active_mask.any() else 0.0
 
+        # Save only summary stats (matrices are too large for JSON)
         results[f'layer_{layer_idx}'] = {
-            'coactivation_matrix': coactivation.numpy().tolist(),
-            'coactivation_prob': coactivation_prob.numpy().tolist(),
             'activation_counts': neuron_activation_count.numpy().tolist(),
             'strong_pairs': strong_pairs[:20],  # Top 20 strong pairs
             'active_neurons': int(active_neurons),
-            'avg_coactivation_prob': float(avg_coactivation)
+            'avg_coactivation_prob': float(avg_coactivation),
+            # Store matrix shape info instead of full matrix
+            'coactivation_matrix_shape': list(coactivation.shape),
+            'coactivation_prob_shape': list(coactivation_prob.shape),
         }
 
         print(f"\nLayer {layer_idx}:")
@@ -998,15 +1010,23 @@ def analyze_neuron_diversity(model, n_layers):
         mask = ~torch.eye(similarity.shape[0], dtype=torch.bool, device=similarity.device)
         off_diag_sim = similarity[mask]
 
-        # Find highly similar pairs
-        similar_pairs = []
+        # Find highly similar pairs (vectorized)
         threshold = 0.9
         similarity_cpu = similarity.cpu()
         n_neurons = similarity.shape[0]
-        for i in range(n_neurons):
-            for j in range(i+1, n_neurons):
-                if abs(similarity_cpu[i, j].item()) > threshold:
-                    similar_pairs.append((i, j, similarity_cpu[i, j].item()))
+
+        # Create upper triangular mask (avoid duplicates and diagonal)
+        triu_mask = torch.triu(torch.ones(n_neurons, n_neurons, dtype=torch.bool), diagonal=1)
+
+        # Find pairs with similarity > threshold
+        high_sim_mask = triu_mask & (torch.abs(similarity_cpu) > threshold)
+        pair_indices = torch.nonzero(high_sim_mask, as_tuple=False)
+
+        # Extract pairs with their similarity values
+        similar_pairs = [
+            (i.item(), j.item(), similarity_cpu[i, j].item())
+            for i, j in pair_indices
+        ]
 
         # Hierarchical clustering
         try:
