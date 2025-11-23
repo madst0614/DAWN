@@ -1440,6 +1440,10 @@ def main():
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     vocab_size = tokenizer.vocab_size
 
+    # Backward compatibility for config parameters
+    neuron_k = cfg['model'].get('neuron_k', cfg['model'].get('k', 8))
+    pattern_k = cfg['model'].get('pattern_k', 16)
+
     model = DAWN(
         vocab_size=vocab_size,
         hidden_dim=cfg['model']['d_model'],
@@ -1447,7 +1451,8 @@ def main():
         n_heads=cfg['model']['n_heads'],
         n_neurons=cfg['model']['n_neurons'],
         n_patterns=cfg['model']['n_patterns'],
-        k=cfg['model']['k'],
+        neuron_k=neuron_k,
+        pattern_k=pattern_k,
         d_ff=cfg['model'].get('d_ff', None),
         max_seq_len=cfg['model']['max_seq_len'],
         dropout=cfg['model']['dropout']
