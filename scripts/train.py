@@ -332,7 +332,7 @@ def main():
     # v5.0: Basis FFN parameters
     args.neuron_rank = cfg['model'].get('neuron_rank', 16)
     args.n_basis = cfg['model'].get('n_basis', 16)
-    args.basis_rank = cfg['model'].get('basis_rank', 8)
+    args.basis_rank = cfg['model'].get('basis_rank', 32)  # v5.1: increased from 8 to 32
     args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored in v5.1)
 
     # Backward compatibility (deprecated)

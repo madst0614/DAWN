@@ -21,7 +21,7 @@ model:
 
   # Basis FFN (v5.1: Coarse + Fine)
   n_basis: 16             # Number of basis FFN blocks
-  basis_rank: 8           # Low-rank dimension for basis FFNs
+  basis_rank: 32          # Basis rank (8→32 for better expressiveness, 4x capacity)
   # Token residual network: d_model → 256 → d_ff (fixed architecture)
 
   # Architecture

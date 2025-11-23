@@ -117,7 +117,7 @@ class BasisFFN(nn.Module):
     """
 
     def __init__(self, n_neurons=512, d_model=256, d_ff=1024,
-                 n_basis=16, basis_rank=8, mod_rank=None):
+                 n_basis=16, basis_rank=32, mod_rank=None):
         super().__init__()
 
         # Backward compatibility: mod_rank ignored in v5.1
@@ -304,7 +304,7 @@ class Layer(nn.Module):
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
                  n_neurons=512, neuron_rank=16, neuron_k=16,
-                 n_basis=16, basis_rank=8, mod_rank=None):
+                 n_basis=16, basis_rank=32, mod_rank=None):
         super().__init__()
 
         # Backward compatibility: mod_rank ignored in v5.1
@@ -393,7 +393,7 @@ class DAWN(nn.Module):
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=512, neuron_rank=16, neuron_k=16,
-                 n_basis=16, basis_rank=8, mod_rank=None,
+                 n_basis=16, basis_rank=32, mod_rank=None,
                  max_seq_len=512, dropout=0.1,
                  # Backward compatibility (v5.0 and earlier)
                  hidden_dim=None, num_layers=None, k=None,
