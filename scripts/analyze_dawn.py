@@ -2522,17 +2522,19 @@ def main():
 
     # Backward compatibility for config parameters
     neuron_k = cfg['model'].get('neuron_k', cfg['model'].get('k', 8))
-    pattern_k = cfg['model'].get('pattern_k', 16)
 
+    # v5.0: Model creation
     model = DAWN(
         vocab_size=vocab_size,
         hidden_dim=cfg['model']['d_model'],
         num_layers=cfg['model']['n_layers'],
         n_heads=cfg['model']['n_heads'],
         n_neurons=cfg['model']['n_neurons'],
-        n_patterns=cfg['model']['n_patterns'],
+        neuron_rank=cfg['model'].get('neuron_rank', 16),
         neuron_k=neuron_k,
-        pattern_k=pattern_k,
+        n_basis=cfg['model'].get('n_basis', 16),
+        basis_rank=cfg['model'].get('basis_rank', 8),
+        mod_rank=cfg['model'].get('mod_rank', 32),
         d_ff=cfg['model'].get('d_ff', None),
         max_seq_len=cfg['model']['max_seq_len'],
         dropout=cfg['model']['dropout']
