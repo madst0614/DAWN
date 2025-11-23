@@ -390,7 +390,7 @@ def main():
     print(f"DAWN (Dynamic Neuron Transformer) Training")
     print(f"{'='*60}")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
-    print(f"Neurons: pool_size={args.n_neurons}, patterns={args.n_patterns}, top_k={args.k}")
+    print(f"Neurons: pool_size={args.n_neurons}, patterns={args.n_patterns}, neuron_k={args.neuron_k}, pattern_k={args.pattern_k}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
