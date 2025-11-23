@@ -2075,6 +2075,310 @@ def analyze_regularization_impact(model, dataloader, device, tokenizer=None, num
     return results
 
 
+def analyze_pattern_diversity(model, n_layers):
+    """패턴 간 실제 차이 분석 - 패턴들이 진짜 다른가?"""
+    print("\n" + "="*70)
+    print("PATTERN DIVERSITY ANALYSIS (Are Patterns Actually Different?)")
+    print("="*70)
+
+    if hasattr(model, '_orig_mod'):
+        m = model._orig_mod
+    else:
+        m = model
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        layer = m.layers[layer_idx]
+        patterns = layer.ffn.pattern_queries.data  # [n_patterns, d_model]
+
+        # Cosine similarity matrix
+        patterns_norm = F.normalize(patterns, dim=1)
+        similarity = torch.mm(patterns_norm, patterns_norm.T)  # [n_patterns, n_patterns]
+
+        # 대각선 제외
+        n_patterns = patterns.shape[0]
+        mask = ~torch.eye(n_patterns, dtype=torch.bool, device=similarity.device)
+        off_diag = similarity[mask]
+
+        avg_sim = off_diag.mean().item()
+        max_sim = off_diag.max().item()
+        min_sim = off_diag.min().item()
+        std_sim = off_diag.std().item()
+
+        # Effective diversity (1 - avg similarity)
+        eff_diversity = 1 - avg_sim
+
+        # Count highly similar pairs
+        high_sim_threshold = 0.9
+        high_sim_pairs = (off_diag > high_sim_threshold).sum().item()
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Pattern similarity (off-diagonal):")
+        print(f"    Mean: {avg_sim:.4f}")
+        print(f"    Max:  {max_sim:.4f}")
+        print(f"    Min:  {min_sim:.4f}")
+        print(f"    Std:  {std_sim:.4f}")
+        print(f"  Effective diversity: {eff_diversity:.4f}")
+        print(f"  Highly similar pairs (>0.9): {high_sim_pairs}/{len(off_diag)}")
+
+        # Warnings
+        if avg_sim > 0.9:
+            print(f"  🔴 CRITICAL: Patterns are almost identical (avg sim {avg_sim:.3f})")
+            print(f"     → No diversity from initialization")
+        elif avg_sim > 0.7:
+            print(f"  ⚠️  WARNING: Patterns are very similar (avg sim {avg_sim:.3f})")
+        else:
+            print(f"  ✅ Patterns have reasonable diversity")
+
+        results[f'layer_{layer_idx}'] = {
+            'mean_similarity': float(avg_sim),
+            'max_similarity': float(max_sim),
+            'min_similarity': float(min_sim),
+            'std_similarity': float(std_sim),
+            'effective_diversity': float(eff_diversity),
+            'high_sim_pairs': int(high_sim_pairs),
+            'total_pairs': int(len(off_diag)),
+        }
+
+    return results
+
+
+def analyze_neuron_pattern_mapping_quality(model, dataloader, device, n_layers, tokenizer=None, num_batches=50):
+    """뉴런 → 패턴 매핑의 일관성 분석"""
+    print("\n" + "="*70)
+    print("NEURON-PATTERN MAPPING QUALITY")
+    print("="*70)
+
+    model.eval()
+
+    # Collect neuron-pattern mappings
+    neuron_to_patterns = [defaultdict(lambda: defaultdict(int)) for _ in range(n_layers)]
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Collecting neuron-pattern mappings")):
+            if batch_idx >= num_batches:
+                break
+
+            input_ids = batch['input_ids'].to(device)
+
+            if tokenizer is not None:
+                input_ids, _ = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+
+            _, selected_neurons, pattern_weights = model(input_ids, return_activations=True)
+
+            for layer_idx in range(n_layers):
+                neurons = selected_neurons[layer_idx]  # [B, S, k]
+                patterns = pattern_weights[layer_idx]  # [B, S, n_patterns]
+
+                B, S, k = neurons.shape
+
+                for b in range(B):
+                    for s in range(S):
+                        # 뉴런 조합을 tuple로
+                        neuron_set = tuple(sorted(neurons[b, s].cpu().tolist()))
+
+                        # 선택된 패턴 (top-1)
+                        pattern_id = patterns[b, s].argmax().item()
+
+                        neuron_to_patterns[layer_idx][neuron_set][pattern_id] += 1
+
+    # Analysis
+    results = {}
+
+    print("\n" + "-" * 70)
+    print("Neuron Set → Pattern Mapping Consistency:")
+    print("-" * 70)
+
+    for layer_idx in range(n_layers):
+        mappings = neuron_to_patterns[layer_idx]
+
+        if not mappings:
+            continue
+
+        # 각 뉴런 조합이 몇 개의 다른 패턴을 선택하나?
+        pattern_counts = []
+        consistencies = []
+
+        for neuron_set, pattern_dist in mappings.items():
+            num_patterns = len(pattern_dist)
+            pattern_counts.append(num_patterns)
+
+            # Consistency: 가장 많이 선택된 패턴의 비율
+            total = sum(pattern_dist.values())
+            max_count = max(pattern_dist.values())
+            consistency = max_count / total if total > 0 else 0
+            consistencies.append(consistency)
+
+        avg_patterns = np.mean(pattern_counts)
+        max_patterns = np.max(pattern_counts)
+
+        # 1:1 매핑 비율
+        one_to_one = sum(1 for c in pattern_counts if c == 1)
+        one_to_one_ratio = one_to_one / len(mappings) if len(mappings) > 0 else 0
+
+        avg_consistency = np.mean(consistencies)
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Unique neuron sets: {len(mappings):,}")
+        print(f"  Avg patterns per neuron set: {avg_patterns:.2f}")
+        print(f"  Max patterns per neuron set: {max_patterns}")
+        print(f"  One-to-one mappings: {one_to_one:,}/{len(mappings):,} ({one_to_one_ratio*100:.1f}%)")
+        print(f"  Avg consistency: {avg_consistency:.4f}")
+
+        # Interpretation
+        if one_to_one_ratio > 0.99:
+            print(f"  🔴 DETERMINISTIC: >99% one-to-one mapping!")
+            print(f"     → Patterns completely determined by neurons")
+            print(f"     → No context-dependent selection")
+        elif one_to_one_ratio > 0.9:
+            print(f"  ⚠️  HIGHLY DETERMINISTIC: {one_to_one_ratio*100:.1f}% one-to-one")
+        elif avg_consistency > 0.9:
+            print(f"  ⚠️  MOSTLY CONSISTENT: Same neurons → mostly same pattern")
+        else:
+            print(f"  ✅ Context-dependent: Same neurons can select different patterns")
+
+        results[f'layer_{layer_idx}'] = {
+            'unique_neuron_sets': int(len(mappings)),
+            'avg_patterns_per_set': float(avg_patterns),
+            'max_patterns_per_set': int(max_patterns),
+            'one_to_one_mappings': int(one_to_one),
+            'one_to_one_ratio': float(one_to_one_ratio),
+            'avg_consistency': float(avg_consistency),
+        }
+
+    return results
+
+
+def analyze_pattern_ffn_impact(model, dataloader, device, n_layers, tokenizer=None, num_batches=30):
+    """패턴이 FFN 출력에 미치는 실제 영향 측정"""
+    print("\n" + "="*70)
+    print("PATTERN FFN IMPACT ANALYSIS")
+    print("="*70)
+
+    model.eval()
+
+    if hasattr(model, '_orig_mod'):
+        m = model._orig_mod
+    else:
+        m = model
+
+    # Save original pattern queries
+    original_queries = [
+        layer.ffn.pattern_queries.data.clone()
+        for layer in m.layers
+    ]
+
+    def measure_output_diff(mode='uniform'):
+        """Measure output difference with modified patterns"""
+        total_diff = 0.0
+        total_norm = 0.0
+        layer_diffs = [0.0 for _ in range(n_layers)]
+        layer_norms = [0.0 for _ in range(n_layers)]
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                if batch_idx >= num_batches:
+                    break
+
+                input_ids = batch['input_ids'].to(device)
+
+                if tokenizer is not None:
+                    input_ids, _ = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+
+                # Normal forward
+                logits_normal = model(input_ids)
+
+                # Modified patterns
+                if mode == 'uniform':
+                    for layer in m.layers:
+                        layer.ffn.pattern_queries.data.fill_(0.01)
+                elif mode == 'random':
+                    for layer in m.layers:
+                        layer.ffn.pattern_queries.data.normal_(0, 0.02)
+
+                logits_modified = model(input_ids)
+
+                # Restore
+                for layer, orig in zip(m.layers, original_queries):
+                    layer.ffn.pattern_queries.data.copy_(orig)
+
+                # Measure difference
+                diff = (logits_normal - logits_modified).abs().mean().item()
+                norm = logits_normal.abs().mean().item()
+
+                total_diff += diff
+                total_norm += norm
+
+        avg_diff = total_diff / num_batches
+        avg_norm = total_norm / num_batches
+        relative_diff = avg_diff / avg_norm if avg_norm > 0 else 0
+
+        return avg_diff, relative_diff
+
+    # Test different modifications
+    print("\nLogits change when patterns are modified:")
+    print("-" * 70)
+
+    uniform_diff, uniform_rel = measure_output_diff('uniform')
+    print(f"\nUniform patterns:")
+    print(f"  Absolute diff: {uniform_diff:.6f}")
+    print(f"  Relative diff: {uniform_rel*100:.2f}%")
+
+    if uniform_rel < 0.01:
+        print(f"  🔴 CRITICAL: <1% change - patterns have NO effect!")
+    elif uniform_rel < 0.05:
+        print(f"  ⚠️  WARNING: <5% change - patterns have minimal effect")
+    else:
+        print(f"  ✅ Patterns have significant effect")
+
+    random_diff, random_rel = measure_output_diff('random')
+    print(f"\nRandom patterns:")
+    print(f"  Absolute diff: {random_diff:.6f}")
+    print(f"  Relative diff: {random_rel*100:.2f}%")
+
+    # Layer-wise analysis
+    print(f"\n{'='*70}")
+    print("Layer-wise Pattern Impact:")
+    print("-" * 70)
+
+    layer_impacts = []
+
+    for ablate_layer_idx in range(n_layers):
+        # Uniform only this layer
+        for layer_idx, layer in enumerate(m.layers):
+            if layer_idx == ablate_layer_idx:
+                layer.ffn.pattern_queries.data.fill_(0.01)
+
+        layer_diff, layer_rel = measure_output_diff('uniform')
+
+        # Restore
+        for layer, orig in zip(m.layers, original_queries):
+            layer.ffn.pattern_queries.data.copy_(orig)
+
+        layer_impacts.append(layer_rel)
+
+        print(f"  L{ablate_layer_idx}: {layer_rel*100:.2f}% change")
+
+    # Identify most important layer
+    max_impact_layer = np.argmax(layer_impacts)
+    print(f"\n  Most impactful layer: L{max_impact_layer} ({layer_impacts[max_impact_layer]*100:.2f}%)")
+
+    results = {
+        'uniform_absolute_diff': float(uniform_diff),
+        'uniform_relative_diff': float(uniform_rel),
+        'random_absolute_diff': float(random_diff),
+        'random_relative_diff': float(random_rel),
+        'layer_impacts': {
+            f'layer_{i}': float(impact)
+            for i, impact in enumerate(layer_impacts)
+        },
+        'most_impactful_layer': int(max_impact_layer),
+    }
+
+    return results
+
+
 def diagnose_bottleneck(all_results, n_layers):
     """통합 진단: bottleneck 위치 파악"""
     print("\n" + "="*70)
@@ -2331,6 +2635,11 @@ def main():
         gradient_detailed_results = analyze_gradient_flow_detailed(model, val_loader, device, num_batches=30, tokenizer=tokenizer)
         pattern_necessity_results = analyze_pattern_necessity(model, val_loader, device, tokenizer=tokenizer, num_batches=50)
         regularization_impact_results = analyze_regularization_impact(model, val_loader, device, tokenizer=tokenizer, num_batches=50)
+
+        # 🎯 Pattern-specific deep dives
+        pattern_diversity_results = analyze_pattern_diversity(model, n_layers)
+        neuron_pattern_mapping_results = analyze_neuron_pattern_mapping_quality(model, val_loader, device, n_layers, tokenizer=tokenizer, num_batches=50)
+        pattern_ffn_impact_results = analyze_pattern_ffn_impact(model, val_loader, device, n_layers, tokenizer=tokenizer, num_batches=30)
     else:
         print("\n⏩ Skipping bottleneck analysis (use --skip_bottleneck to skip)")
         bottleneck_results = {}
@@ -2339,6 +2648,9 @@ def main():
         gradient_detailed_results = {}
         pattern_necessity_results = {}
         regularization_impact_results = {}
+        pattern_diversity_results = {}
+        neuron_pattern_mapping_results = {}
+        pattern_ffn_impact_results = {}
 
     all_results = {
         'neuron_usage': neuron_usage_results,
@@ -2358,6 +2670,9 @@ def main():
         'gradient_detailed': gradient_detailed_results,  # 🔍 NEW
         'pattern_necessity': pattern_necessity_results,  # 🔍 NEW
         'regularization_impact': regularization_impact_results,  # 🔍 NEW
+        'pattern_diversity': pattern_diversity_results,  # 🎯 NEW
+        'neuron_pattern_mapping': neuron_pattern_mapping_results,  # 🎯 NEW
+        'pattern_ffn_impact': pattern_ffn_impact_results,  # 🎯 NEW
     }
 
     # 🎯 통합 진단
