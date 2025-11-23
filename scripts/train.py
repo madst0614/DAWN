@@ -532,48 +532,87 @@ def main():
         print(f"\nResuming from checkpoint: {resume_checkpoint}")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
 
+        # Check for version mismatch
+        checkpoint_version = checkpoint.get('model_version', 'unknown')
+        print(f"📌 Checkpoint version: {checkpoint_version}")
+        print(f"📌 Current model version: {DAWN.__version__}")
+
+        if checkpoint_version != DAWN.__version__ and checkpoint_version != 'unknown':
+            print(f"\n⚠️  Version mismatch detected!")
+            print(f"   Checkpoint: v{checkpoint_version} → Current: v{DAWN.__version__}")
+            print(f"   Will attempt partial loading (architecture-compatible parameters only)")
+
+        # Load model state with strict=False for version compatibility
         missing_keys, unexpected_keys = model.load_state_dict(
             checkpoint['model_state_dict'], strict=False
         )
 
-        # Check for version mismatch
-        checkpoint_version = checkpoint.get('model_version', 'unknown')
-
+        # Categorize missing keys
         if missing_keys:
-            print(f"⚠️  Missing keys: {len(missing_keys)}")
-            print(f"   New parameters in v{DAWN.__version__}: {missing_keys[:3]}...")
+            # v5.0 new parameters
+            v5_new_params = [k for k in missing_keys if any(x in k for x in
+                ['neuron_A', 'neuron_B', 'basis_A', 'basis_B',
+                 'neuron_coef', 'token_mod'])]
+            # v4.5 old parameters that are now missing
+            v4_old_params = [k for k in missing_keys if any(x in k for x in
+                ['pattern_queries', 'pattern_up', 'neuron_q', 'neuron_k', 'neuron_v'])]
+            other_missing = [k for k in missing_keys if k not in v5_new_params and k not in v4_old_params]
+
+            if v5_new_params:
+                print(f"\n✨ v5.0 new parameters (randomly initialized): {len(v5_new_params)}")
+                print(f"   - Low-rank neurons, basis FFN, token modulation")
+            if other_missing:
+                print(f"\n⚠️  Other missing keys: {len(other_missing)}")
+                if len(other_missing) <= 5:
+                    for k in other_missing:
+                        print(f"      - {k}")
+
         if unexpected_keys:
-            print(f"⚠️  Unexpected keys: {len(unexpected_keys)}")
+            # v4.5 parameters not in v5.0
+            v4_deprecated = [k for k in unexpected_keys if any(x in k for x in
+                ['pattern_queries', 'pattern_up', 'neuron_q', 'neuron_k', 'neuron_v',
+                 'neuron_interaction', 'up_base', 'path_proj'])]
+            other_unexpected = [k for k in unexpected_keys if k not in v4_deprecated]
+
+            if v4_deprecated:
+                print(f"\n♻️  v4.5 deprecated parameters (ignored): {len(v4_deprecated)}")
+            if other_unexpected:
+                print(f"\n⚠️  Other unexpected keys: {len(other_unexpected)}")
+                if len(other_unexpected) <= 5:
+                    for k in other_unexpected:
+                        print(f"      - {k}")
+
         if not missing_keys and not unexpected_keys:
-            print("✓ All parameters loaded successfully!")
+            print("\n✅ Perfect match! All parameters loaded successfully!")
 
         # Try to load optimizer state even with version mismatch
-        # PyTorch optimizer handles new parameters automatically
         try:
             if checkpoint_version != DAWN.__version__ and checkpoint_version != 'unknown':
-                print(f"\n⚠️  Model version mismatch (checkpoint: {checkpoint_version}, current: {DAWN.__version__})")
-                print(f"   Attempting to load optimizer state (new params will be auto-initialized)")
+                print(f"\n🔄 Loading optimizer state (cross-version)...")
+                print(f"   New parameters will use default optimizer settings")
 
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
             if 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             if 'scaler_state_dict' in checkpoint and scaler is not None:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
             start_epoch = checkpoint.get('epoch', 0) + 1
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            print(f"✓ Optimizer/scheduler state loaded successfully")
-            print(f"✓ Resuming from epoch {start_epoch} (best loss: {best_val_loss:.4f})")
-        except Exception as e:
-            print(f"\n⚠️  Failed to load optimizer state: {e}")
-            print(f"   Starting with fresh optimizer but keeping epoch count")
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
 
-        print(f"  Starting from epoch {start_epoch}")
-        print(f"  Best val loss so far: {best_val_loss:.4f}")
+            print(f"✅ Optimizer/scheduler loaded successfully")
+            print(f"✅ Resuming from epoch {start_epoch} (best val loss: {best_val_loss:.4f})")
+
+        except Exception as e:
+            print(f"\n⚠️  Could not load optimizer state: {str(e)[:100]}")
+            print(f"   Starting with fresh optimizer (model weights preserved)")
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
+            print(f"   Epoch count: {start_epoch}, Best val loss: {best_val_loss:.4f}")
+
     else:
-        print(f"\nStarting fresh training")
+        print(f"\n🆕 Starting fresh training (no checkpoint found)")
 
     # Checkpoint & Monitor
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
