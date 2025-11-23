@@ -16,6 +16,7 @@ model:
   n_patterns: 128         # Size of pattern pool per layer
   k: 8                    # Top-k neurons to select
   pattern_k: 16           # Top-k patterns to select (prevents collapse)
+  d_rank: 64              # Low-rank dimension for forced diversity (v3.2)
   d_ff: 512               # Feed-forward dimension (2x d_model)
   max_seq_len: 128        # Maximum sequence length
   dropout: 0.1            # Dropout rate

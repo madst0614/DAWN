@@ -889,9 +889,17 @@ def analyze_neuron_diversity(model, n_layers):
 
     for layer_idx in range(n_layers):
         if hasattr(model, '_orig_mod'):
-            neurons = model._orig_mod.layers[layer_idx].router.neurons.data
+            router = model._orig_mod.layers[layer_idx].router
         else:
-            neurons = model.layers[layer_idx].router.neurons.data
+            router = model.layers[layer_idx].router
+
+        # Get neurons (handle low-rank decomposition)
+        if hasattr(router, 'neuron_codes'):
+            # v3.2: Low-rank neurons
+            neurons = torch.matmul(router.neuron_codes.data, router.neuron_basis.data)
+        else:
+            # v3.1 and earlier: Full-rank neurons
+            neurons = router.neurons.data
 
         # 정규화
         neurons_norm = F.normalize(neurons, p=2, dim=1)

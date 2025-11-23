@@ -8,19 +8,21 @@ import math
 # 1. 문맥 기반 뉴런 라우터
 # ============================================
 class NeuronRouter(nn.Module):
-    """문맥 기반 뉴런 라우팅"""
+    """Low-rank neuron routing for forced diversity"""
 
     def __init__(self, n_neurons=256, d_model=256, n_heads=4, k=8,
-                 prev_n_neurons=None):
+                 d_rank=64, prev_n_neurons=None):
         super().__init__()
         self.n_neurons = n_neurons
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.k = k
+        self.d_rank = d_rank
 
-        # 뉴런 풀
-        self.neurons = nn.Parameter(torch.randn(n_neurons, d_model) * 0.02)
+        # Low-rank 뉴런 풀 (제한된 표현력 → 강제 다양성)
+        self.neuron_codes = nn.Parameter(torch.randn(n_neurons, d_rank) * 0.02)
+        self.neuron_basis = nn.Parameter(torch.randn(d_rank, d_model) * 0.02)
 
         # cross-token attention용
         self.q_proj = nn.Linear(d_model, d_model)
@@ -39,6 +41,9 @@ class NeuronRouter(nn.Module):
     def forward(self, x, mask=None, prev_selection=None):
         B, S, D = x.shape
 
+        # 0. Low-rank 뉴런 생성 (런타임에)
+        neurons = torch.matmul(self.neuron_codes, self.neuron_basis)  # [n_neurons, d_model]
+
         # 1. cross-token attention (문맥 수집)
         q = self.q_proj(x).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         k = self.k_proj(x).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -54,10 +59,10 @@ class NeuronRouter(nn.Module):
         context = context.transpose(1, 2).contiguous().view(B, S, D)
 
         # 2. Bottom-up: 토큰 기반 뉴런 점수
-        token_scores = torch.matmul(x, self.neurons.T)  # [B, S, n_neurons]
+        token_scores = torch.matmul(x, neurons.T)  # [B, S, n_neurons]
 
         # 3. Top-down: 문맥 기반 뉴런 점수
-        context_scores = torch.matmul(context, self.neurons.T)  # [B, S, n_neurons]
+        context_scores = torch.matmul(context, neurons.T)  # [B, S, n_neurons]
 
         # 4. Dynamic mixing: 상황에 따라 bottom-up vs top-down 비율 조절
         combined = torch.cat([x, context], dim=-1)  # [B, S, 2*D]
@@ -76,7 +81,7 @@ class NeuronRouter(nn.Module):
         topk_weights = F.softmax(topk_scores, dim=-1)
 
         # 7. 선택된 뉴런 조합
-        selected = self.neurons[topk_idx]
+        selected = neurons[topk_idx]
         output = torch.sum(topk_weights.unsqueeze(-1) * selected, dim=2)
 
         # 8. 다음 레이어로 전달할 selection (soft version)
@@ -90,16 +95,21 @@ class NeuronRouter(nn.Module):
 # 2. 패턴 기반 동적 FFN
 # ============================================
 class PatternFFN(nn.Module):
-    """패턴 기반 동적 FFN (with gating)"""
+    """Low-rank pattern-based FFN"""
 
-    def __init__(self, d_model=256, d_ff=1024, n_patterns=128, k=16):
+    def __init__(self, d_model=256, d_ff=1024, n_patterns=128, k=16, d_rank=64):
         super().__init__()
         self.n_patterns = n_patterns
         self.k = k
+        self.d_rank = d_rank
 
-        # 패턴 저장소
-        self.patterns = nn.Parameter(torch.randn(n_patterns, d_model) * 0.02)
-        self.gates = nn.Parameter(torch.randn(n_patterns, d_ff) * 0.02)
+        # Low-rank 패턴 저장소
+        self.pattern_codes = nn.Parameter(torch.randn(n_patterns, d_rank) * 0.02)
+        self.pattern_basis = nn.Parameter(torch.randn(d_rank, d_model) * 0.02)
+
+        # FFN gates도 low-rank
+        self.gate_codes = nn.Parameter(torch.randn(n_patterns, d_rank) * 0.02)
+        self.gate_basis = nn.Parameter(torch.randn(d_rank, d_ff) * 0.02)
 
         # 패턴 선택용 (dynamic mixing - NeuronRouter와 일관성)
         self.path_proj = nn.Linear(d_model * 2, 2)  # 2 paths: input vs router
@@ -111,11 +121,14 @@ class PatternFFN(nn.Module):
     def forward(self, x, router_out, return_pattern_weights=False):
         B, S, D = x.shape
 
+        # 0. Low-rank 패턴 생성
+        patterns = torch.matmul(self.pattern_codes, self.pattern_basis)  # [n_patterns, d_model]
+
         # 1. Bottom-up: 입력 기반 패턴 점수
-        pattern_scores = torch.matmul(x, self.patterns.T)  # [B, S, n_patterns]
+        pattern_scores = torch.matmul(x, patterns.T)  # [B, S, n_patterns]
 
         # 2. Top-down: 라우터 출력 기반 패턴 점수
-        router_scores = torch.matmul(router_out, self.patterns.T)  # [B, S, n_patterns]
+        router_scores = torch.matmul(router_out, patterns.T)  # [B, S, n_patterns]
 
         # 3. Dynamic mixing: 상황에 따라 input vs router 비율 조절
         combined = torch.cat([x, router_out], dim=-1)  # [B, S, 2*D]
@@ -128,8 +141,9 @@ class PatternFFN(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)
         topk_weights = F.softmax(topk_scores, dim=-1)
 
-        # 5. FFN gate 조합
-        selected_gates = self.gates[topk_idx]
+        # 5. FFN gate 조합 (low-rank)
+        gates = torch.matmul(self.gate_codes, self.gate_basis)  # [n_patterns, d_ff]
+        selected_gates = gates[topk_idx]
         ffn_gate = torch.sum(topk_weights.unsqueeze(-1) * selected_gates, dim=2)
 
         # 6. Gated FFN
@@ -151,16 +165,16 @@ class PatternFFN(nn.Module):
 # 3. 단일 레이어
 # ============================================
 class Layer(nn.Module):
-    """단일 레이어"""
+    """단일 레이어 (Low-rank version)"""
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
                  n_neurons=256, n_patterns=128, neuron_k=8, pattern_k=16,
-                 prev_n_neurons=None):
+                 d_rank=64, prev_n_neurons=None):
         super().__init__()
 
         self.router = NeuronRouter(n_neurons, d_model, n_heads, neuron_k,
-                                   prev_n_neurons=prev_n_neurons)
-        self.ffn = PatternFFN(d_model, d_ff, n_patterns, pattern_k)
+                                   d_rank=d_rank, prev_n_neurons=prev_n_neurons)
+        self.ffn = PatternFFN(d_model, d_ff, n_patterns, pattern_k, d_rank=d_rank)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -193,16 +207,17 @@ class Layer(nn.Module):
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
-    __version__ = "3.1"  # 버전 관리
+    __version__ = "3.2"  # 버전 관리
     # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
     # v2.0: Unified NeuronRouter (no connections)
     # v2.1: NeuronRouter with inter-layer connections
     # v3.0: NeuronRouter with bottom-up/top-down gating
     # v3.1: Dynamic mixing with learned path weights
+    # v3.2: Low-rank neurons/patterns for forced diversity
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=256, n_patterns=128, neuron_k=8, pattern_k=16,
-                 max_seq_len=512, dropout=0.1,
+                 d_rank=64, max_seq_len=512, dropout=0.1,
                  # Backward compatibility
                  hidden_dim=None, num_layers=None, k=None,
                  num_input_neurons=None, num_process_neurons=None,
@@ -225,19 +240,20 @@ class DAWN(nn.Module):
         self.vocab_size = vocab_size
         self.n_layers = n_layers
         self.n_neurons = n_neurons
+        self.d_rank = d_rank
 
         # Embedding
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.dropout = nn.Dropout(dropout)
 
-        # Layers (with connection)
+        # Layers (with low-rank and connection)
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             prev_n = n_neurons if i > 0 else None  # 첫 레이어는 connection 없음
             self.layers.append(
                 Layer(d_model, d_ff, n_heads, n_neurons, n_patterns,
-                      neuron_k, pattern_k, prev_n_neurons=prev_n)
+                      neuron_k, pattern_k, d_rank=d_rank, prev_n_neurons=prev_n)
             )
 
         # Output
