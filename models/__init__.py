@@ -1,30 +1,25 @@
 """
-DAWN: Dynamic Architecture With Neurons
+DAWN Models Module
 
-Neural network models for DAWN.
-v4.5: Pattern-specific up projection + Cross-neuron gating
+v5.0: Hierarchical Basis FFN with Low-rank Neurons
 """
 
 from .model import (
-    # Core components
-    NeuronRouter,
-    InteractionFFN,
-    Layer,
-    # Main model
     DAWN,
     DAWNLanguageModel,
-    # Utilities
+    NeuronRouter,
+    BasisFFN,
+    Layer,
     create_model,
 )
 
 __all__ = [
-    # Core components
-    "NeuronRouter",
-    "InteractionFFN",
-    "Layer",
-    # Main model
-    "DAWN",
-    "DAWNLanguageModel",
-    # Utilities
-    "create_model",
+    'DAWN',
+    'DAWNLanguageModel',
+    'NeuronRouter',
+    'BasisFFN',
+    'Layer',
+    'create_model',
 ]
+
+__version__ = "5.0"
