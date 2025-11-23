@@ -85,15 +85,22 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Mixed precision training
         if scaler is not None:
             with torch.amp.autocast('cuda'):
-                logits = model(input_ids)  # [B, S, vocab_size]
+                logits, losses = model(input_ids, return_losses=True)  # [B, S, vocab_size]
 
-                # Loss 계산
+                # Cross-entropy loss
                 B, S, V = logits.shape
-                loss = F.cross_entropy(
+                ce_loss = F.cross_entropy(
                     logits.view(B * S, V),
                     labels.view(B * S),
                     ignore_index=-100
                 )
+
+                # Auxiliary losses (v4.2)
+                pattern_load_loss = sum(losses['pattern_load'])
+                neuron_ortho_loss = sum(losses['neuron_ortho'])
+
+                # Total loss
+                loss = ce_loss + 0.01 * pattern_load_loss + 0.001 * neuron_ortho_loss
 
             scaler.scale(loss).backward()
 
@@ -104,14 +111,22 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits = model(input_ids)
+            logits, losses = model(input_ids, return_losses=True)
 
+            # Cross-entropy loss
             B, S, V = logits.shape
-            loss = F.cross_entropy(
+            ce_loss = F.cross_entropy(
                 logits.view(B * S, V),
                 labels.view(B * S),
                 ignore_index=-100
             )
+
+            # Auxiliary losses (v4.2)
+            pattern_load_loss = sum(losses['pattern_load'])
+            neuron_ortho_loss = sum(losses['neuron_ortho'])
+
+            # Total loss
+            loss = ce_loss + 0.01 * pattern_load_loss + 0.001 * neuron_ortho_loss
 
             loss.backward()
 
