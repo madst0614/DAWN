@@ -116,12 +116,13 @@ class PatternFFN(nn.Module):
     """
 
     def __init__(self, n_neurons=512, d_model=256, d_ff=1024,
-                 n_patterns=32, k_patterns=4):
+                 n_patterns=32, k_patterns=4, pattern_dropout=0.0):
         super().__init__()
         self.n_neurons = n_neurons
         self.n_patterns = n_patterns
         self.k_patterns = k_patterns
         self.d_model = d_model
+        self.pattern_dropout = pattern_dropout
 
         # 패턴 쿼리 (각 패턴의 "의미" 벡터)
         self.pattern_queries = nn.Parameter(
@@ -172,6 +173,19 @@ class PatternFFN(nn.Module):
 
         # Transpose to [B, S, n_patterns]
         pattern_scores = pattern_scores.permute(1, 2, 0)
+
+        # 3.5️⃣ Pattern Dropout (v4.3: training only)
+        if self.training and self.pattern_dropout > 0:
+            # 랜덤하게 일부 패턴 비활성화 → 다양성 강제
+            drop_mask = torch.rand(
+                1, 1, self.n_patterns,
+                device=pattern_scores.device
+            ) > self.pattern_dropout
+
+            pattern_scores = pattern_scores.masked_fill(
+                ~drop_mask,
+                float('-inf')
+            )
 
         # 4️⃣ Top-k 패턴 선택
         topk_scores, topk_pattern_idx = torch.topk(
@@ -236,14 +250,15 @@ class PatternFFN(nn.Module):
 # 3. 단일 레이어
 # ============================================
 class Layer(nn.Module):
-    """단일 레이어 (v4.2: Load Balancing + Orthogonality)"""
+    """단일 레이어 (v4.3: Strong Regularization + Pattern Dropout)"""
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
-                 n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16):
+                 n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
+                 pattern_dropout=0.0):
         super().__init__()
 
         self.router = NeuronRouter(n_neurons, d_model, n_heads, neuron_k)
-        self.ffn = PatternFFN(n_neurons, d_model, d_ff, n_patterns, pattern_k)
+        self.ffn = PatternFFN(n_neurons, d_model, d_ff, n_patterns, pattern_k, pattern_dropout)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -301,7 +316,7 @@ class Layer(nn.Module):
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
-    __version__ = "4.2"  # 버전 관리
+    __version__ = "4.3"  # 버전 관리
     # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
     # v2.0: Unified NeuronRouter (no connections)
     # v2.1: NeuronRouter with inter-layer connections
@@ -315,10 +330,11 @@ class DAWN(nn.Module):
     # v4.0: Neuron-Pattern Affinity Matching (뉴런 분화 → 패턴 분화 유도)
     # v4.1: Weighted-After Pattern Selection (유사도 → 가중치 → 합산, 직관적)
     # v4.2: Load Balancing + Orthogonality (패턴 균등 + 뉴런 다양성)
+    # v4.3: Strong Regularization (10x weights: 0.1 load, 0.01 ortho)
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
-                 max_seq_len=512, dropout=0.1,
+                 max_seq_len=512, dropout=0.1, pattern_dropout=0.0,
                  # Backward compatibility
                  hidden_dim=None, num_layers=None, k=None,
                  num_input_neurons=None, num_process_neurons=None,
@@ -349,7 +365,7 @@ class DAWN(nn.Module):
 
         # Layers
         self.layers = nn.ModuleList([
-            Layer(d_model, d_ff, n_heads, n_neurons, n_patterns, neuron_k, pattern_k)
+            Layer(d_model, d_ff, n_heads, n_neurons, n_patterns, neuron_k, pattern_k, pattern_dropout)
             for _ in range(n_layers)
         ])
 

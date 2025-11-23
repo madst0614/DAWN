@@ -95,12 +95,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ignore_index=-100
                 )
 
-                # Auxiliary losses (v4.2)
+                # Auxiliary losses (v4.3: 10x stronger regularization)
                 pattern_load_loss = sum(losses['pattern_load'])
                 neuron_ortho_loss = sum(losses['neuron_ortho'])
 
                 # Total loss
-                loss = ce_loss + 0.01 * pattern_load_loss + 0.001 * neuron_ortho_loss
+                loss = ce_loss + 0.1 * pattern_load_loss + 0.01 * neuron_ortho_loss
 
             scaler.scale(loss).backward()
 
@@ -121,12 +121,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 ignore_index=-100
             )
 
-            # Auxiliary losses (v4.2)
+            # Auxiliary losses (v4.3: 10x stronger regularization)
             pattern_load_loss = sum(losses['pattern_load'])
             neuron_ortho_loss = sum(losses['neuron_ortho'])
 
             # Total loss
-            loss = ce_loss + 0.01 * pattern_load_loss + 0.001 * neuron_ortho_loss
+            loss = ce_loss + 0.1 * pattern_load_loss + 0.01 * neuron_ortho_loss
 
             loss.backward()
 
@@ -322,6 +322,7 @@ def main():
     args.d_ff = cfg['model'].get('d_ff', None)  # Auto-calculate if None
     args.max_seq_len = cfg['model'].get('max_seq_len', 2048)
     args.dropout = cfg['model'].get('dropout', 0.1)
+    args.pattern_dropout = cfg['model'].get('pattern_dropout', 0.0)
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -450,7 +451,8 @@ def main():
         pattern_k=args.pattern_k,
         d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
-        dropout=args.dropout
+        dropout=args.dropout,
+        pattern_dropout=args.pattern_dropout
     )
     model = model.to(device)
 
