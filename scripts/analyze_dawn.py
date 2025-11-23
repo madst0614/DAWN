@@ -1660,6 +1660,421 @@ def analyze_task_pressure(model, dataloader, device, num_batches=30, tokenizer=N
     return results
 
 
+def analyze_gradient_flow_detailed(model, dataloader, device, num_batches=30, tokenizer=None):
+    """파라미터 수로 정규화된 gradient 분석"""
+    print("\n" + "="*70)
+    print("DETAILED GRADIENT FLOW ANALYSIS (Normalized by Param Count)")
+    print("="*70)
+
+    model.train()
+
+    n_layers = len(model.layers) if hasattr(model, 'layers') else len(model._orig_mod.layers)
+
+    # Collect gradients
+    router_grads = [[] for _ in range(n_layers)]
+    pattern_grads = [[] for _ in range(n_layers)]
+    ffn_grads = [[] for _ in range(n_layers)]
+
+    for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Collecting detailed gradients")):
+        if batch_idx >= num_batches:
+            break
+
+        input_ids = batch['input_ids'].to(device)
+
+        if tokenizer is not None:
+            input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+        else:
+            labels = input_ids.clone()
+
+        model.zero_grad()
+
+        # Forward
+        logits, losses = model(input_ids, return_losses=True)
+
+        # Loss
+        B, S, V = logits.shape
+        ce_loss = F.cross_entropy(
+            logits.view(B * S, V),
+            labels.view(B * S),
+            ignore_index=-100
+        )
+
+        # With regularization
+        pattern_load_loss = sum(losses['pattern_load'])
+        neuron_ortho_loss = sum(losses['neuron_ortho'])
+        total_loss = ce_loss + 0.1 * pattern_load_loss + 0.01 * neuron_ortho_loss
+
+        total_loss.backward()
+
+        # Collect per-layer gradients
+        for layer_idx in range(n_layers):
+            if hasattr(model, '_orig_mod'):
+                layer = model._orig_mod.layers[layer_idx]
+            else:
+                layer = model.layers[layer_idx]
+
+            # Router gradients (all params)
+            router_grad_list = [
+                p.grad.flatten()
+                for p in layer.router.parameters()
+                if p.grad is not None
+            ]
+            if router_grad_list:
+                router_grad = torch.cat(router_grad_list).norm().item()
+            else:
+                router_grad = 0.0
+
+            # Pattern query gradients specifically
+            if layer.ffn.pattern_queries.grad is not None:
+                pattern_grad = layer.ffn.pattern_queries.grad.norm().item()
+            else:
+                pattern_grad = 0.0
+
+            # All FFN gradients
+            ffn_grad_list = [
+                p.grad.flatten()
+                for p in layer.ffn.parameters()
+                if p.grad is not None
+            ]
+            if ffn_grad_list:
+                ffn_grad = torch.cat(ffn_grad_list).norm().item()
+            else:
+                ffn_grad = 0.0
+
+            router_grads[layer_idx].append(router_grad)
+            pattern_grads[layer_idx].append(pattern_grad)
+            ffn_grads[layer_idx].append(ffn_grad)
+
+    model.eval()
+
+    # Analysis
+    results = {}
+
+    print("\n" + "-" * 70)
+    print("Component Gradients (averaged across batches):")
+    print("-" * 70)
+
+    for layer_idx in range(n_layers):
+        if hasattr(model, '_orig_mod'):
+            layer = model._orig_mod.layers[layer_idx]
+        else:
+            layer = model.layers[layer_idx]
+
+        # Parameter counts
+        router_params = sum(p.numel() for p in layer.router.parameters())
+        pattern_query_params = layer.ffn.pattern_queries.numel()
+        ffn_params = sum(p.numel() for p in layer.ffn.parameters())
+
+        # Average gradients
+        avg_router_grad = np.mean(router_grads[layer_idx])
+        avg_pattern_grad = np.mean(pattern_grads[layer_idx])
+        avg_ffn_grad = np.mean(ffn_grads[layer_idx])
+
+        # Normalized by param count (gradient per parameter)
+        norm_router = avg_router_grad / router_params if router_params > 0 else 0
+        norm_pattern = avg_pattern_grad / pattern_query_params if pattern_query_params > 0 else 0
+        norm_ffn = avg_ffn_grad / ffn_params if ffn_params > 0 else 0
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Router:")
+        print(f"    Grad norm: {avg_router_grad:.6f}")
+        print(f"    Params: {router_params:,}")
+        print(f"    Grad/param: {norm_router:.9f}")
+        print(f"  Pattern queries:")
+        print(f"    Grad norm: {avg_pattern_grad:.6f}")
+        print(f"    Params: {pattern_query_params:,}")
+        print(f"    Grad/param: {norm_pattern:.9f}")
+        print(f"  Full FFN:")
+        print(f"    Grad norm: {avg_ffn_grad:.6f}")
+        print(f"    Params: {ffn_params:,}")
+        print(f"    Grad/param: {norm_ffn:.9f}")
+
+        # Ratio analysis
+        if norm_router > 0:
+            pattern_to_router_ratio = norm_pattern / norm_router
+            print(f"  Pattern/Router ratio: {pattern_to_router_ratio:.4f}")
+
+            if pattern_to_router_ratio < 0.01:
+                print(f"    🔴 Pattern gradient is <1% of Router!")
+            elif pattern_to_router_ratio < 0.1:
+                print(f"    ⚠️  Pattern gradient is <10% of Router")
+
+        results[f'layer_{layer_idx}'] = {
+            'router_grad': float(avg_router_grad),
+            'router_params': int(router_params),
+            'router_grad_per_param': float(norm_router),
+            'pattern_grad': float(avg_pattern_grad),
+            'pattern_params': int(pattern_query_params),
+            'pattern_grad_per_param': float(norm_pattern),
+            'ffn_grad': float(avg_ffn_grad),
+            'ffn_params': int(ffn_params),
+            'ffn_grad_per_param': float(norm_ffn),
+        }
+
+    return results
+
+
+def analyze_pattern_necessity(model, dataloader, device, tokenizer=None, num_batches=50):
+    """패턴이 실제로 필요한지 ablation 테스트"""
+    print("\n" + "="*70)
+    print("PATTERN NECESSITY ANALYSIS (Ablation Test)")
+    print("="*70)
+
+    model.eval()
+
+    if hasattr(model, '_orig_mod'):
+        m = model._orig_mod
+    else:
+        m = model
+
+    # Save original pattern queries
+    original_queries = [
+        layer.ffn.pattern_queries.data.clone()
+        for layer in m.layers
+    ]
+
+    def evaluate_loss():
+        """Evaluate model loss"""
+        total_loss = 0.0
+        total_tokens = 0
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                if batch_idx >= num_batches:
+                    break
+
+                input_ids = batch['input_ids'].to(device)
+
+                if tokenizer is not None:
+                    input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+                else:
+                    labels = input_ids.clone()
+
+                logits = model(input_ids)
+                B, S, V = logits.shape
+
+                loss = F.cross_entropy(
+                    logits.view(B * S, V),
+                    labels.view(B * S),
+                    ignore_index=-100
+                )
+
+                total_loss += loss.item() * B * S
+                total_tokens += B * S
+
+        return total_loss / total_tokens if total_tokens > 0 else 0.0
+
+    # 1. Normal loss
+    print("\n1. Normal model (all patterns active)...")
+    normal_loss = evaluate_loss()
+    print(f"   Loss: {normal_loss:.4f}")
+
+    # 2. Uniform patterns (all same)
+    print("\n2. Uniform patterns (all identical)...")
+    for layer in m.layers:
+        layer.ffn.pattern_queries.data.fill_(0.01)  # Small uniform value
+
+    uniform_loss = evaluate_loss()
+    diff_uniform = uniform_loss - normal_loss
+    print(f"   Loss: {uniform_loss:.4f} (Δ = {diff_uniform:+.4f})")
+
+    # 3. Single pattern only
+    print("\n3. Single pattern per layer...")
+    for layer_idx, layer in enumerate(m.layers):
+        layer.ffn.pattern_queries.data.zero_()
+        # Keep only first pattern
+        layer.ffn.pattern_queries.data[0] = original_queries[layer_idx][0]
+
+    single_loss = evaluate_loss()
+    diff_single = single_loss - normal_loss
+    print(f"   Loss: {single_loss:.4f} (Δ = {diff_single:+.4f})")
+
+    # 4. Random patterns
+    print("\n4. Random patterns (reinitialize)...")
+    for layer in m.layers:
+        layer.ffn.pattern_queries.data.normal_(0, 0.02)
+
+    random_loss = evaluate_loss()
+    diff_random = random_loss - normal_loss
+    print(f"   Loss: {random_loss:.4f} (Δ = {diff_random:+.4f})")
+
+    # Restore original
+    for layer_idx, layer in enumerate(m.layers):
+        layer.ffn.pattern_queries.data.copy_(original_queries[layer_idx])
+
+    # Analysis
+    print(f"\n{'='*70}")
+    print("Pattern Necessity Summary:")
+    print("-" * 70)
+
+    if abs(diff_uniform) < 0.01:
+        print("🔴 CRITICAL: Uniform patterns ≈ normal loss!")
+        print("   → Patterns are NOT being used effectively")
+        print("   → Model can work WITHOUT pattern selection")
+    elif abs(diff_uniform) < 0.05:
+        print("⚠️  WARNING: Uniform patterns only slightly worse")
+        print("   → Pattern selection has minimal impact")
+    else:
+        print("✅ Patterns are necessary (uniform degrades loss)")
+
+    if abs(diff_single) < 0.01:
+        print("\n🔴 CRITICAL: Single pattern ≈ normal loss!")
+        print("   → Only 1 pattern needed per layer")
+        print("   → Pattern collapse is EXPECTED behavior")
+    elif abs(diff_single) < 0.05:
+        print("\n⚠️  WARNING: Single pattern almost sufficient")
+        print("   → Pattern diversity may not be needed")
+    else:
+        print("\n✅ Multiple patterns needed (single pattern degrades)")
+
+    if abs(diff_random) < 0.5:
+        print("\n⚠️  WARNING: Random patterns not much worse")
+        print("   → Trained patterns barely better than random")
+        print("   → Patterns may not be learning")
+    else:
+        print("\n✅ Trained patterns are learned (random is much worse)")
+
+    results = {
+        'normal_loss': float(normal_loss),
+        'uniform_loss': float(uniform_loss),
+        'uniform_diff': float(diff_uniform),
+        'single_loss': float(single_loss),
+        'single_diff': float(diff_single),
+        'random_loss': float(random_loss),
+        'random_diff': float(diff_random),
+    }
+
+    return results
+
+
+def analyze_regularization_impact(model, dataloader, device, tokenizer=None, num_batches=50):
+    """Regularization이 실제로 loss에 얼마나 영향 주는지 분석"""
+    print("\n" + "="*70)
+    print("REGULARIZATION IMPACT ANALYSIS")
+    print("="*70)
+
+    model.eval()
+
+    # Collect losses
+    ce_losses = []
+    pattern_load_losses = []
+    neuron_ortho_losses = []
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Analyzing regularization")):
+            if batch_idx >= num_batches:
+                break
+
+            input_ids = batch['input_ids'].to(device)
+
+            if tokenizer is not None:
+                input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
+            else:
+                labels = input_ids.clone()
+
+            logits, losses = model(input_ids, return_losses=True)
+
+            B, S, V = logits.shape
+            ce_loss = F.cross_entropy(
+                logits.view(B * S, V),
+                labels.view(B * S),
+                ignore_index=-100
+            ).item()
+
+            pattern_load_loss = sum(l.item() for l in losses['pattern_load'])
+            neuron_ortho_loss = sum(l.item() for l in losses['neuron_ortho'])
+
+            ce_losses.append(ce_loss)
+            pattern_load_losses.append(pattern_load_loss)
+            neuron_ortho_losses.append(neuron_ortho_loss)
+
+    # Average
+    avg_ce = np.mean(ce_losses)
+    avg_load = np.mean(pattern_load_losses)
+    avg_ortho = np.mean(neuron_ortho_losses)
+
+    # With current weights
+    current_weight_load = 0.1
+    current_weight_ortho = 0.01
+
+    weighted_load = current_weight_load * avg_load
+    weighted_ortho = current_weight_ortho * avg_ortho
+    total_loss = avg_ce + weighted_load + weighted_ortho
+
+    print(f"\nLoss Components (averaged over {num_batches} batches):")
+    print("-" * 70)
+    print(f"  CE Loss:              {avg_ce:.4f}")
+    print(f"  Pattern Load Loss:    {avg_load:.4f} (raw)")
+    print(f"    → Weighted (0.1):   {weighted_load:.4f} ({weighted_load/total_loss*100:.1f}% of total)")
+    print(f"  Neuron Ortho Loss:    {avg_ortho:.4f} (raw)")
+    print(f"    → Weighted (0.01):  {weighted_ortho:.4f} ({weighted_ortho/total_loss*100:.1f}% of total)")
+    print(f"  Total Loss:           {total_loss:.4f}")
+
+    # Impact analysis
+    print(f"\n{'='*70}")
+    print("Regularization Impact:")
+    print("-" * 70)
+
+    load_ratio = weighted_load / avg_ce
+    ortho_ratio = weighted_ortho / avg_ce
+
+    print(f"  Load balancing / CE:  {load_ratio:.4f} ({load_ratio*100:.2f}%)")
+    print(f"  Orthogonality / CE:   {ortho_ratio:.4f} ({ortho_ratio*100:.2f}%)")
+
+    if load_ratio < 0.01:
+        print(f"\n  🔴 Load balancing is <1% of CE loss!")
+        print(f"     → Too weak to enforce pattern diversity")
+        print(f"     → Consider increasing weight: 0.1 → {0.1 * 10:.1f}")
+    elif load_ratio < 0.05:
+        print(f"\n  ⚠️  Load balancing is <5% of CE loss")
+        print(f"     → May be too weak")
+        print(f"     → Consider increasing weight: 0.1 → {0.1 * 2:.1f}")
+    else:
+        print(f"\n  ✅ Load balancing has significant impact")
+
+    if ortho_ratio < 0.001:
+        print(f"\n  🔴 Orthogonality is <0.1% of CE loss!")
+        print(f"     → Too weak to enforce neuron diversity")
+        print(f"     → Consider increasing weight: 0.01 → {0.01 * 10:.2f}")
+    elif ortho_ratio < 0.01:
+        print(f"\n  ⚠️  Orthogonality is <1% of CE loss")
+        print(f"     → May be too weak")
+        print(f"     → Consider increasing weight: 0.01 → {0.01 * 2:.2f}")
+    else:
+        print(f"\n  ✅ Orthogonality has significant impact")
+
+    # Recommendations
+    print(f"\n{'='*70}")
+    print("Recommendations:")
+    print("-" * 70)
+
+    if load_ratio < 0.05:
+        # Calculate needed weight
+        target_ratio = 0.05
+        needed_weight = (target_ratio * avg_ce) / avg_load if avg_load > 0 else 0.1
+        print(f"  → Increase load balancing weight to {needed_weight:.2f}")
+        print(f"    (to reach {target_ratio*100:.0f}% of CE loss)")
+
+    if ortho_ratio < 0.01:
+        target_ratio = 0.01
+        needed_weight = (target_ratio * avg_ce) / avg_ortho if avg_ortho > 0 else 0.01
+        print(f"  → Increase orthogonality weight to {needed_weight:.3f}")
+        print(f"    (to reach {target_ratio*100:.0f}% of CE loss)")
+
+    results = {
+        'ce_loss': float(avg_ce),
+        'pattern_load_loss_raw': float(avg_load),
+        'pattern_load_loss_weighted': float(weighted_load),
+        'neuron_ortho_loss_raw': float(avg_ortho),
+        'neuron_ortho_loss_weighted': float(weighted_ortho),
+        'total_loss': float(total_loss),
+        'load_to_ce_ratio': float(load_ratio),
+        'ortho_to_ce_ratio': float(ortho_ratio),
+    }
+
+    return results
+
+
 def diagnose_bottleneck(all_results, n_layers):
     """통합 진단: bottleneck 위치 파악"""
     print("\n" + "="*70)
@@ -1911,11 +2326,19 @@ def main():
         bottleneck_results = analyze_layer_bottleneck(model, val_loader, device, num_batches=50, tokenizer=tokenizer)
         information_flow_results = analyze_information_flow(model, val_loader, device, num_batches=50)
         task_pressure_results = analyze_task_pressure(model, val_loader, device, num_batches=30, tokenizer=tokenizer)
+
+        # 🔍 Deep dive analyses
+        gradient_detailed_results = analyze_gradient_flow_detailed(model, val_loader, device, num_batches=30, tokenizer=tokenizer)
+        pattern_necessity_results = analyze_pattern_necessity(model, val_loader, device, tokenizer=tokenizer, num_batches=50)
+        regularization_impact_results = analyze_regularization_impact(model, val_loader, device, tokenizer=tokenizer, num_batches=50)
     else:
         print("\n⏩ Skipping bottleneck analysis (use --skip_bottleneck to skip)")
         bottleneck_results = {}
         information_flow_results = {}
         task_pressure_results = {}
+        gradient_detailed_results = {}
+        pattern_necessity_results = {}
+        regularization_impact_results = {}
 
     all_results = {
         'neuron_usage': neuron_usage_results,
@@ -1932,6 +2355,9 @@ def main():
         'bottleneck': bottleneck_results,  # 🔬 NEW
         'information_flow': information_flow_results,  # 🔬 NEW
         'task_pressure': task_pressure_results,  # 🔬 NEW
+        'gradient_detailed': gradient_detailed_results,  # 🔍 NEW
+        'pattern_necessity': pattern_necessity_results,  # 🔍 NEW
+        'regularization_impact': regularization_impact_results,  # 🔍 NEW
     }
 
     # 🎯 통합 진단
@@ -1970,6 +2396,10 @@ def main():
         print("  - Information flow (similarity, change, rank)")
         print("  - Task pressure (layer ablation)")
         print("  - Integrated bottleneck diagnosis")
+        print("\n🔍 Deep Dive Analyses:")
+        print("  - Detailed gradient flow (normalized by param count)")
+        print("  - Pattern necessity (ablation tests)")
+        print("  - Regularization impact (loss component analysis)")
 
     print("\n" + "="*70)
 
