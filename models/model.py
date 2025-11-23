@@ -76,26 +76,31 @@ class NeuronRouter(nn.Module):
         topk_weights = F.softmax(topk_scores, dim=-1)
 
         # 7. 선택된 뉴런 조합
-        selected = self.neurons[topk_idx]
+        selected = self.neurons[topk_idx]  # [B, S, k, d_model]
         output = torch.sum(topk_weights.unsqueeze(-1) * selected, dim=2)
 
         # 8. 다음 레이어로 전달할 selection (soft version)
         selection_out = torch.zeros(B, S, self.n_neurons, device=x.device)
         selection_out.scatter_(-1, topk_idx, topk_weights)
 
-        return output, topk_idx, topk_weights, selection_out
+        return output, topk_idx, topk_weights, selection_out, selected
 
 
 # ============================================
 # 2. 패턴 기반 동적 FFN
 # ============================================
 class PatternFFN(nn.Module):
-    """v4.0: Neuron-Pattern Affinity Matching
+    """v4.1: Weighted-After Pattern Selection
 
     핵심 아이디어:
-    - 각 패턴이 각 뉴런에 대한 "친화도" 학습
-    - 선택된 뉴런들의 가중치를 활용한 자연스러운 매칭
-    - 뉴런 분화 → 패턴 분화 유도
+    - 패턴 쿼리와 뉴런 벡터의 유사도 계산 (순수 매칭)
+    - 뉴런 가중치를 곱해서 기여도 반영
+    - 합산하여 패턴 점수 도출
+
+    직관적 해석:
+    1. "이 뉴런은 이 패턴과 얼마나 맞나?" (유사도)
+    2. "이 뉴런이 얼마나 중요한가?" (가중치)
+    3. "종합 점수" (유사도 × 가중치의 합)
     """
 
     def __init__(self, n_neurons=512, d_model=256, d_ff=1024,
@@ -104,12 +109,11 @@ class PatternFFN(nn.Module):
         self.n_neurons = n_neurons
         self.n_patterns = n_patterns
         self.k_patterns = k_patterns
+        self.d_model = d_model
 
-        # 🔥 핵심: 패턴-뉴런 친화도 행렬
-        # [n_patterns, n_neurons]
-        # "각 패턴이 각 뉴런을 얼마나 잘 처리하는가"
-        self.pattern_affinity = nn.Parameter(
-            torch.randn(n_patterns, n_neurons) * 0.02
+        # 패턴 쿼리 (각 패턴의 "의미" 벡터)
+        self.pattern_queries = nn.Parameter(
+            torch.randn(n_patterns, d_model) * 0.02
         )
 
         # Pattern gates
@@ -120,38 +124,55 @@ class PatternFFN(nn.Module):
         self.down = nn.Linear(d_ff, d_model)
 
     def forward(self, x, router_out, topk_neuron_idx, topk_neuron_weights,
-                return_pattern_weights=False):
-        B, S, K = topk_neuron_idx.shape  # [B, S, 16]
+                selected_neurons, return_pattern_weights=False):
+        """
+        Args:
+            x: [B, S, d_model] - input
+            router_out: [B, S, d_model] - neuron combination output
+            topk_neuron_idx: [B, S, K] - selected neuron indices
+            topk_neuron_weights: [B, S, K] - neuron importance weights
+            selected_neurons: [B, S, K, d_model] - selected neuron vectors
+        """
+        B, S, K, D = selected_neurons.shape
 
-        # 1. 선택된 뉴런들에 대한 각 패턴의 친화도
-        # pattern_affinity: [n_patterns, n_neurons]
-        # topk_neuron_idx: [B, S, K]
-        # 결과: [B, S, K, n_patterns]
-        affinity_for_selected = self.pattern_affinity[:, topk_neuron_idx]  # Broadcasting indexing
-        affinity_for_selected = affinity_for_selected.permute(1, 2, 3, 0)  # [B, S, K, n_patterns]
+        # 1️⃣ 뉴런-패턴 유사도 계산 (순수 매칭)
+        # pattern_queries: [n_patterns, D]
+        # selected_neurons: [B, S, K, D]
+        neuron_pattern_similarity = torch.einsum(
+            'pd,bskd->pbsk',
+            self.pattern_queries,
+            selected_neurons
+        ) / (D ** 0.5)
+        # [n_patterns, B, S, K]
+        # 예: [패턴7, batch, seq, 뉴런0] = 패턴7과 선택된 첫 뉴런의 유사도
 
-        # 2. 뉴런 가중치를 곱해서 패턴 점수 계산
+        # 2️⃣ 뉴런 중요도 가중치 적용
         # topk_neuron_weights: [B, S, K]
-        # affinity_for_selected: [B, S, K, n_patterns]
-        pattern_scores = torch.sum(
-            affinity_for_selected * topk_neuron_weights.unsqueeze(-1),
-            dim=2
-        )  # [B, S, n_patterns]
+        weighted_similarity = neuron_pattern_similarity * topk_neuron_weights
+        # [n_patterns, B, S, K]
+        # 예: [패턴7, batch, seq, 뉴런0] = (유사도) × (중요도)
 
-        # 3. Top-k 패턴 선택
+        # 3️⃣ 뉴런들의 기여도 합산
+        pattern_scores = weighted_similarity.sum(dim=-1)  # sum over K
+        # [n_patterns, B, S]
+
+        # Transpose to [B, S, n_patterns]
+        pattern_scores = pattern_scores.permute(1, 2, 0)
+
+        # 4️⃣ Top-k 패턴 선택
         topk_scores, topk_pattern_idx = torch.topk(
             pattern_scores, self.k_patterns, dim=-1
         )
         topk_pattern_weights = F.softmax(topk_scores, dim=-1)
 
-        # 4. 선택된 패턴의 gate 조합
+        # 5️⃣ 선택된 패턴의 gate 조합
         selected_gates = self.gates[topk_pattern_idx]  # [B, S, k_patterns, d_ff]
         ffn_gate = torch.sum(
             topk_pattern_weights.unsqueeze(-1) * selected_gates,
             dim=2
         )  # [B, S, d_ff]
 
-        # 5. Gated FFN
+        # 6️⃣ Gated FFN
         h = self.up(x)
         h = h * torch.sigmoid(ffn_gate)
         h = F.gelu(h)
@@ -169,7 +190,7 @@ class PatternFFN(nn.Module):
 # 3. 단일 레이어
 # ============================================
 class Layer(nn.Module):
-    """단일 레이어 (v4.0: Neuron-Pattern Affinity Matching)"""
+    """단일 레이어 (v4.1: Weighted-After Pattern Selection)"""
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
                  n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
@@ -186,20 +207,20 @@ class Layer(nn.Module):
     def forward(self, x, mask=None, prev_selection=None, return_details=False):
         # 1. 뉴런 라우팅 (문맥 기반 + 이전 레이어 영향)
         normed = self.norm1(x)
-        router_out, topk_idx, topk_weights, selection_out = self.router(
+        router_out, topk_idx, topk_weights, selection_out, selected_neurons = self.router(
             normed, mask, prev_selection
         )
         x = x + router_out
 
-        # 2. 패턴 FFN (뉴런 선택 정보 전달)
+        # 2. 패턴 FFN (뉴런 벡터 전달)
         normed = self.norm2(x)
         if return_details:
             ffn_out, pattern_weights = self.ffn(
-                normed, router_out, topk_idx, topk_weights,
+                normed, router_out, topk_idx, topk_weights, selected_neurons,
                 return_pattern_weights=True
             )
         else:
-            ffn_out = self.ffn(normed, router_out, topk_idx, topk_weights)
+            ffn_out = self.ffn(normed, router_out, topk_idx, topk_weights, selected_neurons)
             pattern_weights = None
         x = x + ffn_out
 
@@ -214,7 +235,7 @@ class Layer(nn.Module):
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
-    __version__ = "4.0"  # 버전 관리
+    __version__ = "4.1"  # 버전 관리
     # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
     # v2.0: Unified NeuronRouter (no connections)
     # v2.1: NeuronRouter with inter-layer connections
@@ -226,6 +247,7 @@ class DAWN(nn.Module):
     # v3.6: Attention-based pattern selection (Q-K attention for pattern matching)
     # v3.7: Orthogonal init + Learnable temperature (collapse 방지)
     # v4.0: Neuron-Pattern Affinity Matching (뉴런 분화 → 패턴 분화 유도)
+    # v4.1: Weighted-After Pattern Selection (유사도 → 가중치 → 합산, 직관적)
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
