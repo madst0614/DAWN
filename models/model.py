@@ -248,20 +248,18 @@ class InteractionFFN(nn.Module):
         A_flat = self.pattern_up_A[flat_idx]  # [B*S*k_patterns, D, rank]
         B_flat = self.pattern_up_B[flat_idx]  # [B*S*k_patterns, rank, d_ff]
 
-        # Reshape
-        A = A_flat.view(B, S, self.k_patterns, D, self.rank)
-        B = B_flat.view(B, S, self.k_patterns, self.rank, self.d_ff)
+        # 4-2. Pattern-specific projections (optimized with bmm)
+        # combined: [B, S, D] -> [B*S*k_patterns, 1, D]
+        combined_flat = combined.unsqueeze(2).expand(-1, -1, self.k_patterns, -1).reshape(-1, 1, D)
 
-        # 4-2. Pattern-specific projections (optimized with einsum)
-        # combined: [B, S, D]
-        # A: [B, S, k_patterns, D, rank]
-        # B: [B, S, k_patterns, rank, d_ff]
+        # combined @ A: [B*S*k_patterns, 1, D] @ [B*S*k_patterns, D, rank] -> [B*S*k_patterns, 1, rank]
+        h_mid_flat = torch.bmm(combined_flat, A_flat)  # [B*S*k_patterns, 1, rank]
 
-        # combined @ A -> [B, S, k_patterns, rank]
-        h_mid = torch.einsum('bsd,bskdr->bskr', combined, A)
+        # h_mid @ B: [B*S*k_patterns, 1, rank] @ [B*S*k_patterns, rank, d_ff] -> [B*S*k_patterns, 1, d_ff]
+        h_patterns_flat = torch.bmm(h_mid_flat, B_flat)  # [B*S*k_patterns, 1, d_ff]
 
-        # h_mid @ B -> [B, S, k_patterns, d_ff]
-        h_patterns = torch.einsum('bskr,bskrf->bskf', h_mid, B)
+        # Reshape back: [B*S*k_patterns, 1, d_ff] -> [B, S, k_patterns, d_ff]
+        h_patterns = h_patterns_flat.view(B, S, self.k_patterns, self.d_ff)
 
         # 4-3. Weighted combination
         h_pattern = (topk_pattern_weights.unsqueeze(-1) * h_patterns).sum(dim=2)
