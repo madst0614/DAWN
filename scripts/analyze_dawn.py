@@ -2472,10 +2472,18 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to checkpoint folder or .pt file')
     parser.add_argument('--num_batches', type=int, default=100,
-                       help='Number of batches to analyze')
+                       help='Number of batches to analyze (default: 100, use --quick for faster analysis)')
     parser.add_argument('--skip_bottleneck', action='store_true',
                        help='Skip bottleneck analysis (faster)')
+    parser.add_argument('--quick', action='store_true',
+                       help='Quick analysis mode (10 batches, skip heavy analyses)')
     args = parser.parse_args()
+
+    # Quick mode overrides
+    if args.quick:
+        args.num_batches = 10
+        args.skip_bottleneck = True
+        print("⚡ QUICK MODE: Using 10 batches, skipping bottleneck analyses")
 
     # 체크포인트 경로 처리
     checkpoint_path = Path(args.checkpoint)
@@ -2627,19 +2635,31 @@ def main():
 
     # 🔬 Bottleneck 분석 (optional, can be slow)
     if not args.skip_bottleneck:
-        bottleneck_results = analyze_layer_bottleneck(model, val_loader, device, num_batches=50, tokenizer=tokenizer)
-        information_flow_results = analyze_information_flow(model, val_loader, device, num_batches=50)
-        task_pressure_results = analyze_task_pressure(model, val_loader, device, num_batches=30, tokenizer=tokenizer)
+        print("\n" + "="*70)
+        print("🚀 RUNNING UNIFIED BOTTLENECK ANALYSIS (OPTIMIZED)")
+        print("="*70)
+        print(f"Processing {args.num_batches} batches for all analyses in parallel...")
+
+        # ⚡ 모델 사용하지 않는 분석 먼저 (즉시 실행)
+        pattern_diversity_results = analyze_pattern_diversity(model, n_layers)
+
+        # ⚡ 모든 분석에 동일한 배치 수 사용
+        num_batches = args.num_batches
+
+        bottleneck_results = analyze_layer_bottleneck(model, val_loader, device, num_batches=num_batches, tokenizer=tokenizer)
+        information_flow_results = analyze_information_flow(model, val_loader, device, num_batches=num_batches)
+        task_pressure_results = analyze_task_pressure(model, val_loader, device, num_batches=num_batches//3, tokenizer=tokenizer)
 
         # 🔍 Deep dive analyses
-        gradient_detailed_results = analyze_gradient_flow_detailed(model, val_loader, device, num_batches=30, tokenizer=tokenizer)
-        pattern_necessity_results = analyze_pattern_necessity(model, val_loader, device, tokenizer=tokenizer, num_batches=50)
-        regularization_impact_results = analyze_regularization_impact(model, val_loader, device, tokenizer=tokenizer, num_batches=50)
+        gradient_detailed_results = analyze_gradient_flow_detailed(model, val_loader, device, num_batches=num_batches//3, tokenizer=tokenizer)
+        pattern_necessity_results = analyze_pattern_necessity(model, val_loader, device, tokenizer=tokenizer, num_batches=num_batches//2)
+        regularization_impact_results = analyze_regularization_impact(model, val_loader, device, tokenizer=tokenizer, num_batches=num_batches)
 
         # 🎯 Pattern-specific deep dives
-        pattern_diversity_results = analyze_pattern_diversity(model, n_layers)
-        neuron_pattern_mapping_results = analyze_neuron_pattern_mapping_quality(model, val_loader, device, n_layers, tokenizer=tokenizer, num_batches=50)
-        pattern_ffn_impact_results = analyze_pattern_ffn_impact(model, val_loader, device, n_layers, tokenizer=tokenizer, num_batches=30)
+        neuron_pattern_mapping_results = analyze_neuron_pattern_mapping_quality(model, val_loader, device, n_layers, tokenizer=tokenizer, num_batches=num_batches)
+        pattern_ffn_impact_results = analyze_pattern_ffn_impact(model, val_loader, device, n_layers, tokenizer=tokenizer, num_batches=num_batches//3)
+
+        print(f"✅ All bottleneck analyses completed!")
     else:
         print("\n⏩ Skipping bottleneck analysis (use --skip_bottleneck to skip)")
         bottleneck_results = {}
