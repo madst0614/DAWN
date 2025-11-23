@@ -517,20 +517,42 @@ def main():
             checkpoint['model_state_dict'], strict=False
         )
 
+        # Check for version mismatch
+        has_new_params = len(missing_keys) > 0
+        checkpoint_version = checkpoint.get('model_version', 'unknown')
+
         if missing_keys:
             print(f"⚠️  Missing keys: {len(missing_keys)}")
+            print(f"   New parameters in v{DAWN.__version__}: {missing_keys[:3]}...")
         if unexpected_keys:
             print(f"⚠️  Unexpected keys: {len(unexpected_keys)}")
         if not missing_keys and not unexpected_keys:
             print("✓ All parameters loaded successfully!")
 
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        if 'scaler_state_dict' in checkpoint and scaler is not None:
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0) + 1
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        # Only load optimizer/scheduler if no version mismatch
+        if has_new_params:
+            print(f"\n⚠️  Model version mismatch (checkpoint: {checkpoint_version}, current: {DAWN.__version__})")
+            print(f"   Skipping optimizer/scheduler state - starting fresh optimization")
+            print(f"   Model weights loaded, but optimizer will start from scratch")
+            start_epoch = 1  # Start from epoch 1 with fresh optimizer
+            best_val_loss = float('inf')
+        else:
+            # Safe to load optimizer state
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'scheduler_state_dict' in checkpoint:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if 'scaler_state_dict' in checkpoint and scaler is not None:
+                    scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                start_epoch = checkpoint.get('epoch', 0) + 1
+                best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+                print(f"✓ Optimizer state loaded successfully")
+            except Exception as e:
+                print(f"\n⚠️  Failed to load optimizer state: {e}")
+                print(f"   Starting with fresh optimizer")
+                start_epoch = 1
+                best_val_loss = float('inf')
+
         print(f"  Starting from epoch {start_epoch}")
         print(f"  Best val loss so far: {best_val_loss:.4f}")
     else:
