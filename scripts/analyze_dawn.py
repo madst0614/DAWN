@@ -2607,6 +2607,16 @@ def main():
     layer_diff_results = analyze_layer_differences(neuron_usage_results)
     uncertainty_results = analyze_uncertainty_accuracy(collector, n_layers)
 
+    # v5.0: Basis FFN Analysis 🎯
+    print("\n" + "="*70)
+    print("🎯 v5.0 SPECIFIC ANALYSES")
+    print("="*70)
+
+    n_basis = cfg['model'].get('n_basis', 16)
+    basis_usage_results = analyze_basis_usage(model, collector, n_layers, n_basis)
+    basis_composition_results = analyze_neuron_basis_composition(model, n_layers, n_basis, n_neurons)
+    basis_orthogonality_results = analyze_basis_orthogonality(model, n_layers)
+
     # ⭐ Pattern analysis (v5.0: disabled - no patterns in v5.0)
     # pattern_usage_results = analyze_pattern_usage(collector, n_patterns, n_layers)
     # pattern_collapse_results = analyze_pattern_collapse_detail(collector, n_patterns, n_layers)
@@ -2668,6 +2678,10 @@ def main():
         'layer_differences': layer_diff_results,
         'uncertainty_accuracy': uncertainty_results,
         'neuron_coactivation': coactivation_results,
+        # v5.0 Basis FFN analyses
+        'basis_usage': basis_usage_results,
+        'basis_composition': basis_composition_results,
+        'basis_orthogonality': basis_orthogonality_results,
     }
 
     # 저장
