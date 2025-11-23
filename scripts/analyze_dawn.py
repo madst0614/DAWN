@@ -1267,15 +1267,28 @@ def visualize_neuron_roles(diversity_results, coactivation_results, model, outpu
             ax3.text(0.5, 0.5, 'Clustering unavailable', ha='center', va='center')
             ax3.set_title('Hierarchical Clustering', fontsize=12, fontweight='bold')
 
-        # 4. Co-activation Matrix (if available)
+        # 4. Co-activation Summary (if available)
         ax4 = plt.subplot(2, 3, 4)
-        if coact_data:
-            coact_prob = np.array(coact_data['coactivation_prob'])
-            im4 = ax4.imshow(coact_prob, cmap='YlOrRd', vmin=0, vmax=1)
-            ax4.set_title('Co-activation Probability P(j|i)', fontsize=12, fontweight='bold')
-            ax4.set_xlabel('Neuron j')
-            ax4.set_ylabel('Neuron i')
-            plt.colorbar(im4, ax=ax4, label='Probability')
+        if coact_data and 'strong_pairs' in coact_data:
+            # Since we don't store full matrix, visualize strong pairs as network
+            strong_pairs = coact_data.get('strong_pairs', [])
+
+            if strong_pairs:
+                # Create sparse representation of strong pairs
+                n_neurons = div_data['total_neurons']
+                sparse_coact = np.zeros((n_neurons, n_neurons))
+                for i, j, prob_ij, prob_ji in strong_pairs:
+                    sparse_coact[i, j] = prob_ij
+                    sparse_coact[j, i] = prob_ji
+
+                im4 = ax4.imshow(sparse_coact, cmap='YlOrRd', vmin=0, vmax=1)
+                ax4.set_title(f'Strong Co-activation Pairs (>{len(strong_pairs)} pairs)', fontsize=12, fontweight='bold')
+                ax4.set_xlabel('Neuron j')
+                ax4.set_ylabel('Neuron i')
+                plt.colorbar(im4, ax=ax4, label='Probability')
+            else:
+                ax4.text(0.5, 0.5, 'No strong co-activation pairs', ha='center', va='center')
+                ax4.set_title('Strong Co-activation Pairs', fontsize=12, fontweight='bold')
         else:
             ax4.text(0.5, 0.5, 'No co-activation data', ha='center', va='center')
             ax4.set_title('Co-activation Probability', fontsize=12, fontweight='bold')
