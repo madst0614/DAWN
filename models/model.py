@@ -252,24 +252,16 @@ class InteractionFFN(nn.Module):
         A = A_flat.view(B, S, self.k_patterns, D, self.rank)
         B = B_flat.view(B, S, self.k_patterns, self.rank, self.d_ff)
 
-        # 4-2. Pattern-specific projections
-        # combined: [B, S, D] → [B, S, 1, D] for broadcasting
-        combined_exp = combined.unsqueeze(2)  # [B, S, 1, D]
+        # 4-2. Pattern-specific projections (optimized with einsum)
+        # combined: [B, S, D]
+        # A: [B, S, k_patterns, D, rank]
+        # B: [B, S, k_patterns, rank, d_ff]
 
-        # Matmul: combined @ A
-        # [B, S, 1, D] @ [B, S, k_patterns, D, rank]
-        # Use bmm efficiently
-        h_mid = torch.matmul(
-            combined_exp.unsqueeze(3),  # [B, S, 1, 1, D]
-            A  # [B, S, k_patterns, D, rank]
-        ).squeeze(3)  # [B, S, k_patterns, rank]
+        # combined @ A -> [B, S, k_patterns, rank]
+        h_mid = torch.einsum('bsd,bskdr->bskr', combined, A)
 
-        # Matmul: h_mid @ B
-        # [B, S, k_patterns, rank] @ [B, S, k_patterns, rank, d_ff]
-        h_patterns = torch.matmul(
-            h_mid.unsqueeze(3),  # [B, S, k_patterns, 1, rank]
-            B  # [B, S, k_patterns, rank, d_ff]
-        ).squeeze(3)  # [B, S, k_patterns, d_ff]
+        # h_mid @ B -> [B, S, k_patterns, d_ff]
+        h_patterns = torch.einsum('bskr,bskrf->bskf', h_mid, B)
 
         # 4-3. Weighted combination
         h_pattern = (topk_pattern_weights.unsqueeze(-1) * h_patterns).sum(dim=2)
