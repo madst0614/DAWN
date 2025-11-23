@@ -879,11 +879,96 @@ def analyze_position_patterns(collector, n_layers, max_positions=128):
     return results
 
 
+def analyze_neuron_coactivation(collector, n_neurons, n_layers):
+    """뉴런 co-activation 패턴 분석 - 어떤 뉴런들이 함께 선택되나?"""
+    print("\n" + "="*70)
+    print("NEURON CO-ACTIVATION ANALYSIS")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        if len(collector.neuron_selections[layer_idx]) == 0:
+            continue
+
+        selected_neurons = collector.neuron_selections[layer_idx]  # [N, S, k]
+        N, S, k = selected_neurons.shape
+
+        # Initialize co-activation matrix
+        coactivation = torch.zeros(n_neurons, n_neurons)
+        neuron_activation_count = torch.zeros(n_neurons)
+
+        # Count co-activations
+        for b in range(N):
+            for s in range(S):
+                neurons = selected_neurons[b, s]
+
+                # Count individual activations
+                for n in neurons:
+                    neuron_activation_count[n] += 1
+
+                # Count co-activations
+                for i in range(k):
+                    for j in range(k):
+                        if i != j:
+                            coactivation[neurons[i], neurons[j]] += 1
+
+        # Normalize by activation counts to get co-activation probability
+        # P(j | i) = coactivation[i, j] / activation_count[i]
+        coactivation_prob = torch.zeros_like(coactivation)
+        for i in range(n_neurons):
+            if neuron_activation_count[i] > 0:
+                coactivation_prob[i, :] = coactivation[i, :] / neuron_activation_count[i]
+
+        # Find strong co-activation patterns (mutual high probability)
+        strong_pairs = []
+        threshold = 0.8
+        for i in range(n_neurons):
+            for j in range(i+1, n_neurons):
+                prob_ij = coactivation_prob[i, j].item()
+                prob_ji = coactivation_prob[j, i].item()
+                if prob_ij > threshold and prob_ji > threshold:
+                    strong_pairs.append((i, j, prob_ij, prob_ji))
+
+        # Statistics
+        active_neurons = (neuron_activation_count > 0).sum().item()
+        avg_coactivation = coactivation_prob[neuron_activation_count > 0].mean().item()
+
+        results[f'layer_{layer_idx}'] = {
+            'coactivation_matrix': coactivation.numpy().tolist(),
+            'coactivation_prob': coactivation_prob.numpy().tolist(),
+            'activation_counts': neuron_activation_count.numpy().tolist(),
+            'strong_pairs': strong_pairs[:20],  # Top 20 strong pairs
+            'active_neurons': int(active_neurons),
+            'avg_coactivation_prob': float(avg_coactivation)
+        }
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Active neurons: {active_neurons}/{n_neurons}")
+        print(f"  Strong co-activation pairs (>{threshold}): {len(strong_pairs)}")
+        print(f"  Avg co-activation probability: {avg_coactivation:.4f}")
+
+        # 경고
+        if len(strong_pairs) > 50:
+            print(f"  ⚠️  STRONG COUPLING: {len(strong_pairs)} neuron pairs almost always activate together!")
+            print(f"     → May indicate redundant neurons or over-specialized combinations")
+
+        # Show top 5 strong pairs
+        if strong_pairs:
+            print(f"  Top 5 co-activation pairs:")
+            for idx, (i, j, prob_ij, prob_ji) in enumerate(strong_pairs[:5], 1):
+                print(f"    #{idx}: Neurons ({i}, {j}) - P(j|i)={prob_ij:.3f}, P(i|j)={prob_ji:.3f}")
+
+    return results
+
+
 def analyze_neuron_diversity(model, n_layers):
-    """뉴런 간 유사도 및 effective rank 분석"""
+    """뉴런 간 유사도 및 effective rank 분석 (clustering 포함)"""
     print("\n" + "="*70)
     print("NEURON DIVERSITY ANALYSIS")
     print("="*70)
+
+    from scipy.cluster.hierarchy import linkage
 
     results = {}
 
@@ -901,6 +986,8 @@ def analyze_neuron_diversity(model, n_layers):
             # v3.1 and earlier: Full-rank neurons
             neurons = router.neurons.data
 
+        neurons_cpu = neurons.cpu()
+
         # 정규화
         neurons_norm = F.normalize(neurons, p=2, dim=1)
 
@@ -910,6 +997,23 @@ def analyze_neuron_diversity(model, n_layers):
         # 자기 자신 제외하고 유사도 계산
         mask = ~torch.eye(similarity.shape[0], dtype=torch.bool, device=similarity.device)
         off_diag_sim = similarity[mask]
+
+        # Find highly similar pairs
+        similar_pairs = []
+        threshold = 0.9
+        similarity_cpu = similarity.cpu()
+        n_neurons = similarity.shape[0]
+        for i in range(n_neurons):
+            for j in range(i+1, n_neurons):
+                if abs(similarity_cpu[i, j].item()) > threshold:
+                    similar_pairs.append((i, j, similarity_cpu[i, j].item()))
+
+        # Hierarchical clustering
+        try:
+            linkage_matrix = linkage(neurons_cpu.numpy(), method='ward')
+        except Exception as e:
+            print(f"  ⚠️  Clustering failed: {e}")
+            linkage_matrix = None
 
         # Effective rank (SVD 기반)
         U, S, V = torch.svd(neurons)
@@ -933,7 +1037,9 @@ def analyze_neuron_diversity(model, n_layers):
             'std_similarity': std_sim,
             'effective_rank': effective_rank,
             'total_neurons': neurons.shape[0],
-            'rank_ratio': rank_ratio
+            'rank_ratio': rank_ratio,
+            'similar_pairs': similar_pairs[:20],  # Top 20 similar pairs
+            'linkage': linkage_matrix.tolist() if linkage_matrix is not None else None
         }
 
         print(f"\nLayer {layer_idx}:")
@@ -942,12 +1048,15 @@ def analyze_neuron_diversity(model, n_layers):
         print(f"  Std similarity: {std_sim:.4f}")
         print(f"  Effective rank: {effective_rank:.1f} / {neurons.shape[0]}")
         print(f"  Rank ratio: {rank_ratio:.2%}")
+        print(f"  Highly similar pairs (>{threshold}): {len(similar_pairs)}")
 
         # 경고
         if mean_sim > 0.5:
             print(f"  ⚠️  HIGH SIMILARITY: Neurons are redundant!")
         if rank_ratio < 0.5:
             print(f"  ⚠️  LOW RANK: Limited neuron diversity!")
+        if len(similar_pairs) > 50:
+            print(f"  ⚠️  REDUNDANCY: {len(similar_pairs)} highly similar neuron pairs!")
 
     return results
 
@@ -1057,6 +1166,188 @@ def analyze_connection_patterns(model, collector, n_layers, output_dir):
             print(f"    ⚠️  Connection weights don't match activation patterns")
 
     return results
+
+
+def visualize_neuron_roles(diversity_results, coactivation_results, model, output_dir):
+    """뉴런 역할 종합 시각화 (similarity, co-activation, clustering)"""
+    print("\n=== Visualizing Neuron Roles ===")
+
+    from scipy.cluster.hierarchy import dendrogram
+    import numpy as np
+
+    output_dir = Path(output_dir)
+    roles_dir = output_dir / 'neuron_roles'
+    roles_dir.mkdir(exist_ok=True)
+
+    n_layers = len([k for k in diversity_results.keys() if k.startswith('layer_')])
+
+    for layer_idx in range(n_layers):
+        layer_key = f'layer_{layer_idx}'
+
+        if layer_key not in diversity_results:
+            continue
+
+        div_data = diversity_results[layer_key]
+        coact_data = coactivation_results.get(layer_key, {})
+
+        # Get neurons
+        if hasattr(model, '_orig_mod'):
+            router = model._orig_mod.layers[layer_idx].router
+        else:
+            router = model.layers[layer_idx].router
+
+        if hasattr(router, 'neuron_codes'):
+            neurons = torch.matmul(router.neuron_codes.data, router.neuron_basis.data)
+        else:
+            neurons = router.neurons.data
+
+        neurons_cpu = neurons.cpu()
+        neurons_norm = F.normalize(neurons, p=2, dim=1)
+        similarity = torch.matmul(neurons_norm, neurons_norm.T).cpu().numpy()
+
+        # Create comprehensive figure
+        fig = plt.figure(figsize=(20, 12))
+
+        # 1. Similarity Matrix
+        ax1 = plt.subplot(2, 3, 1)
+        im1 = ax1.imshow(similarity, cmap='RdBu', vmin=-1, vmax=1)
+        ax1.set_title(f'Layer {layer_idx}: Neuron Similarity Matrix', fontsize=12, fontweight='bold')
+        ax1.set_xlabel('Neuron ID')
+        ax1.set_ylabel('Neuron ID')
+        plt.colorbar(im1, ax=ax1, label='Cosine Similarity')
+
+        # Add stats text
+        stats_text = f"Mean: {div_data['mean_similarity']:.3f}\n"
+        stats_text += f"Effective Rank: {div_data['effective_rank']:.1f}/{div_data['total_neurons']}\n"
+        stats_text += f"Rank Ratio: {div_data['rank_ratio']:.2%}"
+        ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes,
+                verticalalignment='top', fontsize=9,
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+
+        # 2. Similarity Distribution
+        ax2 = plt.subplot(2, 3, 2)
+        sim_off_diag = similarity[~np.eye(similarity.shape[0], dtype=bool)]
+        ax2.hist(sim_off_diag, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
+        ax2.set_xlabel('Cosine Similarity')
+        ax2.set_ylabel('Count')
+        ax2.set_title('Similarity Distribution (off-diagonal)', fontsize=12, fontweight='bold')
+        ax2.axvline(div_data['mean_similarity'], color='red', linestyle='--',
+                   label=f"Mean: {div_data['mean_similarity']:.3f}")
+        ax2.legend()
+        ax2.grid(alpha=0.3)
+
+        # 3. Dendrogram (if available)
+        ax3 = plt.subplot(2, 3, 3)
+        if div_data['linkage'] is not None:
+            linkage_matrix = np.array(div_data['linkage'])
+            dendrogram(linkage_matrix, ax=ax3, no_labels=True, color_threshold=0)
+            ax3.set_title('Hierarchical Clustering', fontsize=12, fontweight='bold')
+            ax3.set_ylabel('Distance')
+        else:
+            ax3.text(0.5, 0.5, 'Clustering unavailable', ha='center', va='center')
+            ax3.set_title('Hierarchical Clustering', fontsize=12, fontweight='bold')
+
+        # 4. Co-activation Matrix (if available)
+        ax4 = plt.subplot(2, 3, 4)
+        if coact_data:
+            coact_prob = np.array(coact_data['coactivation_prob'])
+            im4 = ax4.imshow(coact_prob, cmap='YlOrRd', vmin=0, vmax=1)
+            ax4.set_title('Co-activation Probability P(j|i)', fontsize=12, fontweight='bold')
+            ax4.set_xlabel('Neuron j')
+            ax4.set_ylabel('Neuron i')
+            plt.colorbar(im4, ax=ax4, label='Probability')
+        else:
+            ax4.text(0.5, 0.5, 'No co-activation data', ha='center', va='center')
+            ax4.set_title('Co-activation Probability', fontsize=12, fontweight='bold')
+
+        # 5. Activation Counts (if available)
+        ax5 = plt.subplot(2, 3, 5)
+        if coact_data and 'activation_counts' in coact_data:
+            activation_counts = np.array(coact_data['activation_counts'])
+            ax5.bar(range(len(activation_counts)), activation_counts, color='coral', alpha=0.7)
+            ax5.set_xlabel('Neuron ID')
+            ax5.set_ylabel('Activation Count')
+            ax5.set_title('Neuron Activation Frequency', fontsize=12, fontweight='bold')
+            ax5.axhline(activation_counts.mean(), color='blue', linestyle='--',
+                       label=f"Mean: {activation_counts.mean():.1f}")
+            ax5.legend()
+            ax5.grid(alpha=0.3, axis='y')
+        else:
+            ax5.text(0.5, 0.5, 'No activation data', ha='center', va='center')
+            ax5.set_title('Neuron Activation Frequency', fontsize=12, fontweight='bold')
+
+        # 6. Singular Value Distribution (Rank Analysis)
+        ax6 = plt.subplot(2, 3, 6)
+        U, S, V = torch.svd(neurons)
+        S_normalized = (S / S.sum()).numpy()
+        ax6.plot(S_normalized, marker='o', markersize=3, alpha=0.7)
+        ax6.set_xlabel('Singular Value Index')
+        ax6.set_ylabel('Normalized Magnitude')
+        ax6.set_title('Singular Value Spectrum', fontsize=12, fontweight='bold')
+        ax6.set_yscale('log')
+        ax6.grid(alpha=0.3)
+        ax6.axhline(1.0/len(S_normalized), color='red', linestyle='--',
+                   label=f'Uniform (1/{len(S_normalized)})')
+        ax6.legend()
+
+        plt.tight_layout()
+        plt.savefig(roles_dir / f'neuron_roles_layer_{layer_idx}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"  Saved: neuron_roles_layer_{layer_idx}.png")
+
+    # Summary across layers
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    layers = list(range(n_layers))
+    mean_sims = [diversity_results[f'layer_{i}']['mean_similarity'] for i in layers]
+    rank_ratios = [diversity_results[f'layer_{i}']['rank_ratio'] for i in layers]
+    num_similar_pairs = [len(diversity_results[f'layer_{i}']['similar_pairs']) for i in layers]
+
+    # Mean similarity by layer
+    axes[0, 0].plot(layers, mean_sims, marker='o', linewidth=2, markersize=8)
+    axes[0, 0].set_xlabel('Layer')
+    axes[0, 0].set_ylabel('Mean Cosine Similarity')
+    axes[0, 0].set_title('Neuron Similarity Across Layers', fontweight='bold')
+    axes[0, 0].grid(alpha=0.3)
+    axes[0, 0].axhline(0.5, color='red', linestyle='--', alpha=0.5, label='High redundancy threshold')
+    axes[0, 0].legend()
+
+    # Rank ratio by layer
+    axes[0, 1].plot(layers, rank_ratios, marker='s', linewidth=2, markersize=8, color='green')
+    axes[0, 1].set_xlabel('Layer')
+    axes[0, 1].set_ylabel('Effective Rank Ratio')
+    axes[0, 1].set_title('Neuron Diversity Across Layers', fontweight='bold')
+    axes[0, 1].grid(alpha=0.3)
+    axes[0, 1].axhline(0.5, color='red', linestyle='--', alpha=0.5, label='Low diversity threshold')
+    axes[0, 1].legend()
+    axes[0, 1].set_ylim([0, 1])
+
+    # Highly similar pairs
+    axes[1, 0].bar(layers, num_similar_pairs, color='orange', alpha=0.7, edgecolor='black')
+    axes[1, 0].set_xlabel('Layer')
+    axes[1, 0].set_ylabel('Number of Pairs')
+    axes[1, 0].set_title('Highly Similar Neuron Pairs (>0.9)', fontweight='bold')
+    axes[1, 0].grid(alpha=0.3, axis='y')
+
+    # Co-activation stats (if available)
+    if all(f'layer_{i}' in coactivation_results for i in layers):
+        strong_coact_pairs = [len(coactivation_results[f'layer_{i}'].get('strong_pairs', [])) for i in layers]
+        axes[1, 1].bar(layers, strong_coact_pairs, color='purple', alpha=0.7, edgecolor='black')
+        axes[1, 1].set_xlabel('Layer')
+        axes[1, 1].set_ylabel('Number of Pairs')
+        axes[1, 1].set_title('Strong Co-activation Pairs (>0.8)', fontweight='bold')
+        axes[1, 1].grid(alpha=0.3, axis='y')
+    else:
+        axes[1, 1].text(0.5, 0.5, 'No co-activation data', ha='center', va='center',
+                       transform=axes[1, 1].transAxes)
+        axes[1, 1].set_title('Strong Co-activation Pairs', fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(roles_dir / 'neuron_roles_summary.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"  Saved: neuron_roles_summary.png")
 
 
 def main():
@@ -1207,6 +1498,9 @@ def main():
     # 🧬 Neuron diversity 분석
     diversity_results = analyze_neuron_diversity(model, n_layers)
 
+    # 🤝 Co-activation 분석
+    coactivation_results = analyze_neuron_coactivation(collector, n_neurons, n_layers)
+
     # 🔗 Connection 분석 (있고 학습된 경우만)
     has_connections = any(layer.router.has_connection for layer in model.layers)
     if has_connections:
@@ -1238,6 +1532,7 @@ def main():
         'selection_confidence': confidence_results,  # ⭐ NEW
         'position_patterns': position_pattern_results,  # ⭐ NEW
         'neuron_diversity': diversity_results,  # 🧬 NEW
+        'neuron_coactivation': coactivation_results,  # 🤝 NEW
         'connection_patterns': connection_pattern_results,  # 🔗 NEW
         'connection_stats': connection_stats,  # 🔗 NEW
     }
@@ -1251,6 +1546,9 @@ def main():
     # 시각화
     visualize_results(neuron_usage_results, output_dir)
 
+    # 뉴런 역할 시각화 (similarity, co-activation, clustering)
+    visualize_neuron_roles(diversity_results, coactivation_results, model, output_dir)
+
     # 리포트
     generate_report(all_results, output_dir, best_model_path)
 
@@ -1263,6 +1561,7 @@ def main():
     print("  - neuron_usage_distribution.png")
     print("  - layer_statistics.png")
     print("  - neuron_heatmap.png")
+    print("  - neuron_roles/ (similarity, co-activation, clustering)")
     print("  - connections/ (connection matrices)")
 
 
