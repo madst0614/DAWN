@@ -1312,7 +1312,7 @@ def visualize_neuron_roles(diversity_results, coactivation_results, model, outpu
         # 6. Singular Value Distribution (Rank Analysis)
         ax6 = plt.subplot(2, 3, 6)
         U, S, V = torch.svd(neurons)
-        S_normalized = (S / S.sum()).numpy()
+        S_normalized = (S / S.sum()).cpu().numpy()  # Move to CPU before numpy conversion
         ax6.plot(S_normalized, marker='o', markersize=3, alpha=0.7)
         ax6.set_xlabel('Singular Value Index')
         ax6.set_ylabel('Normalized Magnitude')
