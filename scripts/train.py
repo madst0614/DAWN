@@ -398,7 +398,9 @@ def main():
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n✓ Created new run folder: {checkpoint_dir}")
 
-        # Save config for new runs
+        # Save config for new runs (add model version if not present)
+        if 'model_version' not in cfg['model']:
+            cfg['model']['model_version'] = DAWN.__version__
         with open(checkpoint_dir / 'config.json', 'w') as f:
             json.dump(cfg, f, indent=2)
 
@@ -408,6 +410,10 @@ def main():
     print(f"\n{'='*60}")
     print(f"DAWN (Dynamic Neuron Transformer) Training")
     print(f"{'='*60}")
+    config_version = cfg['model'].get('model_version', 'not specified')
+    print(f"\nConfig version: {config_version} | Code version: {DAWN.__version__}")
+    if config_version != DAWN.__version__ and config_version != 'not specified':
+        print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
     print(f"Neurons: pool_size={args.n_neurons}, patterns={args.n_patterns}, neuron_k={args.neuron_k}, pattern_k={args.pattern_k}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
@@ -518,7 +524,6 @@ def main():
         )
 
         # Check for version mismatch
-        has_new_params = len(missing_keys) > 0
         checkpoint_version = checkpoint.get('model_version', 'unknown')
 
         if missing_keys:
@@ -529,29 +534,28 @@ def main():
         if not missing_keys and not unexpected_keys:
             print("✓ All parameters loaded successfully!")
 
-        # Only load optimizer/scheduler if no version mismatch
-        if has_new_params:
-            print(f"\n⚠️  Model version mismatch (checkpoint: {checkpoint_version}, current: {DAWN.__version__})")
-            print(f"   Skipping optimizer/scheduler state - starting fresh optimization")
-            print(f"   Model weights loaded, but optimizer will start from scratch")
-            start_epoch = 1  # Start from epoch 1 with fresh optimizer
-            best_val_loss = float('inf')
-        else:
-            # Safe to load optimizer state
-            try:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                if 'scheduler_state_dict' in checkpoint:
-                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                if 'scaler_state_dict' in checkpoint and scaler is not None:
-                    scaler.load_state_dict(checkpoint['scaler_state_dict'])
-                start_epoch = checkpoint.get('epoch', 0) + 1
-                best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-                print(f"✓ Optimizer state loaded successfully")
-            except Exception as e:
-                print(f"\n⚠️  Failed to load optimizer state: {e}")
-                print(f"   Starting with fresh optimizer")
-                start_epoch = 1
-                best_val_loss = float('inf')
+        # Try to load optimizer state even with version mismatch
+        # PyTorch optimizer handles new parameters automatically
+        try:
+            if checkpoint_version != DAWN.__version__ and checkpoint_version != 'unknown':
+                print(f"\n⚠️  Model version mismatch (checkpoint: {checkpoint_version}, current: {DAWN.__version__})")
+                print(f"   Attempting to load optimizer state (new params will be auto-initialized)")
+
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if 'scaler_state_dict' in checkpoint and scaler is not None:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            print(f"✓ Optimizer/scheduler state loaded successfully")
+            print(f"✓ Resuming from epoch {start_epoch} (best loss: {best_val_loss:.4f})")
+        except Exception as e:
+            print(f"\n⚠️  Failed to load optimizer state: {e}")
+            print(f"   Starting with fresh optimizer but keeping epoch count")
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
 
         print(f"  Starting from epoch {start_epoch}")
         print(f"  Best val loss so far: {best_val_loss:.4f}")

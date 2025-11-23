@@ -9,6 +9,7 @@ data:
 
 # Model Architecture (Dynamic Neuron Transformer)
 model:
+  model_version: "3.7"    # DAWN model version (v3.7: Orthogonal init + Learnable temperature)
   d_model: 256            # Hidden dimension (reduced for efficiency)
   n_layers: 4             # Number of transformer layers
   n_heads: 4              # Number of attention heads
