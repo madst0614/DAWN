@@ -897,8 +897,8 @@ def analyze_basis_usage(model, collector, n_layers, n_basis):
         coef_B = layer.neuron_coef_B[neuron_idx_flat]  # [N*S*k, n_basis]
 
         # Compute basis importance (absolute average)
-        basis_importance_A = coef_A.abs().mean(dim=0).cpu().numpy()  # [n_basis]
-        basis_importance_B = coef_B.abs().mean(dim=0).cpu().numpy()  # [n_basis]
+        basis_importance_A = coef_A.abs().mean(dim=0).detach().cpu().numpy()  # [n_basis]
+        basis_importance_B = coef_B.abs().mean(dim=0).detach().cpu().numpy()  # [n_basis]
 
         # Combined importance
         basis_importance = (basis_importance_A + basis_importance_B) / 2
@@ -1076,7 +1076,7 @@ def analyze_basis_orthogonality(model, n_layers):
 
         # Off-diagonal elements
         mask = ~torch.eye(n_basis, dtype=torch.bool, device=similarity.device)
-        off_diag = similarity[mask].cpu().numpy()
+        off_diag = similarity[mask].detach().cpu().numpy()
 
         # Statistics
         mean_sim = off_diag.mean()
@@ -1105,7 +1105,7 @@ def analyze_basis_orthogonality(model, n_layers):
         basis_B_flat = basis_B.view(n_basis, -1)
         basis_B_norm = F.normalize(basis_B_flat, dim=1)
         similarity_B = torch.mm(basis_B_norm, basis_B_norm.T)
-        off_diag_B = similarity_B[mask].cpu().numpy()
+        off_diag_B = similarity_B[mask].detach().cpu().numpy()
 
         mean_sim_B = off_diag_B.mean()
         max_sim_B = off_diag_B.max()
