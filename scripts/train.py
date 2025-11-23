@@ -325,6 +325,10 @@ def main():
     args.dropout = cfg['model'].get('dropout', 0.1)
     args.pattern_dropout = cfg['model'].get('pattern_dropout', 0.0)
 
+    # v4.5: Pattern-specific projection parameters
+    args.rank = cfg['model'].get('rank', 64)
+    args.use_base = cfg['model'].get('use_base', True)
+
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
     args.n_process = cfg['model'].get('n_process', None)
@@ -454,10 +458,12 @@ def main():
         n_patterns=args.n_patterns,
         k=args.k,
         pattern_k=args.pattern_k,
+        rank=args.rank,
         d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
         dropout=args.dropout,
-        pattern_dropout=args.pattern_dropout
+        pattern_dropout=args.pattern_dropout,
+        use_base=args.use_base
     )
     model = model.to(device)
 

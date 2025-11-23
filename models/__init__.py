@@ -2,7 +2,7 @@
 DAWN: Dynamic Architecture With Neurons
 
 Neural network models for DAWN.
-Context-based Neuron Router with Interaction FFN (v4.4).
+v4.5: Pattern-specific up projection + Cross-neuron gating
 """
 
 from .model import (
