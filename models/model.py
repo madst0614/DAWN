@@ -90,7 +90,7 @@ class NeuronRouter(nn.Module):
 # 2. 패턴 기반 동적 FFN
 # ============================================
 class PatternFFN(nn.Module):
-    """v3.6.1: Orthogonal init + Learnable temperature
+    """v3.7: Orthogonal init + Learnable temperature
 
     핵심 아이디어:
     - Query-Key attention으로 패턴 선택
@@ -156,7 +156,7 @@ class PatternFFN(nn.Module):
 # 3. 단일 레이어
 # ============================================
 class Layer(nn.Module):
-    """단일 레이어 (v3.6.1: Orthogonal init + Learnable temperature)"""
+    """단일 레이어 (v3.7: Orthogonal init + Learnable temperature)"""
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
                  n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
@@ -198,7 +198,7 @@ class Layer(nn.Module):
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
-    __version__ = "3.6.1"  # 버전 관리
+    __version__ = "3.7"  # 버전 관리
     # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
     # v2.0: Unified NeuronRouter (no connections)
     # v2.1: NeuronRouter with inter-layer connections
@@ -208,7 +208,7 @@ class DAWN(nn.Module):
     # v3.4: Full-rank with increased capacity (512 neurons, 256 patterns)
     # v3.5: 뉴런 조합 기반 단순 패턴 선택 (32 patterns, 87% 파라미터 감소)
     # v3.6: Attention-based pattern selection (Q-K attention for pattern matching)
-    # v3.6.1: Orthogonal init + Learnable temperature (collapse 방지)
+    # v3.7: Orthogonal init + Learnable temperature (collapse 방지)
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
