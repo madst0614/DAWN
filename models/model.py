@@ -90,12 +90,13 @@ class NeuronRouter(nn.Module):
 # 2. 패턴 기반 동적 FFN
 # ============================================
 class PatternFFN(nn.Module):
-    """v3.5: 뉴런 조합 기반 단순 패턴 선택
+    """v3.6: Attention-based pattern selection
 
     핵심 아이디어:
-    - 뉴런 조합이 패턴을 직접 결정 (learnable projection)
-    - patterns.T 매칭 제거 → 단순하고 명확
-    - 87% 파라미터 감소 (328K → 41K)
+    - Query-Key attention으로 패턴 선택
+    - Query: 뉴런 조합 (router_out)
+    - Keys: Learnable pattern embeddings
+    - 더 표현력 있는 패턴 매칭
     """
 
     def __init__(self, d_model=256, d_ff=1024, n_patterns=32, k=16):
@@ -103,38 +104,42 @@ class PatternFFN(nn.Module):
         self.n_patterns = n_patterns
         self.k = k
 
-        # 패턴 = gate 벡터 집합 (32개로 축소)
+        # Pattern embeddings (learnable)
+        self.pattern_emb = nn.Parameter(torch.randn(n_patterns, d_model) * 0.1)
         self.gates = nn.Parameter(torch.randn(n_patterns, d_ff) * 0.02)
 
-        # 뉴런 조합 → 패턴 점수 (learnable mapping)
-        self.pattern_proj = nn.Linear(d_model, n_patterns)
+        # Attention mechanism for pattern selection
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
 
-        # FFN
         self.up = nn.Linear(d_model, d_ff)
         self.down = nn.Linear(d_ff, d_model)
 
     def forward(self, x, router_out, return_pattern_weights=False):
         B, S, D = x.shape
 
-        # 뉴런 조합 → 패턴 점수 (단순!)
-        pattern_scores = self.pattern_proj(router_out)  # [B, S, n_patterns]
+        # Query from neuron combination
+        q = self.q_proj(router_out)  # [B, S, D]
 
-        # Top-k 패턴 선택
+        # Keys from pattern embeddings
+        k = self.k_proj(self.pattern_emb)  # [n_patterns, D]
+
+        # Attention scores
+        pattern_scores = torch.matmul(q, k.T) / math.sqrt(D)  # [B, S, n_patterns]
+
+        # Top-k selection
         topk_scores, topk_idx = torch.topk(pattern_scores, self.k, dim=-1)
         topk_weights = F.softmax(topk_scores, dim=-1)
 
-        # 선택된 gate들 조합
-        selected_gates = self.gates[topk_idx]  # [B, S, k, d_ff]
+        selected_gates = self.gates[topk_idx]
         ffn_gate = torch.sum(topk_weights.unsqueeze(-1) * selected_gates, dim=2)
 
-        # Gated FFN
         h = self.up(x)
         h = h * torch.sigmoid(ffn_gate)
         h = F.gelu(h)
         output = self.down(h)
 
         if return_pattern_weights:
-            # 분석용 전체 weights 복원
             full_weights = torch.zeros(B, S, self.n_patterns, device=x.device)
             full_weights.scatter_(-1, topk_idx, topk_weights)
             return output, full_weights
@@ -146,7 +151,7 @@ class PatternFFN(nn.Module):
 # 3. 단일 레이어
 # ============================================
 class Layer(nn.Module):
-    """단일 레이어 (v3.5: Simplified pattern selection)"""
+    """단일 레이어 (v3.6: Attention-based pattern selection)"""
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
                  n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
@@ -188,7 +193,7 @@ class Layer(nn.Module):
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
-    __version__ = "3.5"  # 버전 관리
+    __version__ = "3.6"  # 버전 관리
     # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
     # v2.0: Unified NeuronRouter (no connections)
     # v2.1: NeuronRouter with inter-layer connections
@@ -197,6 +202,7 @@ class DAWN(nn.Module):
     # v3.2: Low-rank neurons/patterns for forced diversity
     # v3.4: Full-rank with increased capacity (512 neurons, 256 patterns)
     # v3.5: 뉴런 조합 기반 단순 패턴 선택 (32 patterns, 87% 파라미터 감소)
+    # v3.6: Attention-based pattern selection (Q-K attention for pattern matching)
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
