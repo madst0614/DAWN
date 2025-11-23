@@ -2,39 +2,29 @@
 DAWN: Dynamic Architecture With Neurons
 
 Neural network models for DAWN.
-Context-based Neuron Router with Pattern FFN.
+v4.5: Pattern-specific up projection + Cross-neuron gating
 """
 
 from .model import (
     # Core components
     NeuronRouter,
-    PatternFFN,
+    InteractionFFN,
     Layer,
     # Main model
     DAWN,
     DAWNLanguageModel,
-    DAWNTrainer,
     # Utilities
     create_model,
-    # Backward compatibility aliases
-    DynamicNeuronTransformer,
-    InputNeurons,
-    ProcessNeurons,
 )
 
 __all__ = [
     # Core components
     "NeuronRouter",
-    "PatternFFN",
+    "InteractionFFN",
     "Layer",
-    # Main model & trainer
+    # Main model
     "DAWN",
     "DAWNLanguageModel",
-    "DAWNTrainer",
     # Utilities
     "create_model",
-    # Backward compatibility
-    "DynamicNeuronTransformer",
-    "InputNeurons",
-    "ProcessNeurons",
 ]

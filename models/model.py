@@ -5,10 +5,10 @@ import math
 
 
 # ============================================
-# 1. 문맥 기반 뉴런 라우터
+# 1. 문맥 기반 뉴런 라우터 (v4.5)
 # ============================================
 class NeuronRouter(nn.Module):
-    """Full-rank neuron routing (v4.1: Connection removed for simplicity)"""
+    """뉴런 선택만 담당 - aggregate 제거!"""
 
     def __init__(self, n_neurons=512, d_model=256, n_heads=4, k=16):
         super().__init__()
@@ -63,136 +63,231 @@ class NeuronRouter(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)
         topk_weights = F.softmax(topk_scores, dim=-1)
 
-        # 6. 선택된 뉴런 조합
+        # 6. 선택된 뉴런 (v4.5: aggregate 제거!)
         selected = self.neurons[topk_idx]  # [B, S, k, d_model]
-        output = torch.sum(topk_weights.unsqueeze(-1) * selected, dim=2)
 
-        # 7. Orthogonality loss (v4.2)
         if return_loss:
             ortho_loss = self.compute_orthogonality_loss()
-            return output, topk_idx, topk_weights, selected, ortho_loss
+            return selected, topk_idx, topk_weights, context, ortho_loss
 
-        return output, topk_idx, topk_weights, selected
+        return selected, topk_idx, topk_weights, context
 
     def compute_orthogonality_loss(self):
-        """뉴런 벡터 직교성 강화 (v4.2)
-
-        목표: 각 뉴런이 서로 다른 방향을 가리키도록
-        방법: Gram matrix가 identity에 가까워지도록
-        """
-        # Normalize neurons to unit vectors
-        neurons_norm = F.normalize(self.neurons, p=2, dim=1)  # [n_neurons, d_model]
-
-        # Compute Gram matrix (cosine similarity)
-        gram = torch.mm(neurons_norm, neurons_norm.T)  # [n_neurons, n_neurons]
-
-        # Target: identity matrix (orthogonal)
+        """뉴런 벡터 직교성 강화"""
+        neurons_norm = F.normalize(self.neurons, p=2, dim=1)
+        gram = torch.mm(neurons_norm, neurons_norm.T)
         identity = torch.eye(self.n_neurons, device=gram.device)
-
-        # L2 loss
         ortho_loss = ((gram - identity) ** 2).sum()
-
-        # Normalize by number of off-diagonal elements
         ortho_loss = ortho_loss / (self.n_neurons * (self.n_neurons - 1))
-
         return ortho_loss
 
 
 # ============================================
-# 2. 패턴 기반 동적 FFN
+# 2. 패턴별 변환 FFN (v4.5)
 # ============================================
-class PatternFFN(nn.Module):
-    """v4.1: Weighted-After Pattern Selection
+class InteractionFFN(nn.Module):
+    """v4.5: Pattern-specific Up Projection with Cross-neuron Gating
 
     핵심 아이디어:
-    - 패턴 쿼리와 뉴런 벡터의 유사도 계산 (순수 매칭)
-    - 뉴런 가중치를 곱해서 기여도 반영
-    - 합산하여 패턴 점수 도출
-
-    직관적 해석:
-    1. "이 뉴런은 이 패턴과 얼마나 맞나?" (유사도)
-    2. "이 뉴런이 얼마나 중요한가?" (가중치)
-    3. "종합 점수" (유사도 × 가중치의 합)
+    1. Cross-neuron gating: 선택된 뉴런들이 서로 보고 feature 조절
+    2. Pattern selection: Context + neuron 조합으로 패턴 선택
+    3. Pattern-specific up: 각 패턴이 256→1024 변환을 다르게 수행!
+       - Pattern 5: "시각적 feature 조합" 공간
+       - Pattern 12: "의미적 feature 조합" 공간
+    4. Down projection: 1024→256으로 필요한 정보만 추출
     """
 
     def __init__(self, n_neurons=512, d_model=256, d_ff=1024,
-                 n_patterns=32, k_patterns=4):
+                 n_patterns=32, k_patterns=4, n_heads=4, rank=64,
+                 pattern_dropout=0.0, use_base=True):
         super().__init__()
-        self.n_neurons = n_neurons
         self.n_patterns = n_patterns
         self.k_patterns = k_patterns
         self.d_model = d_model
+        self.d_ff = d_ff
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.rank = rank
+        self.pattern_dropout = pattern_dropout
+        self.use_base = use_base
 
-        # 패턴 쿼리 (각 패턴의 "의미" 벡터)
+        # =====================================================
+        # Part 1: Cross-Neuron Gating
+        # =====================================================
+        self.neuron_q = nn.Linear(d_model, d_model)
+        self.neuron_k = nn.Linear(d_model, d_model)
+        self.neuron_v = nn.Linear(d_model, d_model)
+
+        # =====================================================
+        # Part 2: Pattern Queries
+        # =====================================================
         self.pattern_queries = nn.Parameter(
             torch.randn(n_patterns, d_model) * 0.02
         )
 
-        # Pattern gates
-        self.gates = nn.Parameter(torch.randn(n_patterns, d_ff) * 0.02)
+        # =====================================================
+        # Part 3: Pattern-Specific Up Projection (Low-rank)
+        # =====================================================
+        # 각 패턴: [d_model, rank] @ [rank, d_ff] = [d_model, d_ff]
+        self.pattern_up_A = nn.Parameter(
+            torch.randn(n_patterns, d_model, rank) * 0.02
+        )
+        self.pattern_up_B = nn.Parameter(
+            torch.randn(n_patterns, rank, d_ff) * 0.01
+        )
 
-        # FFN
-        self.up = nn.Linear(d_model, d_ff)
+        # Optional: Base projection for stability
+        if use_base:
+            self.up_base = nn.Linear(d_model, d_ff)
+            nn.init.normal_(self.up_base.weight, std=0.01)
+            if self.up_base.bias is not None:
+                nn.init.zeros_(self.up_base.bias)
+
+        # =====================================================
+        # Part 4: Down Projection
+        # =====================================================
         self.down = nn.Linear(d_ff, d_model)
 
-    def forward(self, x, router_out, topk_neuron_idx, topk_neuron_weights,
-                selected_neurons, return_pattern_weights=False, return_loss=False):
+    def forward(self, x, selected_neurons, topk_neuron_weights, context,
+                return_pattern_weights=False, return_loss=False):
         """
         Args:
             x: [B, S, d_model] - input
-            router_out: [B, S, d_model] - neuron combination output
-            topk_neuron_idx: [B, S, K] - selected neuron indices
-            topk_neuron_weights: [B, S, K] - neuron importance weights
-            selected_neurons: [B, S, K, d_model] - selected neuron vectors
-            return_pattern_weights: bool - return full pattern weight matrix
-            return_loss: bool - return load balancing loss (v4.2)
+            selected_neurons: [B, S, K, d_model] - router가 선택한 뉴런들
+            topk_neuron_weights: [B, S, K] - 각 뉴런 중요도
+            context: [B, S, d_model] - router의 context
         """
         B, S, K, D = selected_neurons.shape
 
-        # 1️⃣ 뉴런-패턴 유사도 계산 (순수 매칭)
-        # pattern_queries: [n_patterns, D]
-        # selected_neurons: [B, S, K, D]
-        neuron_pattern_similarity = torch.einsum(
-            'pd,bskd->pbsk',
-            self.pattern_queries,
-            selected_neurons
-        ) / (D ** 0.5)
-        # [n_patterns, B, S, K]
-        # 예: [패턴7, batch, seq, 뉴런0] = 패턴7과 선택된 첫 뉴런의 유사도
+        # =====================================================
+        # STEP 1: Cross-Neuron Gating
+        # =====================================================
 
-        # 2️⃣ 뉴런 중요도 가중치 적용
-        # topk_neuron_weights: [B, S, K]
-        weighted_similarity = neuron_pattern_similarity * topk_neuron_weights
-        # [n_patterns, B, S, K]
-        # 예: [패턴7, batch, seq, 뉴런0] = (유사도) × (중요도)
+        # Reshape for multi-head attention
+        neurons_flat = selected_neurons.view(B * S, K, D)
 
-        # 3️⃣ 뉴런들의 기여도 합산
-        pattern_scores = weighted_similarity.sum(dim=-1)  # sum over K
-        # [n_patterns, B, S]
+        # Q, K, V projection
+        q = self.neuron_q(neurons_flat).view(B * S, K, self.n_heads, self.d_head)
+        k = self.neuron_k(neurons_flat).view(B * S, K, self.n_heads, self.d_head)
+        v = self.neuron_v(neurons_flat).view(B * S, K, self.n_heads, self.d_head)
 
-        # Transpose to [B, S, n_patterns]
-        pattern_scores = pattern_scores.permute(1, 2, 0)
+        # V를 gating vector로 변환
+        v = torch.sigmoid(v)  # [0, 1] range
 
-        # 4️⃣ Top-k 패턴 선택
+        # Transpose: [B*S, n_heads, K, d_head]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Attention scores
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5)
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [B*S, n_heads, K, K]
+
+        # Apply attention to gates
+        gates = torch.matmul(attn_weights, v)  # [B*S, n_heads, K, d_head]
+        gates = gates.transpose(1, 2).contiguous().view(B, S, K, D)
+
+        # Apply gating to neurons
+        modulated_neurons = selected_neurons * gates
+
+        # =====================================================
+        # STEP 2: Aggregate Modulated Neurons
+        # =====================================================
+
+        # Weighted average by neuron importance
+        aggregated = (topk_neuron_weights.unsqueeze(-1) * modulated_neurons).sum(dim=2)
+        # [B, S, D]
+
+        # =====================================================
+        # STEP 3: Pattern Selection
+        # =====================================================
+
+        # 3-1. Neuron-based scores
+        neuron_pattern_scores = torch.matmul(
+            aggregated,
+            self.pattern_queries.T
+        ) / (D ** 0.5)  # [B, S, n_patterns]
+
+        # 3-2. Context-based scores
+        context_pattern_scores = torch.matmul(
+            context,
+            self.pattern_queries.T
+        )  # [B, S, n_patterns]
+
+        # 3-3. Combine
+        pattern_scores = 0.5 * neuron_pattern_scores + 0.5 * context_pattern_scores
+
+        # 3-4. Pattern Dropout (training only)
+        if self.training and self.pattern_dropout > 0:
+            drop_mask = torch.rand(
+                1, 1, self.n_patterns,
+                device=pattern_scores.device
+            ) > self.pattern_dropout
+            pattern_scores = pattern_scores.masked_fill(
+                ~drop_mask,
+                float('-inf')
+            )
+
+        # 3-5. Top-k pattern selection
         topk_scores, topk_pattern_idx = torch.topk(
             pattern_scores, self.k_patterns, dim=-1
         )
         topk_pattern_weights = F.softmax(topk_scores, dim=-1)
 
-        # 5️⃣ 선택된 패턴의 gate 조합
-        selected_gates = self.gates[topk_pattern_idx]  # [B, S, k_patterns, d_ff]
-        ffn_gate = torch.sum(
-            topk_pattern_weights.unsqueeze(-1) * selected_gates,
-            dim=2
-        )  # [B, S, d_ff]
+        # =====================================================
+        # STEP 4: Pattern-Specific Up Projection
+        # =====================================================
 
-        # 6️⃣ Gated FFN
-        h = self.up(x)
-        h = h * torch.sigmoid(ffn_gate)
+        combined = x + aggregated  # Residual
+
+        # 4-1. Gather selected patterns' matrices
+        # topk_pattern_idx: [B, S, k_patterns]
+        flat_idx = topk_pattern_idx.view(-1)  # [B*S*k_patterns]
+
+        # Gather: [B*S*k_patterns, D, rank] and [B*S*k_patterns, rank, d_ff]
+        A_flat = self.pattern_up_A[flat_idx]  # [B*S*k_patterns, D, rank]
+        B_flat = self.pattern_up_B[flat_idx]  # [B*S*k_patterns, rank, d_ff]
+
+        # 4-2. Pattern-specific projections (optimized with bmm)
+        # combined: [B, S, D] -> [B*S*k_patterns, 1, D]
+        combined_flat = combined.unsqueeze(2).expand(-1, -1, self.k_patterns, -1).reshape(-1, 1, D)
+
+        # combined @ A: [B*S*k_patterns, 1, D] @ [B*S*k_patterns, D, rank] -> [B*S*k_patterns, 1, rank]
+        h_mid_flat = torch.bmm(combined_flat, A_flat)  # [B*S*k_patterns, 1, rank]
+
+        # h_mid @ B: [B*S*k_patterns, 1, rank] @ [B*S*k_patterns, rank, d_ff] -> [B*S*k_patterns, 1, d_ff]
+        h_patterns_flat = torch.bmm(h_mid_flat, B_flat)  # [B*S*k_patterns, 1, d_ff]
+
+        # Reshape back: [B*S*k_patterns, 1, d_ff] -> [B, S, k_patterns, d_ff]
+        h_patterns = h_patterns_flat.view(B, S, self.k_patterns, self.d_ff)
+
+        # 4-3. Weighted combination
+        h_pattern = (topk_pattern_weights.unsqueeze(-1) * h_patterns).sum(dim=2)
+        # [B, S, d_ff]
+
+        # 4-4. Optional: Base projection
+        if self.use_base:
+            h_base = self.up_base(combined)  # [B, S, d_ff]
+            h = 0.1 * h_base + 0.9 * h_pattern
+        else:
+            h = h_pattern
+
+        # =====================================================
+        # STEP 5: Non-linearity
+        # =====================================================
+
         h = F.gelu(h)
+
+        # =====================================================
+        # STEP 6: Down Projection
+        # =====================================================
+
         output = self.down(h)
 
-        # 7️⃣ Load balancing loss (v4.2)
+        # =====================================================
+        # STEP 7: Return
+        # =====================================================
+
         if return_loss:
             load_loss = self.compute_load_balancing_loss(pattern_scores)
             if return_pattern_weights:
@@ -209,82 +304,80 @@ class PatternFFN(nn.Module):
         return output
 
     def compute_load_balancing_loss(self, pattern_scores):
-        """패턴 사용 균등화 (v4.2)
-
-        목표: 모든 패턴이 골고루 선택되도록
-        방법: 각 패턴의 평균 선택 확률이 uniform에 가까워지도록
-
-        Args:
-            pattern_scores: [B, S, n_patterns] - raw pattern scores before top-k
-        """
-        # Convert scores to probabilities
-        pattern_probs = F.softmax(pattern_scores, dim=-1)  # [B, S, n_patterns]
-
-        # Average probability across batch and sequence
-        pattern_usage = pattern_probs.mean(dim=(0, 1))  # [n_patterns]
-
-        # Uniform target
+        """패턴 사용 균등화"""
+        pattern_probs = F.softmax(pattern_scores, dim=-1)
+        pattern_usage = pattern_probs.mean(dim=(0, 1))
         target = 1.0 / self.n_patterns
-
-        # L2 loss: encourage uniform distribution
         load_loss = ((pattern_usage - target) ** 2).sum()
-
         return load_loss
 
 
 # ============================================
-# 3. 단일 레이어
+# 3. 단일 레이어 (v4.5)
 # ============================================
 class Layer(nn.Module):
-    """단일 레이어 (v4.2: Load Balancing + Orthogonality)"""
+    """v4.5: Cross-neuron gating + Pattern-specific up projection"""
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
-                 n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16):
+                 n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=4,
+                 rank=64, pattern_dropout=0.0, use_base=True):
         super().__init__()
 
-        self.router = NeuronRouter(n_neurons, d_model, n_heads, neuron_k)
-        self.ffn = PatternFFN(n_neurons, d_model, d_ff, n_patterns, pattern_k)
+        # 뉴런 선택
+        self.neuron_router = NeuronRouter(n_neurons, d_model, n_heads, neuron_k)
+
+        # 뉴런 상호작용 + Pattern-specific FFN
+        self.neuron_interaction = InteractionFFN(
+            n_neurons, d_model, d_ff, n_patterns, pattern_k, n_heads,
+            rank, pattern_dropout, use_base
+        )
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x, mask=None, return_details=False, return_losses=False):
-        # 1. 뉴런 라우팅
+        # 1. 뉴런 라우팅 (선택만!)
         normed = self.norm1(x)
         if return_losses:
-            router_out, topk_idx, topk_weights, selected_neurons, ortho_loss = self.router(
-                normed, mask, return_loss=True
-            )
+            selected_neurons, topk_idx, topk_weights, context, ortho_loss = \
+                self.neuron_router(normed, mask, return_loss=True)
         else:
-            router_out, topk_idx, topk_weights, selected_neurons = self.router(normed, mask)
-        x = x + router_out
+            selected_neurons, topk_idx, topk_weights, context = \
+                self.neuron_router(normed, mask)
 
-        # 2. 패턴 FFN
+        # 2. 뉴런 상호작용 + Pattern-specific FFN
         normed = self.norm2(x)
         if return_losses:
             if return_details:
-                ffn_out, pattern_weights, load_loss = self.ffn(
-                    normed, router_out, topk_idx, topk_weights, selected_neurons,
-                    return_pattern_weights=True, return_loss=True
-                )
+                interaction_out, pattern_weights, load_loss = \
+                    self.neuron_interaction(
+                        normed, selected_neurons, topk_weights, context,
+                        return_pattern_weights=True, return_loss=True
+                    )
             else:
-                ffn_out, load_loss = self.ffn(
-                    normed, router_out, topk_idx, topk_weights, selected_neurons,
-                    return_loss=True
-                )
+                interaction_out, load_loss = \
+                    self.neuron_interaction(
+                        normed, selected_neurons, topk_weights, context,
+                        return_loss=True
+                    )
                 pattern_weights = None
         else:
             if return_details:
-                ffn_out, pattern_weights = self.ffn(
-                    normed, router_out, topk_idx, topk_weights, selected_neurons,
-                    return_pattern_weights=True
-                )
+                interaction_out, pattern_weights = \
+                    self.neuron_interaction(
+                        normed, selected_neurons, topk_weights, context,
+                        return_pattern_weights=True
+                    )
             else:
-                ffn_out = self.ffn(normed, router_out, topk_idx, topk_weights, selected_neurons)
+                interaction_out = \
+                    self.neuron_interaction(
+                        normed, selected_neurons, topk_weights, context
+                    )
                 pattern_weights = None
-        x = x + ffn_out
 
-        # Return based on flags
+        x = x + interaction_out
+
+        # Return
         if return_losses:
             if return_details:
                 return x, topk_idx, pattern_weights, load_loss, ortho_loss
@@ -296,33 +389,20 @@ class Layer(nn.Module):
 
 
 # ============================================
-# 4. DAWN 모델
+# 4. DAWN 모델 (v4.5)
 # ============================================
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons"""
 
-    __version__ = "4.2"  # 버전 관리
-    # v1.0: NeuronPool + NeuronAttention (separate) - deprecated
-    # v2.0: Unified NeuronRouter (no connections)
-    # v2.1: NeuronRouter with inter-layer connections
-    # v3.0: NeuronRouter with bottom-up/top-down gating
-    # v3.1: Dynamic mixing with learned path weights
-    # v3.2: Low-rank neurons/patterns for forced diversity
-    # v3.4: Full-rank with increased capacity (512 neurons, 256 patterns)
-    # v3.5: 뉴런 조합 기반 단순 패턴 선택 (32 patterns, 87% 파라미터 감소)
-    # v3.6: Attention-based pattern selection (Q-K attention for pattern matching)
-    # v3.7: Orthogonal init + Learnable temperature (collapse 방지)
-    # v4.0: Neuron-Pattern Affinity Matching (뉴런 분화 → 패턴 분화 유도)
-    # v4.1: Weighted-After Pattern Selection (유사도 → 가중치 → 합산, 직관적)
-    # v4.2: Load Balancing + Orthogonality (패턴 균등 + 뉴런 다양성)
+    __version__ = "4.5"
+    # v4.5: Pattern-specific up projection + Cross-neuron gating
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
-                 n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=16,
-                 max_seq_len=512, dropout=0.1,
+                 n_neurons=512, n_patterns=32, neuron_k=16, pattern_k=4, rank=64,
+                 max_seq_len=512, dropout=0.1, pattern_dropout=0.0, use_base=True,
                  # Backward compatibility
                  hidden_dim=None, num_layers=None, k=None,
-                 num_input_neurons=None, num_process_neurons=None,
-                 adapt_rank=None, process_rank=None):
+                 num_input_neurons=None, num_process_neurons=None):
         super().__init__()
 
         # Backward compatibility
@@ -349,7 +429,8 @@ class DAWN(nn.Module):
 
         # Layers
         self.layers = nn.ModuleList([
-            Layer(d_model, d_ff, n_heads, n_neurons, n_patterns, neuron_k, pattern_k)
+            Layer(d_model, d_ff, n_heads, n_neurons, n_patterns,
+                  neuron_k, pattern_k, rank, pattern_dropout, use_base)
             for _ in range(n_layers)
         ])
 
@@ -418,7 +499,7 @@ class DAWN(nn.Module):
         x = self.norm(x)
         logits = self.head(x)
 
-        # Return based on flags
+        # Return
         if return_losses:
             losses = {
                 'pattern_load': pattern_load_losses,
@@ -450,83 +531,13 @@ class DAWN(nn.Module):
         return input_ids
 
 
-
 # ============================================
-# 5. 학습 유틸리티
-# ============================================
-class DAWNLanguageModel(DAWN):
-    """Language Model wrapper (backward compatibility)"""
-    pass
-
-
-class DAWNTrainer:
-    """DAWN 학습 헬퍼"""
-    def __init__(self, model, optimizer, device='cuda'):
-        self.model = model
-        self.optimizer = optimizer
-        self.device = device
-
-    def train_step(self, input_ids, targets):
-        self.model.train()
-
-        logits = self.model(input_ids)
-        B, S, V = logits.shape
-
-        loss = F.cross_entropy(
-            logits.view(B * S, V),
-            targets.view(B * S),
-            ignore_index=-100
-        )
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-
-        return loss.item()
-
-    def analyze_activations(self, input_ids):
-        """뉴런 선택 패턴 분석"""
-        self.model.eval()
-
-        with torch.no_grad():
-            _, all_selected, all_patterns = self.model(input_ids, return_activations=True)
-
-        analysis = {}
-        for layer_idx, selected_idx in enumerate(all_selected):
-            # selected_idx: [B, S, k]
-            unique_neurons = torch.unique(selected_idx).numel()
-
-            # Get router from layer
-            if hasattr(self.model, '_orig_mod'):
-                total_neurons = self.model._orig_mod.layers[layer_idx].router.n_neurons
-            else:
-                total_neurons = self.model.layers[layer_idx].router.n_neurons
-
-            analysis[f'layer_{layer_idx}'] = {
-                'unique_neurons': unique_neurons,
-                'total_neurons': total_neurons,
-                'usage_ratio': unique_neurons / total_neurons
-            }
-
-        return analysis
-
-    def analyze_connections(self):
-        """레이어 간 connection 분석"""
-        if hasattr(self.model, '_orig_mod'):
-            return self.model._orig_mod.get_connection_stats()
-        return self.model.get_connection_stats()
-
-
-# ============================================
-# 6. 모델 생성 헬퍼
+# 5. Helper functions
 # ============================================
 def create_model(config):
     """Config로부터 모델 생성"""
     return DAWN(**config)
 
 
-# Backward compatibility exports
-DynamicNeuronTransformer = DAWN
-InputNeurons = NeuronRouter  # Old name
-ProcessNeurons = PatternFFN  # Old name
+# Backward compatibility
+DAWNLanguageModel = DAWN

@@ -53,7 +53,8 @@ from utils.training import CheckpointManager, TrainingMonitor, count_parameters,
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None):
+def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
+                load_balancing_weight=0.1, orthogonality_weight=0.01):
     """Train for one epoch"""
     model.train()
 
@@ -95,12 +96,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ignore_index=-100
                 )
 
-                # Auxiliary losses (v4.2)
+                # Auxiliary losses (v4.4: configurable regularization)
                 pattern_load_loss = sum(losses['pattern_load'])
                 neuron_ortho_loss = sum(losses['neuron_ortho'])
 
                 # Total loss
-                loss = ce_loss + 0.01 * pattern_load_loss + 0.001 * neuron_ortho_loss
+                loss = ce_loss + load_balancing_weight * pattern_load_loss + orthogonality_weight * neuron_ortho_loss
 
             scaler.scale(loss).backward()
 
@@ -121,12 +122,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 ignore_index=-100
             )
 
-            # Auxiliary losses (v4.2)
+            # Auxiliary losses (v4.4: configurable regularization)
             pattern_load_loss = sum(losses['pattern_load'])
             neuron_ortho_loss = sum(losses['neuron_ortho'])
 
             # Total loss
-            loss = ce_loss + 0.01 * pattern_load_loss + 0.001 * neuron_ortho_loss
+            loss = ce_loss + load_balancing_weight * pattern_load_loss + orthogonality_weight * neuron_ortho_loss
 
             loss.backward()
 
@@ -322,6 +323,11 @@ def main():
     args.d_ff = cfg['model'].get('d_ff', None)  # Auto-calculate if None
     args.max_seq_len = cfg['model'].get('max_seq_len', 2048)
     args.dropout = cfg['model'].get('dropout', 0.1)
+    args.pattern_dropout = cfg['model'].get('pattern_dropout', 0.0)
+
+    # v4.5: Pattern-specific projection parameters
+    args.rank = cfg['model'].get('rank', 64)
+    args.use_base = cfg['model'].get('use_base', True)
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -333,6 +339,10 @@ def main():
     args.lr = cfg['training']['lr']
     args.weight_decay = cfg['training']['weight_decay']
     args.warmup_epochs = cfg['training'].get('warmup_epochs', 1)
+
+    # v4.4: Regularization weights
+    args.load_balancing_weight = cfg['training'].get('load_balancing_weight', 0.1)
+    args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.01)
 
     # Other
     args.use_amp = cfg.get('use_amp', True)
@@ -448,9 +458,12 @@ def main():
         n_patterns=args.n_patterns,
         k=args.k,
         pattern_k=args.pattern_k,
+        rank=args.rank,
         d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
-        dropout=args.dropout
+        dropout=args.dropout,
+        pattern_dropout=args.pattern_dropout,
+        use_base=args.use_base
     )
     model = model.to(device)
 
@@ -595,7 +608,9 @@ def main():
         # Train
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args,
-            scaler, tokenizer, log_file=str(training_log_file)
+            scaler, tokenizer, log_file=str(training_log_file),
+            load_balancing_weight=args.load_balancing_weight,
+            orthogonality_weight=args.orthogonality_weight
         )
 
         # Evaluate
