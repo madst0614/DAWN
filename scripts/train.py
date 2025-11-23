@@ -96,12 +96,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ignore_index=-100
                 )
 
-                # Auxiliary losses (v5.0: neuron orthogonality + basis sparsity)
+                # Auxiliary losses (v5.0: neuron orthogonality + basis sparsity + basis diversity)
                 neuron_ortho_loss = sum(losses['neuron_ortho'])
                 basis_sparsity_loss = sum(losses['basis_sparsity'])
+                basis_diversity_loss = sum(losses['basis_diversity'])
 
                 # Total loss
-                loss = ce_loss + orthogonality_weight * neuron_ortho_loss + 0.01 * basis_sparsity_loss
+                loss = ce_loss + orthogonality_weight * neuron_ortho_loss + \
+                       0.01 * basis_sparsity_loss + 0.01 * basis_diversity_loss
 
             scaler.scale(loss).backward()
 
@@ -122,12 +124,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 ignore_index=-100
             )
 
-            # Auxiliary losses (v5.0: neuron orthogonality + basis sparsity)
+            # Auxiliary losses (v5.0: neuron orthogonality + basis sparsity + basis diversity)
             neuron_ortho_loss = sum(losses['neuron_ortho'])
             basis_sparsity_loss = sum(losses['basis_sparsity'])
+            basis_diversity_loss = sum(losses['basis_diversity'])
 
             # Total loss
-            loss = ce_loss + orthogonality_weight * neuron_ortho_loss + 0.01 * basis_sparsity_loss
+            loss = ce_loss + orthogonality_weight * neuron_ortho_loss + \
+                   0.01 * basis_sparsity_loss + 0.01 * basis_diversity_loss
 
             loss.backward()
 

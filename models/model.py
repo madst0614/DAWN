@@ -131,15 +131,13 @@ class BasisFFN(nn.Module):
         )
 
         # Neuron-to-basis composition weights
-        # v5.0: Uniform init + noise for diversity
-        self.neuron_coef_A = nn.Parameter(
-            torch.ones(n_neurons, n_basis) / math.sqrt(n_basis) +
-            torch.randn(n_neurons, n_basis) * 0.01  # Small noise
-        )
-        self.neuron_coef_B = nn.Parameter(
-            torch.ones(n_neurons, n_basis) / math.sqrt(n_basis) +
-            torch.randn(n_neurons, n_basis) * 0.01
-        )
+        # v5.0: Orthogonal initialization via QR decomposition
+        # Ensures neurons start with diverse, independent basis combinations
+        Q_A, _ = torch.linalg.qr(torch.randn(n_neurons, n_basis))
+        Q_B, _ = torch.linalg.qr(torch.randn(n_neurons, n_basis))
+
+        self.neuron_coef_A = nn.Parameter(Q_A)
+        self.neuron_coef_B = nn.Parameter(Q_B)
 
         # Low-rank token modulation
         self.token_mod_A = nn.Linear(d_model, mod_rank)
@@ -163,6 +161,30 @@ class BasisFFN(nn.Module):
         target = 3.0
         loss_A = F.relu(target - active_A).mean()
         loss_B = F.relu(target - active_B).mean()
+
+        return loss_A + loss_B
+
+    def compute_diversity_loss(self):
+        """Encourage neurons to maintain diverse basis combinations during training
+
+        Penalizes high cosine similarity between neuron coefficient vectors.
+        This acts as a backup to orthogonal initialization.
+        """
+        # Normalize coefficient vectors
+        coef_A_norm = F.normalize(self.neuron_coef_A, p=2, dim=1)
+        coef_B_norm = F.normalize(self.neuron_coef_B, p=2, dim=1)
+
+        # Compute pairwise similarity matrices
+        sim_A = torch.mm(coef_A_norm, coef_A_norm.T)
+        sim_B = torch.mm(coef_B_norm, coef_B_norm.T)
+
+        # Penalize off-diagonal similarities (exclude self-similarity)
+        n = sim_A.shape[0]
+        mask = ~torch.eye(n, dtype=torch.bool, device=sim_A.device)
+
+        # MSE loss on squared similarities (stronger penalty for high similarity)
+        loss_A = sim_A[mask].pow(2).mean()
+        loss_B = sim_B[mask].pow(2).mean()
 
         return loss_A + loss_B
 
@@ -208,7 +230,8 @@ class BasisFFN(nn.Module):
 
         if return_loss:
             sparsity_loss = self.compute_sparsity_loss()
-            return output, sparsity_loss
+            diversity_loss = self.compute_diversity_loss()
+            return output, sparsity_loss, diversity_loss
 
         return output
 
@@ -308,7 +331,7 @@ class Layer(nn.Module):
         # 3. Basis FFN
         normed = self.norm2(x)
         if return_losses:
-            ffn_out, sparsity_loss = self.basis_ffn(
+            ffn_out, sparsity_loss, diversity_loss = self.basis_ffn(
                 normed, selected_neurons, topk_idx, topk_weights, return_loss=True
             )
         else:
@@ -318,8 +341,8 @@ class Layer(nn.Module):
         # Return
         if return_losses:
             if return_details:
-                return x, topk_idx, ortho_loss, sparsity_loss
-            return x, topk_idx, ortho_loss, sparsity_loss
+                return x, topk_idx, ortho_loss, sparsity_loss, diversity_loss
+            return x, topk_idx, ortho_loss, sparsity_loss, diversity_loss
 
         if return_details:
             return x, topk_idx
@@ -446,20 +469,22 @@ class DAWN(nn.Module):
         all_neuron_idx = []
         ortho_losses = []
         sparsity_losses = []
+        diversity_losses = []
 
         for layer in self.layers:
             if return_losses:
                 if return_activations:
-                    x, neuron_idx, ortho_loss, sparsity_loss = layer(
+                    x, neuron_idx, ortho_loss, sparsity_loss, diversity_loss = layer(
                         x, mask, return_details=True, return_losses=True
                     )
                     all_neuron_idx.append(neuron_idx)
                 else:
-                    x, neuron_idx, ortho_loss, sparsity_loss = layer(
+                    x, neuron_idx, ortho_loss, sparsity_loss, diversity_loss = layer(
                         x, mask, return_details=False, return_losses=True
                     )
                 ortho_losses.append(ortho_loss)
                 sparsity_losses.append(sparsity_loss)
+                diversity_losses.append(diversity_loss)
             elif return_activations:
                 x, neuron_idx = layer(x, mask, return_details=True)
                 all_neuron_idx.append(neuron_idx)
@@ -474,7 +499,8 @@ class DAWN(nn.Module):
         if return_losses:
             losses = {
                 'neuron_ortho': ortho_losses,
-                'basis_sparsity': sparsity_losses
+                'basis_sparsity': sparsity_losses,
+                'basis_diversity': diversity_losses
             }
             if return_activations:
                 return logits, all_neuron_idx, losses
