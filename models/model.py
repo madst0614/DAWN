@@ -117,8 +117,12 @@ class BasisFFN(nn.Module):
     """
 
     def __init__(self, n_neurons=512, d_model=256, d_ff=1024,
-                 n_basis=16, basis_rank=8):
+                 n_basis=16, basis_rank=8, mod_rank=None):
         super().__init__()
+
+        # Backward compatibility: mod_rank ignored in v5.1
+        if mod_rank is not None:
+            pass  # v5.0 compatibility, parameter not used
 
         self.n_basis = n_basis
         self.n_neurons = n_neurons
@@ -300,8 +304,12 @@ class Layer(nn.Module):
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
                  n_neurons=512, neuron_rank=16, neuron_k=16,
-                 n_basis=16, basis_rank=8):
+                 n_basis=16, basis_rank=8, mod_rank=None):
         super().__init__()
+
+        # Backward compatibility: mod_rank ignored in v5.1
+        if mod_rank is not None:
+            pass  # v5.0 compatibility, parameter not used
 
         # Neuron router
         self.neuron_router = NeuronRouter(
@@ -318,7 +326,8 @@ class Layer(nn.Module):
             d_model=d_model,
             d_ff=d_ff,
             n_basis=n_basis,
-            basis_rank=basis_rank
+            basis_rank=basis_rank,
+            mod_rank=mod_rank  # Pass for compatibility
         )
 
         # Layer normalization
@@ -384,14 +393,18 @@ class DAWN(nn.Module):
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=512, neuron_rank=16, neuron_k=16,
-                 n_basis=16, basis_rank=8,
+                 n_basis=16, basis_rank=8, mod_rank=None,
                  max_seq_len=512, dropout=0.1,
-                 # Backward compatibility
+                 # Backward compatibility (v5.0 and earlier)
                  hidden_dim=None, num_layers=None, k=None,
                  n_patterns=None, pattern_k=None, rank=None,
                  pattern_dropout=None, use_base=None,
                  num_input_neurons=None, num_process_neurons=None):
         super().__init__()
+
+        # Backward compatibility: mod_rank ignored in v5.1
+        if mod_rank is not None:
+            pass  # v5.0 compatibility, parameter not used
 
         # Backward compatibility
         if hidden_dim is not None:
@@ -422,7 +435,8 @@ class DAWN(nn.Module):
                 neuron_rank=neuron_rank,
                 neuron_k=neuron_k,
                 n_basis=n_basis,
-                basis_rank=basis_rank
+                basis_rank=basis_rank,
+                mod_rank=mod_rank  # v5.0 compatibility (ignored)
             )
             for _ in range(n_layers)
         ])
@@ -447,6 +461,7 @@ class DAWN(nn.Module):
             'neuron_k': neuron_k,
             'n_basis': n_basis,
             'basis_rank': basis_rank,
+            'mod_rank': mod_rank,  # v5.0 compatibility (not used in v5.1)
             'vocab_size': vocab_size,
             'max_seq_len': max_seq_len,
             'dropout': dropout,
