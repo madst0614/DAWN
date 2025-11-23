@@ -986,9 +986,9 @@ def analyze_neuron_diversity(model, n_layers):
 
     for layer_idx in range(n_layers):
         if hasattr(model, '_orig_mod'):
-            router = model._orig_mod.layers[layer_idx].router
+            router = model._orig_mod.layers[layer_idx].neuron_router
         else:
-            router = model.layers[layer_idx].router
+            router = model.layers[layer_idx].neuron_router
 
         # Get neurons (handle low-rank decomposition)
         if hasattr(router, 'neuron_codes'):
@@ -1107,9 +1107,9 @@ def visualize_neuron_roles(diversity_results, coactivation_results, model, outpu
 
         # Get neurons
         if hasattr(model, '_orig_mod'):
-            router = model._orig_mod.layers[layer_idx].router
+            router = model._orig_mod.layers[layer_idx].neuron_router
         else:
-            router = model.layers[layer_idx].router
+            router = model.layers[layer_idx].neuron_router
 
         if hasattr(router, 'neuron_codes'):
             neurons = torch.matmul(router.neuron_codes.data, router.neuron_basis.data)
@@ -1336,14 +1336,14 @@ def analyze_layer_bottleneck(model, dataloader, device, num_batches=50, tokenize
                 layer = model.layers[layer_idx]
 
             # Router gradients
-            if layer.router.neurons.grad is not None:
-                router_grad = layer.router.neurons.grad.norm().item()
+            if layer.neuron_router.neurons.grad is not None:
+                router_grad = layer.neuron_router.neurons.grad.norm().item()
             else:
                 router_grad = 0.0
 
             # Pattern gradients
-            if layer.ffn.pattern_queries.grad is not None:
-                pattern_grad = layer.ffn.pattern_queries.grad.norm().item()
+            if layer.neuron_interaction.pattern_queries.grad is not None:
+                pattern_grad = layer.neuron_interaction.pattern_queries.grad.norm().item()
             else:
                 pattern_grad = 0.0
 
@@ -1716,7 +1716,7 @@ def analyze_gradient_flow_detailed(model, dataloader, device, num_batches=30, to
             # Router gradients (all params)
             router_grad_list = [
                 p.grad.flatten()
-                for p in layer.router.parameters()
+                for p in layer.neuron_router.parameters()
                 if p.grad is not None
             ]
             if router_grad_list:
@@ -1725,15 +1725,15 @@ def analyze_gradient_flow_detailed(model, dataloader, device, num_batches=30, to
                 router_grad = 0.0
 
             # Pattern query gradients specifically
-            if layer.ffn.pattern_queries.grad is not None:
-                pattern_grad = layer.ffn.pattern_queries.grad.norm().item()
+            if layer.neuron_interaction.pattern_queries.grad is not None:
+                pattern_grad = layer.neuron_interaction.pattern_queries.grad.norm().item()
             else:
                 pattern_grad = 0.0
 
             # All FFN gradients
             ffn_grad_list = [
                 p.grad.flatten()
-                for p in layer.ffn.parameters()
+                for p in layer.neuron_interaction.parameters()
                 if p.grad is not None
             ]
             if ffn_grad_list:
@@ -1761,9 +1761,9 @@ def analyze_gradient_flow_detailed(model, dataloader, device, num_batches=30, to
             layer = model.layers[layer_idx]
 
         # Parameter counts
-        router_params = sum(p.numel() for p in layer.router.parameters())
-        pattern_query_params = layer.ffn.pattern_queries.numel()
-        ffn_params = sum(p.numel() for p in layer.ffn.parameters())
+        router_params = sum(p.numel() for p in layer.neuron_router.parameters())
+        pattern_query_params = layer.neuron_interaction.pattern_queries.numel()
+        ffn_params = sum(p.numel() for p in layer.neuron_interaction.parameters())
 
         # Average gradients
         avg_router_grad = np.mean(router_grads[layer_idx])
@@ -1829,7 +1829,7 @@ def analyze_pattern_necessity(model, dataloader, device, tokenizer=None, num_bat
 
     # Save original pattern queries
     original_queries = [
-        layer.ffn.pattern_queries.data.clone()
+        layer.neuron_interaction.pattern_queries.data.clone()
         for layer in m.layers
     ]
 
@@ -1872,7 +1872,7 @@ def analyze_pattern_necessity(model, dataloader, device, tokenizer=None, num_bat
     # 2. Uniform patterns (all same)
     print("\n2. Uniform patterns (all identical)...")
     for layer in m.layers:
-        layer.ffn.pattern_queries.data.fill_(0.01)  # Small uniform value
+        layer.neuron_interaction.pattern_queries.data.fill_(0.01)  # Small uniform value
 
     uniform_loss = evaluate_loss()
     diff_uniform = uniform_loss - normal_loss
@@ -1881,9 +1881,9 @@ def analyze_pattern_necessity(model, dataloader, device, tokenizer=None, num_bat
     # 3. Single pattern only
     print("\n3. Single pattern per layer...")
     for layer_idx, layer in enumerate(m.layers):
-        layer.ffn.pattern_queries.data.zero_()
+        layer.neuron_interaction.pattern_queries.data.zero_()
         # Keep only first pattern
-        layer.ffn.pattern_queries.data[0] = original_queries[layer_idx][0]
+        layer.neuron_interaction.pattern_queries.data[0] = original_queries[layer_idx][0]
 
     single_loss = evaluate_loss()
     diff_single = single_loss - normal_loss
@@ -1892,7 +1892,7 @@ def analyze_pattern_necessity(model, dataloader, device, tokenizer=None, num_bat
     # 4. Random patterns
     print("\n4. Random patterns (reinitialize)...")
     for layer in m.layers:
-        layer.ffn.pattern_queries.data.normal_(0, 0.02)
+        layer.neuron_interaction.pattern_queries.data.normal_(0, 0.02)
 
     random_loss = evaluate_loss()
     diff_random = random_loss - normal_loss
@@ -1900,7 +1900,7 @@ def analyze_pattern_necessity(model, dataloader, device, tokenizer=None, num_bat
 
     # Restore original
     for layer_idx, layer in enumerate(m.layers):
-        layer.ffn.pattern_queries.data.copy_(original_queries[layer_idx])
+        layer.neuron_interaction.pattern_queries.data.copy_(original_queries[layer_idx])
 
     # Analysis
     print(f"\n{'='*70}")
@@ -2090,7 +2090,7 @@ def analyze_pattern_diversity(model, n_layers):
 
     for layer_idx in range(n_layers):
         layer = m.layers[layer_idx]
-        patterns = layer.ffn.pattern_queries.data  # [n_patterns, d_model]
+        patterns = layer.neuron_interaction.pattern_queries.data  # [n_patterns, d_model]
 
         # Cosine similarity matrix
         patterns_norm = F.normalize(patterns, dim=1)
@@ -2265,7 +2265,7 @@ def analyze_pattern_ffn_impact(model, dataloader, device, n_layers, tokenizer=No
 
     # Save original pattern queries
     original_queries = [
-        layer.ffn.pattern_queries.data.clone()
+        layer.neuron_interaction.pattern_queries.data.clone()
         for layer in m.layers
     ]
 
@@ -2292,16 +2292,16 @@ def analyze_pattern_ffn_impact(model, dataloader, device, n_layers, tokenizer=No
                 # Modified patterns
                 if mode == 'uniform':
                     for layer in m.layers:
-                        layer.ffn.pattern_queries.data.fill_(0.01)
+                        layer.neuron_interaction.pattern_queries.data.fill_(0.01)
                 elif mode == 'random':
                     for layer in m.layers:
-                        layer.ffn.pattern_queries.data.normal_(0, 0.02)
+                        layer.neuron_interaction.pattern_queries.data.normal_(0, 0.02)
 
                 logits_modified = model(input_ids)
 
                 # Restore
                 for layer, orig in zip(m.layers, original_queries):
-                    layer.ffn.pattern_queries.data.copy_(orig)
+                    layer.neuron_interaction.pattern_queries.data.copy_(orig)
 
                 # Measure difference
                 diff = (logits_normal - logits_modified).abs().mean().item()
@@ -2348,13 +2348,13 @@ def analyze_pattern_ffn_impact(model, dataloader, device, n_layers, tokenizer=No
         # Uniform only this layer
         for layer_idx, layer in enumerate(m.layers):
             if layer_idx == ablate_layer_idx:
-                layer.ffn.pattern_queries.data.fill_(0.01)
+                layer.neuron_interaction.pattern_queries.data.fill_(0.01)
 
         layer_diff, layer_rel = measure_output_diff('uniform')
 
         # Restore
         for layer, orig in zip(m.layers, original_queries):
-            layer.ffn.pattern_queries.data.copy_(orig)
+            layer.neuron_interaction.pattern_queries.data.copy_(orig)
 
         layer_impacts.append(layer_rel)
 
