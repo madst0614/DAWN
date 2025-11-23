@@ -100,20 +100,24 @@ class NeuronRouter(nn.Module):
 
 
 # ============================================
-# 2. Basis FFN (v5.0)
+# 2. Basis FFN (v5.1)
 # ============================================
 class BasisFFN(nn.Module):
-    """FFN with hierarchical basis decomposition
+    """FFN with hierarchical basis decomposition + token residual
 
-    v5.0: Hierarchical composition
-    - basis [n_basis] → neurons [n_neurons] → sentence FFN [1]
-    - Each neuron FFN is a learned combination of basis blocks
-    - Sentence FFN is a weighted combination of neuron FFNs
-    - Token modulation provides post-nonlinear adjustment
+    v5.1: Coarse-to-fine architecture
+    - basis [n_basis] → neurons [n_neurons] → sentence FFN [1] (coarse)
+    - token residual network (d_model → 256 → d_ff) (fine)
+    - Combined: h = h_coarse + 0.1 * h_fine
+
+    Benefits:
+    - Coarse: Shared structure across tokens (efficient)
+    - Fine: Token-specific adjustments (expressive)
+    - Scaled residual: Stable training with fine-grained control
     """
 
     def __init__(self, n_neurons=512, d_model=256, d_ff=1024,
-                 n_basis=16, basis_rank=8, mod_rank=32):
+                 n_basis=16, basis_rank=8):
         super().__init__()
 
         self.n_basis = n_basis
@@ -139,9 +143,14 @@ class BasisFFN(nn.Module):
         self.neuron_coef_A = nn.Parameter(Q_A)
         self.neuron_coef_B = nn.Parameter(Q_B)
 
-        # Low-rank token modulation
-        self.token_mod_A = nn.Linear(d_model, mod_rank)
-        self.token_mod_B = nn.Linear(mod_rank, d_ff)
+        # v5.1: Token residual network (coarse + fine)
+        # Provides fine-grained token-level adjustments on top of coarse sentence FFN
+        self.token_residual = nn.Sequential(
+            nn.Linear(d_model, 256),
+            nn.ReLU(),
+            nn.Linear(256, d_ff)
+        )
+        self.residual_scale = 0.1  # Scale factor for fine adjustment
 
         # Down projection
         self.down = nn.Linear(d_ff, d_model)
@@ -205,23 +214,24 @@ class BasisFFN(nn.Module):
         # [B, D, d_ff]
 
         # =====================================================
-        # STEP 2: Apply sentence FFN
+        # STEP 2: Coarse sentence-level FFN (shared structure)
         # =====================================================
-        h = torch.bmm(x, W_up)  # [B, S, D] @ [B, D, d_ff] → [B, S, d_ff]
-        h = F.gelu(h)
+        h_coarse = torch.bmm(x, W_up)  # [B, S, D] @ [B, D, d_ff] → [B, S, d_ff]
+        h_coarse = F.gelu(h_coarse)
 
         # =====================================================
-        # STEP 3: Token-level modulation (post-nonlinear)
+        # STEP 3: Fine token-level adjustment (v5.1)
         # =====================================================
         # Token signature from selected neurons
         token_sig = (selected_neurons * neuron_weights.unsqueeze(-1)).sum(dim=2)
         # [B, S, D]
 
-        # Low-rank modulation
-        mod = self.token_mod_B(F.relu(self.token_mod_A(token_sig)))
+        # Token residual network (full MLP for expressiveness)
+        h_fine = self.token_residual(token_sig)
         # [B, S, d_ff]
 
-        h = h * torch.sigmoid(mod)
+        # Combine coarse + fine with scaled residual
+        h = h_coarse + self.residual_scale * h_fine
 
         # =====================================================
         # STEP 4: Down projection
@@ -283,12 +293,14 @@ class BasisFFN(nn.Module):
 class Layer(nn.Module):
     """Single DAWN layer with neuron routing and basis FFN
 
-    v5.0: Low-rank neurons + Hierarchical basis FFN
+    v5.1: Token residual network (coarse + fine)
+    - Coarse: Sentence-level FFN (shared structure)
+    - Fine: Token-level residual (individual adjustments)
     """
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
                  n_neurons=512, neuron_rank=16, neuron_k=16,
-                 n_basis=16, basis_rank=8, mod_rank=32):
+                 n_basis=16, basis_rank=8):
         super().__init__()
 
         # Neuron router
@@ -300,14 +312,13 @@ class Layer(nn.Module):
             neuron_rank=neuron_rank
         )
 
-        # Basis FFN
+        # Basis FFN (v5.1 with token residual)
         self.basis_ffn = BasisFFN(
             n_neurons=n_neurons,
             d_model=d_model,
             d_ff=d_ff,
             n_basis=n_basis,
-            basis_rank=basis_rank,
-            mod_rank=mod_rank
+            basis_rank=basis_rank
         )
 
         # Layer normalization
@@ -350,25 +361,30 @@ class Layer(nn.Module):
 
 
 # ============================================
-# 4. DAWN Model (v5.0)
+# 4. DAWN Model (v5.1)
 # ============================================
 class DAWN(nn.Module):
     """Dynamic Architecture With Neurons
 
-    v5.0: Basis FFN with Hierarchical Composition
+    v5.1: Token Residual Network (Coarse + Fine)
 
-    Key improvements over v4.5:
+    Key improvements over v5.0:
+    - Token residual: h = h_coarse + 0.1 * h_fine
+    - Coarse: Sentence-level FFN (shared structure, efficient)
+    - Fine: Token residual network (individual adjustments, expressive)
+    - Better balance between efficiency and expressiveness
+
+    v5.0 improvements (retained):
     - Low-rank neuron embeddings (91% parameter reduction)
     - Hierarchical FFN basis decomposition (compositional)
-    - Sentence-level FFN composition (memory efficient)
-    - Token-level modulation (expressive)
+    - Orthogonal initialization + diversity loss (prevents redundancy)
     """
 
-    __version__ = "5.0"
+    __version__ = "5.1"
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024, n_layers=4, n_heads=4,
                  n_neurons=512, neuron_rank=16, neuron_k=16,
-                 n_basis=16, basis_rank=8, mod_rank=32,
+                 n_basis=16, basis_rank=8,
                  max_seq_len=512, dropout=0.1,
                  # Backward compatibility
                  hidden_dim=None, num_layers=None, k=None,
@@ -406,8 +422,7 @@ class DAWN(nn.Module):
                 neuron_rank=neuron_rank,
                 neuron_k=neuron_k,
                 n_basis=n_basis,
-                basis_rank=basis_rank,
-                mod_rank=mod_rank
+                basis_rank=basis_rank
             )
             for _ in range(n_layers)
         ])
@@ -432,7 +447,6 @@ class DAWN(nn.Module):
             'neuron_k': neuron_k,
             'n_basis': n_basis,
             'basis_rank': basis_rank,
-            'mod_rank': mod_rank,
             'vocab_size': vocab_size,
             'max_seq_len': max_seq_len,
             'dropout': dropout,

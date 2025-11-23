@@ -333,7 +333,6 @@ def main():
     args.neuron_rank = cfg['model'].get('neuron_rank', 16)
     args.n_basis = cfg['model'].get('n_basis', 16)
     args.basis_rank = cfg['model'].get('basis_rank', 8)
-    args.mod_rank = cfg['model'].get('mod_rank', 32)
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -432,7 +431,7 @@ def main():
         print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
     print(f"Neurons: pool_size={args.n_neurons}, neuron_rank={args.neuron_rank}, neuron_k={args.neuron_k}")
-    print(f"Basis FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}, mod_rank={args.mod_rank}")
+    print(f"Basis FFN (v5.1): n_basis={args.n_basis}, basis_rank={args.basis_rank}, token_residual=enabled")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -465,7 +464,6 @@ def main():
         neuron_k=args.k,
         n_basis=args.n_basis,
         basis_rank=args.basis_rank,
-        mod_rank=args.mod_rank,
         d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
         dropout=args.dropout
