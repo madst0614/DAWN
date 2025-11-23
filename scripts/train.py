@@ -378,7 +378,8 @@ def main():
         kst = timezone(timedelta(hours=9))
         timestamp = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
         random_suffix = random.randint(1000, 9999)
-        run_name = f"run_{timestamp}_{random_suffix}"
+        version = cfg['model'].get('model_version', DAWN.__version__)
+        run_name = f"run_v{version}_{timestamp}_{random_suffix}"
         checkpoint_dir = base_checkpoint_dir / run_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n✓ Created new run folder: {checkpoint_dir}")
