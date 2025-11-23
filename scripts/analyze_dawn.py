@@ -2661,33 +2661,14 @@ def main():
         neuron_pattern_mapping_results = {}
         pattern_ffn_impact_results = {}
 
+    # v5.0: Simplified results (neuron-only, no patterns)
     all_results = {
         'neuron_usage': neuron_usage_results,
         'token_neuron_specialization': token_spec_results,
         'layer_differences': layer_diff_results,
         'uncertainty_accuracy': uncertainty_results,
-        'pattern_usage': pattern_usage_results,  # ⭐ NEW
-        'pattern_collapse_detail': pattern_collapse_results,  # ⭐ NEW
-        'neuron_pattern_correlation': neuron_pattern_corr_results,  # ⭐ NEW
-        'selection_confidence': confidence_results,  # ⭐ NEW
-        'position_patterns': position_pattern_results,  # ⭐ NEW
-        'neuron_diversity': diversity_results,  # 🧬 NEW
-        'neuron_coactivation': coactivation_results,  # 🤝 NEW
-        'bottleneck': bottleneck_results,  # 🔬 NEW
-        'information_flow': information_flow_results,  # 🔬 NEW
-        'task_pressure': task_pressure_results,  # 🔬 NEW
-        'gradient_detailed': gradient_detailed_results,  # 🔍 NEW
-        'pattern_necessity': pattern_necessity_results,  # 🔍 NEW
-        'regularization_impact': regularization_impact_results,  # 🔍 NEW
-        'pattern_diversity': pattern_diversity_results,  # 🎯 NEW
-        'neuron_pattern_mapping': neuron_pattern_mapping_results,  # 🎯 NEW
-        'pattern_ffn_impact': pattern_ffn_impact_results,  # 🎯 NEW
+        'neuron_coactivation': coactivation_results,
     }
-
-    # 🎯 통합 진단
-    if not args.skip_bottleneck:
-        diagnosis_results = diagnose_bottleneck(all_results, n_layers)
-        all_results['diagnosis'] = diagnosis_results
 
     # 저장
     print(f"\nSaving results to: {output_dir}")
@@ -2697,9 +2678,6 @@ def main():
 
     # 시각화
     visualize_results(neuron_usage_results, output_dir)
-
-    # 뉴런 역할 시각화 (similarity, co-activation, clustering)
-    visualize_neuron_roles(diversity_results, coactivation_results, model, output_dir)
 
     # 리포트
     generate_report(all_results, output_dir, best_model_path)
