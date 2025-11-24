@@ -868,11 +868,16 @@ def main():
                 val_file = data_path / 'validation' / 'wikitext_5to1_texts.pkl'
                 if val_file.exists():
                     val_dataset = TextDataset(str(val_file), tokenizer)
+
+                    # Create collate_fn with tokenizer
+                    def collate_fn(batch):
+                        return collate_fn_dynamic_padding(batch, tokenizer)
+
                     val_loader = DataLoader(
                         val_dataset,
                         batch_size=args.batch_size,
                         shuffle=False,
-                        collate_fn=collate_fn_dynamic_padding
+                        collate_fn=collate_fn
                     )
 
                     activation_results, collector = analyze_activations(
