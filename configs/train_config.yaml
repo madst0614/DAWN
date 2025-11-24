@@ -7,22 +7,21 @@ data:
   train_file: train/wikitext_5to1_texts.pkl
   val_file: validation/wikitext_5to1_texts.pkl
 
-# Model Architecture (v5.1: Token Residual Network)
+# Model Architecture (v6.0: Orthogonal Basis FFN)
 model:
-  model_version: "5.1"    # DAWN model version
+  model_version: "6.0"    # DAWN model version
   d_model: 256            # Hidden dimension
   n_layers: 4             # Number of transformer layers
   n_heads: 4              # Number of attention heads
 
-  # Neurons (v5.0: Low-rank neuron pool)
-  n_neurons: 512          # Size of neuron pool per layer
-  neuron_rank: 16         # Low-rank dimension for neurons (91% reduction!)
+  # Neurons (v6.0: Free coordinates in basis space)
+  n_neurons: 256          # Size of neuron pool per layer (512 → 256, 더 효율적)
   neuron_k: 16            # Top-k neurons to select
 
-  # Basis FFN (v5.1: Coarse + Fine)
-  n_basis: 16             # Number of basis FFN blocks
-  basis_rank: 32          # Basis rank (8→32 for better expressiveness, 4x capacity)
-  # Token residual network: d_model → 256 → d_ff (fixed architecture)
+  # Basis FFN (v6.0: Orthogonal Basis with token-level FFN)
+  n_basis: 8              # Number of orthogonal basis (16 → 8, 명확한 역할)
+  basis_rank: 64          # Basis rank (32 → 64, 더 강력한 표현력)
+  # v6.0 변경: Token residual network 제거, Token별 동적 FFN으로 대체
 
   # Architecture
   d_ff: 512               # Feed-forward dimension (2x d_model)
@@ -37,11 +36,9 @@ training:
   weight_decay: 0.1       # Weight decay for regularization
   warmup_epochs: 2        # Warmup epochs
 
-  # v5.1: Multiple regularization losses
-  orthogonality_weight: 1.0     # Neuron orthogonality regularization
-  # Additional losses (fixed weights):
-  # - basis_sparsity: 0.01 (encourage ≥3 basis per neuron)
-  # - basis_diversity: 0.01 (prevent coefficient redundancy)
+  # v6.0: Simplified regularization (only orthogonality)
+  orthogonality_weight: 0.1     # Basis orthogonality regularization (λ=0.1)
+  # v6.0 removed: basis_sparsity, basis_diversity (자연스러운 neuron clustering 허용)
 
 # Mixed precision (faster training on GPU)
 use_amp: true

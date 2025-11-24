@@ -2803,18 +2803,18 @@ def main():
     # Backward compatibility for config parameters
     neuron_k = cfg['model'].get('neuron_k', cfg['model'].get('k', 8))
 
-    # v5.0: Model creation
+    # v6.0: Model creation (backward compatible)
     model = DAWN(
         vocab_size=vocab_size,
         hidden_dim=cfg['model']['d_model'],
         num_layers=cfg['model']['n_layers'],
         n_heads=cfg['model']['n_heads'],
         n_neurons=cfg['model']['n_neurons'],
-        neuron_rank=cfg['model'].get('neuron_rank', 16),
+        neuron_rank=cfg['model'].get('neuron_rank', 16),  # v6.0: not used, backward compat
         neuron_k=neuron_k,
-        n_basis=cfg['model'].get('n_basis', 16),
-        basis_rank=cfg['model'].get('basis_rank', 8),
-        mod_rank=cfg['model'].get('mod_rank', 32),
+        n_basis=cfg['model'].get('n_basis', 8),
+        basis_rank=cfg['model'].get('basis_rank', 64),
+        mod_rank=cfg['model'].get('mod_rank', None),  # v6.0: not used
         d_ff=cfg['model'].get('d_ff', None),
         max_seq_len=cfg['model']['max_seq_len'],
         dropout=cfg['model']['dropout']
@@ -2889,11 +2889,19 @@ def main():
 
     # v5.0: Basis FFN Analysis 🎯
     print("\n" + "="*70)
-    print("🎯 v5.0 SPECIFIC ANALYSES")
+    print("🎯 v6.0 SPECIFIC ANALYSES")
     print("="*70)
 
-    n_basis = cfg['model'].get('n_basis', 16)
-    basis_usage_results = analyze_basis_usage(model, collector, n_layers, n_basis)
+    n_basis = cfg['model'].get('n_basis', 8)
+
+    # v6.0: Use model's built-in basis analysis
+    if hasattr(model, 'analyze_basis_usage'):
+        print("\n  Using v6.0 built-in basis analysis...")
+        basis_usage_results = model.analyze_basis_usage()
+    else:
+        # Fallback to old analysis for v5.x models
+        basis_usage_results = analyze_basis_usage(model, collector, n_layers, n_basis)
+
     basis_composition_results = analyze_neuron_basis_composition(model, n_layers, n_basis, n_neurons)
     basis_orthogonality_results = analyze_basis_orthogonality(model, n_layers)
 

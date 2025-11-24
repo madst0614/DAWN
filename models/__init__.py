@@ -1,25 +1,29 @@
 """
 DAWN Models Module
 
-v5.0: Hierarchical Basis FFN with Low-rank Neurons
+v6.0: Orthogonal Basis FFN with Token-level Dynamic FFN
 """
 
 from .model import (
     DAWN,
     DAWNLanguageModel,
     NeuronRouter,
-    BasisFFN,
-    Layer,
+    OrthogonalBasisFFN,
+    DAWNLayer,
+    Layer,  # Backward compatibility
     create_model,
+    count_parameters,
 )
 
 __all__ = [
     'DAWN',
     'DAWNLanguageModel',
     'NeuronRouter',
-    'BasisFFN',
-    'Layer',
+    'OrthogonalBasisFFN',
+    'DAWNLayer',
+    'Layer',  # Backward compatibility
     'create_model',
+    'count_parameters',
 ]
 
-__version__ = "5.0"
+__version__ = "6.0"
