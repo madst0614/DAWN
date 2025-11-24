@@ -750,16 +750,42 @@ def main():
     print(f"\nLoading config: {config_file}")
     print(f"Loading checkpoint: {model_file}")
 
-    # Load config
+    # Load checkpoint first to get full config
+    checkpoint = torch.load(model_file, map_location='cpu')
+
+    # Try to get config from checkpoint or separate file
     if config_file.exists():
         with open(config_file, 'r') as f:
-            config = json.load(f)
+            file_config = json.load(f)
+            # Check if config is nested (training format) or flat (model format)
+            if 'model' in file_config:
+                # Nested config from training
+                model_config = file_config['model'].copy()
+            else:
+                # Flat config
+                model_config = file_config.copy()
     else:
-        checkpoint = torch.load(model_file, map_location='cpu')
-        config = checkpoint.get('config', {})
+        model_config = checkpoint.get('config', {})
+
+    # Ensure vocab_size is in the config (might be in checkpoint)
+    if 'vocab_size' not in model_config:
+        # Try to infer from checkpoint
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+
+        # Get vocab_size from token_emb weight shape
+        if 'token_emb.weight' in state_dict:
+            vocab_size = state_dict['token_emb.weight'].shape[0]
+            model_config['vocab_size'] = vocab_size
+            print(f"  Inferred vocab_size from checkpoint: {vocab_size}")
+        else:
+            print("  ⚠️  Warning: Could not find vocab_size, using default 30522")
+            model_config['vocab_size'] = 30522
 
     print(f"\nModel config:")
-    for k, v in config.items():
+    for k, v in model_config.items():
         print(f"  {k}: {v}")
 
     # Import model (try different paths)
@@ -772,10 +798,9 @@ def main():
             from dawn_v7 import DAWN
 
     # Create model
-    model = DAWN(**config)
+    model = DAWN(**model_config)
 
-    # Load weights
-    checkpoint = torch.load(model_file, map_location='cpu')
+    # Load weights (checkpoint already loaded above)
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
