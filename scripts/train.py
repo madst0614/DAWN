@@ -313,11 +313,22 @@ def analyze_activations(model, input_ids, device):
         else:
             layer = model.layers[layer_idx]
 
-        # v6.0: router, v5.x: neuron_router
-        if hasattr(layer, 'router'):
+        # v7.0: ffn.n_neurons, v6.0: router, v5.x: neuron_router
+        if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'n_neurons'):
+            # v7.0: n_neurons is in FFN
+            total_neurons = layer.ffn.n_neurons
+        elif hasattr(layer, 'router') and hasattr(layer.router, 'n_neurons'):
+            # v6.0: n_neurons might be in router
             total_neurons = layer.router.n_neurons
-        else:
+        elif hasattr(layer, 'neuron_router') and hasattr(layer.neuron_router, 'n_neurons'):
+            # v5.x: neuron_router
             total_neurons = layer.neuron_router.n_neurons
+        else:
+            # Fallback: use model's n_neurons
+            if hasattr(model, '_orig_mod'):
+                total_neurons = model._orig_mod.n_neurons
+            else:
+                total_neurons = model.n_neurons
 
         usage_ratio = unique_neurons / total_neurons
 
