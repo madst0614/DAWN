@@ -141,6 +141,16 @@ class OrthogonalBasisFFN(nn.Module):
         # Down projection
         self.W_down = nn.Linear(d_ff, d_model)
 
+    @property
+    def neuron_coef_A(self):
+        """Backward compatibility: v5.x had separate coef_A and coef_B"""
+        return self.neuron_coords
+
+    @property
+    def neuron_coef_B(self):
+        """Backward compatibility: v5.x had separate coef_A and coef_B"""
+        return self.neuron_coords
+
     def orthogonality_loss(self):
         """Basis 직교성 유지 (Soft regularization)
 
@@ -263,6 +273,16 @@ class DAWNLayer(nn.Module):
         # Layer norms
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+
+    @property
+    def basis_ffn(self):
+        """Backward compatibility: v5.x called it basis_ffn"""
+        return self.ffn
+
+    @property
+    def neuron_router(self):
+        """Backward compatibility: v5.x called it neuron_router"""
+        return self.router
 
     def forward(self, x, mask=None, return_details=False, return_losses=False):
         """
