@@ -575,18 +575,28 @@ def main():
     print(f"Run folder: {checkpoint_dir}")
 
     print(f"\n{'='*60}")
-    print(f"DAWN (Dynamic Neuron Transformer) Training")
-    print(f"{'='*60}")
     config_version = cfg['model'].get('model_version', 'not specified')
-    print(f"\nConfig version: {config_version} | Code version: {DAWN.__version__}")
-    if config_version != DAWN.__version__ and config_version != 'not specified':
-        print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
+    if config_version == 'baseline':
+        print(f"Vanilla Transformer Baseline Training")
+    else:
+        print(f"DAWN (Dynamic Neuron Transformer) Training")
+    print(f"{'='*60}")
+    print(f"\nConfig version: {config_version}")
+    if config_version != 'baseline':
+        print(f"Code version: {DAWN.__version__}")
+        if config_version != DAWN.__version__ and config_version != 'not specified':
+            print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
-    router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
-    print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
-    compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
-    basis_note = "v7.0: Fixed Orthogonal Basis" if config_version == "7.0" else "v6.0: Learned Basis"
-    print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}{compat_note}")
+
+    if config_version != 'baseline':
+        router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
+        print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
+        compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
+        basis_note = "v7.0: Fixed Orthogonal Basis" if config_version == "7.0" else "v6.0: Learned Basis"
+        print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}{compat_note}")
+    else:
+        print(f"Standard FFN: d_ff={args.d_ff}")
+
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -609,34 +619,47 @@ def main():
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    # Build model kwargs
-    model_kwargs = {
-        'vocab_size': vocab_size,
-        'd_model': args.d_model,
-        'n_layers': args.n_layers,
-        'n_heads': args.n_heads,
-        'n_neurons': args.n_neurons,
-        'neuron_k': args.k,
-        'n_basis': args.n_basis,
-        'basis_rank': args.basis_rank,
-        'd_ff': args.d_ff,
-        'max_seq_len': args.max_seq_len,
-        'dropout': args.dropout,
-    }
-
-    # v6.0 compatibility parameters (ignored by v7.0+)
-    if args.router_temperature is not None:
-        model_kwargs['router_temperature'] = args.router_temperature
-    if args.neuron_rank is not None:
-        model_kwargs['neuron_rank'] = args.neuron_rank
-    if args.mod_rank is not None:
-        model_kwargs['mod_rank'] = args.mod_rank
-
     # Get model version from args (default to latest)
     model_version = getattr(args, 'model_version', '7.1')
 
+    # Build model kwargs based on version
+    if model_version == 'baseline':
+        # Baseline: only standard transformer parameters
+        model_kwargs = {
+            'vocab_size': vocab_size,
+            'd_model': args.d_model,
+            'n_layers': args.n_layers,
+            'n_heads': args.n_heads,
+            'd_ff': args.d_ff,
+            'max_seq_len': args.max_seq_len,
+            'dropout': args.dropout,
+        }
+    else:
+        # DAWN models: include neuron and basis parameters
+        model_kwargs = {
+            'vocab_size': vocab_size,
+            'd_model': args.d_model,
+            'n_layers': args.n_layers,
+            'n_heads': args.n_heads,
+            'n_neurons': args.n_neurons,
+            'neuron_k': args.k,
+            'n_basis': args.n_basis,
+            'basis_rank': args.basis_rank,
+            'd_ff': args.d_ff,
+            'max_seq_len': args.max_seq_len,
+            'dropout': args.dropout,
+        }
+
+        # v6.0 compatibility parameters (ignored by v7.0+)
+        if args.router_temperature is not None:
+            model_kwargs['router_temperature'] = args.router_temperature
+        if args.neuron_rank is not None:
+            model_kwargs['neuron_rank'] = args.neuron_rank
+        if args.mod_rank is not None:
+            model_kwargs['mod_rank'] = args.mod_rank
+
     # Create model by version
-    if model_version in ['7.1', '7.0', '6.0']:
+    if model_version in ['7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
         print(f"\n📌 Model version: {model_version}")
     else:
