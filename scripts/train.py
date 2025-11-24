@@ -247,7 +247,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
 
 def analyze_activations(model, input_ids, device):
-    """Dynamic Neuron Transformer activation pattern analysis (v5.0)"""
+    """Dynamic Neuron Transformer activation pattern analysis (v6.0)"""
     model.eval()
 
     with torch.no_grad():
@@ -258,12 +258,18 @@ def analyze_activations(model, input_ids, device):
         # selected_idx: [B, S, k]
         unique_neurons = torch.unique(selected_idx).numel()
 
-        # Get total neurons from model
+        # Get total neurons from model (v6.0: router, v5.x: neuron_router)
         if hasattr(model, '_orig_mod'):
             # Compiled model
-            total_neurons = model._orig_mod.layers[layer_idx].neuron_router.n_neurons
+            layer = model._orig_mod.layers[layer_idx]
         else:
-            total_neurons = model.layers[layer_idx].neuron_router.n_neurons
+            layer = model.layers[layer_idx]
+
+        # v6.0: router, v5.x: neuron_router
+        if hasattr(layer, 'router'):
+            total_neurons = layer.router.n_neurons
+        else:
+            total_neurons = layer.neuron_router.n_neurons
 
         usage_ratio = unique_neurons / total_neurons
 
