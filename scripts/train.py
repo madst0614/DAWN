@@ -48,13 +48,13 @@ import math
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
-from models.model import DAWN, DAWNLanguageModel
+from models import DAWN, DAWNLanguageModel, create_model_by_version  # v7.1 default, version-aware loading
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.1):
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0):
     """Train for one epoch"""
     model.train()
 
@@ -71,6 +71,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     window_acc_valid = 0
     window_count = 0
 
+    # Last neuron metrics (for epoch summary)
+    last_neuron_metrics = None
+
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for step, batch in enumerate(pbar):
         input_ids = batch["input_ids"].to(device)
@@ -86,21 +89,45 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Mixed precision training
         if scaler is not None:
             with torch.amp.autocast('cuda'):
-                logits, losses = model(input_ids, return_losses=True)  # [B, S, vocab_size]
+                # v7.0: Use model's get_loss method (handles diversity & load balance)
+                if hasattr(model, 'get_loss') and orthogonality_weight == 0:
+                    loss, loss_dict, logits = model.get_loss(
+                        input_ids, labels,
+                        diversity_weight=diversity_weight,
+                        load_balance_weight=load_balance_weight
+                    )
+                else:
+                    # v6.0 compatibility
+                    if orthogonality_weight > 0:
+                        logits, losses = model(input_ids, return_losses=True)
+                        orth_loss = losses['orth_total']
+                    else:
+                        logits = model(input_ids)
+                        orth_loss = 0.0
 
-                # Cross-entropy loss
-                B, S, V = logits.shape
-                ce_loss = F.cross_entropy(
-                    logits.view(B * S, V),
-                    labels.view(B * S),
-                    ignore_index=-100
-                )
+                    # Cross-entropy loss
+                    B, S, V = logits.shape
+                    ce_loss = F.cross_entropy(
+                        logits.view(B * S, V),
+                        labels.view(B * S),
+                        ignore_index=-100
+                    )
 
-                # v6.0: Only orthogonality loss (basis sparsity/diversity removed)
-                orth_loss = losses['orth_total']
+                    # Recipe diversity loss
+                    diversity_loss = 0.0
+                    if diversity_weight > 0:
+                        for layer in model.layers:
+                            recipe = layer.ffn.neuron_recipe
+                            recipe_norm = F.softmax(recipe, dim=-1)
+                            recipe_normalized = F.normalize(recipe_norm, dim=-1)
+                            similarity = torch.mm(recipe_normalized, recipe_normalized.T)
+                            mask = 1 - torch.eye(model.n_neurons, device=similarity.device)
+                            avg_similarity = (similarity * mask).sum() / mask.sum()
+                            diversity_loss += avg_similarity
+                        diversity_loss = diversity_loss / len(model.layers)
 
-                # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss
+                    # Total loss
+                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss
 
             scaler.scale(loss).backward()
 
@@ -111,21 +138,45 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits, losses = model(input_ids, return_losses=True)
+            # v7.0: Use model's get_loss method (handles diversity & load balance)
+            if hasattr(model, 'get_loss') and orthogonality_weight == 0:
+                loss, loss_dict, logits = model.get_loss(
+                    input_ids, labels,
+                    diversity_weight=diversity_weight,
+                    load_balance_weight=load_balance_weight
+                )
+            else:
+                # v6.0 compatibility
+                if orthogonality_weight > 0:
+                    logits, losses = model(input_ids, return_losses=True)
+                    orth_loss = losses['orth_total']
+                else:
+                    logits = model(input_ids)
+                    orth_loss = 0.0
 
-            # Cross-entropy loss
-            B, S, V = logits.shape
-            ce_loss = F.cross_entropy(
-                logits.view(B * S, V),
-                labels.view(B * S),
-                ignore_index=-100
-            )
+                # Cross-entropy loss
+                B, S, V = logits.shape
+                ce_loss = F.cross_entropy(
+                    logits.view(B * S, V),
+                    labels.view(B * S),
+                    ignore_index=-100
+                )
 
-            # v6.0: Only orthogonality loss (basis sparsity/diversity removed)
-            orth_loss = losses['orth_total']
+                # Recipe diversity loss
+                diversity_loss = 0.0
+                if diversity_weight > 0:
+                    for layer in model.layers:
+                        recipe = layer.ffn.neuron_recipe
+                        recipe_norm = F.softmax(recipe, dim=-1)
+                        recipe_normalized = F.normalize(recipe_norm, dim=-1)
+                        similarity = torch.mm(recipe_normalized, recipe_normalized.T)
+                        mask = 1 - torch.eye(model.n_neurons, device=similarity.device)
+                        avg_similarity = (similarity * mask).sum() / mask.sum()
+                        diversity_loss += avg_similarity
+                    diversity_loss = diversity_loss / len(model.layers)
 
-            # Total loss
-            loss = ce_loss + orthogonality_weight * orth_loss
+                # Total loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss
 
             loss.backward()
 
@@ -176,6 +227,31 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
                        f"acc={avg_window_acc:.6f}\n")
 
+            # Collect neuron metrics
+            model.eval()
+            with torch.no_grad():
+                try:
+                    _, neuron_indices = model(input_ids, return_activations=True)
+                    neuron_metrics = compute_training_metrics(model, neuron_indices, device)
+                    last_neuron_metrics = neuron_metrics
+
+                    # Log neuron metrics to file
+                    with open(log_file, 'a') as f:
+                        f.write(f"METRICS,{epoch},{step+1},"
+                               f"avg_usage={neuron_metrics['avg_usage']:.4f},"
+                               f"avg_gini={neuron_metrics['avg_gini']:.4f},"
+                               f"avg_top10={neuron_metrics['avg_top10']:.4f}")
+                        # Add per-layer details
+                        for i in range(len(neuron_indices)):
+                            f.write(f",L{i}_usage={neuron_metrics[f'L{i}_usage']:.4f},"
+                                   f"L{i}_gini={neuron_metrics[f'L{i}_gini']:.4f},"
+                                   f"L{i}_top10={neuron_metrics[f'L{i}_top10']:.4f}")
+                        f.write("\n")
+                except Exception as e:
+                    # If metrics collection fails, continue training
+                    pass
+            model.train()
+
             # Reset window
             window_loss = 0.0
             window_acc_correct = 0
@@ -194,7 +270,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
 
-    return avg_loss, avg_acc
+    return avg_loss, avg_acc, last_neuron_metrics
 
 
 def evaluate(model, dataloader, device, args, tokenizer=None):
@@ -265,11 +341,22 @@ def analyze_activations(model, input_ids, device):
         else:
             layer = model.layers[layer_idx]
 
-        # v6.0: router, v5.x: neuron_router
-        if hasattr(layer, 'router'):
+        # v7.0: ffn.n_neurons, v6.0: router, v5.x: neuron_router
+        if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'n_neurons'):
+            # v7.0: n_neurons is in FFN
+            total_neurons = layer.ffn.n_neurons
+        elif hasattr(layer, 'router') and hasattr(layer.router, 'n_neurons'):
+            # v6.0: n_neurons might be in router
             total_neurons = layer.router.n_neurons
-        else:
+        elif hasattr(layer, 'neuron_router') and hasattr(layer.neuron_router, 'n_neurons'):
+            # v5.x: neuron_router
             total_neurons = layer.neuron_router.n_neurons
+        else:
+            # Fallback: use model's n_neurons
+            if hasattr(model, '_orig_mod'):
+                total_neurons = model._orig_mod.n_neurons
+            else:
+                total_neurons = model.n_neurons
 
         usage_ratio = unique_neurons / total_neurons
 
@@ -281,6 +368,66 @@ def analyze_activations(model, input_ids, device):
         }
 
     return stats
+
+
+def compute_training_metrics(model, neuron_indices, device):
+    """Compute detailed neuron usage metrics during training
+
+    Args:
+        model: DAWN model
+        neuron_indices: List of [B, S, k] tensors (one per layer)
+        device: torch device
+
+    Returns:
+        metrics: Dict with per-layer and aggregate metrics
+    """
+    metrics = {}
+
+    # Get n_neurons from model
+    if hasattr(model, '_orig_mod'):
+        n_neurons = model._orig_mod.n_neurons
+    else:
+        n_neurons = model.n_neurons
+
+    layer_usage = []
+    layer_gini = []
+    layer_top10 = []
+
+    for layer_idx, selected_idx in enumerate(neuron_indices):
+        # selected_idx: [B, S, k]
+        flat_idx = selected_idx.reshape(-1)
+
+        # 1. Usage rate (unique neurons used / total neurons)
+        unique_neurons = torch.unique(flat_idx).numel()
+        usage_rate = unique_neurons / n_neurons
+        layer_usage.append(usage_rate)
+
+        # 2. Gini coefficient (0 = perfect equality, 1 = maximum inequality)
+        counts = torch.bincount(flat_idx, minlength=n_neurons).float()
+        sorted_counts = torch.sort(counts)[0]
+        n = len(sorted_counts)
+        index = torch.arange(1, n + 1, device=device, dtype=torch.float32)
+        gini = ((2 * index - n - 1) * sorted_counts).sum() / (n * sorted_counts.sum() + 1e-10)
+        layer_gini.append(gini.item())
+
+        # 3. Top-10 concentration (what % of activations go to top 10 neurons)
+        if n_neurons >= 10:
+            top10 = torch.topk(counts, 10).values.sum() / (counts.sum() + 1e-10)
+            layer_top10.append(top10.item())
+        else:
+            layer_top10.append(1.0)
+
+        # Per-layer metrics
+        metrics[f'L{layer_idx}_usage'] = usage_rate
+        metrics[f'L{layer_idx}_gini'] = gini.item()
+        metrics[f'L{layer_idx}_top10'] = layer_top10[-1]
+
+    # Aggregate metrics
+    metrics['avg_usage'] = sum(layer_usage) / len(layer_usage)
+    metrics['avg_gini'] = sum(layer_gini) / len(layer_gini)
+    metrics['avg_top10'] = sum(layer_top10) / len(layer_top10)
+
+    return metrics
 
 
 def load_config(config_path):
@@ -313,6 +460,7 @@ def main():
     args = Args()
 
     # Model (Dynamic Neuron Transformer)
+    args.model_version = cfg['model'].get('model_version', '7.1')  # Default to latest
     args.d_model = cfg['model'].get('d_model', 512)
     args.n_layers = cfg['model'].get('n_layers', 6)
     args.n_heads = cfg['model'].get('n_heads', 8)
@@ -332,9 +480,9 @@ def main():
     # v6.0: Basis FFN parameters
     args.neuron_rank = cfg['model'].get('neuron_rank', None)  # v6.0: not used anymore (backward compat)
     args.n_basis = cfg['model'].get('n_basis', 8)
-    args.basis_rank = cfg['model'].get('basis_rank', 64)  # v6.0: increased from 32 to 64
+    args.basis_rank = cfg['model'].get('basis_rank', 64)
     args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored)
-    args.router_temperature = cfg['model'].get('router_temperature', 2.0)  # v6.0: router temperature
+    args.router_temperature = cfg['model'].get('router_temperature', None)  # v6.0 only (v7.0 ignores)
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -347,8 +495,10 @@ def main():
     args.weight_decay = cfg['training']['weight_decay']
     args.warmup_epochs = cfg['training'].get('warmup_epochs', 1)
 
-    # v6.0: Regularization weights (only orthogonality)
-    args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.1)
+    # Regularization weights
+    args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.0)  # v6.0 compat
+    args.diversity_weight = cfg['training'].get('diversity_weight', 0.0)  # v7.0: recipe diversity
+    args.load_balance_weight = cfg['training'].get('load_balance_weight', 0.0)  # v7.0: load balance
 
     # Other
     args.use_amp = cfg.get('use_amp', True)
@@ -432,9 +582,11 @@ def main():
     if config_version != DAWN.__version__ and config_version != 'not specified':
         print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
-    print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}, router_temp={args.router_temperature}")
+    router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
+    print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
     compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
-    print(f"Basis FFN (v6.0): n_basis={args.n_basis}, basis_rank={args.basis_rank}, token_level_ffn=enabled{compat_note}")
+    basis_note = "v7.0: Fixed Orthogonal Basis" if config_version == "7.0" else "v6.0: Learned Basis"
+    print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}{compat_note}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -457,26 +609,42 @@ def main():
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    model = DAWN(
-        vocab_size=vocab_size,
-        hidden_dim=args.d_model,
-        num_layers=args.n_layers,
-        n_heads=args.n_heads,
-        n_neurons=args.n_neurons,
-        neuron_rank=args.neuron_rank,
-        neuron_k=args.k,
-        n_basis=args.n_basis,
-        basis_rank=args.basis_rank,
-        mod_rank=args.mod_rank,  # v5.0 compatibility
-        d_ff=args.d_ff,
-        max_seq_len=args.max_seq_len,
-        dropout=args.dropout,
-        router_temperature=args.router_temperature  # v6.0
-    )
-    model = model.to(device)
+    # Build model kwargs
+    model_kwargs = {
+        'vocab_size': vocab_size,
+        'd_model': args.d_model,
+        'n_layers': args.n_layers,
+        'n_heads': args.n_heads,
+        'n_neurons': args.n_neurons,
+        'neuron_k': args.k,
+        'n_basis': args.n_basis,
+        'basis_rank': args.basis_rank,
+        'd_ff': args.d_ff,
+        'max_seq_len': args.max_seq_len,
+        'dropout': args.dropout,
+    }
 
-    # Display model version
-    print(f"\n📌 Model version: {DAWN.__version__}")
+    # v6.0 compatibility parameters (ignored by v7.0+)
+    if args.router_temperature is not None:
+        model_kwargs['router_temperature'] = args.router_temperature
+    if args.neuron_rank is not None:
+        model_kwargs['neuron_rank'] = args.neuron_rank
+    if args.mod_rank is not None:
+        model_kwargs['mod_rank'] = args.mod_rank
+
+    # Get model version from args (default to latest)
+    model_version = getattr(args, 'model_version', '7.1')
+
+    # Create model by version
+    if model_version in ['7.1', '7.0', '6.0']:
+        model = create_model_by_version(model_version, model_kwargs)
+        print(f"\n📌 Model version: {model_version}")
+    else:
+        # Fallback to default DAWN (v7.1)
+        model = DAWN(**model_kwargs)
+        print(f"\n📌 Model version: {DAWN.__version__}")
+
+    model = model.to(device)
 
     # PyTorch 2.0+ compilation for speed boost
     if hasattr(torch, 'compile'):
@@ -653,10 +821,12 @@ def main():
         epoch_start = time.time()
 
         # Train
-        train_loss, train_acc = train_epoch(
+        train_loss, train_acc, neuron_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args,
             scaler, tokenizer, log_file=str(training_log_file),
-            orthogonality_weight=args.orthogonality_weight
+            orthogonality_weight=args.orthogonality_weight,
+            diversity_weight=args.diversity_weight,
+            load_balance_weight=args.load_balance_weight
         )
 
         # Evaluate
@@ -679,6 +849,19 @@ def main():
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
+
+        # Print neuron metrics if available
+        if neuron_metrics is not None:
+            print(f"  Neuron Metrics:")
+            print(f"    Avg Usage: {neuron_metrics['avg_usage']:.2%} | "
+                  f"Gini: {neuron_metrics['avg_gini']:.3f} | "
+                  f"Top10: {neuron_metrics['avg_top10']:.2%}")
+            # Per-layer breakdown
+            n_layers = sum(1 for k in neuron_metrics.keys() if k.startswith('L') and k.endswith('_usage'))
+            layer_strs = []
+            for i in range(n_layers):
+                layer_strs.append(f"L{i}: {neuron_metrics[f'L{i}_usage']:.2%}")
+            print(f"    Per-layer usage: {' | '.join(layer_strs)}")
 
         # Write epoch summary to log
         with open(training_log_file, 'a') as f:
