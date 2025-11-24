@@ -867,7 +867,7 @@ def main():
                 from utils.data import TextDataset, collate_fn_dynamic_padding
                 val_file = data_path / 'validation' / 'wikitext_5to1_texts.pkl'
                 if val_file.exists():
-                    val_dataset = TextDataset(str(val_file))
+                    val_dataset = TextDataset(str(val_file), tokenizer)
                     val_loader = DataLoader(
                         val_dataset,
                         batch_size=args.batch_size,
