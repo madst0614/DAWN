@@ -202,24 +202,25 @@ class SymmetricBasisFFN(nn.Module):
         # [B, S, n_basis]
 
         # 3. Basis 조합으로 W_A, W_B 구성
+        # einsum → matmul로 최적화
         W_A = torch.einsum('bsn,ndr->bsdr', token_recipe, self.basis.basis_A)
         # [B, S, d_model, rank]
 
         W_B = torch.einsum('bsn,nrf->bsrf', token_recipe, self.basis.basis_B)
         # [B, S, rank, d_ff]
 
-        # 4. Up projection: x → h
-        h = torch.einsum('bsd,bsdr->bsr', x, W_A)      # [B, S, rank]
-        h = torch.einsum('bsr,bsrf->bsf', h, W_B)      # [B, S, d_ff]
+        # 4. Up projection: x → h (matmul로 최적화!)
+        # einsum 대신 matmul 사용 - 더 빠른 cuBLAS 커널 호출
+        h = torch.matmul(x.unsqueeze(-2), W_A).squeeze(-2)  # [B, S, rank]
+        h = torch.matmul(h.unsqueeze(-2), W_B).squeeze(-2)  # [B, S, d_ff]
 
         # 5. Activation
         h = F.gelu(h)
 
         # 6. Down projection: Transpose! (핵심!)
-        # W_B.T: [B, S, d_ff, rank]
-        h = torch.einsum('bsf,bsrf->bsr', h, W_B)      # [B, S, rank]
-        # W_A.T: [B, S, rank, d_model]
-        output = torch.einsum('bsr,bsdr->bsd', h, W_A)  # [B, S, d_model]
+        # transpose는 view만 바꾸는 거라 메모리 추가 안 듦
+        h = torch.matmul(h.unsqueeze(-2), W_B.transpose(-2, -1)).squeeze(-2)  # [B, S, rank]
+        output = torch.matmul(h.unsqueeze(-2), W_A.transpose(-2, -1)).squeeze(-2)  # [B, S, d_model]
 
         # 7. Output scaling (선택적)
         output = output * self.output_scale
