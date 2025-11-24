@@ -48,7 +48,7 @@ import math
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
-from models import DAWN, DAWNLanguageModel  # v7.0: Uses model_v7 by default
+from models import DAWN, DAWNLanguageModel, create_model_by_version  # v7.1 default, version-aware loading
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
@@ -460,6 +460,7 @@ def main():
     args = Args()
 
     # Model (Dynamic Neuron Transformer)
+    args.model_version = cfg['model'].get('model_version', '7.1')  # Default to latest
     args.d_model = cfg['model'].get('d_model', 512)
     args.n_layers = cfg['model'].get('n_layers', 6)
     args.n_heads = cfg['model'].get('n_heads', 8)
@@ -623,7 +624,7 @@ def main():
         'dropout': args.dropout,
     }
 
-    # v6.0 compatibility parameters (ignored by v7.0)
+    # v6.0 compatibility parameters (ignored by v7.0+)
     if args.router_temperature is not None:
         model_kwargs['router_temperature'] = args.router_temperature
     if args.neuron_rank is not None:
@@ -631,11 +632,19 @@ def main():
     if args.mod_rank is not None:
         model_kwargs['mod_rank'] = args.mod_rank
 
-    model = DAWN(**model_kwargs)
-    model = model.to(device)
+    # Get model version from args (default to latest)
+    model_version = getattr(args, 'model_version', '7.1')
 
-    # Display model version
-    print(f"\n📌 Model version: {DAWN.__version__}")
+    # Create model by version
+    if model_version in ['7.1', '7.0', '6.0']:
+        model = create_model_by_version(model_version, model_kwargs)
+        print(f"\n📌 Model version: {model_version}")
+    else:
+        # Fallback to default DAWN (v7.1)
+        model = DAWN(**model_kwargs)
+        print(f"\n📌 Model version: {DAWN.__version__}")
+
+    model = model.to(device)
 
     # PyTorch 2.0+ compilation for speed boost
     if hasattr(torch, 'compile'):
