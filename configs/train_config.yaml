@@ -36,8 +36,9 @@ training:
   weight_decay: 0.1       # Weight decay for regularization
   warmup_epochs: 2        # Warmup epochs
 
-  # v7.0: No regularization needed! (orthogonality mathematically guaranteed)
-  # v7.0 removed: orthogonality_weight (basis is fixed and perfectly orthogonal)
+  # v7.0 Regularization
+  # orthogonality_weight: 0.0 (not needed - basis is fixed and perfectly orthogonal)
+  diversity_weight: 0.05  # Recipe diversity loss (권장: 0.01~0.1, 0으로 비활성화 가능)
 
 # Mixed precision (faster training on GPU)
 use_amp: true

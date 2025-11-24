@@ -198,8 +198,9 @@ class RecipeFFN(nn.Module):
 
         # ===== 학습되는 파라미터 =====
         # Neuron recipe: 각 neuron이 basis를 어떻게 조합하는지
+        # v7.0: 더 큰 초기화로 다양성 증가 (0.5 → 2.0)
         self.neuron_recipe = nn.Parameter(
-            torch.randn(n_neurons, self.n_basis) * 0.5
+            torch.randn(n_neurons, self.n_basis) * 2.0
         )
 
         # Down projection
@@ -452,25 +453,58 @@ class DAWN(nn.Module):
             return logits, all_neuron_idx
         return logits
 
-    def get_loss(self, input_ids, labels):
-        """Compute loss (no orthogonality loss needed!)
+    def get_loss(self, input_ids, labels, diversity_weight=0.0):
+        """Compute loss with optional diversity regularization
 
         Args:
             input_ids: [B, S]
             labels: [B, S]
+            diversity_weight: Weight for recipe diversity loss (default: 0.0)
+                             Encourages different neurons to have different recipes
 
         Returns:
             total_loss, loss_dict
         """
         logits = self.forward(input_ids)
 
-        loss = F.cross_entropy(
+        # Cross-entropy loss
+        ce_loss = F.cross_entropy(
             logits.view(-1, self.vocab_size),
             labels.view(-1),
             ignore_index=-100
         )
 
-        return loss, {'ce': loss.item(), 'total': loss.item()}
+        # Recipe diversity loss (optional)
+        diversity_loss = 0.0
+        if diversity_weight > 0:
+            for layer in self.layers:
+                recipe = layer.ffn.neuron_recipe
+                recipe_norm = F.softmax(recipe, dim=-1)  # [n_neurons, n_basis]
+
+                # Compute pairwise similarity
+                recipe_normalized = F.normalize(recipe_norm, dim=-1)
+                similarity = torch.mm(recipe_normalized, recipe_normalized.T)
+
+                # Penalize high similarity (encourage diversity)
+                # Exclude diagonal (self-similarity = 1)
+                mask = 1 - torch.eye(self.n_neurons, device=similarity.device)
+                avg_similarity = (similarity * mask).sum() / mask.sum()
+
+                # Loss: push average similarity towards 0
+                diversity_loss += avg_similarity
+
+            diversity_loss = diversity_loss / len(self.layers)
+
+        # Total loss
+        total_loss = ce_loss + diversity_weight * diversity_loss
+
+        loss_dict = {
+            'ce': ce_loss.item(),
+            'diversity': diversity_loss.item() if diversity_weight > 0 else 0.0,
+            'total': total_loss.item()
+        }
+
+        return total_loss, loss_dict
 
     def generate(self, input_ids, max_new_tokens=50, temperature=1.0, top_k=None):
         """Auto-regressive generation"""
