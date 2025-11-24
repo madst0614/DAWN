@@ -2974,8 +2974,27 @@ def main():
 
     # 저장
     print(f"\nSaving results to: {output_dir}")
+
+    # Convert numpy arrays to lists for JSON serialization
+    def convert_to_serializable(obj):
+        """Recursively convert numpy arrays to lists"""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, (np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.float64, np.float32)):
+            return float(obj)
+        else:
+            return obj
+
+    all_results_serializable = convert_to_serializable(all_results)
+
     with open(output_dir / 'analysis_results.json', 'w') as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(all_results_serializable, f, indent=2)
     print("  ✓ analysis_results.json")
 
     # 시각화
