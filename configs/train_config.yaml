@@ -7,32 +7,41 @@ data:
   train_file: train/wikitext_5to1_texts.pkl
   val_file: validation/wikitext_5to1_texts.pkl
 
-# Model Architecture (Dynamic Neuron Transformer)
+# Model Architecture (v5.1: Token Residual Network)
 model:
-  model_version: "4.5"    # DAWN model version (v4.5: Pattern-specific up + Cross-neuron gating)
-  d_model: 256            # Hidden dimension (reduced for efficiency)
+  model_version: "5.1"    # DAWN model version
+  d_model: 256            # Hidden dimension
   n_layers: 4             # Number of transformer layers
   n_heads: 4              # Number of attention heads
-  n_neurons: 512          # Size of neuron pool per layer (v3.4: full-rank neurons)
-  n_patterns: 32          # Size of pattern pool per layer (v3.5: simplified, 87% reduction)
-  neuron_k: 16            # Top-k neurons to select (v3.4: doubled)
-  pattern_k: 4            # Top-k patterns to select (v4.5: reduced for efficiency)
-  rank: 64                # Low-rank dimension for pattern-specific projection (v4.5)
+
+  # Neurons (v5.0: Low-rank neuron pool)
+  n_neurons: 512          # Size of neuron pool per layer
+  neuron_rank: 16         # Low-rank dimension for neurons (91% reduction!)
+  neuron_k: 16            # Top-k neurons to select
+
+  # Basis FFN (v5.1: Coarse + Fine)
+  n_basis: 16             # Number of basis FFN blocks
+  basis_rank: 32          # Basis rank (8→32 for better expressiveness, 4x capacity)
+  # Token residual network: d_model → 256 → d_ff (fixed architecture)
+
+  # Architecture
   d_ff: 512               # Feed-forward dimension (2x d_model)
   max_seq_len: 128        # Maximum sequence length
   dropout: 0.1            # Dropout rate
-  pattern_dropout: 0.2    # Pattern dropout rate (v4.3: force pattern diversity)
-  use_base: true          # Use base projection for stability (v4.5)
 
 # Training
 training:
   batch_size: 128         # Batch size
   num_epochs: 30          # Total epochs
-  lr: 0.0003              # Learning rate (increased for faster convergence)
+  lr: 0.0003              # Learning rate
   weight_decay: 0.1       # Weight decay for regularization
   warmup_epochs: 2        # Warmup epochs
-  load_balancing_weight: 10.0   # v4.4: Strong pattern load balancing (10x)
-  orthogonality_weight: 1.0     # v4.4: Very strong neuron orthogonality (100x from v4.3!)
+
+  # v5.1: Multiple regularization losses
+  orthogonality_weight: 1.0     # Neuron orthogonality regularization
+  # Additional losses (fixed weights):
+  # - basis_sparsity: 0.01 (encourage ≥3 basis per neuron)
+  # - basis_diversity: 0.01 (prevent coefficient redundancy)
 
 # Mixed precision (faster training on GPU)
 use_amp: true

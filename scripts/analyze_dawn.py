@@ -45,7 +45,7 @@ from transformers import BertTokenizer
 # ============================================================
 
 class ActivationCollector:
-    """뉴런/패턴 선택 패턴 수집 (확장판)"""
+    """뉴런 선택 패턴 수집 (v5.0: neuron-only)"""
     def __init__(self, model, n_layers):
         self.model = model
         self.n_layers = n_layers
@@ -53,10 +53,7 @@ class ActivationCollector:
         # 뉴런 선택 기록
         self.neuron_selections = [[] for _ in range(n_layers)]
 
-        # 패턴 선택 기록 ⭐ NEW
-        self.pattern_selections = [[] for _ in range(n_layers)]
-
-        # 위치별 뉴런 선택 ⭐ NEW
+        # 위치별 뉴런 선택
         self.position_neuron_map = defaultdict(lambda: [[] for _ in range(n_layers)])
 
         # 토큰별 뉴런 선택
@@ -66,7 +63,7 @@ class ActivationCollector:
         self.correct_selections = [[] for _ in range(n_layers)]
         self.incorrect_selections = [[] for _ in range(n_layers)]
 
-    def collect(self, input_ids, labels, logits, all_selected, all_patterns=None):
+    def collect(self, input_ids, labels, logits, all_selected):
         """한 배치의 선택 패턴 수집 (최적화)"""
         B, S = input_ids.shape
 
@@ -86,12 +83,7 @@ class ActivationCollector:
             # 1. 전체 뉴런 선택 기록
             self.neuron_selections[layer_idx].append(selected_cpu)
 
-            # 2. 패턴 선택 기록
-            if all_patterns is not None:
-                pattern_weights = all_patterns[layer_idx]  # [B, S, n_patterns]
-                self.pattern_selections[layer_idx].append(pattern_weights.cpu())
-
-            # 3. 토큰별 + 위치별 뉴런 선택 (vectorized)
+            # 2. 토큰별 + 위치별 뉴런 선택 (vectorized)
             # Flatten: [B, S, k] → [B*S, k]
             selected_flat = selected_cpu.reshape(-1, selected_cpu.shape[-1])  # [B*S, k]
             tokens_flat = input_ids_cpu.reshape(-1)  # [B*S]
@@ -108,7 +100,7 @@ class ActivationCollector:
                 neurons = selected_cpu[:, s, :].reshape(-1).tolist()
                 self.position_neuron_map[s][layer_idx].extend(neurons)
 
-            # 4. 정확도별 뉴런 선택
+            # 3. 정확도별 뉴런 선택
             correct_neurons = selected_cpu[correct_mask.cpu()]
             incorrect_neurons = selected_cpu[~correct_mask.cpu()]
 
@@ -123,12 +115,6 @@ class ActivationCollector:
             if self.neuron_selections[layer_idx]:
                 self.neuron_selections[layer_idx] = torch.cat(
                     self.neuron_selections[layer_idx], dim=0
-                )
-
-            # 패턴 정보 병합 ⭐ NEW
-            if self.pattern_selections[layer_idx]:
-                self.pattern_selections[layer_idx] = torch.cat(
-                    self.pattern_selections[layer_idx], dim=0
                 )
 
             if self.correct_selections[layer_idx]:
@@ -875,6 +861,286 @@ def analyze_position_patterns(collector, n_layers, max_positions=128):
                 print(f"  ⚠️  LARGE CHANGE: Position strongly affects neuron selection!")
 
         results[f'layer_{layer_idx}'] = position_stats
+
+    return results
+
+
+# ============================================================
+# v5.0: Basis FFN Analysis
+# ============================================================
+
+def analyze_basis_usage(model, collector, n_layers, n_basis):
+    """Analyze basis usage patterns in BasisFFN
+
+    Checks:
+    1. Which basis blocks are used
+    2. Basis activation frequency
+    3. Basis collapse detection
+    """
+    print("\n" + "="*70)
+    print("🎯 BASIS USAGE ANALYSIS (v5.0)")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        layer = model.layers[layer_idx].basis_ffn
+
+        # Get neuron selections from collector
+        neuron_selections = collector.neuron_selections[layer_idx]  # [N, S, k]
+
+        # Flatten
+        neuron_idx_flat = neuron_selections.reshape(-1).long()  # [N*S*k]
+
+        # Get coefficients for selected neurons
+        coef_A = layer.neuron_coef_A[neuron_idx_flat]  # [N*S*k, n_basis]
+        coef_B = layer.neuron_coef_B[neuron_idx_flat]  # [N*S*k, n_basis]
+
+        # Compute basis importance (absolute average)
+        basis_importance_A = coef_A.abs().mean(dim=0).detach().cpu().numpy()  # [n_basis]
+        basis_importance_B = coef_B.abs().mean(dim=0).detach().cpu().numpy()  # [n_basis]
+
+        # Combined importance
+        basis_importance = (basis_importance_A + basis_importance_B) / 2
+
+        # Statistics
+        threshold = 0.01
+        used_basis = (basis_importance > threshold).sum()
+
+        # Gini coefficient (inequality measure)
+        sorted_imp = np.sort(basis_importance)
+        n = len(sorted_imp)
+        index = np.arange(1, n + 1)
+        gini = (2 * np.sum(index * sorted_imp)) / (n * np.sum(sorted_imp)) - (n + 1) / n
+
+        # Entropy (diversity measure)
+        basis_probs = basis_importance / (basis_importance.sum() + 1e-10)
+        basis_entropy = -np.sum(basis_probs * np.log(basis_probs + 1e-10))
+        max_entropy = np.log(n_basis)
+        normalized_entropy = basis_entropy / max_entropy
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Active basis (>{threshold}): {used_basis}/{n_basis} ({used_basis/n_basis*100:.1f}%)")
+        print(f"  Gini coefficient: {gini:.4f} (0=equal, 1=concentrated)")
+        print(f"  Entropy: {basis_entropy:.4f}/{max_entropy:.4f} ({normalized_entropy*100:.1f}%)")
+
+        # Top basis
+        top_idx = np.argsort(basis_importance)[::-1][:5]
+        print(f"  Top-5 basis importance: {basis_importance[top_idx]}")
+
+        # Warnings
+        if used_basis < n_basis * 0.5:
+            print(f"  🔴 WARNING: Only {used_basis}/{n_basis} basis active - COLLAPSE!")
+        elif used_basis < n_basis * 0.7:
+            print(f"  🟡 CAUTION: {used_basis}/{n_basis} basis active - underutilized")
+        else:
+            print(f"  ✅ GOOD: {used_basis}/{n_basis} basis active")
+
+        if gini > 0.7:
+            print(f"  🔴 WARNING: High Gini ({gini:.3f}) - basis usage concentrated!")
+
+        if normalized_entropy < 0.6:
+            print(f"  🔴 WARNING: Low entropy ({normalized_entropy:.3f}) - low diversity!")
+
+        results[f'layer_{layer_idx}'] = {
+            'active_basis': int(used_basis),
+            'total_basis': int(n_basis),
+            'usage_ratio': float(used_basis / n_basis),
+            'gini': float(gini),
+            'entropy': float(basis_entropy),
+            'normalized_entropy': float(normalized_entropy),
+            'importance_A': basis_importance_A.tolist(),
+            'importance_B': basis_importance_B.tolist(),
+            'importance_combined': basis_importance.tolist(),
+        }
+
+    return results
+
+
+def analyze_neuron_basis_composition(model, n_layers, n_basis, n_neurons):
+    """Analyze how neurons compose basis blocks
+
+    Checks:
+    1. How many basis each neuron uses
+    2. Sparsity of neuron-basis connections
+    3. Redundancy in compositions
+    """
+    print("\n" + "="*70)
+    print("🔗 NEURON-BASIS COMPOSITION ANALYSIS (v5.0)")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        layer = model.layers[layer_idx].basis_ffn
+
+        # Coefficients: [n_neurons, n_basis]
+        coef_A = layer.neuron_coef_A.data.cpu().numpy()
+        coef_B = layer.neuron_coef_B.data.cpu().numpy()
+
+        # Count active connections (threshold = 0.1)
+        threshold = 0.1
+        active_A = (np.abs(coef_A) > threshold).sum(axis=1)  # per neuron
+        active_B = (np.abs(coef_B) > threshold).sum(axis=1)
+
+        # Statistics
+        avg_active_A = active_A.mean()
+        avg_active_B = active_B.mean()
+        std_active_A = active_A.std()
+        std_active_B = active_B.std()
+
+        # Sparsity
+        sparsity_A = 1 - (active_A.sum() / (n_neurons * n_basis))
+        sparsity_B = 1 - (active_B.sum() / (n_neurons * n_basis))
+
+        # Check for redundancy (neurons with same basis)
+        from scipy.spatial.distance import pdist, squareform
+
+        # Normalize coefficients
+        coef_A_norm = coef_A / (np.linalg.norm(coef_A, axis=1, keepdims=True) + 1e-8)
+        coef_B_norm = coef_B / (np.linalg.norm(coef_B, axis=1, keepdims=True) + 1e-8)
+
+        # Compute pairwise similarity (sample if too large)
+        sample_size = min(200, n_neurons)
+        sample_idx = np.random.choice(n_neurons, sample_size, replace=False)
+
+        sim_A = 1 - pdist(coef_A_norm[sample_idx], 'cosine')
+        sim_B = 1 - pdist(coef_B_norm[sample_idx], 'cosine')
+
+        # Count highly similar pairs (>0.8)
+        similar_pairs_A = (sim_A > 0.8).sum()
+        similar_pairs_B = (sim_B > 0.8).sum()
+        total_pairs = len(sim_A)
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Avg active basis per neuron:")
+        print(f"    Coef A: {avg_active_A:.2f} ± {std_active_A:.2f} / {n_basis}")
+        print(f"    Coef B: {avg_active_B:.2f} ± {std_active_B:.2f} / {n_basis}")
+        print(f"  Sparsity: A={sparsity_A*100:.1f}%, B={sparsity_B*100:.1f}%")
+        print(f"  Similar neuron pairs (>0.8 cosine):")
+        print(f"    A: {similar_pairs_A}/{total_pairs} ({similar_pairs_A/total_pairs*100:.1f}%)")
+        print(f"    B: {similar_pairs_B}/{total_pairs} ({similar_pairs_B/total_pairs*100:.1f}%)")
+
+        # Warnings
+        if avg_active_A < 3 or avg_active_B < 3:
+            print(f"  🔴 WARNING: Neurons use <3 basis on average - too sparse!")
+        elif avg_active_A < 5 or avg_active_B < 5:
+            print(f"  🟡 CAUTION: Low basis usage per neuron")
+        else:
+            print(f"  ✅ GOOD: Neurons use multiple basis")
+
+        if similar_pairs_A / total_pairs > 0.3 or similar_pairs_B / total_pairs > 0.3:
+            print(f"  🔴 WARNING: Many similar neurons - redundancy!")
+
+        results[f'layer_{layer_idx}'] = {
+            'avg_active_basis_A': float(avg_active_A),
+            'avg_active_basis_B': float(avg_active_B),
+            'sparsity_A': float(sparsity_A),
+            'sparsity_B': float(sparsity_B),
+            'similar_pairs_ratio_A': float(similar_pairs_A / total_pairs),
+            'similar_pairs_ratio_B': float(similar_pairs_B / total_pairs),
+        }
+
+    return results
+
+
+def analyze_basis_orthogonality(model, n_layers):
+    """Analyze diversity of basis blocks
+
+    Checks:
+    1. Orthogonality between basis vectors
+    2. Similarity distribution
+    3. Effective rank
+    """
+    print("\n" + "="*70)
+    print("📐 BASIS ORTHOGONALITY ANALYSIS (v5.0)")
+    print("="*70)
+
+    results = {}
+
+    for layer_idx in range(n_layers):
+        layer = model.layers[layer_idx].basis_ffn
+
+        # Basis A: [n_basis, d_model, basis_rank]
+        basis_A = layer.basis_A.data
+        n_basis, d_model, basis_rank = basis_A.shape
+
+        # Flatten to [n_basis, d_model*basis_rank]
+        basis_A_flat = basis_A.view(n_basis, -1)
+
+        # Normalize
+        basis_A_norm = F.normalize(basis_A_flat, dim=1)
+
+        # Similarity matrix [n_basis, n_basis]
+        similarity = torch.mm(basis_A_norm, basis_A_norm.T)
+
+        # Off-diagonal elements
+        mask = ~torch.eye(n_basis, dtype=torch.bool, device=similarity.device)
+        off_diag = similarity[mask].detach().cpu().numpy()
+
+        # Statistics
+        mean_sim = off_diag.mean()
+        max_sim = off_diag.max()
+        std_sim = off_diag.std()
+
+        # Count highly similar pairs (>0.7)
+        similar_pairs = (off_diag > 0.7).sum()
+        total_pairs = len(off_diag)
+
+        # Effective rank (via singular values)
+        U, S, V = torch.svd(basis_A_flat)
+        S_normalized = S / S.sum()
+        effective_rank = torch.exp(-(S_normalized * torch.log(S_normalized + 1e-10)).sum()).item()
+        rank_ratio = effective_rank / n_basis
+
+        print(f"\nLayer {layer_idx} - Basis A:")
+        print(f"  Mean similarity: {mean_sim:.4f} (lower is better)")
+        print(f"  Max similarity: {max_sim:.4f}")
+        print(f"  Std similarity: {std_sim:.4f}")
+        print(f"  Similar pairs (>0.7): {similar_pairs}/{total_pairs} ({similar_pairs/total_pairs*100:.1f}%)")
+        print(f"  Effective rank: {effective_rank:.2f}/{n_basis} ({rank_ratio*100:.1f}%)")
+
+        # Same for Basis B
+        basis_B = layer.basis_B.data
+        basis_B_flat = basis_B.view(n_basis, -1)
+        basis_B_norm = F.normalize(basis_B_flat, dim=1)
+        similarity_B = torch.mm(basis_B_norm, basis_B_norm.T)
+        off_diag_B = similarity_B[mask].detach().cpu().numpy()
+
+        mean_sim_B = off_diag_B.mean()
+        max_sim_B = off_diag_B.max()
+        similar_pairs_B = (off_diag_B > 0.7).sum()
+
+        print(f"\nLayer {layer_idx} - Basis B:")
+        print(f"  Mean similarity: {mean_sim_B:.4f}")
+        print(f"  Max similarity: {max_sim_B:.4f}")
+        print(f"  Similar pairs (>0.7): {similar_pairs_B}/{total_pairs} ({similar_pairs_B/total_pairs*100:.1f}%)")
+
+        # Warnings
+        if mean_sim > 0.5 or mean_sim_B > 0.5:
+            print(f"  🔴 WARNING: High mean similarity - basis not diverse!")
+        elif mean_sim > 0.3 or mean_sim_B > 0.3:
+            print(f"  🟡 CAUTION: Moderate similarity")
+        else:
+            print(f"  ✅ GOOD: Low similarity - diverse basis")
+
+        if rank_ratio < 0.6:
+            print(f"  🔴 WARNING: Low effective rank ({rank_ratio:.2f}) - basis collapse!")
+        elif rank_ratio < 0.8:
+            print(f"  🟡 CAUTION: Moderate effective rank")
+        else:
+            print(f"  ✅ GOOD: High effective rank - all basis used")
+
+        results[f'layer_{layer_idx}'] = {
+            'mean_similarity_A': float(mean_sim),
+            'max_similarity_A': float(max_sim),
+            'similar_pairs_ratio_A': float(similar_pairs / total_pairs),
+            'effective_rank_A': float(effective_rank),
+            'rank_ratio_A': float(rank_ratio),
+            'mean_similarity_B': float(mean_sim_B),
+            'max_similarity_B': float(max_sim_B),
+            'similar_pairs_ratio_B': float(similar_pairs_B / total_pairs),
+        }
 
     return results
 
@@ -2165,7 +2431,7 @@ def analyze_neuron_pattern_mapping_quality(model, dataloader, device, n_layers, 
             if tokenizer is not None:
                 input_ids, _ = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
 
-            _, selected_neurons, pattern_weights = model(input_ids, return_activations=True)
+            _, selected_neurons = model(input_ids, return_activations=True)
 
             for layer_idx in range(n_layers):
                 neurons = selected_neurons[layer_idx]  # [B, S, k]
@@ -2536,17 +2802,19 @@ def main():
 
     # Backward compatibility for config parameters
     neuron_k = cfg['model'].get('neuron_k', cfg['model'].get('k', 8))
-    pattern_k = cfg['model'].get('pattern_k', 16)
 
+    # v5.0: Model creation
     model = DAWN(
         vocab_size=vocab_size,
         hidden_dim=cfg['model']['d_model'],
         num_layers=cfg['model']['n_layers'],
         n_heads=cfg['model']['n_heads'],
         n_neurons=cfg['model']['n_neurons'],
-        n_patterns=cfg['model']['n_patterns'],
+        neuron_rank=cfg['model'].get('neuron_rank', 16),
         neuron_k=neuron_k,
-        pattern_k=pattern_k,
+        n_basis=cfg['model'].get('n_basis', 16),
+        basis_rank=cfg['model'].get('basis_rank', 8),
+        mod_rank=cfg['model'].get('mod_rank', 32),
         d_ff=cfg['model'].get('d_ff', None),
         max_seq_len=cfg['model']['max_seq_len'],
         dropout=cfg['model']['dropout']
@@ -2581,9 +2849,8 @@ def main():
 
     n_layers = cfg['model']['n_layers']
     n_neurons = cfg['model']['n_neurons']
-    n_patterns = cfg['model']['n_patterns']
 
-    print(f"\nModel: {n_layers} layers, {n_neurons} neurons/layer")
+    print(f"\nModel: {n_layers} layers, {n_neurons} neurons/layer (v5.0)")
     print(f"Validation loss: {checkpoint.get('val_loss', 'N/A')}")
     print(f"Epoch: {checkpoint.get('epoch', 'N/A')}")
 
@@ -2607,8 +2874,8 @@ def main():
             input_ids = batch['input_ids'].to(device)
             input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
 
-            logits, all_selected, all_patterns = model(input_ids, return_activations=True)
-            collector.collect(input_ids, labels, logits, all_selected, all_patterns)
+            logits, all_selected = model(input_ids, return_activations=True)
+            collector.collect(input_ids, labels, logits, all_selected)
 
     collector.finalize()
 
@@ -2620,21 +2887,33 @@ def main():
     layer_diff_results = analyze_layer_differences(neuron_usage_results)
     uncertainty_results = analyze_uncertainty_accuracy(collector, n_layers)
 
-    # ⭐ 새로운 분석
-    pattern_usage_results = analyze_pattern_usage(collector, n_patterns, n_layers)
-    pattern_collapse_results = analyze_pattern_collapse_detail(collector, n_patterns, n_layers)
-    neuron_pattern_corr_results = analyze_neuron_pattern_correlation(collector, n_layers)
-    confidence_results = analyze_selection_confidence(collector, n_layers)
-    position_pattern_results = analyze_position_patterns(collector, n_layers)
+    # v5.0: Basis FFN Analysis 🎯
+    print("\n" + "="*70)
+    print("🎯 v5.0 SPECIFIC ANALYSES")
+    print("="*70)
 
-    # 🧬 Neuron diversity 분석
-    diversity_results = analyze_neuron_diversity(model, n_layers)
+    n_basis = cfg['model'].get('n_basis', 16)
+    basis_usage_results = analyze_basis_usage(model, collector, n_layers, n_basis)
+    basis_composition_results = analyze_neuron_basis_composition(model, n_layers, n_basis, n_neurons)
+    basis_orthogonality_results = analyze_basis_orthogonality(model, n_layers)
+
+    # ⭐ Pattern analysis (v5.0: disabled - no patterns in v5.0)
+    # pattern_usage_results = analyze_pattern_usage(collector, n_patterns, n_layers)
+    # pattern_collapse_results = analyze_pattern_collapse_detail(collector, n_patterns, n_layers)
+    # neuron_pattern_corr_results = analyze_neuron_pattern_correlation(collector, n_layers)
+    # confidence_results = analyze_selection_confidence(collector, n_layers)
+    # position_pattern_results = analyze_position_patterns(collector, n_layers)
+
+    # 🧬 Neuron diversity 분석 (v5.0: disabled for now)
+    # diversity_results = analyze_neuron_diversity(model, n_layers)
 
     # 🤝 Co-activation 분석
     coactivation_results = analyze_neuron_coactivation(collector, n_neurons, n_layers)
 
-    # 🔬 Bottleneck 분석 (optional, can be slow)
-    if not args.skip_bottleneck:
+    print("\n✅ Analysis complete! (v5.0: pattern analyses disabled)")
+
+    # 🔬 Bottleneck 분석 (v5.0: disabled for simplicity)
+    if False and not args.skip_bottleneck:
         print("\n" + "="*70)
         print("🚀 RUNNING UNIFIED BOTTLENECK ANALYSIS (OPTIMIZED)")
         print("="*70)
@@ -2672,33 +2951,18 @@ def main():
         neuron_pattern_mapping_results = {}
         pattern_ffn_impact_results = {}
 
+    # v5.0: Simplified results (neuron-only, no patterns)
     all_results = {
         'neuron_usage': neuron_usage_results,
         'token_neuron_specialization': token_spec_results,
         'layer_differences': layer_diff_results,
         'uncertainty_accuracy': uncertainty_results,
-        'pattern_usage': pattern_usage_results,  # ⭐ NEW
-        'pattern_collapse_detail': pattern_collapse_results,  # ⭐ NEW
-        'neuron_pattern_correlation': neuron_pattern_corr_results,  # ⭐ NEW
-        'selection_confidence': confidence_results,  # ⭐ NEW
-        'position_patterns': position_pattern_results,  # ⭐ NEW
-        'neuron_diversity': diversity_results,  # 🧬 NEW
-        'neuron_coactivation': coactivation_results,  # 🤝 NEW
-        'bottleneck': bottleneck_results,  # 🔬 NEW
-        'information_flow': information_flow_results,  # 🔬 NEW
-        'task_pressure': task_pressure_results,  # 🔬 NEW
-        'gradient_detailed': gradient_detailed_results,  # 🔍 NEW
-        'pattern_necessity': pattern_necessity_results,  # 🔍 NEW
-        'regularization_impact': regularization_impact_results,  # 🔍 NEW
-        'pattern_diversity': pattern_diversity_results,  # 🎯 NEW
-        'neuron_pattern_mapping': neuron_pattern_mapping_results,  # 🎯 NEW
-        'pattern_ffn_impact': pattern_ffn_impact_results,  # 🎯 NEW
+        'neuron_coactivation': coactivation_results,
+        # v5.0 Basis FFN analyses
+        'basis_usage': basis_usage_results,
+        'basis_composition': basis_composition_results,
+        'basis_orthogonality': basis_orthogonality_results,
     }
-
-    # 🎯 통합 진단
-    if not args.skip_bottleneck:
-        diagnosis_results = diagnose_bottleneck(all_results, n_layers)
-        all_results['diagnosis'] = diagnosis_results
 
     # 저장
     print(f"\nSaving results to: {output_dir}")
@@ -2708,9 +2972,6 @@ def main():
 
     # 시각화
     visualize_results(neuron_usage_results, output_dir)
-
-    # 뉴런 역할 시각화 (similarity, co-activation, clustering)
-    visualize_neuron_roles(diversity_results, coactivation_results, model, output_dir)
 
     # 리포트
     generate_report(all_results, output_dir, best_model_path)

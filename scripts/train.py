@@ -54,7 +54,7 @@ from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dy
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                load_balancing_weight=0.1, orthogonality_weight=0.01):
+                orthogonality_weight=0.01):
     """Train for one epoch"""
     model.train()
 
@@ -96,12 +96,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ignore_index=-100
                 )
 
-                # Auxiliary losses (v4.4: configurable regularization)
-                pattern_load_loss = sum(losses['pattern_load'])
+                # Auxiliary losses (v5.0: neuron orthogonality + basis sparsity + basis diversity)
                 neuron_ortho_loss = sum(losses['neuron_ortho'])
+                basis_sparsity_loss = sum(losses['basis_sparsity'])
+                basis_diversity_loss = sum(losses['basis_diversity'])
 
                 # Total loss
-                loss = ce_loss + load_balancing_weight * pattern_load_loss + orthogonality_weight * neuron_ortho_loss
+                loss = ce_loss + orthogonality_weight * neuron_ortho_loss + \
+                       0.01 * basis_sparsity_loss + 0.01 * basis_diversity_loss
 
             scaler.scale(loss).backward()
 
@@ -122,12 +124,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 ignore_index=-100
             )
 
-            # Auxiliary losses (v4.4: configurable regularization)
-            pattern_load_loss = sum(losses['pattern_load'])
+            # Auxiliary losses (v5.0: neuron orthogonality + basis sparsity + basis diversity)
             neuron_ortho_loss = sum(losses['neuron_ortho'])
+            basis_sparsity_loss = sum(losses['basis_sparsity'])
+            basis_diversity_loss = sum(losses['basis_diversity'])
 
             # Total loss
-            loss = ce_loss + load_balancing_weight * pattern_load_loss + orthogonality_weight * neuron_ortho_loss
+            loss = ce_loss + orthogonality_weight * neuron_ortho_loss + \
+                   0.01 * basis_sparsity_loss + 0.01 * basis_diversity_loss
 
             loss.backward()
 
@@ -249,23 +253,23 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
 
 def analyze_activations(model, input_ids, device):
-    """Dynamic Neuron Transformer 활성화 패턴 분석"""
+    """Dynamic Neuron Transformer activation pattern analysis (v5.0)"""
     model.eval()
 
     with torch.no_grad():
-        _, all_selected, all_patterns = model(input_ids, return_activations=True)
+        _, all_selected = model(input_ids, return_activations=True)
 
     stats = {}
     for layer_idx, selected_idx in enumerate(all_selected):
         # selected_idx: [B, S, k]
         unique_neurons = torch.unique(selected_idx).numel()
 
-        # Get total neurons from model (updated for NeuronRouter)
+        # Get total neurons from model
         if hasattr(model, '_orig_mod'):
             # Compiled model
-            total_neurons = model._orig_mod.layers[layer_idx].router.n_neurons
+            total_neurons = model._orig_mod.layers[layer_idx].neuron_router.n_neurons
         else:
-            total_neurons = model.layers[layer_idx].router.n_neurons
+            total_neurons = model.layers[layer_idx].neuron_router.n_neurons
 
         usage_ratio = unique_neurons / total_neurons
 
@@ -325,9 +329,11 @@ def main():
     args.dropout = cfg['model'].get('dropout', 0.1)
     args.pattern_dropout = cfg['model'].get('pattern_dropout', 0.0)
 
-    # v4.5: Pattern-specific projection parameters
-    args.rank = cfg['model'].get('rank', 64)
-    args.use_base = cfg['model'].get('use_base', True)
+    # v5.0: Basis FFN parameters
+    args.neuron_rank = cfg['model'].get('neuron_rank', 16)
+    args.n_basis = cfg['model'].get('n_basis', 16)
+    args.basis_rank = cfg['model'].get('basis_rank', 32)  # v5.1: increased from 8 to 32
+    args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored in v5.1)
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -340,8 +346,7 @@ def main():
     args.weight_decay = cfg['training']['weight_decay']
     args.warmup_epochs = cfg['training'].get('warmup_epochs', 1)
 
-    # v4.4: Regularization weights
-    args.load_balancing_weight = cfg['training'].get('load_balancing_weight', 0.1)
+    # v5.0: Regularization weights (only orthogonality)
     args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.01)
 
     # Other
@@ -426,7 +431,9 @@ def main():
     if config_version != DAWN.__version__ and config_version != 'not specified':
         print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
-    print(f"Neurons: pool_size={args.n_neurons}, patterns={args.n_patterns}, neuron_k={args.neuron_k}, pattern_k={args.pattern_k}")
+    print(f"Neurons: pool_size={args.n_neurons}, neuron_rank={args.neuron_rank}, neuron_k={args.neuron_k}")
+    compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
+    print(f"Basis FFN (v5.1): n_basis={args.n_basis}, basis_rank={args.basis_rank}, token_residual=enabled{compat_note}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -455,15 +462,14 @@ def main():
         num_layers=args.n_layers,
         n_heads=args.n_heads,
         n_neurons=args.n_neurons,
-        n_patterns=args.n_patterns,
-        k=args.k,
-        pattern_k=args.pattern_k,
-        rank=args.rank,
+        neuron_rank=args.neuron_rank,
+        neuron_k=args.k,
+        n_basis=args.n_basis,
+        basis_rank=args.basis_rank,
+        mod_rank=args.mod_rank,  # v5.0 compatibility
         d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
-        dropout=args.dropout,
-        pattern_dropout=args.pattern_dropout,
-        use_base=args.use_base
+        dropout=args.dropout
     )
     model = model.to(device)
 
@@ -533,48 +539,87 @@ def main():
         print(f"\nResuming from checkpoint: {resume_checkpoint}")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
 
+        # Check for version mismatch
+        checkpoint_version = checkpoint.get('model_version', 'unknown')
+        print(f"📌 Checkpoint version: {checkpoint_version}")
+        print(f"📌 Current model version: {DAWN.__version__}")
+
+        if checkpoint_version != DAWN.__version__ and checkpoint_version != 'unknown':
+            print(f"\n⚠️  Version mismatch detected!")
+            print(f"   Checkpoint: v{checkpoint_version} → Current: v{DAWN.__version__}")
+            print(f"   Will attempt partial loading (architecture-compatible parameters only)")
+
+        # Load model state with strict=False for version compatibility
         missing_keys, unexpected_keys = model.load_state_dict(
             checkpoint['model_state_dict'], strict=False
         )
 
-        # Check for version mismatch
-        checkpoint_version = checkpoint.get('model_version', 'unknown')
-
+        # Categorize missing keys
         if missing_keys:
-            print(f"⚠️  Missing keys: {len(missing_keys)}")
-            print(f"   New parameters in v{DAWN.__version__}: {missing_keys[:3]}...")
+            # v5.0 new parameters
+            v5_new_params = [k for k in missing_keys if any(x in k for x in
+                ['neuron_A', 'neuron_B', 'basis_A', 'basis_B',
+                 'neuron_coef', 'token_mod'])]
+            # v4.5 old parameters that are now missing
+            v4_old_params = [k for k in missing_keys if any(x in k for x in
+                ['pattern_queries', 'pattern_up', 'neuron_q', 'neuron_k', 'neuron_v'])]
+            other_missing = [k for k in missing_keys if k not in v5_new_params and k not in v4_old_params]
+
+            if v5_new_params:
+                print(f"\n✨ v5.0 new parameters (randomly initialized): {len(v5_new_params)}")
+                print(f"   - Low-rank neurons, basis FFN, token modulation")
+            if other_missing:
+                print(f"\n⚠️  Other missing keys: {len(other_missing)}")
+                if len(other_missing) <= 5:
+                    for k in other_missing:
+                        print(f"      - {k}")
+
         if unexpected_keys:
-            print(f"⚠️  Unexpected keys: {len(unexpected_keys)}")
+            # v4.5 parameters not in v5.0
+            v4_deprecated = [k for k in unexpected_keys if any(x in k for x in
+                ['pattern_queries', 'pattern_up', 'neuron_q', 'neuron_k', 'neuron_v',
+                 'neuron_interaction', 'up_base', 'path_proj'])]
+            other_unexpected = [k for k in unexpected_keys if k not in v4_deprecated]
+
+            if v4_deprecated:
+                print(f"\n♻️  v4.5 deprecated parameters (ignored): {len(v4_deprecated)}")
+            if other_unexpected:
+                print(f"\n⚠️  Other unexpected keys: {len(other_unexpected)}")
+                if len(other_unexpected) <= 5:
+                    for k in other_unexpected:
+                        print(f"      - {k}")
+
         if not missing_keys and not unexpected_keys:
-            print("✓ All parameters loaded successfully!")
+            print("\n✅ Perfect match! All parameters loaded successfully!")
 
         # Try to load optimizer state even with version mismatch
-        # PyTorch optimizer handles new parameters automatically
         try:
             if checkpoint_version != DAWN.__version__ and checkpoint_version != 'unknown':
-                print(f"\n⚠️  Model version mismatch (checkpoint: {checkpoint_version}, current: {DAWN.__version__})")
-                print(f"   Attempting to load optimizer state (new params will be auto-initialized)")
+                print(f"\n🔄 Loading optimizer state (cross-version)...")
+                print(f"   New parameters will use default optimizer settings")
 
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
             if 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             if 'scaler_state_dict' in checkpoint and scaler is not None:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
             start_epoch = checkpoint.get('epoch', 0) + 1
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            print(f"✓ Optimizer/scheduler state loaded successfully")
-            print(f"✓ Resuming from epoch {start_epoch} (best loss: {best_val_loss:.4f})")
-        except Exception as e:
-            print(f"\n⚠️  Failed to load optimizer state: {e}")
-            print(f"   Starting with fresh optimizer but keeping epoch count")
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
 
-        print(f"  Starting from epoch {start_epoch}")
-        print(f"  Best val loss so far: {best_val_loss:.4f}")
+            print(f"✅ Optimizer/scheduler loaded successfully")
+            print(f"✅ Resuming from epoch {start_epoch} (best val loss: {best_val_loss:.4f})")
+
+        except Exception as e:
+            print(f"\n⚠️  Could not load optimizer state: {str(e)[:100]}")
+            print(f"   Starting with fresh optimizer (model weights preserved)")
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
+            print(f"   Epoch count: {start_epoch}, Best val loss: {best_val_loss:.4f}")
+
     else:
-        print(f"\nStarting fresh training")
+        print(f"\n🆕 Starting fresh training (no checkpoint found)")
 
     # Checkpoint & Monitor
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
@@ -609,7 +654,6 @@ def main():
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args,
             scaler, tokenizer, log_file=str(training_log_file),
-            load_balancing_weight=args.load_balancing_weight,
             orthogonality_weight=args.orthogonality_weight
         )
 
