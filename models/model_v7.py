@@ -453,19 +453,55 @@ class DAWN(nn.Module):
             return logits, all_neuron_idx
         return logits
 
-    def get_loss(self, input_ids, labels, diversity_weight=0.0):
-        """Compute loss with optional diversity regularization
+    def compute_load_balance(self, neuron_indices):
+        """Compute load balance loss for a layer
+
+        Encourages uniform usage of neurons across the batch
+
+        Args:
+            neuron_indices: [B, S, k] - selected neuron indices
+
+        Returns:
+            load_balance_loss: scalar - higher means more imbalanced
+        """
+        # Flatten and count occurrences of each neuron
+        flat_indices = neuron_indices.flatten()
+        counts = torch.bincount(flat_indices, minlength=self.n_neurons).float()
+
+        # Normalize to get frequency distribution
+        total = counts.sum()
+        if total == 0:
+            return torch.tensor(0.0, device=neuron_indices.device)
+
+        freq = counts / total
+
+        # Encourage uniform distribution using coefficient of variation
+        # CV = std / mean (lower is better, 0 = perfectly uniform)
+        mean_freq = freq.mean()
+        std_freq = freq.std()
+        cv = std_freq / (mean_freq + 1e-8)
+
+        return cv
+
+    def get_loss(self, input_ids, labels, diversity_weight=0.0, load_balance_weight=0.0):
+        """Compute loss with optional diversity and load balance regularization
 
         Args:
             input_ids: [B, S]
             labels: [B, S]
             diversity_weight: Weight for recipe diversity loss (default: 0.0)
                              Encourages different neurons to have different recipes
+            load_balance_weight: Weight for load balance loss (default: 0.0)
+                                Encourages uniform usage of neurons
 
         Returns:
             total_loss, loss_dict
         """
-        logits = self.forward(input_ids)
+        # Forward with activation tracking if load balance is enabled
+        if load_balance_weight > 0:
+            logits, neuron_indices = self.forward(input_ids, return_activations=True)
+        else:
+            logits = self.forward(input_ids)
 
         # Cross-entropy loss
         ce_loss = F.cross_entropy(
@@ -495,12 +531,20 @@ class DAWN(nn.Module):
 
             diversity_loss = diversity_loss / len(self.layers)
 
+        # Load balance loss (optional)
+        lb_loss = 0.0
+        if load_balance_weight > 0:
+            for layer_indices in neuron_indices:
+                lb_loss += self.compute_load_balance(layer_indices)
+            lb_loss = lb_loss / len(neuron_indices)
+
         # Total loss
-        total_loss = ce_loss + diversity_weight * diversity_loss
+        total_loss = ce_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
         loss_dict = {
             'ce': ce_loss.item(),
             'diversity': diversity_loss.item() if diversity_weight > 0 else 0.0,
+            'load_balance': lb_loss.item() if load_balance_weight > 0 else 0.0,
             'total': total_loss.item()
         }
 

@@ -54,7 +54,7 @@ from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dy
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0):
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0):
     """Train for one epoch"""
     model.train()
 
@@ -86,13 +86,72 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Mixed precision training
         if scaler is not None:
             with torch.amp.autocast('cuda'):
-                # v7.0: No need for return_losses (orthogonality guaranteed)
-                if orthogonality_weight > 0:
+                # v7.0: Use model's get_loss method (handles diversity & load balance)
+                if hasattr(model, 'get_loss') and orthogonality_weight == 0:
+                    loss, loss_dict = model.get_loss(
+                        input_ids, labels,
+                        diversity_weight=diversity_weight,
+                        load_balance_weight=load_balance_weight
+                    )
+                    # Get logits for accuracy calculation
+                    logits = model(input_ids)
+                else:
                     # v6.0 compatibility
+                    if orthogonality_weight > 0:
+                        logits, losses = model(input_ids, return_losses=True)
+                        orth_loss = losses['orth_total']
+                    else:
+                        logits = model(input_ids)
+                        orth_loss = 0.0
+
+                    # Cross-entropy loss
+                    B, S, V = logits.shape
+                    ce_loss = F.cross_entropy(
+                        logits.view(B * S, V),
+                        labels.view(B * S),
+                        ignore_index=-100
+                    )
+
+                    # Recipe diversity loss
+                    diversity_loss = 0.0
+                    if diversity_weight > 0:
+                        for layer in model.layers:
+                            recipe = layer.ffn.neuron_recipe
+                            recipe_norm = F.softmax(recipe, dim=-1)
+                            recipe_normalized = F.normalize(recipe_norm, dim=-1)
+                            similarity = torch.mm(recipe_normalized, recipe_normalized.T)
+                            mask = 1 - torch.eye(model.n_neurons, device=similarity.device)
+                            avg_similarity = (similarity * mask).sum() / mask.sum()
+                            diversity_loss += avg_similarity
+                        diversity_loss = diversity_loss / len(model.layers)
+
+                    # Total loss
+                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss
+
+            scaler.scale(loss).backward()
+
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # v7.0: Use model's get_loss method (handles diversity & load balance)
+            if hasattr(model, 'get_loss') and orthogonality_weight == 0:
+                loss, loss_dict = model.get_loss(
+                    input_ids, labels,
+                    diversity_weight=diversity_weight,
+                    load_balance_weight=load_balance_weight
+                )
+                # Get logits for accuracy calculation
+                logits = model(input_ids)
+            else:
+                # v6.0 compatibility
+                if orthogonality_weight > 0:
                     logits, losses = model(input_ids, return_losses=True)
                     orth_loss = losses['orth_total']
                 else:
-                    # v7.0: Simple forward pass
                     logits = model(input_ids)
                     orth_loss = 0.0
 
@@ -104,7 +163,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ignore_index=-100
                 )
 
-                # Recipe diversity loss (v7.0)
+                # Recipe diversity loss
                 diversity_loss = 0.0
                 if diversity_weight > 0:
                     for layer in model.layers:
@@ -119,49 +178,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # Total loss
                 loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss
-
-            scaler.scale(loss).backward()
-
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            # v7.0: No need for return_losses (orthogonality guaranteed)
-            if orthogonality_weight > 0:
-                # v6.0 compatibility
-                logits, losses = model(input_ids, return_losses=True)
-                orth_loss = losses['orth_total']
-            else:
-                # v7.0: Simple forward pass
-                logits = model(input_ids)
-                orth_loss = 0.0
-
-            # Cross-entropy loss
-            B, S, V = logits.shape
-            ce_loss = F.cross_entropy(
-                logits.view(B * S, V),
-                labels.view(B * S),
-                ignore_index=-100
-            )
-
-            # Recipe diversity loss (v7.0)
-            diversity_loss = 0.0
-            if diversity_weight > 0:
-                for layer in model.layers:
-                    recipe = layer.ffn.neuron_recipe
-                    recipe_norm = F.softmax(recipe, dim=-1)
-                    recipe_normalized = F.normalize(recipe_norm, dim=-1)
-                    similarity = torch.mm(recipe_normalized, recipe_normalized.T)
-                    mask = 1 - torch.eye(model.n_neurons, device=similarity.device)
-                    avg_similarity = (similarity * mask).sum() / mask.sum()
-                    diversity_loss += avg_similarity
-                diversity_loss = diversity_loss / len(model.layers)
-
-            # Total loss
-            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss
 
             loss.backward()
 
@@ -386,6 +402,7 @@ def main():
     # Regularization weights
     args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.0)  # v6.0 compat
     args.diversity_weight = cfg['training'].get('diversity_weight', 0.0)  # v7.0: recipe diversity
+    args.load_balance_weight = cfg['training'].get('load_balance_weight', 0.0)  # v7.0: load balance
 
     # Other
     args.use_amp = cfg.get('use_amp', True)
@@ -704,7 +721,8 @@ def main():
             model, train_loader, optimizer, scheduler, device, epoch, args,
             scaler, tokenizer, log_file=str(training_log_file),
             orthogonality_weight=args.orthogonality_weight,
-            diversity_weight=args.diversity_weight
+            diversity_weight=args.diversity_weight,
+            load_balance_weight=args.load_balance_weight
         )
 
         # Evaluate
