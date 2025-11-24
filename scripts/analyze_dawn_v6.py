@@ -472,6 +472,7 @@ def main():
         basis_rank=model_cfg.get('basis_rank', 64),
         max_seq_len=model_cfg.get('max_seq_len', 512),
         dropout=model_cfg.get('dropout', 0.1),
+        router_temperature=model_cfg.get('router_temperature', 2.0),
     )
 
     # State dict 로드
@@ -496,7 +497,8 @@ def main():
 
     print(f"\nModel config:")
     print(f"  Layers: {n_layers}")
-    print(f"  Neurons: {n_neurons}")
+    print(f"  Neurons: {n_neurons}, neuron_k: {model_cfg.get('neuron_k', 16)}")
+    print(f"  Router temperature: {model_cfg.get('router_temperature', 2.0)}")
     print(f"  Basis: {n_basis}, Rank: {model_cfg.get('basis_rank', 64)}")
     print(f"  Validation loss: {checkpoint.get('val_loss', 'N/A')}")
     print(f"  Epoch: {checkpoint.get('epoch', 'N/A')}")

@@ -17,6 +17,7 @@ model:
   # Neurons (v6.0: Free coordinates in basis space)
   n_neurons: 256          # Size of neuron pool per layer (512 → 256, 더 효율적)
   neuron_k: 16            # Top-k neurons to select
+  router_temperature: 2.0 # Router softmax temperature (higher = smoother distribution)
 
   # Basis FFN (v6.0: Orthogonal Basis with token-level FFN)
   n_basis: 8              # Number of orthogonal basis (16 → 8, 명확한 역할)

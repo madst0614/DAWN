@@ -334,6 +334,7 @@ def main():
     args.n_basis = cfg['model'].get('n_basis', 8)
     args.basis_rank = cfg['model'].get('basis_rank', 64)  # v6.0: increased from 32 to 64
     args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored)
+    args.router_temperature = cfg['model'].get('router_temperature', 2.0)  # v6.0: router temperature
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -431,7 +432,7 @@ def main():
     if config_version != DAWN.__version__ and config_version != 'not specified':
         print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
-    print(f"Neurons: pool_size={args.n_neurons}, neuron_rank={args.neuron_rank}, neuron_k={args.neuron_k}")
+    print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}, router_temp={args.router_temperature}")
     compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
     print(f"Basis FFN (v6.0): n_basis={args.n_basis}, basis_rank={args.basis_rank}, token_level_ffn=enabled{compat_note}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
@@ -469,7 +470,8 @@ def main():
         mod_rank=args.mod_rank,  # v5.0 compatibility
         d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
-        dropout=args.dropout
+        dropout=args.dropout,
+        router_temperature=args.router_temperature  # v6.0
     )
     model = model.to(device)
 

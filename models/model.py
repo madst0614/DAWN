@@ -33,13 +33,14 @@ class NeuronRouter(nn.Module):
     - Token + Context 기반 neuron 선택
     """
 
-    def __init__(self, n_neurons=256, d_model=256, n_heads=4, k=16):
+    def __init__(self, n_neurons=256, d_model=256, n_heads=4, k=16, temperature=2.0):
         super().__init__()
         self.n_neurons = n_neurons
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.k = k
+        self.temperature = temperature
 
         # Neuron embeddings (routing용)
         self.neuron_emb = nn.Parameter(
@@ -93,7 +94,7 @@ class NeuronRouter(nn.Module):
 
         # 4. Top-k selection
         topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)
-        weights = F.softmax(topk_scores, dim=-1)
+        weights = F.softmax(topk_scores / self.temperature, dim=-1)
 
         return topk_idx, weights, context
 
@@ -250,7 +251,7 @@ class DAWNLayer(nn.Module):
 
     def __init__(self, d_model=256, d_ff=1024, n_heads=4,
                  n_neurons=256, neuron_k=16,
-                 n_basis=8, basis_rank=64):
+                 n_basis=8, basis_rank=64, router_temperature=2.0):
         super().__init__()
 
         # Neuron Router
@@ -258,7 +259,8 @@ class DAWNLayer(nn.Module):
             n_neurons=n_neurons,
             d_model=d_model,
             n_heads=n_heads,
-            k=neuron_k
+            k=neuron_k,
+            temperature=router_temperature
         )
 
         # Orthogonal Basis FFN
@@ -349,6 +351,7 @@ class DAWN(nn.Module):
                  n_neurons=256, neuron_k=16,
                  n_basis=8, basis_rank=64,
                  max_seq_len=512, dropout=0.1,
+                 router_temperature=2.0,
                  # Backward compatibility
                  hidden_dim=None, num_layers=None, k=None,
                  neuron_rank=None, mod_rank=None,
@@ -366,6 +369,7 @@ class DAWN(nn.Module):
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.n_layers = n_layers
+        self.router_temperature = router_temperature
 
         # Embeddings
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -381,7 +385,8 @@ class DAWN(nn.Module):
                 n_neurons=n_neurons,
                 neuron_k=neuron_k,
                 n_basis=n_basis,
-                basis_rank=basis_rank
+                basis_rank=basis_rank,
+                router_temperature=router_temperature
             )
             for _ in range(n_layers)
         ])
@@ -404,6 +409,7 @@ class DAWN(nn.Module):
             'basis_rank': basis_rank,
             'max_seq_len': max_seq_len,
             'dropout': dropout,
+            'router_temperature': router_temperature,
         }
 
         # For compatibility
