@@ -88,13 +88,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             with torch.amp.autocast('cuda'):
                 # v7.0: Use model's get_loss method (handles diversity & load balance)
                 if hasattr(model, 'get_loss') and orthogonality_weight == 0:
-                    loss, loss_dict = model.get_loss(
+                    loss, loss_dict, logits = model.get_loss(
                         input_ids, labels,
                         diversity_weight=diversity_weight,
                         load_balance_weight=load_balance_weight
                     )
-                    # Get logits for accuracy calculation
-                    logits = model(input_ids)
                 else:
                     # v6.0 compatibility
                     if orthogonality_weight > 0:
@@ -139,13 +137,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         else:
             # v7.0: Use model's get_loss method (handles diversity & load balance)
             if hasattr(model, 'get_loss') and orthogonality_weight == 0:
-                loss, loss_dict = model.get_loss(
+                loss, loss_dict, logits = model.get_loss(
                     input_ids, labels,
                     diversity_weight=diversity_weight,
                     load_balance_weight=load_balance_weight
                 )
-                # Get logits for accuracy calculation
-                logits = model(input_ids)
             else:
                 # v6.0 compatibility
                 if orthogonality_weight > 0:

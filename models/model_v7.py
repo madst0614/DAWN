@@ -495,7 +495,7 @@ class DAWN(nn.Module):
                                 Encourages uniform usage of neurons
 
         Returns:
-            total_loss, loss_dict
+            total_loss, loss_dict, logits
         """
         # Forward with activation tracking if load balance is enabled
         if load_balance_weight > 0:
@@ -548,7 +548,7 @@ class DAWN(nn.Module):
             'total': total_loss.item()
         }
 
-        return total_loss, loss_dict
+        return total_loss, loss_dict, logits
 
     def generate(self, input_ids, max_new_tokens=50, temperature=1.0, top_k=None):
         """Auto-regressive generation"""
