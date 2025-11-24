@@ -2850,7 +2850,7 @@ def main():
     n_layers = cfg['model']['n_layers']
     n_neurons = cfg['model']['n_neurons']
 
-    print(f"\nModel: {n_layers} layers, {n_neurons} neurons/layer (v5.0)")
+    print(f"\nModel: {n_layers} layers, {n_neurons} neurons/layer (v{DAWN.__version__})")
     print(f"Validation loss: {checkpoint.get('val_loss', 'N/A')}")
     print(f"Epoch: {checkpoint.get('epoch', 'N/A')}")
 
