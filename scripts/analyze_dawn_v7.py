@@ -944,17 +944,25 @@ def main():
     for k, v in model_config.items():
         print(f"  {k}: {v}")
 
-    # Import model (try different paths)
-    try:
-        from models.model_v7 import DAWN
-    except ImportError:
-        try:
-            from models.model import DAWN
-        except ImportError:
-            from dawn_v7 import DAWN
+    # Get model version (default to 7.0 for backward compatibility)
+    model_version = model_config.get('model_version', '7.0')
 
-    # Create model
-    model = DAWN(**model_config)
+    # Import version-aware model creator
+    try:
+        from models import create_model_by_version
+        print(f"  Using model version: {model_version}")
+        model = create_model_by_version(model_version, model_config)
+    except ImportError:
+        # Fallback for old structure
+        print("  ⚠️  Using fallback import (consider updating models/__init__.py)")
+        try:
+            from models.model_v7 import DAWN
+        except ImportError:
+            try:
+                from models.model import DAWN
+            except ImportError:
+                from dawn_v7 import DAWN
+        model = DAWN(**model_config)
 
     # Load weights (checkpoint already loaded above)
     if 'model_state_dict' in checkpoint:
@@ -972,7 +980,9 @@ def main():
     model = model.to(device)
     model.eval()
 
-    print(f"\n📌 Model version: {getattr(DAWN, '__version__', 'unknown')}")
+    # Print model version (get from model or config)
+    detected_version = model_version if model_version else 'unknown'
+    print(f"\n📌 Model version: {detected_version}")
 
     # Analysis results
     all_results = {}
