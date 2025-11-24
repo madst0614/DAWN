@@ -71,6 +71,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     window_acc_valid = 0
     window_count = 0
 
+    # Last neuron metrics (for epoch summary)
+    last_neuron_metrics = None
+
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for step, batch in enumerate(pbar):
         input_ids = batch["input_ids"].to(device)
@@ -224,6 +227,31 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
                        f"acc={avg_window_acc:.6f}\n")
 
+            # Collect neuron metrics
+            model.eval()
+            with torch.no_grad():
+                try:
+                    _, neuron_indices = model(input_ids, return_activations=True)
+                    neuron_metrics = compute_training_metrics(model, neuron_indices, device)
+                    last_neuron_metrics = neuron_metrics
+
+                    # Log neuron metrics to file
+                    with open(log_file, 'a') as f:
+                        f.write(f"METRICS,{epoch},{step+1},"
+                               f"avg_usage={neuron_metrics['avg_usage']:.4f},"
+                               f"avg_gini={neuron_metrics['avg_gini']:.4f},"
+                               f"avg_top10={neuron_metrics['avg_top10']:.4f}")
+                        # Add per-layer details
+                        for i in range(len(neuron_indices)):
+                            f.write(f",L{i}_usage={neuron_metrics[f'L{i}_usage']:.4f},"
+                                   f"L{i}_gini={neuron_metrics[f'L{i}_gini']:.4f},"
+                                   f"L{i}_top10={neuron_metrics[f'L{i}_top10']:.4f}")
+                        f.write("\n")
+                except Exception as e:
+                    # If metrics collection fails, continue training
+                    pass
+            model.train()
+
             # Reset window
             window_loss = 0.0
             window_acc_correct = 0
@@ -242,7 +270,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
 
-    return avg_loss, avg_acc
+    return avg_loss, avg_acc, last_neuron_metrics
 
 
 def evaluate(model, dataloader, device, args, tokenizer=None):
@@ -340,6 +368,66 @@ def analyze_activations(model, input_ids, device):
         }
 
     return stats
+
+
+def compute_training_metrics(model, neuron_indices, device):
+    """Compute detailed neuron usage metrics during training
+
+    Args:
+        model: DAWN model
+        neuron_indices: List of [B, S, k] tensors (one per layer)
+        device: torch device
+
+    Returns:
+        metrics: Dict with per-layer and aggregate metrics
+    """
+    metrics = {}
+
+    # Get n_neurons from model
+    if hasattr(model, '_orig_mod'):
+        n_neurons = model._orig_mod.n_neurons
+    else:
+        n_neurons = model.n_neurons
+
+    layer_usage = []
+    layer_gini = []
+    layer_top10 = []
+
+    for layer_idx, selected_idx in enumerate(neuron_indices):
+        # selected_idx: [B, S, k]
+        flat_idx = selected_idx.reshape(-1)
+
+        # 1. Usage rate (unique neurons used / total neurons)
+        unique_neurons = torch.unique(flat_idx).numel()
+        usage_rate = unique_neurons / n_neurons
+        layer_usage.append(usage_rate)
+
+        # 2. Gini coefficient (0 = perfect equality, 1 = maximum inequality)
+        counts = torch.bincount(flat_idx, minlength=n_neurons).float()
+        sorted_counts = torch.sort(counts)[0]
+        n = len(sorted_counts)
+        index = torch.arange(1, n + 1, device=device, dtype=torch.float32)
+        gini = ((2 * index - n - 1) * sorted_counts).sum() / (n * sorted_counts.sum() + 1e-10)
+        layer_gini.append(gini.item())
+
+        # 3. Top-10 concentration (what % of activations go to top 10 neurons)
+        if n_neurons >= 10:
+            top10 = torch.topk(counts, 10).values.sum() / (counts.sum() + 1e-10)
+            layer_top10.append(top10.item())
+        else:
+            layer_top10.append(1.0)
+
+        # Per-layer metrics
+        metrics[f'L{layer_idx}_usage'] = usage_rate
+        metrics[f'L{layer_idx}_gini'] = gini.item()
+        metrics[f'L{layer_idx}_top10'] = layer_top10[-1]
+
+    # Aggregate metrics
+    metrics['avg_usage'] = sum(layer_usage) / len(layer_usage)
+    metrics['avg_gini'] = sum(layer_gini) / len(layer_gini)
+    metrics['avg_top10'] = sum(layer_top10) / len(layer_top10)
+
+    return metrics
 
 
 def load_config(config_path):
@@ -724,7 +812,7 @@ def main():
         epoch_start = time.time()
 
         # Train
-        train_loss, train_acc = train_epoch(
+        train_loss, train_acc, neuron_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args,
             scaler, tokenizer, log_file=str(training_log_file),
             orthogonality_weight=args.orthogonality_weight,
@@ -752,6 +840,19 @@ def main():
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
+
+        # Print neuron metrics if available
+        if neuron_metrics is not None:
+            print(f"  Neuron Metrics:")
+            print(f"    Avg Usage: {neuron_metrics['avg_usage']:.2%} | "
+                  f"Gini: {neuron_metrics['avg_gini']:.3f} | "
+                  f"Top10: {neuron_metrics['avg_top10']:.2%}")
+            # Per-layer breakdown
+            n_layers = sum(1 for k in neuron_metrics.keys() if k.startswith('L') and k.endswith('_usage'))
+            layer_strs = []
+            for i in range(n_layers):
+                layer_strs.append(f"L{i}: {neuron_metrics[f'L{i}_usage']:.2%}")
+            print(f"    Per-layer usage: {' | '.join(layer_strs)}")
 
         # Write epoch summary to log
         with open(training_log_file, 'a') as f:
