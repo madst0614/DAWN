@@ -877,8 +877,14 @@ def analyze_basis_usage(model, collector, n_layers, n_basis):
     2. Basis activation frequency
     3. Basis collapse detection
     """
+    # Check if v6.0 (unified coords) or v5.x (separate coefs)
+    is_v6 = hasattr(model.layers[0].basis_ffn, 'neuron_coords')
+
     print("\n" + "="*70)
-    print("🎯 BASIS USAGE ANALYSIS (v5.0)")
+    if is_v6:
+        print(f"🎯 BASIS USAGE ANALYSIS (v6.0)")
+    else:
+        print(f"🎯 BASIS USAGE ANALYSIS (v5.x)")
     print("="*70)
 
     results = {}
@@ -894,14 +900,25 @@ def analyze_basis_usage(model, collector, n_layers, n_basis):
 
         # Get coefficients for selected neurons
         coef_A = layer.neuron_coef_A[neuron_idx_flat]  # [N*S*k, n_basis]
-        coef_B = layer.neuron_coef_B[neuron_idx_flat]  # [N*S*k, n_basis]
+
+        if is_v6:
+            # v6.0: Single neuron_coords
+            coef_B = coef_A
+        else:
+            # v5.x: Separate coef_B
+            coef_B = layer.neuron_coef_B[neuron_idx_flat]
 
         # Compute basis importance (absolute average)
         basis_importance_A = coef_A.abs().mean(dim=0).detach().cpu().numpy()  # [n_basis]
         basis_importance_B = coef_B.abs().mean(dim=0).detach().cpu().numpy()  # [n_basis]
 
         # Combined importance
-        basis_importance = (basis_importance_A + basis_importance_B) / 2
+        if is_v6:
+            # v6.0: Only one set of coords
+            basis_importance = basis_importance_A
+        else:
+            # v5.x: Average A and B
+            basis_importance = (basis_importance_A + basis_importance_B) / 2
 
         # Statistics
         threshold = 0.01
@@ -965,8 +982,14 @@ def analyze_neuron_basis_composition(model, n_layers, n_basis, n_neurons):
     2. Sparsity of neuron-basis connections
     3. Redundancy in compositions
     """
+    # Check if v6.0 (unified coords) or v5.x (separate coefs)
+    is_v6 = hasattr(model.layers[0].basis_ffn, 'neuron_coords')
+
     print("\n" + "="*70)
-    print("🔗 NEURON-BASIS COMPOSITION ANALYSIS (v5.0)")
+    if is_v6:
+        print(f"🔗 NEURON-BASIS COMPOSITION ANALYSIS (v6.0)")
+    else:
+        print(f"🔗 NEURON-BASIS COMPOSITION ANALYSIS (v5.x)")
     print("="*70)
 
     results = {}
@@ -976,7 +999,13 @@ def analyze_neuron_basis_composition(model, n_layers, n_basis, n_neurons):
 
         # Coefficients: [n_neurons, n_basis]
         coef_A = layer.neuron_coef_A.data.cpu().numpy()
-        coef_B = layer.neuron_coef_B.data.cpu().numpy()
+
+        if is_v6:
+            # v6.0: Single neuron_coords
+            coef_B = coef_A  # Same
+        else:
+            # v5.x: Separate coef_A and coef_B
+            coef_B = layer.neuron_coef_B.data.cpu().numpy()
 
         # Count active connections (threshold = 0.1)
         threshold = 0.1
@@ -1013,13 +1042,25 @@ def analyze_neuron_basis_composition(model, n_layers, n_basis, n_neurons):
         total_pairs = len(sim_A)
 
         print(f"\nLayer {layer_idx}:")
-        print(f"  Avg active basis per neuron:")
-        print(f"    Coef A: {avg_active_A:.2f} ± {std_active_A:.2f} / {n_basis}")
-        print(f"    Coef B: {avg_active_B:.2f} ± {std_active_B:.2f} / {n_basis}")
-        print(f"  Sparsity: A={sparsity_A*100:.1f}%, B={sparsity_B*100:.1f}%")
-        print(f"  Similar neuron pairs (>0.8 cosine):")
-        print(f"    A: {similar_pairs_A}/{total_pairs} ({similar_pairs_A/total_pairs*100:.1f}%)")
-        print(f"    B: {similar_pairs_B}/{total_pairs} ({similar_pairs_B/total_pairs*100:.1f}%)")
+
+        if is_v6:
+            # v6.0: Simplified output
+            print(f"  Avg active basis per neuron: {avg_active_A:.2f} ± {std_active_A:.2f} / {n_basis}")
+            print(f"  Sparsity: {sparsity_A*100:.1f}%")
+        else:
+            # v5.x: Detailed output
+            print(f"  Avg active basis per neuron:")
+            print(f"    Coef A: {avg_active_A:.2f} ± {std_active_A:.2f} / {n_basis}")
+            print(f"    Coef B: {avg_active_B:.2f} ± {std_active_B:.2f} / {n_basis}")
+            print(f"  Sparsity: A={sparsity_A*100:.1f}%, B={sparsity_B*100:.1f}%")
+        if is_v6:
+            # v6.0: Single output
+            print(f"  Similar neuron pairs (>0.8 cosine): {similar_pairs_A}/{total_pairs} ({similar_pairs_A/total_pairs*100:.1f}%)")
+        else:
+            # v5.x: Separate A/B output
+            print(f"  Similar neuron pairs (>0.8 cosine):")
+            print(f"    A: {similar_pairs_A}/{total_pairs} ({similar_pairs_A/total_pairs*100:.1f}%)")
+            print(f"    B: {similar_pairs_B}/{total_pairs} ({similar_pairs_B/total_pairs*100:.1f}%)")
 
         # Warnings
         if avg_active_A < 3 or avg_active_B < 3:
@@ -2803,18 +2844,18 @@ def main():
     # Backward compatibility for config parameters
     neuron_k = cfg['model'].get('neuron_k', cfg['model'].get('k', 8))
 
-    # v5.0: Model creation
+    # v6.0: Model creation (backward compatible)
     model = DAWN(
         vocab_size=vocab_size,
         hidden_dim=cfg['model']['d_model'],
         num_layers=cfg['model']['n_layers'],
         n_heads=cfg['model']['n_heads'],
         n_neurons=cfg['model']['n_neurons'],
-        neuron_rank=cfg['model'].get('neuron_rank', 16),
+        neuron_rank=cfg['model'].get('neuron_rank', 16),  # v6.0: not used, backward compat
         neuron_k=neuron_k,
-        n_basis=cfg['model'].get('n_basis', 16),
-        basis_rank=cfg['model'].get('basis_rank', 8),
-        mod_rank=cfg['model'].get('mod_rank', 32),
+        n_basis=cfg['model'].get('n_basis', 8),
+        basis_rank=cfg['model'].get('basis_rank', 64),
+        mod_rank=cfg['model'].get('mod_rank', None),  # v6.0: not used
         d_ff=cfg['model'].get('d_ff', None),
         max_seq_len=cfg['model']['max_seq_len'],
         dropout=cfg['model']['dropout']
@@ -2850,7 +2891,7 @@ def main():
     n_layers = cfg['model']['n_layers']
     n_neurons = cfg['model']['n_neurons']
 
-    print(f"\nModel: {n_layers} layers, {n_neurons} neurons/layer (v5.0)")
+    print(f"\nModel: {n_layers} layers, {n_neurons} neurons/layer (v{DAWN.__version__})")
     print(f"Validation loss: {checkpoint.get('val_loss', 'N/A')}")
     print(f"Epoch: {checkpoint.get('epoch', 'N/A')}")
 
@@ -2889,11 +2930,19 @@ def main():
 
     # v5.0: Basis FFN Analysis 🎯
     print("\n" + "="*70)
-    print("🎯 v5.0 SPECIFIC ANALYSES")
+    print("🎯 v6.0 SPECIFIC ANALYSES")
     print("="*70)
 
-    n_basis = cfg['model'].get('n_basis', 16)
-    basis_usage_results = analyze_basis_usage(model, collector, n_layers, n_basis)
+    n_basis = cfg['model'].get('n_basis', 8)
+
+    # v6.0: Use model's built-in basis analysis
+    if hasattr(model, 'analyze_basis_usage'):
+        print("\n  Using v6.0 built-in basis analysis...")
+        basis_usage_results = model.analyze_basis_usage()
+    else:
+        # Fallback to old analysis for v5.x models
+        basis_usage_results = analyze_basis_usage(model, collector, n_layers, n_basis)
+
     basis_composition_results = analyze_neuron_basis_composition(model, n_layers, n_basis, n_neurons)
     basis_orthogonality_results = analyze_basis_orthogonality(model, n_layers)
 
@@ -2966,8 +3015,27 @@ def main():
 
     # 저장
     print(f"\nSaving results to: {output_dir}")
+
+    # Convert numpy arrays to lists for JSON serialization
+    def convert_to_serializable(obj):
+        """Recursively convert numpy arrays to lists"""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, (np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.float64, np.float32)):
+            return float(obj)
+        else:
+            return obj
+
+    all_results_serializable = convert_to_serializable(all_results)
+
     with open(output_dir / 'analysis_results.json', 'w') as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(all_results_serializable, f, indent=2)
     print("  ✓ analysis_results.json")
 
     # 시각화

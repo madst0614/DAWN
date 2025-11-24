@@ -54,7 +54,7 @@ from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dy
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.01):
+                orthogonality_weight=0.1):
     """Train for one epoch"""
     model.train()
 
@@ -96,14 +96,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ignore_index=-100
                 )
 
-                # Auxiliary losses (v5.0: neuron orthogonality + basis sparsity + basis diversity)
-                neuron_ortho_loss = sum(losses['neuron_ortho'])
-                basis_sparsity_loss = sum(losses['basis_sparsity'])
-                basis_diversity_loss = sum(losses['basis_diversity'])
+                # v6.0: Only orthogonality loss (basis sparsity/diversity removed)
+                orth_loss = losses['orth_total']
 
                 # Total loss
-                loss = ce_loss + orthogonality_weight * neuron_ortho_loss + \
-                       0.01 * basis_sparsity_loss + 0.01 * basis_diversity_loss
+                loss = ce_loss + orthogonality_weight * orth_loss
 
             scaler.scale(loss).backward()
 
@@ -124,14 +121,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 ignore_index=-100
             )
 
-            # Auxiliary losses (v5.0: neuron orthogonality + basis sparsity + basis diversity)
-            neuron_ortho_loss = sum(losses['neuron_ortho'])
-            basis_sparsity_loss = sum(losses['basis_sparsity'])
-            basis_diversity_loss = sum(losses['basis_diversity'])
+            # v6.0: Only orthogonality loss (basis sparsity/diversity removed)
+            orth_loss = losses['orth_total']
 
             # Total loss
-            loss = ce_loss + orthogonality_weight * neuron_ortho_loss + \
-                   0.01 * basis_sparsity_loss + 0.01 * basis_diversity_loss
+            loss = ce_loss + orthogonality_weight * orth_loss
 
             loss.backward()
 
@@ -253,7 +247,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
 
 def analyze_activations(model, input_ids, device):
-    """Dynamic Neuron Transformer activation pattern analysis (v5.0)"""
+    """Dynamic Neuron Transformer activation pattern analysis (v6.0)"""
     model.eval()
 
     with torch.no_grad():
@@ -264,12 +258,18 @@ def analyze_activations(model, input_ids, device):
         # selected_idx: [B, S, k]
         unique_neurons = torch.unique(selected_idx).numel()
 
-        # Get total neurons from model
+        # Get total neurons from model (v6.0: router, v5.x: neuron_router)
         if hasattr(model, '_orig_mod'):
             # Compiled model
-            total_neurons = model._orig_mod.layers[layer_idx].neuron_router.n_neurons
+            layer = model._orig_mod.layers[layer_idx]
         else:
-            total_neurons = model.layers[layer_idx].neuron_router.n_neurons
+            layer = model.layers[layer_idx]
+
+        # v6.0: router, v5.x: neuron_router
+        if hasattr(layer, 'router'):
+            total_neurons = layer.router.n_neurons
+        else:
+            total_neurons = layer.neuron_router.n_neurons
 
         usage_ratio = unique_neurons / total_neurons
 
@@ -329,11 +329,12 @@ def main():
     args.dropout = cfg['model'].get('dropout', 0.1)
     args.pattern_dropout = cfg['model'].get('pattern_dropout', 0.0)
 
-    # v5.0: Basis FFN parameters
-    args.neuron_rank = cfg['model'].get('neuron_rank', 16)
-    args.n_basis = cfg['model'].get('n_basis', 16)
-    args.basis_rank = cfg['model'].get('basis_rank', 32)  # v5.1: increased from 8 to 32
-    args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored in v5.1)
+    # v6.0: Basis FFN parameters
+    args.neuron_rank = cfg['model'].get('neuron_rank', None)  # v6.0: not used anymore (backward compat)
+    args.n_basis = cfg['model'].get('n_basis', 8)
+    args.basis_rank = cfg['model'].get('basis_rank', 64)  # v6.0: increased from 32 to 64
+    args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored)
+    args.router_temperature = cfg['model'].get('router_temperature', 2.0)  # v6.0: router temperature
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -346,8 +347,8 @@ def main():
     args.weight_decay = cfg['training']['weight_decay']
     args.warmup_epochs = cfg['training'].get('warmup_epochs', 1)
 
-    # v5.0: Regularization weights (only orthogonality)
-    args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.01)
+    # v6.0: Regularization weights (only orthogonality)
+    args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.1)
 
     # Other
     args.use_amp = cfg.get('use_amp', True)
@@ -431,9 +432,9 @@ def main():
     if config_version != DAWN.__version__ and config_version != 'not specified':
         print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
-    print(f"Neurons: pool_size={args.n_neurons}, neuron_rank={args.neuron_rank}, neuron_k={args.neuron_k}")
+    print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}, router_temp={args.router_temperature}")
     compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
-    print(f"Basis FFN (v5.1): n_basis={args.n_basis}, basis_rank={args.basis_rank}, token_residual=enabled{compat_note}")
+    print(f"Basis FFN (v6.0): n_basis={args.n_basis}, basis_rank={args.basis_rank}, token_level_ffn=enabled{compat_note}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -469,7 +470,8 @@ def main():
         mod_rank=args.mod_rank,  # v5.0 compatibility
         d_ff=args.d_ff,
         max_seq_len=args.max_seq_len,
-        dropout=args.dropout
+        dropout=args.dropout,
+        router_temperature=args.router_temperature  # v6.0
     )
     model = model.to(device)
 
