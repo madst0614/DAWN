@@ -847,9 +847,11 @@ def print_summary(all_results):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze DAWN v7.0 checkpoint')
+    parser = argparse.ArgumentParser(description='Analyze DAWN v7.0/v7.1 checkpoint')
     parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to checkpoint folder')
+                        help='Path to checkpoint folder or .pt file')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to config YAML file (optional)')
     parser.add_argument('--data-dir', type=str, default='/content/drive/MyDrive/data',
                         help='Data directory')
     parser.add_argument('--max-batches', type=int, default=100,
@@ -865,31 +867,53 @@ def main():
 
     # Load checkpoint
     checkpoint_path = Path(args.checkpoint)
-    config_file = checkpoint_path / 'config.json'
-    model_file = checkpoint_path / 'best_model.pt'
+
+    # Determine if checkpoint is a folder or file
+    if checkpoint_path.is_dir():
+        config_file = checkpoint_path / 'config.json'
+        model_file = checkpoint_path / 'best_model.pt'
+    else:
+        # Direct .pt file
+        model_file = checkpoint_path
+        config_file = None
 
     if not model_file.exists():
         print(f"❌ Checkpoint not found: {model_file}")
         return
 
-    print(f"\nLoading config: {config_file}")
-    print(f"Loading checkpoint: {model_file}")
+    print(f"\nLoading checkpoint: {model_file}")
 
     # Load checkpoint first to get full config
     checkpoint = torch.load(model_file, map_location='cpu')
 
-    # Try to get config from checkpoint or separate file
-    if config_file.exists():
-        with open(config_file, 'r') as f:
-            file_config = json.load(f)
-            # Check if config is nested (training format) or flat (model format)
+    # Try to get config from: 1) --config arg, 2) config.json, 3) checkpoint
+    model_config = None
+
+    # Priority 1: Explicit config file from --config argument
+    if args.config:
+        import yaml
+        config_path = Path(args.config)
+        print(f"Loading config from: {config_path}")
+        with open(config_path, 'r') as f:
+            file_config = yaml.safe_load(f)
             if 'model' in file_config:
-                # Nested config from training
                 model_config = file_config['model'].copy()
             else:
-                # Flat config
                 model_config = file_config.copy()
+
+    # Priority 2: config.json in checkpoint folder
+    elif config_file and config_file.exists():
+        print(f"Loading config from: {config_file}")
+        with open(config_file, 'r') as f:
+            file_config = json.load(f)
+            if 'model' in file_config:
+                model_config = file_config['model'].copy()
+            else:
+                model_config = file_config.copy()
+
+    # Priority 3: Config embedded in checkpoint
     else:
+        print("Loading config from checkpoint")
         model_config = checkpoint.get('config', {})
 
     # Ensure vocab_size is in the config (might be in checkpoint)
