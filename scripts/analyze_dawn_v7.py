@@ -47,8 +47,11 @@ from collections import defaultdict, Counter
 def compute_gini(values):
     """Compute Gini coefficient"""
     if isinstance(values, torch.Tensor):
-        values = values.cpu()
-    sorted_values = torch.sort(torch.tensor(values).float())[0]
+        values = values.detach().cpu()
+        sorted_values = torch.sort(values.float())[0]
+    else:
+        sorted_values = torch.sort(torch.tensor(values, dtype=torch.float32))[0]
+
     n = len(sorted_values)
     if n == 0 or sorted_values.sum() == 0:
         return 0.0
@@ -321,7 +324,7 @@ def analyze_basis_contribution(model):
 
         # Per-basis usage (averaged over neurons)
         basis_usage = recipe_norm.mean(dim=0)  # [n_basis]
-        all_basis_usage += basis_usage.cpu()
+        all_basis_usage += basis_usage.detach().cpu()
 
         # Identify dead/underused bases
         dead_threshold = 1.0 / (n_basis * 10)  # Less than 10% of uniform
@@ -338,7 +341,7 @@ def analyze_basis_contribution(model):
         usage_entropy = -torch.sum(basis_usage * torch.log(basis_usage + 1e-10)).item()
 
         results[f'layer_{layer_idx}'] = {
-            'basis_usage': basis_usage.cpu().numpy().tolist(),
+            'basis_usage': basis_usage.detach().cpu().numpy().tolist(),
             'underused_bases': underused_bases,
             'dominant_bases': dominant_bases,
             'usage_gini': gini.item() if isinstance(gini, torch.Tensor) else gini,
