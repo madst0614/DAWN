@@ -48,7 +48,7 @@ import math
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
-from models.model import DAWN, DAWNLanguageModel
+from models import DAWN, DAWNLanguageModel  # v7.0: Uses model_v7 by default
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
@@ -86,7 +86,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Mixed precision training
         if scaler is not None:
             with torch.amp.autocast('cuda'):
-                logits, losses = model(input_ids, return_losses=True)  # [B, S, vocab_size]
+                # v7.0: No need for return_losses (orthogonality guaranteed)
+                if orthogonality_weight > 0:
+                    # v6.0 compatibility
+                    logits, losses = model(input_ids, return_losses=True)
+                    orth_loss = losses['orth_total']
+                else:
+                    # v7.0: Simple forward pass
+                    logits = model(input_ids)
+                    orth_loss = 0.0
 
                 # Cross-entropy loss
                 B, S, V = logits.shape
@@ -95,9 +103,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     labels.view(B * S),
                     ignore_index=-100
                 )
-
-                # v6.0: Only orthogonality loss (basis sparsity/diversity removed)
-                orth_loss = losses['orth_total']
 
                 # Total loss
                 loss = ce_loss + orthogonality_weight * orth_loss
@@ -111,7 +116,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits, losses = model(input_ids, return_losses=True)
+            # v7.0: No need for return_losses (orthogonality guaranteed)
+            if orthogonality_weight > 0:
+                # v6.0 compatibility
+                logits, losses = model(input_ids, return_losses=True)
+                orth_loss = losses['orth_total']
+            else:
+                # v7.0: Simple forward pass
+                logits = model(input_ids)
+                orth_loss = 0.0
 
             # Cross-entropy loss
             B, S, V = logits.shape
@@ -120,9 +133,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 labels.view(B * S),
                 ignore_index=-100
             )
-
-            # v6.0: Only orthogonality loss (basis sparsity/diversity removed)
-            orth_loss = losses['orth_total']
 
             # Total loss
             loss = ce_loss + orthogonality_weight * orth_loss
@@ -332,9 +342,9 @@ def main():
     # v6.0: Basis FFN parameters
     args.neuron_rank = cfg['model'].get('neuron_rank', None)  # v6.0: not used anymore (backward compat)
     args.n_basis = cfg['model'].get('n_basis', 8)
-    args.basis_rank = cfg['model'].get('basis_rank', 64)  # v6.0: increased from 32 to 64
+    args.basis_rank = cfg['model'].get('basis_rank', 64)
     args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored)
-    args.router_temperature = cfg['model'].get('router_temperature', 2.0)  # v6.0: router temperature
+    args.router_temperature = cfg['model'].get('router_temperature', None)  # v6.0 only (v7.0 ignores)
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -347,8 +357,8 @@ def main():
     args.weight_decay = cfg['training']['weight_decay']
     args.warmup_epochs = cfg['training'].get('warmup_epochs', 1)
 
-    # v6.0: Regularization weights (only orthogonality)
-    args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.1)
+    # Regularization weights (v7.0: not needed, v6.0 compat: defaults to 0.0)
+    args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.0)
 
     # Other
     args.use_amp = cfg.get('use_amp', True)
@@ -432,9 +442,11 @@ def main():
     if config_version != DAWN.__version__ and config_version != 'not specified':
         print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
-    print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}, router_temp={args.router_temperature}")
+    router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
+    print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
     compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
-    print(f"Basis FFN (v6.0): n_basis={args.n_basis}, basis_rank={args.basis_rank}, token_level_ffn=enabled{compat_note}")
+    basis_note = "v7.0: Fixed Orthogonal Basis" if config_version == "7.0" else "v6.0: Learned Basis"
+    print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}{compat_note}")
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Load data
@@ -457,22 +469,30 @@ def main():
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    model = DAWN(
-        vocab_size=vocab_size,
-        hidden_dim=args.d_model,
-        num_layers=args.n_layers,
-        n_heads=args.n_heads,
-        n_neurons=args.n_neurons,
-        neuron_rank=args.neuron_rank,
-        neuron_k=args.k,
-        n_basis=args.n_basis,
-        basis_rank=args.basis_rank,
-        mod_rank=args.mod_rank,  # v5.0 compatibility
-        d_ff=args.d_ff,
-        max_seq_len=args.max_seq_len,
-        dropout=args.dropout,
-        router_temperature=args.router_temperature  # v6.0
-    )
+    # Build model kwargs
+    model_kwargs = {
+        'vocab_size': vocab_size,
+        'd_model': args.d_model,
+        'n_layers': args.n_layers,
+        'n_heads': args.n_heads,
+        'n_neurons': args.n_neurons,
+        'neuron_k': args.k,
+        'n_basis': args.n_basis,
+        'basis_rank': args.basis_rank,
+        'd_ff': args.d_ff,
+        'max_seq_len': args.max_seq_len,
+        'dropout': args.dropout,
+    }
+
+    # v6.0 compatibility parameters (ignored by v7.0)
+    if args.router_temperature is not None:
+        model_kwargs['router_temperature'] = args.router_temperature
+    if args.neuron_rank is not None:
+        model_kwargs['neuron_rank'] = args.neuron_rank
+    if args.mod_rank is not None:
+        model_kwargs['mod_rank'] = args.mod_rank
+
+    model = DAWN(**model_kwargs)
     model = model.to(device)
 
     # Display model version

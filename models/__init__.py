@@ -1,29 +1,35 @@
 """
 DAWN Models Module
 
-v6.0: Orthogonal Basis FFN with Token-level Dynamic FFN
+v7.0: Fixed Orthogonal Basis (default)
+v6.0: Orthogonal Basis FFN with Token-level Dynamic FFN (legacy)
 """
 
-from .model import (
+# v7.0 (default)
+from .model_v7 import (
     DAWN,
     DAWNLanguageModel,
-    NeuronRouter,
-    OrthogonalBasisFFN,
+    SimpleRouter,
+    RecipeFFN,
+    FixedOrthogonalBasis,
     DAWNLayer,
-    Layer,  # Backward compatibility
     create_model,
     count_parameters,
 )
 
+# v6.0 compatibility imports
+from . import model as model_v6
+
 __all__ = [
     'DAWN',
     'DAWNLanguageModel',
-    'NeuronRouter',
-    'OrthogonalBasisFFN',
+    'SimpleRouter',
+    'RecipeFFN',
+    'FixedOrthogonalBasis',
     'DAWNLayer',
-    'Layer',  # Backward compatibility
     'create_model',
     'count_parameters',
+    'model_v6',  # Access v6.0 via models.model_v6
 ]
 
-__version__ = "6.0"
+__version__ = "7.0"

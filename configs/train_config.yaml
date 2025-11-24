@@ -7,25 +7,24 @@ data:
   train_file: train/wikitext_5to1_texts.pkl
   val_file: validation/wikitext_5to1_texts.pkl
 
-# Model Architecture (v6.0: Orthogonal Basis FFN)
+# Model Architecture (v7.0: Fixed Orthogonal Basis)
 model:
-  model_version: "6.0"    # DAWN model version
+  model_version: "7.0"    # DAWN model version
   d_model: 256            # Hidden dimension
   n_layers: 4             # Number of transformer layers
   n_heads: 4              # Number of attention heads
 
-  # Neurons (v6.0: Free coordinates in basis space)
-  n_neurons: 256          # Size of neuron pool per layer (512 → 256, 더 효율적)
-  neuron_k: 16            # Top-k neurons to select
-  router_temperature: 2.0 # Router softmax temperature (higher = smoother distribution)
+  # Neurons (v7.0: Recipe-based, derived from fixed basis)
+  n_neurons: 64           # Size of neuron pool per layer (256 → 64, 더 집중적)
+  neuron_k: 8             # Top-k neurons to select (16 → 8, 더 선택적)
 
-  # Basis FFN (v6.0: Orthogonal Basis with token-level FFN)
-  n_basis: 8              # Number of orthogonal basis (16 → 8, 명확한 역할)
-  basis_rank: 64          # Basis rank (32 → 64, 더 강력한 표현력)
-  # v6.0 변경: Token residual network 제거, Token별 동적 FFN으로 대체
+  # Basis FFN (v7.0: Fixed Orthogonal Basis, shared across layers)
+  n_basis: 32             # Number of orthogonal basis (8 → 32, 더 풍부한 좌표계)
+  basis_rank: 64          # Basis rank (동일, 강력한 표현력 유지)
+  # v7.0 변경: Basis 고정 (학습 X), 전체 Layer 공유, neuron_emb = recipe @ basis_emb
 
   # Architecture
-  d_ff: 512               # Feed-forward dimension (2x d_model)
+  d_ff: 1024              # Feed-forward dimension (512 → 1024, basis 증가에 맞춤)
   max_seq_len: 128        # Maximum sequence length
   dropout: 0.1            # Dropout rate
 
@@ -37,9 +36,8 @@ training:
   weight_decay: 0.1       # Weight decay for regularization
   warmup_epochs: 2        # Warmup epochs
 
-  # v6.0: Simplified regularization (only orthogonality)
-  orthogonality_weight: 0.1     # Basis orthogonality regularization (λ=0.1)
-  # v6.0 removed: basis_sparsity, basis_diversity (자연스러운 neuron clustering 허용)
+  # v7.0: No regularization needed! (orthogonality mathematically guaranteed)
+  # v7.0 removed: orthogonality_weight (basis is fixed and perfectly orthogonal)
 
 # Mixed precision (faster training on GPU)
 use_amp: true
