@@ -776,8 +776,15 @@ def main():
             state_dict = checkpoint
 
         # Get vocab_size from token_emb weight shape
+        # Handle both normal and torch.compile() wrapped models
+        token_emb_key = None
         if 'token_emb.weight' in state_dict:
-            vocab_size = state_dict['token_emb.weight'].shape[0]
+            token_emb_key = 'token_emb.weight'
+        elif '_orig_mod.token_emb.weight' in state_dict:
+            token_emb_key = '_orig_mod.token_emb.weight'
+
+        if token_emb_key:
+            vocab_size = state_dict[token_emb_key].shape[0]
             model_config['vocab_size'] = vocab_size
             print(f"  Inferred vocab_size from checkpoint: {vocab_size}")
         else:
@@ -802,9 +809,16 @@ def main():
 
     # Load weights (checkpoint already loaded above)
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
     else:
-        model.load_state_dict(checkpoint)
+        state_dict = checkpoint
+
+    # Handle torch.compile() wrapped models (strip "_orig_mod." prefix)
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        print("  Detected torch.compile() wrapped model, stripping prefix...")
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
 
     model = model.to(device)
     model.eval()
