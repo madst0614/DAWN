@@ -41,15 +41,15 @@ class TTRepresentation:
 
 class TTKarcherMean(nn.Module):
     """
-    Weighted Karcher Mean on TT Manifold
+    Weighted Karcher Mean on TT Manifold (Memory-efficient version)
 
     8개 Neuron의 TT 표현을 weight로 조합
-    → 균형점(centroid) 찾기
+    → 단순 weighted average (메모리 효율)
     """
 
     def __init__(self, max_iter=5, tolerance=1e-6, step_size=0.5):
         super().__init__()
-
+        # Note: iterations disabled for memory efficiency
         self.max_iter = max_iter
         self.tolerance = tolerance
         self.step_size = step_size
@@ -57,148 +57,39 @@ class TTKarcherMean(nn.Module):
     def forward(self, neuron_cores_A, neuron_cores_B, weights):
         """
         Args:
-            neuron_cores_A: List of 8 TT cores for Basis_A
-                Each: {'core1': [B, S, 16, rank, 8],
-                       'core2': [B, S, rank, 16, 8]}
-            neuron_cores_B: List of 8 TT cores for Basis_B
-                Each: {'core1': [B, S, 8, rank, 32],
-                       'core2': [B, S, rank, 8, 32]}
-            weights: [B, S, 8] neuron weights (softmax)
+            neuron_cores_A: List of k TT cores for Basis_A
+            neuron_cores_B: List of k TT cores for Basis_B
+            weights: [B, S, k] neuron weights (softmax)
 
         Returns:
             centroid_A: Weighted centroid TT for Basis_A
             centroid_B: Weighted centroid TT for Basis_B
         """
-        # Find centroid for Basis_A
-        centroid_A = self.find_centroid(neuron_cores_A, weights)
-
-        # Find centroid for Basis_B
-        centroid_B = self.find_centroid(neuron_cores_B, weights)
+        # Simple weighted average (memory efficient)
+        centroid_A = self.weighted_average(neuron_cores_A, weights)
+        centroid_B = self.weighted_average(neuron_cores_B, weights)
 
         return centroid_A, centroid_B
 
-    def find_centroid(self, tt_cores_list, weights):
+    def weighted_average(self, tt_cores_list, weights):
         """
-        TT manifold에서 weighted centroid 찾기
-
-        Args:
-            tt_cores_list: List[Dict] - 8개 TT cores
-            weights: [B, S, 8]
+        Memory-efficient weighted average of TT cores
         """
-        # 초기 추정: weighted average
-        center = self.weighted_average_init(tt_cores_list, weights)
+        B, S, k = weights.shape
 
-        # Iterative refinement
-        for iteration in range(self.max_iter):
-            # 각 neuron에서 center로의 tangent
-            tangents = []
-            for i, tt_cores in enumerate(tt_cores_list):
-                w = weights[:, :, i]  # [B, S]
-                tangent = self.compute_tangent(center, tt_cores)
+        # Stack and compute weighted sum in one operation
+        # Stack cores: [k, B, S, ...]
+        core1_stack = torch.stack([tt['core1'] for tt in tt_cores_list], dim=0)
+        core2_stack = torch.stack([tt['core2'] for tt in tt_cores_list], dim=0)
 
-                # Weight 적용
-                weighted_tangent = {
-                    'core1': w.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * tangent['core1'],
-                    'core2': w.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * tangent['core2']
-                }
-                tangents.append(weighted_tangent)
+        # weights: [B, S, k] -> [k, B, S, 1, 1, 1]
+        w = weights.permute(2, 0, 1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
-            # Total tangent (합력)
-            total_tangent = self.sum_tangents(tangents)
+        # Weighted sum
+        core1_avg = (w * core1_stack).sum(dim=0)
+        core2_avg = (w * core2_stack).sum(dim=0)
 
-            # Convergence check
-            tangent_norm = self.compute_tangent_norm(total_tangent)
-            if tangent_norm < self.tolerance:
-                break
-
-            # Move center along tangent
-            step = self.step_size / (iteration + 1)  # Decreasing step
-            center = self.move_along_tangent(center, total_tangent, step)
-
-        return center
-
-    def weighted_average_init(self, tt_cores_list, weights):
-        """
-        초기 추정: weighted average of cores
-        """
-        B, S = weights.shape[:2]
-
-        # Weighted sum of cores
-        core1_sum = sum(
-            weights[:, :, i].view(B, S, 1, 1, 1) * tt['core1']
-            for i, tt in enumerate(tt_cores_list)
-        )
-        core2_sum = sum(
-            weights[:, :, i].view(B, S, 1, 1, 1) * tt['core2']
-            for i, tt in enumerate(tt_cores_list)
-        )
-
-        # Orthogonalize
-        core1_orth = self.orthogonalize_core(core1_sum)
-        core2_orth = self.orthogonalize_core(core2_sum)
-
-        return {'core1': core1_orth, 'core2': core2_orth}
-
-    def compute_tangent(self, center, target):
-        """
-        Center에서 target으로의 tangent vector
-        """
-        # 간단 버전: target - center
-        tangent = {
-            'core1': target['core1'] - center['core1'],
-            'core2': target['core2'] - center['core2']
-        }
-        return tangent
-
-    def sum_tangents(self, tangents):
-        """
-        여러 tangent의 합
-        """
-        total = {
-            'core1': sum(t['core1'] for t in tangents),
-            'core2': sum(t['core2'] for t in tangents)
-        }
-        return total
-
-    def compute_tangent_norm(self, tangent):
-        """
-        Tangent의 norm (수렴 판단용)
-        """
-        norm1 = torch.norm(tangent['core1'])
-        norm2 = torch.norm(tangent['core2'])
-        return (norm1 + norm2).item()
-
-    def move_along_tangent(self, center, tangent, step_size):
-        """
-        Center를 tangent 방향으로 이동
-        """
-        new_center = {
-            'core1': center['core1'] + step_size * tangent['core1'],
-            'core2': center['core2'] + step_size * tangent['core2']
-        }
-
-        # Orthogonalize to stay on manifold
-        new_center['core1'] = self.orthogonalize_core(new_center['core1'])
-        new_center['core2'] = self.orthogonalize_core(new_center['core2'])
-
-        return new_center
-
-    def orthogonalize_core(self, core):
-        """
-        Core를 직교화 (TT manifold 유지)
-        """
-        shape = core.shape
-        # Reshape for QR
-        # [..., d1, rank, d2] → [..., d1*rank, d2]
-        core_2d = core.reshape(*shape[:-3], shape[-3] * shape[-2], shape[-1])
-
-        # QR decomposition
-        Q, R = torch.linalg.qr(core_2d)
-
-        # Reshape back
-        Q = Q.reshape(*shape[:-3], shape[-3], shape[-2], shape[-1])
-
-        return Q
+        return {'core1': core1_avg, 'core2': core2_avg}
 
 
 class TTBasisWithKarcher(nn.Module):
