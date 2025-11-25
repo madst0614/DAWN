@@ -50,7 +50,7 @@ class KarcherFFN(nn.Module):
 
     def forward(self, x, neuron_idx, neuron_weights):
         """
-        Memory-efficient forward with on-the-fly averaging
+        Memory-efficient forward with TRUE in-place averaging
 
         Args:
             x: [B, S, 256]
@@ -70,16 +70,17 @@ class KarcherFFN(nn.Module):
 
         cores_A, cores_B = self.basis.get_neuron_tt_cores(recipe_0)
 
+        # Clone to ensure we can do in-place ops
         centroid_A = {
-            'core1': cores_A['core1'] * w0,
-            'core2': cores_A['core2'] * w0
+            'core1': (cores_A['core1'] * w0).clone(),
+            'core2': (cores_A['core2'] * w0).clone()
         }
         centroid_B = {
-            'core1': cores_B['core1'] * w0,
-            'core2': cores_B['core2'] * w0
+            'core1': (cores_B['core1'] * w0).clone(),
+            'core2': (cores_B['core2'] * w0).clone()
         }
 
-        # 3. 나머지 neuron들을 순차적으로 누적 (메모리 절약!)
+        # 3. 나머지 neuron들을 순차적으로 누적 (TRUE in-place!)
         for i in range(1, k):
             recipe_i = selected_recipes[:, :, i, :]  # [B, S, 32]
             w_i = neuron_weights[:, :, i].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
@@ -87,11 +88,11 @@ class KarcherFFN(nn.Module):
             # Neuron cores 생성
             cores_A, cores_B = self.basis.get_neuron_tt_cores(recipe_i)
 
-            # 즉시 누적 (저장하지 않음!)
-            centroid_A['core1'] = centroid_A['core1'] + cores_A['core1'] * w_i
-            centroid_A['core2'] = centroid_A['core2'] + cores_A['core2'] * w_i
-            centroid_B['core1'] = centroid_B['core1'] + cores_B['core1'] * w_i
-            centroid_B['core2'] = centroid_B['core2'] + cores_B['core2'] * w_i
+            # TRUE in-place 누적 (메모리 절약!)
+            centroid_A['core1'].add_(cores_A['core1'] * w_i)
+            centroid_A['core2'].add_(cores_A['core2'] * w_i)
+            centroid_B['core1'].add_(cores_B['core1'] * w_i)
+            centroid_B['core2'].add_(cores_B['core2'] * w_i)
 
         # 4. Centroid TT로 FFN 적용
         output = self.apply_tt_ffn(x, centroid_A, centroid_B)
