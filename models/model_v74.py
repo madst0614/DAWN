@@ -50,7 +50,11 @@ class KarcherFFN(nn.Module):
 
     def forward(self, x, neuron_idx, neuron_weights):
         """
-        Memory-efficient forward - simplified accumulation
+        Memory-efficient forward - weight recipes BEFORE TT expansion
+
+        핵심: Recipe를 먼저 weighted sum → TT 확장 1번만!
+        - Before: 8개 neuron × TT 확장 = 8배 메모리
+        - After: Recipe weighted sum → 1번 TT 확장 = 1배 메모리
 
         Args:
             x: [B, S, 256]
@@ -58,38 +62,24 @@ class KarcherFFN(nn.Module):
             neuron_weights: [B, S, k] neuron weights (softmax)
         """
         B, S, D = x.shape
-        k = neuron_idx.shape[-1]
 
         # 1. Get selected recipes
         selected_recipes = self.neuron_recipes[neuron_idx]  # [B, S, k, 32]
         selected_recipes = F.softmax(selected_recipes, dim=-1)
 
-        # 2. Initialize with zeros
-        device = x.device
-        centroid_A_core1 = torch.zeros(B, S, 16, self.basis.basis_rank, 8, device=device)
-        centroid_A_core2 = torch.zeros(B, S, self.basis.basis_rank, 16, 8, device=device)
-        centroid_B_core1 = torch.zeros(B, S, 8, self.basis.basis_rank, 32, device=device)
-        centroid_B_core2 = torch.zeros(B, S, self.basis.basis_rank, 8, 32, device=device)
+        # 2. 🔥 핵심: Recipe를 먼저 weighted sum! (메모리 폭발 방지)
+        # [B, S, k, 32] × [B, S, k] → [B, S, 32]
+        weighted_recipe = torch.einsum('bskn,bsk->bsn',
+                                       selected_recipes,
+                                       neuron_weights)
+        # weighted_recipe: [B, S, 32] - 작음! ✅
 
-        # 3. Accumulate all neurons
-        for i in range(k):
-            recipe_i = selected_recipes[:, :, i, :]
-            w_i = neuron_weights[:, :, i].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        # 3. Weighted recipe로 cores 생성 (1번만!)
+        cores_A, cores_B = self.basis.get_neuron_tt_cores(weighted_recipe)
+        # cores: [B, S, ...] - 1번만 확장 ✅
 
-            cores_A, cores_B = self.basis.get_neuron_tt_cores(recipe_i)
-
-            # Simple accumulation
-            centroid_A_core1 = centroid_A_core1 + cores_A['core1'] * w_i
-            centroid_A_core2 = centroid_A_core2 + cores_A['core2'] * w_i
-            centroid_B_core1 = centroid_B_core1 + cores_B['core1'] * w_i
-            centroid_B_core2 = centroid_B_core2 + cores_B['core2'] * w_i
-
-        # 4. Build centroid dict
-        centroid_A = {'core1': centroid_A_core1, 'core2': centroid_A_core2}
-        centroid_B = {'core1': centroid_B_core1, 'core2': centroid_B_core2}
-
-        # 5. Apply FFN
-        output = self.apply_tt_ffn(x, centroid_A, centroid_B)
+        # 4. FFN 적용
+        output = self.apply_tt_ffn(x, cores_A, cores_B)
 
         return output
 
