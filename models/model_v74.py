@@ -88,6 +88,12 @@ class KarcherFFN(nn.Module):
         """
         TT cores로 FFN 적용
 
+        TT Contraction:
+        - x[i1, i2] × core1[i1, r, o1] × core2[r, i2, o2] → output[o1, o2]
+
+        Basis_A: [256→64] = [16×16 → 8×8]
+        Basis_B: [64→1024] = [8×8 → 32×32]
+
         Args:
             x: [B, S, 256]
             cores_A: Dict{'core1': [B, S, 16, rank, 8],
@@ -97,33 +103,42 @@ class KarcherFFN(nn.Module):
         """
         B, S, D = x.shape
 
-        # x를 fold: [B, S, 256] → [B, S, 16, 16]
+        # === Basis_A: [256] → [64] ===
+        # x를 fold: [B, S, 256] → [B, S, 16, 16] (i1, i2)
         x_fold = x.view(B, S, 16, 16)
 
         # TT contraction for Basis_A
-        # x_fold: [B, S, i, j]
-        # core1: [B, S, i, r, k]
-        h1 = torch.einsum('bsij,bsirk->bsjrk', x_fold, cores_A['core1'])
-        h1 = h1.sum(dim=2)  # [B, S, r, k]
+        # Step 1: contract with core1 over i1
+        # x_fold: [B, S, i1, i2] × cores_A['core1']: [B, S, i1, r, o1]
+        temp = torch.einsum('bsab,bsarc->bsrcb', x_fold, cores_A['core1'])
+        # temp: [B, S, rank, 8, 16]
 
-        # core2: [B, S, r, j, l]
-        h2 = torch.einsum('bsrk,bsrjl->bskjl', h1, cores_A['core2'])
-        h2 = h2.reshape(B, S, 64)  # [B, S, 8, 8] → [B, S, 64]
+        # Step 2: contract with core2 over i2 and rank
+        # temp: [B, S, r, o1, i2] × cores_A['core2']: [B, S, r, i2, o2]
+        h = torch.einsum('bsrcb,bsrbd->bscd', temp, cores_A['core2'])
+        # h: [B, S, 8, 8] = [B, S, 64]
+        h = h.reshape(B, S, 64)
 
-        # h2를 fold: [B, S, 64] → [B, S, 8, 8]
-        h2_fold = h2.view(B, S, 8, 8)
+        # === Basis_B: [64] → [1024] ===
+        # h를 fold: [B, S, 64] → [B, S, 8, 8] (i1, i2)
+        h_fold = h.view(B, S, 8, 8)
 
         # TT contraction for Basis_B
-        h3 = torch.einsum('bsij,bsirk->bsjrk', h2_fold, cores_B['core1'])
-        h3 = h3.sum(dim=2)  # [B, S, r, k]
+        # Step 1: contract with core1 over i1
+        # h_fold: [B, S, i1, i2] × cores_B['core1']: [B, S, i1, r, o1]
+        temp = torch.einsum('bsab,bsarc->bsrcb', h_fold, cores_B['core1'])
+        # temp: [B, S, rank, 32, 8]
 
-        output = torch.einsum('bsrk,bsrjl->bskjl', h3, cores_B['core2'])
-        output = output.reshape(B, S, 1024)  # [B, S, 32, 32] → [B, S, 1024]
+        # Step 2: contract with core2 over i2 and rank
+        # temp: [B, S, r, o1, i2] × cores_B['core2']: [B, S, r, i2, o2]
+        output = torch.einsum('bsrcb,bsrbd->bscd', temp, cores_B['core2'])
+        # output: [B, S, 32, 32] = [B, S, 1024]
+        output = output.reshape(B, S, 1024)
 
         # GELU
         output = F.gelu(output)
 
-        # Down projection
+        # Down projection: [1024] → [256]
         output = self.w_down(output)
 
         return output
