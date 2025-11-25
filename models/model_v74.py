@@ -50,7 +50,7 @@ class KarcherFFN(nn.Module):
 
     def forward(self, x, neuron_idx, neuron_weights):
         """
-        Memory-efficient forward with TRUE in-place averaging
+        Memory-efficient forward - simplified accumulation
 
         Args:
             x: [B, S, 256]
@@ -60,41 +60,35 @@ class KarcherFFN(nn.Module):
         B, S, D = x.shape
         k = neuron_idx.shape[-1]
 
-        # 1. 선택된 neuron들의 recipes
+        # 1. Get selected recipes
         selected_recipes = self.neuron_recipes[neuron_idx]  # [B, S, k, 32]
         selected_recipes = F.softmax(selected_recipes, dim=-1)
 
-        # 2. 첫 번째 neuron으로 centroid 초기화
-        recipe_0 = selected_recipes[:, :, 0, :]  # [B, S, 32]
-        w0 = neuron_weights[:, :, 0].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        # 2. Initialize with zeros
+        device = x.device
+        centroid_A_core1 = torch.zeros(B, S, 16, self.basis.basis_rank, 8, device=device)
+        centroid_A_core2 = torch.zeros(B, S, self.basis.basis_rank, 16, 8, device=device)
+        centroid_B_core1 = torch.zeros(B, S, 8, self.basis.basis_rank, 32, device=device)
+        centroid_B_core2 = torch.zeros(B, S, self.basis.basis_rank, 8, 32, device=device)
 
-        cores_A, cores_B = self.basis.get_neuron_tt_cores(recipe_0)
-
-        # Clone to ensure we can do in-place ops
-        centroid_A = {
-            'core1': (cores_A['core1'] * w0).clone(),
-            'core2': (cores_A['core2'] * w0).clone()
-        }
-        centroid_B = {
-            'core1': (cores_B['core1'] * w0).clone(),
-            'core2': (cores_B['core2'] * w0).clone()
-        }
-
-        # 3. 나머지 neuron들을 순차적으로 누적 (TRUE in-place!)
-        for i in range(1, k):
-            recipe_i = selected_recipes[:, :, i, :]  # [B, S, 32]
+        # 3. Accumulate all neurons
+        for i in range(k):
+            recipe_i = selected_recipes[:, :, i, :]
             w_i = neuron_weights[:, :, i].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
-            # Neuron cores 생성
             cores_A, cores_B = self.basis.get_neuron_tt_cores(recipe_i)
 
-            # TRUE in-place 누적 (메모리 절약!)
-            centroid_A['core1'].add_(cores_A['core1'] * w_i)
-            centroid_A['core2'].add_(cores_A['core2'] * w_i)
-            centroid_B['core1'].add_(cores_B['core1'] * w_i)
-            centroid_B['core2'].add_(cores_B['core2'] * w_i)
+            # Simple accumulation
+            centroid_A_core1 = centroid_A_core1 + cores_A['core1'] * w_i
+            centroid_A_core2 = centroid_A_core2 + cores_A['core2'] * w_i
+            centroid_B_core1 = centroid_B_core1 + cores_B['core1'] * w_i
+            centroid_B_core2 = centroid_B_core2 + cores_B['core2'] * w_i
 
-        # 4. Centroid TT로 FFN 적용
+        # 4. Build centroid dict
+        centroid_A = {'core1': centroid_A_core1, 'core2': centroid_A_core2}
+        centroid_B = {'core1': centroid_B_core1, 'core2': centroid_B_core2}
+
+        # 5. Apply FFN
         output = self.apply_tt_ffn(x, centroid_A, centroid_B)
 
         return output
