@@ -484,6 +484,11 @@ def main():
     args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored)
     args.router_temperature = cfg['model'].get('router_temperature', None)  # v6.0 only (v7.0 ignores)
 
+    # v8.0: Unified Tensor Product parameters
+    args.n_row = cfg['model'].get('n_row', 8)      # Row basis (Query)
+    args.n_col = cfg['model'].get('n_col', 8)      # Col basis (Key-Value-Transform)
+    args.mid_dim = cfg['model'].get('mid_dim', 32) # Intermediate dimension
+
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
     args.n_process = cfg['model'].get('n_process', None)
@@ -592,7 +597,9 @@ def main():
         router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
         print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
 
-        if config_version == "7.4":
+        if config_version == "8.0":
+            print(f"Unified Tensor Product: n_row={args.n_row}, n_col={args.n_col}, mid_dim={args.mid_dim}")
+        elif config_version == "7.4":
             print(f"TT Karcher Mean FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}")
         elif config_version == "7.2":
             print(f"FFN: Standard FFN with Neuron Augmentation (d_ff={args.d_ff})")
@@ -669,8 +676,14 @@ def main():
         if args.mod_rank is not None:
             model_kwargs['mod_rank'] = args.mod_rank
 
+    # v8.0: Add unified tensor product parameters
+    if model_version == '8.0':
+        model_kwargs['n_row'] = args.n_row
+        model_kwargs['n_col'] = args.n_col
+        model_kwargs['mid_dim'] = args.mid_dim
+
     # Create model by version
-    if model_version in ['7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['8.0', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
         print(f"\n📌 Model version: {model_version}")
     else:
