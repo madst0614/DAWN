@@ -592,7 +592,9 @@ def main():
         router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
         print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
 
-        if config_version == "7.2":
+        if config_version == "7.4":
+            print(f"TT Karcher Mean FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}")
+        elif config_version == "7.2":
             print(f"FFN: Standard FFN with Neuron Augmentation (d_ff={args.d_ff})")
         else:
             compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
@@ -668,7 +670,7 @@ def main():
             model_kwargs['mod_rank'] = args.mod_rank
 
     # Create model by version
-    if model_version in ['7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
         print(f"\n📌 Model version: {model_version}")
     else:

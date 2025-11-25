@@ -1,0 +1,50 @@
+# DAWN v7.4 Training Configuration
+# TT Weighted Karcher Mean
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_file: train/wikitext_5to1_texts.pkl
+  val_file: validation/wikitext_5to1_texts.pkl
+
+# Model Architecture
+model:
+  model_version: "7.4"    # v7.4: TT Karcher Mean
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+
+  # Neurons
+  n_neurons: 64
+  neuron_k: 8
+
+  # TT Basis
+  n_basis: 32
+  basis_rank: 64          # TT rank
+
+  # Karcher Mean
+  karcher_max_iter: 5     # Iteration 횟수
+  karcher_tolerance: 1e-6 # 수렴 tolerance
+
+  d_ff: 1024
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+
+  # Regularization (v7.0과 동일)
+  diversity_weight: 0.05
+  load_balance_weight: 0.01
+
+# Mixed precision
+use_amp: true
+
+# Paths
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v74
+log_dir: /content/drive/MyDrive/dawn/checkpoints_v74
