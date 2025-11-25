@@ -1,5 +1,5 @@
 # DAWN v7.2 Training Config
-# Standard FFN + Neuron Routing (병목 탐색 실험)
+# Basis Residual FFN (Recipe 기반 필터 + Residual + Standard FFN)
 
 # Data
 data:
@@ -7,23 +7,23 @@ data:
   train_file: train/wikitext_5to1_texts.pkl
   val_file: validation/wikitext_5to1_texts.pkl
 
-# Model Architecture (v7.2: Standard FFN + Neuron Routing)
+# Model Architecture (v7.2: Basis Residual FFN)
 model:
-  model_version: "7.2"    # DAWN v7.2 - Standard FFN + Neuron Routing
+  model_version: "7.2"    # DAWN v7.2 - Basis Residual FFN
   d_model: 256            # Hidden dimension
   n_layers: 4             # Number of transformer layers
   n_heads: 4              # Number of attention heads
 
-  # Neuron routing (same as v7.0/v7.1)
-  n_neurons: 64           # Size of neuron pool per layer
+  # Neuron routing
+  n_neurons: 64           # Size of neuron pool per layer (recipes)
   neuron_k: 8             # Top-k neurons to select
 
-  # Basis parameters (ignored in v7.2, for compatibility)
-  n_basis: 32             # Not used in v7.2
-  basis_rank: 64          # Not used in v7.2
+  # Basis parameters (v7.2: Shared basis for filtering)
+  n_basis: 32             # Number of basis filters (shared across layers)
+  basis_rank: 64          # Rank of each basis filter
 
   # Architecture
-  d_ff: 1024              # Feed-forward dimension (Standard FFN)
+  d_ff: 1024              # Feed-forward dimension (Standard FFN part)
   max_seq_len: 128        # Maximum sequence length
   dropout: 0.1            # Dropout rate
 
@@ -35,9 +35,9 @@ training:
   weight_decay: 0.1       # Weight decay for regularization
   warmup_epochs: 2        # Warmup epochs
 
-  # Regularization (v7.2: only load balance)
-  diversity_weight: 0.0      # Not applicable (no recipe)
-  load_balance_weight: 0.01  # Load balance loss
+  # Regularization (v7.2: load balance for neuron selection)
+  diversity_weight: 0.0      # Not used in v7.2
+  load_balance_weight: 0.01  # Load balance loss for neuron routing
 
 # Mixed precision (faster training on GPU)
 use_amp: true
