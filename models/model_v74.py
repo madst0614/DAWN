@@ -50,43 +50,50 @@ class KarcherFFN(nn.Module):
 
     def forward(self, x, neuron_idx, neuron_weights):
         """
+        Memory-efficient forward - weight recipes BEFORE TT expansion
+
+        핵심: Recipe를 먼저 weighted sum → TT 확장 1번만!
+        - Before: 8개 neuron × TT 확장 = 8배 메모리
+        - After: Recipe weighted sum → 1번 TT 확장 = 1배 메모리
+
         Args:
             x: [B, S, 256]
             neuron_idx: [B, S, k] selected neuron indices
-            neuron_weights: [B, S, k] neuron weights
+            neuron_weights: [B, S, k] neuron weights (softmax)
         """
         B, S, D = x.shape
-        k = neuron_idx.shape[-1]
 
-        # 1. 선택된 neuron들의 recipes
+        # 1. Get selected recipes
         selected_recipes = self.neuron_recipes[neuron_idx]  # [B, S, k, 32]
         selected_recipes = F.softmax(selected_recipes, dim=-1)
 
-        # 2. 각 neuron의 TT cores 생성
-        neuron_cores_A_list = []
-        neuron_cores_B_list = []
+        # 2. 🔥 핵심: Recipe를 먼저 weighted sum! (메모리 폭발 방지)
+        # [B, S, k, 32] × [B, S, k] → [B, S, 32]
+        weighted_recipe = torch.einsum('bskn,bsk->bsn',
+                                       selected_recipes,
+                                       neuron_weights)
+        # weighted_recipe: [B, S, 32] - 작음! ✅
 
-        for i in range(k):
-            recipe_i = selected_recipes[:, :, i, :]  # [B, S, 32]
-            cores_A, cores_B = self.basis.get_neuron_tt_cores(recipe_i)
-            neuron_cores_A_list.append(cores_A)
-            neuron_cores_B_list.append(cores_B)
+        # 3. Weighted recipe로 cores 생성 (1번만!)
+        cores_A, cores_B = self.basis.get_neuron_tt_cores(weighted_recipe)
+        # cores: [B, S, ...] - 1번만 확장 ✅
 
-        # 3. Karcher Mean으로 centroid 찾기!
-        centroid_A, centroid_B = self.basis.karcher(
-            neuron_cores_A_list,
-            neuron_cores_B_list,
-            neuron_weights
-        )
-
-        # 4. Centroid TT로 FFN 적용
-        output = self.apply_tt_ffn(x, centroid_A, centroid_B)
+        # 4. FFN 적용
+        output = self.apply_tt_ffn(x, cores_A, cores_B)
 
         return output
 
     def apply_tt_ffn(self, x, cores_A, cores_B):
         """
         TT cores로 FFN 적용
+
+        TT Contraction 원리:
+        - Input matrix를 fold: x[i,j]
+        - TT cores: core1[i,r,k], core2[r,j,l]
+        - Contract: sum_i,j,r [ x[i,j] * core1[i,r,k] * core2[r,j,l] ] = output[k,l]
+
+        Basis_A: [256→64] = [16×16 → 8×8]
+        Basis_B: [64→1024] = [8×8 → 32×32]
 
         Args:
             x: [B, S, 256]
@@ -97,33 +104,46 @@ class KarcherFFN(nn.Module):
         """
         B, S, D = x.shape
 
+        # === Basis_A: [256] → [64] ===
         # x를 fold: [B, S, 256] → [B, S, 16, 16]
-        x_fold = x.view(B, S, 16, 16)
+        x_fold = x.view(B, S, 16, 16)  # [B, S, i, j]
 
         # TT contraction for Basis_A
         # x_fold: [B, S, i, j]
-        # core1: [B, S, i, r, k]
-        h1 = torch.einsum('bsij,bsirk->bsjrk', x_fold, cores_A['core1'])
-        h1 = h1.sum(dim=2)  # [B, S, r, k]
+        # cores_A['core1']: [B, S, i, r, k]
+        # cores_A['core2']: [B, S, r, j, l]
 
-        # core2: [B, S, r, j, l]
-        h2 = torch.einsum('bsrk,bsrjl->bskjl', h1, cores_A['core2'])
-        h2 = h2.reshape(B, S, 64)  # [B, S, 8, 8] → [B, S, 64]
+        # Step 1: contract over i dimension
+        temp = torch.einsum('bsij,bsirk->bsjrk', x_fold, cores_A['core1'])
+        # temp: [B, S, j, r, k] - i가 사라짐
 
-        # h2를 fold: [B, S, 64] → [B, S, 8, 8]
-        h2_fold = h2.view(B, S, 8, 8)
+        # Step 2: contract over j and r dimensions
+        h = torch.einsum('bsjrk,bsrjl->bskl', temp, cores_A['core2'])
+        # h: [B, S, k, l] = [B, S, 8, 8]
+        h = h.reshape(B, S, 64)
+
+        # === Basis_B: [64] → [1024] ===
+        # h를 fold: [B, S, 64] → [B, S, 8, 8]
+        h_fold = h.view(B, S, 8, 8)  # [B, S, i, j]
 
         # TT contraction for Basis_B
-        h3 = torch.einsum('bsij,bsirk->bsjrk', h2_fold, cores_B['core1'])
-        h3 = h3.sum(dim=2)  # [B, S, r, k]
+        # h_fold: [B, S, i, j]
+        # cores_B['core1']: [B, S, i, r, k]
+        # cores_B['core2']: [B, S, r, j, l]
 
-        output = torch.einsum('bsrk,bsrjl->bskjl', h3, cores_B['core2'])
-        output = output.reshape(B, S, 1024)  # [B, S, 32, 32] → [B, S, 1024]
+        # Step 1: contract over i dimension
+        temp = torch.einsum('bsij,bsirk->bsjrk', h_fold, cores_B['core1'])
+        # temp: [B, S, j, r, k] - i가 사라짐
+
+        # Step 2: contract over j and r dimensions
+        output = torch.einsum('bsjrk,bsrjl->bskl', temp, cores_B['core2'])
+        # output: [B, S, k, l] = [B, S, 32, 32]
+        output = output.reshape(B, S, 1024)
 
         # GELU
         output = F.gelu(output)
 
-        # Down projection
+        # Down projection: [1024] → [256]
         output = self.w_down(output)
 
         return output

@@ -73,21 +73,29 @@ class TTKarcherMean(nn.Module):
 
     def weighted_average(self, tt_cores_list, weights):
         """
-        Memory-efficient weighted average of TT cores
+        Memory-efficient weighted average using in-place accumulation
+
+        Args:
+            tt_cores_list: List of k dicts with 'core1', 'core2'
+            weights: [B, S, k] neuron weights
+
+        Returns:
+            Dict with 'core1', 'core2' averaged cores
         """
         B, S, k = weights.shape
 
-        # Stack and compute weighted sum in one operation
-        # Stack cores: [k, B, S, ...]
-        core1_stack = torch.stack([tt['core1'] for tt in tt_cores_list], dim=0)
-        core2_stack = torch.stack([tt['core2'] for tt in tt_cores_list], dim=0)
+        # 첫 번째 neuron으로 초기화 (weighted)
+        # weights: [B, S, k] → [B, S, 1, 1, 1]
+        w0 = weights[:, :, 0].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
-        # weights: [B, S, k] -> [k, B, S, 1, 1, 1]
-        w = weights.permute(2, 0, 1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        core1_avg = tt_cores_list[0]['core1'] * w0
+        core2_avg = tt_cores_list[0]['core2'] * w0
 
-        # Weighted sum
-        core1_avg = (w * core1_stack).sum(dim=0)
-        core2_avg = (w * core2_stack).sum(dim=0)
+        # 나머지 neuron들을 순차적으로 누적
+        for i in range(1, k):
+            w_i = weights[:, :, i].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            core1_avg = core1_avg + tt_cores_list[i]['core1'] * w_i
+            core2_avg = core2_avg + tt_cores_list[i]['core2'] * w_i
 
         return {'core1': core1_avg, 'core2': core2_avg}
 
