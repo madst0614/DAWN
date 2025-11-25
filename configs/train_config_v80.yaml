@@ -1,0 +1,55 @@
+# DAWN v8.0 Training Configuration
+# Unified Tensor Product Architecture
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_file: train/wikitext_5to1_texts.pkl
+  val_file: validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v8.0: Unified Attention + FFN)
+model:
+  model_version: "8.0"    # v8.0: Unified architecture
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+
+  # Neurons
+  n_neurons: 64
+  neuron_k: 8
+
+  # Tensor Product Basis
+  n_row: 8                # Row basis (Query)
+  n_col: 8                # Col basis (Key-Value-Transform)
+  mid_dim: 32             # Intermediate dimension
+
+  # Note: n_row x n_col = 64 combinations!
+  # Much richer than 32 linear basis
+
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+
+  # Regularization
+  diversity_weight: 0.05
+  load_balance_weight: 0.01
+
+# Mixed precision
+use_amp: true
+
+# Paths
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v80
+log_dir: /content/drive/MyDrive/dawn/checkpoints_v80
+
+# v8.0 Notes:
+# - Attention + FFN unified into single operation
+# - Row basis: Query generation
+# - Col basis: Key-Value-Transform
+# - Expected: Better efficiency and interpretability
