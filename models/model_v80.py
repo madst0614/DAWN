@@ -194,12 +194,8 @@ class UnifiedTensorBlock(nn.Module):
         keys = keys.transpose(-2, -1).mean(dim=2)  # [B, S, mid]
 
         # 7. Attention scores
-        # [B, S, mid] @ [B, mid, S] → [B, S, S]
-        attention_scores = torch.bmm(
-            queries.view(B*S, 1, self.mid_dim),
-            keys.view(B*S, self.mid_dim, 1).transpose(-2, -1).expand(-1, self.mid_dim, S)
-        )
-        attention_scores = attention_scores.view(B, S, S) / math.sqrt(self.mid_dim)
+        # [B, S, mid] @ [B, S, mid].T → [B, S, S]
+        attention_scores = torch.bmm(queries, keys.transpose(-2, -1)) / math.sqrt(self.mid_dim)
 
         # Causal mask (for language modeling)
         causal_mask = torch.triu(
