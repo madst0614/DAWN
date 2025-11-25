@@ -139,7 +139,7 @@ class UnifiedTensorBlock(nn.Module):
         # Neuron recipes: [n_neurons, n_row * n_col]
         n_combinations = self.n_row * self.n_col
         self.neuron_recipe = nn.Parameter(
-            torch.randn(n_neurons, n_combinations) * 2.0
+            torch.randn(n_neurons, n_combinations) * 0.02  # 작게!
         )
 
         # Output projection (residual connection 위해)
@@ -215,10 +215,9 @@ class UnifiedTensorBlock(nn.Module):
         # [B, S, n_col] × [n_col, mid, d_model] → [B, S, mid, d_model]
         transform = torch.einsum('bsc,cij->bsij', col_weights, self.basis.col_basis)
 
-        # Apply transformation to context
-        # [B, S, d_model] → [B, S, mid] → [B, S, d_model]
-        output = torch.einsum('bsd,bsmd->bsm', context, transform)
-        output = torch.einsum('bsm,bsmd->bsd', output, transform)
+        # Apply transformation to context (옵션 C: 간단하게)
+        # transform 평균내서 context에 더하기
+        output = context + transform.mean(dim=2)  # [B, S, d_model]
 
         # GELU activation
         output = F.gelu(output)
