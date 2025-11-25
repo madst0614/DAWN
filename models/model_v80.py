@@ -186,13 +186,12 @@ class UnifiedTensorBlock(nn.Module):
         # 5. Generate Queries (Row basis)
         # [B, S, n_row] × [n_row, d_model, mid] → [B, S, d_model, mid]
         queries = torch.einsum('bsr,rij->bsij', row_weights, self.basis.row_basis)
-        # Sum over d_model to get query vectors (정보 보존)
-        queries = queries.sum(dim=2)  # [B, S, mid]
+        queries = F.normalize(queries.sum(dim=2), dim=-1)  # [B, S, mid]
 
         # 6. Generate Keys (Col basis)
         # [B, S, n_col] × [n_col, mid, d_model] → [B, S, mid, d_model]
         keys = torch.einsum('bsc,cij->bsij', col_weights, self.basis.col_basis)
-        keys = keys.transpose(-2, -1).sum(dim=2)  # [B, S, mid]
+        keys = F.normalize(keys.transpose(-2, -1).sum(dim=2), dim=-1)  # [B, S, mid]
 
         # 7. Attention scores
         # [B, S, mid] @ [B, S, mid].T → [B, S, S]
@@ -215,9 +214,10 @@ class UnifiedTensorBlock(nn.Module):
         # 9. Transform with Col basis
         # [B, S, n_col] × [n_col, mid, d_model] → [B, S, mid, d_model]
         transform = torch.einsum('bsc,cij->bsij', col_weights, self.basis.col_basis)
+        transform_vector = F.normalize(transform.sum(dim=2), dim=-1)  # [B, S, d_model]
 
         # Apply transformation to context (weighted sum)
-        output = context + self.alpha * transform.sum(dim=2)  # [B, S, d_model]
+        output = context + self.alpha * transform_vector
 
         # GELU activation
         output = F.gelu(output)
