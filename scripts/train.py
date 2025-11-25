@@ -591,9 +591,18 @@ def main():
     if config_version != 'baseline':
         router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
         print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
-        compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
-        basis_note = "v7.0: Fixed Orthogonal Basis" if config_version == "7.0" else "v6.0: Learned Basis"
-        print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}{compat_note}")
+
+        if config_version == "7.2":
+            print(f"FFN: Standard FFN with Neuron Augmentation (d_ff={args.d_ff})")
+        else:
+            compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
+            if config_version == "7.1":
+                basis_note = "v7.1: Symmetric Basis FFN"
+            elif config_version == "7.0":
+                basis_note = "v7.0: Fixed Orthogonal Basis"
+            else:
+                basis_note = "v6.0: Learned Basis"
+            print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}{compat_note}")
     else:
         print(f"Standard FFN: d_ff={args.d_ff}")
 
@@ -659,7 +668,7 @@ def main():
             model_kwargs['mod_rank'] = args.mod_rank
 
     # Create model by version
-    if model_version in ['7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
         print(f"\n📌 Model version: {model_version}")
     else:
