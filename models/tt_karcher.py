@@ -250,24 +250,16 @@ class TTBasisWithKarcher(nn.Module):
         self.karcher = TTKarcherMean(max_iter=5, tolerance=1e-6)
 
     def _init_orthogonal(self):
-        """초기 직교화"""
+        """초기 직교화 - row-wise normalization for TT cores"""
         with torch.no_grad():
-            for i in range(self.n_basis):
-                for k in range(8):
-                    # Basis_A cores
-                    Q, _ = torch.linalg.qr(self.basis_A_core1[i, :, :, k])
-                    self.basis_A_core1.data[i, :, :, k] = Q
+            # Basis_A cores: [n_basis, 16, rank, 8] and [n_basis, rank, 16, 8]
+            # Normalize along appropriate dimensions
+            self.basis_A_core1.data = F.normalize(self.basis_A_core1.data, dim=2)
+            self.basis_A_core2.data = F.normalize(self.basis_A_core2.data, dim=1)
 
-                    Q, _ = torch.linalg.qr(self.basis_A_core2[i, :, :, k].T)
-                    self.basis_A_core2.data[i, :, :, k] = Q.T
-
-                for k in range(32):
-                    # Basis_B cores
-                    Q, _ = torch.linalg.qr(self.basis_B_core1[i, :, :, k])
-                    self.basis_B_core1.data[i, :, :, k] = Q
-
-                    Q, _ = torch.linalg.qr(self.basis_B_core2[i, :, :, k].T)
-                    self.basis_B_core2.data[i, :, :, k] = Q.T
+            # Basis_B cores: [n_basis, 8, rank, 32] and [n_basis, rank, 8, 32]
+            self.basis_B_core1.data = F.normalize(self.basis_B_core1.data, dim=2)
+            self.basis_B_core2.data = F.normalize(self.basis_B_core2.data, dim=1)
 
     def get_neuron_tt_cores(self, neuron_recipe):
         """
