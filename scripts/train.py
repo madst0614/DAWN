@@ -668,7 +668,7 @@ def main():
             model_kwargs['mod_rank'] = args.mod_rank
 
     # Create model by version
-    if model_version in ['7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
         print(f"\n📌 Model version: {model_version}")
     else:
