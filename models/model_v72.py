@@ -87,9 +87,17 @@ class FixedOrthogonalBasis(nn.Module):
         for i in range(n):
             v = vectors[i].clone()
             for j in range(i):
-                proj = torch.dot(orthogonal[j], vectors[i]) * orthogonal[j]
+                # Fixed: use v instead of vectors[i]
+                proj = torch.dot(orthogonal[j], v) * orthogonal[j]
                 v = v - proj
-            orthogonal[i] = F.normalize(v, dim=0)
+
+            # Normalize with zero check
+            norm = torch.norm(v)
+            if norm > 1e-10:
+                orthogonal[i] = v / norm
+            else:
+                # Fallback to random if near-zero
+                orthogonal[i] = F.normalize(torch.randn_like(v), dim=0)
 
         return orthogonal
 
@@ -100,7 +108,7 @@ class FixedOrthogonalBasis(nn.Module):
 class SimpleRouter(nn.Module):
     """Neuron Router - DAWN과 동일"""
 
-    def __init__(self, d_model=256, n_heads=4, k=8):
+    def __init__(self, d_model=256, n_heads=4, k=8, dropout=0.1):
         super().__init__()
 
         self.d_model = d_model
@@ -112,6 +120,7 @@ class SimpleRouter(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.score_proj = nn.Linear(d_model * 2, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, x, neuron_emb, mask=None):
         B, S, D = x.shape
@@ -125,6 +134,7 @@ class SimpleRouter(nn.Module):
         if mask is not None:
             attn = attn.masked_fill(mask == 0, float('-inf'))
         attn = F.softmax(attn, dim=-1)
+        attn = self.attn_dropout(attn)  # Add dropout
 
         context = torch.matmul(attn, v)
         context = context.transpose(1, 2).contiguous().view(B, S, D)
@@ -182,8 +192,8 @@ class BasisResidualFFN(nn.Module):
         self.w_down = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
 
-        # Residual alpha
-        self.alpha = nn.Parameter(torch.tensor(0.1))
+        # Residual alpha (with explicit dtype)
+        self.alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
     @property
     def neuron_emb(self):
@@ -228,11 +238,13 @@ class BasisResidualFFN(nn.Module):
         W_A = torch.einsum('bsn,ndr->bsdr', token_recipe, self.basis.basis_A)
 
         # ============ 4. 필터 적용 ============
+        # Projection: delta = x @ W_A @ W_A^T
         # h = x @ W_A: [B, S, d_model] @ [B, S, d_model, rank] -> [B, S, rank]
         h = torch.einsum('bsd,bsdr->bsr', x, W_A)
 
-        # delta = h @ W_A.T: [B, S, rank] @ [B, S, rank, d_model] -> [B, S, d_model]
-        delta = torch.einsum('bsr,bsdr->bsd', h, W_A)
+        # delta = h @ W_A^T: [B, S, rank] @ [B, S, rank, d_model] -> [B, S, d_model]
+        # Fixed: transpose W_A properly
+        delta = torch.einsum('bsr,bsrd->bsd', h, W_A.transpose(-2, -1))
 
         # ============ 5. Residual ============
         x_filtered = x + self.alpha * delta
@@ -259,7 +271,8 @@ class DAWNLayer(nn.Module):
         self.router = SimpleRouter(
             d_model=d_model,
             n_heads=n_heads,
-            k=neuron_k
+            k=neuron_k,
+            dropout=dropout
         )
 
         self.ffn = BasisResidualFFN(
@@ -337,6 +350,10 @@ class DAWN(nn.Module):
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.dropout = nn.Dropout(dropout)
 
+        # Causal mask (cached for efficiency)
+        causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len))
+        self.register_buffer('causal_mask', causal_mask)
+
         # Layers (모두 같은 basis 공유)
         self.layers = nn.ModuleList([
             DAWNLayer(
@@ -394,9 +411,8 @@ class DAWN(nn.Module):
         x = self.token_emb(input_ids) + self.pos_emb(pos)
         x = self.dropout(x)
 
-        # Causal mask
-        mask = torch.tril(torch.ones(S, S, device=input_ids.device))
-        mask = mask.unsqueeze(0).unsqueeze(0)
+        # Causal mask (use cached)
+        mask = self.causal_mask[:S, :S].unsqueeze(0).unsqueeze(0)
 
         # Layers
         all_neuron_idx = []
