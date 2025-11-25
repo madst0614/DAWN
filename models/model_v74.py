@@ -88,8 +88,10 @@ class KarcherFFN(nn.Module):
         """
         TT cores로 FFN 적용
 
-        TT Contraction:
-        - x[i1, i2] × core1[i1, r, o1] × core2[r, i2, o2] → output[o1, o2]
+        TT Contraction 원리:
+        - Input matrix를 fold: x[i,j]
+        - TT cores: core1[i,r,k], core2[r,j,l]
+        - Contract: sum_i,j,r [ x[i,j] * core1[i,r,k] * core2[r,j,l] ] = output[k,l]
 
         Basis_A: [256→64] = [16×16 → 8×8]
         Basis_B: [64→1024] = [8×8 → 32×32]
@@ -104,35 +106,39 @@ class KarcherFFN(nn.Module):
         B, S, D = x.shape
 
         # === Basis_A: [256] → [64] ===
-        # x를 fold: [B, S, 256] → [B, S, 16, 16] (i1, i2)
-        x_fold = x.view(B, S, 16, 16)
+        # x를 fold: [B, S, 256] → [B, S, 16, 16]
+        x_fold = x.view(B, S, 16, 16)  # [B, S, i, j]
 
         # TT contraction for Basis_A
-        # Step 1: contract with core1 over i1
-        # x_fold: [B, S, i1, i2] × cores_A['core1']: [B, S, i1, r, o1]
-        temp = torch.einsum('bsab,bsarc->bsrcb', x_fold, cores_A['core1'])
-        # temp: [B, S, rank, 8, 16]
+        # x_fold: [B, S, i, j]
+        # cores_A['core1']: [B, S, i, r, k]
+        # cores_A['core2']: [B, S, r, j, l]
 
-        # Step 2: contract with core2 over i2 and rank
-        # temp: [B, S, r, o1, i2] × cores_A['core2']: [B, S, r, i2, o2]
-        h = torch.einsum('bsrcb,bsrbd->bscd', temp, cores_A['core2'])
-        # h: [B, S, 8, 8] = [B, S, 64]
+        # Step 1: contract over i dimension
+        temp = torch.einsum('bsij,bsirk->bsjrk', x_fold, cores_A['core1'])
+        # temp: [B, S, j, r, k] - i가 사라짐
+
+        # Step 2: contract over j and r dimensions
+        h = torch.einsum('bsjrk,bsrjl->bskl', temp, cores_A['core2'])
+        # h: [B, S, k, l] = [B, S, 8, 8]
         h = h.reshape(B, S, 64)
 
         # === Basis_B: [64] → [1024] ===
-        # h를 fold: [B, S, 64] → [B, S, 8, 8] (i1, i2)
-        h_fold = h.view(B, S, 8, 8)
+        # h를 fold: [B, S, 64] → [B, S, 8, 8]
+        h_fold = h.view(B, S, 8, 8)  # [B, S, i, j]
 
         # TT contraction for Basis_B
-        # Step 1: contract with core1 over i1
-        # h_fold: [B, S, i1, i2] × cores_B['core1']: [B, S, i1, r, o1]
-        temp = torch.einsum('bsab,bsarc->bsrcb', h_fold, cores_B['core1'])
-        # temp: [B, S, rank, 32, 8]
+        # h_fold: [B, S, i, j]
+        # cores_B['core1']: [B, S, i, r, k]
+        # cores_B['core2']: [B, S, r, j, l]
 
-        # Step 2: contract with core2 over i2 and rank
-        # temp: [B, S, r, o1, i2] × cores_B['core2']: [B, S, r, i2, o2]
-        output = torch.einsum('bsrcb,bsrbd->bscd', temp, cores_B['core2'])
-        # output: [B, S, 32, 32] = [B, S, 1024]
+        # Step 1: contract over i dimension
+        temp = torch.einsum('bsij,bsirk->bsjrk', h_fold, cores_B['core1'])
+        # temp: [B, S, j, r, k] - i가 사라짐
+
+        # Step 2: contract over j and r dimensions
+        output = torch.einsum('bsjrk,bsrjl->bskl', temp, cores_B['core2'])
+        # output: [B, S, k, l] = [B, S, 32, 32]
         output = output.reshape(B, S, 1024)
 
         # GELU
