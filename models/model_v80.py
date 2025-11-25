@@ -89,8 +89,10 @@ class UnifiedTensorBasis(nn.Module):
         for i in range(self.n_row):
             for j in range(self.n_col):
                 # Row + Col 정보 결합
+                # row_basis[i]: [d_model, mid_dim] → mean over mid_dim → [d_model]
                 row_emb = self.row_basis[i].mean(dim=-1)  # [d_model]
-                col_emb = self.col_basis[j].mean(dim=-1)  # [d_model]
+                # col_basis[j]: [mid_dim, d_model] → mean over mid_dim → [d_model]
+                col_emb = self.col_basis[j].mean(dim=0)   # [d_model]
 
                 # 평균으로 조합
                 combined = (row_emb + col_emb) / 2
