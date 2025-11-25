@@ -80,7 +80,7 @@ class UnifiedTensorBasis(nn.Module):
             else:
                 orthogonal[i] = v
 
-        return orthogonal.view(n_basis, dim1, dim2)
+        return orthogonal.view(n_basis, dim1, dim2) * math.sqrt(dim2)
 
     def _create_basis_embeddings(self):
         """각 (row, col) 조합의 embedding"""
@@ -139,11 +139,12 @@ class UnifiedTensorBlock(nn.Module):
         # Neuron recipes: [n_neurons, n_row * n_col]
         n_combinations = self.n_row * self.n_col
         self.neuron_recipe = nn.Parameter(
-            torch.randn(n_neurons, n_combinations) * 2.0
+            torch.randn(n_neurons, n_combinations) * 0.02  # 작게!
         )
 
         # Output projection (residual connection 위해)
         self.out_proj = nn.Linear(d_model, d_model)
+        self.alpha = nn.Parameter(torch.tensor(0.1))  # transform weight
 
     @property
     def neuron_emb(self):
@@ -185,13 +186,12 @@ class UnifiedTensorBlock(nn.Module):
         # 5. Generate Queries (Row basis)
         # [B, S, n_row] × [n_row, d_model, mid] → [B, S, d_model, mid]
         queries = torch.einsum('bsr,rij->bsij', row_weights, self.basis.row_basis)
-        # Average over d_model to get query vectors
-        queries = queries.mean(dim=2)  # [B, S, mid]
+        queries = F.normalize(queries.sum(dim=2), dim=-1)  # [B, S, mid]
 
         # 6. Generate Keys (Col basis)
         # [B, S, n_col] × [n_col, mid, d_model] → [B, S, mid, d_model]
         keys = torch.einsum('bsc,cij->bsij', col_weights, self.basis.col_basis)
-        keys = keys.transpose(-2, -1).mean(dim=2)  # [B, S, mid]
+        keys = F.normalize(keys.transpose(-2, -1).sum(dim=2), dim=-1)  # [B, S, mid]
 
         # 7. Attention scores
         # [B, S, mid] @ [B, S, mid].T → [B, S, S]
@@ -214,11 +214,10 @@ class UnifiedTensorBlock(nn.Module):
         # 9. Transform with Col basis
         # [B, S, n_col] × [n_col, mid, d_model] → [B, S, mid, d_model]
         transform = torch.einsum('bsc,cij->bsij', col_weights, self.basis.col_basis)
+        transform_vector = F.normalize(transform.sum(dim=2), dim=-1)  # [B, S, d_model]
 
-        # Apply transformation to context
-        # [B, S, d_model] → [B, S, mid] → [B, S, d_model]
-        output = torch.einsum('bsd,bsmd->bsm', context, transform)
-        output = torch.einsum('bsm,bsmd->bsd', output, transform)
+        # Apply transformation to context (weighted sum)
+        output = context + self.alpha * transform_vector
 
         # GELU activation
         output = F.gelu(output)
