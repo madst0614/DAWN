@@ -50,10 +50,12 @@ class KarcherFFN(nn.Module):
 
     def forward(self, x, neuron_idx, neuron_weights):
         """
+        Memory-efficient forward with on-the-fly averaging
+
         Args:
             x: [B, S, 256]
             neuron_idx: [B, S, k] selected neuron indices
-            neuron_weights: [B, S, k] neuron weights
+            neuron_weights: [B, S, k] neuron weights (softmax)
         """
         B, S, D = x.shape
         k = neuron_idx.shape[-1]
@@ -62,22 +64,34 @@ class KarcherFFN(nn.Module):
         selected_recipes = self.neuron_recipes[neuron_idx]  # [B, S, k, 32]
         selected_recipes = F.softmax(selected_recipes, dim=-1)
 
-        # 2. 각 neuron의 TT cores 생성
-        neuron_cores_A_list = []
-        neuron_cores_B_list = []
+        # 2. 첫 번째 neuron으로 centroid 초기화
+        recipe_0 = selected_recipes[:, :, 0, :]  # [B, S, 32]
+        w0 = neuron_weights[:, :, 0].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
-        for i in range(k):
+        cores_A, cores_B = self.basis.get_neuron_tt_cores(recipe_0)
+
+        centroid_A = {
+            'core1': cores_A['core1'] * w0,
+            'core2': cores_A['core2'] * w0
+        }
+        centroid_B = {
+            'core1': cores_B['core1'] * w0,
+            'core2': cores_B['core2'] * w0
+        }
+
+        # 3. 나머지 neuron들을 순차적으로 누적 (메모리 절약!)
+        for i in range(1, k):
             recipe_i = selected_recipes[:, :, i, :]  # [B, S, 32]
-            cores_A, cores_B = self.basis.get_neuron_tt_cores(recipe_i)
-            neuron_cores_A_list.append(cores_A)
-            neuron_cores_B_list.append(cores_B)
+            w_i = neuron_weights[:, :, i].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
-        # 3. Karcher Mean으로 centroid 찾기!
-        centroid_A, centroid_B = self.basis.karcher(
-            neuron_cores_A_list,
-            neuron_cores_B_list,
-            neuron_weights
-        )
+            # Neuron cores 생성
+            cores_A, cores_B = self.basis.get_neuron_tt_cores(recipe_i)
+
+            # 즉시 누적 (저장하지 않음!)
+            centroid_A['core1'] = centroid_A['core1'] + cores_A['core1'] * w_i
+            centroid_A['core2'] = centroid_A['core2'] + cores_A['core2'] * w_i
+            centroid_B['core1'] = centroid_B['core1'] + cores_B['core1'] * w_i
+            centroid_B['core2'] = centroid_B['core2'] + cores_B['core2'] * w_i
 
         # 4. Centroid TT로 FFN 적용
         output = self.apply_tt_ffn(x, centroid_A, centroid_B)
