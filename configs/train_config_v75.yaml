@@ -15,12 +15,12 @@ model:
   n_heads: 4              # Number of attention heads
 
   # Neuron routing (x만 보고 선택, 깔끔한 설계)
-  n_neurons: 192          # Size of neuron pool per layer (96 → 192, 2배)
+  n_neurons: 96           # Size of neuron pool per layer
   neuron_k: 8             # Top-k neurons to select
 
   # Basis parameters (공유 basis로 동적 Q/K/V 생성)
   n_basis: 32             # Number of basis filters (shared across layers)
-  basis_rank: 128         # Rank for Q/K/V (64 → 128, 2배, 4 heads × 32 d_head)
+  basis_rank: 64          # Rank for Q/K/V (4 heads × 16 d_head)
 
   # Architecture
   d_ff: 1024              # Feed-forward dimension (Standard FFN)

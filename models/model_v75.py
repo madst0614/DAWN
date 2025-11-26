@@ -255,10 +255,10 @@ class DAWN(nn.Module):
         n_heads: int = 4,
         d_ff: int = 1024,
         max_seq_len: int = 128,
-        n_neurons: int = 192,  # 96 → 192 (2배)
+        n_neurons: int = 96,
         neuron_k: int = 8,
         n_basis: int = 32,
-        basis_rank: int = 128,  # 64 → 128 (2배)
+        basis_rank: int = 64,
         dropout: float = 0.1,
         **kwargs
     ):
