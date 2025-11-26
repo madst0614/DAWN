@@ -139,11 +139,12 @@ class NeuronBasedValue(nn.Module):
         recipe_norm = F.softmax(self.neuron_recipe, dim=-1)
         return torch.matmul(recipe_norm, self.basis.basis_emb)
 
-    def forward(self, x, attn_weights):
+    def forward(self, x, attn_weights, K=None):
         """
         Args:
             x: [B, S, D] - 원본 임베딩 (아직 섞이지 않음!)
             attn_weights: [B, n_heads, S, S] - attention 패턴
+            K: [B, n_heads, S, d_head] - Key (optional, for semantic scoring)
 
         Returns:
             V: [B, n_heads, S, d_head] - 동적 생성된 Value
@@ -154,7 +155,12 @@ class NeuronBasedValue(nn.Module):
         # ========== 1. 뉴런 선택 (의미 + 문맥) ==========
 
         # 의미 점수: "이 단어는 어떤 뉴런?"
-        semantic_scores = x @ self.neuron_emb_semantic.T  # [B, S, n_neurons]
+        # K를 사용 (QK Attention 정보 재활용)
+        if K is not None:
+            K_combined = K.transpose(1, 2).reshape(B, S, D)  # [B, S, D]
+            semantic_scores = K_combined @ self.neuron_emb_semantic.T  # [B, S, n_neurons]
+        else:
+            semantic_scores = x @ self.neuron_emb_semantic.T  # [B, S, n_neurons]
 
         # 문맥 점수: "이 문맥 패턴은 어떤 뉴런?"
         # Attention 패턴 요약 (head별 평균)
@@ -261,9 +267,9 @@ class DAWNLayer(nn.Module):
         attn_weights = F.softmax(attn_scores, dim=-1)  # [B, n_heads, S, S]
         attn_weights_dropout = self.attn_dropout(attn_weights)
 
-        # 3. 원본 normed + attn_weights로 뉴런 선택 & V 생성
-        # 핵심: 원본 normed 사용! (아직 정보 섞이지 않음)
-        V, neuron_idx = self.neuron_value(normed, attn_weights)
+        # 3. 원본 normed + attn_weights + K로 뉴런 선택 & V 생성
+        # 핵심: K 사용 (QK Attention 정보 재활용)
+        V, neuron_idx = self.neuron_value(normed, attn_weights, K)
         # V: [B, n_heads, S, d_head]
 
         # 4. Attention 적용

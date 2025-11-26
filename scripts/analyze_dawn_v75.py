@@ -280,8 +280,9 @@ def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
                 # ⭐ Analyze neuron selection
                 neuron_value = layer.neuron_value
 
-                # Semantic scores
-                semantic_scores = normed @ neuron_value.neuron_emb_semantic.T  # [B, S, n_neurons]
+                # Semantic scores (using K - QK Attention 정보 재활용)
+                K_combined = K.transpose(1, 2).reshape(B, S, layer.d_model)  # [B, S, D]
+                semantic_scores = K_combined @ neuron_value.neuron_emb_semantic.T  # [B, S, n_neurons]
 
                 # Context scores
                 attn_summary = attn_weights.mean(dim=-1).transpose(1, 2)  # [B, S, n_heads]
@@ -313,7 +314,7 @@ def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
                 all_attn_patterns.append(attn_self)
 
                 # V generation and forward
-                V, _ = neuron_value(normed, attn_weights)
+                V, _ = neuron_value(normed, attn_weights, K)
                 attn_out = (layer.attn_dropout(attn_weights) @ V).transpose(1, 2).reshape(B, S, layer.d_model)
                 attn_out = layer.attn_out(attn_out)
                 x = residual + layer.dropout(attn_out)
