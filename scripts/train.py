@@ -728,11 +728,53 @@ def main():
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    # Get model version from args (default to latest)
-    model_version = getattr(args, 'model_version', '7.1')
+    # Check if resuming from checkpoint and load config
+    resume_checkpoint = None
+    if latest_best_checkpoint:
+        resume_checkpoint = latest_best_checkpoint
 
-    # Build model kwargs based on version
-    if model_version == 'baseline':
+    # Load model config from checkpoint folder or checkpoint file if resuming
+    checkpoint_config = None
+    if resume_checkpoint and resume_checkpoint.exists():
+        print(f"\n📌 Resuming from checkpoint: {resume_checkpoint}")
+
+        # Try to load config.json from checkpoint folder first
+        config_json_path = resume_checkpoint.parent / 'config.json'
+        if config_json_path.exists():
+            import json
+            with open(config_json_path, 'r') as f:
+                saved_cfg = json.load(f)
+                checkpoint_config = saved_cfg['model']
+                print(f"✅ Found config.json in checkpoint folder")
+        else:
+            # Fallback: load config from checkpoint file
+            temp_checkpoint = torch.load(resume_checkpoint, map_location='cpu')
+            if 'config' in temp_checkpoint:
+                checkpoint_config = temp_checkpoint['config']
+                print(f"✅ Found model config in checkpoint file")
+            else:
+                print(f"⚠️  No config found, using YAML config")
+            del temp_checkpoint  # Free memory
+
+    # Get model version from checkpoint or args
+    if checkpoint_config:
+        model_version = checkpoint_config.get('model_version', getattr(args, 'model_version', '7.1'))
+        print(f"📌 Using checkpoint config (version: {model_version})")
+    else:
+        model_version = getattr(args, 'model_version', '7.1')
+        print(f"📌 Using YAML config (version: {model_version})")
+
+    # Build model kwargs
+    if checkpoint_config:
+        # Use config from checkpoint (ensures architecture match)
+        model_kwargs = checkpoint_config.copy()
+        # Update vocab_size from current tokenizer (may differ)
+        model_kwargs['vocab_size'] = vocab_size
+        print(f"   Parameters from checkpoint:")
+        print(f"   - n_neurons: {model_kwargs.get('n_neurons', 'N/A')}")
+        print(f"   - basis_rank: {model_kwargs.get('basis_rank', 'N/A')}")
+        print(f"   - n_basis: {model_kwargs.get('n_basis', 'N/A')}")
+    elif model_version == 'baseline':
         # Baseline: only standard transformer parameters
         model_kwargs = {
             'vocab_size': vocab_size,
@@ -837,37 +879,44 @@ def main():
     if args.use_amp:
         print(f"\nUsing Automatic Mixed Precision (AMP)")
 
-    # Resume from checkpoint
+    # Resume from checkpoint (weights loading)
     start_epoch = 1
     best_val_loss = float('inf')
-    resume_checkpoint = None
-
-    # Load checkpoint if resuming
-    if latest_best_checkpoint:
-        resume_checkpoint = latest_best_checkpoint
 
     if resume_checkpoint and resume_checkpoint.exists():
-        print(f"\nResuming from checkpoint: {resume_checkpoint}")
+        print(f"\n{'='*60}")
+        print("Loading checkpoint weights...")
+        print(f"{'='*60}")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
 
-        # Check for version mismatch
+        # Version check (should match if we used checkpoint config)
         checkpoint_version = checkpoint.get('model_version', 'unknown')
         current_version = getattr(model, '__version__', 'unknown')
-        print(f"📌 Checkpoint version: {checkpoint_version}")
-        print(f"📌 Current model version: {current_version}")
 
-        if checkpoint_version != current_version and checkpoint_version != 'unknown':
-            print(f"\n⚠️  Version mismatch detected!")
-            print(f"   Checkpoint: v{checkpoint_version} → Current: v{current_version}")
-            print(f"   Will attempt partial loading (architecture-compatible parameters only)")
+        if checkpoint_config:
+            # We used checkpoint config, so architecture should match perfectly
+            print(f"✅ Architecture matches (both v{current_version})")
+        else:
+            # We used YAML config, check for mismatch
+            print(f"📌 Checkpoint version: {checkpoint_version}")
+            print(f"📌 Current model version: {current_version}")
 
-        # Load model state with strict=False for version compatibility
+            if checkpoint_version != current_version and checkpoint_version != 'unknown':
+                print(f"\n⚠️  Version mismatch detected!")
+                print(f"   Checkpoint: v{checkpoint_version} → Current: v{current_version}")
+                print(f"   Will attempt partial loading (architecture-compatible parameters only)")
+
+        # Load model state (strict if using checkpoint config)
+        use_strict = checkpoint_config is not None
         missing_keys, unexpected_keys = model.load_state_dict(
-            checkpoint['model_state_dict'], strict=False
+            checkpoint['model_state_dict'], strict=use_strict
         )
 
-        # Categorize missing keys
-        if missing_keys:
+        if use_strict:
+            print(f"✅ Weights loaded successfully (strict mode)")
+
+        # Categorize missing keys (only when not using strict mode)
+        if not use_strict and missing_keys:
             # v5.0 new parameters
             v5_new_params = [k for k in missing_keys if any(x in k for x in
                 ['neuron_A', 'neuron_B', 'basis_A', 'basis_B',
@@ -886,7 +935,7 @@ def main():
                     for k in other_missing:
                         print(f"      - {k}")
 
-        if unexpected_keys:
+        if not use_strict and unexpected_keys:
             # v4.5 parameters not in v5.0
             v4_deprecated = [k for k in unexpected_keys if any(x in k for x in
                 ['pattern_queries', 'pattern_up', 'neuron_q', 'neuron_k', 'neuron_v',
