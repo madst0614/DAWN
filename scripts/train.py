@@ -240,12 +240,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         f.write(f"METRICS,{epoch},{step+1},"
                                f"avg_usage={neuron_metrics['avg_usage']:.4f},"
                                f"avg_gini={neuron_metrics['avg_gini']:.4f},"
-                               f"avg_top10={neuron_metrics['avg_top10']:.4f}")
+                               f"avg_entropy={neuron_metrics['avg_entropy']:.4f},"
+                               f"avg_top10={neuron_metrics['avg_top10']:.4f},"
+                               f"avg_top50={neuron_metrics['avg_top50']:.4f}")
                         # Add per-layer details
                         for i in range(len(neuron_indices)):
                             f.write(f",L{i}_usage={neuron_metrics[f'L{i}_usage']:.4f},"
                                    f"L{i}_gini={neuron_metrics[f'L{i}_gini']:.4f},"
-                                   f"L{i}_top10={neuron_metrics[f'L{i}_top10']:.4f}")
+                                   f"L{i}_entropy={neuron_metrics[f'L{i}_entropy']:.4f},"
+                                   f"L{i}_top10={neuron_metrics[f'L{i}_top10']:.4f},"
+                                   f"L{i}_top50={neuron_metrics[f'L{i}_top50']:.4f}")
                         f.write("\n")
                 except Exception as e:
                     # If metrics collection fails, continue training
@@ -392,40 +396,62 @@ def compute_training_metrics(model, neuron_indices, device):
     layer_usage = []
     layer_gini = []
     layer_top10 = []
+    layer_top50 = []
+    layer_entropy = []
 
     for layer_idx, selected_idx in enumerate(neuron_indices):
         # selected_idx: [B, S, k]
         flat_idx = selected_idx.reshape(-1)
+        total_selections = flat_idx.numel()
 
         # 1. Usage rate (unique neurons used / total neurons)
         unique_neurons = torch.unique(flat_idx).numel()
         usage_rate = unique_neurons / n_neurons
         layer_usage.append(usage_rate)
 
-        # 2. Gini coefficient (0 = perfect equality, 1 = maximum inequality)
+        # 2. Selection frequency distribution
         counts = torch.bincount(flat_idx, minlength=n_neurons).float()
+        freq = counts / (counts.sum() + 1e-10)
+
+        # 3. Gini coefficient (0 = perfect equality, 1 = maximum inequality)
         sorted_counts = torch.sort(counts)[0]
         n = len(sorted_counts)
         index = torch.arange(1, n + 1, device=device, dtype=torch.float32)
         gini = ((2 * index - n - 1) * sorted_counts).sum() / (n * sorted_counts.sum() + 1e-10)
         layer_gini.append(gini.item())
 
-        # 3. Top-10 concentration (what % of activations go to top 10 neurons)
+        # 4. Top-K concentration
         if n_neurons >= 10:
             top10 = torch.topk(counts, 10).values.sum() / (counts.sum() + 1e-10)
             layer_top10.append(top10.item())
         else:
             layer_top10.append(1.0)
 
+        if n_neurons >= 50:
+            top50 = torch.topk(counts, 50).values.sum() / (counts.sum() + 1e-10)
+            layer_top50.append(top50.item())
+        else:
+            layer_top50.append(1.0)
+
+        # 5. Entropy (higher = more uniform distribution)
+        # Normalize to [0, 1] by dividing by log(n_neurons)
+        entropy = -(freq * torch.log(freq + 1e-10)).sum()
+        normalized_entropy = entropy / (torch.log(torch.tensor(n_neurons, dtype=torch.float32)) + 1e-10)
+        layer_entropy.append(normalized_entropy.item())
+
         # Per-layer metrics
         metrics[f'L{layer_idx}_usage'] = usage_rate
         metrics[f'L{layer_idx}_gini'] = gini.item()
         metrics[f'L{layer_idx}_top10'] = layer_top10[-1]
+        metrics[f'L{layer_idx}_top50'] = layer_top50[-1]
+        metrics[f'L{layer_idx}_entropy'] = normalized_entropy.item()
 
     # Aggregate metrics
     metrics['avg_usage'] = sum(layer_usage) / len(layer_usage)
     metrics['avg_gini'] = sum(layer_gini) / len(layer_gini)
     metrics['avg_top10'] = sum(layer_top10) / len(layer_top10)
+    metrics['avg_top50'] = sum(layer_top50) / len(layer_top50)
+    metrics['avg_entropy'] = sum(layer_entropy) / len(layer_entropy)
 
     return metrics
 
@@ -889,14 +915,20 @@ def main():
         # Print neuron metrics if available
         if neuron_metrics is not None:
             print(f"  Neuron Metrics:")
-            print(f"    Avg Usage: {neuron_metrics['avg_usage']:.2%} | "
+            print(f"    Usage: {neuron_metrics['avg_usage']:.1%} | "
                   f"Gini: {neuron_metrics['avg_gini']:.3f} | "
-                  f"Top10: {neuron_metrics['avg_top10']:.2%}")
+                  f"Entropy: {neuron_metrics['avg_entropy']:.3f}")
+            print(f"    Top-10: {neuron_metrics['avg_top10']:.2%} | "
+                  f"Top-50: {neuron_metrics['avg_top50']:.2%}")
             # Per-layer breakdown
             n_layers = sum(1 for k in neuron_metrics.keys() if k.startswith('L') and k.endswith('_usage'))
             layer_strs = []
             for i in range(n_layers):
-                layer_strs.append(f"L{i}: {neuron_metrics[f'L{i}_usage']:.2%}")
+                layer_strs.append(
+                    f"L{i}: U={neuron_metrics[f'L{i}_usage']:.0%} "
+                    f"G={neuron_metrics[f'L{i}_gini']:.2f} "
+                    f"E={neuron_metrics[f'L{i}_entropy']:.2f}"
+                )
             print(f"    Per-layer usage: {' | '.join(layer_strs)}")
 
         # Write epoch summary to log
