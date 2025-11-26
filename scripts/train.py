@@ -686,10 +686,12 @@ def main():
 
     if config_version != 'baseline':
         router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
-        print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
+        print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
 
         if config_version == "7.5":
-            print(f"QK Attention Routing + Soft FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}")
+            print(f"Dynamic Q/K/V/O Generation (v8 design): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
+            print(f"  - Learnable Basis with Orthogonality Loss")
+            print(f"  - Simple Router (x only)")
         elif config_version == "7.4":
             print(f"TT Karcher Mean FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}")
         elif config_version == "7.2":
