@@ -1,0 +1,47 @@
+# DAWN v7.3 Training Config
+# QK Attention Routing + Soft FFN
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_file: train/wikitext_5to1_texts.pkl
+  val_file: validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v7.3: QK Attention Routing)
+model:
+  model_version: "7.3"    # DAWN v7.3 - QK Attention Routing + Soft FFN
+  d_model: 256            # Hidden dimension
+  n_layers: 4             # Number of transformer layers
+  n_heads: 4              # Number of attention heads
+
+  # Neuron routing (의미 + 문맥 결합)
+  n_neurons: 96           # Size of neuron pool per layer
+  neuron_k: 8             # Top-k neurons to select
+
+  # Basis parameters (v7.3: Shared basis for dynamic V)
+  n_basis: 32             # Number of basis filters (shared across layers)
+  basis_rank: 96          # Rank of each basis filter (256→96→256)
+
+  # Architecture
+  d_ff: 1024              # Feed-forward dimension (Standard FFN)
+  max_seq_len: 128        # Maximum sequence length
+  dropout: 0.1            # Dropout rate
+
+# Training
+training:
+  batch_size: 128         # Batch size
+  num_epochs: 30          # Total epochs
+  lr: 0.0003              # Learning rate
+  weight_decay: 0.1       # Weight decay for regularization
+  warmup_epochs: 2        # Warmup epochs
+
+  # Regularization (v7.3: load balance for neuron selection)
+  diversity_weight: 0.0      # Not used in v7.3
+  load_balance_weight: 0.01  # Load balance loss for neuron routing
+
+# Mixed precision (faster training on GPU)
+use_amp: true
+
+# Paths
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v73
+log_dir: /content/drive/MyDrive/dawn/checkpoints_v73
