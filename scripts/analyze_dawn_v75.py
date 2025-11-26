@@ -531,7 +531,14 @@ def main():
 
     # Load state dict
     state_dict_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'model'
-    model.load_state_dict(checkpoint[state_dict_key])
+    state_dict = checkpoint[state_dict_key]
+
+    # Handle torch.compile wrapper (remove _orig_mod. prefix)
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        print("  Removing torch.compile wrapper prefix...")
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
