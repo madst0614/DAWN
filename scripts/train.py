@@ -672,55 +672,98 @@ def main():
     log_dir = checkpoint_dir
     print(f"Run folder: {checkpoint_dir}")
 
+    # ============================================================
+    # STEP 1: Load checkpoint config FIRST (before logging)
+    # ============================================================
+    resume_checkpoint = None
+    if latest_best_checkpoint:
+        resume_checkpoint = latest_best_checkpoint
+
+    checkpoint_config = None
+    checkpoint_training_config = None
+    if resume_checkpoint and resume_checkpoint.exists():
+        print(f"\n📌 Resuming from checkpoint: {resume_checkpoint}")
+
+        # Try config.json first, then checkpoint file
+        config_json_path = resume_checkpoint.parent / 'config.json'
+        if config_json_path.exists():
+            import json
+            with open(config_json_path, 'r') as f:
+                saved_cfg = json.load(f)
+                checkpoint_config = saved_cfg.get('model')
+                checkpoint_training_config = saved_cfg.get('training')
+                print(f"✅ Loaded config.json from checkpoint folder")
+        else:
+            temp_checkpoint = torch.load(resume_checkpoint, map_location='cpu')
+            if 'config' in temp_checkpoint:
+                checkpoint_config = temp_checkpoint['config']
+                print(f"✅ Loaded model config from checkpoint file")
+            del temp_checkpoint
+
+    # Update args from checkpoint config (if resuming)
+    if checkpoint_config:
+        args.model_version = checkpoint_config.get('model_version', args.model_version)
+        args.d_model = checkpoint_config.get('d_model', args.d_model)
+        args.n_layers = checkpoint_config.get('n_layers', args.n_layers)
+        args.n_heads = checkpoint_config.get('n_heads', args.n_heads)
+        args.n_neurons = checkpoint_config.get('n_neurons', args.n_neurons)
+        args.k = checkpoint_config.get('neuron_k', args.k)
+        args.n_basis = checkpoint_config.get('n_basis', args.n_basis)
+        args.basis_rank = checkpoint_config.get('basis_rank', args.basis_rank)
+        args.d_ff = checkpoint_config.get('d_ff', args.d_ff)
+        args.max_seq_len = checkpoint_config.get('max_seq_len', args.max_seq_len)
+        args.dropout = checkpoint_config.get('dropout', args.dropout)
+
+        if checkpoint_training_config:
+            args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
+            args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
+            args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
+
+        print(f"   → Updated args from checkpoint config (v{args.model_version})")
+
+    # ============================================================
+    # STEP 2: Print configuration summary (using updated args)
+    # ============================================================
     print(f"\n{'='*60}")
-    config_version = cfg['model'].get('model_version', 'not specified')
-    if config_version == 'baseline':
+    model_version = getattr(args, 'model_version', '7.1')
+    if model_version == 'baseline':
         print(f"Vanilla Transformer Baseline Training")
     else:
         print(f"DAWN (Dynamic Neuron Transformer) Training")
     print(f"{'='*60}")
-    print(f"\nModel version: {config_version}")
-    if config_version != 'baseline' and config_version != 'not specified':
-        print(f"  (Default DAWN module version: {DAWN.__version__})")
+    print(f"\nModel version: {model_version}")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
-    if config_version != 'baseline':
-        router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
-        print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
+    if model_version != 'baseline':
+        print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
-        if config_version == "7.5":
+        if model_version == "7.5":
             print(f"Dynamic Q/K/V/O Generation (v8 design): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
-
-            # Basis learning status
             if args.orthogonality_weight > 0:
                 print(f"  - Learnable Basis (orth_weight={args.orthogonality_weight})")
             else:
-                print(f"  - Fixed Basis (no orthogonality loss)")
-
-            # Load balance status
+                print(f"  - Fixed Basis")
             if args.load_balance_weight > 0:
                 print(f"  - Load Balance Loss (lb_weight={args.load_balance_weight})")
-
             print(f"  - Simple Router (x only)")
-        elif config_version == "7.4":
+        elif model_version == "7.4":
             print(f"TT Karcher Mean FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}")
-        elif config_version == "7.2":
+        elif model_version == "7.2":
             print(f"FFN: Standard FFN with Neuron Augmentation (d_ff={args.d_ff})")
         else:
-            compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
-            if config_version == "7.1":
+            if model_version == "7.1":
                 basis_note = "v7.1: Symmetric Basis FFN"
-            elif config_version == "7.0":
+            elif model_version == "7.0":
                 basis_note = "v7.0: Fixed Orthogonal Basis"
             else:
                 basis_note = "v6.0: Learned Basis"
-            print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}{compat_note}")
+            print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
     else:
         print(f"Standard FFN: d_ff={args.d_ff}")
 
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
-    # Regularization settings (if any are enabled)
+    # Regularization summary
     reg_parts = []
     if args.orthogonality_weight > 0:
         reg_parts.append(f"orth={args.orthogonality_weight}")
@@ -728,11 +771,12 @@ def main():
         reg_parts.append(f"div={args.diversity_weight}")
     if args.load_balance_weight > 0:
         reg_parts.append(f"lb={args.load_balance_weight}")
-
     if reg_parts:
         print(f"Regularization: {', '.join(reg_parts)}")
 
-    # Load data
+    # ============================================================
+    # STEP 3: Load data
+    # ============================================================
     print(f"\n{'='*60}")
     print("Loading data...")
     print(f"{'='*60}")
@@ -747,110 +791,37 @@ def main():
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
 
-    # Create model
+    # ============================================================
+    # STEP 4: Create model (using args)
+    # ============================================================
     print(f"\n{'='*60}")
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    # Check if resuming from checkpoint and load config
-    resume_checkpoint = None
-    if latest_best_checkpoint:
-        resume_checkpoint = latest_best_checkpoint
+    # Build model kwargs from args (already updated from checkpoint if resuming)
+    model_version = getattr(args, 'model_version', '7.1')
 
-    # Load model config from checkpoint folder or checkpoint file if resuming
-    checkpoint_config = None
-    checkpoint_training_config = None
-    if resume_checkpoint and resume_checkpoint.exists():
-        print(f"\n📌 Resuming from checkpoint: {resume_checkpoint}")
+    # Common parameters
+    model_kwargs = {
+        'vocab_size': vocab_size,
+        'd_model': args.d_model,
+        'n_layers': args.n_layers,
+        'n_heads': args.n_heads,
+        'd_ff': args.d_ff,
+        'max_seq_len': args.max_seq_len,
+        'dropout': args.dropout,
+    }
 
-        # Try to load config.json from checkpoint folder first
-        config_json_path = resume_checkpoint.parent / 'config.json'
-        if config_json_path.exists():
-            import json
-            with open(config_json_path, 'r') as f:
-                saved_cfg = json.load(f)
-                checkpoint_config = saved_cfg.get('model')
-                checkpoint_training_config = saved_cfg.get('training')
-                print(f"✅ Found config.json in checkpoint folder")
-        else:
-            # Fallback: load config from checkpoint file
-            temp_checkpoint = torch.load(resume_checkpoint, map_location='cpu')
-            if 'config' in temp_checkpoint:
-                checkpoint_config = temp_checkpoint['config']
-                print(f"✅ Found model config in checkpoint file")
-            else:
-                print(f"⚠️  No config found, using YAML config")
-            del temp_checkpoint  # Free memory
-
-    # Get model version from checkpoint or args
-    if checkpoint_config:
-        model_version = checkpoint_config.get('model_version', getattr(args, 'model_version', '7.1'))
-        print(f"📌 Using checkpoint config (version: {model_version})")
-
-        # Update args with checkpoint config to ensure consistency
-        args.model_version = model_version
-        args.d_model = checkpoint_config.get('d_model', args.d_model)
-        args.n_layers = checkpoint_config.get('n_layers', args.n_layers)
-        args.n_heads = checkpoint_config.get('n_heads', args.n_heads)
-        args.n_neurons = checkpoint_config.get('n_neurons', args.n_neurons)
-        args.k = checkpoint_config.get('neuron_k', args.k)
-        args.n_basis = checkpoint_config.get('n_basis', args.n_basis)
-        args.basis_rank = checkpoint_config.get('basis_rank', args.basis_rank)
-        args.d_ff = checkpoint_config.get('d_ff', args.d_ff)
-        args.max_seq_len = checkpoint_config.get('max_seq_len', args.max_seq_len)
-        args.dropout = checkpoint_config.get('dropout', args.dropout)
-
-        # Update training config if available
-        if checkpoint_training_config:
-            args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
-            args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
-            args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
-    else:
-        model_version = getattr(args, 'model_version', '7.1')
-        print(f"📌 Using YAML config (version: {model_version})")
-
-    # Build model kwargs
-    if checkpoint_config:
-        # Use config from checkpoint (ensures architecture match)
-        model_kwargs = checkpoint_config.copy()
-        # Update vocab_size from current tokenizer (may differ)
-        model_kwargs['vocab_size'] = vocab_size
-        print(f"   Model parameters from checkpoint:")
-        print(f"   - n_neurons: {model_kwargs.get('n_neurons', 'N/A')}")
-        print(f"   - basis_rank: {model_kwargs.get('basis_rank', 'N/A')}")
-        print(f"   - n_basis: {model_kwargs.get('n_basis', 'N/A')}")
-        if checkpoint_training_config:
-            print(f"   Training config from checkpoint:")
-            print(f"   - orthogonality_weight: {args.orthogonality_weight}")
-            print(f"   - load_balance_weight: {args.load_balance_weight}")
-    elif model_version == 'baseline':
-        # Baseline: only standard transformer parameters
-        model_kwargs = {
-            'vocab_size': vocab_size,
-            'd_model': args.d_model,
-            'n_layers': args.n_layers,
-            'n_heads': args.n_heads,
-            'd_ff': args.d_ff,
-            'max_seq_len': args.max_seq_len,
-            'dropout': args.dropout,
-        }
-    else:
-        # DAWN models: include neuron and basis parameters
-        model_kwargs = {
-            'vocab_size': vocab_size,
-            'd_model': args.d_model,
-            'n_layers': args.n_layers,
-            'n_heads': args.n_heads,
+    # Add DAWN-specific parameters
+    if model_version != 'baseline':
+        model_kwargs.update({
             'n_neurons': args.n_neurons,
             'neuron_k': args.k,
             'n_basis': args.n_basis,
             'basis_rank': args.basis_rank,
-            'd_ff': args.d_ff,
-            'max_seq_len': args.max_seq_len,
-            'dropout': args.dropout,
-        }
+        })
 
-        # v6.0 compatibility parameters (ignored by v7.0+)
+        # v6.0 compatibility (ignored by v7.0+)
         if args.router_temperature is not None:
             model_kwargs['router_temperature'] = args.router_temperature
         if args.neuron_rank is not None:
@@ -858,25 +829,14 @@ def main():
         if args.mod_rank is not None:
             model_kwargs['mod_rank'] = args.mod_rank
 
-    # Create model by version
+    # Create model
     if model_version in ['7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
-        print(f"\n📌 Creating model version: {model_version}")
     else:
-        # Fallback to default DAWN (v7.1)
         model = DAWN(**model_kwargs)
-        print(f"\n📌 Creating model version: {DAWN.__version__}")
 
     model = model.to(device)
-
-    # Verify model version
-    if hasattr(model, '__version__'):
-        actual_version = model.__version__
-        print(f"✅ Model created: DAWN v{actual_version}")
-        if model_version != actual_version and model_version != 'baseline':
-            print(f"⚠️  Warning: Requested v{model_version} but got v{actual_version}")
-    elif model_version == 'baseline':
-        print(f"✅ Model created: Vanilla Transformer (baseline)")
+    print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
 
     # PyTorch 2.0+ compilation for speed boost
     if hasattr(torch, 'compile'):
