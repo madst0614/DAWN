@@ -441,6 +441,23 @@ def main():
     # ⚡ Use torch.compile for faster inference (PyTorch 2.0+)
     if hasattr(torch, 'compile') and torch.cuda.is_available():
         print("\n⚡ Compiling model with torch.compile for faster GPU execution...")
+        print("   (Suppressing autotune logs...)")
+
+        # Suppress autotune verbose output
+        import os
+        import logging
+        os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
+        logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
+        logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+
+        # Disable autotune logging
+        try:
+            import torch._inductor.config as inductor_config
+            inductor_config.trace.enabled = False
+            inductor_config.trace.log_autotuning_results = False
+        except:
+            pass
+
         try:
             model = torch.compile(model, mode='max-autotune')
             print("   ✅ Model compiled successfully!")
