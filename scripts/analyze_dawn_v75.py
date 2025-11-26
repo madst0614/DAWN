@@ -457,28 +457,74 @@ def main():
     # Load model
     from models import create_model_by_version
 
+    # First, detect actual model version from checkpoint
+    actual_version = checkpoint.get('model_version', 'unknown')
+    print(f"Checkpoint model version: {actual_version}")
+
     # Get model config (with backward compatibility)
     if 'config' in checkpoint:
         model_config = checkpoint['config']
-        model_version = model_config.get('model_version', checkpoint.get('model_version', '7.5'))
+        model_version = model_config.get('model_version', actual_version)
     else:
         # Backward compatibility: infer config from checkpoint
-        print("⚠️  Warning: No config found in checkpoint. Using defaults for v7.5")
-        model_version = checkpoint.get('model_version', '7.5')
+        print("⚠️  Warning: No config found in checkpoint. Inferring from state_dict...")
+
+        # Try to infer version from state_dict keys
+        state_dict_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'model'
+        state_dict = checkpoint[state_dict_key]
+
+        # Check for v7.5 specific keys
+        if 'layers.0.neuron_value.neuron_recipe' in state_dict:
+            model_version = '7.5'
+            print(f"  Detected v7.5 architecture (neuron_value found)")
+        elif 'layers.0.ffn.neuron_recipe' in state_dict:
+            model_version = '7.1'
+            print(f"  Detected v7.1 architecture (ffn.neuron_recipe found)")
+        else:
+            model_version = actual_version if actual_version != 'unknown' else '7.1'
+            print(f"  Using version: {model_version}")
+
+        # Build default config based on detected version
         model_config = {
             'vocab_size': 30522,  # BERT vocab
             'd_model': 256,
             'n_layers': 4,
             'n_heads': 4,
-            'n_neurons': 96,
-            'neuron_k': 8,
-            'n_basis': 32,
-            'basis_rank': 96,
             'd_ff': 1024,
             'max_seq_len': 128,
             'dropout': 0.1,
         }
+
+        # Version-specific parameters
+        if model_version == '7.5':
+            model_config.update({
+                'n_neurons': 96,
+                'neuron_k': 8,
+                'n_basis': 32,
+                'basis_rank': 96,
+            })
+        else:
+            model_config.update({
+                'n_neurons': 64,
+                'neuron_k': 8,
+                'n_basis': 32,
+                'basis_rank': 64,
+            })
+
         model_config['model_version'] = model_version
+
+    # Check if this is actually v7.5
+    if model_version != '7.5':
+        print(f"\n❌ ERROR: This script is for v7.5 models only!")
+        print(f"   Found: v{model_version}")
+        print(f"   Please use the appropriate analysis script:")
+        print(f"   - v7.0: scripts/analyze_dawn_v7.py")
+        print(f"   - v7.1: scripts/analyze_dawn_v7.py")
+        print(f"   - v7.2: scripts/analyze_dawn_v7.py")
+        print(f"   - v7.4: scripts/analyze_dawn_v7.py")
+        return
+
+    print(f"\n✅ Confirmed v7.5 checkpoint. Proceeding with analysis...")
 
     model = create_model_by_version(model_version, model_config)
 
