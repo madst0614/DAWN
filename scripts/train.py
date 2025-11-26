@@ -97,25 +97,48 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         load_balance_weight=load_balance_weight
                     )
                 else:
-                    # v6.0 compatibility
-                    if orthogonality_weight > 0:
+                    # v7.5+: Dynamic Q/K/V with routing
+                    # v6.0: compatibility
+                    if hasattr(model, '__version__') and model.__version__ == "7.5":
+                        # v7.5: Get routing info for load balance loss
+                        if load_balance_weight > 0:
+                            ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                        else:
+                            ce_loss, logits = model(input_ids, labels)
+                            routing_infos = None
+
+                        # Basis orthogonality loss (v7.5)
+                        if orthogonality_weight > 0:
+                            orth_loss = model.orthogonality_loss()
+                        else:
+                            orth_loss = 0.0
+                        diversity_loss = 0.0
+                    elif orthogonality_weight > 0:
                         logits, losses = model(input_ids, return_losses=True)
                         orth_loss = losses['orth_total']
+                        ce_loss = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            labels.view(-1),
+                            ignore_index=-100
+                        )
+                        diversity_loss = 0.0
+                        routing_infos = None
                     else:
                         logits = model(input_ids)
                         orth_loss = 0.0
+                        diversity_loss = 0.0
+                        routing_infos = None
 
-                    # Cross-entropy loss
-                    B, S, V = logits.shape
-                    ce_loss = F.cross_entropy(
-                        logits.view(B * S, V),
-                        labels.view(B * S),
-                        ignore_index=-100
-                    )
+                        # Cross-entropy loss
+                        B, S, V = logits.shape
+                        ce_loss = F.cross_entropy(
+                            logits.view(B * S, V),
+                            labels.view(B * S),
+                            ignore_index=-100
+                        )
 
-                    # Recipe diversity loss
-                    diversity_loss = 0.0
-                    if diversity_weight > 0:
+                    # Recipe diversity loss (v7.0-v7.4)
+                    if diversity_weight > 0 and hasattr(model.layers[0], 'ffn') and hasattr(model.layers[0].ffn, 'neuron_recipe'):
                         for layer in model.layers:
                             recipe = layer.ffn.neuron_recipe
                             recipe_norm = F.softmax(recipe, dim=-1)
@@ -126,8 +149,21 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             diversity_loss += avg_similarity
                         diversity_loss = diversity_loss / len(model.layers)
 
+                    # Load balance loss (v7.5+)
+                    lb_loss = 0.0
+                    if load_balance_weight > 0 and routing_infos is not None:
+                        for routing_info in routing_infos:
+                            neuron_indices = routing_info['neuron_indices']  # [B, S, k]
+                            # Count neuron usage
+                            counts = torch.bincount(neuron_indices.reshape(-1), minlength=model.n_neurons)
+                            freq = counts.float() / (counts.sum() + 1e-8)
+                            # L2 distance from uniform distribution
+                            uniform = 1.0 / model.n_neurons
+                            lb_loss += ((freq - uniform) ** 2).sum() * model.n_neurons
+                        lb_loss = lb_loss / len(routing_infos)
+
                     # Total loss
-                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss
+                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             scaler.scale(loss).backward()
 
@@ -146,25 +182,48 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     load_balance_weight=load_balance_weight
                 )
             else:
-                # v6.0 compatibility
-                if orthogonality_weight > 0:
+                # v7.5+: Dynamic Q/K/V with routing
+                # v6.0: compatibility
+                if hasattr(model, '__version__') and model.__version__ == "7.5":
+                    # v7.5: Get routing info for load balance loss
+                    if load_balance_weight > 0:
+                        ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                    else:
+                        ce_loss, logits = model(input_ids, labels)
+                        routing_infos = None
+
+                    # Basis orthogonality loss (v7.5)
+                    if orthogonality_weight > 0:
+                        orth_loss = model.orthogonality_loss()
+                    else:
+                        orth_loss = 0.0
+                    diversity_loss = 0.0
+                elif orthogonality_weight > 0:
                     logits, losses = model(input_ids, return_losses=True)
                     orth_loss = losses['orth_total']
+                    ce_loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        labels.view(-1),
+                        ignore_index=-100
+                    )
+                    diversity_loss = 0.0
+                    routing_infos = None
                 else:
                     logits = model(input_ids)
                     orth_loss = 0.0
+                    diversity_loss = 0.0
+                    routing_infos = None
 
-                # Cross-entropy loss
-                B, S, V = logits.shape
-                ce_loss = F.cross_entropy(
-                    logits.view(B * S, V),
-                    labels.view(B * S),
-                    ignore_index=-100
-                )
+                    # Cross-entropy loss
+                    B, S, V = logits.shape
+                    ce_loss = F.cross_entropy(
+                        logits.view(B * S, V),
+                        labels.view(B * S),
+                        ignore_index=-100
+                    )
 
-                # Recipe diversity loss
-                diversity_loss = 0.0
-                if diversity_weight > 0:
+                # Recipe diversity loss (v7.0-v7.4)
+                if diversity_weight > 0 and hasattr(model.layers[0], 'ffn') and hasattr(model.layers[0].ffn, 'neuron_recipe'):
                     for layer in model.layers:
                         recipe = layer.ffn.neuron_recipe
                         recipe_norm = F.softmax(recipe, dim=-1)
@@ -175,8 +234,21 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         diversity_loss += avg_similarity
                     diversity_loss = diversity_loss / len(model.layers)
 
+                # Load balance loss (v7.5+)
+                lb_loss = 0.0
+                if load_balance_weight > 0 and routing_infos is not None:
+                    for routing_info in routing_infos:
+                        neuron_indices = routing_info['neuron_indices']  # [B, S, k]
+                        # Count neuron usage
+                        counts = torch.bincount(neuron_indices.reshape(-1), minlength=model.n_neurons)
+                        freq = counts.float() / (counts.sum() + 1e-8)
+                        # L2 distance from uniform distribution
+                        uniform = 1.0 / model.n_neurons
+                        lb_loss += ((freq - uniform) ** 2).sum() * model.n_neurons
+                    lb_loss = lb_loss / len(routing_infos)
+
                 # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             loss.backward()
 
@@ -240,12 +312,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         f.write(f"METRICS,{epoch},{step+1},"
                                f"avg_usage={neuron_metrics['avg_usage']:.4f},"
                                f"avg_gini={neuron_metrics['avg_gini']:.4f},"
-                               f"avg_top10={neuron_metrics['avg_top10']:.4f}")
+                               f"avg_entropy={neuron_metrics['avg_entropy']:.4f},"
+                               f"avg_top10={neuron_metrics['avg_top10']:.4f},"
+                               f"avg_top50={neuron_metrics['avg_top50']:.4f}")
                         # Add per-layer details
                         for i in range(len(neuron_indices)):
                             f.write(f",L{i}_usage={neuron_metrics[f'L{i}_usage']:.4f},"
                                    f"L{i}_gini={neuron_metrics[f'L{i}_gini']:.4f},"
-                                   f"L{i}_top10={neuron_metrics[f'L{i}_top10']:.4f}")
+                                   f"L{i}_entropy={neuron_metrics[f'L{i}_entropy']:.4f},"
+                                   f"L{i}_top10={neuron_metrics[f'L{i}_top10']:.4f},"
+                                   f"L{i}_top50={neuron_metrics[f'L{i}_top50']:.4f}")
                         f.write("\n")
                 except Exception as e:
                     # If metrics collection fails, continue training
@@ -392,40 +468,62 @@ def compute_training_metrics(model, neuron_indices, device):
     layer_usage = []
     layer_gini = []
     layer_top10 = []
+    layer_top50 = []
+    layer_entropy = []
 
     for layer_idx, selected_idx in enumerate(neuron_indices):
         # selected_idx: [B, S, k]
         flat_idx = selected_idx.reshape(-1)
+        total_selections = flat_idx.numel()
 
         # 1. Usage rate (unique neurons used / total neurons)
         unique_neurons = torch.unique(flat_idx).numel()
         usage_rate = unique_neurons / n_neurons
         layer_usage.append(usage_rate)
 
-        # 2. Gini coefficient (0 = perfect equality, 1 = maximum inequality)
+        # 2. Selection frequency distribution
         counts = torch.bincount(flat_idx, minlength=n_neurons).float()
+        freq = counts / (counts.sum() + 1e-10)
+
+        # 3. Gini coefficient (0 = perfect equality, 1 = maximum inequality)
         sorted_counts = torch.sort(counts)[0]
         n = len(sorted_counts)
         index = torch.arange(1, n + 1, device=device, dtype=torch.float32)
         gini = ((2 * index - n - 1) * sorted_counts).sum() / (n * sorted_counts.sum() + 1e-10)
         layer_gini.append(gini.item())
 
-        # 3. Top-10 concentration (what % of activations go to top 10 neurons)
+        # 4. Top-K concentration
         if n_neurons >= 10:
             top10 = torch.topk(counts, 10).values.sum() / (counts.sum() + 1e-10)
             layer_top10.append(top10.item())
         else:
             layer_top10.append(1.0)
 
+        if n_neurons >= 50:
+            top50 = torch.topk(counts, 50).values.sum() / (counts.sum() + 1e-10)
+            layer_top50.append(top50.item())
+        else:
+            layer_top50.append(1.0)
+
+        # 5. Entropy (higher = more uniform distribution)
+        # Normalize to [0, 1] by dividing by log(n_neurons)
+        entropy = -(freq * torch.log(freq + 1e-10)).sum()
+        normalized_entropy = entropy / (torch.log(torch.tensor(n_neurons, dtype=torch.float32)) + 1e-10)
+        layer_entropy.append(normalized_entropy.item())
+
         # Per-layer metrics
         metrics[f'L{layer_idx}_usage'] = usage_rate
         metrics[f'L{layer_idx}_gini'] = gini.item()
         metrics[f'L{layer_idx}_top10'] = layer_top10[-1]
+        metrics[f'L{layer_idx}_top50'] = layer_top50[-1]
+        metrics[f'L{layer_idx}_entropy'] = normalized_entropy.item()
 
     # Aggregate metrics
     metrics['avg_usage'] = sum(layer_usage) / len(layer_usage)
     metrics['avg_gini'] = sum(layer_gini) / len(layer_gini)
     metrics['avg_top10'] = sum(layer_top10) / len(layer_top10)
+    metrics['avg_top50'] = sum(layer_top50) / len(layer_top50)
+    metrics['avg_entropy'] = sum(layer_entropy) / len(layer_entropy)
 
     return metrics
 
@@ -483,11 +581,6 @@ def main():
     args.basis_rank = cfg['model'].get('basis_rank', 64)
     args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored)
     args.router_temperature = cfg['model'].get('router_temperature', None)  # v6.0 only (v7.0 ignores)
-
-    # v8.0: Unified Tensor Product parameters
-    args.n_row = cfg['model'].get('n_row', 8)      # Row basis (Query)
-    args.n_col = cfg['model'].get('n_col', 8)      # Col basis (Key-Value-Transform)
-    args.mid_dim = cfg['model'].get('mid_dim', 32) # Intermediate dimension
 
     # Backward compatibility (deprecated)
     args.n_input = cfg['model'].get('n_input', None)
@@ -579,45 +672,111 @@ def main():
     log_dir = checkpoint_dir
     print(f"Run folder: {checkpoint_dir}")
 
+    # ============================================================
+    # STEP 1: Load checkpoint config FIRST (before logging)
+    # ============================================================
+    resume_checkpoint = None
+    if latest_best_checkpoint:
+        resume_checkpoint = latest_best_checkpoint
+
+    checkpoint_config = None
+    checkpoint_training_config = None
+    if resume_checkpoint and resume_checkpoint.exists():
+        print(f"\n📌 Resuming from checkpoint: {resume_checkpoint}")
+
+        # Try config.json first, then checkpoint file
+        config_json_path = resume_checkpoint.parent / 'config.json'
+        if config_json_path.exists():
+            import json
+            with open(config_json_path, 'r') as f:
+                saved_cfg = json.load(f)
+                checkpoint_config = saved_cfg.get('model')
+                checkpoint_training_config = saved_cfg.get('training')
+                print(f"✅ Loaded config.json from checkpoint folder")
+        else:
+            temp_checkpoint = torch.load(resume_checkpoint, map_location='cpu')
+            if 'config' in temp_checkpoint:
+                checkpoint_config = temp_checkpoint['config']
+                print(f"✅ Loaded model config from checkpoint file")
+            del temp_checkpoint
+
+    # Update args from checkpoint config (if resuming)
+    if checkpoint_config:
+        args.model_version = checkpoint_config.get('model_version', args.model_version)
+        args.d_model = checkpoint_config.get('d_model', args.d_model)
+        args.n_layers = checkpoint_config.get('n_layers', args.n_layers)
+        args.n_heads = checkpoint_config.get('n_heads', args.n_heads)
+        args.n_neurons = checkpoint_config.get('n_neurons', args.n_neurons)
+        args.k = checkpoint_config.get('neuron_k', args.k)
+        args.n_basis = checkpoint_config.get('n_basis', args.n_basis)
+        args.basis_rank = checkpoint_config.get('basis_rank', args.basis_rank)
+        args.d_ff = checkpoint_config.get('d_ff', args.d_ff)
+        args.max_seq_len = checkpoint_config.get('max_seq_len', args.max_seq_len)
+        args.dropout = checkpoint_config.get('dropout', args.dropout)
+
+        if checkpoint_training_config:
+            args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
+            args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
+            args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
+
+        print(f"   → Updated args from checkpoint config (v{args.model_version})")
+
+    # ============================================================
+    # STEP 2: Print configuration summary (using updated args)
+    # ============================================================
     print(f"\n{'='*60}")
-    config_version = cfg['model'].get('model_version', 'not specified')
-    if config_version == 'baseline':
+    model_version = getattr(args, 'model_version', '7.1')
+    if model_version == 'baseline':
         print(f"Vanilla Transformer Baseline Training")
     else:
         print(f"DAWN (Dynamic Neuron Transformer) Training")
     print(f"{'='*60}")
-    print(f"\nConfig version: {config_version}")
-    if config_version != 'baseline':
-        print(f"Code version: {DAWN.__version__}")
-        if config_version != DAWN.__version__ and config_version != 'not specified':
-            print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
+    print(f"\nModel version: {model_version}")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
-    if config_version != 'baseline':
-        router_temp_str = f", router_temp={args.router_temperature}" if args.router_temperature else ""
-        print(f"Neurons: pool_size={args.n_neurons}, neuron_k={args.neuron_k}{router_temp_str}")
+    if model_version != 'baseline':
+        print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
-        if config_version == "8.0":
-            print(f"Unified Tensor Product: n_row={args.n_row}, n_col={args.n_col}, mid_dim={args.mid_dim}")
-        elif config_version == "7.4":
+        if model_version == "7.5":
+            print(f"Dynamic Q/K/V/O Generation (v8 design): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
+            if args.orthogonality_weight > 0:
+                print(f"  - Learnable Basis (orth_weight={args.orthogonality_weight})")
+            else:
+                print(f"  - Fixed Basis")
+            if args.load_balance_weight > 0:
+                print(f"  - Load Balance Loss (lb_weight={args.load_balance_weight})")
+            print(f"  - Simple Router (x only)")
+        elif model_version == "7.4":
             print(f"TT Karcher Mean FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}")
-        elif config_version == "7.2":
+        elif model_version == "7.2":
             print(f"FFN: Standard FFN with Neuron Augmentation (d_ff={args.d_ff})")
         else:
-            compat_note = f" (v5.0 compat: mod_rank={args.mod_rank})" if args.mod_rank else ""
-            if config_version == "7.1":
+            if model_version == "7.1":
                 basis_note = "v7.1: Symmetric Basis FFN"
-            elif config_version == "7.0":
+            elif model_version == "7.0":
                 basis_note = "v7.0: Fixed Orthogonal Basis"
             else:
                 basis_note = "v6.0: Learned Basis"
-            print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}{compat_note}")
+            print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
     else:
         print(f"Standard FFN: d_ff={args.d_ff}")
 
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
-    # Load data
+    # Regularization summary
+    reg_parts = []
+    if args.orthogonality_weight > 0:
+        reg_parts.append(f"orth={args.orthogonality_weight}")
+    if args.diversity_weight > 0:
+        reg_parts.append(f"div={args.diversity_weight}")
+    if args.load_balance_weight > 0:
+        reg_parts.append(f"lb={args.load_balance_weight}")
+    if reg_parts:
+        print(f"Regularization: {', '.join(reg_parts)}")
+
+    # ============================================================
+    # STEP 3: Load data
+    # ============================================================
     print(f"\n{'='*60}")
     print("Loading data...")
     print(f"{'='*60}")
@@ -632,43 +791,37 @@ def main():
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
 
-    # Create model
+    # ============================================================
+    # STEP 4: Create model (using args)
+    # ============================================================
     print(f"\n{'='*60}")
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    # Get model version from args (default to latest)
+    # Build model kwargs from args (already updated from checkpoint if resuming)
     model_version = getattr(args, 'model_version', '7.1')
 
-    # Build model kwargs based on version
-    if model_version == 'baseline':
-        # Baseline: only standard transformer parameters
-        model_kwargs = {
-            'vocab_size': vocab_size,
-            'd_model': args.d_model,
-            'n_layers': args.n_layers,
-            'n_heads': args.n_heads,
-            'd_ff': args.d_ff,
-            'max_seq_len': args.max_seq_len,
-            'dropout': args.dropout,
-        }
-    else:
-        # DAWN models: include neuron and basis parameters
-        model_kwargs = {
-            'vocab_size': vocab_size,
-            'd_model': args.d_model,
-            'n_layers': args.n_layers,
-            'n_heads': args.n_heads,
+    # Common parameters
+    model_kwargs = {
+        'vocab_size': vocab_size,
+        'd_model': args.d_model,
+        'n_layers': args.n_layers,
+        'n_heads': args.n_heads,
+        'd_ff': args.d_ff,
+        'max_seq_len': args.max_seq_len,
+        'dropout': args.dropout,
+    }
+
+    # Add DAWN-specific parameters
+    if model_version != 'baseline':
+        model_kwargs.update({
             'n_neurons': args.n_neurons,
             'neuron_k': args.k,
             'n_basis': args.n_basis,
             'basis_rank': args.basis_rank,
-            'd_ff': args.d_ff,
-            'max_seq_len': args.max_seq_len,
-            'dropout': args.dropout,
-        }
+        })
 
-        # v6.0 compatibility parameters (ignored by v7.0+)
+        # v6.0 compatibility (ignored by v7.0+)
         if args.router_temperature is not None:
             model_kwargs['router_temperature'] = args.router_temperature
         if args.neuron_rank is not None:
@@ -676,22 +829,14 @@ def main():
         if args.mod_rank is not None:
             model_kwargs['mod_rank'] = args.mod_rank
 
-    # v8.0: Add unified tensor product parameters
-    if model_version == '8.0':
-        model_kwargs['n_row'] = args.n_row
-        model_kwargs['n_col'] = args.n_col
-        model_kwargs['mid_dim'] = args.mid_dim
-
-    # Create model by version
-    if model_version in ['8.0', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    # Create model
+    if model_version in ['7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
-        print(f"\n📌 Model version: {model_version}")
     else:
-        # Fallback to default DAWN (v7.1)
         model = DAWN(**model_kwargs)
-        print(f"\n📌 Model version: {DAWN.__version__}")
 
     model = model.to(device)
+    print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
 
     # PyTorch 2.0+ compilation for speed boost
     if hasattr(torch, 'compile'):
@@ -743,36 +888,44 @@ def main():
     if args.use_amp:
         print(f"\nUsing Automatic Mixed Precision (AMP)")
 
-    # Resume from checkpoint
+    # Resume from checkpoint (weights loading)
     start_epoch = 1
     best_val_loss = float('inf')
-    resume_checkpoint = None
-
-    # Load checkpoint if resuming
-    if latest_best_checkpoint:
-        resume_checkpoint = latest_best_checkpoint
 
     if resume_checkpoint and resume_checkpoint.exists():
-        print(f"\nResuming from checkpoint: {resume_checkpoint}")
+        print(f"\n{'='*60}")
+        print("Loading checkpoint weights...")
+        print(f"{'='*60}")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
 
-        # Check for version mismatch
+        # Version check (should match if we used checkpoint config)
         checkpoint_version = checkpoint.get('model_version', 'unknown')
-        print(f"📌 Checkpoint version: {checkpoint_version}")
-        print(f"📌 Current model version: {DAWN.__version__}")
+        current_version = getattr(model, '__version__', 'unknown')
 
-        if checkpoint_version != DAWN.__version__ and checkpoint_version != 'unknown':
-            print(f"\n⚠️  Version mismatch detected!")
-            print(f"   Checkpoint: v{checkpoint_version} → Current: v{DAWN.__version__}")
-            print(f"   Will attempt partial loading (architecture-compatible parameters only)")
+        if checkpoint_config:
+            # We used checkpoint config, so architecture should match perfectly
+            print(f"✅ Architecture matches (both v{current_version})")
+        else:
+            # We used YAML config, check for mismatch
+            print(f"📌 Checkpoint version: {checkpoint_version}")
+            print(f"📌 Current model version: {current_version}")
 
-        # Load model state with strict=False for version compatibility
+            if checkpoint_version != current_version and checkpoint_version != 'unknown':
+                print(f"\n⚠️  Version mismatch detected!")
+                print(f"   Checkpoint: v{checkpoint_version} → Current: v{current_version}")
+                print(f"   Will attempt partial loading (architecture-compatible parameters only)")
+
+        # Load model state (strict if using checkpoint config)
+        use_strict = checkpoint_config is not None
         missing_keys, unexpected_keys = model.load_state_dict(
-            checkpoint['model_state_dict'], strict=False
+            checkpoint['model_state_dict'], strict=use_strict
         )
 
-        # Categorize missing keys
-        if missing_keys:
+        if use_strict:
+            print(f"✅ Weights loaded successfully (strict mode)")
+
+        # Categorize missing keys (only when not using strict mode)
+        if not use_strict and missing_keys:
             # v5.0 new parameters
             v5_new_params = [k for k in missing_keys if any(x in k for x in
                 ['neuron_A', 'neuron_B', 'basis_A', 'basis_B',
@@ -791,7 +944,7 @@ def main():
                     for k in other_missing:
                         print(f"      - {k}")
 
-        if unexpected_keys:
+        if not use_strict and unexpected_keys:
             # v4.5 parameters not in v5.0
             v4_deprecated = [k for k in unexpected_keys if any(x in k for x in
                 ['pattern_queries', 'pattern_up', 'neuron_q', 'neuron_k', 'neuron_v',
@@ -900,14 +1053,20 @@ def main():
         # Print neuron metrics if available
         if neuron_metrics is not None:
             print(f"  Neuron Metrics:")
-            print(f"    Avg Usage: {neuron_metrics['avg_usage']:.2%} | "
+            print(f"    Usage: {neuron_metrics['avg_usage']:.1%} | "
                   f"Gini: {neuron_metrics['avg_gini']:.3f} | "
-                  f"Top10: {neuron_metrics['avg_top10']:.2%}")
+                  f"Entropy: {neuron_metrics['avg_entropy']:.3f}")
+            print(f"    Top-10: {neuron_metrics['avg_top10']:.2%} | "
+                  f"Top-50: {neuron_metrics['avg_top50']:.2%}")
             # Per-layer breakdown
             n_layers = sum(1 for k in neuron_metrics.keys() if k.startswith('L') and k.endswith('_usage'))
             layer_strs = []
             for i in range(n_layers):
-                layer_strs.append(f"L{i}: {neuron_metrics[f'L{i}_usage']:.2%}")
+                layer_strs.append(
+                    f"L{i}: U={neuron_metrics[f'L{i}_usage']:.0%} "
+                    f"G={neuron_metrics[f'L{i}_gini']:.2f} "
+                    f"E={neuron_metrics[f'L{i}_entropy']:.2f}"
+                )
             print(f"    Per-layer usage: {' | '.join(layer_strs)}")
 
         # Write epoch summary to log
@@ -916,15 +1075,20 @@ def main():
                    f"{val_loss:.6f},{val_acc:.6f},"
                    f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}\n")
 
-        # Analyze activations periodically
+        # Analyze activations periodically (skip for v7.5 - uses different architecture)
         if epoch % 10 == 0:
-            sample_batch = next(iter(val_loader))
-            sample_ids = sample_batch['input_ids'][:1].to(device)
-            act_stats = analyze_activations(model, sample_ids, device)
-            print(f"\n  Neuron Usage Analysis (Epoch {epoch}):")
-            for layer_name, stats in act_stats.items():
-                print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
-                      f"({stats['usage_ratio']:.2%} usage)")
+            model_version = getattr(model, '__version__', None)
+            if model_version != "7.5":
+                sample_batch = next(iter(val_loader))
+                sample_ids = sample_batch['input_ids'][:1].to(device)
+                act_stats = analyze_activations(model, sample_ids, device)
+                print(f"\n  Neuron Usage Analysis (Epoch {epoch}):")
+                for layer_name, stats in act_stats.items():
+                    print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
+                          f"({stats['usage_ratio']:.2%} usage)")
+            else:
+                # v7.5 uses dynamic Q/K/V/O - activation analysis not applicable
+                print(f"\n  (Neuron usage analysis skipped for v7.5 - use analyze_dawn_v75.py instead)")
 
         # Save checkpoint
         is_best = val_loss < best_val_loss
@@ -934,7 +1098,7 @@ def main():
 
         ckpt_manager.save_checkpoint(
             model, optimizer, epoch, val_loss, metrics, is_best=is_best,
-            scheduler=scheduler, scaler=scaler
+            scheduler=scheduler, scaler=scaler, model_config=model_kwargs
         )
 
     print(f"\n{'='*60}")

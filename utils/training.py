@@ -39,7 +39,8 @@ class CheckpointManager:
         metrics: dict,
         is_best: bool = False,
         scheduler=None,
-        scaler=None
+        scaler=None,
+        model_config: dict = None
     ) -> str:
         """
         Save checkpoint.
@@ -53,6 +54,7 @@ class CheckpointManager:
             is_best: Whether this is the best model so far
             scheduler: Optional scheduler state
             scaler: Optional AMP scaler state
+            model_config: Optional model configuration dict
 
         Returns:
             Path to saved checkpoint
@@ -76,6 +78,10 @@ class CheckpointManager:
             'timestamp': timestamp,
             'model_version': model_version  # 버전 저장
         }
+
+        # Save model config if provided
+        if model_config is not None:
+            checkpoint['config'] = model_config
 
         if scheduler is not None:
             checkpoint['scheduler_state_dict'] = scheduler.state_dict()
