@@ -687,7 +687,6 @@ def main():
         # Try config.json first, then checkpoint file
         config_json_path = resume_checkpoint.parent / 'config.json'
         if config_json_path.exists():
-            import json
             with open(config_json_path, 'r') as f:
                 saved_cfg = json.load(f)
                 checkpoint_config = saved_cfg.get('model')
