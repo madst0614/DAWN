@@ -1,5 +1,5 @@
 """
-DAWN v7.5 Checkpoint Analysis
+DAWN v7.5/v7.6 Checkpoint Analysis
 Dynamic Q/K/V Generation (v8 design)
 
 분석 항목:
@@ -12,10 +12,15 @@ Dynamic Q/K/V Generation (v8 design)
 7. ⭐ O Projection 정보 손실 분석 (핵심!)
 8. Attention 패턴 분석
 
-v7.5 특징 (v8 design):
+v7.5 특징:
 - 라우터: x만 보고 뉴런 선택
 - Q/K/V 모두 동적 생성 (recipe_Q/K/V)
-- 깔끔한 구조: basis_emb 없음, context score 없음
+- O projection: basis.T 사용 (종속)
+
+v7.6 특징 (개선):
+- basis_down (Q/K/V용)과 basis_up (O용) 분리
+- 독립적인 O projection 학습
+- Recipe diversity loss 추가
 
 핵심 지표 해석 가이드:
 | 지표                    | 정상 범위   | 문제 신호                      |
@@ -24,6 +29,7 @@ v7.5 특징 (v8 design):
 | Basis effective rank   | > 20       | < 10 → 중복된 basis           |
 | O proj relative error  | < 0.2      | > 0.4 → 심각한 정보 손실       |
 | Attention entropy      | 1.5 ~ 3.0  | < 1.0 또는 > 4.0              |
+| Basis correspondence   | < 0.3      | > 0.7 → basis_up 미학습 (v7.6) |
 
 Usage:
     python scripts/analyze_dawn_v75.py --checkpoint /path/to/checkpoint_folder
@@ -71,43 +77,75 @@ def compute_gini(values):
 # ============================================================
 
 def analyze_basis_orthogonality(model):
-    """Verify that basis is perfectly orthogonal"""
+    """Verify that basis is perfectly orthogonal
+
+    Supports both v7.5 (single basis) and v7.6 (separate basis_down/basis_up)
+    """
     print("\n" + "="*60)
     print("1. BASIS ORTHOGONALITY VERIFICATION")
     print("="*60)
 
-    basis = model.shared_basis.basis  # [n_basis, D, rank]
+    # Detect model version
+    is_v76 = hasattr(model.shared_basis, 'get_basis_down')
     n_basis = model.n_basis
-
     results = {}
 
-    # Check orthogonality for each basis element
-    # Each basis[i] is [D, rank], we want columns to be orthogonal
-    max_errors = []
-    mean_errors = []
+    def check_orthogonality(basis, name):
+        """Check orthogonality for a given basis"""
+        max_errors = []
+        mean_errors = []
 
-    for i in range(n_basis):
-        basis_i = basis[i]  # [D, rank]
-        gram = basis_i.T @ basis_i  # [rank, rank]
-        identity = torch.eye(gram.shape[0], device=gram.device)
-        error = (gram - identity).abs()
-        error_offdiag = error.clone()
-        error_offdiag.fill_diagonal_(0)
+        for i in range(n_basis):
+            basis_i = basis[i]  # [D, rank] or [rank, D]
+            # Ensure we get the right shape for gram matrix
+            if basis_i.shape[0] > basis_i.shape[1]:
+                gram = basis_i.T @ basis_i  # [rank, rank]
+            else:
+                gram = basis_i @ basis_i.T  # [rank, rank] for basis_up
+            identity = torch.eye(gram.shape[0], device=gram.device)
+            error = (gram - identity).abs()
+            error_offdiag = error.clone()
+            error_offdiag.fill_diagonal_(0)
 
-        max_errors.append(error_offdiag.max().item())
-        mean_errors.append(error_offdiag.mean().item())
+            max_errors.append(error_offdiag.max().item())
+            mean_errors.append(error_offdiag.mean().item())
 
-    results['basis'] = {
-        'max_off_diagonal': max(max_errors),
-        'mean_off_diagonal': np.mean(mean_errors),
-        'max_across_basis': max_errors,
-    }
+        return {
+            'max_off_diagonal': max(max_errors),
+            'mean_off_diagonal': np.mean(mean_errors),
+            'max_across_basis': max_errors,
+        }
 
-    print(f"\nBasis orthogonality:")
-    print(f"  Max off-diagonal: {max(max_errors):.2e}")
-    print(f"  Mean off-diagonal: {np.mean(mean_errors):.2e}")
+    if is_v76:
+        print("\n📌 v7.6 model: Checking both basis_down and basis_up")
 
-    max_error = max(max_errors)
+        # Check basis_down
+        basis_down = model.shared_basis.get_basis_down()
+        results['basis_down'] = check_orthogonality(basis_down, 'basis_down')
+        print(f"\nBasis_down orthogonality:")
+        print(f"  Max off-diagonal: {results['basis_down']['max_off_diagonal']:.2e}")
+        print(f"  Mean off-diagonal: {results['basis_down']['mean_off_diagonal']:.2e}")
+
+        # Check basis_up
+        basis_up = model.shared_basis.get_basis_up()
+        results['basis_up'] = check_orthogonality(basis_up, 'basis_up')
+        print(f"\nBasis_up orthogonality:")
+        print(f"  Max off-diagonal: {results['basis_up']['max_off_diagonal']:.2e}")
+        print(f"  Mean off-diagonal: {results['basis_up']['mean_off_diagonal']:.2e}")
+
+        max_error = max(results['basis_down']['max_off_diagonal'],
+                       results['basis_up']['max_off_diagonal'])
+        results['basis'] = {'max_off_diagonal': max_error}
+    else:
+        basis = model.shared_basis.basis
+        results['basis'] = check_orthogonality(basis, 'basis')
+
+        print(f"\nBasis orthogonality:")
+        print(f"  Max off-diagonal: {results['basis']['max_off_diagonal']:.2e}")
+        print(f"  Mean off-diagonal: {results['basis']['mean_off_diagonal']:.2e}")
+
+        max_error = results['basis']['max_off_diagonal']
+
     print(f"\n{'✅' if max_error < 1e-5 else '⚠️'} Overall: Max error = {max_error:.2e}")
     print(f"   Orthogonality {'PERFECT' if max_error < 1e-5 else 'APPROXIMATE'}!")
 
@@ -465,12 +503,21 @@ def analyze_w_dynamics(model, dataloader, device, max_batches=5):
 # ============================================================
 
 def analyze_basis_coverage(model, dataloader, device, max_batches=5):
-    """Analyze how well basis covers the space"""
+    """Analyze how well basis covers the space
+
+    Supports both v7.5 (single basis) and v7.6 (separate basis_down/basis_up)
+    """
     print("\n" + "="*60)
     print("6. BASIS COVERAGE ANALYSIS")
     print("="*60)
 
-    basis = model.shared_basis.basis  # [n_basis, D, rank]
+    # Detect model version and get basis
+    is_v76 = hasattr(model.shared_basis, 'get_basis_down')
+    if is_v76:
+        basis = model.shared_basis.get_basis_down()  # [n_basis, D, rank]
+        print("📌 Analyzing basis_down (v7.6)")
+    else:
+        basis = model.shared_basis.basis  # [n_basis, D, rank]
     n_basis, D, rank = basis.shape
 
     # 1. Flatten basis for analysis
@@ -541,13 +588,44 @@ def analyze_basis_coverage(model, dataloader, device, max_batches=5):
 # ============================================================
 
 def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
-    """Measure information loss in O projection"""
+    """Measure information loss in O projection
+
+    Supports both v7.5 (shared basis.T) and v7.6 (independent basis_up)
+    """
     print("\n" + "="*60)
     print("7. ⭐ O PROJECTION INFORMATION LOSS (KEY SUSPECT)")
     print("="*60)
 
     model.eval()
     results = {f'layer_{i}': [] for i in range(len(model.layers))}
+
+    # Detect model version
+    is_v76 = hasattr(model.shared_basis, 'get_basis_up')
+    if is_v76:
+        print("\n📌 Detected v7.6 model with independent basis_up")
+
+        # Analyze basis down-up correspondence
+        basis_down = model.shared_basis.get_basis_down()  # [n_basis, D, rank]
+        basis_up = model.shared_basis.get_basis_up()      # [n_basis, rank, D]
+
+        correspondence = []
+        for i in range(model.n_basis):
+            down_i = basis_down[i]  # [D, rank]
+            up_i = basis_up[i]      # [rank, D]
+
+            # Compare down.T with up
+            down_T = down_i.T  # [rank, D]
+            sim = F.cosine_similarity(down_T.flatten().unsqueeze(0),
+                                       up_i.flatten().unsqueeze(0)).item()
+            correspondence.append(sim)
+
+        avg_correspondence = np.mean(correspondence)
+        print(f"\n📊 Basis Down-Up Correspondence:")
+        print(f"  Average similarity (down.T vs up): {avg_correspondence:.4f}")
+        print(f"  (Lower = more independent learning, < 0.3 recommended)")
+        results['basis_correspondence'] = avg_correspondence
+    else:
+        print("\n📌 Detected v7.5 model with shared basis.T")
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="O Proj Loss", total=max_batches)):
@@ -575,7 +653,12 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 recipe_K = F.softmax((qkv.neuron_recipe_K[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
                 recipe_V = F.softmax((qkv.neuron_recipe_V[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
 
-                basis = qkv.shared_basis()
+                # Get basis (v7.6: use get_basis_down, v7.5: use forward)
+                if is_v76:
+                    basis = qkv.shared_basis.get_basis_down()
+                else:
+                    basis = qkv.shared_basis()
+
                 W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
                 W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
                 W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
@@ -600,9 +683,12 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 # ⭐ KEY: Compare before and after O projection
                 attn_out_before_O = attn_out.clone()  # [B, S, rank]
 
-                # Perform O projection
+                # Perform O projection (v7.6: use get_basis_up, v7.5: use transpose)
                 recipe_O = F.softmax((qkv.neuron_recipe_O[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
-                basis_up = qkv.shared_basis().transpose(-1, -2)  # [n_basis, rank, D]
+                if is_v76:
+                    basis_up = qkv.shared_basis.get_basis_up()  # [n_basis, rank, D]
+                else:
+                    basis_up = qkv.shared_basis().transpose(-1, -2)  # [n_basis, rank, D]
                 W_O = torch.einsum('bsn,nrd->bsrd', recipe_O, basis_up)  # [B, S, rank, D]
                 attn_out_after_O = torch.einsum('bsr,bsrd->bsd', attn_out, W_O)  # [B, S, D]
 

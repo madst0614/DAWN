@@ -1,7 +1,8 @@
 """
 DAWN Models Module
 
-v7.5: Dynamic Q/K/V Generation (NEW - v8 design)
+v7.6: Independent O Basis + Recipe Diversity (NEW)
+v7.5: Dynamic Q/K/V Generation (v8 design)
 v7.4: TT Weighted Karcher Mean
 v7.2: Standard FFN + Neuron Routing (병목 탐색 실험)
 v7.1: Symmetric Basis FFN (W_down 제거) - DEFAULT
@@ -21,7 +22,8 @@ from .model_v71 import (
     count_parameters,
 )
 
-# v7.5, v7.4, v7.2, v7.0 and v6.0 compatibility imports
+# v7.6, v7.5, v7.4, v7.2, v7.0 and v6.0 compatibility imports
+from . import model_v76 as model_v76
 from . import model_v75 as model_v75
 from . import model_v74 as model_v74
 from . import model_v72 as model_v72
@@ -46,6 +48,7 @@ __all__ = [
     'DAWNLayer',
     'create_model',
     'count_parameters',
+    'model_v76',  # Access v7.6 via models.model_v76
     'model_v75',  # Access v7.5 via models.model_v75
     'model_v74',  # Access v7.4 via models.model_v74
     'model_v72',  # Access v7.2 via models.model_v72
@@ -62,7 +65,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "7.5", "7.4", "7.2", "7.1", "7.0", "6.0", or "baseline"
+        version: "7.6", "7.5", "7.4", "7.2", "7.1", "7.0", "6.0", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -70,7 +73,10 @@ def create_model_by_version(version, config):
     """
     version = str(version)
 
-    if version in ["7.5", "75"]:
+    if version in ["7.6", "76"]:
+        from .model_v76 import DAWN as DAWN_v76
+        return DAWN_v76(**config)
+    elif version in ["7.5", "75"]:
         from .model_v75 import DAWN as DAWN_v75
         return DAWN_v75(**config)
     elif version in ["7.4", "74"]:
@@ -95,4 +101,4 @@ def create_model_by_version(version, config):
         return VanillaTransformer(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 7.5, 7.4, 7.2, 7.1, 7.0, 6.0, baseline")
+                        f"Supported versions: 7.6, 7.5, 7.4, 7.2, 7.1, 7.0, 6.0, baseline")

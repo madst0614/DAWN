@@ -99,20 +99,25 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 else:
                     # v7.5+: Dynamic Q/K/V with routing
                     # v6.0: compatibility
-                    if hasattr(model, '__version__') and model.__version__ == "7.5":
-                        # v7.5: Get routing info for load balance loss
+                    if hasattr(model, '__version__') and model.__version__ in ["7.5", "7.6"]:
+                        # v7.5/v7.6: Get routing info for load balance loss
                         if load_balance_weight > 0:
                             ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                         else:
                             ce_loss, logits = model(input_ids, labels)
                             routing_infos = None
 
-                        # Basis orthogonality loss (v7.5)
+                        # Basis orthogonality loss (v7.5/v7.6)
                         if orthogonality_weight > 0:
                             orth_loss = model.orthogonality_loss()
                         else:
                             orth_loss = 0.0
-                        diversity_loss = 0.0
+
+                        # Recipe diversity loss (v7.6 only - built-in method)
+                        if diversity_weight > 0 and hasattr(model, 'recipe_diversity_loss'):
+                            diversity_loss = model.recipe_diversity_loss()
+                        else:
+                            diversity_loss = 0.0
                     elif orthogonality_weight > 0:
                         logits, losses = model(input_ids, return_losses=True)
                         orth_loss = losses['orth_total']
@@ -184,20 +189,25 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             else:
                 # v7.5+: Dynamic Q/K/V with routing
                 # v6.0: compatibility
-                if hasattr(model, '__version__') and model.__version__ == "7.5":
-                    # v7.5: Get routing info for load balance loss
+                if hasattr(model, '__version__') and model.__version__ in ["7.5", "7.6"]:
+                    # v7.5/v7.6: Get routing info for load balance loss
                     if load_balance_weight > 0:
                         ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                     else:
                         ce_loss, logits = model(input_ids, labels)
                         routing_infos = None
 
-                    # Basis orthogonality loss (v7.5)
+                    # Basis orthogonality loss (v7.5/v7.6)
                     if orthogonality_weight > 0:
                         orth_loss = model.orthogonality_loss()
                     else:
                         orth_loss = 0.0
-                    diversity_loss = 0.0
+
+                    # Recipe diversity loss (v7.6 only - built-in method)
+                    if diversity_weight > 0 and hasattr(model, 'recipe_diversity_loss'):
+                        diversity_loss = model.recipe_diversity_loss()
+                    else:
+                        diversity_loss = 0.0
                 elif orthogonality_weight > 0:
                     logits, losses = model(input_ids, return_losses=True)
                     orth_loss = losses['orth_total']
