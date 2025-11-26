@@ -240,13 +240,20 @@ def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
 
     model.eval()
 
-    # Accumulators
-    all_neuron_usage = defaultdict(lambda: torch.zeros(model.n_neurons, device=device))
-    all_semantic_scores = []
-    all_context_scores = []
-    all_final_scores = []
-    all_attn_patterns = []
-    semantic_vs_context_ratios = []
+    # ⚡ GPU-optimized accumulators (keep everything on GPU)
+    n_layers = len(model.layers)
+    all_neuron_usage = {f'layer_{i}': torch.zeros(model.n_neurons, device=device, dtype=torch.long)
+                        for i in range(n_layers)}
+
+    # Accumulate statistics per layer on GPU
+    layer_stats = {
+        'semantic_scores': torch.zeros(n_layers, device=device),
+        'context_scores': torch.zeros(n_layers, device=device),
+        'final_scores': torch.zeros(n_layers, device=device),
+        'semantic_vs_context_ratios': torch.zeros(n_layers, device=device),
+        'attn_self': torch.zeros(n_layers, device=device),
+        'counts': torch.zeros(n_layers, device=device),  # for averaging
+    }
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Analyzing", total=max_batches)):
@@ -294,24 +301,23 @@ def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
                 # Top-K selection
                 topk_scores, neuron_idx = torch.topk(final_scores, neuron_value.k, dim=-1)
 
-                # Record statistics
-                all_semantic_scores.append(semantic_scores.abs().mean().item())
-                all_context_scores.append(context_scores.abs().mean().item())
-                all_final_scores.append(final_scores.abs().mean().item())
+                # ⚡ GPU-optimized statistics accumulation (no CPU sync)
+                layer_stats['semantic_scores'][layer_idx] += semantic_scores.abs().mean()
+                layer_stats['context_scores'][layer_idx] += context_scores.abs().mean()
+                layer_stats['final_scores'][layer_idx] += final_scores.abs().mean()
 
-                # Semantic vs Context ratio
                 semantic_contrib = semantic_scores.abs().mean()
                 context_contrib = torch.sigmoid(context_scores).abs().mean()
-                ratio = semantic_contrib / (context_contrib + 1e-8)
-                semantic_vs_context_ratios.append(ratio.item())
+                layer_stats['semantic_vs_context_ratios'][layer_idx] += semantic_contrib / (context_contrib + 1e-8)
 
-                # Neuron usage
-                for idx in neuron_idx.reshape(-1):
-                    all_neuron_usage[f'layer_{layer_idx}'][idx] += 1
+                # ⚡ Vectorized neuron usage update with bincount (much faster than loop)
+                neuron_idx_flat = neuron_idx.reshape(-1)
+                usage_update = torch.bincount(neuron_idx_flat, minlength=model.n_neurons)
+                all_neuron_usage[f'layer_{layer_idx}'] += usage_update
 
                 # Attention pattern statistics
-                attn_self = torch.diagonal(attn_weights, dim1=-2, dim2=-1).mean().item()
-                all_attn_patterns.append(attn_self)
+                layer_stats['attn_self'][layer_idx] += torch.diagonal(attn_weights, dim1=-2, dim2=-1).mean()
+                layer_stats['counts'][layer_idx] += 1
 
                 # V generation and forward
                 V, _ = neuron_value(normed, attn_weights, K)
@@ -327,29 +333,33 @@ def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
                 ffn_out = layer.w_down(ffn_out)
                 x = residual + layer.dropout(ffn_out)
 
+    # ⚡ Single CPU transfer at the end (average across batches)
+    for key in ['semantic_scores', 'context_scores', 'final_scores', 'semantic_vs_context_ratios', 'attn_self']:
+        layer_stats[key] = (layer_stats[key] / layer_stats['counts']).cpu().numpy()
+
     # Compute results
     results = {}
 
     # 4. Semantic vs Context Analysis
     print("\n4. SEMANTIC vs CONTEXT SCORES:")
-    print(f"  Semantic score (mean): {np.mean(all_semantic_scores):.4f}")
-    print(f"  Context score (mean): {np.mean(all_context_scores):.4f}")
-    print(f"  Final score (mean): {np.mean(all_final_scores):.4f}")
-    print(f"  Semantic/Context ratio: {np.mean(semantic_vs_context_ratios):.4f}")
+    print(f"  Semantic score (mean): {layer_stats['semantic_scores'].mean():.4f}")
+    print(f"  Context score (mean): {layer_stats['context_scores'].mean():.4f}")
+    print(f"  Final score (mean): {layer_stats['final_scores'].mean():.4f}")
+    print(f"  Semantic/Context ratio: {layer_stats['semantic_vs_context_ratios'].mean():.4f}")
 
     results['semantic_context'] = {
-        'semantic_mean': float(np.mean(all_semantic_scores)),
-        'context_mean': float(np.mean(all_context_scores)),
-        'final_mean': float(np.mean(all_final_scores)),
-        'ratio_mean': float(np.mean(semantic_vs_context_ratios)),
+        'semantic_mean': float(layer_stats['semantic_scores'].mean()),
+        'context_mean': float(layer_stats['context_scores'].mean()),
+        'final_mean': float(layer_stats['final_scores'].mean()),
+        'ratio_mean': float(layer_stats['semantic_vs_context_ratios'].mean()),
     }
 
     # 5. Attention Pattern Analysis
     print("\n5. ATTENTION PATTERNS:")
-    print(f"  Self-attention (mean): {np.mean(all_attn_patterns):.4f}")
+    print(f"  Self-attention (mean): {layer_stats['attn_self'].mean():.4f}")
 
     results['attention'] = {
-        'self_attention_mean': float(np.mean(all_attn_patterns)),
+        'self_attention_mean': float(layer_stats['attn_self'].mean()),
     }
 
     # 6. Neuron Usage Analysis
@@ -440,8 +450,8 @@ def main():
                         help='Path to checkpoint folder')
     parser.add_argument('--max-batches', type=int, default=10,
                         help='Max batches for runtime analysis')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='Batch size for data loading')
+    parser.add_argument('--batch-size', type=int, default=128,
+                        help='Batch size for data loading (default: 128, increase for faster GPU processing)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -545,6 +555,16 @@ def main():
     print(f"Model: DAWN v{model.__version__}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    # ⚡ Use torch.compile for faster inference (PyTorch 2.0+)
+    if hasattr(torch, 'compile') and torch.cuda.is_available():
+        print("\n⚡ Compiling model with torch.compile for faster GPU execution...")
+        try:
+            model = torch.compile(model, mode='max-autotune')
+            print("   ✅ Model compiled successfully!")
+        except Exception as e:
+            print(f"   ⚠️  Compilation failed: {e}")
+            print("   Continuing with uncompiled model...")
+
     # Prepare dataloader
     from utils.data import TextDataset, collate_fn_dynamic_padding
     from torch.utils.data import DataLoader
@@ -574,12 +594,16 @@ def main():
 
     max_seq_len = model_config.get('max_seq_len', 128)
     val_dataset = TextDataset(val_texts, tokenizer, max_length=max_seq_len)
+
+    # ⚡ GPU-optimized DataLoader
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=partial(collate_fn_dynamic_padding, tokenizer=tokenizer),
-        num_workers=0
+        num_workers=4,  # Parallel data loading
+        pin_memory=True,  # Faster CPU->GPU transfer
+        prefetch_factor=2,  # Prefetch batches
     )
 
     # Run analysis
