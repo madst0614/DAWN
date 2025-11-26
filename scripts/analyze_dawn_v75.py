@@ -854,21 +854,30 @@ def main():
     actual_version = checkpoint.get('model_version', 'unknown')
     print(f"Checkpoint model version: {actual_version}")
 
+    # Get state_dict for version inference
+    state_dict_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'model'
+    state_dict = checkpoint[state_dict_key]
+
+    # Detect v7.6 from state_dict (has basis_down/basis_up instead of basis)
+    has_split_basis = any('basis_down' in k or 'basis_up' in k for k in state_dict.keys())
+    if has_split_basis:
+        detected_version = '7.6'
+        print("  Detected v7.6 from state_dict (split basis_down/basis_up)")
+    elif 'layers.0.qkv_dynamic.neuron_recipe_Q' in state_dict:
+        detected_version = '7.5'
+        print("  Detected v7.5 from state_dict (Dynamic Q/K/V)")
+    else:
+        detected_version = actual_version if actual_version != 'unknown' else '7.5'
+
+    # Use detected version (more reliable than config)
+    model_version = detected_version
+
     # Get model config (with backward compatibility)
     if 'config' in checkpoint:
         model_config = checkpoint['config']
-        model_version = model_config.get('model_version', '7.5')
+        # Override model_version with detected version
+        model_config['model_version'] = model_version
     else:
-        # Infer from state_dict keys
-        state_dict_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'model'
-        state_dict = checkpoint[state_dict_key]
-
-        if 'layers.0.qkv_dynamic.neuron_recipe_Q' in state_dict:
-            model_version = '7.5'
-            print("  Inferred model version: 7.5 (Dynamic Q/K/V)")
-        else:
-            raise ValueError("Cannot infer model version from checkpoint")
-
         # Infer model config from state_dict
         sample_layer = 'layers.0.qkv_dynamic'
         n_neurons = state_dict[f'{sample_layer}.neuron_recipe_Q'].shape[0]
