@@ -1006,15 +1006,20 @@ def main():
                    f"{val_loss:.6f},{val_acc:.6f},"
                    f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}\n")
 
-        # Analyze activations periodically
+        # Analyze activations periodically (skip for v7.5 - uses different architecture)
         if epoch % 10 == 0:
-            sample_batch = next(iter(val_loader))
-            sample_ids = sample_batch['input_ids'][:1].to(device)
-            act_stats = analyze_activations(model, sample_ids, device)
-            print(f"\n  Neuron Usage Analysis (Epoch {epoch}):")
-            for layer_name, stats in act_stats.items():
-                print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
-                      f"({stats['usage_ratio']:.2%} usage)")
+            model_version = getattr(model, '__version__', None)
+            if model_version != "7.5":
+                sample_batch = next(iter(val_loader))
+                sample_ids = sample_batch['input_ids'][:1].to(device)
+                act_stats = analyze_activations(model, sample_ids, device)
+                print(f"\n  Neuron Usage Analysis (Epoch {epoch}):")
+                for layer_name, stats in act_stats.items():
+                    print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
+                          f"({stats['usage_ratio']:.2%} usage)")
+            else:
+                # v7.5 uses dynamic Q/K/V/O - activation analysis not applicable
+                print(f"\n  (Neuron usage analysis skipped for v7.5 - use analyze_dawn_v75.py instead)")
 
         # Save checkpoint
         is_best = val_loss < best_val_loss
