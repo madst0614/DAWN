@@ -548,6 +548,7 @@ def main():
     # Prepare dataloader
     from utils.data import TextDataset, collate_fn_dynamic_padding
     from torch.utils.data import DataLoader
+    from functools import partial
     import pickle
     import os
 
@@ -577,7 +578,7 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=collate_fn_dynamic_padding,
+        collate_fn=partial(collate_fn_dynamic_padding, tokenizer=tokenizer),
         num_workers=0
     )
 
