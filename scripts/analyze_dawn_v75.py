@@ -1,22 +1,17 @@
 """
 DAWN v7.5 Checkpoint Analysis
-QK Attention Routing + Soft FFN 구조 종합 분석
+Dynamic Q/K/V Generation (v8 design)
 
 분석 항목:
 1. Basis 직교성 검증 (완벽해야 함!)
-2. Recipe 분석 (basis 사용 패턴)
-3. ⭐ Neuron Context Pattern 분석 (NEW!)
-4. ⭐ 의미 vs 문맥 점수 분석 (NEW!)
-5. ⭐ Attention 패턴 분석 (NEW!)
-6. ⭐ V 생성 품질 분석 (NEW!)
-7. Neuron 사용률 분석
-8. 종합 메트릭 요약
+2. Recipe 분석 (Q/K/V recipe 3개)
+3. ⭐ Runtime 분석 (라우팅 + 뉴런 사용)
+4. 종합 메트릭 요약
 
-v7.5 특징:
-- Router 제거 → QK Attention weights 재활용
-- 의미(X) + 문맥(Attention) 결합 뉴런 선택
-- 동적 V 생성 (256→96→256)
-- neuron_recipe + neuron_context_pattern 학습
+v7.5 특징 (v8 design):
+- 라우터: x만 보고 뉴런 선택
+- Q/K/V 모두 동적 생성 (recipe_Q/K/V)
+- 깔끔한 구조: basis_emb 없음, context score 없음
 
 Usage:
     python scripts/analyze_dawn_v75.py --checkpoint /path/to/checkpoint_folder
@@ -69,52 +64,38 @@ def analyze_basis_orthogonality(model):
     print("1. BASIS ORTHOGONALITY VERIFICATION")
     print("="*60)
 
-    basis = model.shared_basis
-    n_basis = basis.n_basis
+    basis = model.shared_basis.basis  # [n_basis, D, rank]
+    n_basis = model.n_basis
 
     results = {}
 
-    # Basis A orthogonality
-    basis_A_flat = basis.basis_A.view(n_basis, -1)
-    gram_A = torch.mm(basis_A_flat, basis_A_flat.T)
-    identity_A = torch.eye(n_basis, device=gram_A.device)
-    error_A = (gram_A - identity_A).abs()
-    error_A_offdiag = error_A.clone()
-    error_A_offdiag.fill_diagonal_(0)
+    # Check orthogonality for each basis element
+    # Each basis[i] is [D, rank], we want columns to be orthogonal
+    max_errors = []
+    mean_errors = []
 
-    results['basis_A'] = {
-        'max_off_diagonal': error_A_offdiag.max().item(),
-        'mean_off_diagonal': error_A_offdiag.sum().item() / (n_basis * (n_basis - 1)),
-        'diagonal_mean': torch.diag(gram_A).mean().item(),
-        'diagonal_std': torch.diag(gram_A).std().item(),
+    for i in range(n_basis):
+        basis_i = basis[i]  # [D, rank]
+        gram = basis_i.T @ basis_i  # [rank, rank]
+        identity = torch.eye(gram.shape[0], device=gram.device)
+        error = (gram - identity).abs()
+        error_offdiag = error.clone()
+        error_offdiag.fill_diagonal_(0)
+
+        max_errors.append(error_offdiag.max().item())
+        mean_errors.append(error_offdiag.mean().item())
+
+    results['basis'] = {
+        'max_off_diagonal': max(max_errors),
+        'mean_off_diagonal': np.mean(mean_errors),
+        'max_across_basis': max_errors,
     }
 
-    # Basis embedding orthogonality
-    gram_emb = torch.mm(basis.basis_emb, basis.basis_emb.T)
-    error_emb = (gram_emb - identity_A).abs()
-    error_emb_offdiag = error_emb.clone()
-    error_emb_offdiag.fill_diagonal_(0)
+    print(f"\nBasis orthogonality:")
+    print(f"  Max off-diagonal: {max(max_errors):.2e}")
+    print(f"  Mean off-diagonal: {np.mean(mean_errors):.2e}")
 
-    results['basis_emb'] = {
-        'max_off_diagonal': error_emb_offdiag.max().item(),
-        'mean_off_diagonal': error_emb_offdiag.sum().item() / (n_basis * (n_basis - 1)),
-        'diagonal_mean': torch.diag(gram_emb).mean().item(),
-        'diagonal_std': torch.diag(gram_emb).std().item(),
-    }
-
-    # Print results
-    for basis_name, stats in results.items():
-        print(f"\n{basis_name}:")
-        print(f"  Max off-diagonal: {stats['max_off_diagonal']:.2e}")
-        print(f"  Mean off-diagonal: {stats['mean_off_diagonal']:.2e}")
-        print(f"  Diagonal mean: {stats['diagonal_mean']:.6f}")
-
-    # Overall verdict
-    max_error = max(
-        results['basis_A']['max_off_diagonal'],
-        results['basis_emb']['max_off_diagonal']
-    )
-
+    max_error = max(max_errors)
     print(f"\n{'✅' if max_error < 1e-5 else '⚠️'} Overall: Max error = {max_error:.2e}")
     print(f"   Orthogonality {'PERFECT' if max_error < 1e-5 else 'APPROXIMATE'}!")
 
@@ -122,137 +103,110 @@ def analyze_basis_orthogonality(model):
 
 
 # ============================================================
-# 2. Recipe Analysis
+# 2. Recipe Analysis (Q/K/V)
 # ============================================================
 
 def analyze_recipes(model):
-    """Analyze how neurons combine basis elements"""
+    """Analyze how neurons combine basis elements for Q/K/V"""
     print("\n" + "="*60)
-    print("2. RECIPE ANALYSIS")
+    print("2. RECIPE ANALYSIS (Q/K/V)")
     print("="*60)
 
     results = {}
 
     for layer_idx, layer in enumerate(model.layers):
-        recipe = layer.neuron_value.neuron_recipe  # [n_neurons, n_basis]
-        recipe_norm = F.softmax(recipe, dim=-1)  # Normalized
+        qkv_module = layer.qkv_dynamic
 
-        # 1. Basis usage distribution
-        basis_usage = recipe_norm.mean(dim=0)  # [n_basis]
+        # Get Q/K/V recipes
+        recipe_Q = qkv_module.neuron_recipe_Q  # [n_neurons, n_basis]
+        recipe_K = qkv_module.neuron_recipe_K
+        recipe_V = qkv_module.neuron_recipe_V
 
-        # 2. Recipe entropy (how spread out each recipe is)
-        recipe_entropy = -torch.sum(
-            recipe_norm * torch.log(recipe_norm + 1e-10), dim=-1
-        )  # [n_neurons]
+        layer_results = {}
 
-        # 3. Recipe diversity (variance across neurons)
-        recipe_std = recipe_norm.std(dim=0)  # [n_basis]
+        for recipe_name, recipe in [('Q', recipe_Q), ('K', recipe_K), ('V', recipe_V)]:
+            recipe_norm = F.softmax(recipe, dim=-1)  # Normalized
 
-        # 4. Dominant basis per neuron
-        dominant_basis = recipe_norm.argmax(dim=-1)
-        dominant_counts = torch.bincount(
-            dominant_basis, minlength=model.n_basis
-        )
+            # 1. Basis usage distribution
+            basis_usage = recipe_norm.mean(dim=0)  # [n_basis]
 
-        # 5. Neuron specialization (max weight per neuron)
-        max_weights = recipe_norm.max(dim=-1)[0]
+            # 2. Recipe entropy (how spread out each recipe is)
+            recipe_entropy = -torch.sum(
+                recipe_norm * torch.log(recipe_norm + 1e-10), dim=-1
+            )  # [n_neurons]
 
-        results[f'layer_{layer_idx}'] = {
-            'basis_usage_mean': basis_usage.mean().item(),
-            'basis_usage_std': basis_usage.std().item(),
-            'basis_usage_min': basis_usage.min().item(),
-            'basis_usage_max': basis_usage.max().item(),
-            'recipe_entropy_mean': recipe_entropy.mean().item(),
-            'recipe_entropy_std': recipe_entropy.std().item(),
-            'recipe_diversity_mean': recipe_std.mean().item(),
-            'neuron_specialization_mean': max_weights.mean().item(),
-            'neuron_specialization_std': max_weights.std().item(),
-            'dominant_basis_dist': dominant_counts.cpu().numpy().tolist(),
+            # 3. Neuron specialization (max weight per neuron)
+            max_weights = recipe_norm.max(dim=-1)[0]
+
+            # 4. Dominant basis per neuron
+            dominant_basis = recipe_norm.argmax(dim=-1)
+            dominant_counts = torch.bincount(
+                dominant_basis, minlength=model.n_basis
+            )
+
+            layer_results[f'recipe_{recipe_name}'] = {
+                'basis_usage_mean': basis_usage.mean().item(),
+                'basis_usage_std': basis_usage.std().item(),
+                'recipe_entropy_mean': recipe_entropy.mean().item(),
+                'recipe_entropy_std': recipe_entropy.std().item(),
+                'neuron_specialization_mean': max_weights.mean().item(),
+                'neuron_specialization_std': max_weights.std().item(),
+                'dominant_basis_dist': dominant_counts.cpu().numpy().tolist(),
+            }
+
+        # Compare Q/K/V recipes
+        recipe_Q_norm = F.softmax(recipe_Q, dim=-1)
+        recipe_K_norm = F.softmax(recipe_K, dim=-1)
+        recipe_V_norm = F.softmax(recipe_V, dim=-1)
+
+        # Cosine similarity between recipes
+        qk_sim = F.cosine_similarity(recipe_Q_norm, recipe_K_norm, dim=-1).mean().item()
+        qv_sim = F.cosine_similarity(recipe_Q_norm, recipe_V_norm, dim=-1).mean().item()
+        kv_sim = F.cosine_similarity(recipe_K_norm, recipe_V_norm, dim=-1).mean().item()
+
+        layer_results['recipe_similarity'] = {
+            'Q_K_similarity': qk_sim,
+            'Q_V_similarity': qv_sim,
+            'K_V_similarity': kv_sim,
         }
 
+        results[f'layer_{layer_idx}'] = layer_results
+
         print(f"\nLayer {layer_idx}:")
-        print(f"  Basis usage: {basis_usage.mean().item():.4f} ± {basis_usage.std().item():.4f}")
-        print(f"  Recipe entropy: {recipe_entropy.mean().item():.4f} ± {recipe_entropy.std().item():.4f}")
-        print(f"  Neuron specialization: {max_weights.mean().item():.4f} ± {max_weights.std().item():.4f}")
+        for recipe_name in ['Q', 'K', 'V']:
+            r = layer_results[f'recipe_{recipe_name}']
+            print(f"  Recipe {recipe_name}:")
+            print(f"    Basis usage: {r['basis_usage_mean']:.4f} ± {r['basis_usage_std']:.4f}")
+            print(f"    Entropy: {r['recipe_entropy_mean']:.4f} ± {r['recipe_entropy_std']:.4f}")
+            print(f"    Specialization: {r['neuron_specialization_mean']:.4f} ± {r['neuron_specialization_std']:.4f}")
+        print(f"  Recipe similarity: Q-K={qk_sim:.4f}, Q-V={qv_sim:.4f}, K-V={kv_sim:.4f}")
 
     return results
 
 
 # ============================================================
-# 3. ⭐ Neuron Context Pattern Analysis (NEW!)
-# ============================================================
-
-def analyze_context_patterns(model):
-    """Analyze neuron_context_pattern weights"""
-    print("\n" + "="*60)
-    print("3. ⭐ NEURON CONTEXT PATTERN ANALYSIS")
-    print("="*60)
-
-    results = {}
-    n_heads = model.layers[0].n_heads
-
-    for layer_idx, layer in enumerate(model.layers):
-        context_pattern = layer.neuron_value.neuron_context_pattern  # [n_neurons, n_heads]
-
-        # 1. Head preference per neuron
-        preferred_head = context_pattern.argmax(dim=-1)
-        head_counts = torch.bincount(preferred_head, minlength=n_heads)
-
-        # 2. Pattern diversity (how specialized each neuron is)
-        pattern_entropy = -torch.sum(
-            F.softmax(context_pattern, dim=-1) * F.log_softmax(context_pattern, dim=-1),
-            dim=-1
-        )
-
-        # 3. Head specialization (how many neurons prefer each head)
-        head_specialization = head_counts.float() / head_counts.sum()
-
-        # 4. Context pattern magnitude
-        pattern_magnitude = context_pattern.abs().mean(dim=-1)
-
-        results[f'layer_{layer_idx}'] = {
-            'pattern_entropy_mean': pattern_entropy.mean().item(),
-            'pattern_entropy_std': pattern_entropy.std().item(),
-            'pattern_magnitude_mean': pattern_magnitude.mean().item(),
-            'pattern_magnitude_std': pattern_magnitude.std().item(),
-            'head_preference_dist': head_counts.cpu().numpy().tolist(),
-            'head_specialization_gini': compute_gini(head_specialization).item(),
-        }
-
-        print(f"\nLayer {layer_idx}:")
-        print(f"  Pattern entropy: {pattern_entropy.mean().item():.4f} ± {pattern_entropy.std().item():.4f}")
-        print(f"  Pattern magnitude: {pattern_magnitude.mean().item():.4f} ± {pattern_magnitude.std().item():.4f}")
-        print(f"  Head preference: {head_counts.cpu().numpy().tolist()}")
-        print(f"  Head specialization Gini: {compute_gini(head_specialization):.4f}")
-
-    return results
-
-
-# ============================================================
-# 4-6. ⭐ Runtime Analysis (Semantic/Context/Attention/V)
+# 3. ⭐ Runtime Behavior Analysis
 # ============================================================
 
 def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
-    """Analyze neuron selection behavior during inference"""
+    """Analyze neuron routing and usage during inference"""
     print("\n" + "="*60)
-    print("4-6. ⭐ RUNTIME BEHAVIOR ANALYSIS")
+    print("3. ⭐ RUNTIME BEHAVIOR ANALYSIS")
     print("="*60)
 
     model.eval()
 
-    # ⚡ GPU-optimized accumulators (keep everything on GPU)
+    # ⚡ GPU-optimized accumulators
     n_layers = len(model.layers)
     all_neuron_usage = {f'layer_{i}': torch.zeros(model.n_neurons, device=device, dtype=torch.long)
                         for i in range(n_layers)}
 
     # Accumulate statistics per layer on GPU
     layer_stats = {
-        'semantic_scores': torch.zeros(n_layers, device=device),
-        'context_scores': torch.zeros(n_layers, device=device),
-        'final_scores': torch.zeros(n_layers, device=device),
-        'semantic_vs_context_ratios': torch.zeros(n_layers, device=device),
+        'router_scores': torch.zeros(n_layers, device=device),
+        'routing_weights': torch.zeros(n_layers, device=device),
         'attn_self': torch.zeros(n_layers, device=device),
-        'counts': torch.zeros(n_layers, device=device),  # for averaging
+        'counts': torch.zeros(n_layers, device=device),
     }
 
     with torch.no_grad():
@@ -261,109 +215,73 @@ def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
                 break
 
             input_ids = batch["input_ids"].to(device)
+
+            # Forward pass with routing info
+            logits, routing_infos = model(input_ids, return_routing_info=True)
+
             B, S = input_ids.shape
 
-            # Forward pass with activations
+            # Compute attention self-attention for analysis
             pos = torch.arange(S, device=device).unsqueeze(0)
             x = model.token_emb(input_ids) + model.pos_emb(pos)
             x = model.dropout(x)
-
-            mask = model.causal_mask[:S, :S].unsqueeze(0).unsqueeze(0)
+            mask = model.causal_mask[:, :, :S, :S]
 
             for layer_idx, layer in enumerate(model.layers):
-                # Part 1: Attention
-                residual = x
-                normed = layer.norm1(x)
+                routing_info = routing_infos[layer_idx]
+                neuron_indices = routing_info['neuron_indices']  # [B, S, k]
+                neuron_weights = routing_info['neuron_weights']  # [B, S, k]
 
-                # Q, K
-                Q = layer.q_proj(normed).view(B, S, layer.n_heads, layer.d_head).transpose(1, 2)
-                K = layer.k_proj(normed).view(B, S, layer.n_heads, layer.d_head).transpose(1, 2)
+                # ⚡ Statistics accumulation (no CPU sync)
+                layer_stats['routing_weights'][layer_idx] += neuron_weights.mean()
 
-                # Attention weights
-                attn_scores = Q @ K.transpose(-2, -1) / (layer.d_head ** 0.5)
-                attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
-                attn_weights = F.softmax(attn_scores, dim=-1)  # [B, n_heads, S, S]
-
-                # ⭐ Analyze neuron selection
-                neuron_value = layer.neuron_value
-
-                # Semantic scores (using K - QK Attention 정보 재활용)
-                K_combined = K.transpose(1, 2).reshape(B, S, layer.d_model)  # [B, S, D]
-                semantic_scores = K_combined @ neuron_value.neuron_emb_semantic.T  # [B, S, n_neurons]
-
-                # Context scores
-                attn_summary = attn_weights.mean(dim=-1).transpose(1, 2)  # [B, S, n_heads]
-                context_scores = attn_summary @ neuron_value.neuron_context_pattern.T  # [B, S, n_neurons]
-
-                # Final scores
-                final_scores = semantic_scores * torch.sigmoid(context_scores)
-
-                # Top-K selection
-                topk_scores, neuron_idx = torch.topk(final_scores, neuron_value.k, dim=-1)
-
-                # ⚡ GPU-optimized statistics accumulation (no CPU sync)
-                layer_stats['semantic_scores'][layer_idx] += semantic_scores.abs().mean()
-                layer_stats['context_scores'][layer_idx] += context_scores.abs().mean()
-                layer_stats['final_scores'][layer_idx] += final_scores.abs().mean()
-
-                semantic_contrib = semantic_scores.abs().mean()
-                context_contrib = torch.sigmoid(context_scores).abs().mean()
-                layer_stats['semantic_vs_context_ratios'][layer_idx] += semantic_contrib / (context_contrib + 1e-8)
-
-                # ⚡ Vectorized neuron usage update with bincount (much faster than loop)
-                neuron_idx_flat = neuron_idx.reshape(-1)
+                # ⚡ Vectorized neuron usage update
+                neuron_idx_flat = neuron_indices.reshape(-1)
                 usage_update = torch.bincount(neuron_idx_flat, minlength=model.n_neurons)
                 all_neuron_usage[f'layer_{layer_idx}'] += usage_update
 
-                # Attention pattern statistics
-                layer_stats['attn_self'][layer_idx] += torch.diagonal(attn_weights, dim1=-2, dim2=-1).mean()
+                # Get router scores for analysis
+                residual = x
+                normed = layer.norm1(x)
+                router_scores = layer.qkv_dynamic.W_router(normed)  # [B, S, n_neurons]
+                layer_stats['router_scores'][layer_idx] += router_scores.abs().mean()
+
+                # Compute attention for self-attention metric
+                qkv_module = layer.qkv_dynamic
+                attn_out, _ = qkv_module(normed, mask)
+
+                # For self-attention metric, we need to recompute attention weights
+                # Just use a simple approximation based on the output
+                layer_stats['attn_self'][layer_idx] += attn_out.abs().mean()
+
                 layer_stats['counts'][layer_idx] += 1
 
-                # V generation and forward
-                V, _ = neuron_value(normed, attn_weights, K)
-                attn_out = (layer.attn_dropout(attn_weights) @ V).transpose(1, 2).reshape(B, S, layer.d_model)
-                attn_out = layer.attn_out(attn_out)
+                # Forward through layer
                 x = residual + layer.dropout(attn_out)
-
-                # Part 2: FFN
                 residual = x
                 normed = layer.norm2(x)
-                ffn_out = F.gelu(layer.w_up(normed))
-                ffn_out = layer.dropout(ffn_out)
-                ffn_out = layer.w_down(ffn_out)
+                ffn_out = layer.w_down(F.gelu(layer.w_up(normed)))
                 x = residual + layer.dropout(ffn_out)
 
-    # ⚡ Single CPU transfer at the end (average across batches)
-    for key in ['semantic_scores', 'context_scores', 'final_scores', 'semantic_vs_context_ratios', 'attn_self']:
+    # ⚡ Single CPU transfer at the end
+    for key in ['router_scores', 'routing_weights', 'attn_self']:
         layer_stats[key] = (layer_stats[key] / layer_stats['counts']).cpu().numpy()
 
     # Compute results
     results = {}
 
-    # 4. Semantic vs Context Analysis
-    print("\n4. SEMANTIC vs CONTEXT SCORES:")
-    print(f"  Semantic score (mean): {layer_stats['semantic_scores'].mean():.4f}")
-    print(f"  Context score (mean): {layer_stats['context_scores'].mean():.4f}")
-    print(f"  Final score (mean): {layer_stats['final_scores'].mean():.4f}")
-    print(f"  Semantic/Context ratio: {layer_stats['semantic_vs_context_ratios'].mean():.4f}")
+    # Routing Analysis
+    print("\n⭐ ROUTING ANALYSIS:")
+    print(f"  Router score (mean): {layer_stats['router_scores'].mean():.4f}")
+    print(f"  Routing weight (mean): {layer_stats['routing_weights'].mean():.4f}")
 
-    results['semantic_context'] = {
-        'semantic_mean': float(layer_stats['semantic_scores'].mean()),
-        'context_mean': float(layer_stats['context_scores'].mean()),
-        'final_mean': float(layer_stats['final_scores'].mean()),
-        'ratio_mean': float(layer_stats['semantic_vs_context_ratios'].mean()),
+    results['routing'] = {
+        'router_score_mean': float(layer_stats['router_scores'].mean()),
+        'routing_weight_mean': float(layer_stats['routing_weights'].mean()),
     }
 
-    # 5. Attention Pattern Analysis
-    print("\n5. ATTENTION PATTERNS:")
-    print(f"  Self-attention (mean): {layer_stats['attn_self'].mean():.4f}")
-
-    results['attention'] = {
-        'self_attention_mean': float(layer_stats['attn_self'].mean()),
-    }
-
-    # 6. Neuron Usage Analysis
-    print("\n6. NEURON USAGE:")
+    # Neuron Usage Analysis
+    print("\n⭐ NEURON USAGE:")
     for layer_idx in range(len(model.layers)):
         usage = all_neuron_usage[f'layer_{layer_idx}']
         total = usage.sum()
@@ -379,63 +297,61 @@ def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
             'active_neurons': int((usage > 0).sum().item()),
             'usage_rate': float(usage_rate),
             'gini': float(gini),
-            'total_selections': int(total.item()),
+            'top10_usage': usage.topk(10)[0].cpu().numpy().tolist(),
         }
 
     return results
 
 
 # ============================================================
-# 7. Summary Metrics
+# 4. Summary Metrics
 # ============================================================
 
 def compute_summary_metrics(all_results):
-    """Compute overall summary metrics"""
+    """Compute summary statistics across all analyses"""
     print("\n" + "="*60)
-    print("7. SUMMARY METRICS")
+    print("4. SUMMARY METRICS")
     print("="*60)
 
     summary = {}
 
     # Basis orthogonality
-    basis_quality = all_results['basis']['basis_A']['max_off_diagonal']
-    summary['basis_orthogonality'] = 'PERFECT' if basis_quality < 1e-5 else 'APPROXIMATE'
+    if 'basis' in all_results:
+        summary['basis_orthogonal'] = all_results['basis']['basis']['max_off_diagonal'] < 1e-5
 
-    # Recipe diversity
-    recipe_results = all_results['recipes']
-    recipe_entropies = [v['recipe_entropy_mean'] for k, v in recipe_results.items() if k.startswith('layer_')]
-    summary['recipe_entropy_mean'] = float(np.mean(recipe_entropies))
+    # Recipe diversity (average across Q/K/V and layers)
+    recipe_entropies = []
+    recipe_specializations = []
+    if 'recipes' in all_results:
+        for layer_key, layer_data in all_results['recipes'].items():
+            if layer_key.startswith('layer_'):
+                for recipe_type in ['Q', 'K', 'V']:
+                    recipe_key = f'recipe_{recipe_type}'
+                    if recipe_key in layer_data:
+                        recipe_entropies.append(layer_data[recipe_key]['recipe_entropy_mean'])
+                        recipe_specializations.append(layer_data[recipe_key]['neuron_specialization_mean'])
 
-    # Context pattern diversity
-    context_results = all_results['context_patterns']
-    context_entropies = [v['pattern_entropy_mean'] for k, v in context_results.items() if k.startswith('layer_')]
-    summary['context_pattern_entropy_mean'] = float(np.mean(context_entropies))
+    summary['recipe_entropy_avg'] = float(np.mean(recipe_entropies)) if recipe_entropies else 0.0
+    summary['recipe_specialization_avg'] = float(np.mean(recipe_specializations)) if recipe_specializations else 0.0
 
-    # Semantic vs Context balance
-    semantic_context = all_results['runtime']['semantic_context']
-    summary['semantic_context_ratio'] = semantic_context['ratio_mean']
-    summary['semantic_dominance'] = 'High' if semantic_context['ratio_mean'] > 2.0 else 'Balanced'
-
-    # Neuron usage
+    # Neuron usage (average across layers)
     usage_rates = []
-    usage_ginis = []
-    for layer_idx in range(4):  # Assuming 4 layers
-        key = f'usage_layer_{layer_idx}'
-        if key in all_results['runtime']:
-            usage_rates.append(all_results['runtime'][key]['usage_rate'])
-            usage_ginis.append(all_results['runtime'][key]['gini'])
+    gini_coeffs = []
+    if 'runtime' in all_results:
+        for key, value in all_results['runtime'].items():
+            if key.startswith('usage_layer_'):
+                usage_rates.append(value['usage_rate'])
+                gini_coeffs.append(value['gini'])
 
-    summary['neuron_usage_rate_mean'] = float(np.mean(usage_rates)) if usage_rates else 0.0
-    summary['neuron_usage_gini_mean'] = float(np.mean(usage_ginis)) if usage_ginis else 0.0
+    summary['avg_neuron_usage_rate'] = float(np.mean(usage_rates)) if usage_rates else 0.0
+    summary['avg_usage_gini'] = float(np.mean(gini_coeffs)) if gini_coeffs else 0.0
 
-    # Print summary
-    print("\n📊 OVERALL SUMMARY:")
-    print(f"  Basis Orthogonality: {summary['basis_orthogonality']}")
-    print(f"  Recipe Entropy: {summary['recipe_entropy_mean']:.4f}")
-    print(f"  Context Pattern Entropy: {summary['context_pattern_entropy_mean']:.4f}")
-    print(f"  Semantic/Context Ratio: {summary['semantic_context_ratio']:.4f} ({summary['semantic_dominance']})")
-    print(f"  Neuron Usage Rate: {summary['neuron_usage_rate_mean']*100:.1f}%")
-    print(f"  Neuron Usage Gini: {summary['neuron_usage_gini_mean']:.4f}")
+    print(f"\n📊 Summary:")
+    print(f"  Basis orthogonal: {summary.get('basis_orthogonal', False)}")
+    print(f"  Avg recipe entropy: {summary['recipe_entropy_avg']:.4f}")
+    print(f"  Avg recipe specialization: {summary['recipe_specialization_avg']:.4f}")
+    print(f"  Avg neuron usage: {summary['avg_neuron_usage_rate']*100:.1f}%")
+    print(f"  Avg usage Gini: {summary['avg_usage_gini']:.4f}")
 
     return summary
 
@@ -475,68 +391,35 @@ def main():
     # Get model config (with backward compatibility)
     if 'config' in checkpoint:
         model_config = checkpoint['config']
-        model_version = model_config.get('model_version', actual_version)
+        model_version = model_config.get('model_version', '7.5')
     else:
-        # Backward compatibility: infer config from checkpoint
-        print("⚠️  Warning: No config found in checkpoint. Inferring from state_dict...")
-
-        # Try to infer version from state_dict keys
+        # Infer from state_dict keys
         state_dict_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'model'
         state_dict = checkpoint[state_dict_key]
 
-        # Check for v7.5 specific keys
-        if 'layers.0.neuron_value.neuron_recipe' in state_dict:
+        if 'layers.0.qkv_dynamic.neuron_recipe_Q' in state_dict:
             model_version = '7.5'
-            print(f"  Detected v7.5 architecture (neuron_value found)")
-        elif 'layers.0.ffn.neuron_recipe' in state_dict:
-            model_version = '7.1'
-            print(f"  Detected v7.1 architecture (ffn.neuron_recipe found)")
+            print("  Inferred model version: 7.5 (Dynamic Q/K/V)")
         else:
-            model_version = actual_version if actual_version != 'unknown' else '7.1'
-            print(f"  Using version: {model_version}")
+            raise ValueError("Cannot infer model version from checkpoint")
 
-        # Build default config based on detected version
+        # Infer model config from state_dict
+        sample_layer = 'layers.0.qkv_dynamic'
+        n_neurons = state_dict[f'{sample_layer}.neuron_recipe_Q'].shape[0]
+        n_basis = state_dict[f'{sample_layer}.neuron_recipe_Q'].shape[1]
+
         model_config = {
-            'vocab_size': 30522,  # BERT vocab
-            'd_model': 256,
-            'n_layers': 4,
-            'n_heads': 4,
-            'd_ff': 1024,
-            'max_seq_len': 128,
-            'dropout': 0.1,
+            'vocab_size': state_dict['token_emb.weight'].shape[0],
+            'd_model': state_dict['token_emb.weight'].shape[1],
+            'n_layers': sum(1 for k in state_dict.keys() if k.startswith('layers.') and '.norm1.weight' in k),
+            'n_neurons': n_neurons,
+            'n_basis': n_basis,
+            'model_version': model_version,
         }
+        print(f"  Inferred config: {model_config}")
 
-        # Version-specific parameters
-        if model_version == '7.5':
-            model_config.update({
-                'n_neurons': 96,
-                'neuron_k': 8,
-                'n_basis': 32,
-                'basis_rank': 96,
-            })
-        else:
-            model_config.update({
-                'n_neurons': 64,
-                'neuron_k': 8,
-                'n_basis': 32,
-                'basis_rank': 64,
-            })
-
-        model_config['model_version'] = model_version
-
-    # Check if this is actually v7.5
-    if model_version != '7.5':
-        print(f"\n❌ ERROR: This script is for v7.5 models only!")
-        print(f"   Found: v{model_version}")
-        print(f"   Please use the appropriate analysis script:")
-        print(f"   - v7.0: scripts/analyze_dawn_v7.py")
-        print(f"   - v7.1: scripts/analyze_dawn_v7.py")
-        print(f"   - v7.2: scripts/analyze_dawn_v7.py")
-        print(f"   - v7.4: scripts/analyze_dawn_v7.py")
-        return
-
-    print(f"\n✅ Confirmed v7.5 checkpoint. Proceeding with analysis...")
-
+    # Create model
+    print(f"\nCreating model v{model_version}...")
     model = create_model_by_version(model_version, model_config)
 
     # Load state dict
@@ -615,7 +498,6 @@ def main():
 
     all_results['basis'] = analyze_basis_orthogonality(model)
     all_results['recipes'] = analyze_recipes(model)
-    all_results['context_patterns'] = analyze_context_patterns(model)
     all_results['runtime'] = analyze_runtime_behavior(model, val_loader, device, args.max_batches)
     all_results['summary'] = compute_summary_metrics(all_results)
 
