@@ -45,10 +45,11 @@ class SharedBasis(nn.Module):
 
         # 복원용 Basis: rank → D
         # O projection에 사용, 독립적으로 학습
+        # Note: QR decomposition of [D, rank] gives Q of [D, rank], we need [rank, D]
         basis_up = torch.zeros(n_basis, basis_rank, d_model)
         for i in range(n_basis):
-            q, _ = torch.linalg.qr(torch.randn(basis_rank, d_model))
-            basis_up[i] = q
+            q, _ = torch.linalg.qr(torch.randn(d_model, basis_rank))
+            basis_up[i] = q.T  # Transpose to get [rank, D]
         self.basis_up = nn.Parameter(basis_up)
 
     def get_basis_down(self):
