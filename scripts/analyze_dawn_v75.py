@@ -7,11 +7,23 @@ Dynamic Q/K/V Generation (v8 design)
 2. Recipe 분석 (Q/K/V recipe 3개)
 3. ⭐ Runtime 분석 (라우팅 + 뉴런 사용)
 4. 종합 메트릭 요약
+5. W_Q/K/V 동적성 검증 (토큰별 유사도)
+6. Basis 커버리지 분석 (공간 커버리지)
+7. ⭐ O Projection 정보 손실 분석 (핵심!)
+8. Attention 패턴 분석
 
 v7.5 특징 (v8 design):
 - 라우터: x만 보고 뉴런 선택
 - Q/K/V 모두 동적 생성 (recipe_Q/K/V)
 - 깔끔한 구조: basis_emb 없음, context score 없음
+
+핵심 지표 해석 가이드:
+| 지표                    | 정상 범위   | 문제 신호                      |
+|------------------------|------------|-------------------------------|
+| W_Q token similarity   | < 0.7      | > 0.9 → 동적 생성 무의미        |
+| Basis effective rank   | > 20       | < 10 → 중복된 basis           |
+| O proj relative error  | < 0.2      | > 0.4 → 심각한 정보 손실       |
+| Attention entropy      | 1.5 ~ 3.0  | < 1.0 또는 > 4.0              |
 
 Usage:
     python scripts/analyze_dawn_v75.py --checkpoint /path/to/checkpoint_folder
@@ -366,6 +378,365 @@ def compute_summary_metrics(all_results):
 
 
 # ============================================================
+# 5. W_Q/K/V Dynamics Analysis
+# ============================================================
+
+def analyze_w_dynamics(model, dataloader, device, max_batches=5):
+    """Measure how different W_Q/K/V are across tokens"""
+    print("\n" + "="*60)
+    print("5. W_Q/K/V DYNAMICS ANALYSIS")
+    print("="*60)
+
+    model.eval()
+    results = {}
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="W Dynamics", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            B, S = input_ids.shape
+
+            pos = torch.arange(S, device=device).unsqueeze(0)
+            x = model.token_emb(input_ids) + model.pos_emb(pos)
+            x = model.dropout(x)
+
+            for layer_idx, layer in enumerate(model.layers):
+                normed = layer.norm1(x)
+                qkv = layer.qkv_dynamic
+
+                # Perform routing
+                scores = qkv.W_router(normed)
+                topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
+                weights = F.softmax(topk_scores, dim=-1)
+
+                # Get recipe
+                recipe_Q = qkv.neuron_recipe_Q[topk_idx]
+                token_recipe_Q = (recipe_Q * weights.unsqueeze(-1)).sum(dim=2)
+                token_recipe_Q = F.softmax(token_recipe_Q, dim=-1)
+
+                # Generate W_Q
+                basis = qkv.shared_basis()
+                W_Q = torch.einsum('bsn,ndr->bsdr', token_recipe_Q, basis)  # [B, S, D, rank]
+
+                # Flatten W_Q and compute token-wise similarity
+                W_Q_flat = W_Q.view(B * S, -1)  # [B*S, D*rank]
+                W_Q_norm = F.normalize(W_Q_flat, dim=-1)
+
+                # Cosine similarity between tokens (sampling)
+                n_samples = min(100, B * S)
+                indices = torch.randperm(B * S, device=device)[:n_samples]
+                W_Q_sampled = W_Q_norm[indices]
+                sim_matrix = W_Q_sampled @ W_Q_sampled.T
+
+                # Off-diagonal similarity
+                mask = ~torch.eye(n_samples, dtype=torch.bool, device=device)
+                off_diag_sim = sim_matrix[mask]
+
+                key = f'layer_{layer_idx}'
+                if key not in results:
+                    results[key] = {'w_q_sim': [], 'w_q_std': []}
+
+                results[key]['w_q_sim'].append(off_diag_sim.mean().item())
+                results[key]['w_q_std'].append(W_Q_flat.std(dim=0).mean().item())
+
+                # Forward to next layer
+                attn_out, _ = qkv(normed, model.causal_mask[:, :, :S, :S])
+                x = x + layer.dropout(attn_out)
+                x = x + layer.dropout(layer.w_down(F.gelu(layer.w_up(layer.norm2(x)))))
+
+    # Output results
+    print("\n⭐ W_Q DYNAMICS:")
+    for layer_idx in range(len(model.layers)):
+        key = f'layer_{layer_idx}'
+        sim = np.mean(results[key]['w_q_sim'])
+        std = np.mean(results[key]['w_q_std'])
+        print(f"  Layer {layer_idx}: Token-wise W_Q similarity = {sim:.4f}, W_Q std = {std:.6f}")
+
+        if sim > 0.95:
+            print(f"    ⚠️  WARNING: W_Q nearly identical across tokens!")
+
+    return results
+
+
+# ============================================================
+# 6. Basis Coverage Analysis
+# ============================================================
+
+def analyze_basis_coverage(model, dataloader, device, max_batches=5):
+    """Analyze how well basis covers the space"""
+    print("\n" + "="*60)
+    print("6. BASIS COVERAGE ANALYSIS")
+    print("="*60)
+
+    basis = model.shared_basis.basis  # [n_basis, D, rank]
+    n_basis, D, rank = basis.shape
+
+    # 1. Flatten basis for analysis
+    basis_flat = basis.view(n_basis, -1)  # [n_basis, D*rank]
+
+    # SVD for effective rank
+    U, S, V = torch.linalg.svd(basis_flat, full_matrices=False)
+
+    # Effective rank (entropy-based)
+    S_norm = S / S.sum()
+    entropy = -torch.sum(S_norm * torch.log(S_norm + 1e-10))
+    effective_rank = torch.exp(entropy).item()
+
+    # Top-k singular value ratios
+    top_k_ratios = []
+    for k in [1, 5, 10, 20]:
+        ratio = S[:k].sum() / S.sum()
+        top_k_ratios.append((k, ratio.item()))
+
+    print(f"\n📊 Basis Span Analysis:")
+    print(f"  Effective rank: {effective_rank:.2f} / {n_basis}")
+    print(f"  Singular value concentration:")
+    for k, ratio in top_k_ratios:
+        print(f"    Top-{k}: {ratio*100:.1f}%")
+
+    # 2. How well token embeddings project onto basis space
+    model.eval()
+    projection_errors = []
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Coverage", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            x = model.token_emb(input_ids)  # [B, S, D]
+
+            # Measure reconstruction error for each basis
+            for i in range(n_basis):
+                basis_i = basis[i]  # [D, rank]
+                x_proj = x @ basis_i  # [B, S, rank]
+                x_recon = x_proj @ basis_i.T  # [B, S, D]
+                error = (x - x_recon).norm(dim=-1).mean()
+                projection_errors.append(error.item())
+
+    avg_error = np.mean(projection_errors)
+    print(f"\n📊 Projection Quality:")
+    print(f"  Avg reconstruction error per basis: {avg_error:.4f}")
+
+    # 3. Basis diversity (span perspective)
+    basis_centered = basis_flat - basis_flat.mean(dim=0, keepdim=True)
+    cov = basis_centered.T @ basis_centered / n_basis
+    cov_eigenvalues = torch.linalg.eigvalsh(cov)
+
+    print(f"\n📊 Basis Diversity:")
+    print(f"  Covariance top eigenvalue: {cov_eigenvalues[-1].item():.4f}")
+    print(f"  Covariance eigenvalue ratio (top/bottom): {cov_eigenvalues[-1].item() / (cov_eigenvalues[0].item() + 1e-10):.2f}")
+
+    return {
+        'effective_rank': effective_rank,
+        'sv_concentration': top_k_ratios,
+        'projection_error': avg_error,
+    }
+
+
+# ============================================================
+# 7. ⭐ O Projection Information Loss Analysis (KEY SUSPECT)
+# ============================================================
+
+def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
+    """Measure information loss in O projection"""
+    print("\n" + "="*60)
+    print("7. ⭐ O PROJECTION INFORMATION LOSS (KEY SUSPECT)")
+    print("="*60)
+
+    model.eval()
+    results = {f'layer_{i}': [] for i in range(len(model.layers))}
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="O Proj Loss", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            B, S = input_ids.shape
+
+            pos = torch.arange(S, device=device).unsqueeze(0)
+            x = model.token_emb(input_ids) + model.pos_emb(pos)
+            mask = model.causal_mask[:, :, :S, :S]
+
+            for layer_idx, layer in enumerate(model.layers):
+                normed = layer.norm1(x)
+                qkv = layer.qkv_dynamic
+
+                # Replicate attention internals
+                scores = qkv.W_router(normed)
+                topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
+                weights = F.softmax(topk_scores, dim=-1)
+
+                # Generate Q, K, V
+                recipe_Q = F.softmax((qkv.neuron_recipe_Q[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                recipe_K = F.softmax((qkv.neuron_recipe_K[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                recipe_V = F.softmax((qkv.neuron_recipe_V[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+
+                basis = qkv.shared_basis()
+                W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
+                W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
+                W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
+
+                Q = torch.einsum('bsd,bsdr->bsr', normed, W_Q)
+                K = torch.einsum('bsd,bsdr->bsr', normed, W_K)
+                V = torch.einsum('bsd,bsdr->bsr', normed, W_V)
+
+                # Perform attention
+                d_head = qkv.d_head
+                n_heads = qkv.n_heads
+                Q = Q.view(B, S, n_heads, d_head).transpose(1, 2)
+                K = K.view(B, S, n_heads, d_head).transpose(1, 2)
+                V = V.view(B, S, n_heads, d_head).transpose(1, 2)
+
+                attn_scores = Q @ K.transpose(-2, -1) / (d_head ** 0.5)
+                attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+                attn_weights = F.softmax(attn_scores, dim=-1)
+                attn_out = attn_weights @ V  # [B, H, S, d_head]
+                attn_out = attn_out.transpose(1, 2).reshape(B, S, qkv.basis_rank)  # [B, S, rank]
+
+                # ⭐ KEY: Compare before and after O projection
+                attn_out_before_O = attn_out.clone()  # [B, S, rank]
+
+                # Perform O projection
+                recipe_O = F.softmax((qkv.neuron_recipe_O[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                basis_up = qkv.shared_basis().transpose(-1, -2)  # [n_basis, rank, D]
+                W_O = torch.einsum('bsn,nrd->bsrd', recipe_O, basis_up)  # [B, S, rank, D]
+                attn_out_after_O = torch.einsum('bsr,bsrd->bsd', attn_out, W_O)  # [B, S, D]
+
+                # Measure info loss 1: Reconstruction possibility after back-projection
+                W_down = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)  # Use any down projection
+                attn_reconstructed = torch.einsum('bsd,bsdr->bsr', attn_out_after_O, W_down)
+
+                recon_error = (attn_out_before_O - attn_reconstructed).norm(dim=-1).mean()
+                original_norm = attn_out_before_O.norm(dim=-1).mean()
+                relative_error = recon_error / (original_norm + 1e-10)
+
+                # Measure info loss 2: W_O effective rank
+                W_O_flat = W_O.view(B * S, -1)
+                W_O_sample = W_O_flat[torch.randperm(B * S, device=device)[:100]]
+                _, S_vals, _ = torch.linalg.svd(W_O_sample, full_matrices=False)
+                S_norm = S_vals / S_vals.sum()
+                entropy = -torch.sum(S_norm * torch.log(S_norm + 1e-10))
+                eff_rank = torch.exp(entropy).item()
+
+                results[f'layer_{layer_idx}'].append({
+                    'recon_error': recon_error.item(),
+                    'relative_error': relative_error.item(),
+                    'w_o_effective_rank': eff_rank,
+                })
+
+                # Forward to next layer
+                x = x + layer.dropout(attn_out_after_O)
+                x = x + layer.dropout(layer.w_down(F.gelu(layer.w_up(layer.norm2(x)))))
+
+    # Output results
+    print("\n⭐ O PROJECTION ANALYSIS:")
+    for layer_idx in range(len(model.layers)):
+        key = f'layer_{layer_idx}'
+        data = results[key]
+        avg_rel_error = np.mean([d['relative_error'] for d in data])
+        avg_eff_rank = np.mean([d['w_o_effective_rank'] for d in data])
+
+        print(f"\n  Layer {layer_idx}:")
+        print(f"    Relative reconstruction error: {avg_rel_error:.4f}")
+        print(f"    W_O effective rank: {avg_eff_rank:.2f}")
+
+        if avg_rel_error > 0.3:
+            print(f"    ⚠️  HIGH INFO LOSS - O projection losing significant information!")
+
+    return results
+
+
+# ============================================================
+# 8. Attention Pattern Analysis
+# ============================================================
+
+def analyze_attention_patterns(model, dataloader, device, max_batches=5):
+    """Analyze attention score distribution"""
+    print("\n" + "="*60)
+    print("8. ATTENTION PATTERN ANALYSIS")
+    print("="*60)
+
+    model.eval()
+    results = {f'layer_{i}': {'entropy': [], 'sparsity': [], 'self_attn': []}
+               for i in range(len(model.layers))}
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Attn Patterns", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            B, S = input_ids.shape
+
+            pos = torch.arange(S, device=device).unsqueeze(0)
+            x = model.token_emb(input_ids) + model.pos_emb(pos)
+            mask = model.causal_mask[:, :, :S, :S]
+
+            for layer_idx, layer in enumerate(model.layers):
+                normed = layer.norm1(x)
+                qkv = layer.qkv_dynamic
+
+                # Compute attention weights
+                scores = qkv.W_router(normed)
+                topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
+                weights = F.softmax(topk_scores, dim=-1)
+
+                recipe_Q = F.softmax((qkv.neuron_recipe_Q[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                recipe_K = F.softmax((qkv.neuron_recipe_K[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+
+                basis = qkv.shared_basis()
+                W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
+                W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
+
+                Q = torch.einsum('bsd,bsdr->bsr', normed, W_Q)
+                K = torch.einsum('bsd,bsdr->bsr', normed, W_K)
+
+                d_head = qkv.d_head
+                n_heads = qkv.n_heads
+                Q = Q.view(B, S, n_heads, d_head).transpose(1, 2)
+                K = K.view(B, S, n_heads, d_head).transpose(1, 2)
+
+                attn_scores = Q @ K.transpose(-2, -1) / (d_head ** 0.5)
+                attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+                attn_weights = F.softmax(attn_scores, dim=-1)  # [B, H, S, S]
+
+                # Entropy (higher = more uniform)
+                attn_entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-10), dim=-1)
+                avg_entropy = attn_entropy.mean().item()
+
+                # Sparsity (top-1 weight ratio)
+                top1_weight = attn_weights.max(dim=-1)[0].mean().item()
+
+                # Self-attention (diagonal ratio)
+                diag_mask = torch.eye(S, device=device).bool()
+                self_attn = attn_weights[:, :, diag_mask].mean().item()
+
+                results[f'layer_{layer_idx}']['entropy'].append(avg_entropy)
+                results[f'layer_{layer_idx}']['sparsity'].append(top1_weight)
+                results[f'layer_{layer_idx}']['self_attn'].append(self_attn)
+
+                # Forward to next layer
+                attn_out, _ = qkv(normed, mask)
+                x = x + layer.dropout(attn_out)
+                x = x + layer.dropout(layer.w_down(F.gelu(layer.w_up(layer.norm2(x)))))
+
+    print("\n📊 ATTENTION PATTERNS:")
+    for layer_idx in range(len(model.layers)):
+        key = f'layer_{layer_idx}'
+        entropy = np.mean(results[key]['entropy'])
+        sparsity = np.mean(results[key]['sparsity'])
+        self_attn = np.mean(results[key]['self_attn'])
+
+        print(f"  Layer {layer_idx}: entropy={entropy:.4f}, top1_weight={sparsity:.4f}, self_attn={self_attn:.4f}")
+
+    return results
+
+
+# ============================================================
 # Main Analysis Pipeline
 # ============================================================
 
@@ -551,6 +922,10 @@ def main():
     all_results['basis'] = analyze_basis_orthogonality(model)
     all_results['recipes'] = analyze_recipes(model)
     all_results['runtime'] = analyze_runtime_behavior(model, val_loader, device, args.max_batches)
+    all_results['w_dynamics'] = analyze_w_dynamics(model, val_loader, device, args.max_batches)
+    all_results['basis_coverage'] = analyze_basis_coverage(model, val_loader, device, args.max_batches)
+    all_results['o_projection'] = analyze_o_projection_loss(model, val_loader, device, args.max_batches)
+    all_results['attention'] = analyze_attention_patterns(model, val_loader, device, args.max_batches)
     all_results['summary'] = compute_summary_metrics(all_results)
 
     # Save results
