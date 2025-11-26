@@ -106,7 +106,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         else:
                             ce_loss, logits = model(input_ids, labels)
                             routing_infos = None
-                        orth_loss = 0.0
+
+                        # Basis orthogonality loss (v7.5)
+                        if orthogonality_weight > 0:
+                            orth_loss = model.orthogonality_loss()
+                        else:
+                            orth_loss = 0.0
                         diversity_loss = 0.0
                     elif orthogonality_weight > 0:
                         logits, losses = model(input_ids, return_losses=True)
@@ -186,7 +191,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     else:
                         ce_loss, logits = model(input_ids, labels)
                         routing_infos = None
-                    orth_loss = 0.0
+
+                    # Basis orthogonality loss (v7.5)
+                    if orthogonality_weight > 0:
+                        orth_loss = model.orthogonality_loss()
+                    else:
+                        orth_loss = 0.0
                     diversity_loss = 0.0
                 elif orthogonality_weight > 0:
                     logits, losses = model(input_ids, return_losses=True)

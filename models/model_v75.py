@@ -25,7 +25,7 @@ import math
 class SharedBasis(nn.Module):
     """
     공유 Basis (모든 layer가 사용)
-    학습하지 않음 - 직교성 보장
+    학습 가능 - 직교성 Loss로 유지
     """
     def __init__(self, n_basis: int, d_model: int, basis_rank: int):
         super().__init__()
@@ -39,10 +39,26 @@ class SharedBasis(nn.Module):
             q, r = torch.linalg.qr(torch.randn(d_model, basis_rank))
             basis[i] = q
 
-        self.register_buffer('basis', basis)  # [n_basis, D, rank]
+        self.basis = nn.Parameter(basis)  # [n_basis, D, rank] - 학습 가능
 
     def forward(self):
         return self.basis
+
+    def orthogonality_loss(self):
+        """
+        Basis 간 직교성 유지를 위한 loss
+        각 basis를 펼쳐서 내적 행렬이 단위행렬이 되도록 강제
+        """
+        # basis: [n_basis, d_model, basis_rank]
+        # 각 basis를 펼쳐서 [n_basis, d_model * basis_rank]
+        B = self.basis.view(self.n_basis, -1)  # [32, 256*64]
+
+        # 내적 행렬 (Gram matrix)
+        gram = B @ B.T  # [32, 32]
+
+        # 단위행렬과의 차이
+        I = torch.eye(self.n_basis, device=gram.device)
+        return ((gram - I) ** 2).mean()
 
 
 class NeuronBasedQKV(nn.Module):
@@ -373,6 +389,13 @@ class DAWN(nn.Module):
             return (loss, logits, routing_infos) if labels is not None else (logits, routing_infos)
         else:
             return (loss, logits) if labels is not None else logits
+
+    def orthogonality_loss(self):
+        """
+        Basis 직교성 유지 loss
+        모든 레이어가 같은 SharedBasis를 공유하므로 한 번만 계산
+        """
+        return self.shared_basis.orthogonality_loss()
 
     def count_parameters(self):
         """Count trainable parameters"""

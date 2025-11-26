@@ -35,7 +35,8 @@ training:
   weight_decay: 0.1       # Weight decay for regularization
   warmup_epochs: 2        # Warmup epochs
 
-  # Regularization (v7.5: load balance for neuron selection)
+  # Regularization (v7.5: orthogonality + load balance)
+  orthogonality_weight: 0.01 # Basis orthogonality loss (학습 가능한 basis 유지)
   diversity_weight: 0.0      # Not used in v7.5
   load_balance_weight: 0.01  # Load balance loss for neuron routing
 
