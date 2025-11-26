@@ -546,18 +546,27 @@ def main():
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Prepare dataloader
-    from utils.data import load_data, TextDataset, collate_fn_dynamic_padding
+    from utils.data import TextDataset, collate_fn_dynamic_padding
     from torch.utils.data import DataLoader
+    import pickle
+    import os
 
     data_config = checkpoint.get('data_config', {
         'base_dir': '/content/drive/MyDrive/data',
         'val_file': 'validation/wikitext_5to1_texts.pkl'
     })
 
-    val_texts = load_data(
-        data_config['base_dir'],
-        data_config['val_file']
-    )
+    # Load validation texts directly
+    val_path = os.path.join(data_config['base_dir'], data_config['val_file'])
+    print(f"\nLoading validation data from: {val_path}")
+
+    if not os.path.exists(val_path):
+        raise FileNotFoundError(f"Validation data not found: {val_path}")
+
+    with open(val_path, 'rb') as f:
+        val_texts = pickle.load(f)
+
+    print(f"Loaded {len(val_texts)} validation texts")
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
