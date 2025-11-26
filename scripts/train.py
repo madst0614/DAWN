@@ -842,12 +842,13 @@ def main():
 
         # Check for version mismatch
         checkpoint_version = checkpoint.get('model_version', 'unknown')
+        current_version = getattr(model, '__version__', 'unknown')
         print(f"📌 Checkpoint version: {checkpoint_version}")
-        print(f"📌 Current model version: {DAWN.__version__}")
+        print(f"📌 Current model version: {current_version}")
 
-        if checkpoint_version != DAWN.__version__ and checkpoint_version != 'unknown':
+        if checkpoint_version != current_version and checkpoint_version != 'unknown':
             print(f"\n⚠️  Version mismatch detected!")
-            print(f"   Checkpoint: v{checkpoint_version} → Current: v{DAWN.__version__}")
+            print(f"   Checkpoint: v{checkpoint_version} → Current: v{current_version}")
             print(f"   Will attempt partial loading (architecture-compatible parameters only)")
 
         # Load model state with strict=False for version compatibility
