@@ -452,23 +452,49 @@ def main():
         print("\n⚡ Compiling model with torch.compile for faster GPU execution...")
         print("   (Suppressing autotune logs...)")
 
-        # Suppress autotune verbose output
+        # Aggressive suppression of all compilation/autotune output
         import os
         import logging
-        os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
-        logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
-        logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+        import sys
+        import io
 
-        # Disable autotune logging
+        # Set environment variables to suppress Triton/Inductor output
+        os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
+        os.environ['TRITON_PRINT_AUTOTUNING'] = '0'
+        os.environ['TORCHINDUCTOR_MAX_AUTOTUNE'] = '0'
+
+        # Suppress all logging from compilation-related modules
+        logging.getLogger("torch._inductor").setLevel(logging.CRITICAL)
+        logging.getLogger("torch._inductor.utils").setLevel(logging.CRITICAL)
+        logging.getLogger("torch._inductor.compile_fx").setLevel(logging.CRITICAL)
+        logging.getLogger("torch._dynamo").setLevel(logging.CRITICAL)
+        logging.getLogger("torch._dynamo.output_graph").setLevel(logging.CRITICAL)
+
+        # Disable autotune in inductor config
         try:
             import torch._inductor.config as inductor_config
+            inductor_config.triton.autotune_at_compile_time = False
             inductor_config.trace.enabled = False
             inductor_config.trace.log_autotuning_results = False
+            inductor_config.max_autotune = False
         except:
             pass
 
         try:
-            model = torch.compile(model, mode='max-autotune')
+            # Redirect stdout/stderr during compilation to suppress print output
+            old_stdout = sys.stdout
+            old_stderr = sys.stderr
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+
+            try:
+                # Use 'reduce-overhead' mode instead of 'max-autotune' to avoid autotune entirely
+                model = torch.compile(model, mode='reduce-overhead')
+            finally:
+                # Restore stdout/stderr
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+
             print("   ✅ Model compiled successfully!")
         except Exception as e:
             print(f"   ⚠️  Compilation failed: {e}")
