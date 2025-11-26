@@ -690,7 +690,17 @@ def main():
 
         if config_version == "7.5":
             print(f"Dynamic Q/K/V/O Generation (v8 design): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
-            print(f"  - Learnable Basis with Orthogonality Loss")
+
+            # Basis learning status
+            if args.orthogonality_weight > 0:
+                print(f"  - Learnable Basis (orth_weight={args.orthogonality_weight})")
+            else:
+                print(f"  - Fixed Basis (no orthogonality loss)")
+
+            # Load balance status
+            if args.load_balance_weight > 0:
+                print(f"  - Load Balance Loss (lb_weight={args.load_balance_weight})")
+
             print(f"  - Simple Router (x only)")
         elif config_version == "7.4":
             print(f"TT Karcher Mean FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}")
@@ -709,6 +719,18 @@ def main():
         print(f"Standard FFN: d_ff={args.d_ff}")
 
     print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
+
+    # Regularization settings (if any are enabled)
+    reg_parts = []
+    if args.orthogonality_weight > 0:
+        reg_parts.append(f"orth={args.orthogonality_weight}")
+    if args.diversity_weight > 0:
+        reg_parts.append(f"div={args.diversity_weight}")
+    if args.load_balance_weight > 0:
+        reg_parts.append(f"lb={args.load_balance_weight}")
+
+    if reg_parts:
+        print(f"Regularization: {', '.join(reg_parts)}")
 
     # Load data
     print(f"\n{'='*60}")
