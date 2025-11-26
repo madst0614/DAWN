@@ -97,25 +97,43 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         load_balance_weight=load_balance_weight
                     )
                 else:
-                    # v6.0 compatibility
-                    if orthogonality_weight > 0:
+                    # v7.5+: Dynamic Q/K/V with routing
+                    # v6.0: compatibility
+                    if hasattr(model, '__version__') and model.__version__ == "7.5":
+                        # v7.5: Get routing info for load balance loss
+                        if load_balance_weight > 0:
+                            ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                        else:
+                            ce_loss, logits = model(input_ids, labels)
+                            routing_infos = None
+                        orth_loss = 0.0
+                        diversity_loss = 0.0
+                    elif orthogonality_weight > 0:
                         logits, losses = model(input_ids, return_losses=True)
                         orth_loss = losses['orth_total']
+                        ce_loss = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            labels.view(-1),
+                            ignore_index=-100
+                        )
+                        diversity_loss = 0.0
+                        routing_infos = None
                     else:
                         logits = model(input_ids)
                         orth_loss = 0.0
+                        diversity_loss = 0.0
+                        routing_infos = None
 
-                    # Cross-entropy loss
-                    B, S, V = logits.shape
-                    ce_loss = F.cross_entropy(
-                        logits.view(B * S, V),
-                        labels.view(B * S),
-                        ignore_index=-100
-                    )
+                        # Cross-entropy loss
+                        B, S, V = logits.shape
+                        ce_loss = F.cross_entropy(
+                            logits.view(B * S, V),
+                            labels.view(B * S),
+                            ignore_index=-100
+                        )
 
-                    # Recipe diversity loss
-                    diversity_loss = 0.0
-                    if diversity_weight > 0:
+                    # Recipe diversity loss (v7.0-v7.4)
+                    if diversity_weight > 0 and hasattr(model.layers[0], 'ffn') and hasattr(model.layers[0].ffn, 'neuron_recipe'):
                         for layer in model.layers:
                             recipe = layer.ffn.neuron_recipe
                             recipe_norm = F.softmax(recipe, dim=-1)
@@ -126,8 +144,21 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             diversity_loss += avg_similarity
                         diversity_loss = diversity_loss / len(model.layers)
 
+                    # Load balance loss (v7.5+)
+                    lb_loss = 0.0
+                    if load_balance_weight > 0 and routing_infos is not None:
+                        for routing_info in routing_infos:
+                            neuron_indices = routing_info['neuron_indices']  # [B, S, k]
+                            # Count neuron usage
+                            counts = torch.bincount(neuron_indices.reshape(-1), minlength=model.n_neurons)
+                            freq = counts.float() / (counts.sum() + 1e-8)
+                            # L2 distance from uniform distribution
+                            uniform = 1.0 / model.n_neurons
+                            lb_loss += ((freq - uniform) ** 2).sum() * model.n_neurons
+                        lb_loss = lb_loss / len(routing_infos)
+
                     # Total loss
-                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss
+                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             scaler.scale(loss).backward()
 
@@ -146,25 +177,43 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     load_balance_weight=load_balance_weight
                 )
             else:
-                # v6.0 compatibility
-                if orthogonality_weight > 0:
+                # v7.5+: Dynamic Q/K/V with routing
+                # v6.0: compatibility
+                if hasattr(model, '__version__') and model.__version__ == "7.5":
+                    # v7.5: Get routing info for load balance loss
+                    if load_balance_weight > 0:
+                        ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                    else:
+                        ce_loss, logits = model(input_ids, labels)
+                        routing_infos = None
+                    orth_loss = 0.0
+                    diversity_loss = 0.0
+                elif orthogonality_weight > 0:
                     logits, losses = model(input_ids, return_losses=True)
                     orth_loss = losses['orth_total']
+                    ce_loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        labels.view(-1),
+                        ignore_index=-100
+                    )
+                    diversity_loss = 0.0
+                    routing_infos = None
                 else:
                     logits = model(input_ids)
                     orth_loss = 0.0
+                    diversity_loss = 0.0
+                    routing_infos = None
 
-                # Cross-entropy loss
-                B, S, V = logits.shape
-                ce_loss = F.cross_entropy(
-                    logits.view(B * S, V),
-                    labels.view(B * S),
-                    ignore_index=-100
-                )
+                    # Cross-entropy loss
+                    B, S, V = logits.shape
+                    ce_loss = F.cross_entropy(
+                        logits.view(B * S, V),
+                        labels.view(B * S),
+                        ignore_index=-100
+                    )
 
-                # Recipe diversity loss
-                diversity_loss = 0.0
-                if diversity_weight > 0:
+                # Recipe diversity loss (v7.0-v7.4)
+                if diversity_weight > 0 and hasattr(model.layers[0], 'ffn') and hasattr(model.layers[0].ffn, 'neuron_recipe'):
                     for layer in model.layers:
                         recipe = layer.ffn.neuron_recipe
                         recipe_norm = F.softmax(recipe, dim=-1)
@@ -175,8 +224,21 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         diversity_loss += avg_similarity
                     diversity_loss = diversity_loss / len(model.layers)
 
+                # Load balance loss (v7.5+)
+                lb_loss = 0.0
+                if load_balance_weight > 0 and routing_infos is not None:
+                    for routing_info in routing_infos:
+                        neuron_indices = routing_info['neuron_indices']  # [B, S, k]
+                        # Count neuron usage
+                        counts = torch.bincount(neuron_indices.reshape(-1), minlength=model.n_neurons)
+                        freq = counts.float() / (counts.sum() + 1e-8)
+                        # L2 distance from uniform distribution
+                        uniform = 1.0 / model.n_neurons
+                        lb_loss += ((freq - uniform) ** 2).sum() * model.n_neurons
+                    lb_loss = lb_loss / len(routing_infos)
+
                 # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             loss.backward()
 

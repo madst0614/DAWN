@@ -76,10 +76,10 @@ class NeuronBasedQKV(nn.Module):
         # 라우터: x만 보고 뉴런 선택
         self.W_router = nn.Linear(d_model, n_neurons, bias=False)
 
-        # 뉴런별 Q/K/V recipe (학습됨)
-        self.neuron_recipe_Q = nn.Parameter(torch.randn(n_neurons, n_basis))
-        self.neuron_recipe_K = nn.Parameter(torch.randn(n_neurons, n_basis))
-        self.neuron_recipe_V = nn.Parameter(torch.randn(n_neurons, n_basis))
+        # 뉴런별 Q/K/V recipe (학습됨) - 초기화 분리로 다양성 확보
+        self.neuron_recipe_Q = nn.Parameter(torch.randn(n_neurons, n_basis) * 0.5)
+        self.neuron_recipe_K = nn.Parameter(torch.randn(n_neurons, n_basis) * 0.5 + 0.1)
+        self.neuron_recipe_V = nn.Parameter(torch.randn(n_neurons, n_basis) * 0.5 - 0.1)
 
         # Output projection
         self.W_o = nn.Linear(basis_rank, d_model, bias=False)
@@ -242,10 +242,10 @@ class DAWN(nn.Module):
         n_heads: int = 4,
         d_ff: int = 1024,
         max_seq_len: int = 128,
-        n_neurons: int = 96,
+        n_neurons: int = 192,  # 96 → 192 (2배)
         neuron_k: int = 8,
         n_basis: int = 32,
-        basis_rank: int = 64,
+        basis_rank: int = 128,  # 64 → 128 (2배)
         dropout: float = 0.1,
         **kwargs
     ):
