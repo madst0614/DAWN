@@ -1,7 +1,7 @@
 """
 DAWN Models Module
 
-v7.3: QK Attention Routing + Soft FFN (NEW)
+v7.5: QK Attention Routing + Soft FFN (NEW)
 v7.4: TT Weighted Karcher Mean
 v7.2: Standard FFN + Neuron Routing (병목 탐색 실험)
 v7.1: Symmetric Basis FFN (W_down 제거) - DEFAULT
@@ -21,8 +21,8 @@ from .model_v71 import (
     count_parameters,
 )
 
-# v7.3, v7.4, v7.2, v7.0 and v6.0 compatibility imports
-from . import model_v73 as model_v73
+# v7.5, v7.4, v7.2, v7.0 and v6.0 compatibility imports
+from . import model_v75 as model_v75
 from . import model_v74 as model_v74
 from . import model_v72 as model_v72
 from . import model_v7 as model_v70
@@ -46,7 +46,7 @@ __all__ = [
     'DAWNLayer',
     'create_model',
     'count_parameters',
-    'model_v73',  # Access v7.3 via models.model_v73
+    'model_v75',  # Access v7.5 via models.model_v75
     'model_v74',  # Access v7.4 via models.model_v74
     'model_v72',  # Access v7.2 via models.model_v72
     'model_v70',  # Access v7.0 via models.model_v70
@@ -62,7 +62,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "7.3", "7.4", "7.2", "7.1", "7.0", "6.0", or "baseline"
+        version: "7.5", "7.4", "7.2", "7.1", "7.0", "6.0", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -70,9 +70,9 @@ def create_model_by_version(version, config):
     """
     version = str(version)
 
-    if version in ["7.3", "73"]:
-        from .model_v73 import DAWN as DAWN_v73
-        return DAWN_v73(**config)
+    if version in ["7.5", "75"]:
+        from .model_v75 import DAWN as DAWN_v75
+        return DAWN_v75(**config)
     elif version in ["7.4", "74"]:
         from .model_v74 import DAWN as DAWN_v74
         return DAWN_v74(**config)
@@ -95,4 +95,4 @@ def create_model_by_version(version, config):
         return VanillaTransformer(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 7.3, 7.4, 7.2, 7.1, 7.0, 6.0, baseline")
+                        f"Supported versions: 7.5, 7.4, 7.2, 7.1, 7.0, 6.0, baseline")

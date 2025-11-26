@@ -1,5 +1,5 @@
 """
-DAWN v7.3 - QK Attention Routing + Soft FFN
+DAWN v7.5 - QK Attention Routing + Soft FFN
 
 핵심 변경사항:
 1. Router 제거 → QK Attention weights 재활용
@@ -286,10 +286,10 @@ class DAWNLayer(nn.Module):
 
 
 # ============================================
-# 4. DAWN Model v7.3
+# 4. DAWN Model v7.5
 # ============================================
 class DAWN(nn.Module):
-    """DAWN v7.3 - QK Attention Routing + Soft FFN
+    """DAWN v7.5 - QK Attention Routing + Soft FFN
 
     핵심 혁신:
     1. Router 제거 → QK Attention weights 재활용
@@ -303,7 +303,7 @@ class DAWN(nn.Module):
     - Per Layer: QK Attention + Neuron V + Soft FFN
     """
 
-    __version__ = "7.3"
+    __version__ = "7.5"
 
     def __init__(self, vocab_size, d_model=256, d_ff=1024,
                  n_layers=4, n_heads=4,
@@ -505,7 +505,7 @@ DAWNLanguageModel = DAWN
 # ============================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("DAWN v7.3 - QK Attention Routing + Soft FFN")
+    print("DAWN v7.5 - QK Attention Routing + Soft FFN")
     print("=" * 60)
 
     config = {
