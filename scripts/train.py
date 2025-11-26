@@ -607,11 +607,9 @@ def main():
     else:
         print(f"DAWN (Dynamic Neuron Transformer) Training")
     print(f"{'='*60}")
-    print(f"\nConfig version: {config_version}")
-    if config_version != 'baseline':
-        print(f"Code version: {DAWN.__version__}")
-        if config_version != DAWN.__version__ and config_version != 'not specified':
-            print(f"⚠️  Warning: Config version ({config_version}) != Code version ({DAWN.__version__})")
+    print(f"\nModel version: {config_version}")
+    if config_version != 'baseline' and config_version != 'not specified':
+        print(f"  (Default DAWN module version: {DAWN.__version__})")
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if config_version != 'baseline':
@@ -700,13 +698,22 @@ def main():
     # Create model by version
     if model_version in ['7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
-        print(f"\n📌 Model version: {model_version}")
+        print(f"\n📌 Creating model version: {model_version}")
     else:
         # Fallback to default DAWN (v7.1)
         model = DAWN(**model_kwargs)
-        print(f"\n📌 Model version: {DAWN.__version__}")
+        print(f"\n📌 Creating model version: {DAWN.__version__}")
 
     model = model.to(device)
+
+    # Verify model version
+    if hasattr(model, '__version__'):
+        actual_version = model.__version__
+        print(f"✅ Model created: DAWN v{actual_version}")
+        if model_version != actual_version and model_version != 'baseline':
+            print(f"⚠️  Warning: Requested v{model_version} but got v{actual_version}")
+    elif model_version == 'baseline':
+        print(f"✅ Model created: Vanilla Transformer (baseline)")
 
     # PyTorch 2.0+ compilation for speed boost
     if hasattr(torch, 'compile'):
