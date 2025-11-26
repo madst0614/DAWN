@@ -1,18 +1,19 @@
 """
-DAWN v7.5 - Dynamic Q/K/V with Neuron-Based Routing
+DAWN v7.5 - Dynamic Q/K/V/O with Neuron-Based Routing
 
 핵심 아이디어:
 - 라우터가 x만 보고 뉴런 선택 (깔끔한 설계)
-- 선택된 뉴런의 recipe_Q/K/V로 동적 W_Q/K/V 생성
-- Q, K, V 모두 동적으로 생성
+- 선택된 뉴런의 recipe_Q/K/V/O로 동적 W_Q/K/V/O 생성
+- Q, K, V, O 모두 동적으로 생성 (완전한 동적 attention)
 - 표준 Attention 사용
 - basis_emb 제거, context score 제거
 
 구조:
-    입력 x → 라우터(x) → 뉴런 선택 → recipe_Q/K/V 조합
-    → W_Q/K/V 동적 생성 → Q/K/V 계산 → Attention → FFN
+    입력 x → 라우터(x) → 뉴런 선택 → recipe_Q/K/V/O 조합
+    → W_Q/K/V 동적 생성 → Q/K/V 계산 → Attention
+    → W_O 동적 생성 (basis transpose) → 차원 복원 → FFN
 
-v8 설계를 v7.5로 구현
+v8 설계를 v7.5로 구현 + O projection도 동적화
 """
 
 import torch
@@ -46,11 +47,14 @@ class SharedBasis(nn.Module):
 
 class NeuronBasedQKV(nn.Module):
     """
-    뉴런 기반 동적 Q/K/V 생성
+    뉴런 기반 동적 Q/K/V/O 생성
 
-    각 뉴런이 Q/K/V 만드는 방법(recipe)을 학습
+    각 뉴런이 Q/K/V/O 만드는 방법(recipe)을 학습
     라우터가 x 보고 뉴런 선택
-    선택된 뉴런들의 recipe 조합해서 토큰별 동적 W_Q/K/V 생성
+    선택된 뉴런들의 recipe 조합해서 토큰별 동적 W_Q/K/V/O 생성
+
+    W_Q/K/V: basis [n_basis, D, rank]로 생성
+    W_O: basis transpose [n_basis, rank, D]로 생성 (차원 복원)
     """
     def __init__(
         self,
@@ -76,13 +80,13 @@ class NeuronBasedQKV(nn.Module):
         # 라우터: x만 보고 뉴런 선택
         self.W_router = nn.Linear(d_model, n_neurons, bias=False)
 
-        # 뉴런별 Q/K/V recipe (학습됨) - 초기화 분리로 다양성 확보
+        # 뉴런별 Q/K/V/O recipe (학습됨) - 초기화 분리로 다양성 확보
         self.neuron_recipe_Q = nn.Parameter(torch.randn(n_neurons, n_basis) * 0.5)
         self.neuron_recipe_K = nn.Parameter(torch.randn(n_neurons, n_basis) * 0.5 + 0.1)
         self.neuron_recipe_V = nn.Parameter(torch.randn(n_neurons, n_basis) * 0.5 - 0.1)
+        self.neuron_recipe_O = nn.Parameter(torch.randn(n_neurons, n_basis) * 0.5 + 0.05)
 
-        # Output projection
-        self.W_o = nn.Linear(basis_rank, d_model, bias=False)
+        # Output projection은 동적으로 생성 (recipe_O 사용)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -147,9 +151,18 @@ class NeuronBasedQKV(nn.Module):
 
         attn_out = attn_weights @ V  # [B, H, S, d_head]
 
-        # 9. Concat & Project
+        # 9. Concat
         attn_out = attn_out.transpose(1, 2).reshape(B, S, self.basis_rank)  # [B, S, rank]
-        attn_out = self.W_o(attn_out)  # [B, S, D]
+
+        # 10. 동적 W_O 생성 및 복원 (rank → d_model)
+        recipe_O = self.neuron_recipe_O[topk_idx]  # [B, S, k, n_basis]
+        token_recipe_O = (recipe_O * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, n_basis]
+        token_recipe_O = F.softmax(token_recipe_O, dim=-1)
+
+        # basis를 transpose해서 [n_basis, rank, D] 생성
+        basis_up = self.shared_basis().transpose(-1, -2)  # [n_basis, rank, D]
+        W_O = torch.einsum('bsn,nrd->bsrd', token_recipe_O, basis_up)  # [B, S, rank, D]
+        attn_out = torch.einsum('bsr,bsrd->bsd', attn_out, W_O)  # [B, S, D]
 
         # Routing info for analysis
         routing_info = {

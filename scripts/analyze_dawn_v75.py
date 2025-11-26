@@ -107,9 +107,9 @@ def analyze_basis_orthogonality(model):
 # ============================================================
 
 def analyze_recipes(model):
-    """Analyze how neurons combine basis elements for Q/K/V"""
+    """Analyze how neurons combine basis elements for Q/K/V/O"""
     print("\n" + "="*60)
-    print("2. RECIPE ANALYSIS (Q/K/V)")
+    print("2. RECIPE ANALYSIS (Q/K/V/O)")
     print("="*60)
 
     results = {}
@@ -117,14 +117,15 @@ def analyze_recipes(model):
     for layer_idx, layer in enumerate(model.layers):
         qkv_module = layer.qkv_dynamic
 
-        # Get Q/K/V recipes
+        # Get Q/K/V/O recipes
         recipe_Q = qkv_module.neuron_recipe_Q  # [n_neurons, n_basis]
         recipe_K = qkv_module.neuron_recipe_K
         recipe_V = qkv_module.neuron_recipe_V
+        recipe_O = qkv_module.neuron_recipe_O
 
         layer_results = {}
 
-        for recipe_name, recipe in [('Q', recipe_Q), ('K', recipe_K), ('V', recipe_V)]:
+        for recipe_name, recipe in [('Q', recipe_Q), ('K', recipe_K), ('V', recipe_V), ('O', recipe_O)]:
             recipe_norm = F.softmax(recipe, dim=-1)  # Normalized
 
             # 1. Basis usage distribution
@@ -154,32 +155,40 @@ def analyze_recipes(model):
                 'dominant_basis_dist': dominant_counts.cpu().numpy().tolist(),
             }
 
-        # Compare Q/K/V recipes
+        # Compare Q/K/V/O recipes
         recipe_Q_norm = F.softmax(recipe_Q, dim=-1)
         recipe_K_norm = F.softmax(recipe_K, dim=-1)
         recipe_V_norm = F.softmax(recipe_V, dim=-1)
+        recipe_O_norm = F.softmax(recipe_O, dim=-1)
 
         # Cosine similarity between recipes
         qk_sim = F.cosine_similarity(recipe_Q_norm, recipe_K_norm, dim=-1).mean().item()
         qv_sim = F.cosine_similarity(recipe_Q_norm, recipe_V_norm, dim=-1).mean().item()
+        qo_sim = F.cosine_similarity(recipe_Q_norm, recipe_O_norm, dim=-1).mean().item()
         kv_sim = F.cosine_similarity(recipe_K_norm, recipe_V_norm, dim=-1).mean().item()
+        ko_sim = F.cosine_similarity(recipe_K_norm, recipe_O_norm, dim=-1).mean().item()
+        vo_sim = F.cosine_similarity(recipe_V_norm, recipe_O_norm, dim=-1).mean().item()
 
         layer_results['recipe_similarity'] = {
             'Q_K_similarity': qk_sim,
             'Q_V_similarity': qv_sim,
+            'Q_O_similarity': qo_sim,
             'K_V_similarity': kv_sim,
+            'K_O_similarity': ko_sim,
+            'V_O_similarity': vo_sim,
         }
 
         results[f'layer_{layer_idx}'] = layer_results
 
         print(f"\nLayer {layer_idx}:")
-        for recipe_name in ['Q', 'K', 'V']:
+        for recipe_name in ['Q', 'K', 'V', 'O']:
             r = layer_results[f'recipe_{recipe_name}']
             print(f"  Recipe {recipe_name}:")
             print(f"    Basis usage: {r['basis_usage_mean']:.4f} ± {r['basis_usage_std']:.4f}")
             print(f"    Entropy: {r['recipe_entropy_mean']:.4f} ± {r['recipe_entropy_std']:.4f}")
             print(f"    Specialization: {r['neuron_specialization_mean']:.4f} ± {r['neuron_specialization_std']:.4f}")
-        print(f"  Recipe similarity: Q-K={qk_sim:.4f}, Q-V={qv_sim:.4f}, K-V={kv_sim:.4f}")
+        print(f"  Recipe similarity: Q-K={qk_sim:.4f}, Q-V={qv_sim:.4f}, Q-O={qo_sim:.4f}")
+        print(f"                     K-V={kv_sim:.4f}, K-O={ko_sim:.4f}, V-O={vo_sim:.4f}")
 
     return results
 
@@ -319,13 +328,13 @@ def compute_summary_metrics(all_results):
     if 'basis' in all_results:
         summary['basis_orthogonal'] = all_results['basis']['basis']['max_off_diagonal'] < 1e-5
 
-    # Recipe diversity (average across Q/K/V and layers)
+    # Recipe diversity (average across Q/K/V/O and layers)
     recipe_entropies = []
     recipe_specializations = []
     if 'recipes' in all_results:
         for layer_key, layer_data in all_results['recipes'].items():
             if layer_key.startswith('layer_'):
-                for recipe_type in ['Q', 'K', 'V']:
+                for recipe_type in ['Q', 'K', 'V', 'O']:
                     recipe_key = f'recipe_{recipe_type}'
                     if recipe_key in layer_data:
                         recipe_entropies.append(layer_data[recipe_key]['recipe_entropy_mean'])
