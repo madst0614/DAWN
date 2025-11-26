@@ -1,7 +1,7 @@
 """
 DAWN Models Module
 
-v7.5: QK Attention Routing + Soft FFN (NEW)
+v7.5: Dynamic Q/K/V Generation (NEW - v8 design)
 v7.4: TT Weighted Karcher Mean
 v7.2: Standard FFN + Neuron Routing (병목 탐색 실험)
 v7.1: Symmetric Basis FFN (W_down 제거) - DEFAULT

@@ -1,17 +1,18 @@
 """
-DAWN v7.5 - QK Attention Routing + Soft FFN
+DAWN v7.5 - Dynamic Q/K/V with Neuron-Based Routing
 
-핵심 변경사항:
-1. Router 제거 → QK Attention weights 재활용
-2. 뉴런 선택: 의미(X) + 문맥(Attention) 결합
-3. 동적 V 생성: 256 → 64 → 256 (sparse semantic)
-4. Soft FFN 유지 (성능 보장)
+핵심 아이디어:
+- 라우터가 x만 보고 뉴런 선택 (깔끔한 설계)
+- 선택된 뉴런의 recipe_Q/K/V로 동적 W_Q/K/V 생성
+- Q, K, V 모두 동적으로 생성
+- 표준 Attention 사용
+- basis_emb 제거, context score 제거
 
-철학:
-- Attention이 문맥 파악 → 같은 정보로 뉴런 선택
-- 원본 X로 뉴런 라우팅 (정보 손실 전)
-- Softmax 비선형성만으로 충분
-- 파라미터 효율적 (~11M)
+구조:
+    입력 x → 라우터(x) → 뉴런 선택 → recipe_Q/K/V 조합
+    → W_Q/K/V 동적 생성 → Q/K/V 계산 → Attention → FFN
+
+v8 설계를 v7.5로 구현
 """
 
 import torch
@@ -20,336 +21,265 @@ import torch.nn.functional as F
 import math
 
 
-# ============================================
-# 1. Fixed Orthogonal Basis (Shared)
-# ============================================
-class FixedOrthogonalBasis(nn.Module):
-    """고정된 직교 Basis - 전체 Layer 공유, 학습 안 함
-
-    구성:
-    - Basis_A: [n_basis, d_model, rank] - 필터 기본 블록
-    - basis_emb: [n_basis, d_model] - Routing 보조 벡터
-
-    역할:
-    - 모든 Layer가 같은 Basis 공유
-    - Recipe로 조합하여 동적 필터 생성
+class SharedBasis(nn.Module):
     """
-
-    def __init__(self, n_basis=32, d_model=256, basis_rank=96):
+    공유 Basis (모든 layer가 사용)
+    학습하지 않음 - 직교성 보장
+    """
+    def __init__(self, n_basis: int, d_model: int, basis_rank: int):
         super().__init__()
-
         self.n_basis = n_basis
         self.d_model = d_model
         self.basis_rank = basis_rank
 
-        # Basis A: [n_basis, d_model, rank] - 필터 조각
-        basis_A = self._create_orthogonal_basis(n_basis, d_model, basis_rank)
-        self.register_buffer('basis_A', basis_A)
+        # Basis 초기화 (직교)
+        basis = torch.zeros(n_basis, d_model, basis_rank)
+        for i in range(n_basis):
+            q, r = torch.linalg.qr(torch.randn(d_model, basis_rank))
+            basis[i] = q
 
-        # Basis embedding: [n_basis, d_model] - Routing용
-        basis_emb = self._create_orthogonal_vectors(n_basis, d_model)
-        self.register_buffer('basis_emb', basis_emb)
+        self.register_buffer('basis', basis)  # [n_basis, D, rank]
 
-    def _create_orthogonal_basis(self, n_basis, dim1, dim2):
-        """직교 basis 생성 [n_basis, dim1, dim2]"""
-        random_tensor = torch.randn(n_basis, dim1, dim2)
-        flat = random_tensor.view(n_basis, -1)
-        orthogonal = self._gram_schmidt(flat)
-        return orthogonal.view(n_basis, dim1, dim2)
-
-    def _create_orthogonal_vectors(self, n_basis, dim):
-        """직교 벡터들 생성 [n_basis, dim]"""
-        if n_basis <= dim:
-            random_matrix = torch.randn(dim, n_basis)
-            q, r = torch.linalg.qr(random_matrix)
-            return q[:, :n_basis].T
-        else:
-            vectors = torch.randn(n_basis, dim)
-            return F.normalize(vectors, dim=-1)
-
-    def _gram_schmidt(self, vectors):
-        """Gram-Schmidt 직교화"""
-        n, d = vectors.shape
-        orthogonal = torch.zeros_like(vectors)
-
-        for i in range(n):
-            v = vectors[i].clone()
-            for j in range(i):
-                proj = torch.dot(orthogonal[j], v) * orthogonal[j]
-                v = v - proj
-
-            norm = torch.norm(v)
-            if norm > 1e-10:
-                orthogonal[i] = v / norm
-            else:
-                orthogonal[i] = F.normalize(torch.randn_like(v), dim=0)
-
-        return orthogonal
+    def forward(self):
+        return self.basis
 
 
-# ============================================
-# 2. Neuron-Based Value Generator
-# ============================================
-class NeuronBasedValue(nn.Module):
-    """뉴런 기반 동적 V 생성
-
-    핵심:
-    1. 원본 X (의미) + Attention weights (문맥)로 뉴런 선택
-    2. 선택된 뉴런으로 sparse representation (256→96)
-    3. 복원하여 V 생성 (96→256)
-    4. Multi-head 형태로 reshape
-
-    뉴런 선택:
-    - semantic_score: X @ neuron_emb (의미 매칭)
-    - context_score: Attn_pattern @ context_pattern (문맥 매칭)
-    - final_score: semantic × sigmoid(context) (둘 다 맞아야!)
+class NeuronBasedQKV(nn.Module):
     """
+    뉴런 기반 동적 Q/K/V 생성
 
-    def __init__(self, shared_basis, n_neurons=96, d_model=256,
-                 n_heads=4, neuron_k=8, dropout=0.1):
+    각 뉴런이 Q/K/V 만드는 방법(recipe)을 학습
+    라우터가 x 보고 뉴런 선택
+    선택된 뉴런들의 recipe 조합해서 토큰별 동적 W_Q/K/V 생성
+    """
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_neurons: int,
+        neuron_k: int,  # Top-K 선택
+        n_basis: int,
+        basis_rank: int,
+        shared_basis: SharedBasis,
+        dropout: float = 0.1
+    ):
         super().__init__()
-
-        self.basis = shared_basis
-        self.n_neurons = n_neurons
         self.d_model = d_model
         self.n_heads = n_heads
-        self.d_head = d_model // n_heads
+        self.d_head = basis_rank // n_heads
+        self.n_neurons = n_neurons
         self.k = neuron_k
+        self.n_basis = n_basis
+        self.basis_rank = basis_rank
+        self.shared_basis = shared_basis
 
-        # Neuron Recipe (의미 차원) - 학습됨!
-        self.neuron_recipe = nn.Parameter(
-            torch.randn(n_neurons, shared_basis.n_basis) * 0.5
-        )
+        # 라우터: x만 보고 뉴런 선택
+        self.W_router = nn.Linear(d_model, n_neurons, bias=False)
 
-        # Neuron Context Pattern (문맥 차원) - 학습됨!
-        self.neuron_context_pattern = nn.Parameter(
-            torch.randn(n_neurons, n_heads) * 0.5
-        )
+        # 뉴런별 Q/K/V recipe (학습됨)
+        self.neuron_recipe_Q = nn.Parameter(torch.randn(n_neurons, n_basis))
+        self.neuron_recipe_K = nn.Parameter(torch.randn(n_neurons, n_basis))
+        self.neuron_recipe_V = nn.Parameter(torch.randn(n_neurons, n_basis))
 
-        # V 복원 projection
-        self.v_out = nn.Linear(shared_basis.basis_rank, d_model)
+        # Output projection
+        self.W_o = nn.Linear(basis_rank, d_model, bias=False)
+
         self.dropout = nn.Dropout(dropout)
 
-    @property
-    def neuron_emb_semantic(self):
-        """의미 기반 임베딩 [n_neurons, d_model]
-
-        Recipe를 basis_emb와 조합하여 생성
-        """
-        recipe_norm = F.softmax(self.neuron_recipe, dim=-1)
-        return torch.matmul(recipe_norm, self.basis.basis_emb)
-
-    def forward(self, x, attn_weights, K=None):
+    def forward(self, x, mask=None):
         """
         Args:
-            x: [B, S, D] - 원본 임베딩 (아직 섞이지 않음!)
-            attn_weights: [B, n_heads, S, S] - attention 패턴
-            K: [B, n_heads, S, d_head] - Key (optional, for semantic scoring)
+            x: [B, S, D]
+            mask: [B, 1, S, S] causal mask
 
         Returns:
-            V: [B, n_heads, S, d_head] - 동적 생성된 Value
-            neuron_idx: [B, S, k] - 선택된 뉴런 인덱스
+            attn_out: [B, S, D]
+            routing_info: dict (for analysis)
         """
         B, S, D = x.shape
 
-        # ========== 1. 뉴런 선택 (의미 + 문맥) ==========
+        # 1. 라우팅: x만 보고 뉴런 선택
+        scores = self.W_router(x)  # [B, S, n_neurons]
+        topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)  # [B, S, k]
+        weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 의미 점수: "이 단어는 어떤 뉴런?"
-        # K를 사용 (QK Attention 정보 재활용)
-        if K is not None:
-            K_combined = K.transpose(1, 2).reshape(B, S, D)  # [B, S, D]
-            semantic_scores = K_combined @ self.neuron_emb_semantic.T  # [B, S, n_neurons]
-        else:
-            semantic_scores = x @ self.neuron_emb_semantic.T  # [B, S, n_neurons]
+        # 2. Recipe 가져오기
+        recipe_Q = self.neuron_recipe_Q[topk_idx]  # [B, S, k, n_basis]
+        recipe_K = self.neuron_recipe_K[topk_idx]
+        recipe_V = self.neuron_recipe_V[topk_idx]
 
-        # 문맥 점수: "이 문맥 패턴은 어떤 뉴런?"
-        # Attention 패턴 요약 (head별 평균)
-        attn_summary = attn_weights.mean(dim=-1).transpose(1, 2)  # [B, S, n_heads]
-        context_scores = attn_summary @ self.neuron_context_pattern.T  # [B, S, n_neurons]
+        # 3. 가중 평균으로 토큰별 recipe
+        token_recipe_Q = (recipe_Q * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, n_basis]
+        token_recipe_K = (recipe_K * weights.unsqueeze(-1)).sum(dim=2)
+        token_recipe_V = (recipe_V * weights.unsqueeze(-1)).sum(dim=2)
 
-        # 결합: 의미도 맞고 문맥도 맞아야!
-        final_scores = semantic_scores * torch.sigmoid(context_scores)
+        # 4. Softmax로 비율화
+        token_recipe_Q = F.softmax(token_recipe_Q, dim=-1)
+        token_recipe_K = F.softmax(token_recipe_K, dim=-1)
+        token_recipe_V = F.softmax(token_recipe_V, dim=-1)
 
-        # Top-K 선택
-        topk_scores, neuron_idx = torch.topk(final_scores, self.k, dim=-1)
-        neuron_weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
+        # 5. 동적 변환 행렬 생성
+        basis = self.shared_basis()  # [n_basis, D, rank]
 
-        # ========== 2. 선택된 뉴런으로 sparse representation ==========
+        # einsum: 토큰별 recipe와 basis 조합
+        W_Q = torch.einsum('bsn,ndr->bsdr', token_recipe_Q, basis)  # [B, S, D, rank]
+        W_K = torch.einsum('bsn,ndr->bsdr', token_recipe_K, basis)
+        W_V = torch.einsum('bsn,ndr->bsdr', token_recipe_V, basis)
 
-        # Recipe 가져오기
-        selected_recipe = self.neuron_recipe[neuron_idx]  # [B, S, k, n_basis]
-        selected_recipe = F.softmax(selected_recipe, dim=-1)
+        # 6. Q, K, V 생성
+        Q = torch.einsum('bsd,bsdr->bsr', x, W_Q)  # [B, S, rank]
+        K = torch.einsum('bsd,bsdr->bsr', x, W_K)
+        V = torch.einsum('bsd,bsdr->bsr', x, W_V)
 
-        # Token별 recipe (weighted sum)
-        token_recipe = (selected_recipe * neuron_weights.unsqueeze(-1)).sum(dim=2)
-        # [B, S, n_basis]
-
-        # Basis 조합으로 필터 생성
-        W_A = torch.einsum('bsn,ndr->bsdr', token_recipe, self.basis.basis_A)
-        # [B, S, d_model, basis_rank]
-
-        # 256 → 96 압축 (sparse semantic space)
-        v_semantic = torch.einsum('bsd,bsdr->bsr', x, W_A)
-        # [B, S, basis_rank=96]
-
-        # ========== 3. 96 → 256 복원 ==========
-        V = self.v_out(v_semantic)  # [B, S, 256]
-        V = self.dropout(V)
-
-        # ========== 4. Multi-head 형태로 reshape ==========
+        # 7. Multi-head reshape
+        Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)  # [B, H, S, d_head]
+        K = K.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
-        # [B, n_heads, S, d_head]
 
-        return V, neuron_idx
+        # 8. Attention
+        attn_scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_head)  # [B, H, S, S]
+
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [B, H, S, S]
+        attn_weights = self.dropout(attn_weights)
+
+        attn_out = attn_weights @ V  # [B, H, S, d_head]
+
+        # 9. Concat & Project
+        attn_out = attn_out.transpose(1, 2).reshape(B, S, self.basis_rank)  # [B, S, rank]
+        attn_out = self.W_o(attn_out)  # [B, S, D]
+
+        # Routing info for analysis
+        routing_info = {
+            'neuron_indices': topk_idx,  # [B, S, k]
+            'neuron_weights': weights,   # [B, S, k]
+        }
+
+        return attn_out, routing_info
 
 
-# ============================================
-# 3. DAWN Layer v7.3
-# ============================================
-class DAWNLayer(nn.Module):
-    """DAWN Layer with QK Attention Routing
-
-    구조:
-    1. Q, K 생성 및 Attention weights 계산
-    2. 원본 X + Attention으로 뉴런 선택 & 동적 V 생성
-    3. Attention 적용 (weights @ V)
-    4. Soft FFN (표준, 성능 보장)
+class TransformerBlock(nn.Module):
     """
-
-    def __init__(self, shared_basis, d_model=256, d_ff=1024,
-                 n_heads=4, n_neurons=96, neuron_k=8, dropout=0.1):
+    Transformer Block: NeuronBasedQKV + FFN
+    """
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        n_neurons: int,
+        neuron_k: int,
+        n_basis: int,
+        basis_rank: int,
+        shared_basis: SharedBasis,
+        dropout: float = 0.1
+    ):
         super().__init__()
-
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
         self.d_model = d_model
 
-        # Q, K projection (표준 Attention)
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.attn_out = nn.Linear(d_model, d_model)
-
-        # Neuron-based V 생성
-        self.neuron_value = NeuronBasedValue(
-            shared_basis=shared_basis,
-            n_neurons=n_neurons,
+        # Attention with dynamic Q/K/V
+        self.qkv_dynamic = NeuronBasedQKV(
             d_model=d_model,
             n_heads=n_heads,
+            n_neurons=n_neurons,
             neuron_k=neuron_k,
+            n_basis=n_basis,
+            basis_rank=basis_rank,
+            shared_basis=shared_basis,
             dropout=dropout
         )
 
-        # Soft FFN (표준)
+        # Standard FFN
         self.w_up = nn.Linear(d_model, d_ff)
         self.w_down = nn.Linear(d_ff, d_model)
 
+        # LayerNorm
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+
         self.dropout = nn.Dropout(dropout)
-        self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, mask=None, return_indices=False):
-        B, S, D = x.shape
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: [B, S, D]
+            mask: [B, 1, S, S]
 
-        # ========== Part 1: Attention with Dynamic V ==========
+        Returns:
+            x: [B, S, D]
+            routing_info: dict
+        """
+        # Attention with residual
         residual = x
-        normed = self.norm1(x)
-
-        # 1. Q, K 생성
-        Q = self.q_proj(normed).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
-        K = self.k_proj(normed).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
-        # [B, n_heads, S, d_head]
-
-        # 2. Attention weights 계산
-        attn_scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_head)
-        if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
-        attn_weights = F.softmax(attn_scores, dim=-1)  # [B, n_heads, S, S]
-        attn_weights_dropout = self.attn_dropout(attn_weights)
-
-        # 3. 원본 normed + attn_weights + K로 뉴런 선택 & V 생성
-        # 핵심: K 사용 (QK Attention 정보 재활용)
-        V, neuron_idx = self.neuron_value(normed, attn_weights, K)
-        # V: [B, n_heads, S, d_head]
-
-        # 4. Attention 적용
-        attn_out = (attn_weights_dropout @ V).transpose(1, 2).reshape(B, S, D)
-        attn_out = self.attn_out(attn_out)
+        x_norm = self.norm1(x)
+        attn_out, routing_info = self.qkv_dynamic(x_norm, mask)
         x = residual + self.dropout(attn_out)
 
-        # ========== Part 2: Soft FFN ==========
+        # FFN with residual
         residual = x
-        normed = self.norm2(x)
-
-        ffn_out = F.gelu(self.w_up(normed))
-        ffn_out = self.dropout(ffn_out)
-        ffn_out = self.w_down(ffn_out)
+        x_norm = self.norm2(x)
+        ffn_out = self.w_down(F.gelu(self.w_up(x_norm)))
         x = residual + self.dropout(ffn_out)
 
-        if return_indices:
-            return x, neuron_idx
-        return x
+        return x, routing_info
 
 
-# ============================================
-# 4. DAWN Model v7.5
-# ============================================
 class DAWN(nn.Module):
-    """DAWN v7.5 - QK Attention Routing + Soft FFN
-
-    핵심 혁신:
-    1. Router 제거 → QK Attention weights 재활용
-    2. 의미(X) + 문맥(Attention) 결합 뉴런 선택
-    3. 동적 V 생성 (256→96→256)
-    4. Softmax 비선형성만으로 충분
-    5. 파라미터 효율적 (~11M)
-
-    구조:
-    - Shared Basis: 전체 layer 공유, 고정
-    - Per Layer: QK Attention + Neuron V + Soft FFN
     """
+    DAWN v7.5 - Dynamic Q/K/V Generation
 
+    모든 Q/K/V를 뉴런 기반으로 동적 생성
+    """
     __version__ = "7.5"
 
-    def __init__(self, vocab_size, d_model=256, d_ff=1024,
-                 n_layers=4, n_heads=4,
-                 n_neurons=96, neuron_k=8,
-                 n_basis=32, basis_rank=96,
-                 max_seq_len=128, dropout=0.1, **kwargs):
+    def __init__(
+        self,
+        vocab_size: int = 30522,
+        d_model: int = 256,
+        n_layers: int = 4,
+        n_heads: int = 4,
+        d_ff: int = 1024,
+        max_seq_len: int = 128,
+        n_neurons: int = 96,
+        neuron_k: int = 8,
+        n_basis: int = 32,
+        basis_rank: int = 64,
+        dropout: float = 0.1,
+        **kwargs
+    ):
         super().__init__()
 
-        self.d_model = d_model
         self.vocab_size = vocab_size
+        self.d_model = d_model
         self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.d_ff = d_ff
+        self.max_seq_len = max_seq_len
         self.n_neurons = n_neurons
+        self.neuron_k = neuron_k
         self.n_basis = n_basis
         self.basis_rank = basis_rank
-
-        # ===== Shared Basis (전체 Layer 공유, 고정) =====
-        self.shared_basis = FixedOrthogonalBasis(
-            n_basis=n_basis,
-            d_model=d_model,
-            basis_rank=basis_rank
-        )
 
         # Embeddings
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
-        self.dropout = nn.Dropout(dropout)
 
-        # Causal mask (cached)
-        causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len))
-        self.register_buffer('causal_mask', causal_mask)
+        # Shared Basis (고정, 학습 안 함)
+        self.shared_basis = SharedBasis(n_basis, d_model, basis_rank)
 
-        # Layers
+        # Transformer Layers
         self.layers = nn.ModuleList([
-            DAWNLayer(
-                shared_basis=self.shared_basis,
+            TransformerBlock(
                 d_model=d_model,
-                d_ff=d_ff,
                 n_heads=n_heads,
+                d_ff=d_ff,
                 n_neurons=n_neurons,
                 neuron_k=neuron_k,
+                n_basis=n_basis,
+                basis_rank=basis_rank,
+                shared_basis=self.shared_basis,
                 dropout=dropout
             )
             for _ in range(n_layers)
@@ -357,225 +287,96 @@ class DAWN(nn.Module):
 
         # Output
         self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size, bias=False)
-        self.head.weight = self.token_emb.weight  # Weight tying
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-        # Config
-        self.config = {
-            'model_version': self.__version__,
-            'vocab_size': vocab_size,
-            'd_model': d_model,
-            'd_ff': d_ff,
-            'n_layers': n_layers,
-            'n_heads': n_heads,
-            'n_neurons': n_neurons,
-            'neuron_k': neuron_k,
-            'n_basis': n_basis,
-            'basis_rank': basis_rank,
-            'max_seq_len': max_seq_len,
-            'dropout': dropout,
-        }
+        # Causal mask
+        self.register_buffer(
+            'causal_mask',
+            torch.tril(torch.ones(max_seq_len, max_seq_len)).unsqueeze(0).unsqueeze(0)
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # Weight tying
+        self.lm_head.weight = self.token_emb.weight
 
         self._init_weights()
 
     def _init_weights(self):
+        """Initialize weights"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, std=0.02)
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+                    torch.nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, std=0.02)
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+                torch.nn.init.ones_(module.weight)
+                torch.nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, return_activations=False):
+    def forward(self, input_ids, labels=None, return_routing_info=False):
+        """
+        Args:
+            input_ids: [B, S]
+            labels: [B, S] (optional, for training)
+            return_routing_info: bool (for analysis)
+
+        Returns:
+            loss or logits, optionally with routing_info
+        """
         B, S = input_ids.shape
+        device = input_ids.device
 
         # Embeddings
-        pos = torch.arange(S, device=input_ids.device).unsqueeze(0)
-        x = self.token_emb(input_ids) + self.pos_emb(pos)
+        pos = torch.arange(S, device=device).unsqueeze(0)  # [1, S]
+        x = self.token_emb(input_ids) + self.pos_emb(pos)  # [B, S, D]
         x = self.dropout(x)
 
         # Causal mask
-        mask = self.causal_mask[:S, :S].unsqueeze(0).unsqueeze(0)
+        mask = self.causal_mask[:, :, :S, :S]  # [1, 1, S, S]
 
-        # Layers
-        all_neuron_idx = []
+        # Transformer layers
+        routing_infos = []
         for layer in self.layers:
-            if return_activations:
-                x, neuron_idx = layer(x, mask, return_indices=True)
-                all_neuron_idx.append(neuron_idx)
-            else:
-                x = layer(x, mask)
+            x, routing_info = layer(x, mask)
+            if return_routing_info:
+                routing_infos.append(routing_info)
 
         # Output
         x = self.norm(x)
-        logits = self.head(x)
+        logits = self.lm_head(x)  # [B, S, vocab_size]
 
-        if return_activations:
-            return logits, all_neuron_idx
-        return logits
-
-    def get_loss(self, input_ids, labels,
-                 diversity_weight=0.0, load_balance_weight=0.0, **kwargs):
-        """Compute loss with optional regularization"""
-        logits, neuron_indices = self.forward(input_ids, return_activations=True)
-
-        # CE loss
-        ce_loss = F.cross_entropy(
-            logits.view(-1, self.vocab_size),
-            labels.view(-1),
-            ignore_index=-100
-        )
-
-        total_loss = ce_loss
-        loss_dict = {'ce': ce_loss.item()}
-
-        # Load balance loss (optional)
-        if load_balance_weight > 0:
-            lb_loss = 0
-            for layer_indices in neuron_indices:
-                flat_idx = layer_indices.reshape(-1)
-                counts = torch.bincount(flat_idx, minlength=self.n_neurons).float()
-                freq = counts / (counts.sum() + 1e-10)
-                uniform = 1.0 / self.n_neurons
-                lb_loss += ((freq - uniform) ** 2).sum() * self.n_neurons
-            lb_loss = lb_loss / len(neuron_indices)
-            total_loss = total_loss + load_balance_weight * lb_loss
-            loss_dict['load_balance'] = lb_loss.item()
-
-        loss_dict['total'] = total_loss.item()
-
-        return total_loss, loss_dict, logits
-
-    def get_num_params(self):
-        """Count parameters"""
-        total = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-        # Basis (고정, 학습 X)
-        basis_params = sum(p.numel() for p in self.shared_basis.parameters())
-
-        # Per layer breakdown
-        layer_params = {}
-        if len(self.layers) > 0:
-            layer = self.layers[0]
-
-            # Attention (Q, K, Out)
-            attn_params = (
-                layer.q_proj.weight.numel() +
-                layer.k_proj.weight.numel() +
-                layer.attn_out.weight.numel()
+        # Loss
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, self.vocab_size),
+                labels.view(-1),
+                ignore_index=-100
             )
 
-            # Neuron V
-            neuron_params = (
-                layer.neuron_value.neuron_recipe.numel() +
-                layer.neuron_value.neuron_context_pattern.numel() +
-                layer.neuron_value.v_out.weight.numel() +
-                layer.neuron_value.v_out.bias.numel()
-            )
+        if return_routing_info:
+            return (loss, logits, routing_infos) if labels is not None else (logits, routing_infos)
+        else:
+            return (loss, logits) if labels is not None else logits
 
-            # FFN
-            ffn_params = (
-                layer.w_up.weight.numel() + layer.w_up.bias.numel() +
-                layer.w_down.weight.numel() + layer.w_down.bias.numel()
-            )
+    def count_parameters(self):
+        """Count trainable parameters"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-            layer_params = {
-                'attention': attn_params,
-                'neuron_v': neuron_params,
-                'ffn': ffn_params,
-                'total_per_layer': attn_params + neuron_params + ffn_params
-            }
-
+    def get_config(self):
+        """Get model configuration"""
         return {
-            'total': total,
-            'trainable': trainable,
-            'basis': basis_params,
-            'per_layer': layer_params,
-            'embeddings': self.token_emb.weight.numel() + self.pos_emb.weight.numel(),
+            'model_version': self.__version__,
+            'vocab_size': self.vocab_size,
+            'd_model': self.d_model,
+            'n_layers': self.n_layers,
+            'n_heads': self.n_heads,
+            'd_ff': self.d_ff,
+            'max_seq_len': self.max_seq_len,
+            'n_neurons': self.n_neurons,
+            'neuron_k': self.neuron_k,
+            'n_basis': self.n_basis,
+            'basis_rank': self.basis_rank,
         }
-
-
-# ============================================
-# Convenience exports
-# ============================================
-DAWNLanguageModel = DAWN
-
-
-# ============================================
-# Test
-# ============================================
-if __name__ == "__main__":
-    print("=" * 60)
-    print("DAWN v7.5 - QK Attention Routing + Soft FFN")
-    print("=" * 60)
-
-    config = {
-        'vocab_size': 30522,
-        'd_model': 256,
-        'd_ff': 1024,
-        'n_layers': 4,
-        'n_heads': 4,
-        'n_neurons': 96,
-        'neuron_k': 8,
-        'n_basis': 32,
-        'basis_rank': 96,
-        'max_seq_len': 128,
-        'dropout': 0.1,
-    }
-
-    model = DAWN(**config)
-    params = model.get_num_params()
-
-    print(f"\n📊 Parameters:")
-    print(f"  Total: {params['total']:,}")
-    print(f"  Trainable: {params['trainable']:,}")
-    print(f"  Embeddings: {params['embeddings']:,}")
-    print(f"  Basis (fixed): {params['basis']:,}")
-
-    if 'per_layer' in params and params['per_layer']:
-        print(f"\n📊 Per Layer:")
-        print(f"  Attention (Q,K,Out): {params['per_layer']['attention']:,}")
-        print(f"  Neuron V: {params['per_layer']['neuron_v']:,}")
-        print(f"  FFN: {params['per_layer']['ffn']:,}")
-        print(f"  Total: {params['per_layer']['total_per_layer']:,}")
-        print(f"  4 Layers: {params['per_layer']['total_per_layer'] * 4:,}")
-
-    # Target comparison
-    target = 11_000_000
-    diff = params['total'] - target
-    print(f"\n🎯 Target: {target:,}")
-    print(f"   Current: {params['total']:,}")
-    print(f"   Diff: {diff:+,} ({diff/target*100:+.1f}%)")
-
-    # Test forward
-    print(f"\n📊 Forward Pass:")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-
-    batch_size = 2
-    seq_len = 64
-    input_ids = torch.randint(0, config['vocab_size'], (batch_size, seq_len)).to(device)
-    labels = torch.randint(0, config['vocab_size'], (batch_size, seq_len)).to(device)
-
-    # Forward
-    logits, neuron_indices = model(input_ids, return_activations=True)
-    print(f"  Input: {input_ids.shape}")
-    print(f"  Output: {logits.shape}")
-    print(f"  Neuron indices: {neuron_indices[0].shape}")
-
-    # Loss
-    loss, loss_dict, _ = model.get_loss(input_ids, labels, load_balance_weight=0.01)
-    print(f"  Loss: {loss.item():.4f}")
-    print(f"  Loss dict: {loss_dict}")
-
-    # Neuron usage analysis
-    all_used = torch.cat([idx.reshape(-1) for idx in neuron_indices])
-    unique, counts = torch.unique(all_used, return_counts=True)
-    print(f"\n📊 Neuron Usage:")
-    print(f"  Active neurons: {len(unique)}/{config['n_neurons']}")
-    print(f"  Usage rate: {len(unique)/config['n_neurons']*100:.1f}%")
