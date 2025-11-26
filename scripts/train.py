@@ -955,7 +955,7 @@ def main():
 
         ckpt_manager.save_checkpoint(
             model, optimizer, epoch, val_loss, metrics, is_best=is_best,
-            scheduler=scheduler, scaler=scaler
+            scheduler=scheduler, scaler=scaler, model_config=model_kwargs
         )
 
     print(f"\n{'='*60}")

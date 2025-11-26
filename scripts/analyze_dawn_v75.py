@@ -457,9 +457,34 @@ def main():
     # Load model
     from models import create_model_by_version
 
-    model_config = checkpoint['config']
-    model = create_model_by_version(model_config['model_version'], model_config)
-    model.load_state_dict(checkpoint['model'])
+    # Get model config (with backward compatibility)
+    if 'config' in checkpoint:
+        model_config = checkpoint['config']
+        model_version = model_config.get('model_version', checkpoint.get('model_version', '7.5'))
+    else:
+        # Backward compatibility: infer config from checkpoint
+        print("⚠️  Warning: No config found in checkpoint. Using defaults for v7.5")
+        model_version = checkpoint.get('model_version', '7.5')
+        model_config = {
+            'vocab_size': 30522,  # BERT vocab
+            'd_model': 256,
+            'n_layers': 4,
+            'n_heads': 4,
+            'n_neurons': 96,
+            'neuron_k': 8,
+            'n_basis': 32,
+            'basis_rank': 96,
+            'd_ff': 1024,
+            'max_seq_len': 128,
+            'dropout': 0.1,
+        }
+        model_config['model_version'] = model_version
+
+    model = create_model_by_version(model_version, model_config)
+
+    # Load state dict
+    state_dict_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'model'
+    model.load_state_dict(checkpoint[state_dict_key])
     model = model.to(device)
     model.eval()
 
@@ -483,7 +508,8 @@ def main():
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 
-    val_dataset = TextDataset(val_texts, tokenizer, max_length=model_config['max_seq_len'])
+    max_seq_len = model_config.get('max_seq_len', 128)
+    val_dataset = TextDataset(val_texts, tokenizer, max_length=max_seq_len)
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
