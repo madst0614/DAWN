@@ -99,7 +99,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 else:
                     # v7.5+: Dynamic Q/K/V with routing
                     # v6.0: compatibility
-                    if hasattr(model, '__version__') and model.__version__ in ["7.5", "7.6"]:
+                    # Robust version detection: check for qkv_dynamic (v7.5/v7.6) or model version
+                    is_v75_or_v76 = (
+                        (hasattr(model, '__version__') and model.__version__ in ["7.5", "7.6"]) or
+                        (hasattr(model, 'layers') and len(model.layers) > 0 and hasattr(model.layers[0], 'qkv_dynamic'))
+                    )
+                    if is_v75_or_v76:
                         # v7.5/v7.6: Get routing info for load balance loss
                         if load_balance_weight > 0:
                             ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
@@ -189,7 +194,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             else:
                 # v7.5+: Dynamic Q/K/V with routing
                 # v6.0: compatibility
-                if hasattr(model, '__version__') and model.__version__ in ["7.5", "7.6"]:
+                # Robust version detection: check for qkv_dynamic (v7.5/v7.6) or model version
+                is_v75_or_v76 = (
+                    (hasattr(model, '__version__') and model.__version__ in ["7.5", "7.6"]) or
+                    (hasattr(model, 'layers') and len(model.layers) > 0 and hasattr(model.layers[0], 'qkv_dynamic'))
+                )
+                if is_v75_or_v76:
                     # v7.5/v7.6: Get routing info for load balance loss
                     if load_balance_weight > 0:
                         ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
