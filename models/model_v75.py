@@ -271,7 +271,7 @@ class DAWN(nn.Module):
         n_heads: int = 4,
         d_ff: int = 1024,
         max_seq_len: int = 128,
-        n_neurons: int = 96,
+        n_neurons: int = 128,
         neuron_k: int = 8,
         n_basis: int = 32,
         basis_rank: int = 64,

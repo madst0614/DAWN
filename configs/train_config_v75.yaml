@@ -15,7 +15,7 @@ model:
   n_heads: 4              # Number of attention heads
 
   # Neuron routing (x만 보고 선택, 깔끔한 설계)
-  n_neurons: 96           # Size of neuron pool per layer
+  n_neurons: 128          # Size of neuron pool per layer
   neuron_k: 8             # Top-k neurons to select
 
   # Basis parameters (공유 basis로 동적 Q/K/V 생성)
