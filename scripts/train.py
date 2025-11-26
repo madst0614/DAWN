@@ -869,7 +869,7 @@ def main():
             model_kwargs['mod_rank'] = args.mod_rank
 
     # Create model
-    if model_version in ['7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
