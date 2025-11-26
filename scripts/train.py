@@ -759,6 +759,7 @@ def main():
 
     # Load model config from checkpoint folder or checkpoint file if resuming
     checkpoint_config = None
+    checkpoint_training_config = None
     if resume_checkpoint and resume_checkpoint.exists():
         print(f"\n📌 Resuming from checkpoint: {resume_checkpoint}")
 
@@ -768,7 +769,8 @@ def main():
             import json
             with open(config_json_path, 'r') as f:
                 saved_cfg = json.load(f)
-                checkpoint_config = saved_cfg['model']
+                checkpoint_config = saved_cfg.get('model')
+                checkpoint_training_config = saved_cfg.get('training')
                 print(f"✅ Found config.json in checkpoint folder")
         else:
             # Fallback: load config from checkpoint file
@@ -784,6 +786,25 @@ def main():
     if checkpoint_config:
         model_version = checkpoint_config.get('model_version', getattr(args, 'model_version', '7.1'))
         print(f"📌 Using checkpoint config (version: {model_version})")
+
+        # Update args with checkpoint config to ensure consistency
+        args.model_version = model_version
+        args.d_model = checkpoint_config.get('d_model', args.d_model)
+        args.n_layers = checkpoint_config.get('n_layers', args.n_layers)
+        args.n_heads = checkpoint_config.get('n_heads', args.n_heads)
+        args.n_neurons = checkpoint_config.get('n_neurons', args.n_neurons)
+        args.k = checkpoint_config.get('neuron_k', args.k)
+        args.n_basis = checkpoint_config.get('n_basis', args.n_basis)
+        args.basis_rank = checkpoint_config.get('basis_rank', args.basis_rank)
+        args.d_ff = checkpoint_config.get('d_ff', args.d_ff)
+        args.max_seq_len = checkpoint_config.get('max_seq_len', args.max_seq_len)
+        args.dropout = checkpoint_config.get('dropout', args.dropout)
+
+        # Update training config if available
+        if checkpoint_training_config:
+            args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
+            args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
+            args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
     else:
         model_version = getattr(args, 'model_version', '7.1')
         print(f"📌 Using YAML config (version: {model_version})")
@@ -794,10 +815,14 @@ def main():
         model_kwargs = checkpoint_config.copy()
         # Update vocab_size from current tokenizer (may differ)
         model_kwargs['vocab_size'] = vocab_size
-        print(f"   Parameters from checkpoint:")
+        print(f"   Model parameters from checkpoint:")
         print(f"   - n_neurons: {model_kwargs.get('n_neurons', 'N/A')}")
         print(f"   - basis_rank: {model_kwargs.get('basis_rank', 'N/A')}")
         print(f"   - n_basis: {model_kwargs.get('n_basis', 'N/A')}")
+        if checkpoint_training_config:
+            print(f"   Training config from checkpoint:")
+            print(f"   - orthogonality_weight: {args.orthogonality_weight}")
+            print(f"   - load_balance_weight: {args.load_balance_weight}")
     elif model_version == 'baseline':
         # Baseline: only standard transformer parameters
         model_kwargs = {
