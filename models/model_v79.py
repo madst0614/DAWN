@@ -62,10 +62,17 @@ class NeuronCircuit(nn.Module):
 
     def _init_weights(self):
         """직교 초기화"""
-        # InputNeuron: 직교 행렬로 초기화
+        # InputNeuron: 직교 행렬로 초기화 [n_input, d_model, rank]
         for i in range(self.n_input):
-            q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
-            self.input_neurons.data[i] = q
+            # QR decomposition: if d_model >= rank, Q is [d_model, rank]
+            # if d_model < rank, we need to transpose approach
+            if self.d_model >= self.rank:
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.input_neurons.data[i] = q
+            else:
+                # Create [rank, d_model] orthogonal, then transpose
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.input_neurons.data[i] = q.T  # [d_model, rank]
 
         # ProcessNeuron: 단위 벡터로 초기화 (랜덤 방향)
         for i in range(self.n_process):
@@ -73,10 +80,16 @@ class NeuronCircuit(nn.Module):
             v = v / (v.norm() + 1e-8)
             self.process_neurons.data[i] = v
 
-        # OutputNeuron: 직교 행렬로 초기화
+        # OutputNeuron: 직교 행렬로 초기화 [n_output, rank, d_model]
         for i in range(self.n_output):
-            q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
-            self.output_neurons.data[i] = q.T  # [rank, d_model]
+            # Need [rank, d_model] matrix
+            if self.rank >= self.d_model:
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.output_neurons.data[i] = q
+            else:
+                # Create [d_model, rank] orthogonal, then transpose
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.output_neurons.data[i] = q.T  # [rank, d_model]
 
     def apply_householder(self, x, v):
         """
