@@ -152,6 +152,10 @@ class NeuronBasedQKV(nn.Module):
         Returns:
             attn_out: [B, S, D]
             routing_info: dict
+
+        Memory-optimized: Project all neurons first, then gather selected.
+        Before: W[topk_idx] creates [B, S, k, D, rank] = huge
+        After: x @ W creates [B, S, n_neurons, rank] = much smaller
         """
         B, S, D = x.shape
 
@@ -160,21 +164,24 @@ class NeuronBasedQKV(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 2. 선택된 뉴런의 W 가져오기
-        W_Q = self.neuron_bank.get_W_Q(topk_idx)  # [B, S, k, D, rank]
-        W_K = self.neuron_bank.get_W_K(topk_idx)
-        W_V = self.neuron_bank.get_W_V(topk_idx)
+        # 2. 전체 뉴런 projection 먼저 계산 (메모리 효율적)
+        # W_Q: [n_neurons, D, rank] -> all_Q: [B, S, n_neurons, rank]
+        all_Q = torch.einsum('bsd,ndr->bsnr', x, self.neuron_bank.W_Q)
+        all_K = torch.einsum('bsd,ndr->bsnr', x, self.neuron_bank.W_K)
+        all_V = torch.einsum('bsd,ndr->bsnr', x, self.neuron_bank.W_V)
 
-        # 3. 가중 평균으로 W 혼합 (뉴런 레벨에서만)
-        weights_expanded = weights.unsqueeze(-1).unsqueeze(-1)  # [B, S, k, 1, 1]
-        W_Q_mixed = (W_Q * weights_expanded).sum(dim=2)  # [B, S, D, rank]
-        W_K_mixed = (W_K * weights_expanded).sum(dim=2)
-        W_V_mixed = (W_V * weights_expanded).sum(dim=2)
+        # 3. 선택된 뉴런만 gather
+        # topk_idx: [B, S, k] -> expand to [B, S, k, rank]
+        idx_expanded = topk_idx.unsqueeze(-1).expand(B, S, self.k, self.rank)
+        Q_selected = all_Q.gather(2, idx_expanded)  # [B, S, k, rank]
+        K_selected = all_K.gather(2, idx_expanded)
+        V_selected = all_V.gather(2, idx_expanded)
 
-        # 4. Projection
-        Q = torch.einsum('bsd,bsdr->bsr', x, W_Q_mixed)  # [B, S, rank]
-        K = torch.einsum('bsd,bsdr->bsr', x, W_K_mixed)
-        V = torch.einsum('bsd,bsdr->bsr', x, W_V_mixed)
+        # 4. 가중 평균으로 혼합
+        weights_expanded = weights.unsqueeze(-1)  # [B, S, k, 1]
+        Q = (Q_selected * weights_expanded).sum(dim=2)  # [B, S, rank]
+        K = (K_selected * weights_expanded).sum(dim=2)
+        V = (V_selected * weights_expanded).sum(dim=2)
 
         # 5. Multi-head reshape
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -195,10 +202,12 @@ class NeuronBasedQKV(nn.Module):
         # 7. Concat
         attn_out = attn_out.transpose(1, 2).reshape(B, S, self.rank)  # [B, S, rank]
 
-        # 8. O projection - W_O 가중 평균
-        W_O = self.neuron_bank.get_W_O(topk_idx)  # [B, S, k, rank, D]
-        W_O_mixed = (W_O * weights_expanded).sum(dim=2)  # [B, S, rank, D]
-        attn_out = torch.einsum('bsr,bsrd->bsd', attn_out, W_O_mixed)  # [B, S, D]
+        # 8. O projection - 전체 계산 후 gather
+        # W_O: [n_neurons, rank, D] -> all_O: [B, S, n_neurons, D]
+        all_O = torch.einsum('bsr,nrd->bsnd', attn_out, self.neuron_bank.W_O)
+        idx_expanded_d = topk_idx.unsqueeze(-1).expand(B, S, self.k, D)
+        O_selected = all_O.gather(2, idx_expanded_d)  # [B, S, k, D]
+        attn_out = (O_selected * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         routing_info = {
             'neuron_indices': topk_idx,
