@@ -41,10 +41,23 @@ from models.model_v79 import DAWN
 try:
     import matplotlib.pyplot as plt
     import matplotlib
-    matplotlib.use('Agg')
+    # Check if running in notebook/Colab
+    try:
+        from IPython import get_ipython
+        if get_ipython() is not None:
+            IN_NOTEBOOK = True
+            # Use inline backend for notebooks
+            get_ipython().run_line_magic('matplotlib', 'inline')
+        else:
+            IN_NOTEBOOK = False
+            matplotlib.use('Agg')
+    except (ImportError, AttributeError):
+        IN_NOTEBOOK = False
+        matplotlib.use('Agg')
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
+    IN_NOTEBOOK = False
     print("Warning: matplotlib not available")
 
 try:
@@ -636,7 +649,10 @@ class SemanticAnalyzer:
         plt.colorbar(im, ax=axes[-1])
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'token_neuron_heatmap.png'), dpi=150)
-        plt.close()
+        if IN_NOTEBOOK:
+            plt.show()
+        else:
+            plt.close()
         print(f"    Saved: token_neuron_heatmap.png")
 
         # 2. Neuron clustering t-SNE
@@ -665,7 +681,10 @@ class SemanticAnalyzer:
 
             plt.tight_layout()
             plt.savefig(os.path.join(output_dir, 'neuron_tsne.png'), dpi=150)
-            plt.close()
+            if IN_NOTEBOOK:
+                plt.show()
+            else:
+                plt.close()
             print(f"    Saved: neuron_tsne.png")
 
         # 3. Position-based activation
@@ -693,7 +712,10 @@ class SemanticAnalyzer:
         plt.colorbar(im, ax=axes[-1])
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'position_neuron_pattern.png'), dpi=150)
-        plt.close()
+        if IN_NOTEBOOK:
+            plt.show()
+        else:
+            plt.close()
         print(f"    Saved: position_neuron_pattern.png")
 
         # 4. Layer specialization comparison
@@ -717,7 +739,10 @@ class SemanticAnalyzer:
 
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'layer_neuron_usage.png'), dpi=150)
-        plt.close()
+        if IN_NOTEBOOK:
+            plt.show()
+        else:
+            plt.close()
         print(f"    Saved: layer_neuron_usage.png")
 
         print(f"\n  All visualizations saved to: {output_dir}")
