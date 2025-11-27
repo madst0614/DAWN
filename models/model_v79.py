@@ -340,7 +340,8 @@ class NeuronCircuitQKV(nn.Module):
     """
     NeuronCircuit 기반 동적 Q/K/V/O 생성
 
-    각 Q/K/V/O에 대해 별도의 NeuronCircuit 사용
+    Q/K/V: d_model -> rank (compression only)
+    O: rank -> d_model (expansion only)
     """
     def __init__(
         self,
@@ -360,10 +361,12 @@ class NeuronCircuitQKV(nn.Module):
         self.d_head = rank // n_heads
         self.rank = rank
 
-        # Q/K/V/O 각각에 대한 NeuronCircuit
+        # Q/K/V: d_model -> rank (use input + process only)
         self.circuit_Q = NeuronCircuit(d_model, rank, n_input, n_process, n_output)
         self.circuit_K = NeuronCircuit(d_model, rank, n_input, n_process, n_output)
         self.circuit_V = NeuronCircuit(d_model, rank, n_input, n_process, n_output)
+
+        # O: rank -> d_model (use output only)
         self.circuit_O = NeuronCircuit(rank, d_model, n_input, n_process, n_output)
 
         # 공유 라우터 (Q/K/V 동일한 routing 사용)
@@ -401,27 +404,22 @@ class NeuronCircuitQKV(nn.Module):
 
         if use_soft:
             input_weights = routing_info['input_weights']
-            output_weights = routing_info['output_weights']
             input_idx = None
-            output_idx = None
         else:
             input_weights = None
-            output_weights = None
             input_idx = routing_info['input_idx']
-            output_idx = routing_info['output_idx']
 
         process_indices = routing_info['process_indices']
 
-        # 2. Q/K/V 생성 via NeuronCircuit
-        Q = self.circuit_Q(
-            x, input_idx, input_weights, process_indices, output_idx, output_weights
-        )  # [B, S, rank]
-        K = self.circuit_K(
-            x, input_idx, input_weights, process_indices, output_idx, output_weights
-        )
-        V = self.circuit_V(
-            x, input_idx, input_weights, process_indices, output_idx, output_weights
-        )
+        # 2. Q/K/V 생성: d_model -> rank (input + process only, skip output)
+        Q = self.circuit_Q.forward_input(x, input_idx, input_weights)
+        Q = self.circuit_Q.forward_process(Q, process_indices)
+
+        K = self.circuit_K.forward_input(x, input_idx, input_weights)
+        K = self.circuit_K.forward_process(K, process_indices)
+
+        V = self.circuit_V.forward_input(x, input_idx, input_weights)
+        V = self.circuit_V.forward_process(V, process_indices)
 
         # 3. Multi-head reshape
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -442,22 +440,21 @@ class NeuronCircuitQKV(nn.Module):
         # 5. Concat
         attn_out = attn_out.transpose(1, 2).reshape(B, S, self.rank)  # [B, S, rank]
 
-        # 6. O projection via NeuronCircuit (rank → d_model)
+        # 6. O projection: rank -> d_model (use input projection only)
+        # circuit_O is NeuronCircuit(rank, d_model), so forward_input does rank -> d_model
         routing_info_O = self.router_O(attn_out)
         if 'input_weights' in routing_info_O:
-            attn_out = self.circuit_O(
-                attn_out,
-                input_weights=routing_info_O['input_weights'],
-                process_indices=routing_info_O['process_indices'],
-                output_weights=routing_info_O['output_weights'],
-            )
+            input_weights_O = routing_info_O['input_weights']
+            input_idx_O = None
         else:
-            attn_out = self.circuit_O(
-                attn_out,
-                input_idx=routing_info_O['input_idx'],
-                process_indices=routing_info_O['process_indices'],
-                output_idx=routing_info_O['output_idx'],
-            )
+            input_weights_O = None
+            input_idx_O = routing_info_O['input_idx']
+
+        process_indices_O = routing_info_O['process_indices']
+
+        # O: rank -> d_model (input + process, but process is on d_model space now)
+        attn_out = self.circuit_O.forward_input(attn_out, input_idx_O, input_weights_O)
+        attn_out = self.circuit_O.forward_process(attn_out, process_indices_O)
 
         routing_info['routing_O'] = routing_info_O
 
