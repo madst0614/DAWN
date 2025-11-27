@@ -7,16 +7,18 @@ DAWN v7.9 - NeuronCircuit with Householder Transformations
 - Input/Process/Output 블록 분리
 
 구조:
-    InputNeuron: [n_input, d_model, rank] - 256차원 → 64차원 압축
-    ProcessNeuron: [n_process, rank] - Householder 반사 벡터
-    OutputNeuron: [n_output, rank, d_model] - 64차원 → 256차원 복원
+    NeuronCircuitDown (Q/K/V용): d_model → rank 압축
+        - InputNeuron: [n_input, d_model, rank]
+        - ProcessNeuron: [n_process, rank] (Householder on rank space)
+
+    NeuronCircuitUp (O용): rank → d_model 복원
+        - OutputNeuron: [n_output, rank, d_model]
+        - ProcessNeuron: [n_process, d_model] (Householder on d_model space)
 
 v7.8 대비 변경점:
-- NeuronBank → NeuronCircuit (Input/Process/Output 분리)
+- NeuronBank → NeuronCircuitDown/Up (명확한 방향성)
 - Householder 변환으로 직교성 자동 유지
-- 파라미터 감소: ~264K (v7.7 basis 540K보다 적음)
-
-조합 수: n_input × C(n_process, k) × n_output = 8 × C(32,3) × 8 = 317K 조합
+- 불필요한 파라미터 제거 (Down에서 OutputNeuron, Up에서 InputNeuron)
 """
 
 import torch
@@ -25,13 +27,12 @@ import torch.nn.functional as F
 import math
 
 
-class NeuronCircuit(nn.Module):
+class NeuronCircuitDown(nn.Module):
     """
-    NeuronCircuit: Input/Process/Output 분리 구조
+    NeuronCircuitDown: d_model → rank 압축용 (Q/K/V)
 
     - InputNeuron: 차원 압축 (d_model → rank)
-    - ProcessNeuron: Householder 변환 벡터들
-    - OutputNeuron: 차원 복원 (rank → d_model)
+    - ProcessNeuron: Householder 변환 (rank space)
     """
     def __init__(
         self,
@@ -39,299 +40,275 @@ class NeuronCircuit(nn.Module):
         rank: int = 64,
         n_input: int = 8,
         n_process: int = 32,
-        n_output: int = 8,
     ):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
         self.n_input = n_input
         self.n_process = n_process
-        self.n_output = n_output
 
         # InputNeuron: [n_input, d_model, rank] - 차원 압축
         self.input_neurons = nn.Parameter(torch.zeros(n_input, d_model, rank))
 
-        # ProcessNeuron: [n_process, rank] - Householder 반사 벡터
+        # ProcessNeuron: [n_process, rank] - Householder 반사 벡터 (rank space)
         self.process_neurons = nn.Parameter(torch.zeros(n_process, rank))
 
-        # OutputNeuron: [n_output, rank, d_model] - 차원 복원
-        self.output_neurons = nn.Parameter(torch.zeros(n_output, rank, d_model))
-
-        # 초기화
         self._init_weights()
 
     def _init_weights(self):
         """직교 초기화"""
         # InputNeuron: 직교 행렬로 초기화 [n_input, d_model, rank]
         for i in range(self.n_input):
-            # QR decomposition: if d_model >= rank, Q is [d_model, rank]
-            # if d_model < rank, we need to transpose approach
             if self.d_model >= self.rank:
                 q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
                 self.input_neurons.data[i] = q
             else:
-                # Create [rank, d_model] orthogonal, then transpose
                 q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
-                self.input_neurons.data[i] = q.T  # [d_model, rank]
+                self.input_neurons.data[i] = q.T
 
-        # ProcessNeuron: 단위 벡터로 초기화 (랜덤 방향)
+        # ProcessNeuron: 단위 벡터로 초기화
         for i in range(self.n_process):
             v = torch.randn(self.rank)
             v = v / (v.norm() + 1e-8)
             self.process_neurons.data[i] = v
 
-        # OutputNeuron: 직교 행렬로 초기화 [n_output, rank, d_model]
-        for i in range(self.n_output):
-            # Need [rank, d_model] matrix
-            if self.rank >= self.d_model:
-                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
-                self.output_neurons.data[i] = q
-            else:
-                # Create [d_model, rank] orthogonal, then transpose
-                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
-                self.output_neurons.data[i] = q.T  # [rank, d_model]
-
     def apply_householder(self, x, v):
-        """
-        Householder 변환 적용
-
-        H = I - 2 * v @ v.T / ||v||²
-        H @ x = x - 2 * v * (v.T @ x) / ||v||²
-
-        Args:
-            x: [..., rank]
-            v: [rank] or [..., rank]
-
-        Returns:
-            H @ x: [..., rank]
-        """
-        # v 정규화
-        v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-8  # [..., 1]
-        v_normalized = v / v_norm_sq.sqrt()  # [..., rank]
-
-        # v.T @ x
-        vTx = (x * v_normalized).sum(dim=-1, keepdim=True)  # [..., 1]
-
-        # H @ x = x - 2 * v * (v.T @ x)
+        """Householder 변환: H @ x = x - 2 * v * (v.T @ x) / ||v||²"""
+        v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-8
+        v_normalized = v / v_norm_sq.sqrt()
+        vTx = (x * v_normalized).sum(dim=-1, keepdim=True)
         return x - 2 * v_normalized * vTx
 
-    def forward_input(self, x, input_idx=None, input_weights=None):
+    def forward(self, x, input_idx=None, input_weights=None, process_indices=None):
         """
-        Input projection: d_model → rank
-
         Args:
             x: [B, S, d_model]
-            input_idx: [B, S] - hard selection (1개 선택)
-            input_weights: [B, S, n_input] - soft selection (가중 평균)
+            input_idx: [B, S] - hard selection
+            input_weights: [B, S, n_input] - soft selection
+            process_indices: [B, S, k] - Householder indices
 
         Returns:
-            projected: [B, S, rank]
+            output: [B, S, rank]
         """
         B, S, D = x.shape
 
+        # 1. Input projection: d_model → rank
         if input_weights is not None:
-            # Soft selection: 모든 input neuron으로 projection 후 가중 평균
-            # x @ input_neurons: [B, S, n_input, rank]
             all_proj = torch.einsum('bsd,ndr->bsnr', x, self.input_neurons)
-            # 가중 평균
-            weights = input_weights.unsqueeze(-1)  # [B, S, n_input, 1]
-            return (all_proj * weights).sum(dim=2)  # [B, S, rank]
+            weights = input_weights.unsqueeze(-1)
+            x = (all_proj * weights).sum(dim=2)
         else:
-            # Hard selection
-            # 선택된 input neuron만 gather
-            # input_neurons[input_idx]: [B, S, D, rank]
-            selected = self.input_neurons[input_idx]  # [B, S, D, rank]
-            return torch.einsum('bsd,bsdr->bsr', x, selected)  # [B, S, rank]
+            selected = self.input_neurons[input_idx]
+            x = torch.einsum('bsd,bsdr->bsr', x, selected)
 
-    def forward_process(self, x, process_indices):
-        """
-        Process: Householder 변환 순차 적용
-
-        Args:
-            x: [B, S, rank]
-            process_indices: [B, S, k] - 선택된 process neuron indices
-
-        Returns:
-            transformed: [B, S, rank]
-        """
-        B, S, _ = x.shape
-        k = process_indices.shape[-1]
-
-        # 선택된 Householder 벡터들 gather
-        # process_neurons: [n_process, rank]
-        # process_indices: [B, S, k]
-        # 결과: [B, S, k, rank]
-        idx_expanded = process_indices.unsqueeze(-1).expand(B, S, k, self.rank)
-        selected_v = self.process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
-        selected_v = selected_v.gather(2, idx_expanded)  # [B, S, k, rank]
-
-        # 순차적으로 Householder 변환 적용
-        for i in range(k):
-            v = selected_v[:, :, i, :]  # [B, S, rank]
-            x = self.apply_householder(x, v)
-
-        return x
-
-    def forward_output(self, x, output_idx=None, output_weights=None):
-        """
-        Output projection: rank → d_model
-
-        Args:
-            x: [B, S, rank]
-            output_idx: [B, S] - hard selection
-            output_weights: [B, S, n_output] - soft selection
-
-        Returns:
-            projected: [B, S, d_model]
-        """
-        B, S, _ = x.shape
-
-        if output_weights is not None:
-            # Soft selection
-            # x @ output_neurons: [B, S, n_output, d_model]
-            all_proj = torch.einsum('bsr,nrd->bsnd', x, self.output_neurons)
-            weights = output_weights.unsqueeze(-1)  # [B, S, n_output, 1]
-            return (all_proj * weights).sum(dim=2)  # [B, S, d_model]
-        else:
-            # Hard selection
-            selected = self.output_neurons[output_idx]  # [B, S, rank, d_model]
-            return torch.einsum('bsr,bsrd->bsd', x, selected)  # [B, S, d_model]
-
-    def forward(self, x, input_idx=None, input_weights=None,
-                process_indices=None, output_idx=None, output_weights=None):
-        """
-        Full forward pass
-
-        Args:
-            x: [B, S, d_model]
-            input_idx/input_weights: Input neuron selection
-            process_indices: [B, S, k] Process neuron indices
-            output_idx/output_weights: Output neuron selection
-
-        Returns:
-            output: [B, S, d_model]
-        """
-        # 1. Input projection
-        x = self.forward_input(x, input_idx, input_weights)
-
-        # 2. Process (Householder transforms)
+        # 2. Process: Householder transforms on rank space
         if process_indices is not None:
-            x = self.forward_process(x, process_indices)
+            k = process_indices.shape[-1]
+            idx_expanded = process_indices.unsqueeze(-1).expand(B, S, k, self.rank)
+            selected_v = self.process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+            selected_v = selected_v.gather(2, idx_expanded)
 
-        # 3. Output projection
-        x = self.forward_output(x, output_idx, output_weights)
+            for i in range(k):
+                v = selected_v[:, :, i, :]
+                x = self.apply_householder(x, v)
 
         return x
 
     def orthogonality_loss(self):
-        """
-        Input/Output Neuron의 직교성 유지 loss
-
-        W @ W.T ≈ I 유지
-        """
-        loss = 0.0
-
-        # InputNeuron: [n_input, D, rank]
-        # W.T @ W: [n_input, rank, rank]
-        WtW_in = torch.bmm(
+        """InputNeuron 직교성 유지"""
+        WtW = torch.bmm(
             self.input_neurons.transpose(-1, -2),
             self.input_neurons
-        )  # [n_input, rank, rank]
+        )
         I = torch.eye(self.rank, device=self.input_neurons.device).unsqueeze(0)
-        loss += ((WtW_in - I) ** 2).mean()
-
-        # OutputNeuron: [n_output, rank, D]
-        WtW_out = torch.bmm(
-            self.output_neurons,
-            self.output_neurons.transpose(-1, -2)
-        )  # [n_output, rank, rank]
-        loss += ((WtW_out - I) ** 2).mean()
-
-        return loss / 2
+        return ((WtW - I) ** 2).mean()
 
     def process_norm_loss(self):
-        """
-        ProcessNeuron 벡터의 norm 유지 loss
-
-        ||v|| ≈ 1 유지 (Householder 안정성)
-        """
-        norms = self.process_neurons.norm(dim=-1)  # [n_process]
+        """ProcessNeuron ||v|| ≈ 1 유지"""
+        norms = self.process_neurons.norm(dim=-1)
         return ((norms - 1.0) ** 2).mean()
 
 
-class CircuitRouter(nn.Module):
+class NeuronCircuitUp(nn.Module):
     """
-    NeuronCircuit용 라우터
+    NeuronCircuitUp: rank → d_model 복원용 (O projection)
 
-    입력 x로부터 Input/Process/Output neuron 선택
+    - OutputNeuron: 차원 복원 (rank → d_model)
+    - ProcessNeuron: Householder 변환 (d_model space)
     """
+    def __init__(
+        self,
+        rank: int = 64,
+        d_model: int = 256,
+        n_output: int = 8,
+        n_process: int = 32,
+    ):
+        super().__init__()
+        self.rank = rank
+        self.d_model = d_model
+        self.n_output = n_output
+        self.n_process = n_process
+
+        # OutputNeuron: [n_output, rank, d_model] - 차원 복원
+        self.output_neurons = nn.Parameter(torch.zeros(n_output, rank, d_model))
+
+        # ProcessNeuron: [n_process, d_model] - Householder 반사 벡터 (d_model space)
+        self.process_neurons = nn.Parameter(torch.zeros(n_process, d_model))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """직교 초기화"""
+        # OutputNeuron: [n_output, rank, d_model]
+        for i in range(self.n_output):
+            if self.rank >= self.d_model:
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.output_neurons.data[i] = q
+            else:
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.output_neurons.data[i] = q.T
+
+        # ProcessNeuron: 단위 벡터로 초기화 (d_model space)
+        for i in range(self.n_process):
+            v = torch.randn(self.d_model)
+            v = v / (v.norm() + 1e-8)
+            self.process_neurons.data[i] = v
+
+    def apply_householder(self, x, v):
+        """Householder 변환: H @ x = x - 2 * v * (v.T @ x) / ||v||²"""
+        v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-8
+        v_normalized = v / v_norm_sq.sqrt()
+        vTx = (x * v_normalized).sum(dim=-1, keepdim=True)
+        return x - 2 * v_normalized * vTx
+
+    def forward(self, x, output_idx=None, output_weights=None, process_indices=None):
+        """
+        Args:
+            x: [B, S, rank]
+            output_idx: [B, S] - hard selection
+            output_weights: [B, S, n_output] - soft selection
+            process_indices: [B, S, k] - Householder indices
+
+        Returns:
+            output: [B, S, d_model]
+        """
+        B, S, _ = x.shape
+
+        # 1. Output projection: rank → d_model
+        if output_weights is not None:
+            all_proj = torch.einsum('bsr,nrd->bsnd', x, self.output_neurons)
+            weights = output_weights.unsqueeze(-1)
+            x = (all_proj * weights).sum(dim=2)
+        else:
+            selected = self.output_neurons[output_idx]
+            x = torch.einsum('bsr,bsrd->bsd', x, selected)
+
+        # 2. Process: Householder transforms on d_model space
+        if process_indices is not None:
+            k = process_indices.shape[-1]
+            idx_expanded = process_indices.unsqueeze(-1).expand(B, S, k, self.d_model)
+            selected_v = self.process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+            selected_v = selected_v.gather(2, idx_expanded)
+
+            for i in range(k):
+                v = selected_v[:, :, i, :]
+                x = self.apply_householder(x, v)
+
+        return x
+
+    def orthogonality_loss(self):
+        """OutputNeuron 직교성 유지"""
+        WtW = torch.bmm(
+            self.output_neurons,
+            self.output_neurons.transpose(-1, -2)
+        )
+        I = torch.eye(self.rank, device=self.output_neurons.device).unsqueeze(0)
+        return ((WtW - I) ** 2).mean()
+
+    def process_norm_loss(self):
+        """ProcessNeuron ||v|| ≈ 1 유지"""
+        norms = self.process_neurons.norm(dim=-1)
+        return ((norms - 1.0) ** 2).mean()
+
+
+class CircuitRouterDown(nn.Module):
+    """Down circuit용 라우터 (Input + Process 선택)"""
     def __init__(
         self,
         d_model: int,
         n_input: int = 8,
         n_process: int = 32,
-        n_output: int = 8,
         process_k: int = 3,
         use_soft_selection: bool = True,
     ):
         super().__init__()
-        self.d_model = d_model
         self.n_input = n_input
         self.n_process = n_process
-        self.n_output = n_output
         self.process_k = process_k
         self.use_soft_selection = use_soft_selection
 
-        # 라우터 projections
         self.input_router = nn.Linear(d_model, n_input, bias=False)
         self.process_router = nn.Linear(d_model, n_process, bias=False)
-        self.output_router = nn.Linear(d_model, n_output, bias=False)
 
     def forward(self, x):
         """
         Args:
             x: [B, S, d_model]
-
         Returns:
-            routing_info: dict containing:
-                - input_idx or input_weights
-                - process_indices
-                - output_idx or output_weights
+            routing_info: dict with input_weights/idx, process_indices
         """
-        B, S, D = x.shape
+        input_scores = self.input_router(x)
+        process_scores = self.process_router(x)
 
-        # Input routing
-        input_scores = self.input_router(x)  # [B, S, n_input]
-        if self.use_soft_selection:
-            input_weights = F.softmax(input_scores, dim=-1)
-        else:
-            input_idx = input_scores.argmax(dim=-1)  # [B, S]
+        _, process_indices = torch.topk(process_scores, self.process_k, dim=-1)
 
-        # Process routing (always top-k selection)
-        process_scores = self.process_router(x)  # [B, S, n_process]
-        topk_scores, process_indices = torch.topk(
-            process_scores, self.process_k, dim=-1
-        )  # [B, S, k]
-        process_weights = F.softmax(topk_scores, dim=-1)
-
-        # Output routing
-        output_scores = self.output_router(x)  # [B, S, n_output]
-        if self.use_soft_selection:
-            output_weights = F.softmax(output_scores, dim=-1)
-        else:
-            output_idx = output_scores.argmax(dim=-1)  # [B, S]
-
-        routing_info = {
-            'process_indices': process_indices,
-            'process_weights': process_weights,
-        }
+        routing_info = {'process_indices': process_indices}
 
         if self.use_soft_selection:
-            routing_info['input_weights'] = input_weights
-            routing_info['output_weights'] = output_weights
+            routing_info['input_weights'] = F.softmax(input_scores, dim=-1)
         else:
-            routing_info['input_idx'] = input_idx
-            routing_info['output_idx'] = output_idx
+            routing_info['input_idx'] = input_scores.argmax(dim=-1)
+
+        return routing_info
+
+
+class CircuitRouterUp(nn.Module):
+    """Up circuit용 라우터 (Output + Process 선택)"""
+    def __init__(
+        self,
+        rank: int,
+        n_output: int = 8,
+        n_process: int = 32,
+        process_k: int = 3,
+        use_soft_selection: bool = True,
+    ):
+        super().__init__()
+        self.n_output = n_output
+        self.n_process = n_process
+        self.process_k = process_k
+        self.use_soft_selection = use_soft_selection
+
+        self.output_router = nn.Linear(rank, n_output, bias=False)
+        self.process_router = nn.Linear(rank, n_process, bias=False)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, S, rank]
+        Returns:
+            routing_info: dict with output_weights/idx, process_indices
+        """
+        output_scores = self.output_router(x)
+        process_scores = self.process_router(x)
+
+        _, process_indices = torch.topk(process_scores, self.process_k, dim=-1)
+
+        routing_info = {'process_indices': process_indices}
+
+        if self.use_soft_selection:
+            routing_info['output_weights'] = F.softmax(output_scores, dim=-1)
+        else:
+            routing_info['output_idx'] = output_scores.argmax(dim=-1)
 
         return routing_info
 
@@ -340,8 +317,8 @@ class NeuronCircuitQKV(nn.Module):
     """
     NeuronCircuit 기반 동적 Q/K/V/O 생성
 
-    Q/K/V: d_model -> rank (compression only)
-    O: rank -> d_model (expansion only)
+    Q/K/V: NeuronCircuitDown (d_model → rank)
+    O: NeuronCircuitUp (rank → d_model)
     """
     def __init__(
         self,
@@ -361,28 +338,20 @@ class NeuronCircuitQKV(nn.Module):
         self.d_head = rank // n_heads
         self.rank = rank
 
-        # Q/K/V: d_model -> rank (use input + process only)
-        self.circuit_Q = NeuronCircuit(d_model, rank, n_input, n_process, n_output)
-        self.circuit_K = NeuronCircuit(d_model, rank, n_input, n_process, n_output)
-        self.circuit_V = NeuronCircuit(d_model, rank, n_input, n_process, n_output)
+        # Q/K/V: d_model → rank
+        self.circuit_Q = NeuronCircuitDown(d_model, rank, n_input, n_process)
+        self.circuit_K = NeuronCircuitDown(d_model, rank, n_input, n_process)
+        self.circuit_V = NeuronCircuitDown(d_model, rank, n_input, n_process)
 
-        # O: rank -> d_model (use output only)
-        self.circuit_O = NeuronCircuit(rank, d_model, n_input, n_process, n_output)
+        # O: rank → d_model
+        self.circuit_O = NeuronCircuitUp(rank, d_model, n_output, n_process)
 
-        # 공유 라우터 (Q/K/V 동일한 routing 사용)
-        self.router = CircuitRouter(
-            d_model, n_input, n_process, n_output, process_k, use_soft_selection
-        )
-
-        # O projection용 별도 라우터 (rank → d_model)
-        self.router_O = CircuitRouter(
-            rank, n_input, n_process, n_output, process_k, use_soft_selection
-        )
+        # 라우터
+        self.router_down = CircuitRouterDown(d_model, n_input, n_process, process_k, use_soft_selection)
+        self.router_up = CircuitRouterUp(rank, n_output, n_process, process_k, use_soft_selection)
 
         self.dropout = nn.Dropout(dropout)
-
-        # 분석 스크립트 호환용
-        self.basis_rank = rank
+        self.basis_rank = rank  # 분석 스크립트 호환용
 
     def forward(self, x, mask=None):
         """
@@ -396,30 +365,16 @@ class NeuronCircuitQKV(nn.Module):
         """
         B, S, D = x.shape
 
-        # 1. 라우팅 - Input/Process/Output neuron 선택
-        routing_info = self.router(x)
+        # 1. Down routing
+        routing_down = self.router_down(x)
+        input_weights = routing_down.get('input_weights')
+        input_idx = routing_down.get('input_idx')
+        process_indices_down = routing_down['process_indices']
 
-        # Selection 방식 확인
-        use_soft = 'input_weights' in routing_info
-
-        if use_soft:
-            input_weights = routing_info['input_weights']
-            input_idx = None
-        else:
-            input_weights = None
-            input_idx = routing_info['input_idx']
-
-        process_indices = routing_info['process_indices']
-
-        # 2. Q/K/V 생성: d_model -> rank (input + process only, skip output)
-        Q = self.circuit_Q.forward_input(x, input_idx, input_weights)
-        Q = self.circuit_Q.forward_process(Q, process_indices)
-
-        K = self.circuit_K.forward_input(x, input_idx, input_weights)
-        K = self.circuit_K.forward_process(K, process_indices)
-
-        V = self.circuit_V.forward_input(x, input_idx, input_weights)
-        V = self.circuit_V.forward_process(V, process_indices)
+        # 2. Q/K/V: d_model → rank
+        Q = self.circuit_Q(x, input_idx, input_weights, process_indices_down)
+        K = self.circuit_K(x, input_idx, input_weights, process_indices_down)
+        V = self.circuit_V(x, input_idx, input_weights, process_indices_down)
 
         # 3. Multi-head reshape
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -428,43 +383,33 @@ class NeuronCircuitQKV(nn.Module):
 
         # 4. Attention
         attn_scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_head)
-
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
-
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
-
         attn_out = attn_weights @ V  # [B, H, S, d_head]
 
         # 5. Concat
         attn_out = attn_out.transpose(1, 2).reshape(B, S, self.rank)  # [B, S, rank]
 
-        # 6. O projection: rank -> d_model (use input projection only)
-        # circuit_O is NeuronCircuit(rank, d_model), so forward_input does rank -> d_model
-        routing_info_O = self.router_O(attn_out)
-        if 'input_weights' in routing_info_O:
-            input_weights_O = routing_info_O['input_weights']
-            input_idx_O = None
-        else:
-            input_weights_O = None
-            input_idx_O = routing_info_O['input_idx']
+        # 6. Up routing & O projection: rank → d_model
+        routing_up = self.router_up(attn_out)
+        output_weights = routing_up.get('output_weights')
+        output_idx = routing_up.get('output_idx')
+        process_indices_up = routing_up['process_indices']
 
-        process_indices_O = routing_info_O['process_indices']
+        attn_out = self.circuit_O(attn_out, output_idx, output_weights, process_indices_up)
 
-        # O: rank -> d_model (input + process, but process is on d_model space now)
-        attn_out = self.circuit_O.forward_input(attn_out, input_idx_O, input_weights_O)
-        attn_out = self.circuit_O.forward_process(attn_out, process_indices_O)
-
-        routing_info['routing_O'] = routing_info_O
+        routing_info = {
+            'routing_down': routing_down,
+            'routing_up': routing_up,
+        }
 
         return attn_out, routing_info
 
 
 class TransformerBlock(nn.Module):
-    """
-    Transformer Block: NeuronCircuitQKV + FFN
-    """
+    """Transformer Block: NeuronCircuitQKV + FFN"""
     def __init__(
         self,
         d_model: int,
@@ -481,7 +426,6 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        # Attention with NeuronCircuit Q/K/V
         self.qkv_circuit = NeuronCircuitQKV(
             d_model=d_model,
             n_heads=n_heads,
@@ -494,33 +438,18 @@ class TransformerBlock(nn.Module):
             use_soft_selection=use_soft_selection,
         )
 
-        # Standard FFN
         self.w_up = nn.Linear(d_model, d_ff)
         self.w_down = nn.Linear(d_ff, d_model)
-
-        # LayerNorm
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
-        """
-        Args:
-            x: [B, S, D]
-            mask: [B, 1, S, S]
-
-        Returns:
-            x: [B, S, D]
-            routing_info: dict
-        """
-        # Attention with residual
         residual = x
         x_norm = self.norm1(x)
         attn_out, routing_info = self.qkv_circuit(x_norm, mask)
         x = residual + self.dropout(attn_out)
 
-        # FFN with residual
         residual = x
         x_norm = self.norm2(x)
         ffn_out = self.w_down(F.gelu(self.w_up(x_norm)))
@@ -530,14 +459,7 @@ class TransformerBlock(nn.Module):
 
 
 class DAWN(nn.Module):
-    """
-    DAWN v7.9 - NeuronCircuit with Householder Transformations
-
-    핵심 변경:
-    - NeuronBank → NeuronCircuit (Input/Process/Output 분리)
-    - Householder 변환으로 직교성 자동 유지
-    - rank 붕괴 방지
-    """
+    """DAWN v7.9 - NeuronCircuit with Householder Transformations"""
     __version__ = "7.9"
 
     def __init__(
@@ -574,7 +496,7 @@ class DAWN(nn.Module):
 
         # 분석 스크립트 호환용
         self.basis_rank = rank
-        self.n_neurons = n_input  # 대략적인 호환성
+        self.n_neurons = n_input
 
         # Embeddings
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -597,19 +519,15 @@ class DAWN(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # Output
         self.norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-        # Causal mask
         self.register_buffer(
             'causal_mask',
             torch.tril(torch.ones(max_seq_len, max_seq_len)).unsqueeze(0).unsqueeze(0)
         )
 
         self.dropout = nn.Dropout(dropout)
-
-        # Weight tying
         self.lm_head.weight = self.token_emb.weight
 
         self._init_weights()
@@ -653,7 +571,6 @@ class DAWN(nn.Module):
                 ignore_index=-100
             )
 
-        # Handle return_losses (for train.py compatibility)
         if return_losses:
             losses = self.get_auxiliary_losses()
             if return_routing_info:
@@ -666,43 +583,36 @@ class DAWN(nn.Module):
             return (loss, logits) if labels is not None else logits
 
     def orthogonality_loss(self):
-        """Input/Output Neuron의 직교성 유지"""
+        """Input/Output Neuron 직교성 유지"""
         total_loss = 0.0
         count = 0
 
         for layer in self.layers:
             qkv = layer.qkv_circuit
-            for circuit in [qkv.circuit_Q, qkv.circuit_K, qkv.circuit_V, qkv.circuit_O]:
+            for circuit in [qkv.circuit_Q, qkv.circuit_K, qkv.circuit_V]:
                 total_loss += circuit.orthogonality_loss()
                 count += 1
+            total_loss += qkv.circuit_O.orthogonality_loss()
+            count += 1
 
         return total_loss / count if count > 0 else 0.0
 
     def process_norm_loss(self):
-        """ProcessNeuron 벡터의 norm 유지"""
+        """ProcessNeuron ||v|| ≈ 1 유지"""
         total_loss = 0.0
         count = 0
 
         for layer in self.layers:
             qkv = layer.qkv_circuit
-            for circuit in [qkv.circuit_Q, qkv.circuit_K, qkv.circuit_V, qkv.circuit_O]:
+            for circuit in [qkv.circuit_Q, qkv.circuit_K, qkv.circuit_V]:
                 total_loss += circuit.process_norm_loss()
                 count += 1
+            total_loss += qkv.circuit_O.process_norm_loss()
+            count += 1
 
         return total_loss / count if count > 0 else 0.0
 
-    def load_balance_loss(self):
-        """
-        라우터 load balance loss
-
-        모든 neuron이 균등하게 사용되도록 유도
-        """
-        # 이 loss는 forward 시에 routing_info를 사용해야 함
-        # 여기서는 간단한 구현으로 0 반환
-        return torch.tensor(0.0, device=next(self.parameters()).device)
-
     def get_auxiliary_losses(self):
-        """모든 보조 loss 반환"""
         return {
             'orthogonality': self.orthogonality_loss(),
             'process_norm': self.process_norm_loss(),
