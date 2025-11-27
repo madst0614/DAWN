@@ -109,9 +109,18 @@ class HouseholderAnalyzer:
         process_k = process_indices.shape[-1]
         rank = x_after_input.shape[-1]
 
-        # 선택된 process neurons 가져오기
+        # 선택된 process neurons 가져오기 (v8.1 QK/VO 분리 지원)
         idx_expanded = process_indices.unsqueeze(-1).expand(B, S, process_k, rank)
-        selected_v = shared.process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+        if hasattr(shared, 'process_neurons_qk'):
+            # v8.1: comp_name에 따라 QK/VO 선택
+            if comp_name in ['Q', 'K']:
+                process_neurons = shared.process_neurons_qk
+            else:  # V
+                process_neurons = shared.process_neurons_vo
+        else:
+            # v8.0: 단일 pool
+            process_neurons = shared.process_neurons
+        selected_v = process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
         selected_v = selected_v.gather(2, idx_expanded)  # [B, S, k, rank]
 
         # 각 Householder 단계별 v·x 내적 계산
@@ -184,8 +193,13 @@ class HouseholderAnalyzer:
         process_indices = routing_info['process_indices']  # [B, S, k]
         process_k = process_indices.shape[-1]
 
+        # v8.1 QK/VO 분리 지원 (Expander는 O이므로 VO 사용)
         idx_expanded = process_indices.unsqueeze(-1).expand(B, S, process_k, rank)
-        selected_v = shared.process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+        if hasattr(shared, 'process_neurons_qk'):
+            process_neurons = shared.process_neurons_vo  # O는 VO pool
+        else:
+            process_neurons = shared.process_neurons
+        selected_v = process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
         selected_v = selected_v.gather(2, idx_expanded)  # [B, S, k, rank]
 
         vdotx_list = []
