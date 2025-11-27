@@ -1123,6 +1123,10 @@ def main():
     args.process_k = cfg['model'].get('process_k', 3)
     args.use_soft_selection = cfg['model'].get('use_soft_selection', True)
 
+    # v8.0 KnowledgeNeurons parameters
+    args.n_knowledge = cfg['model'].get('n_knowledge', 64)
+    args.knowledge_k = cfg['model'].get('knowledge_k', 8)
+
     # Training
     args.batch_size = cfg['training']['batch_size']
     args.num_epochs = cfg['training']['num_epochs']
@@ -1273,7 +1277,28 @@ def main():
     if model_version != 'baseline':
         print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
-        if model_version == "7.9":
+        if model_version == "8.0":
+            # v8.0: SharedNeurons + NeuronMemory (FFN 대체)
+            rank = getattr(args, 'rank', args.basis_rank)
+            n_input = getattr(args, 'n_input', 8)
+            n_process = getattr(args, 'n_process', 32)
+            n_output = getattr(args, 'n_output', 8)
+            process_k = getattr(args, 'process_k', 3)
+            n_knowledge = getattr(args, 'n_knowledge', 64)
+            knowledge_k = getattr(args, 'knowledge_k', 8)
+            print(f"SharedNeurons + NeuronMemory (v8.0): rank={rank}")
+            print(f"  TransformNeurons (Shared):")
+            print(f"    - InputNeuron: {n_input} × {args.d_model} × {rank}")
+            print(f"    - ProcessNeuron: {n_process} × {rank} (Householder vectors)")
+            print(f"    - OutputNeuron: {n_output} × {rank} × {args.d_model}")
+            print(f"    - Process top-k: {process_k}")
+            print(f"  KnowledgeNeurons (Shared):")
+            print(f"    - K: {n_knowledge} × {rank}")
+            print(f"    - V: {n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {knowledge_k}")
+            if args.orthogonality_weight > 0:
+                print(f"  - Orthogonality Loss (orth_weight={args.orthogonality_weight})")
+        elif model_version == "7.9":
             # v7.9: NeuronCircuit with Householder Transformations
             rank = getattr(args, 'rank', args.basis_rank)
             n_input = getattr(args, 'n_input', 8)
@@ -1412,8 +1437,20 @@ def main():
                 'rank': args.basis_rank,  # v7.9 uses 'rank' instead of 'basis_rank'
             })
 
+        # v8.0 SharedNeurons + NeuronMemory parameters
+        if model_version == '8.0':
+            model_kwargs.update({
+                'n_input': args.n_input,
+                'n_process': args.n_process,
+                'n_output': args.n_output,
+                'process_k': args.process_k,
+                'n_knowledge': getattr(args, 'n_knowledge', 64),
+                'knowledge_k': getattr(args, 'knowledge_k', 8),
+                'rank': args.basis_rank,  # v8.0 uses 'rank' instead of 'basis_rank'
+            })
+
     # Create model
-    if model_version in ['7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['8.0', '7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
@@ -1678,7 +1715,7 @@ def main():
         # Analyze activations periodically (skip for v7.5+ - uses different architecture)
         if epoch % 10 == 0:
             model_version = getattr(model, '__version__', None)
-            if model_version not in ["7.5", "7.8", "7.9"]:
+            if model_version not in ["7.5", "7.8", "7.9", "8.0"]:
                 sample_batch = next(iter(val_loader))
                 sample_ids = sample_batch['input_ids'][:1].to(device)
                 act_stats = analyze_activations(model, sample_ids, device)
@@ -1687,7 +1724,7 @@ def main():
                     print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
                           f"({stats['usage_ratio']:.2%} usage)")
             else:
-                # v7.5/v7.8/v7.9 uses dynamic Q/K/V/O - activation analysis not applicable
+                # v7.5/v7.8/v7.9/v8.0 uses dynamic Q/K/V/O - activation analysis not applicable
                 print(f"\n  (Neuron usage analysis skipped for {model_version} - use analyze_dawn_v75.py instead)")
 
         # Debug: Log epoch summary for specific epochs
