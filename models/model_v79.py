@@ -504,7 +504,7 @@ class DAWN(nn.Module):
 
         # 분석 스크립트 호환용
         self.basis_rank = rank
-        self.n_neurons = n_input
+        self.n_neurons = n_process  # For load balance loss (matches neuron_indices = process_indices)
 
         # Embeddings
         self.token_emb = nn.Embedding(vocab_size, d_model)
