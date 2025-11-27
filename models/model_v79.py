@@ -133,8 +133,13 @@ class NeuronCircuitUp(nn.Module):
     """
     NeuronCircuitUp: rank → d_model 복원용 (O projection)
 
+    순서: Householder(rank) → Output projection
+    - ProcessNeuron: Householder 변환 (rank space) - 파라미터 효율적
     - OutputNeuron: 차원 복원 (rank → d_model)
-    - ProcessNeuron: Householder 변환 (d_model space)
+
+    Down과 대칭 구조:
+    - Down: Input(d_model→rank) → Householder(rank)
+    - Up:   Householder(rank) → Output(rank→d_model)
     """
     def __init__(
         self,
@@ -149,16 +154,23 @@ class NeuronCircuitUp(nn.Module):
         self.n_output = n_output
         self.n_process = n_process
 
+        # ProcessNeuron: [n_process, rank] - Householder 반사 벡터 (rank space)
+        # 파라미터 효율: [32, 64] vs [32, 256]
+        self.process_neurons = nn.Parameter(torch.zeros(n_process, rank))
+
         # OutputNeuron: [n_output, rank, d_model] - 차원 복원
         self.output_neurons = nn.Parameter(torch.zeros(n_output, rank, d_model))
-
-        # ProcessNeuron: [n_process, d_model] - Householder 반사 벡터 (d_model space)
-        self.process_neurons = nn.Parameter(torch.zeros(n_process, d_model))
 
         self._init_weights()
 
     def _init_weights(self):
         """직교 초기화"""
+        # ProcessNeuron: 단위 벡터로 초기화 (rank space)
+        for i in range(self.n_process):
+            v = torch.randn(self.rank)
+            v = v / (v.norm() + 1e-8)
+            self.process_neurons.data[i] = v
+
         # OutputNeuron: [n_output, rank, d_model]
         for i in range(self.n_output):
             if self.rank >= self.d_model:
@@ -167,12 +179,6 @@ class NeuronCircuitUp(nn.Module):
             else:
                 q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
                 self.output_neurons.data[i] = q.T
-
-        # ProcessNeuron: 단위 벡터로 초기화 (d_model space)
-        for i in range(self.n_process):
-            v = torch.randn(self.d_model)
-            v = v / (v.norm() + 1e-8)
-            self.process_neurons.data[i] = v
 
     def apply_householder(self, x, v):
         """Householder 변환: H @ x = x - 2 * v * (v.T @ x) / ||v||²"""
@@ -194,7 +200,18 @@ class NeuronCircuitUp(nn.Module):
         """
         B, S, _ = x.shape
 
-        # 1. Output projection: rank → d_model
+        # 1. Process: Householder transforms on rank space (FIRST)
+        if process_indices is not None:
+            k = process_indices.shape[-1]
+            idx_expanded = process_indices.unsqueeze(-1).expand(B, S, k, self.rank)
+            selected_v = self.process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+            selected_v = selected_v.gather(2, idx_expanded)
+
+            for i in range(k):
+                v = selected_v[:, :, i, :]
+                x = self.apply_householder(x, v)
+
+        # 2. Output projection: rank → d_model (SECOND)
         if output_weights is not None:
             all_proj = torch.einsum('bsr,nrd->bsnd', x, self.output_neurons)
             weights = output_weights.unsqueeze(-1)
@@ -202,17 +219,6 @@ class NeuronCircuitUp(nn.Module):
         else:
             selected = self.output_neurons[output_idx]
             x = torch.einsum('bsr,bsrd->bsd', x, selected)
-
-        # 2. Process: Householder transforms on d_model space
-        if process_indices is not None:
-            k = process_indices.shape[-1]
-            idx_expanded = process_indices.unsqueeze(-1).expand(B, S, k, self.d_model)
-            selected_v = self.process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
-            selected_v = selected_v.gather(2, idx_expanded)
-
-            for i in range(k):
-                v = selected_v[:, :, i, :]
-                x = self.apply_householder(x, v)
 
         return x
 
