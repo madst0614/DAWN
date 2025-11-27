@@ -1116,9 +1116,12 @@ def main():
     args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored)
     args.router_temperature = cfg['model'].get('router_temperature', None)  # v6.0 only (v7.0 ignores)
 
-    # Backward compatibility (deprecated)
-    args.n_input = cfg['model'].get('n_input', None)
-    args.n_process = cfg['model'].get('n_process', None)
+    # v7.9 NeuronCircuit parameters
+    args.n_input = cfg['model'].get('n_input', 8)
+    args.n_process = cfg['model'].get('n_process', 32)
+    args.n_output = cfg['model'].get('n_output', 8)
+    args.process_k = cfg['model'].get('process_k', 3)
+    args.use_soft_selection = cfg['model'].get('use_soft_selection', True)
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -1270,7 +1273,21 @@ def main():
     if model_version != 'baseline':
         print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
-        if model_version == "7.8":
+        if model_version == "7.9":
+            # v7.9: NeuronCircuit with Householder Transformations
+            rank = getattr(args, 'rank', args.basis_rank)
+            n_input = getattr(args, 'n_input', 8)
+            n_process = getattr(args, 'n_process', 32)
+            n_output = getattr(args, 'n_output', 8)
+            process_k = getattr(args, 'process_k', 3)
+            print(f"NeuronCircuit with Householder (v7.9): rank={rank}")
+            print(f"  - InputNeuron: {n_input} × {args.d_model} × {rank}")
+            print(f"  - ProcessNeuron: {n_process} × {rank} (Householder vectors)")
+            print(f"  - OutputNeuron: {n_output} × {rank} × {args.d_model}")
+            print(f"  - Process top-k: {process_k}")
+            if args.orthogonality_weight > 0:
+                print(f"  - Orthogonality Loss (orth_weight={args.orthogonality_weight})")
+        elif model_version == "7.8":
             # v7.8: Independent Neuron W_Q/K/V/O (No Basis Mixing)
             rank = getattr(args, 'rank', args.basis_rank)  # v7.8 uses 'rank', fallback to basis_rank
             print(f"Independent Neuron Projections (v7.8): rank={rank}")
@@ -1384,8 +1401,19 @@ def main():
         if args.mod_rank is not None:
             model_kwargs['mod_rank'] = args.mod_rank
 
+        # v7.9 NeuronCircuit parameters
+        if model_version == '7.9':
+            model_kwargs.update({
+                'n_input': args.n_input,
+                'n_process': args.n_process,
+                'n_output': args.n_output,
+                'process_k': args.process_k,
+                'use_soft_selection': args.use_soft_selection,
+                'rank': args.basis_rank,  # v7.9 uses 'rank' instead of 'basis_rank'
+            })
+
     # Create model
-    if model_version in ['7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
