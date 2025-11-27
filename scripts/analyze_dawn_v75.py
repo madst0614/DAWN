@@ -862,17 +862,55 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
 
                 # Get W_Q, W_K, W_V based on version
                 if version == "7.8":
-                    # v7.8: Direct neuron W matrices (no recipe/basis)
+                    # v7.8: Memory-efficient project-then-gather
                     nb = qkv.neuron_bank
-                    W_Q_neurons = nb.get_W_Q(topk_idx)  # [B, S, k, D, rank]
-                    W_K_neurons = nb.get_W_K(topk_idx)
-                    W_V_neurons = nb.get_W_V(topk_idx)
+                    rank = nb.W_Q.shape[2]
+                    D = nb.W_Q.shape[1]
 
-                    # Weighted average of neuron W matrices
-                    weights_exp = weights.unsqueeze(-1).unsqueeze(-1)  # [B, S, k, 1, 1]
-                    W_Q = (W_Q_neurons * weights_exp).sum(dim=2)  # [B, S, D, rank]
-                    W_K = (W_K_neurons * weights_exp).sum(dim=2)
-                    W_V = (W_V_neurons * weights_exp).sum(dim=2)
+                    # Project through ALL neurons first, then gather selected
+                    all_Q = torch.einsum('bsd,ndr->bsnr', normed, nb.W_Q)  # [B, S, n_neurons, rank]
+                    all_K = torch.einsum('bsd,ndr->bsnr', normed, nb.W_K)
+                    all_V = torch.einsum('bsd,ndr->bsnr', normed, nb.W_V)
+
+                    # Gather selected neurons
+                    idx_exp_r = topk_idx.unsqueeze(-1).expand(B, S, qkv.k, rank)
+                    Q_selected = all_Q.gather(2, idx_exp_r)  # [B, S, k, rank]
+                    K_selected = all_K.gather(2, idx_exp_r)
+                    V_selected = all_V.gather(2, idx_exp_r)
+
+                    # Weighted sum for Q, K, V projections
+                    Q = (Q_selected * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, rank]
+                    K = (K_selected * weights.unsqueeze(-1)).sum(dim=2)
+                    V = (V_selected * weights.unsqueeze(-1)).sum(dim=2)
+
+                    del all_Q, all_K, all_V, Q_selected, K_selected, V_selected
+
+                    # For W matrix SVD analysis: sample positions and compute effective W
+                    n_analyze = min(100, B * S)
+                    sample_positions = torch.randperm(B * S, device=device)[:n_analyze]
+                    topk_flat = topk_idx.view(B * S, qkv.k)
+                    weights_flat = weights.view(B * S, qkv.k)
+                    topk_sampled = topk_flat[sample_positions]  # [n_analyze, k]
+                    weights_sampled = weights_flat[sample_positions]  # [n_analyze, k]
+
+                    # Effective W_Q for sampled positions
+                    idx_exp_W = topk_sampled.unsqueeze(-1).unsqueeze(-1).expand(n_analyze, qkv.k, D, rank)
+                    W_Q_sel = nb.W_Q.unsqueeze(0).expand(n_analyze, -1, -1, -1).gather(1, idx_exp_W)
+                    W_Q_sample = (W_Q_sel * weights_sampled.unsqueeze(-1).unsqueeze(-1)).sum(dim=1).view(n_analyze, -1)
+
+                    W_K_sel = nb.W_K.unsqueeze(0).expand(n_analyze, -1, -1, -1).gather(1, idx_exp_W)
+                    W_K_sample = (W_K_sel * weights_sampled.unsqueeze(-1).unsqueeze(-1)).sum(dim=1).view(n_analyze, -1)
+
+                    W_V_sel = nb.W_V.unsqueeze(0).expand(n_analyze, -1, -1, -1).gather(1, idx_exp_W)
+                    W_V_sample = (W_V_sel * weights_sampled.unsqueeze(-1).unsqueeze(-1)).sum(dim=1).view(n_analyze, -1)
+
+                    del W_Q_sel, W_K_sel, W_V_sel
+
+                    # Placeholder W matrices for compatibility (won't be used for flat/sample)
+                    W_Q = None
+                    W_K = None
+                    W_V = None
+                    v78_W_samples = (W_Q_sample, W_K_sample, W_V_sample, sample_positions, topk_sampled, weights_sampled, n_analyze, D, rank)
                 else:
                     # Generate Q, K, V recipes (v7.5/7.6/7.7)
                     recipe_Q = F.softmax((qkv.neuron_recipe_Q[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
@@ -905,16 +943,22 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 # ============================================================
                 # STAGE 1: Q/K/V Projection (x → Q, K, V)
                 # ============================================================
-                Q = torch.einsum('bsd,bsdr->bsr', normed, W_Q)
-                K = torch.einsum('bsd,bsdr->bsr', normed, W_K)
-                V = torch.einsum('bsd,bsdr->bsr', normed, W_V)  # [B, S, rank]
+                if version != "7.8":
+                    Q = torch.einsum('bsd,bsdr->bsr', normed, W_Q)
+                    K = torch.einsum('bsd,bsdr->bsr', normed, W_K)
+                    V = torch.einsum('bsd,bsdr->bsr', normed, W_V)  # [B, S, rank]
+                # else: Q, K, V already computed for v7.8
 
                 # Q projection analysis
                 var_after_q = Q.var(dim=-1).mean()
                 var_ratio_q = (var_after_q / (var_input + 1e-10)).item()
 
-                W_Q_flat = W_Q.view(B * S, -1)
-                W_Q_sample = W_Q_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
+                if version == "7.8":
+                    W_Q_sample, W_K_sample, W_V_sample, _, topk_sampled, weights_sampled, n_analyze, D, rank = v78_W_samples
+                else:
+                    W_Q_flat = W_Q.view(B * S, -1)
+                    W_Q_sample = W_Q_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
+
                 _, S_vals_q, _ = torch.linalg.svd(W_Q_sample, full_matrices=False)
                 cond_num_q = (S_vals_q[0] / (S_vals_q[-1] + 1e-10)).item()
                 # W_Q effective rank
@@ -926,8 +970,10 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 var_after_k = K.var(dim=-1).mean()
                 var_ratio_k = (var_after_k / (var_input + 1e-10)).item()
 
-                W_K_flat = W_K.view(B * S, -1)
-                W_K_sample = W_K_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
+                if version != "7.8":
+                    W_K_flat = W_K.view(B * S, -1)
+                    W_K_sample = W_K_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
+
                 _, S_vals_k, _ = torch.linalg.svd(W_K_sample, full_matrices=False)
                 cond_num_k = (S_vals_k[0] / (S_vals_k[-1] + 1e-10)).item()
                 # W_K effective rank
@@ -939,8 +985,10 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 var_after_v = V.var(dim=-1).mean()
                 var_ratio_v = (var_after_v / (var_input + 1e-10)).item()
 
-                W_V_flat = W_V.view(B * S, -1)
-                W_V_sample = W_V_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
+                if version != "7.8":
+                    W_V_flat = W_V.view(B * S, -1)
+                    W_V_sample = W_V_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
+
                 _, S_vals_v, _ = torch.linalg.svd(W_V_sample, full_matrices=False)
                 cond_num_v = (S_vals_v[0] / (S_vals_v[-1] + 1e-10)).item()
                 # W_V effective rank
@@ -1005,9 +1053,19 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 attn_out_before_O = attn_out.clone()  # [B, S, rank]
 
                 if version == "7.8":
-                    # v7.8: Direct neuron W_O matrices
-                    W_O_neurons = nb.get_W_O(topk_idx)  # [B, S, k, rank, D]
-                    W_O = (W_O_neurons * weights_exp).sum(dim=2)  # [B, S, rank, D]
+                    # v7.8: Memory-efficient O projection
+                    # Project through ALL neurons first, then gather selected
+                    all_O = torch.einsum('bsr,nrd->bsnd', attn_out, nb.W_O)  # [B, S, n_neurons, D]
+                    idx_exp_d = topk_idx.unsqueeze(-1).expand(B, S, qkv.k, D)
+                    O_selected = all_O.gather(2, idx_exp_d)  # [B, S, k, D]
+                    attn_out_after_O = (O_selected * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
+                    del all_O, O_selected
+
+                    # Compute W_O_sample for SVD analysis (memory efficient)
+                    idx_exp_W_O = topk_sampled.unsqueeze(-1).unsqueeze(-1).expand(n_analyze, qkv.k, rank, D)
+                    W_O_sel = nb.W_O.unsqueeze(0).expand(n_analyze, -1, -1, -1).gather(1, idx_exp_W_O)
+                    W_O_sample = (W_O_sel * weights_sampled.unsqueeze(-1).unsqueeze(-1)).sum(dim=1).view(n_analyze, -1)
+                    del W_O_sel
                 else:
                     recipe_O = F.softmax((qkv.neuron_recipe_O[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
                     if version == "7.7":
@@ -1017,14 +1075,14 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                     else:
                         basis_up = qkv.shared_basis().transpose(-1, -2)  # [n_basis, rank, D]
                     W_O = torch.einsum('bsn,nrd->bsrd', recipe_O, basis_up)  # [B, S, rank, D]
-                attn_out_after_O = torch.einsum('bsr,bsrd->bsd', attn_out, W_O)  # [B, S, D]
+                    attn_out_after_O = torch.einsum('bsr,bsrd->bsd', attn_out, W_O)  # [B, S, D]
+                    W_O_flat = W_O.view(B * S, -1)
+                    W_O_sample = W_O_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
 
                 var_after_o = attn_out_after_O.var(dim=-1).mean()  # O projection 후 분산
                 var_ratio_o = (var_after_o / (var_after_attn + 1e-10)).item()
 
                 # W_O condition number
-                W_O_flat = W_O.view(B * S, -1)
-                W_O_sample = W_O_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
                 _, S_vals_o, _ = torch.linalg.svd(W_O_sample, full_matrices=False)
                 cond_num_o = (S_vals_o[0] / (S_vals_o[-1] + 1e-10)).item()
 
