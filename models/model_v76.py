@@ -36,7 +36,7 @@ class SharedBasis(nn.Module):
         self.basis_rank = basis_rank
 
         # 압축용 Basis: D → rank
-        # Q, K, V 생성에 사용
+        # Q, K, V 생성에 사용 - QR로 직교 초기화
         basis_down = torch.zeros(n_basis, d_model, basis_rank)
         for i in range(n_basis):
             q, _ = torch.linalg.qr(torch.randn(d_model, basis_rank))
@@ -45,11 +45,9 @@ class SharedBasis(nn.Module):
 
         # 복원용 Basis: rank → D
         # O projection에 사용, 독립적으로 학습
-        # Note: QR decomposition of [D, rank] gives Q of [D, rank], we need [rank, D]
-        basis_up = torch.zeros(n_basis, basis_rank, d_model)
-        for i in range(n_basis):
-            q, _ = torch.linalg.qr(torch.randn(d_model, basis_rank))
-            basis_up[i] = q.T  # Transpose to get [rank, D]
+        # Xavier-style initialization for better gradient flow
+        # Scale: 1/sqrt(basis_rank) for stable gradients through O projection
+        basis_up = torch.randn(n_basis, basis_rank, d_model) * (1.0 / math.sqrt(basis_rank))
         self.basis_up = nn.Parameter(basis_up)
 
     def get_basis_down(self):
@@ -67,19 +65,25 @@ class SharedBasis(nn.Module):
     def orthogonality_loss(self):
         """
         양쪽 Basis 직교성 유지
+
+        basis_down: QR 초기화 → 단위 벡터, Gram = I 직접 비교
+        basis_up: Xavier 초기화 → 정규화 후 직교성만 체크 (off-diagonal = 0)
         """
         loss = 0.0
+        I = torch.eye(self.n_basis, device=self.basis_down.device)
 
-        # 압축용 basis 직교성
+        # 압축용 basis 직교성 (QR init → orthonormal target)
         B_down = self.basis_down.view(self.n_basis, -1)
         gram_down = B_down @ B_down.T
-        I = torch.eye(self.n_basis, device=gram_down.device)
         loss += ((gram_down - I) ** 2).mean()
 
-        # 복원용 basis 직교성
+        # 복원용 basis 직교성 (Xavier init → normalize first, check orthogonality)
         B_up = self.basis_up.view(self.n_basis, -1)
-        gram_up = B_up @ B_up.T
-        loss += ((gram_up - I) ** 2).mean()
+        B_up_norm = F.normalize(B_up, dim=-1)  # 정규화하여 크기 무시
+        gram_up = B_up_norm @ B_up_norm.T
+        # Off-diagonal만 0이 되도록 (대각선은 1이므로 무시)
+        off_diagonal_mask = ~I.bool()
+        loss += (gram_up[off_diagonal_mask] ** 2).mean()
 
         return loss / 2
 
