@@ -439,40 +439,38 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
 
 def analyze_activations(model, input_ids, device):
-    """Dynamic Neuron Transformer activation pattern analysis (v6.0)"""
+    """Dynamic Neuron Transformer activation pattern analysis (v6.0+)"""
     model.eval()
+    base_model = get_underlying_model(model)
 
     with torch.no_grad():
-        _, all_selected = model(input_ids, return_activations=True)
+        # v7.5/v7.6: use return_routing_info, v6.0: use return_activations
+        if is_v75_or_v76_model(model):
+            logits, routing_infos = model(input_ids, return_routing_info=True)
+            # Extract neuron_indices from routing_infos
+            all_selected = [info['neuron_indices'] for info in routing_infos]
+        else:
+            _, all_selected = model(input_ids, return_activations=True)
 
     stats = {}
     for layer_idx, selected_idx in enumerate(all_selected):
         # selected_idx: [B, S, k]
         unique_neurons = torch.unique(selected_idx).numel()
 
-        # Get total neurons from model (v6.0: router, v5.x: neuron_router)
-        if hasattr(model, '_orig_mod'):
-            # Compiled model
-            layer = model._orig_mod.layers[layer_idx]
-        else:
-            layer = model.layers[layer_idx]
+        # Get total neurons from model
+        layer = base_model.layers[layer_idx]
 
-        # v7.0: ffn.n_neurons, v6.0: router, v5.x: neuron_router
-        if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'n_neurons'):
-            # v7.0: n_neurons is in FFN
+        # v7.5/v7.6: qkv_dynamic.n_neurons, v7.0: ffn.n_neurons, v6.0: router
+        if hasattr(layer, 'qkv_dynamic') and hasattr(layer.qkv_dynamic, 'n_neurons'):
+            total_neurons = layer.qkv_dynamic.n_neurons
+        elif hasattr(layer, 'ffn') and hasattr(layer.ffn, 'n_neurons'):
             total_neurons = layer.ffn.n_neurons
         elif hasattr(layer, 'router') and hasattr(layer.router, 'n_neurons'):
-            # v6.0: n_neurons might be in router
             total_neurons = layer.router.n_neurons
         elif hasattr(layer, 'neuron_router') and hasattr(layer.neuron_router, 'n_neurons'):
-            # v5.x: neuron_router
             total_neurons = layer.neuron_router.n_neurons
         else:
-            # Fallback: use model's n_neurons
-            if hasattr(model, '_orig_mod'):
-                total_neurons = model._orig_mod.n_neurons
-            else:
-                total_neurons = model.n_neurons
+            total_neurons = base_model.n_neurons
 
         usage_ratio = unique_neurons / total_neurons
 
