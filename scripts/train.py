@@ -53,6 +53,273 @@ from utils.training import CheckpointManager, TrainingMonitor, count_parameters,
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
 
+# ============================================================
+# DEBUG LOGGING FUNCTIONS
+# ============================================================
+
+class DebugLogger:
+    """Debug logger for basis_up analysis, gradients, and orthogonality loss"""
+
+    # Epochs to log detailed stats
+    LOG_EPOCHS = {0, 1, 5, 10, 20, 50, 100}
+
+    def __init__(self, log_file_path):
+        self.log_file = log_file_path
+        self.epoch_logged = set()
+
+        # Initialize log file
+        with open(self.log_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("DAWN Debug Log - Basis_up Analysis\n")
+            f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n\n")
+
+    def should_log_epoch(self, epoch):
+        """Check if this epoch should be logged"""
+        return epoch in self.LOG_EPOCHS or epoch % 10 == 0
+
+    def log(self, message):
+        """Write message to debug log file"""
+        with open(self.log_file, 'a') as f:
+            f.write(message + "\n")
+
+    def log_section(self, title):
+        """Log a section header"""
+        self.log(f"\n{'='*60}")
+        self.log(f"{title}")
+        self.log(f"{'='*60}")
+
+    def log_basis_stats(self, model, epoch, step=None):
+        """
+        Log basis_up statistics at specific epochs
+
+        Tracks:
+        - Singular value distribution per basis
+        - Overall condition number
+        - Potential collapse detection
+        """
+        base_model = get_underlying_model(model)
+
+        # Only for v7.6 models with shared_basis
+        if not hasattr(base_model, 'shared_basis'):
+            return
+
+        step_str = f" Step {step}" if step else ""
+        self.log_section(f"Basis Stats - Epoch {epoch}{step_str}")
+
+        with torch.no_grad():
+            basis_up = base_model.shared_basis.basis_up.detach()  # [n_basis, rank, D]
+            n_basis = basis_up.shape[0]
+
+            # Per-basis singular values
+            self.log("\n[Per-Basis Singular Values (top 5)]")
+            all_singular_values = []
+            for i in range(n_basis):
+                # basis_up[i]: [rank, D] -> SVD
+                _, S, _ = torch.linalg.svd(basis_up[i])
+                all_singular_values.extend(S.cpu().tolist())
+                self.log(f"  Basis_up[{i}]: {S[:5].cpu().numpy()}")
+
+            # Overall condition number
+            B_up_flat = basis_up.view(n_basis, -1)  # [n_basis, rank*D]
+            _, S_all, _ = torch.linalg.svd(B_up_flat)
+            sigma_max = S_all[0].item()
+            sigma_min = S_all[-1].item()
+            condition_number = sigma_max / (sigma_min + 1e-10)
+
+            self.log(f"\n[Overall Condition Number]")
+            self.log(f"  σ_max = {sigma_max:.6f}")
+            self.log(f"  σ_min = {sigma_min:.10f}")
+            self.log(f"  Condition number = {condition_number:.2e}")
+
+            # Collapse detection
+            if condition_number > 1e6:
+                self.log(f"  ⚠️  WARNING: High condition number indicates potential collapse!")
+            elif condition_number > 1e4:
+                self.log(f"  ⚠️  CAUTION: Condition number getting high")
+            else:
+                self.log(f"  ✓ Condition number is healthy")
+
+            # Also log basis_down for comparison
+            basis_down = base_model.shared_basis.basis_down.detach()  # [n_basis, D, rank]
+            B_down_flat = basis_down.view(n_basis, -1)
+            _, S_down, _ = torch.linalg.svd(B_down_flat)
+            cond_down = S_down[0].item() / (S_down[-1].item() + 1e-10)
+
+            self.log(f"\n[Basis_down Condition Number (for comparison)]")
+            self.log(f"  σ_max = {S_down[0].item():.6f}")
+            self.log(f"  σ_min = {S_down[-1].item():.10f}")
+            self.log(f"  Condition number = {cond_down:.2e}")
+
+    def log_gradient_flow(self, model, epoch, step=None):
+        """
+        Log gradient flow for basis parameters
+
+        Tracks:
+        - Gradient norms for basis_down and basis_up
+        - Parameter norms
+        - Gradient/parameter ratio
+        """
+        base_model = get_underlying_model(model)
+
+        if not hasattr(base_model, 'shared_basis'):
+            return
+
+        step_str = f" Step {step}" if step else ""
+        self.log_section(f"Gradient Flow - Epoch {epoch}{step_str}")
+
+        self.log("\n[Basis Gradient Analysis]")
+        for name, param in base_model.named_parameters():
+            if 'basis' in name and param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                param_norm = param.norm().item()
+                ratio = grad_norm / (param_norm + 1e-10)
+
+                self.log(f"  {name}:")
+                self.log(f"    grad_norm = {grad_norm:.8f}")
+                self.log(f"    param_norm = {param_norm:.6f}")
+                self.log(f"    ratio = {ratio:.8f}")
+
+                # Gradient health check
+                if grad_norm < 1e-8:
+                    self.log(f"    ⚠️  WARNING: Vanishing gradient!")
+                elif grad_norm > 100:
+                    self.log(f"    ⚠️  WARNING: Exploding gradient!")
+
+    def log_orthogonality_breakdown(self, model, epoch, step=None):
+        """
+        Log orthogonality loss breakdown
+
+        Tracks:
+        - ortho_down loss
+        - ortho_up loss
+        - Which direction dominates
+        """
+        base_model = get_underlying_model(model)
+
+        if not hasattr(base_model, 'shared_basis'):
+            return
+
+        step_str = f" Step {step}" if step else ""
+        self.log_section(f"Orthogonality Loss Breakdown - Epoch {epoch}{step_str}")
+
+        with torch.no_grad():
+            sb = base_model.shared_basis
+            n_basis = sb.n_basis
+            I = torch.eye(n_basis, device=sb.basis_down.device)
+
+            # basis_down orthogonality
+            B_down = sb.basis_down.view(n_basis, -1)
+            gram_down = B_down @ B_down.T
+            ortho_down = ((gram_down - I) ** 2).mean().item()
+
+            # basis_up orthogonality (with normalization)
+            B_up = sb.basis_up.view(n_basis, -1)
+            B_up_norm = F.normalize(B_up, dim=-1)
+            gram_up = B_up_norm @ B_up_norm.T
+            off_diagonal_mask = ~I.bool()
+            ortho_up = (gram_up[off_diagonal_mask] ** 2).mean().item()
+
+            self.log(f"\n[Orthogonality Loss Components]")
+            self.log(f"  ortho_down = {ortho_down:.8f}")
+            self.log(f"  ortho_up   = {ortho_up:.8f}")
+            self.log(f"  total (avg) = {(ortho_down + ortho_up) / 2:.8f}")
+
+            # Gram matrix diagnostics
+            self.log(f"\n[Gram Matrix Diagnostics]")
+            self.log(f"  gram_down diagonal mean: {gram_down.diag().mean().item():.6f} (target: 1.0)")
+            self.log(f"  gram_down off-diag mean: {gram_down[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+            self.log(f"  gram_up diagonal mean: {gram_up.diag().mean().item():.6f} (target: 1.0)")
+            self.log(f"  gram_up off-diag mean: {gram_up[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+
+            if ortho_up > ortho_down * 10:
+                self.log(f"\n  ⚠️  ortho_up >> ortho_down: O projection learning may be unstable")
+            elif ortho_down > ortho_up * 10:
+                self.log(f"\n  ⚠️  ortho_down >> ortho_up: Q/K/V projection learning may be unstable")
+
+    def log_recipe_analysis(self, model, sample_input, epoch, step=None):
+        """
+        Log Recipe → W_O analysis
+
+        Tracks:
+        - Recipe entropy (diversity)
+        - Max weight concentration
+        - W_O singular values
+        """
+        base_model = get_underlying_model(model)
+
+        if not hasattr(base_model, 'shared_basis'):
+            return
+
+        step_str = f" Step {step}" if step else ""
+        self.log_section(f"Recipe → W_O Analysis - Epoch {epoch}{step_str}")
+
+        base_model.eval()
+        with torch.no_grad():
+            B, S = sample_input.shape
+            device = sample_input.device
+
+            # Get first layer's qkv_dynamic
+            layer = base_model.layers[0]
+            qkv = layer.qkv_dynamic
+
+            # Routing
+            pos = torch.arange(S, device=device).unsqueeze(0)
+            x = base_model.token_emb(sample_input) + base_model.pos_emb(pos)
+
+            scores = qkv.W_router(x)
+            topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
+            weights = F.softmax(topk_scores, dim=-1)
+
+            # Recipe O
+            recipe_O = qkv.neuron_recipe_O[topk_idx]
+            token_recipe_O = (recipe_O * weights.unsqueeze(-1)).sum(dim=2)
+            token_recipe_O = F.softmax(token_recipe_O, dim=-1)  # [B, S, n_basis]
+
+            # Recipe entropy
+            entropy = (-token_recipe_O * torch.log(token_recipe_O + 1e-10)).sum(-1).mean()
+            max_entropy = math.log(qkv.n_basis)  # Maximum possible entropy
+
+            # Max weight
+            max_weight = token_recipe_O.max(-1)[0].mean()
+
+            self.log(f"\n[Recipe_O Statistics]")
+            self.log(f"  Entropy: {entropy.item():.4f} (max possible: {max_entropy:.4f})")
+            self.log(f"  Normalized entropy: {entropy.item() / max_entropy:.4f}")
+            self.log(f"  Max weight (mean): {max_weight.item():.4f}")
+
+            if max_weight.item() > 0.8:
+                self.log(f"  ⚠️  WARNING: Recipe too concentrated on single basis!")
+
+            # W_O singular values
+            basis_up = base_model.shared_basis.get_basis_up()
+            W_O = torch.einsum('bsn,nrd->bsrd', token_recipe_O, basis_up)  # [B, S, rank, D]
+
+            # Analyze first token's W_O
+            W_O_sample = W_O[0, 0]  # [rank, D]
+            _, S_wo, _ = torch.linalg.svd(W_O_sample)
+
+            self.log(f"\n[W_O Singular Values (sample token)]")
+            self.log(f"  Top 5: {S_wo[:5].cpu().numpy()}")
+            self.log(f"  σ_max/σ_min: {(S_wo[0] / (S_wo[-1] + 1e-10)).item():.2e}")
+
+            # Check if W_O is degenerating
+            if S_wo[-1].item() < 1e-6:
+                self.log(f"  ⚠️  WARNING: W_O has near-zero singular values!")
+
+        base_model.train()
+
+    def log_epoch_summary(self, model, sample_input, epoch, step=None):
+        """Log all debug info for an epoch"""
+        self.log_basis_stats(model, epoch, step)
+        self.log_orthogonality_breakdown(model, epoch, step)
+        self.log_recipe_analysis(model, sample_input, epoch, step)
+
+    def log_post_backward(self, model, epoch, step=None):
+        """Log gradient info after backward pass"""
+        self.log_gradient_flow(model, epoch, step)
+
+
 def get_underlying_model(model):
     """Get the underlying model from a potentially torch.compile() wrapped model"""
     # torch.compile() wraps models in OptimizedModule with _orig_mod attribute
@@ -78,9 +345,12 @@ def is_v75_or_v76_model(model):
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0):
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, debug_logger=None):
     """Train for one epoch"""
     model.train()
+
+    # Debug: Log at start of key epochs
+    debug_log_steps = {0, 100, 500}  # Steps to log gradient info
 
     total_loss = 0
     total_tokens = 0
@@ -203,6 +473,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
+            # Debug: Log gradient flow at specific steps
+            if debug_logger and debug_logger.should_log_epoch(epoch) and step in debug_log_steps:
+                debug_logger.log_post_backward(model, epoch, step)
+
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -294,6 +568,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Debug: Log gradient flow at specific steps
+            if debug_logger and debug_logger.should_log_epoch(epoch) and step in debug_log_steps:
+                debug_logger.log_post_backward(model, epoch, step)
 
             optimizer.step()
 
@@ -581,6 +859,8 @@ def main():
                         help='Path to checkpoint folder to resume from (e.g., checkpoints/run_20240101_120000_1234)')
     parser.add_argument('--from-scratch', action='store_true',
                         help='Start training from scratch (disable auto-resume)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug logging to debug.txt (basis_up analysis, gradients, etc.)')
     cli_args = parser.parse_args()
 
     # Load config
@@ -1048,11 +1328,27 @@ def main():
         with open(training_log_file, 'a') as f:
             f.write(f"\n# === Resumed training at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
 
+    # Debug logger (if --debug flag is set)
+    debug_logger = None
+    if cli_args.debug:
+        debug_log_file = checkpoint_dir / "debug.txt"
+        debug_logger = DebugLogger(str(debug_log_file))
+        print(f"\n🔍 Debug mode enabled")
+        print(f"  Debug log: {debug_log_file}")
+
     # Training loop
     print(f"\n{'='*60}")
     print(f"Starting training...")
     print(f"  Training log: {training_log_file}")
     print(f"{'='*60}")
+
+    # Get sample batch for debug logging
+    sample_batch_for_debug = None
+    if debug_logger:
+        sample_batch_for_debug = next(iter(train_loader))['input_ids'][:1].to(device)
+        # Log initial state (before any training)
+        debug_logger.log_section(f"Initial State (Before Training)")
+        debug_logger.log_epoch_summary(model, sample_batch_for_debug, epoch=0)
 
     for epoch in range(start_epoch, args.num_epochs + 1):
         epoch_start = time.time()
@@ -1063,7 +1359,8 @@ def main():
             scaler, tokenizer, log_file=str(training_log_file),
             orthogonality_weight=args.orthogonality_weight,
             diversity_weight=args.diversity_weight,
-            load_balance_weight=args.load_balance_weight
+            load_balance_weight=args.load_balance_weight,
+            debug_logger=debug_logger
         )
 
         # Evaluate
@@ -1126,6 +1423,11 @@ def main():
             else:
                 # v7.5 uses dynamic Q/K/V/O - activation analysis not applicable
                 print(f"\n  (Neuron usage analysis skipped for v7.5 - use analyze_dawn_v75.py instead)")
+
+        # Debug: Log epoch summary for specific epochs
+        if debug_logger and debug_logger.should_log_epoch(epoch):
+            debug_logger.log_section(f"End of Epoch {epoch}")
+            debug_logger.log_epoch_summary(model, sample_batch_for_debug, epoch)
 
         # Save checkpoint
         is_best = val_loss < best_val_loss
