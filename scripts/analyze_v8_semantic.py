@@ -361,15 +361,14 @@ class SemanticAnalyzerV8:
         print("\n📌 Neuron Usage Correlation Between Components:")
         for layer_idx in range(self.n_layers):
             correlations = {}
-            for c1 in self.components:
-                for c2 in self.components:
-                    if c1 < c2:
-                        v1 = comp_totals[c1][layer_idx]
-                        v2 = comp_totals[c2][layer_idx]
-                        v1_norm = F.normalize(v1.unsqueeze(0), dim=-1)
-                        v2_norm = F.normalize(v2.unsqueeze(0), dim=-1)
-                        corr = (v1_norm @ v2_norm.T).item()
-                        correlations[f'{c1}-{c2}'] = corr
+            for i, c1 in enumerate(self.components):
+                for c2 in self.components[i+1:]:
+                    v1 = comp_totals[c1][layer_idx]
+                    v2 = comp_totals[c2][layer_idx]
+                    v1_norm = F.normalize(v1.unsqueeze(0), dim=-1)
+                    v2_norm = F.normalize(v2.unsqueeze(0), dim=-1)
+                    corr = (v1_norm @ v2_norm.T).item()
+                    correlations[f'{c1}-{c2}'] = corr
 
             print(f"  Layer {layer_idx}: Q-K={correlations['Q-K']:.3f}, Q-V={correlations['Q-V']:.3f}, "
                   f"K-V={correlations['K-V']:.3f}, Q-O={correlations['Q-O']:.3f}")
