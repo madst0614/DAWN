@@ -466,7 +466,14 @@ def main():
     }
 
     model = create_model_by_version(model_version, model_kwargs)
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Handle torch.compile() wrapped checkpoints (keys have "_orig_mod." prefix)
+    state_dict = checkpoint['model_state_dict']
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        print("  Detected torch.compile() checkpoint, stripping '_orig_mod.' prefix...")
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
