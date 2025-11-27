@@ -769,16 +769,34 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 var_input = normed.var(dim=-1).mean()  # [D] 공간 분산
 
                 # ============================================================
-                # STAGE 1: V Projection (x → V)
+                # STAGE 1: Q/K/V Projection (x → Q, K, V)
                 # ============================================================
                 Q = torch.einsum('bsd,bsdr->bsr', normed, W_Q)
                 K = torch.einsum('bsd,bsdr->bsr', normed, W_K)
                 V = torch.einsum('bsd,bsdr->bsr', normed, W_V)  # [B, S, rank]
 
-                var_after_v = V.var(dim=-1).mean()  # V projection 후 분산
+                # Q projection analysis
+                var_after_q = Q.var(dim=-1).mean()
+                var_ratio_q = (var_after_q / (var_input + 1e-10)).item()
+
+                W_Q_flat = W_Q.view(B * S, -1)
+                W_Q_sample = W_Q_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
+                _, S_vals_q, _ = torch.linalg.svd(W_Q_sample, full_matrices=False)
+                cond_num_q = (S_vals_q[0] / (S_vals_q[-1] + 1e-10)).item()
+
+                # K projection analysis
+                var_after_k = K.var(dim=-1).mean()
+                var_ratio_k = (var_after_k / (var_input + 1e-10)).item()
+
+                W_K_flat = W_K.view(B * S, -1)
+                W_K_sample = W_K_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
+                _, S_vals_k, _ = torch.linalg.svd(W_K_sample, full_matrices=False)
+                cond_num_k = (S_vals_k[0] / (S_vals_k[-1] + 1e-10)).item()
+
+                # V projection analysis
+                var_after_v = V.var(dim=-1).mean()
                 var_ratio_v = (var_after_v / (var_input + 1e-10)).item()
 
-                # W_V condition number
                 W_V_flat = W_V.view(B * S, -1)
                 W_V_sample = W_V_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
                 _, S_vals_v, _ = torch.linalg.svd(W_V_sample, full_matrices=False)
@@ -841,7 +859,11 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 var_ratio_total = (var_after_o / (var_input + 1e-10)).item()
 
                 results[f'layer_{layer_idx}'].append({
-                    # Stage 1: V projection
+                    # Stage 1: Q/K/V projection
+                    'var_ratio_q': var_ratio_q,
+                    'cond_num_q': cond_num_q,
+                    'var_ratio_k': var_ratio_k,
+                    'cond_num_k': cond_num_k,
                     'var_ratio_v': var_ratio_v,
                     'cond_num_v': cond_num_v,
                     # Stage 2: Attention
@@ -860,9 +882,9 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 x = x + layer.dropout(layer.w_down(F.gelu(layer.w_up(layer.norm2(x)))))
 
     # Output results
-    print("\n⭐ FULL PIPELINE ANALYSIS: x → V → Attention → O")
+    print("\n⭐ FULL PIPELINE ANALYSIS: x → Q/K/V → Attention → O")
     print("\n  Pipeline stages:")
-    print("    Stage 1: V Projection (x → V)")
+    print("    Stage 1: Q/K/V Projection (x → Q, K, V)")
     print("    Stage 2: Attention Mixing (V → Attn(V))")
     print("    Stage 3: O Projection (Attn → Output)")
     print("\n  Metrics explanation:")
@@ -874,49 +896,84 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
         key = f'layer_{layer_idx}'
         data = results[key]
 
-        # Aggregate metrics
+        # Aggregate metrics - Q/K/V
+        avg_var_q = np.mean([d['var_ratio_q'] for d in data])
+        avg_cond_q = np.mean([d['cond_num_q'] for d in data])
+        avg_var_k = np.mean([d['var_ratio_k'] for d in data])
+        avg_cond_k = np.mean([d['cond_num_k'] for d in data])
         avg_var_v = np.mean([d['var_ratio_v'] for d in data])
         avg_cond_v = np.mean([d['cond_num_v'] for d in data])
+        # Attention
         avg_var_attn = np.mean([d['var_ratio_attn'] for d in data])
         avg_entropy = np.mean([d['attn_entropy'] for d in data])
+        # O projection
         avg_var_o = np.mean([d['var_ratio_o'] for d in data])
         avg_cond_o = np.mean([d['cond_num_o'] for d in data])
         avg_eff_rank = np.mean([d['eff_rank_o'] for d in data])
         avg_total = np.mean([d['var_ratio_total'] for d in data])
 
         print(f"\n  Layer {layer_idx}:")
-        print(f"    ┌─────────────────────────────────────────────────────────")
+        print(f"    ┌─────────────────────────────────────────────────────────────────")
 
-        # Stage 1: V Projection
+        # Stage 1: Q/K/V Projection comparison
+        print(f"    │ [Stage 1: Q/K/V Projection]")
+
+        status_q = "⚠️ COLLAPSE" if avg_var_q < 0.3 else ("⚠️ EXPLODE" if avg_var_q > 3.0 else "✓")
+        cond_q_status = "⚠️" if avg_cond_q > 100 else ""
+        print(f"    │   Q: var_ratio={avg_var_q:.4f} {status_q}  cond_num={avg_cond_q:.1f} {cond_q_status}")
+
+        status_k = "⚠️ COLLAPSE" if avg_var_k < 0.3 else ("⚠️ EXPLODE" if avg_var_k > 3.0 else "✓")
+        cond_k_status = "⚠️" if avg_cond_k > 100 else ""
+        print(f"    │   K: var_ratio={avg_var_k:.4f} {status_k}  cond_num={avg_cond_k:.1f} {cond_k_status}")
+
         status_v = "⚠️ COLLAPSE" if avg_var_v < 0.3 else ("⚠️ EXPLODE" if avg_var_v > 3.0 else "✓")
         cond_v_status = "⚠️" if avg_cond_v > 100 else ""
-        print(f"    │ [V Proj]  var_ratio={avg_var_v:.4f} {status_v}  cond_num={avg_cond_v:.1f} {cond_v_status}")
+        print(f"    │   V: var_ratio={avg_var_v:.4f} {status_v}  cond_num={avg_cond_v:.1f} {cond_v_status}")
+
+        # Q/K/V comparison summary
+        qkv_vars = [('Q', avg_var_q), ('K', avg_var_k), ('V', avg_var_v)]
+        min_proj = min(qkv_vars, key=lambda x: x[1])
+        max_proj = max(qkv_vars, key=lambda x: x[1])
+        if max_proj[1] / (min_proj[1] + 1e-10) > 2.0:
+            print(f"    │   ⚠️  Imbalance: {max_proj[0]} >> {min_proj[0]} (ratio={max_proj[1]/min_proj[1]:.2f}x)")
+
+        print(f"    ├─────────────────────────────────────────────────────────────────")
 
         # Stage 2: Attention
+        print(f"    │ [Stage 2: Attention]")
         status_attn = "⚠️ COLLAPSE" if avg_var_attn < 0.3 else ("⚠️ EXPLODE" if avg_var_attn > 3.0 else "✓")
-        print(f"    │ [Attn]    var_ratio={avg_var_attn:.4f} {status_attn}  entropy={avg_entropy:.2f}")
+        print(f"    │   var_ratio={avg_var_attn:.4f} {status_attn}  entropy={avg_entropy:.2f}")
+
+        print(f"    ├─────────────────────────────────────────────────────────────────")
 
         # Stage 3: O Projection
+        print(f"    │ [Stage 3: O Projection]")
         status_o = "⚠️ COLLAPSE" if avg_var_o < 0.3 else ("⚠️ EXPLODE" if avg_var_o > 3.0 else "✓")
         cond_o_status = "⚠️" if avg_cond_o > 100 else ""
-        print(f"    │ [O Proj]  var_ratio={avg_var_o:.4f} {status_o}  cond_num={avg_cond_o:.1f} {cond_o_status}  eff_rank={avg_eff_rank:.1f}")
+        print(f"    │   var_ratio={avg_var_o:.4f} {status_o}  cond_num={avg_cond_o:.1f} {cond_o_status}  eff_rank={avg_eff_rank:.1f}")
 
         # Total pipeline
-        print(f"    └─────────────────────────────────────────────────────────")
+        print(f"    └─────────────────────────────────────────────────────────────────")
         status_total = "⚠️ COLLAPSE" if avg_total < 0.1 else ("⚠️ EXPLODE" if avg_total > 10.0 else "✓")
-        print(f"    │ [TOTAL]   x→O var_ratio={avg_total:.4f} {status_total}")
+        print(f"      [TOTAL] x→O var_ratio={avg_total:.4f} {status_total}")
 
-        # Identify bottleneck
+        # Identify bottleneck - check all stages
         bottleneck = None
-        if avg_var_v < 0.3:
-            bottleneck = "V Projection"
+        min_var = min(avg_var_q, avg_var_k, avg_var_v)
+        if min_var < 0.3:
+            if avg_var_q == min_var:
+                bottleneck = "Q Projection"
+            elif avg_var_k == min_var:
+                bottleneck = "K Projection"
+            else:
+                bottleneck = "V Projection"
         elif avg_var_attn < 0.3:
             bottleneck = "Attention"
         elif avg_var_o < 0.3:
             bottleneck = "O Projection"
 
         if bottleneck:
-            print(f"    │ 🎯 BOTTLENECK: {bottleneck}")
+            print(f"      🎯 BOTTLENECK: {bottleneck}")
 
     return results
 
