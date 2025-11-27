@@ -616,7 +616,7 @@ class DAWN(nn.Module):
                 torch.nn.init.ones_(module.weight)
                 torch.nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, labels=None, return_routing_info=False):
+    def forward(self, input_ids, labels=None, return_routing_info=False, return_losses=False):
         B, S = input_ids.shape
         device = input_ids.device
 
@@ -642,6 +642,13 @@ class DAWN(nn.Module):
                 labels.view(-1),
                 ignore_index=-100
             )
+
+        # Handle return_losses (for train.py compatibility)
+        if return_losses:
+            losses = self.get_auxiliary_losses()
+            if return_routing_info:
+                return (logits, losses, routing_infos)
+            return (logits, losses)
 
         if return_routing_info:
             return (loss, logits, routing_infos) if labels is not None else (logits, routing_infos)
