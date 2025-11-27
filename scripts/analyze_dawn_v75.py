@@ -783,6 +783,10 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 W_Q_sample = W_Q_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
                 _, S_vals_q, _ = torch.linalg.svd(W_Q_sample, full_matrices=False)
                 cond_num_q = (S_vals_q[0] / (S_vals_q[-1] + 1e-10)).item()
+                # W_Q effective rank
+                S_norm_q = S_vals_q / S_vals_q.sum()
+                entropy_q = -torch.sum(S_norm_q * torch.log(S_norm_q + 1e-10))
+                eff_rank_q = torch.exp(entropy_q).item()
 
                 # K projection analysis
                 var_after_k = K.var(dim=-1).mean()
@@ -792,6 +796,10 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 W_K_sample = W_K_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
                 _, S_vals_k, _ = torch.linalg.svd(W_K_sample, full_matrices=False)
                 cond_num_k = (S_vals_k[0] / (S_vals_k[-1] + 1e-10)).item()
+                # W_K effective rank
+                S_norm_k = S_vals_k / S_vals_k.sum()
+                entropy_k = -torch.sum(S_norm_k * torch.log(S_norm_k + 1e-10))
+                eff_rank_k = torch.exp(entropy_k).item()
 
                 # V projection analysis
                 var_after_v = V.var(dim=-1).mean()
@@ -801,6 +809,10 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 W_V_sample = W_V_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
                 _, S_vals_v, _ = torch.linalg.svd(W_V_sample, full_matrices=False)
                 cond_num_v = (S_vals_v[0] / (S_vals_v[-1] + 1e-10)).item()
+                # W_V effective rank
+                S_norm_v = S_vals_v / S_vals_v.sum()
+                entropy_v = -torch.sum(S_norm_v * torch.log(S_norm_v + 1e-10))
+                eff_rank_v = torch.exp(entropy_v).item()
 
                 # ============================================================
                 # STAGE 2: Attention Mixing (V → Attention(V))
@@ -862,10 +874,13 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                     # Stage 1: Q/K/V projection
                     'var_ratio_q': var_ratio_q,
                     'cond_num_q': cond_num_q,
+                    'eff_rank_q': eff_rank_q,
                     'var_ratio_k': var_ratio_k,
                     'cond_num_k': cond_num_k,
+                    'eff_rank_k': eff_rank_k,
                     'var_ratio_v': var_ratio_v,
                     'cond_num_v': cond_num_v,
+                    'eff_rank_v': eff_rank_v,
                     # Stage 2: Attention
                     'var_ratio_attn': var_ratio_attn,
                     'attn_entropy': attn_entropy,
@@ -899,10 +914,13 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
         # Aggregate metrics - Q/K/V
         avg_var_q = np.mean([d['var_ratio_q'] for d in data])
         avg_cond_q = np.mean([d['cond_num_q'] for d in data])
+        avg_eff_q = np.mean([d['eff_rank_q'] for d in data])
         avg_var_k = np.mean([d['var_ratio_k'] for d in data])
         avg_cond_k = np.mean([d['cond_num_k'] for d in data])
+        avg_eff_k = np.mean([d['eff_rank_k'] for d in data])
         avg_var_v = np.mean([d['var_ratio_v'] for d in data])
         avg_cond_v = np.mean([d['cond_num_v'] for d in data])
+        avg_eff_v = np.mean([d['eff_rank_v'] for d in data])
         # Attention
         avg_var_attn = np.mean([d['var_ratio_attn'] for d in data])
         avg_entropy = np.mean([d['attn_entropy'] for d in data])
@@ -920,15 +938,15 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
 
         status_q = "⚠️ COLLAPSE" if avg_var_q < 0.3 else ("⚠️ EXPLODE" if avg_var_q > 3.0 else "✓")
         cond_q_status = "⚠️" if avg_cond_q > 100 else ""
-        print(f"    │   Q: var_ratio={avg_var_q:.4f} {status_q}  cond_num={avg_cond_q:.1f} {cond_q_status}")
+        print(f"    │   Q: var={avg_var_q:.3f} {status_q}  cond={avg_cond_q:.1f} {cond_q_status}  eff_rank={avg_eff_q:.1f}")
 
         status_k = "⚠️ COLLAPSE" if avg_var_k < 0.3 else ("⚠️ EXPLODE" if avg_var_k > 3.0 else "✓")
         cond_k_status = "⚠️" if avg_cond_k > 100 else ""
-        print(f"    │   K: var_ratio={avg_var_k:.4f} {status_k}  cond_num={avg_cond_k:.1f} {cond_k_status}")
+        print(f"    │   K: var={avg_var_k:.3f} {status_k}  cond={avg_cond_k:.1f} {cond_k_status}  eff_rank={avg_eff_k:.1f}")
 
         status_v = "⚠️ COLLAPSE" if avg_var_v < 0.3 else ("⚠️ EXPLODE" if avg_var_v > 3.0 else "✓")
         cond_v_status = "⚠️" if avg_cond_v > 100 else ""
-        print(f"    │   V: var_ratio={avg_var_v:.4f} {status_v}  cond_num={avg_cond_v:.1f} {cond_v_status}")
+        print(f"    │   V: var={avg_var_v:.3f} {status_v}  cond={avg_cond_v:.1f} {cond_v_status}  eff_rank={avg_eff_v:.1f}")
 
         # Q/K/V comparison summary
         qkv_vars = [('Q', avg_var_q), ('K', avg_var_k), ('V', avg_var_v)]
@@ -974,6 +992,223 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
 
         if bottleneck:
             print(f"      🎯 BOTTLENECK: {bottleneck}")
+
+    return results
+
+
+# ============================================================
+# 7.5. ⭐ Mixing Stage Condition Analysis (NEW)
+# ============================================================
+
+def analyze_mixing_condition(model, dataloader, device, max_batches=3):
+    """Analyze where condition number explosion happens
+
+    Compares condition numbers at each mixing stage:
+    1. Single basis: Each basis_i has its own condition
+    2. Single neuron recipe → W: recipe selects/combines basis
+    3. Mixed neurons → W: topk neurons mixed together
+
+    Goal: Identify if explosion is from neuron mixing or basis mixing
+    """
+    print("\n" + "="*60)
+    print("7.5. ⭐ MIXING STAGE CONDITION ANALYSIS")
+    print("="*60)
+
+    model.eval()
+    version = detect_model_version(model)
+    results = {f'layer_{i}': [] for i in range(len(model.layers))}
+
+    # ============================================================
+    # STAGE A: Single Basis Condition Numbers
+    # ============================================================
+    print("\n📊 [Stage A] Single Basis Condition Numbers")
+
+    if version == "7.7":
+        basis_qk = model.shared_basis.basis_qk  # [n_basis, D, rank]
+        basis_vo = model.shared_basis.basis_vo
+
+        cond_per_basis_qk = []
+        cond_per_basis_vo = []
+        for i in range(model.n_basis):
+            # basis_i: [D, rank] - condition of this projection matrix
+            _, s_qk, _ = torch.linalg.svd(basis_qk[i], full_matrices=False)
+            _, s_vo, _ = torch.linalg.svd(basis_vo[i], full_matrices=False)
+            cond_per_basis_qk.append((s_qk[0] / (s_qk[-1] + 1e-10)).item())
+            cond_per_basis_vo.append((s_vo[0] / (s_vo[-1] + 1e-10)).item())
+
+        print(f"  basis_qk: mean={np.mean(cond_per_basis_qk):.2f}, max={np.max(cond_per_basis_qk):.2f}, min={np.min(cond_per_basis_qk):.2f}")
+        print(f"  basis_vo: mean={np.mean(cond_per_basis_vo):.2f}, max={np.max(cond_per_basis_vo):.2f}, min={np.min(cond_per_basis_vo):.2f}")
+        results['single_basis_cond_qk'] = cond_per_basis_qk
+        results['single_basis_cond_vo'] = cond_per_basis_vo
+
+    elif version == "7.6":
+        basis_down = model.shared_basis.get_basis_down()
+        basis_up = model.shared_basis.get_basis_up()
+
+        cond_per_basis_down = []
+        cond_per_basis_up = []
+        for i in range(model.n_basis):
+            _, s_down, _ = torch.linalg.svd(basis_down[i], full_matrices=False)
+            _, s_up, _ = torch.linalg.svd(basis_up[i], full_matrices=False)
+            cond_per_basis_down.append((s_down[0] / (s_down[-1] + 1e-10)).item())
+            cond_per_basis_up.append((s_up[0] / (s_up[-1] + 1e-10)).item())
+
+        print(f"  basis_down: mean={np.mean(cond_per_basis_down):.2f}, max={np.max(cond_per_basis_down):.2f}")
+        print(f"  basis_up: mean={np.mean(cond_per_basis_up):.2f}, max={np.max(cond_per_basis_up):.2f}")
+        results['single_basis_cond_down'] = cond_per_basis_down
+        results['single_basis_cond_up'] = cond_per_basis_up
+    else:
+        basis = model.shared_basis.basis
+        cond_per_basis = []
+        for i in range(model.n_basis):
+            _, s, _ = torch.linalg.svd(basis[i], full_matrices=False)
+            cond_per_basis.append((s[0] / (s[-1] + 1e-10)).item())
+        print(f"  basis: mean={np.mean(cond_per_basis):.2f}, max={np.max(cond_per_basis):.2f}")
+        results['single_basis_cond'] = cond_per_basis
+
+    # ============================================================
+    # STAGE B & C: Single Neuron vs Mixed Neurons
+    # ============================================================
+    print("\n📊 [Stage B] Single Neuron Recipe → W Condition")
+    print("📊 [Stage C] Mixed Neurons (top-k) → W Condition")
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Mixing Analysis", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            B, S = input_ids.shape
+
+            pos = torch.arange(S, device=device).unsqueeze(0)
+            x = model.token_emb(input_ids) + model.pos_emb(pos)
+            mask = model.causal_mask[:, :, :S, :S]
+
+            for layer_idx, layer in enumerate(model.layers):
+                normed = layer.norm1(x)
+                qkv = layer.qkv_dynamic
+
+                # Get routing info
+                scores = qkv.W_router(normed)  # [B, S, n_neurons]
+                topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
+                weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
+
+                # Get basis
+                if version == "7.7":
+                    basis = qkv.shared_basis.basis_vo  # Use V basis for analysis
+                elif version == "7.6":
+                    basis = qkv.shared_basis.get_basis_down()
+                else:
+                    basis = qkv.shared_basis()
+
+                # --------------------------------------------------------
+                # Stage B: Single neuron recipe → W (no mixing)
+                # --------------------------------------------------------
+                # For each of the top-k neurons, compute W individually
+                single_neuron_conds = []
+                for k_idx in range(qkv.k):
+                    neuron_idx = topk_idx[:, :, k_idx]  # [B, S]
+                    recipe = qkv.neuron_recipe_V[neuron_idx]  # [B, S, n_basis]
+                    recipe_norm = F.softmax(recipe, dim=-1)
+
+                    # W from single neuron: [B, S, D, rank]
+                    W_single = torch.einsum('bsn,ndr->bsdr', recipe_norm, basis)
+
+                    # Sample and compute condition
+                    W_flat = W_single.view(B * S, -1)
+                    sample_idx = torch.randperm(B * S, device=device)[:min(50, B * S)]
+                    W_sample = W_flat[sample_idx]
+                    _, s_vals, _ = torch.linalg.svd(W_sample, full_matrices=False)
+                    cond = (s_vals[0] / (s_vals[-1] + 1e-10)).item()
+                    single_neuron_conds.append(cond)
+
+                avg_single_neuron_cond = np.mean(single_neuron_conds)
+
+                # --------------------------------------------------------
+                # Stage C: Mixed neurons (top-k weighted) → W
+                # --------------------------------------------------------
+                recipe_mixed = (qkv.neuron_recipe_V[topk_idx] * weights.unsqueeze(-1)).sum(dim=2)
+                recipe_mixed_norm = F.softmax(recipe_mixed, dim=-1)  # [B, S, n_basis]
+
+                W_mixed = torch.einsum('bsn,ndr->bsdr', recipe_mixed_norm, basis)
+
+                W_flat = W_mixed.view(B * S, -1)
+                sample_idx = torch.randperm(B * S, device=device)[:min(50, B * S)]
+                W_sample = W_flat[sample_idx]
+                _, s_vals, _ = torch.linalg.svd(W_sample, full_matrices=False)
+                mixed_neuron_cond = (s_vals[0] / (s_vals[-1] + 1e-10)).item()
+
+                # --------------------------------------------------------
+                # Stage D: Recipe entropy (how spread is the recipe?)
+                # --------------------------------------------------------
+                recipe_entropy = -torch.sum(
+                    recipe_mixed_norm * torch.log(recipe_mixed_norm + 1e-10), dim=-1
+                ).mean().item()
+
+                # Max weight in recipe (specialization)
+                max_recipe_weight = recipe_mixed_norm.max(dim=-1)[0].mean().item()
+
+                results[f'layer_{layer_idx}'].append({
+                    'single_neuron_cond': avg_single_neuron_cond,
+                    'mixed_neuron_cond': mixed_neuron_cond,
+                    'cond_ratio': mixed_neuron_cond / (avg_single_neuron_cond + 1e-10),
+                    'recipe_entropy': recipe_entropy,
+                    'max_recipe_weight': max_recipe_weight,
+                })
+
+                # Forward to next layer
+                attn_out, _ = qkv(normed, mask)
+                x = x + layer.dropout(attn_out)
+                x = x + layer.dropout(layer.w_down(F.gelu(layer.w_up(layer.norm2(x)))))
+
+    # ============================================================
+    # Output Results
+    # ============================================================
+    print("\n⭐ MIXING CONDITION ANALYSIS RESULTS:")
+    print("\n  Stages:")
+    print("    A: Single basis condition (orthogonal init → should be ~1)")
+    print("    B: Single neuron recipe → W (basis mixing only)")
+    print("    C: Mixed neurons → W (neuron + basis mixing)")
+    print("\n  If B >> A: Basis mixing causes explosion")
+    print("  If C >> B: Neuron mixing causes explosion")
+
+    for layer_idx in range(len(model.layers)):
+        key = f'layer_{layer_idx}'
+        data = results[key]
+
+        avg_single = np.mean([d['single_neuron_cond'] for d in data])
+        avg_mixed = np.mean([d['mixed_neuron_cond'] for d in data])
+        avg_ratio = np.mean([d['cond_ratio'] for d in data])
+        avg_entropy = np.mean([d['recipe_entropy'] for d in data])
+        avg_max_weight = np.mean([d['max_recipe_weight'] for d in data])
+
+        print(f"\n  Layer {layer_idx}:")
+        print(f"    ┌─────────────────────────────────────────────────────────")
+        print(f"    │ [B] Single neuron → W:  cond_num = {avg_single:.1f}")
+        print(f"    │ [C] Mixed neurons → W:  cond_num = {avg_mixed:.1f}")
+        print(f"    │")
+
+        # Identify explosion source
+        if avg_ratio > 2.0:
+            print(f"    │ ⚠️  Neuron mixing causes {avg_ratio:.1f}x condition explosion!")
+            explosion_source = "NEURON_MIXING"
+        elif avg_single > 50:
+            print(f"    │ ⚠️  Basis mixing already causes high condition!")
+            explosion_source = "BASIS_MIXING"
+        else:
+            print(f"    │ ✓  Mixing ratio = {avg_ratio:.2f}x (acceptable)")
+            explosion_source = None
+
+        print(f"    │")
+        print(f"    │ Recipe stats: entropy={avg_entropy:.2f}, max_weight={avg_max_weight:.3f}")
+
+        if avg_max_weight > 0.5:
+            print(f"    │ ⚠️  High specialization (max_weight > 0.5) - recipe nearly one-hot")
+
+        print(f"    └─────────────────────────────────────────────────────────")
+
+        if explosion_source:
+            print(f"      🎯 EXPLOSION SOURCE: {explosion_source}")
 
     return results
 
@@ -1267,6 +1502,7 @@ def main():
     all_results['w_dynamics'] = analyze_w_dynamics(model, val_loader, device, args.max_batches)
     all_results['basis_coverage'] = analyze_basis_coverage(model, val_loader, device, args.max_batches)
     all_results['o_projection'] = analyze_o_projection_loss(model, val_loader, device, args.max_batches)
+    all_results['mixing_condition'] = analyze_mixing_condition(model, val_loader, device, max_batches=3)
     all_results['attention'] = analyze_attention_patterns(model, val_loader, device, args.max_batches)
     all_results['summary'] = compute_summary_metrics(all_results)
 
