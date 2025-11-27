@@ -88,8 +88,25 @@ def detect_model_version(model):
     """Detect model version from shared_basis structure
 
     Returns:
-        str: "7.8", "7.7", "7.6", or "7.5"
+        str: "8.0", "7.9", "7.8", "7.7", "7.6", or "7.5"
     """
+    # Check model __version__ attribute first
+    model_version = getattr(model, '__version__', None)
+    if model_version in ["8.0", "7.9"]:
+        return model_version
+
+    # v7.9/v8.0 don't have shared_basis
+    if not hasattr(model, 'shared_basis'):
+        # v8.0: has shared_neurons with knowledge_K
+        if hasattr(model, 'shared_neurons') and hasattr(model.shared_neurons, 'knowledge_K'):
+            return "8.0"
+        # v7.9: has layers with qkv_circuit containing circuit_Q
+        if hasattr(model, 'layers') and len(model.layers) > 0:
+            layer = model.layers[0]
+            if hasattr(layer, 'qkv_circuit') and hasattr(layer.qkv_circuit, 'circuit_Q'):
+                return "7.9"
+        raise ValueError("Model version not detected: no shared_basis and not v7.9/v8.0 structure")
+
     sb = model.shared_basis
     # v7.8: NeuronBank with W_Q/K/V/O (no basis)
     if hasattr(sb, 'W_Q') and hasattr(sb, 'W_K'):
@@ -154,13 +171,41 @@ def analyze_basis_orthogonality(model):
     """Verify that basis is perfectly orthogonal
 
     Supports v7.5 (single basis), v7.6 (basis_down/basis_up), v7.7 (basis_qk/basis_vo),
-    and v7.8 (neuron W_Q/K/V/O orthogonality)
+    v7.8 (neuron W_Q/K/V/O orthogonality), v7.9/v8.0 (NeuronCircuit)
     """
     print("\n" + "="*60)
     print("1. BASIS ORTHOGONALITY VERIFICATION")
     print("="*60)
 
     version = detect_model_version(model)
+
+    # v7.9/v8.0: Different architecture, use model's own orthogonality_loss
+    if version in ["7.9", "8.0"]:
+        print(f"\n📌 v{version} model: NeuronCircuit architecture")
+        print(f"   Using model's built-in orthogonality_loss()")
+
+        with torch.no_grad():
+            orth_loss = model.orthogonality_loss().item()
+            process_norm_loss = model.process_norm_loss().item()
+
+        print(f"\n  Orthogonality loss: {orth_loss:.6f}")
+        print(f"  Process norm loss: {process_norm_loss:.6f}")
+
+        if version == "8.0":
+            knowledge_div_loss = model.knowledge_diversity_loss().item()
+            print(f"  Knowledge diversity loss: {knowledge_div_loss:.6f}")
+
+        results = {
+            'version': version,
+            'orth_loss': orth_loss,
+            'process_norm_loss': process_norm_loss,
+            'basis': {'max_off_diagonal': orth_loss},  # For compatibility
+        }
+        if version == "8.0":
+            results['knowledge_div_loss'] = knowledge_div_loss
+
+        return results
+
     n_basis = model.n_basis
     results = {}
 
@@ -278,6 +323,13 @@ def analyze_recipes(model):
     print("="*60)
 
     version = detect_model_version(model)
+
+    # v7.9/v8.0: NeuronCircuit - analyze routing patterns instead
+    if version in ["7.9", "8.0"]:
+        print(f"\n📌 v{version} model: NeuronCircuit architecture")
+        print(f"   No recipes - uses Householder transforms + routing")
+        print(f"   (Use runtime analysis for routing patterns)")
+        return {'version': version, 'skipped': True}
 
     # v7.8: No recipes - analyze neuron W matrices directly
     if version == "7.8":
@@ -413,6 +465,59 @@ def analyze_recipes(model):
 # 3. ⭐ Runtime Behavior Analysis
 # ============================================================
 
+def analyze_runtime_behavior_v79(model, dataloader, device, max_batches=10):
+    """Analyze routing patterns for v7.9/v8.0 NeuronCircuit models"""
+    from collections import defaultdict
+
+    n_layers = len(model.layers)
+    n_process = model.n_process
+
+    # Track process neuron usage (Householder selection)
+    process_usage = {f'layer_{i}': torch.zeros(n_process, device=device, dtype=torch.long)
+                     for i in range(n_layers)}
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Analyzing v7.9/v8.0", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+
+            # Forward pass with routing info
+            logits, routing_infos = model(input_ids, return_routing_info=True)
+
+            for layer_idx, routing_info in enumerate(routing_infos):
+                # v7.9/v8.0: neuron_indices from attention routing
+                if 'neuron_indices' in routing_info:
+                    indices = routing_info['neuron_indices']  # [B, S, k]
+                    idx_flat = indices.reshape(-1)
+                    usage = torch.bincount(idx_flat, minlength=n_process)
+                    process_usage[f'layer_{layer_idx}'] += usage
+
+    # Compute statistics
+    results = {'routing': {}, 'usage': {}}
+
+    print("\n⭐ PROCESS NEURON USAGE (Householder selection):")
+    for layer_idx in range(n_layers):
+        usage = process_usage[f'layer_{layer_idx}']
+        total = usage.sum()
+        usage_rate = (usage > 0).float().mean().item()
+        gini = compute_gini(usage).item()
+
+        print(f"  Layer {layer_idx}: {usage_rate:.1%} neurons used, Gini={gini:.3f}")
+        results['usage'][f'layer_{layer_idx}'] = {
+            'usage_rate': usage_rate,
+            'gini': gini,
+        }
+
+    results['routing']['avg_usage_rate'] = np.mean([v['usage_rate'] for v in results['usage'].values()])
+    results['routing']['avg_gini'] = np.mean([v['gini'] for v in results['usage'].values()])
+
+    print(f"\n  Average: {results['routing']['avg_usage_rate']:.1%} usage, Gini={results['routing']['avg_gini']:.3f}")
+
+    return results
+
+
 def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
     """Analyze neuron routing and usage during inference"""
     print("\n" + "="*60)
@@ -420,6 +525,12 @@ def analyze_runtime_behavior(model, dataloader, device, max_batches=10):
     print("="*60)
 
     model.eval()
+    version = detect_model_version(model)
+
+    # v7.9/v8.0: Different architecture - simplified routing analysis
+    if version in ["7.9", "8.0"]:
+        print(f"\n📌 v{version} model: NeuronCircuit routing analysis")
+        return analyze_runtime_behavior_v79(model, dataloader, device, max_batches)
 
     # ⚡ GPU-optimized accumulators
     n_layers = len(model.layers)
@@ -540,8 +651,29 @@ def compute_summary_metrics(all_results):
 
     summary = {}
 
-    # Basis orthogonality
-    if 'basis' in all_results:
+    # Check if v7.9/v8.0 (skipped most analyses)
+    basis_result = all_results.get('basis', {})
+    if basis_result.get('version') in ["7.9", "8.0"]:
+        version = basis_result['version']
+        print(f"\n📊 Summary (v{version} - NeuronCircuit):")
+        summary['version'] = version
+        summary['orth_loss'] = basis_result.get('orth_loss', 0.0)
+        summary['process_norm_loss'] = basis_result.get('process_norm_loss', 0.0)
+        print(f"  Orthogonality loss: {summary['orth_loss']:.6f}")
+        print(f"  Process norm loss: {summary['process_norm_loss']:.6f}")
+
+        # Runtime analysis results (if available)
+        runtime_result = all_results.get('runtime', {})
+        if 'routing' in runtime_result:
+            summary['avg_usage_rate'] = runtime_result['routing'].get('avg_usage_rate', 0.0)
+            summary['avg_gini'] = runtime_result['routing'].get('avg_gini', 0.0)
+            print(f"  Avg neuron usage: {summary['avg_usage_rate']*100:.1f}%")
+            print(f"  Avg usage Gini: {summary['avg_gini']:.4f}")
+
+        return summary
+
+    # Basis orthogonality (v7.5-v7.8)
+    if 'basis' in all_results and 'basis' in all_results['basis']:
         summary['basis_orthogonal'] = all_results['basis']['basis']['max_off_diagonal'] < 1e-5
 
     # Recipe diversity (average across Q/K/V/O and layers)
@@ -592,6 +724,14 @@ def analyze_w_dynamics(model, dataloader, device, max_batches=5):
     print("="*60)
 
     model.eval()
+    version = detect_model_version(model)
+
+    # v7.9/v8.0: Skip - NeuronCircuit uses different projection mechanism
+    if version in ["7.9", "8.0"]:
+        print(f"\n📌 v{version} model: NeuronCircuit architecture")
+        print(f"   W dynamics analysis not applicable (uses Householder transforms)")
+        return {'version': version, 'skipped': True}
+
     results = {}
 
     # Detect model version from first layer
@@ -694,14 +834,21 @@ def analyze_basis_coverage(model, dataloader, device, max_batches=5):
     """Analyze how well basis covers the space
 
     Supports v7.5 (single basis), v7.6 (basis_down/basis_up), v7.7 (basis_qk/basis_vo),
-    and v7.8 (neuron W_Q - analyzes neuron diversity instead of basis)
+    v7.8 (neuron W_Q - analyzes neuron diversity instead of basis), v7.9/v8.0 (NeuronCircuit)
     """
     print("\n" + "="*60)
     print("6. BASIS COVERAGE ANALYSIS")
     print("="*60)
 
-    # Detect model version and get basis using helper
+    # Detect model version
     version = detect_model_version(model)
+
+    # v7.9/v8.0: Skip - NeuronCircuit uses different structure
+    if version in ["7.9", "8.0"]:
+        print(f"\n📌 v{version} model: NeuronCircuit architecture")
+        print(f"   Basis coverage analysis not applicable (uses shared neurons)")
+        return {'version': version, 'skipped': True}
+
     basis, basis_name = get_basis_for_qkv(model)
     print(f"📌 Analyzing {basis_name} (v{version})")
 
@@ -781,17 +928,24 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
     """Measure information loss in O projection
 
     Supports v7.5 (shared basis.T), v7.6 (independent basis_up), v7.7 (basis_qk/basis_vo),
-    and v7.8 (neuron W_Q/K/V/O - no basis mixing)
+    v7.8 (neuron W_Q/K/V/O - no basis mixing), v7.9/v8.0 (NeuronCircuit)
     """
     print("\n" + "="*60)
     print("7. ⭐ O PROJECTION INFORMATION LOSS (KEY SUSPECT)")
     print("="*60)
 
     model.eval()
-    results = {f'layer_{i}': [] for i in range(len(model.layers))}
 
     # Detect model version
     version = detect_model_version(model)
+
+    # v7.9/v8.0: Skip - uses Expander for O projection
+    if version in ["7.9", "8.0"]:
+        print(f"\n📌 v{version} model: NeuronCircuit architecture")
+        print(f"   O projection analysis not applicable (uses Expander with Householder)")
+        return {'version': version, 'skipped': True}
+
+    results = {f'layer_{i}': [] for i in range(len(model.layers))}
 
     if version == "7.8":
         print("\n📌 Detected v7.8 model with independent neuron W_Q/K/V/O")
@@ -1258,6 +1412,13 @@ def analyze_mixing_condition(model, dataloader, device, max_batches=3):
 
     model.eval()
     version = detect_model_version(model)
+
+    # v7.9/v8.0: Skip - NeuronCircuit uses different mixing mechanism
+    if version in ["7.9", "8.0"]:
+        print(f"\n📌 v{version} model: NeuronCircuit architecture")
+        print(f"   Mixing condition analysis not applicable (uses Householder transforms)")
+        return {'version': version, 'skipped': True}
+
     results = {f'layer_{i}': [] for i in range(len(model.layers))}
 
     # ============================================================
@@ -1537,6 +1698,14 @@ def analyze_attention_patterns(model, dataloader, device, max_batches=5):
     print("="*60)
 
     model.eval()
+    version = detect_model_version(model)
+
+    # v7.9/v8.0: Skip detailed attention analysis (different architecture)
+    if version in ["7.9", "8.0"]:
+        print(f"\n📌 v{version} model: NeuronCircuit architecture")
+        print(f"   Attention pattern analysis not applicable (uses NeuronAttention)")
+        return {'version': version, 'skipped': True}
+
     results = {f'layer_{i}': {'entropy': [], 'sparsity': [], 'self_attn': []}
                for i in range(len(model.layers))}
 
