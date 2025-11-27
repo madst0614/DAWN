@@ -1,0 +1,67 @@
+# DAWN v8.2 Training Config
+# v8.1 기반 + Householder 변환 시 F.normalize 사용
+#
+# 변경점:
+#   v8.1 → v8.2: apply_householder에서 v를 F.normalize로 정규화
+#   기존: v_norm_sq 계산 후 나눔
+#   변경: F.normalize(v, dim=-1) 사용
+#
+# 하이퍼파라미터는 v8.1과 동일:
+#   n_knowledge: 128
+#   knowledge_k: 16
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_file: train/wikitext_5to1_texts.pkl
+  val_file: validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v8.2: v8.1 + F.normalize Householder)
+model:
+  model_version: "8.2"    # DAWN v8.2 - F.normalize Householder
+  d_model: 256            # Hidden dimension
+  n_layers: 4             # Number of transformer layers
+  n_heads: 4              # Number of attention heads
+
+  # TransformNeurons parameters (shared across layers)
+  rank: 64                # Projection rank (4 heads x 16 d_head)
+  n_input: 8              # Number of input neurons (256 -> 64 compression)
+  n_process: 32           # Number of Householder process neurons
+  n_output: 8             # Number of output neurons (64 -> 256 restoration)
+  process_k: 3            # Number of process neurons to select (top-k)
+
+  # KnowledgeNeurons parameters (same as v8.1)
+  n_knowledge: 128        # Number of knowledge neurons
+  knowledge_k: 16         # Number of knowledge neurons to retrieve
+
+  # Architecture
+  max_seq_len: 128        # Maximum sequence length
+  dropout: 0.1            # Dropout rate
+
+# Training
+training:
+  batch_size: 128         # Batch size
+  num_epochs: 30          # Total epochs
+  lr: 0.0003              # Learning rate
+  weight_decay: 0.1       # Weight decay for regularization
+  warmup_epochs: 2        # Warmup epochs
+
+  # Regularization
+  orthogonality_weight: 0.01   # Input/Output neuron orthogonality loss
+  process_norm_weight: 0.01    # Process neuron norm regularization (||v|| = 1)
+  load_balance_weight: 0.01    # Load balance loss for routing
+
+# Mixed precision (faster training on GPU)
+use_amp: true
+
+# Paths
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v82
+log_dir: /content/drive/MyDrive/dawn/checkpoints_v82
+
+# Notes:
+# v8.2 Changes from v8.1:
+# - apply_householder 변환 방식 변경:
+#   Before: v_norm_sq = (v*v).sum() + 1e-8; v_normalized = v / sqrt(v_norm_sq)
+#   After:  v = F.normalize(v, dim=-1)
+# - 더 깔끔하고 수치적으로 안정적인 정규화
+# - process_norm_loss는 그대로 유지

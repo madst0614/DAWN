@@ -116,7 +116,8 @@ class SharedNeurons(nn.Module):
 
     def apply_householder(self, x, v):
         """
-        Householder 변환: H @ x = x - 2 * v * (v.T @ x) / ||v||²
+        Householder 변환: H @ x = x - 2 * v * (v.T @ x)
+        (v는 단위 벡터로 정규화됨)
 
         Args:
             x: [B, S, rank] or [B, S, d_model]
@@ -125,10 +126,9 @@ class SharedNeurons(nn.Module):
         Returns:
             H @ x: same shape as x
         """
-        v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-8
-        v_normalized = v / v_norm_sq.sqrt()
-        vTx = (x * v_normalized).sum(dim=-1, keepdim=True)
-        return x - 2 * v_normalized * vTx
+        v = F.normalize(v, dim=-1)
+        vTx = (x * v).sum(dim=-1, keepdim=True)
+        return x - 2 * v * vTx
 
 
 class Compressor(nn.Module):

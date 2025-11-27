@@ -1277,8 +1277,8 @@ def main():
     if model_version != 'baseline':
         print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
-        if model_version in ["8.0", "8.1"]:
-            # v8.0/v8.1: SharedNeurons + NeuronMemory (FFN 대체)
+        if model_version in ["8.0", "8.1", "8.2"]:
+            # v8.0/v8.1/v8.2: SharedNeurons + NeuronMemory (FFN 대체)
             rank = getattr(args, 'rank', args.basis_rank)
             n_input = getattr(args, 'n_input', 8)
             n_process = getattr(args, 'n_process', 32)
@@ -1437,8 +1437,8 @@ def main():
                 'rank': args.basis_rank,  # v7.9 uses 'rank' instead of 'basis_rank'
             })
 
-        # v8.0/v8.1 SharedNeurons + NeuronMemory parameters
-        if model_version in ['8.0', '8.1']:
+        # v8.0/v8.1/v8.2 SharedNeurons + NeuronMemory parameters
+        if model_version in ['8.0', '8.1', '8.2']:
             model_kwargs.update({
                 'n_input': args.n_input,
                 'n_process': args.n_process,
@@ -1450,7 +1450,7 @@ def main():
             })
 
     # Create model
-    if model_version in ['8.1', '8.0', '7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['8.2', '8.1', '8.0', '7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
@@ -1715,7 +1715,7 @@ def main():
         # Analyze activations periodically (skip for v7.5+ - uses different architecture)
         if epoch % 10 == 0:
             model_version = getattr(model, '__version__', None)
-            if model_version not in ["7.5", "7.8", "7.9", "8.0", "8.1"]:
+            if model_version not in ["7.5", "7.8", "7.9", "8.0", "8.1", "8.2"]:
                 sample_batch = next(iter(val_loader))
                 sample_ids = sample_batch['input_ids'][:1].to(device)
                 act_stats = analyze_activations(model, sample_ids, device)
@@ -1724,7 +1724,7 @@ def main():
                     print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
                           f"({stats['usage_ratio']:.2%} usage)")
             else:
-                # v7.5/v7.8/v7.9/v8.0/v8.1 uses dynamic Q/K/V/O - activation analysis not applicable
+                # v7.5/v7.8/v7.9/v8.x uses dynamic Q/K/V/O - activation analysis not applicable
                 print(f"\n  (Neuron usage analysis skipped for v{model_version} - use analyze_dawn_v75.py instead)")
 
         # Debug: Log epoch summary for specific epochs
