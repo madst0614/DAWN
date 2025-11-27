@@ -27,7 +27,8 @@ v7.6 특징 (개선):
 |------------------------|------------|-------------------------------|
 | W_Q token similarity   | < 0.7      | > 0.9 → 동적 생성 무의미        |
 | Basis effective rank   | > 20       | < 10 → 중복된 basis           |
-| O proj relative error  | < 0.2      | > 0.4 → 심각한 정보 손실       |
+| O proj variance ratio  | 0.5 ~ 2.0  | < 0.5 collapse, > 2.0 explode |
+| O proj condition #     | < 100      | > 100 → ill-conditioned W_O   |
 | Attention entropy      | 1.5 ~ 3.0  | < 1.0 또는 > 4.0              |
 | Basis correspondence   | < 0.3      | > 0.7 → basis_up 미학습 (v7.6) |
 
@@ -692,25 +693,27 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 W_O = torch.einsum('bsn,nrd->bsrd', recipe_O, basis_up)  # [B, S, rank, D]
                 attn_out_after_O = torch.einsum('bsr,bsrd->bsd', attn_out, W_O)  # [B, S, D]
 
-                # Measure info loss 1: Reconstruction possibility after back-projection
-                W_down = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)  # Use any down projection
-                attn_reconstructed = torch.einsum('bsd,bsdr->bsr', attn_out_after_O, W_down)
+                # ⭐ Metric 1: Variance ratio (information preservation)
+                # 투영 전후 분산 비교 - 1에 가까울수록 정보 보존됨
+                var_before = attn_out_before_O.var(dim=-1).mean()  # rank 공간 분산
+                var_after = attn_out_after_O.var(dim=-1).mean()    # D 공간 분산
+                var_ratio = (var_after / (var_before + 1e-10)).item()
 
-                recon_error = (attn_out_before_O - attn_reconstructed).norm(dim=-1).mean()
-                original_norm = attn_out_before_O.norm(dim=-1).mean()
-                relative_error = recon_error / (original_norm + 1e-10)
-
-                # Measure info loss 2: W_O effective rank
+                # ⭐ Metric 2: W_O condition number (projection quality)
+                # 낮을수록 W_O가 잘 학습됨
                 W_O_flat = W_O.view(B * S, -1)
-                W_O_sample = W_O_flat[torch.randperm(B * S, device=device)[:100]]
+                W_O_sample = W_O_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
                 _, S_vals, _ = torch.linalg.svd(W_O_sample, full_matrices=False)
+                condition_number = (S_vals[0] / (S_vals[-1] + 1e-10)).item()
+
+                # Metric 3: W_O effective rank (표현력)
                 S_norm = S_vals / S_vals.sum()
                 entropy = -torch.sum(S_norm * torch.log(S_norm + 1e-10))
                 eff_rank = torch.exp(entropy).item()
 
                 results[f'layer_{layer_idx}'].append({
-                    'recon_error': recon_error.item(),
-                    'relative_error': relative_error.item(),
+                    'var_ratio': var_ratio,
+                    'condition_number': condition_number,
                     'w_o_effective_rank': eff_rank,
                 })
 
@@ -720,18 +723,34 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
 
     # Output results
     print("\n⭐ O PROJECTION ANALYSIS:")
+    print("\n  Metrics explanation:")
+    print("    - Variance ratio: var(after)/var(before), ~1 = good preservation")
+    print("    - Condition number: σ_max/σ_min of W_O, lower = better")
+    print("    - Effective rank: expressiveness of W_O")
+
     for layer_idx in range(len(model.layers)):
         key = f'layer_{layer_idx}'
         data = results[key]
-        avg_rel_error = np.mean([d['relative_error'] for d in data])
+        avg_var_ratio = np.mean([d['var_ratio'] for d in data])
+        avg_cond_num = np.mean([d['condition_number'] for d in data])
         avg_eff_rank = np.mean([d['w_o_effective_rank'] for d in data])
 
         print(f"\n  Layer {layer_idx}:")
-        print(f"    Relative reconstruction error: {avg_rel_error:.4f}")
-        print(f"    W_O effective rank: {avg_eff_rank:.2f}")
+        print(f"    Variance ratio: {avg_var_ratio:.4f}", end="")
+        if avg_var_ratio < 0.5:
+            print(" ⚠️  LOW - variance collapse")
+        elif avg_var_ratio > 2.0:
+            print(" ⚠️  HIGH - variance explosion")
+        else:
+            print(" ✓")
 
-        if avg_rel_error > 0.3:
-            print(f"    ⚠️  HIGH INFO LOSS - O projection losing significant information!")
+        print(f"    W_O condition number: {avg_cond_num:.2f}", end="")
+        if avg_cond_num > 100:
+            print(" ⚠️  HIGH - ill-conditioned projection")
+        else:
+            print(" ✓")
+
+        print(f"    W_O effective rank: {avg_eff_rank:.2f}")
 
     return results
 
