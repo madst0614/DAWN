@@ -53,6 +53,489 @@ from utils.training import CheckpointManager, TrainingMonitor, count_parameters,
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
 
+# ============================================================
+# DEBUG LOGGING FUNCTIONS
+# ============================================================
+
+class DebugLogger:
+    """Debug logger for basis_up analysis, gradients, and orthogonality loss"""
+
+    # Epochs to log detailed stats
+    LOG_EPOCHS = {0, 1, 5, 10, 20, 50, 100}
+
+    def __init__(self, log_file_path):
+        self.log_file = log_file_path
+        self.epoch_logged = set()
+
+        # Initialize log file
+        with open(self.log_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("DAWN Debug Log - Basis_up Analysis\n")
+            f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n\n")
+
+    def should_log_epoch(self, epoch):
+        """Check if this epoch should be logged"""
+        return epoch in self.LOG_EPOCHS or epoch % 10 == 0
+
+    def log(self, message):
+        """Write message to debug log file"""
+        with open(self.log_file, 'a') as f:
+            f.write(message + "\n")
+
+    def log_section(self, title):
+        """Log a section header"""
+        self.log(f"\n{'='*60}")
+        self.log(f"{title}")
+        self.log(f"{'='*60}")
+
+    def log_basis_stats(self, model, epoch, step=None):
+        """
+        Log basis statistics at specific epochs
+
+        Supports:
+        - v7.8: NeuronBank W_Q/K/V/O (no basis)
+        - v7.7: basis_qk / basis_vo
+        - v7.6: basis_down / basis_up
+
+        Tracks:
+        - Singular value distribution per basis/neuron
+        - Overall condition number
+        - Potential collapse detection
+        """
+        base_model = get_underlying_model(model)
+
+        # Only for models with shared_basis (aliased as neuron_bank for v7.8)
+        if not hasattr(base_model, 'shared_basis'):
+            return
+
+        step_str = f" Step {step}" if step else ""
+        self.log_section(f"Basis/Neuron Stats - Epoch {epoch}{step_str}")
+
+        sb = base_model.shared_basis
+
+        # Detect model version
+        is_v78 = hasattr(sb, 'W_Q') and hasattr(sb, 'W_K')  # NeuronBank
+        is_v77 = hasattr(sb, 'basis_qk')
+
+        with torch.no_grad():
+            if is_v78:
+                # v7.8: NeuronBank with independent W_Q/K/V/O per neuron
+                self.log(f"\n[v7.8 NeuronBank - Independent Neuron W Matrices]")
+                n_neurons = sb.n_neurons
+
+                for W_name, W in [('W_Q', sb.W_Q), ('W_K', sb.W_K), ('W_V', sb.W_V), ('W_O', sb.W_O)]:
+                    # Per-neuron condition numbers
+                    cond_nums = []
+                    for i in range(n_neurons):
+                        _, S, _ = torch.linalg.svd(W[i])
+                        cond = (S[0] / (S[-1] + 1e-10)).item()
+                        cond_nums.append(cond)
+
+                    avg_cond = sum(cond_nums) / len(cond_nums)
+                    max_cond = max(cond_nums)
+                    min_cond = min(cond_nums)
+
+                    self.log(f"\n  {W_name} condition numbers (across {n_neurons} neurons):")
+                    self.log(f"    mean = {avg_cond:.2f}, max = {max_cond:.2f}, min = {min_cond:.2f}")
+
+                    if max_cond > 100:
+                        self.log(f"    ⚠️  WARNING: High condition in some neurons!")
+                    elif max_cond > 10:
+                        self.log(f"    ⚠️  CAUTION: Condition numbers drifting from init")
+                    else:
+                        self.log(f"    ✓ Orthogonality well maintained")
+
+            elif is_v77:
+                # v7.7: basis_vo is the "output" basis (O uses its transpose)
+                basis_o = sb.basis_vo.detach()  # [n_basis, D, rank]
+                basis_o_name = "Basis_VO"
+                basis_qk = sb.basis_qk.detach()  # [n_basis, D, rank]
+                basis_qk_name = "Basis_QK"
+
+                n_basis = basis_o.shape[0]
+
+                # Per-basis singular values for O projection basis
+                self.log(f"\n[{basis_o_name} Per-Basis Singular Values (top 5)]")
+                all_singular_values = []
+                for i in range(n_basis):
+                    _, S, _ = torch.linalg.svd(basis_o[i])
+                    all_singular_values.extend(S.cpu().tolist())
+                    self.log(f"  {basis_o_name}[{i}]: {S[:5].cpu().numpy()}")
+
+                # Overall condition number for O basis
+                B_o_flat = basis_o.view(n_basis, -1)
+                _, S_all, _ = torch.linalg.svd(B_o_flat)
+                sigma_max = S_all[0].item()
+                sigma_min = S_all[-1].item()
+                condition_number = sigma_max / (sigma_min + 1e-10)
+
+                self.log(f"\n[{basis_o_name} Overall Condition Number]")
+                self.log(f"  σ_max = {sigma_max:.6f}")
+                self.log(f"  σ_min = {sigma_min:.10f}")
+                self.log(f"  Condition number = {condition_number:.2e}")
+
+                # Collapse detection
+                if condition_number > 1e6:
+                    self.log(f"  ⚠️  WARNING: High condition number indicates potential collapse!")
+                elif condition_number > 1e4:
+                    self.log(f"  ⚠️  CAUTION: Condition number getting high")
+                else:
+                    self.log(f"  ✓ Condition number is healthy")
+
+                # Also log QK basis for comparison
+                B_qk_flat = basis_qk.view(n_basis, -1)
+                _, S_qk, _ = torch.linalg.svd(B_qk_flat)
+                cond_qk = S_qk[0].item() / (S_qk[-1].item() + 1e-10)
+
+                self.log(f"\n[{basis_qk_name} Condition Number (for comparison)]")
+                self.log(f"  σ_max = {S_qk[0].item():.6f}")
+                self.log(f"  σ_min = {S_qk[-1].item():.10f}")
+                self.log(f"  Condition number = {cond_qk:.2e}")
+
+            elif hasattr(sb, 'basis_up') and hasattr(sb, 'basis_down'):
+                # v7.6: basis_up is the "output" basis
+                basis_o = sb.basis_up.detach()  # [n_basis, rank, D]
+                basis_o_name = "Basis_up"
+                basis_qk = sb.basis_down.detach()  # [n_basis, D, rank]
+                basis_qk_name = "Basis_down"
+
+                n_basis = basis_o.shape[0]
+
+                # Per-basis singular values for O projection basis
+                self.log(f"\n[{basis_o_name} Per-Basis Singular Values (top 5)]")
+                all_singular_values = []
+                for i in range(n_basis):
+                    _, S, _ = torch.linalg.svd(basis_o[i])
+                    all_singular_values.extend(S.cpu().tolist())
+                    self.log(f"  {basis_o_name}[{i}]: {S[:5].cpu().numpy()}")
+
+                # Overall condition number for O basis
+                B_o_flat = basis_o.view(n_basis, -1)
+                _, S_all, _ = torch.linalg.svd(B_o_flat)
+                sigma_max = S_all[0].item()
+                sigma_min = S_all[-1].item()
+                condition_number = sigma_max / (sigma_min + 1e-10)
+
+                self.log(f"\n[{basis_o_name} Overall Condition Number]")
+                self.log(f"  σ_max = {sigma_max:.6f}")
+                self.log(f"  σ_min = {sigma_min:.10f}")
+                self.log(f"  Condition number = {condition_number:.2e}")
+
+                # Collapse detection
+                if condition_number > 1e6:
+                    self.log(f"  ⚠️  WARNING: High condition number indicates potential collapse!")
+                elif condition_number > 1e4:
+                    self.log(f"  ⚠️  CAUTION: Condition number getting high")
+                else:
+                    self.log(f"  ✓ Condition number is healthy")
+
+                # Also log QK basis for comparison
+                B_qk_flat = basis_qk.view(n_basis, -1)
+                _, S_qk, _ = torch.linalg.svd(B_qk_flat)
+                cond_qk = S_qk[0].item() / (S_qk[-1].item() + 1e-10)
+
+                self.log(f"\n[{basis_qk_name} Condition Number (for comparison)]")
+                self.log(f"  σ_max = {S_qk[0].item():.6f}")
+                self.log(f"  σ_min = {S_qk[-1].item():.10f}")
+                self.log(f"  Condition number = {cond_qk:.2e}")
+            else:
+                # Other versions (v7.5, v7.1, etc.) - skip detailed basis logging
+                self.log(f"\n[Note: Detailed basis stats not available for this model version]")
+
+    def log_gradient_flow(self, model, epoch, step=None):
+        """
+        Log gradient flow for basis/neuron parameters
+
+        Supports:
+        - v7.8: neuron_bank.W_Q/K/V/O
+        - v7.6/v7.7: basis_down/up, basis_qk/vo
+
+        Tracks:
+        - Gradient norms for basis/neuron W parameters
+        - Parameter norms
+        - Gradient/parameter ratio
+        """
+        base_model = get_underlying_model(model)
+
+        if not hasattr(base_model, 'shared_basis'):
+            return
+
+        step_str = f" Step {step}" if step else ""
+        self.log_section(f"Gradient Flow - Epoch {epoch}{step_str}")
+
+        self.log("\n[Basis/Neuron Gradient Analysis]")
+        for name, param in base_model.named_parameters():
+            # Match basis or neuron_bank parameters
+            if ('basis' in name or 'neuron_bank' in name) and param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                param_norm = param.norm().item()
+                ratio = grad_norm / (param_norm + 1e-10)
+
+                self.log(f"  {name}:")
+                self.log(f"    grad_norm = {grad_norm:.8f}")
+                self.log(f"    param_norm = {param_norm:.6f}")
+                self.log(f"    ratio = {ratio:.8f}")
+
+                # Gradient health check
+                if grad_norm < 1e-8:
+                    self.log(f"    ⚠️  WARNING: Vanishing gradient!")
+                elif grad_norm > 100:
+                    self.log(f"    ⚠️  WARNING: Exploding gradient!")
+
+    def log_orthogonality_breakdown(self, model, epoch, step=None):
+        """
+        Log orthogonality loss breakdown
+
+        Supports:
+        - v7.8: neuron_bank W_Q/K/V/O (per-neuron orthogonality)
+        - v7.7: basis_qk / basis_vo
+        - v7.6: basis_down / basis_up
+
+        Tracks:
+        - ortho loss for each basis/neuron
+        - Which direction dominates
+        """
+        base_model = get_underlying_model(model)
+
+        if not hasattr(base_model, 'shared_basis'):
+            return
+
+        step_str = f" Step {step}" if step else ""
+        self.log_section(f"Orthogonality Loss Breakdown - Epoch {epoch}{step_str}")
+
+        with torch.no_grad():
+            sb = base_model.shared_basis
+
+            # Detect model version
+            is_v78 = hasattr(sb, 'W_Q') and hasattr(sb, 'W_K')
+            is_v77 = hasattr(sb, 'basis_qk')
+
+            if is_v78:
+                # v7.8: Per-neuron W orthogonality
+                self.log(f"\n[Orthogonality Loss Components (v7.8 - Per Neuron)]")
+                n_neurons = sb.n_neurons
+
+                for W_name, W in [('W_Q', sb.W_Q), ('W_K', sb.W_K), ('W_V', sb.W_V), ('W_O', sb.W_O)]:
+                    # Compute per-neuron orthogonality error
+                    ortho_errors = []
+                    for i in range(n_neurons):
+                        W_i = W[i]  # [D, rank] or [rank, D]
+                        if W_i.shape[0] > W_i.shape[1]:
+                            gram = W_i.T @ W_i  # [rank, rank]
+                        else:
+                            gram = W_i @ W_i.T  # [rank, rank]
+                        I = torch.eye(gram.shape[0], device=gram.device)
+                        error = ((gram - I) ** 2).mean().item()
+                        ortho_errors.append(error)
+
+                    avg_error = sum(ortho_errors) / len(ortho_errors)
+                    max_error = max(ortho_errors)
+                    self.log(f"  {W_name}: mean_error={avg_error:.8f}, max_error={max_error:.8f}")
+
+                self.log(f"\n  (Lower is better, 0 = perfect orthogonality)")
+
+            elif is_v77:
+                # v7.7: basis_qk and basis_vo (both QR initialized)
+                n_basis = sb.n_basis
+                I = torch.eye(n_basis, device=sb.basis_qk.device)
+                B_qk = sb.basis_qk.view(n_basis, -1)
+                B_vo = sb.basis_vo.view(n_basis, -1)
+                gram_qk = B_qk @ B_qk.T
+                gram_vo = B_vo @ B_vo.T
+                ortho_qk = ((gram_qk - I) ** 2).mean().item()
+                ortho_vo = ((gram_vo - I) ** 2).mean().item()
+                off_diagonal_mask = ~I.bool()
+
+                self.log(f"\n[Orthogonality Loss Components (v7.7)]")
+                self.log(f"  ortho_qk = {ortho_qk:.8f}")
+                self.log(f"  ortho_vo = {ortho_vo:.8f}")
+                self.log(f"  total (avg) = {(ortho_qk + ortho_vo) / 2:.8f}")
+
+                self.log(f"\n[Gram Matrix Diagnostics]")
+                self.log(f"  gram_qk diagonal mean: {gram_qk.diag().mean().item():.6f} (target: 1.0)")
+                self.log(f"  gram_qk off-diag mean: {gram_qk[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+                self.log(f"  gram_vo diagonal mean: {gram_vo.diag().mean().item():.6f} (target: 1.0)")
+                self.log(f"  gram_vo off-diag mean: {gram_vo[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+
+                if ortho_vo > ortho_qk * 10:
+                    self.log(f"\n  ⚠️  ortho_vo >> ortho_qk: V/O projection learning may be unstable")
+                elif ortho_qk > ortho_vo * 10:
+                    self.log(f"\n  ⚠️  ortho_qk >> ortho_vo: Q/K projection learning may be unstable")
+            elif hasattr(sb, 'basis_up') and hasattr(sb, 'basis_down'):
+                # v7.6: basis_down and basis_up
+                n_basis = sb.n_basis
+                I = torch.eye(n_basis, device=sb.basis_down.device)
+                B_down = sb.basis_down.view(n_basis, -1)
+                gram_down = B_down @ B_down.T
+                ortho_down = ((gram_down - I) ** 2).mean().item()
+
+                # basis_up orthogonality (with normalization for v7.6)
+                B_up = sb.basis_up.view(n_basis, -1)
+                B_up_norm = F.normalize(B_up, dim=-1)
+                gram_up = B_up_norm @ B_up_norm.T
+                off_diagonal_mask = ~I.bool()
+                ortho_up = (gram_up[off_diagonal_mask] ** 2).mean().item()
+
+                self.log(f"\n[Orthogonality Loss Components (v7.6)]")
+                self.log(f"  ortho_down = {ortho_down:.8f}")
+                self.log(f"  ortho_up   = {ortho_up:.8f}")
+                self.log(f"  total (avg) = {(ortho_down + ortho_up) / 2:.8f}")
+
+                self.log(f"\n[Gram Matrix Diagnostics]")
+                self.log(f"  gram_down diagonal mean: {gram_down.diag().mean().item():.6f} (target: 1.0)")
+                self.log(f"  gram_down off-diag mean: {gram_down[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+                self.log(f"  gram_up diagonal mean: {gram_up.diag().mean().item():.6f} (target: 1.0)")
+                self.log(f"  gram_up off-diag mean: {gram_up[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+
+                if ortho_up > ortho_down * 10:
+                    self.log(f"\n  ⚠️  ortho_up >> ortho_down: O projection learning may be unstable")
+                elif ortho_down > ortho_up * 10:
+                    self.log(f"\n  ⚠️  ortho_down >> ortho_up: Q/K/V projection learning may be unstable")
+            else:
+                # Other versions - skip
+                self.log(f"\n[Note: Orthogonality breakdown not available for this model version]")
+
+    def log_recipe_analysis(self, model, sample_input, epoch, step=None):
+        """
+        Log Recipe → W_O analysis
+
+        Supports:
+        - v7.8: NeuronBank W_O (no recipe, direct neuron mixing)
+        - v7.7: get_basis_o() (basis_vo.T)
+        - v7.6: get_basis_up()
+
+        Tracks:
+        - Recipe/neuron weight entropy (diversity)
+        - Max weight concentration
+        - W_O singular values
+        """
+        base_model = get_underlying_model(model)
+
+        if not hasattr(base_model, 'shared_basis'):
+            return
+
+        step_str = f" Step {step}" if step else ""
+        self.log_section(f"Recipe/Neuron → W_O Analysis - Epoch {epoch}{step_str}")
+
+        sb = base_model.shared_basis
+        is_v78 = hasattr(sb, 'W_Q') and hasattr(sb, 'W_K')
+        is_v77 = hasattr(sb, 'basis_qk')
+
+        base_model.eval()
+        with torch.no_grad():
+            B, S = sample_input.shape
+            device = sample_input.device
+
+            # Get first layer's qkv_dynamic
+            layer = base_model.layers[0]
+            qkv = layer.qkv_dynamic
+
+            # Routing
+            pos = torch.arange(S, device=device).unsqueeze(0)
+            x = base_model.token_emb(sample_input) + base_model.pos_emb(pos)
+
+            scores = qkv.W_router(x)
+            topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
+            weights = F.softmax(topk_scores, dim=-1)
+
+            if is_v78:
+                # v7.8: No recipe, analyze neuron weight distribution
+                self.log(f"\n[v7.8 Neuron Weight Statistics (no recipe)]")
+
+                # Neuron weight entropy
+                entropy = (-weights * torch.log(weights + 1e-10)).sum(-1).mean()
+                max_entropy = math.log(qkv.k)  # Maximum entropy for k neurons
+
+                # Max weight
+                max_weight = weights.max(-1)[0].mean()
+
+                self.log(f"  Neuron weight entropy: {entropy.item():.4f} (max possible: {max_entropy:.4f})")
+                self.log(f"  Normalized entropy: {entropy.item() / max_entropy:.4f}")
+                self.log(f"  Max weight (mean): {max_weight.item():.4f}")
+
+                if max_weight.item() > 0.8:
+                    self.log(f"  ⚠️  WARNING: Neuron weights too concentrated on single neuron!")
+
+                # W_O construction via neuron mixing
+                self.log(f"\n[W_O Construction (v7.8): weighted_avg(neuron_W_O)]")
+                nb = qkv.neuron_bank
+                W_O_neurons = nb.get_W_O(topk_idx)  # [B, S, k, rank, D]
+                weights_exp = weights.unsqueeze(-1).unsqueeze(-1)
+                W_O = (W_O_neurons * weights_exp).sum(dim=2)  # [B, S, rank, D]
+
+                # Analyze sample W_O
+                W_O_sample = W_O[0, 0]  # [rank, D]
+                _, S_wo, _ = torch.linalg.svd(W_O_sample)
+
+                self.log(f"\n[Mixed W_O Singular Values (sample token)]")
+                self.log(f"  Top 5: {S_wo[:5].cpu().numpy()}")
+                self.log(f"  σ_max/σ_min: {(S_wo[0] / (S_wo[-1] + 1e-10)).item():.2e}")
+
+                if S_wo[-1].item() < 1e-6:
+                    self.log(f"  ⚠️  WARNING: W_O has near-zero singular values!")
+
+            elif hasattr(qkv, 'neuron_recipe_O'):
+                # v7.5/v7.6/v7.7: Recipe-based analysis
+                # Recipe O
+                recipe_O = qkv.neuron_recipe_O[topk_idx]
+                token_recipe_O = (recipe_O * weights.unsqueeze(-1)).sum(dim=2)
+                token_recipe_O = F.softmax(token_recipe_O, dim=-1)  # [B, S, n_basis]
+
+                # Recipe entropy
+                entropy = (-token_recipe_O * torch.log(token_recipe_O + 1e-10)).sum(-1).mean()
+                max_entropy = math.log(qkv.n_basis)  # Maximum possible entropy
+
+                # Max weight
+                max_weight = token_recipe_O.max(-1)[0].mean()
+
+                self.log(f"\n[Recipe_O Statistics]")
+                self.log(f"  Entropy: {entropy.item():.4f} (max possible: {max_entropy:.4f})")
+                self.log(f"  Normalized entropy: {entropy.item() / max_entropy:.4f}")
+                self.log(f"  Max weight (mean): {max_weight.item():.4f}")
+
+                if max_weight.item() > 0.8:
+                    self.log(f"  ⚠️  WARNING: Recipe too concentrated on single basis!")
+
+                # W_O singular values - handle v7.6 vs v7.7
+                if is_v77:
+                    basis_o = sb.get_basis_o()  # [n_basis, rank, D] = basis_vo.T
+                    self.log(f"\n[W_O Construction (v7.7): recipe_O @ basis_vo.T]")
+                else:
+                    basis_o = sb.get_basis_up()  # [n_basis, rank, D]
+                    self.log(f"\n[W_O Construction (v7.6): recipe_O @ basis_up]")
+
+                W_O = torch.einsum('bsn,nrd->bsrd', token_recipe_O, basis_o)  # [B, S, rank, D]
+
+                # Analyze first token's W_O
+                W_O_sample = W_O[0, 0]  # [rank, D]
+                _, S_wo, _ = torch.linalg.svd(W_O_sample)
+
+                self.log(f"\n[W_O Singular Values (sample token)]")
+                self.log(f"  Top 5: {S_wo[:5].cpu().numpy()}")
+                self.log(f"  σ_max/σ_min: {(S_wo[0] / (S_wo[-1] + 1e-10)).item():.2e}")
+
+                # Check if W_O is degenerating
+                if S_wo[-1].item() < 1e-6:
+                    self.log(f"  ⚠️  WARNING: W_O has near-zero singular values!")
+
+            else:
+                # Other versions - skip recipe analysis
+                self.log(f"\n[Note: Recipe analysis not available for this model version]")
+
+        base_model.train()
+
+    def log_epoch_summary(self, model, sample_input, epoch, step=None):
+        """Log all debug info for an epoch"""
+        self.log_basis_stats(model, epoch, step)
+        self.log_orthogonality_breakdown(model, epoch, step)
+        self.log_recipe_analysis(model, sample_input, epoch, step)
+
+    def log_post_backward(self, model, epoch, step=None):
+        """Log gradient info after backward pass"""
+        self.log_gradient_flow(model, epoch, step)
+
+
 def get_underlying_model(model):
     """Get the underlying model from a potentially torch.compile() wrapped model"""
     # torch.compile() wraps models in OptimizedModule with _orig_mod attribute
@@ -62,14 +545,14 @@ def get_underlying_model(model):
 
 
 def is_v75_or_v76_model(model):
-    """Robust detection of v7.5/v7.6 models, handling torch.compile() wrapped models"""
+    """Robust detection of v7.5/v7.6/v7.7 models, handling torch.compile() wrapped models"""
     base_model = get_underlying_model(model)
 
     # Check model version attribute
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7"]:
         return True
 
-    # Check for qkv_dynamic attribute on layers (v7.5/v7.6 specific structure)
+    # Check for qkv_dynamic attribute on layers (v7.5/v7.6/v7.7 specific structure)
     if hasattr(base_model, 'layers') and len(base_model.layers) > 0:
         if hasattr(base_model.layers[0], 'qkv_dynamic'):
             return True
@@ -78,9 +561,12 @@ def is_v75_or_v76_model(model):
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0):
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, debug_logger=None):
     """Train for one epoch"""
     model.train()
+
+    # Debug: Log at start of key epochs
+    debug_log_steps = {0, 100, 500}  # Steps to log gradient info
 
     total_loss = 0
     total_tokens = 0
@@ -203,6 +689,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
+            # Debug: Log gradient flow at specific steps
+            if debug_logger and debug_logger.should_log_epoch(epoch) and step in debug_log_steps:
+                debug_logger.log_post_backward(model, epoch, step)
+
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -294,6 +784,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Debug: Log gradient flow at specific steps
+            if debug_logger and debug_logger.should_log_epoch(epoch) and step in debug_log_steps:
+                debug_logger.log_post_backward(model, epoch, step)
 
             optimizer.step()
 
@@ -581,6 +1075,8 @@ def main():
                         help='Path to checkpoint folder to resume from (e.g., checkpoints/run_20240101_120000_1234)')
     parser.add_argument('--from-scratch', action='store_true',
                         help='Start training from scratch (disable auto-resume)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug logging to debug.txt (basis_up analysis, gradients, etc.)')
     cli_args = parser.parse_args()
 
     # Load config
@@ -774,8 +1270,30 @@ def main():
     if model_version != 'baseline':
         print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
-        if model_version == "7.5":
-            print(f"Dynamic Q/K/V/O Generation (v8 design): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
+        if model_version == "7.8":
+            # v7.8: Independent Neuron W_Q/K/V/O (No Basis Mixing)
+            rank = getattr(args, 'rank', args.basis_rank)  # v7.8 uses 'rank', fallback to basis_rank
+            print(f"Independent Neuron Projections (v7.8): rank={rank}")
+            print(f"  - NeuronBank: {args.n_neurons} neurons × W_Q/K/V/O each")
+            print(f"  - No basis mixing (condition number stability)")
+            if args.orthogonality_weight > 0:
+                print(f"  - Neuron W Orthogonality Loss (orth_weight={args.orthogonality_weight})")
+        elif model_version == "7.7":
+            # v7.7: QK/VO Basis Separation
+            print(f"QK/VO Basis Separation (v7.7): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
+            print(f"  - basis_qk: Q/K share (gradient 2x)")
+            print(f"  - basis_vo: V/O share (O uses transpose)")
+            if args.orthogonality_weight > 0:
+                print(f"  - Orthogonality Loss (orth_weight={args.orthogonality_weight})")
+        elif model_version == "7.6":
+            # v7.6: Independent O Basis
+            print(f"Independent O Basis (v7.6): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
+            print(f"  - basis_down: Q/K/V projection")
+            print(f"  - basis_up: O projection (independent)")
+            if args.orthogonality_weight > 0:
+                print(f"  - Orthogonality Loss (orth_weight={args.orthogonality_weight})")
+        elif model_version == "7.5":
+            print(f"Dynamic Q/K/V/O Generation (v7.5): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
             if args.orthogonality_weight > 0:
                 print(f"  - Learnable Basis (orth_weight={args.orthogonality_weight})")
             else:
@@ -867,7 +1385,7 @@ def main():
             model_kwargs['mod_rank'] = args.mod_rank
 
     # Create model
-    if model_version in ['7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
@@ -1048,11 +1566,27 @@ def main():
         with open(training_log_file, 'a') as f:
             f.write(f"\n# === Resumed training at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
 
+    # Debug logger (if --debug flag is set)
+    debug_logger = None
+    if cli_args.debug:
+        debug_log_file = checkpoint_dir / "debug.txt"
+        debug_logger = DebugLogger(str(debug_log_file))
+        print(f"\n🔍 Debug mode enabled")
+        print(f"  Debug log: {debug_log_file}")
+
     # Training loop
     print(f"\n{'='*60}")
     print(f"Starting training...")
     print(f"  Training log: {training_log_file}")
     print(f"{'='*60}")
+
+    # Get sample batch for debug logging
+    sample_batch_for_debug = None
+    if debug_logger:
+        sample_batch_for_debug = next(iter(train_loader))['input_ids'][:1].to(device)
+        # Log initial state (before any training)
+        debug_logger.log_section(f"Initial State (Before Training)")
+        debug_logger.log_epoch_summary(model, sample_batch_for_debug, epoch=0)
 
     for epoch in range(start_epoch, args.num_epochs + 1):
         epoch_start = time.time()
@@ -1063,7 +1597,8 @@ def main():
             scaler, tokenizer, log_file=str(training_log_file),
             orthogonality_weight=args.orthogonality_weight,
             diversity_weight=args.diversity_weight,
-            load_balance_weight=args.load_balance_weight
+            load_balance_weight=args.load_balance_weight,
+            debug_logger=debug_logger
         )
 
         # Evaluate
@@ -1126,6 +1661,11 @@ def main():
             else:
                 # v7.5 uses dynamic Q/K/V/O - activation analysis not applicable
                 print(f"\n  (Neuron usage analysis skipped for v7.5 - use analyze_dawn_v75.py instead)")
+
+        # Debug: Log epoch summary for specific epochs
+        if debug_logger and debug_logger.should_log_epoch(epoch):
+            debug_logger.log_section(f"End of Epoch {epoch}")
+            debug_logger.log_epoch_summary(model, sample_batch_for_debug, epoch)
 
         # Save checkpoint
         is_best = val_loss < best_val_loss
