@@ -594,6 +594,13 @@ def analyze_w_dynamics(model, dataloader, device, max_batches=5):
     model.eval()
     results = {}
 
+    # Detect model version from first layer
+    qkv_sample = model.layers[0].qkv_dynamic
+    is_v78 = hasattr(qkv_sample, 'neuron_bank') and hasattr(qkv_sample.neuron_bank, 'W_Q')
+
+    if is_v78:
+        print("📌 v7.8 model: Analyzing effective W_Q from weighted neuron selection")
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="W Dynamics", total=max_batches)):
             if batch_idx >= max_batches:
@@ -615,14 +622,29 @@ def analyze_w_dynamics(model, dataloader, device, max_batches=5):
                 topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
                 weights = F.softmax(topk_scores, dim=-1)
 
-                # Get recipe
-                recipe_Q = qkv.neuron_recipe_Q[topk_idx]
-                token_recipe_Q = (recipe_Q * weights.unsqueeze(-1)).sum(dim=2)
-                token_recipe_Q = F.softmax(token_recipe_Q, dim=-1)
+                if is_v78:
+                    # v7.8: Direct W matrices per neuron
+                    # W_Q: [n_neurons, D, rank]
+                    # topk_idx: [B, S, k]
+                    nb = qkv.neuron_bank
+                    D, rank = nb.W_Q.shape[1], nb.W_Q.shape[2]
 
-                # Generate W_Q
-                basis = qkv.shared_basis()
-                W_Q = torch.einsum('bsn,ndr->bsdr', token_recipe_Q, basis)  # [B, S, D, rank]
+                    # Gather selected neurons' W_Q
+                    idx_expanded = topk_idx.unsqueeze(-1).unsqueeze(-1).expand(B, S, qkv.k, D, rank)
+                    W_Q_selected = nb.W_Q.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1).gather(2, idx_expanded)
+                    # [B, S, k, D, rank]
+
+                    # Weighted sum
+                    W_Q = (W_Q_selected * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)  # [B, S, D, rank]
+                else:
+                    # v7.5/7.6/7.7: Recipe-based
+                    recipe_Q = qkv.neuron_recipe_Q[topk_idx]
+                    token_recipe_Q = (recipe_Q * weights.unsqueeze(-1)).sum(dim=2)
+                    token_recipe_Q = F.softmax(token_recipe_Q, dim=-1)
+
+                    # Generate W_Q
+                    basis = qkv.shared_basis()
+                    W_Q = torch.einsum('bsn,ndr->bsdr', token_recipe_Q, basis)  # [B, S, D, rank]
 
                 # Flatten W_Q and compute token-wise similarity
                 W_Q_flat = W_Q.view(B * S, -1)  # [B*S, D*rank]
