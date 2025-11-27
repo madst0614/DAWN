@@ -53,6 +53,30 @@ from utils.training import CheckpointManager, TrainingMonitor, count_parameters,
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
 
+def get_underlying_model(model):
+    """Get the underlying model from a potentially torch.compile() wrapped model"""
+    # torch.compile() wraps models in OptimizedModule with _orig_mod attribute
+    if hasattr(model, '_orig_mod'):
+        return model._orig_mod
+    return model
+
+
+def is_v75_or_v76_model(model):
+    """Robust detection of v7.5/v7.6 models, handling torch.compile() wrapped models"""
+    base_model = get_underlying_model(model)
+
+    # Check model version attribute
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6"]:
+        return True
+
+    # Check for qkv_dynamic attribute on layers (v7.5/v7.6 specific structure)
+    if hasattr(base_model, 'layers') and len(base_model.layers) > 0:
+        if hasattr(base_model.layers[0], 'qkv_dynamic'):
+            return True
+
+    return False
+
+
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
                 orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0):
     """Train for one epoch"""
@@ -89,8 +113,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Mixed precision training
         if scaler is not None:
             with torch.amp.autocast('cuda'):
+                # Get underlying model for attribute checks (handles torch.compile)
+                base_model = get_underlying_model(model)
+
                 # v7.0: Use model's get_loss method (handles diversity & load balance)
-                if hasattr(model, 'get_loss') and orthogonality_weight == 0:
+                if hasattr(base_model, 'get_loss') and orthogonality_weight == 0:
                     loss, loss_dict, logits = model.get_loss(
                         input_ids, labels,
                         diversity_weight=diversity_weight,
@@ -99,20 +126,25 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 else:
                     # v7.5+: Dynamic Q/K/V with routing
                     # v6.0: compatibility
-                    if hasattr(model, '__version__') and model.__version__ == "7.5":
-                        # v7.5: Get routing info for load balance loss
+                    if is_v75_or_v76_model(model):
+                        # v7.5/v7.6: Get routing info for load balance loss
                         if load_balance_weight > 0:
                             ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                         else:
                             ce_loss, logits = model(input_ids, labels)
                             routing_infos = None
 
-                        # Basis orthogonality loss (v7.5)
+                        # Basis orthogonality loss (v7.5/v7.6)
                         if orthogonality_weight > 0:
-                            orth_loss = model.orthogonality_loss()
+                            orth_loss = base_model.orthogonality_loss()
                         else:
                             orth_loss = 0.0
-                        diversity_loss = 0.0
+
+                        # Recipe diversity loss (v7.6 only - built-in method)
+                        if diversity_weight > 0 and hasattr(base_model, 'recipe_diversity_loss'):
+                            diversity_loss = base_model.recipe_diversity_loss()
+                        else:
+                            diversity_loss = 0.0
                     elif orthogonality_weight > 0:
                         logits, losses = model(input_ids, return_losses=True)
                         orth_loss = losses['orth_total']
@@ -138,16 +170,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         )
 
                     # Recipe diversity loss (v7.0-v7.4)
-                    if diversity_weight > 0 and hasattr(model.layers[0], 'ffn') and hasattr(model.layers[0].ffn, 'neuron_recipe'):
-                        for layer in model.layers:
+                    if diversity_weight > 0 and hasattr(base_model.layers[0], 'ffn') and hasattr(base_model.layers[0].ffn, 'neuron_recipe'):
+                        for layer in base_model.layers:
                             recipe = layer.ffn.neuron_recipe
                             recipe_norm = F.softmax(recipe, dim=-1)
                             recipe_normalized = F.normalize(recipe_norm, dim=-1)
                             similarity = torch.mm(recipe_normalized, recipe_normalized.T)
-                            mask = 1 - torch.eye(model.n_neurons, device=similarity.device)
+                            mask = 1 - torch.eye(base_model.n_neurons, device=similarity.device)
                             avg_similarity = (similarity * mask).sum() / mask.sum()
                             diversity_loss += avg_similarity
-                        diversity_loss = diversity_loss / len(model.layers)
+                        diversity_loss = diversity_loss / len(base_model.layers)
 
                     # Load balance loss (v7.5+)
                     lb_loss = 0.0
@@ -155,11 +187,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         for routing_info in routing_infos:
                             neuron_indices = routing_info['neuron_indices']  # [B, S, k]
                             # Count neuron usage
-                            counts = torch.bincount(neuron_indices.reshape(-1), minlength=model.n_neurons)
+                            counts = torch.bincount(neuron_indices.reshape(-1), minlength=base_model.n_neurons)
                             freq = counts.float() / (counts.sum() + 1e-8)
                             # L2 distance from uniform distribution
-                            uniform = 1.0 / model.n_neurons
-                            lb_loss += ((freq - uniform) ** 2).sum() * model.n_neurons
+                            uniform = 1.0 / base_model.n_neurons
+                            lb_loss += ((freq - uniform) ** 2).sum() * base_model.n_neurons
                         lb_loss = lb_loss / len(routing_infos)
 
                     # Total loss
@@ -174,8 +206,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             scaler.step(optimizer)
             scaler.update()
         else:
+            # Get underlying model for attribute checks (handles torch.compile)
+            base_model = get_underlying_model(model)
+
             # v7.0: Use model's get_loss method (handles diversity & load balance)
-            if hasattr(model, 'get_loss') and orthogonality_weight == 0:
+            if hasattr(base_model, 'get_loss') and orthogonality_weight == 0:
                 loss, loss_dict, logits = model.get_loss(
                     input_ids, labels,
                     diversity_weight=diversity_weight,
@@ -184,20 +219,25 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             else:
                 # v7.5+: Dynamic Q/K/V with routing
                 # v6.0: compatibility
-                if hasattr(model, '__version__') and model.__version__ == "7.5":
-                    # v7.5: Get routing info for load balance loss
+                if is_v75_or_v76_model(model):
+                    # v7.5/v7.6: Get routing info for load balance loss
                     if load_balance_weight > 0:
                         ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                     else:
                         ce_loss, logits = model(input_ids, labels)
                         routing_infos = None
 
-                    # Basis orthogonality loss (v7.5)
+                    # Basis orthogonality loss (v7.5/v7.6)
                     if orthogonality_weight > 0:
-                        orth_loss = model.orthogonality_loss()
+                        orth_loss = base_model.orthogonality_loss()
                     else:
                         orth_loss = 0.0
-                    diversity_loss = 0.0
+
+                    # Recipe diversity loss (v7.6 only - built-in method)
+                    if diversity_weight > 0 and hasattr(base_model, 'recipe_diversity_loss'):
+                        diversity_loss = base_model.recipe_diversity_loss()
+                    else:
+                        diversity_loss = 0.0
                 elif orthogonality_weight > 0:
                     logits, losses = model(input_ids, return_losses=True)
                     orth_loss = losses['orth_total']
@@ -223,16 +263,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     )
 
                 # Recipe diversity loss (v7.0-v7.4)
-                if diversity_weight > 0 and hasattr(model.layers[0], 'ffn') and hasattr(model.layers[0].ffn, 'neuron_recipe'):
-                    for layer in model.layers:
+                if diversity_weight > 0 and hasattr(base_model.layers[0], 'ffn') and hasattr(base_model.layers[0].ffn, 'neuron_recipe'):
+                    for layer in base_model.layers:
                         recipe = layer.ffn.neuron_recipe
                         recipe_norm = F.softmax(recipe, dim=-1)
                         recipe_normalized = F.normalize(recipe_norm, dim=-1)
                         similarity = torch.mm(recipe_normalized, recipe_normalized.T)
-                        mask = 1 - torch.eye(model.n_neurons, device=similarity.device)
+                        mask = 1 - torch.eye(base_model.n_neurons, device=similarity.device)
                         avg_similarity = (similarity * mask).sum() / mask.sum()
                         diversity_loss += avg_similarity
-                    diversity_loss = diversity_loss / len(model.layers)
+                    diversity_loss = diversity_loss / len(base_model.layers)
 
                 # Load balance loss (v7.5+)
                 lb_loss = 0.0
@@ -240,11 +280,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     for routing_info in routing_infos:
                         neuron_indices = routing_info['neuron_indices']  # [B, S, k]
                         # Count neuron usage
-                        counts = torch.bincount(neuron_indices.reshape(-1), minlength=model.n_neurons)
+                        counts = torch.bincount(neuron_indices.reshape(-1), minlength=base_model.n_neurons)
                         freq = counts.float() / (counts.sum() + 1e-8)
                         # L2 distance from uniform distribution
-                        uniform = 1.0 / model.n_neurons
-                        lb_loss += ((freq - uniform) ** 2).sum() * model.n_neurons
+                        uniform = 1.0 / base_model.n_neurons
+                        lb_loss += ((freq - uniform) ** 2).sum() * base_model.n_neurons
                     lb_loss = lb_loss / len(routing_infos)
 
                 # Total loss
@@ -399,40 +439,38 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
 
 
 def analyze_activations(model, input_ids, device):
-    """Dynamic Neuron Transformer activation pattern analysis (v6.0)"""
+    """Dynamic Neuron Transformer activation pattern analysis (v6.0+)"""
     model.eval()
+    base_model = get_underlying_model(model)
 
     with torch.no_grad():
-        _, all_selected = model(input_ids, return_activations=True)
+        # v7.5/v7.6: use return_routing_info, v6.0: use return_activations
+        if is_v75_or_v76_model(model):
+            logits, routing_infos = model(input_ids, return_routing_info=True)
+            # Extract neuron_indices from routing_infos
+            all_selected = [info['neuron_indices'] for info in routing_infos]
+        else:
+            _, all_selected = model(input_ids, return_activations=True)
 
     stats = {}
     for layer_idx, selected_idx in enumerate(all_selected):
         # selected_idx: [B, S, k]
         unique_neurons = torch.unique(selected_idx).numel()
 
-        # Get total neurons from model (v6.0: router, v5.x: neuron_router)
-        if hasattr(model, '_orig_mod'):
-            # Compiled model
-            layer = model._orig_mod.layers[layer_idx]
-        else:
-            layer = model.layers[layer_idx]
+        # Get total neurons from model
+        layer = base_model.layers[layer_idx]
 
-        # v7.0: ffn.n_neurons, v6.0: router, v5.x: neuron_router
-        if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'n_neurons'):
-            # v7.0: n_neurons is in FFN
+        # v7.5/v7.6: qkv_dynamic.n_neurons, v7.0: ffn.n_neurons, v6.0: router
+        if hasattr(layer, 'qkv_dynamic') and hasattr(layer.qkv_dynamic, 'n_neurons'):
+            total_neurons = layer.qkv_dynamic.n_neurons
+        elif hasattr(layer, 'ffn') and hasattr(layer.ffn, 'n_neurons'):
             total_neurons = layer.ffn.n_neurons
         elif hasattr(layer, 'router') and hasattr(layer.router, 'n_neurons'):
-            # v6.0: n_neurons might be in router
             total_neurons = layer.router.n_neurons
         elif hasattr(layer, 'neuron_router') and hasattr(layer.neuron_router, 'n_neurons'):
-            # v5.x: neuron_router
             total_neurons = layer.neuron_router.n_neurons
         else:
-            # Fallback: use model's n_neurons
-            if hasattr(model, '_orig_mod'):
-                total_neurons = model._orig_mod.n_neurons
-            else:
-                total_neurons = model.n_neurons
+            total_neurons = base_model.n_neurons
 
         usage_ratio = unique_neurons / total_neurons
 
@@ -687,7 +725,6 @@ def main():
         # Try config.json first, then checkpoint file
         config_json_path = resume_checkpoint.parent / 'config.json'
         if config_json_path.exists():
-            import json
             with open(config_json_path, 'r') as f:
                 saved_cfg = json.load(f)
                 checkpoint_config = saved_cfg.get('model')
@@ -830,7 +867,7 @@ def main():
             model_kwargs['mod_rank'] = args.mod_rank
 
     # Create model
-    if model_version in ['7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
