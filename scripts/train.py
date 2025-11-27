@@ -193,7 +193,7 @@ class DebugLogger:
                 self.log(f"  σ_min = {S_qk[-1].item():.10f}")
                 self.log(f"  Condition number = {cond_qk:.2e}")
 
-            else:
+            elif hasattr(sb, 'basis_up') and hasattr(sb, 'basis_down'):
                 # v7.6: basis_up is the "output" basis
                 basis_o = sb.basis_up.detach()  # [n_basis, rank, D]
                 basis_o_name = "Basis_up"
@@ -239,6 +239,9 @@ class DebugLogger:
                 self.log(f"  σ_max = {S_qk[0].item():.6f}")
                 self.log(f"  σ_min = {S_qk[-1].item():.10f}")
                 self.log(f"  Condition number = {cond_qk:.2e}")
+            else:
+                # Other versions (v7.5, v7.1, etc.) - skip detailed basis logging
+                self.log(f"\n[Note: Detailed basis stats not available for this model version]")
 
     def log_gradient_flow(self, model, epoch, step=None):
         """
@@ -359,7 +362,7 @@ class DebugLogger:
                     self.log(f"\n  ⚠️  ortho_vo >> ortho_qk: V/O projection learning may be unstable")
                 elif ortho_qk > ortho_vo * 10:
                     self.log(f"\n  ⚠️  ortho_qk >> ortho_vo: Q/K projection learning may be unstable")
-            else:
+            elif hasattr(sb, 'basis_up') and hasattr(sb, 'basis_down'):
                 # v7.6: basis_down and basis_up
                 n_basis = sb.n_basis
                 I = torch.eye(n_basis, device=sb.basis_down.device)
@@ -389,6 +392,9 @@ class DebugLogger:
                     self.log(f"\n  ⚠️  ortho_up >> ortho_down: O projection learning may be unstable")
                 elif ortho_down > ortho_up * 10:
                     self.log(f"\n  ⚠️  ortho_down >> ortho_up: Q/K/V projection learning may be unstable")
+            else:
+                # Other versions - skip
+                self.log(f"\n[Note: Orthogonality breakdown not available for this model version]")
 
     def log_recipe_analysis(self, model, sample_input, epoch, step=None):
         """
@@ -469,8 +475,8 @@ class DebugLogger:
                 if S_wo[-1].item() < 1e-6:
                     self.log(f"  ⚠️  WARNING: W_O has near-zero singular values!")
 
-            else:
-                # v7.6/v7.7: Recipe-based analysis
+            elif hasattr(qkv, 'neuron_recipe_O'):
+                # v7.5/v7.6/v7.7: Recipe-based analysis
                 # Recipe O
                 recipe_O = qkv.neuron_recipe_O[topk_idx]
                 token_recipe_O = (recipe_O * weights.unsqueeze(-1)).sum(dim=2)
@@ -512,6 +518,10 @@ class DebugLogger:
                 # Check if W_O is degenerating
                 if S_wo[-1].item() < 1e-6:
                     self.log(f"  ⚠️  WARNING: W_O has near-zero singular values!")
+
+            else:
+                # Other versions - skip recipe analysis
+                self.log(f"\n[Note: Recipe analysis not available for this model version]")
 
         base_model.train()
 
@@ -1375,7 +1385,7 @@ def main():
             model_kwargs['mod_rank'] = args.mod_rank
 
     # Create model
-    if model_version in ['7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
