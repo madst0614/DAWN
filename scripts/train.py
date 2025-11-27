@@ -549,7 +549,7 @@ def is_v75_or_v76_model(model):
     base_model = get_underlying_model(model)
 
     # Check model version attribute
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7", "7.8", "7.9"]:
         return True
 
     # Check for qkv_dynamic attribute on layers (v7.5/v7.6/v7.7 specific structure)
@@ -1116,9 +1116,12 @@ def main():
     args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored)
     args.router_temperature = cfg['model'].get('router_temperature', None)  # v6.0 only (v7.0 ignores)
 
-    # Backward compatibility (deprecated)
-    args.n_input = cfg['model'].get('n_input', None)
-    args.n_process = cfg['model'].get('n_process', None)
+    # v7.9 NeuronCircuit parameters
+    args.n_input = cfg['model'].get('n_input', 8)
+    args.n_process = cfg['model'].get('n_process', 32)
+    args.n_output = cfg['model'].get('n_output', 8)
+    args.process_k = cfg['model'].get('process_k', 3)
+    args.use_soft_selection = cfg['model'].get('use_soft_selection', True)
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -1270,7 +1273,21 @@ def main():
     if model_version != 'baseline':
         print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
-        if model_version == "7.8":
+        if model_version == "7.9":
+            # v7.9: NeuronCircuit with Householder Transformations
+            rank = getattr(args, 'rank', args.basis_rank)
+            n_input = getattr(args, 'n_input', 8)
+            n_process = getattr(args, 'n_process', 32)
+            n_output = getattr(args, 'n_output', 8)
+            process_k = getattr(args, 'process_k', 3)
+            print(f"NeuronCircuit with Householder (v7.9): rank={rank}")
+            print(f"  - InputNeuron: {n_input} × {args.d_model} × {rank}")
+            print(f"  - ProcessNeuron: {n_process} × {rank} (Householder vectors)")
+            print(f"  - OutputNeuron: {n_output} × {rank} × {args.d_model}")
+            print(f"  - Process top-k: {process_k}")
+            if args.orthogonality_weight > 0:
+                print(f"  - Orthogonality Loss (orth_weight={args.orthogonality_weight})")
+        elif model_version == "7.8":
             # v7.8: Independent Neuron W_Q/K/V/O (No Basis Mixing)
             rank = getattr(args, 'rank', args.basis_rank)  # v7.8 uses 'rank', fallback to basis_rank
             print(f"Independent Neuron Projections (v7.8): rank={rank}")
@@ -1384,8 +1401,19 @@ def main():
         if args.mod_rank is not None:
             model_kwargs['mod_rank'] = args.mod_rank
 
+        # v7.9 NeuronCircuit parameters
+        if model_version == '7.9':
+            model_kwargs.update({
+                'n_input': args.n_input,
+                'n_process': args.n_process,
+                'n_output': args.n_output,
+                'process_k': args.process_k,
+                'use_soft_selection': args.use_soft_selection,
+                'rank': args.basis_rank,  # v7.9 uses 'rank' instead of 'basis_rank'
+            })
+
     # Create model
-    if model_version in ['7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
@@ -1647,10 +1675,10 @@ def main():
                    f"{val_loss:.6f},{val_acc:.6f},"
                    f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}\n")
 
-        # Analyze activations periodically (skip for v7.5 - uses different architecture)
+        # Analyze activations periodically (skip for v7.5+ - uses different architecture)
         if epoch % 10 == 0:
             model_version = getattr(model, '__version__', None)
-            if model_version != "7.5":
+            if model_version not in ["7.5", "7.8", "7.9"]:
                 sample_batch = next(iter(val_loader))
                 sample_ids = sample_batch['input_ids'][:1].to(device)
                 act_stats = analyze_activations(model, sample_ids, device)
@@ -1659,8 +1687,8 @@ def main():
                     print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
                           f"({stats['usage_ratio']:.2%} usage)")
             else:
-                # v7.5 uses dynamic Q/K/V/O - activation analysis not applicable
-                print(f"\n  (Neuron usage analysis skipped for v7.5 - use analyze_dawn_v75.py instead)")
+                # v7.5/v7.8/v7.9 uses dynamic Q/K/V/O - activation analysis not applicable
+                print(f"\n  (Neuron usage analysis skipped for {model_version} - use analyze_dawn_v75.py instead)")
 
         # Debug: Log epoch summary for specific epochs
         if debug_logger and debug_logger.should_log_epoch(epoch):

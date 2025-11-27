@@ -1,7 +1,8 @@
 """
 DAWN Models Module
 
-v7.8: Independent Neuron Projections (No Basis Mixing) - NEW
+v7.9: NeuronCircuit with Householder Transformations - NEW
+v7.8: Independent Neuron Projections (No Basis Mixing)
 v7.7: QK/VO Basis Separation with Symmetric O Projection
 v7.6: Independent O Basis + Recipe Diversity
 v7.5: Dynamic Q/K/V Generation (v8 design)
@@ -24,7 +25,8 @@ from .model_v71 import (
     count_parameters,
 )
 
-# v7.8, v7.7, v7.6, v7.5, v7.4, v7.2, v7.0 and v6.0 compatibility imports
+# v7.9, v7.8, v7.7, v7.6, v7.5, v7.4, v7.2, v7.0 and v6.0 compatibility imports
+from . import model_v79 as model_v79
 from . import model_v78 as model_v78
 from . import model_v77 as model_v77
 from . import model_v76 as model_v76
@@ -52,6 +54,7 @@ __all__ = [
     'DAWNLayer',
     'create_model',
     'count_parameters',
+    'model_v79',  # Access v7.9 via models.model_v79
     'model_v78',  # Access v7.8 via models.model_v78
     'model_v77',  # Access v7.7 via models.model_v77
     'model_v76',  # Access v7.6 via models.model_v76
@@ -71,7 +74,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "7.8", "7.7", "7.6", "7.5", "7.4", "7.2", "7.1", "7.0", "6.0", or "baseline"
+        version: "7.9", "7.8", "7.7", "7.6", "7.5", "7.4", "7.2", "7.1", "7.0", "6.0", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -79,7 +82,10 @@ def create_model_by_version(version, config):
     """
     version = str(version)
 
-    if version in ["7.8", "78"]:
+    if version in ["7.9", "79"]:
+        from .model_v79 import DAWN as DAWN_v79
+        return DAWN_v79(**config)
+    elif version in ["7.8", "78"]:
         from .model_v78 import DAWN as DAWN_v78
         return DAWN_v78(**config)
     elif version in ["7.7", "77"]:
@@ -113,4 +119,4 @@ def create_model_by_version(version, config):
         return VanillaTransformer(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 7.8, 7.7, 7.6, 7.5, 7.4, 7.2, 7.1, 7.0, 6.0, baseline")
+                        f"Supported versions: 7.9, 7.8, 7.7, 7.6, 7.5, 7.4, 7.2, 7.1, 7.0, 6.0, baseline")

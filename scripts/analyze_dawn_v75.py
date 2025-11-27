@@ -1540,6 +1540,12 @@ def analyze_attention_patterns(model, dataloader, device, max_batches=5):
     results = {f'layer_{i}': {'entropy': [], 'sparsity': [], 'self_attn': []}
                for i in range(len(model.layers))}
 
+    # Detect model version
+    is_v78 = hasattr(model, 'neuron_bank') or (
+        hasattr(model.layers[0], 'qkv_dynamic') and
+        hasattr(model.layers[0].qkv_dynamic, 'neuron_bank')
+    )
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Attn Patterns", total=max_batches)):
             if batch_idx >= max_batches:
@@ -1561,15 +1567,35 @@ def analyze_attention_patterns(model, dataloader, device, max_batches=5):
                 topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
                 weights = F.softmax(topk_scores, dim=-1)
 
-                recipe_Q = F.softmax((qkv.neuron_recipe_Q[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
-                recipe_K = F.softmax((qkv.neuron_recipe_K[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                if is_v78:
+                    # v7.8: Use neuron_bank.W_Q/K directly (project-then-gather)
+                    neuron_bank = qkv.neuron_bank
+                    rank = neuron_bank.rank
 
-                basis = qkv.shared_basis()
-                W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
-                W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
+                    # Project all neurons first
+                    all_Q = torch.einsum('bsd,ndr->bsnr', normed, neuron_bank.W_Q)
+                    all_K = torch.einsum('bsd,ndr->bsnr', normed, neuron_bank.W_K)
 
-                Q = torch.einsum('bsd,bsdr->bsr', normed, W_Q)
-                K = torch.einsum('bsd,bsdr->bsr', normed, W_K)
+                    # Gather selected neurons
+                    idx_expanded = topk_idx.unsqueeze(-1).expand(B, S, qkv.k, rank)
+                    Q_selected = all_Q.gather(2, idx_expanded)
+                    K_selected = all_K.gather(2, idx_expanded)
+
+                    # Weighted sum
+                    weights_expanded = weights.unsqueeze(-1)
+                    Q = (Q_selected * weights_expanded).sum(dim=2)
+                    K = (K_selected * weights_expanded).sum(dim=2)
+                else:
+                    # v7.5/7.6/7.7: Use recipe + basis
+                    recipe_Q = F.softmax((qkv.neuron_recipe_Q[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                    recipe_K = F.softmax((qkv.neuron_recipe_K[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+
+                    basis = qkv.shared_basis()
+                    W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
+                    W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
+
+                    Q = torch.einsum('bsd,bsdr->bsr', normed, W_Q)
+                    K = torch.einsum('bsd,bsdr->bsr', normed, W_K)
 
                 d_head = qkv.d_head
                 n_heads = qkv.n_heads
