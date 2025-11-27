@@ -848,9 +848,25 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
+    # Handle checkpoint path (directory or file)
+    checkpoint_path = Path(args.checkpoint)
+    if checkpoint_path.is_dir():
+        # Look for best_model.pt or latest checkpoint
+        best_model = checkpoint_path / 'best_model.pt'
+        if best_model.exists():
+            checkpoint_path = best_model
+        else:
+            # Find most recent .pt file
+            pt_files = list(checkpoint_path.glob('*.pt'))
+            if pt_files:
+                checkpoint_path = max(pt_files, key=lambda p: p.stat().st_mtime)
+            else:
+                raise FileNotFoundError(f"No .pt files found in {args.checkpoint}")
+        print(f"Found checkpoint: {checkpoint_path}")
+
     # Load checkpoint
-    print(f"\nLoading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    print(f"\nLoading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
 
     # Get config
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
