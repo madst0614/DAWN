@@ -1289,7 +1289,12 @@ def main():
             print(f"SharedNeurons + NeuronMemory (v{model_version}): rank={rank}")
             print(f"  TransformNeurons (Shared):")
             print(f"    - InputNeuron: {n_input} × {args.d_model} × {rank}")
-            print(f"    - ProcessNeuron: {n_process} × {rank} (Householder vectors)")
+            if model_version == "8.1":
+                # v8.1: QK/VO 분리
+                print(f"    - ProcessNeuron_QK: {n_process} × {rank} (Q, K용 Householder)")
+                print(f"    - ProcessNeuron_VO: {n_process} × {rank} (V, O용 Householder)")
+            else:
+                print(f"    - ProcessNeuron: {n_process} × {rank} (Householder vectors)")
             print(f"    - OutputNeuron: {n_output} × {rank} × {args.d_model}")
             print(f"    - Process top-k: {process_k}")
             print(f"  KnowledgeNeurons (Shared):")

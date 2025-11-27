@@ -1,7 +1,7 @@
 """
 DAWN Models Module
 
-v8.1: v8.0 + Expanded KnowledgeNeurons (n_knowledge=128, knowledge_k=16)
+v8.1: v8.0 + Process Neurons QK/VO 분리 (process_neurons_qk, process_neurons_vo)
 v8.0: SharedNeurons + NeuronMemory (FFN 대체)
 v7.9: NeuronCircuit with Householder Transformations
 v7.8: Independent Neuron Projections (No Basis Mixing)
