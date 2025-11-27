@@ -28,8 +28,7 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Version-agnostic utilities
-from scripts.analysis_utils import load_model, get_underlying_model, get_routing_info_compat
+from models.model_v79 import DAWN
 
 # Optional: matplotlib for visualization
 try:
@@ -271,8 +270,8 @@ def analyze_neuron_orthogonality(model):
 # 3. Routing Pattern Deep Analysis (GPU Optimized)
 # ============================================================
 
-def analyze_routing_patterns(model, dataloader, device, max_batches=10, version="7.9"):
-    """Deep analysis of routing patterns - GPU optimized, version-agnostic"""
+def analyze_routing_patterns(model, dataloader, device, max_batches=10):
+    """Deep analysis of routing patterns - GPU optimized"""
     print("\n" + "=" * 60)
     print("3. ROUTING PATTERN DEEP ANALYSIS")
     print("=" * 60)
@@ -304,29 +303,19 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10, version=
             _, routing_infos = model(input_ids, return_routing_info=True)
 
             for layer_idx, routing_info in enumerate(routing_infos):
-                # Use version-agnostic routing info access
-                compat = get_routing_info_compat(routing_info, version)
-                process_idx = compat['process_indices']
+                routing_down = routing_info['routing_down']
+                routing_up = routing_info['routing_up']
 
-                # Skip if no process indices (shouldn't happen)
-                if process_idx is None:
-                    print(f"  Warning: No process_indices for layer {layer_idx}")
-                    continue
+                # Process indices [B, S, k]
+                process_idx = routing_down['process_indices']
+                up_idx = routing_up['process_indices']
 
                 # ⚡ Vectorized usage count (GPU bincount)
                 idx_flat = process_idx.reshape(-1)
                 usage_down[layer_idx] += torch.bincount(idx_flat, minlength=n_process).float()
 
-                # For v7.9, also track up routing
-                if version == "7.9":
-                    routing_up = routing_info.get('routing_up', {})
-                    up_idx = routing_up.get('process_indices')
-                    if up_idx is not None:
-                        up_flat = up_idx.reshape(-1)
-                        usage_up[layer_idx] += torch.bincount(up_flat, minlength=n_process).float()
-                else:
-                    # v8.0 uses same process indices for all
-                    usage_up[layer_idx] = usage_down[layer_idx]
+                up_flat = up_idx.reshape(-1)
+                usage_up[layer_idx] += torch.bincount(up_flat, minlength=n_process).float()
 
                 # ⚡ Vectorized co-occurrence (GPU scatter_add)
                 # For each token, all pairs (i,j) where i,j in selected indices
@@ -875,9 +864,47 @@ def main():
                 raise FileNotFoundError(f"No .pt files found in {args.checkpoint}")
         print(f"Found checkpoint: {checkpoint_path}")
 
-    # Load model (version-agnostic)
+    # Load checkpoint
     print(f"\nLoading checkpoint: {checkpoint_path}")
-    model, version, config = load_model(checkpoint_path, device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Get config
+    config = checkpoint.get('model_config', checkpoint.get('config', {}))
+    model_version = config.get('model_version', checkpoint.get('model_version', '7.9'))
+    print(f"Checkpoint model version: {model_version}")
+
+    if model_version != "7.9":
+        print(f"Warning: This script is for v7.9, but checkpoint is v{model_version}")
+
+    # Create model
+    print(f"\nCreating model v7.9...")
+    model = DAWN(
+        vocab_size=config.get('vocab_size', 30522),
+        d_model=config.get('d_model', 256),
+        n_layers=config.get('n_layers', 4),
+        n_heads=config.get('n_heads', 4),
+        d_ff=config.get('d_ff', 1024),
+        max_seq_len=config.get('max_seq_len', 128),
+        rank=config.get('rank', config.get('basis_rank', 64)),
+        n_input=config.get('n_input', 8),
+        n_process=config.get('n_process', 32),
+        n_output=config.get('n_output', 8),
+        process_k=config.get('process_k', 3),
+        dropout=config.get('dropout', 0.1),
+        use_soft_selection=config.get('use_soft_selection', True),
+    )
+
+    # Load weights
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+    # Handle torch.compile prefix
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        print("  Removing torch.compile wrapper prefix...")
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict, strict=False)
+    model = model.to(device)
+    model.eval()
 
     print(f"Model: DAWN v{model.__version__}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -927,57 +954,28 @@ def main():
     # Run Analyses
     # ============================================================
     print("\n" + "=" * 60)
-    print(f"STARTING ANALYSIS (v{version})")
+    print("STARTING ANALYSIS")
     print("=" * 60)
 
     all_results = {}
-    all_results['version'] = version
 
-    # Check if v7.9 specific analyses can run
-    is_v79 = version == "7.9"
+    # 1. Householder Transform Analysis
+    all_results['householder'] = analyze_householder_transforms(model)
 
-    if not is_v79:
-        print(f"\n⚠️  Note: This script is optimized for v7.9.")
-        print(f"   Some analyses may be skipped or adapted for v{version}.")
-        print(f"   Consider using analyze_v79_semantic.py or analyze_v79_deep.py instead.\n")
+    # 2. Neuron Orthogonality
+    all_results['orthogonality'] = analyze_neuron_orthogonality(model)
 
-    # 1. Householder Transform Analysis (v7.9 specific structure)
-    if is_v79:
-        all_results['householder'] = analyze_householder_transforms(model)
-    else:
-        print("\n[SKIP] Householder Transform Analysis (v7.9 specific)")
-        all_results['householder'] = {'skipped': True, 'reason': 'v8.0 uses SharedNeurons'}
+    # 3. Routing Patterns
+    all_results['routing'] = analyze_routing_patterns(model, dataloader, device, args.max_batches)
 
-    # 2. Neuron Orthogonality (v7.9 specific structure)
-    if is_v79:
-        all_results['orthogonality'] = analyze_neuron_orthogonality(model)
-    else:
-        print("\n[SKIP] Neuron Orthogonality Analysis (v7.9 specific)")
-        all_results['orthogonality'] = {'skipped': True, 'reason': 'v8.0 uses SharedNeurons'}
+    # 4. Information Flow
+    all_results['info_flow'] = analyze_information_flow(model, dataloader, device, max_batches=5)
 
-    # 3. Routing Patterns - adapted for both versions
-    all_results['routing'] = analyze_routing_patterns(model, dataloader, device, args.max_batches, version)
+    # 5. Layer Comparison
+    all_results['layer_comparison'] = analyze_layer_comparison(model)
 
-    # 4. Information Flow (v7.9 specific)
-    if is_v79:
-        all_results['info_flow'] = analyze_information_flow(model, dataloader, device, max_batches=5)
-    else:
-        print("\n[SKIP] Information Flow Analysis (v7.9 specific)")
-        all_results['info_flow'] = {'skipped': True, 'reason': 'v8.0 uses different architecture'}
-
-    # 5. Layer Comparison (v7.9 specific)
-    if is_v79:
-        all_results['layer_comparison'] = analyze_layer_comparison(model)
-    else:
-        print("\n[SKIP] Layer Comparison (v7.9 specific)")
-        all_results['layer_comparison'] = {'skipped': True, 'reason': 'v8.0 uses SharedNeurons'}
-
-    # 6. Attention Patterns (v7.9 specific)
-    if is_v79:
-        all_results['attention'] = analyze_attention_patterns(model, dataloader, device, max_batches=5)
-    else:
-        print("\n[SKIP] Attention Patterns (v7.9 specific)")
-        all_results['attention'] = {'skipped': True, 'reason': 'v8.0 uses different attention structure'}
+    # 6. Attention Patterns
+    all_results['attention'] = analyze_attention_patterns(model, dataloader, device, max_batches=5)
 
     # ============================================================
     # Summary
@@ -987,15 +985,8 @@ def main():
     print("=" * 60)
 
     print("\n📊 Key Findings:")
-    underlying = get_underlying_model(model)
-    if hasattr(underlying, 'orthogonality_loss'):
-        print(f"  Orthogonality loss: {underlying.orthogonality_loss().item():.6f}")
-    if hasattr(underlying, 'process_norm_loss'):
-        print(f"  Process norm loss: {underlying.process_norm_loss().item():.6f}")
-    if hasattr(underlying, 'get_auxiliary_losses'):
-        aux_losses = underlying.get_auxiliary_losses()
-        for name, val in aux_losses.items():
-            print(f"  {name}: {val.item():.6f}")
+    print(f"  Orthogonality loss: {model.orthogonality_loss().item():.6f}")
+    print(f"  Process norm loss: {model.process_norm_loss().item():.6f}")
     print(f"  Avg routing entropy: {all_results['routing']['global']['avg_entropy']:.3f}")
     print(f"  Avg routing gini: {all_results['routing']['global']['avg_gini']:.3f}")
 
