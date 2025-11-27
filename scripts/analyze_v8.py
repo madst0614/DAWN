@@ -907,7 +907,8 @@ def create_visualizations(all_results, output_dir):
 
         # Input neurons condition
         if 'input' in shared:
-            input_conds = [shared['input']['neurons'][str(i)]['condition'] for i in range(len(shared['input']['neurons']))]
+            n_input = len(shared['input']['neurons'])
+            input_conds = [shared['input']['neurons'][i]['condition'] for i in range(n_input)]
             axes[0, 0].bar(range(len(input_conds)), input_conds, color='steelblue')
             axes[0, 0].set_xlabel('Input Neuron')
             axes[0, 0].set_ylabel('Condition Number')
@@ -915,7 +916,8 @@ def create_visualizations(all_results, output_dir):
 
         # Process neurons norms
         if 'process' in shared:
-            process_norms = [shared['process']['neurons'][str(i)]['norm'] for i in range(len(shared['process']['neurons']))]
+            n_process = len(shared['process']['neurons'])
+            process_norms = [shared['process']['neurons'][i]['norm'] for i in range(n_process)]
             axes[0, 1].bar(range(len(process_norms)), process_norms, color='coral')
             axes[0, 1].set_xlabel('Process Neuron')
             axes[0, 1].set_ylabel('Norm')
@@ -924,7 +926,8 @@ def create_visualizations(all_results, output_dir):
 
         # Output neurons condition
         if 'output' in shared:
-            output_conds = [shared['output']['neurons'][str(i)]['condition'] for i in range(len(shared['output']['neurons']))]
+            n_output = len(shared['output']['neurons'])
+            output_conds = [shared['output']['neurons'][i]['condition'] for i in range(n_output)]
             axes[1, 0].bar(range(len(output_conds)), output_conds, color='seagreen')
             axes[1, 0].set_xlabel('Output Neuron')
             axes[1, 0].set_ylabel('Condition Number')
