@@ -1277,8 +1277,8 @@ def main():
     if model_version != 'baseline':
         print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
-        if model_version in ["8.0", "8.1"]:
-            # v8.0/v8.1: SharedNeurons + NeuronMemory (FFN 대체)
+        if model_version in ["8.0", "8.1", "8.2"]:
+            # v8.0/v8.1/v8.2: SharedNeurons + NeuronMemory (FFN 대체)
             rank = getattr(args, 'rank', args.basis_rank)
             n_input = getattr(args, 'n_input', 8)
             n_process = getattr(args, 'n_process', 32)
@@ -1289,7 +1289,12 @@ def main():
             print(f"SharedNeurons + NeuronMemory (v{model_version}): rank={rank}")
             print(f"  TransformNeurons (Shared):")
             print(f"    - InputNeuron: {n_input} × {args.d_model} × {rank}")
-            if model_version == "8.1":
+            if model_version == "8.2":
+                # v8.2: QK/V/O 분리
+                print(f"    - ProcessNeuron_QK: {n_process} × {rank} (Q, K용 Householder)")
+                print(f"    - ProcessNeuron_V: {n_process} × {rank} (V용 Householder)")
+                print(f"    - ProcessNeuron_O: {n_process} × {rank} (O용 Householder)")
+            elif model_version == "8.1":
                 # v8.1: QK/VO 분리
                 print(f"    - ProcessNeuron_QK: {n_process} × {rank} (Q, K용 Householder)")
                 print(f"    - ProcessNeuron_VO: {n_process} × {rank} (V, O용 Householder)")
@@ -1442,8 +1447,8 @@ def main():
                 'rank': args.basis_rank,  # v7.9 uses 'rank' instead of 'basis_rank'
             })
 
-        # v8.0/v8.1 SharedNeurons + NeuronMemory parameters
-        if model_version in ['8.0', '8.1']:
+        # v8.0/v8.1/v8.2 SharedNeurons + NeuronMemory parameters
+        if model_version in ['8.0', '8.1', '8.2']:
             model_kwargs.update({
                 'n_input': args.n_input,
                 'n_process': args.n_process,
@@ -1451,11 +1456,11 @@ def main():
                 'process_k': args.process_k,
                 'n_knowledge': getattr(args, 'n_knowledge', 64),
                 'knowledge_k': getattr(args, 'knowledge_k', 8),
-                'rank': args.basis_rank,  # v8.0/v8.1 uses 'rank' instead of 'basis_rank'
+                'rank': args.basis_rank,  # v8.x uses 'rank' instead of 'basis_rank'
             })
 
     # Create model
-    if model_version in ['8.1', '8.0', '7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['8.2', '8.1', '8.0', '7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)

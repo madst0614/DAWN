@@ -109,10 +109,16 @@ class HouseholderAnalyzer:
         process_k = process_indices.shape[-1]
         rank = x_after_input.shape[-1]
 
-        # 선택된 process neurons 가져오기 (v8.1 QK/VO 분리 지원)
+        # 선택된 process neurons 가져오기 (v8.0/v8.1/v8.2 호환)
         idx_expanded = process_indices.unsqueeze(-1).expand(B, S, process_k, rank)
-        if hasattr(shared, 'process_neurons_qk'):
-            # v8.1: comp_name에 따라 QK/VO 선택
+        if hasattr(shared, 'process_neurons_v'):
+            # v8.2: QK/V/O 분리
+            if comp_name in ['Q', 'K']:
+                process_neurons = shared.process_neurons_qk
+            else:  # V
+                process_neurons = shared.process_neurons_v
+        elif hasattr(shared, 'process_neurons_qk'):
+            # v8.1: QK/VO 분리
             if comp_name in ['Q', 'K']:
                 process_neurons = shared.process_neurons_qk
             else:  # V
@@ -193,11 +199,16 @@ class HouseholderAnalyzer:
         process_indices = routing_info['process_indices']  # [B, S, k]
         process_k = process_indices.shape[-1]
 
-        # v8.1 QK/VO 분리 지원 (Expander는 O이므로 VO 사용)
+        # v8.0/v8.1/v8.2 호환 (Expander는 O)
         idx_expanded = process_indices.unsqueeze(-1).expand(B, S, process_k, rank)
-        if hasattr(shared, 'process_neurons_qk'):
-            process_neurons = shared.process_neurons_vo  # O는 VO pool
+        if hasattr(shared, 'process_neurons_o'):
+            # v8.2: O 전용 pool
+            process_neurons = shared.process_neurons_o
+        elif hasattr(shared, 'process_neurons_qk'):
+            # v8.1: VO pool
+            process_neurons = shared.process_neurons_vo
         else:
+            # v8.0: 단일 pool
             process_neurons = shared.process_neurons
         selected_v = process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
         selected_v = selected_v.gather(2, idx_expanded)  # [B, S, k, rank]
@@ -277,8 +288,15 @@ def analyze_process_neuron_pool(model):
     """전체 process neuron pool 분석"""
     shared = model.shared_neurons
 
-    # v8.1 QK/VO 분리 지원
-    if hasattr(shared, 'process_neurons_qk'):
+    # v8.0/v8.1/v8.2 호환
+    if hasattr(shared, 'process_neurons_o'):
+        # v8.2: QK/V/O 분리
+        process_qk = shared.process_neurons_qk.detach()
+        process_v = shared.process_neurons_v.detach()
+        process_o = shared.process_neurons_o.detach()
+        process_neurons = torch.cat([process_qk, process_v, process_o], dim=0)
+        is_split = True
+    elif hasattr(shared, 'process_neurons_qk'):
         # v8.1: QK/VO 분리
         process_qk = shared.process_neurons_qk.detach()
         process_vo = shared.process_neurons_vo.detach()
