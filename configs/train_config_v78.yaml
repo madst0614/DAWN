@@ -1,0 +1,47 @@
+# DAWN v7.8 Training Config
+# Independent Neuron Projections (No Basis Mixing)
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_file: train/wikitext_5to1_texts.pkl
+  val_file: validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v7.8: Independent Neuron W_Q/K/V/O)
+model:
+  model_version: "7.8"    # DAWN v7.8 - No Basis Mixing
+  d_model: 256            # Hidden dimension
+  n_layers: 4             # Number of transformer layers
+  n_heads: 4              # Number of attention heads
+
+  # Neuron routing (v7.8: 뉴런별 독립 W)
+  n_neurons: 64           # Size of neuron pool (각 뉴런이 독립 W 소유, 파라미터 관리를 위해 64)
+  neuron_k: 8             # Top-k neurons to select
+
+  # Projection parameters (v7.8: basis 없음, rank만)
+  rank: 64                # Projection rank (4 heads x 16 d_head)
+
+  # Architecture
+  d_ff: 1024              # Feed-forward dimension (Standard FFN)
+  max_seq_len: 128        # Maximum sequence length
+  dropout: 0.1            # Dropout rate
+
+# Training
+training:
+  batch_size: 128         # Batch size
+  num_epochs: 30          # Total epochs
+  lr: 0.0003              # Learning rate
+  weight_decay: 0.1       # Weight decay for regularization
+  warmup_epochs: 2        # Warmup epochs
+
+  # Regularization (v7.8: neuron orthogonality + diversity + load balance)
+  orthogonality_weight: 0.01  # Neuron W orthogonality loss (각 뉴런 내부 직교성)
+  diversity_weight: 0.1       # Recipe diversity loss
+  load_balance_weight: 0.01   # Load balance loss for neuron routing
+
+# Mixed precision (faster training on GPU)
+use_amp: true
+
+# Paths
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v78
+log_dir: /content/drive/MyDrive/dawn/checkpoints_v78

@@ -1,5 +1,5 @@
 """
-DAWN v7.5/v7.6/v7.7 Checkpoint Analysis
+DAWN v7.5/v7.6/v7.7/v7.8 Checkpoint Analysis
 Dynamic Q/K/V Generation (v8 design)
 
 분석 항목:
@@ -26,6 +26,12 @@ v7.7 특징 (개선):
 - basis_qk (Q/K용)과 basis_vo (V/O용) 분리
 - O는 basis_vo.T 사용 (V와 대칭)
 - Gradient 균형: QK 2개, VO 2개
+
+v7.8 특징 (개선):
+- Basis 제거: recipe @ basis 혼합 없음
+- 뉴런별 독립 W_Q/K/V/O: 각 뉴런이 완전한 projection 행렬 소유
+- 직교 초기화: 각 뉴런의 W에 orthogonal init
+- Condition number 폭발 방지
 
 핵심 지표 해석 가이드:
 | 지표                    | 정상 범위   | 문제 신호                      |
@@ -82,10 +88,13 @@ def detect_model_version(model):
     """Detect model version from shared_basis structure
 
     Returns:
-        str: "7.7", "7.6", or "7.5"
+        str: "7.8", "7.7", "7.6", or "7.5"
     """
     sb = model.shared_basis
-    if hasattr(sb, 'basis_qk'):
+    # v7.8: NeuronBank with W_Q/K/V/O (no basis)
+    if hasattr(sb, 'W_Q') and hasattr(sb, 'W_K'):
+        return "7.8"
+    elif hasattr(sb, 'basis_qk'):
         return "7.7"
     elif hasattr(sb, 'get_basis_down'):
         return "7.6"
@@ -97,13 +106,16 @@ def get_basis_for_qkv(model):
     """Get basis used for Q/K/V projection
 
     Returns:
-        basis: Tensor [n_basis, D, rank]
+        basis: Tensor [n_basis/n_neurons, D, rank]
         name: str describing the basis
     """
     version = detect_model_version(model)
     sb = model.shared_basis
 
-    if version == "7.7":
+    if version == "7.8":
+        # v7.8: No basis, return W_Q directly (뉴런별 독립 W)
+        return sb.W_Q, "neuron_W_Q"
+    elif version == "7.7":
         # v7.7: Q/K use basis_qk, V uses basis_vo
         return sb.basis_qk, "basis_qk"
     elif version == "7.6":
@@ -116,13 +128,16 @@ def get_basis_for_o(model):
     """Get basis used for O projection
 
     Returns:
-        basis: Tensor [n_basis, rank, D]
+        basis: Tensor [n_basis/n_neurons, rank, D]
         name: str describing the basis
     """
     version = detect_model_version(model)
     sb = model.shared_basis
 
-    if version == "7.7":
+    if version == "7.8":
+        # v7.8: No basis, return W_O directly (뉴런별 독립 W)
+        return sb.W_O, "neuron_W_O"
+    elif version == "7.7":
         # v7.7: O uses basis_vo.T
         return sb.get_basis_o(), "basis_vo.T"
     elif version == "7.6":
@@ -138,7 +153,8 @@ def get_basis_for_o(model):
 def analyze_basis_orthogonality(model):
     """Verify that basis is perfectly orthogonal
 
-    Supports v7.5 (single basis), v7.6 (basis_down/basis_up), and v7.7 (basis_qk/basis_vo)
+    Supports v7.5 (single basis), v7.6 (basis_down/basis_up), v7.7 (basis_qk/basis_vo),
+    and v7.8 (neuron W_Q/K/V/O orthogonality)
     """
     print("\n" + "="*60)
     print("1. BASIS ORTHOGONALITY VERIFICATION")
@@ -148,12 +164,14 @@ def analyze_basis_orthogonality(model):
     n_basis = model.n_basis
     results = {}
 
-    def check_orthogonality(basis, name):
+    def check_orthogonality(basis, name, n_items=None):
         """Check orthogonality for a given basis"""
         max_errors = []
         mean_errors = []
+        if n_items is None:
+            n_items = n_basis
 
-        for i in range(n_basis):
+        for i in range(n_items):
             basis_i = basis[i]  # [D, rank] or [rank, D]
             # Ensure we get the right shape for gram matrix
             if basis_i.shape[0] > basis_i.shape[1]:
@@ -174,7 +192,25 @@ def analyze_basis_orthogonality(model):
             'max_across_basis': max_errors,
         }
 
-    if version == "7.7":
+    if version == "7.8":
+        print(f"\n📌 v7.8 model: Checking neuron W_Q/K/V/O orthogonality")
+        print(f"   (뉴런별 독립 W, basis mixing 없음)")
+
+        nb = model.shared_basis  # NeuronBank
+        n_neurons = nb.n_neurons
+
+        # Check each W type
+        for W_name, W in [('W_Q', nb.W_Q), ('W_K', nb.W_K), ('W_V', nb.W_V), ('W_O', nb.W_O)]:
+            result = check_orthogonality(W, W_name, n_items=n_neurons)
+            results[W_name] = result
+            print(f"\n{W_name} orthogonality (across {n_neurons} neurons):")
+            print(f"  Max off-diagonal: {result['max_off_diagonal']:.2e}")
+            print(f"  Mean off-diagonal: {result['mean_off_diagonal']:.2e}")
+
+        max_error = max(results[k]['max_off_diagonal'] for k in ['W_Q', 'W_K', 'W_V', 'W_O'])
+        results['basis'] = {'max_off_diagonal': max_error}  # For compatibility
+
+    elif version == "7.7":
         print(f"\n📌 v7.7 model: Checking both basis_qk and basis_vo")
 
         # Check basis_qk
@@ -240,6 +276,57 @@ def analyze_recipes(model):
     print("\n" + "="*60)
     print("2. RECIPE ANALYSIS (Q/K/V/O)")
     print("="*60)
+
+    version = detect_model_version(model)
+
+    # v7.8: No recipes - analyze neuron W matrices directly
+    if version == "7.8":
+        print(f"\n📌 v7.8 model: No recipes (뉴런별 독립 W)")
+        print(f"   대신 뉴런 W 행렬 간 유사도 분석")
+
+        nb = model.shared_basis  # NeuronBank
+        n_neurons = nb.n_neurons
+        results = {}
+
+        # Analyze W matrix similarity between neurons
+        for W_name, W in [('W_Q', nb.W_Q), ('W_K', nb.W_K), ('W_V', nb.W_V), ('W_O', nb.W_O)]:
+            # W: [n_neurons, D, rank] or [n_neurons, rank, D]
+            W_flat = W.view(n_neurons, -1)  # [n_neurons, D*rank]
+            W_norm = F.normalize(W_flat, dim=-1)
+            sim_matrix = W_norm @ W_norm.T  # [n_neurons, n_neurons]
+
+            # Off-diagonal similarity (neuron 간 유사도)
+            mask = ~torch.eye(n_neurons, dtype=torch.bool, device=W.device)
+            off_diag_sim = sim_matrix[mask].mean().item()
+            off_diag_std = sim_matrix[mask].std().item()
+
+            results[W_name] = {
+                'neuron_similarity_mean': off_diag_sim,
+                'neuron_similarity_std': off_diag_std,
+            }
+            print(f"\n  {W_name} neuron similarity: {off_diag_sim:.4f} ± {off_diag_std:.4f}")
+
+        # Cross-type similarity (Q vs K, Q vs V, etc.)
+        W_types = {'Q': nb.W_Q, 'K': nb.W_K, 'V': nb.W_V, 'O': nb.W_O}
+        cross_sim = {}
+        for name1, W1 in W_types.items():
+            for name2, W2 in W_types.items():
+                if name1 >= name2:
+                    continue
+                # Per-neuron similarity
+                W1_flat = W1.view(n_neurons, -1)
+                W2_flat = W2.view(n_neurons, -1)
+                W1_norm = F.normalize(W1_flat, dim=-1)
+                W2_norm = F.normalize(W2_flat, dim=-1)
+                sim = (W1_norm * W2_norm).sum(dim=-1).mean().item()
+                cross_sim[f'{name1}_{name2}'] = sim
+
+        results['cross_similarity'] = cross_sim
+        print(f"\n  Cross-type similarity:")
+        print(f"    Q-K: {cross_sim['Q_K']:.4f}, Q-V: {cross_sim['Q_V']:.4f}, Q-O: {cross_sim['Q_O']:.4f}")
+        print(f"    K-V: {cross_sim['K_V']:.4f}, K-O: {cross_sim['K_O']:.4f}, V-O: {cross_sim['V_O']:.4f}")
+
+        return results
 
     results = {}
 
@@ -584,7 +671,8 @@ def analyze_w_dynamics(model, dataloader, device, max_batches=5):
 def analyze_basis_coverage(model, dataloader, device, max_batches=5):
     """Analyze how well basis covers the space
 
-    Supports v7.5 (single basis), v7.6 (basis_down/basis_up), and v7.7 (basis_qk/basis_vo)
+    Supports v7.5 (single basis), v7.6 (basis_down/basis_up), v7.7 (basis_qk/basis_vo),
+    and v7.8 (neuron W_Q - analyzes neuron diversity instead of basis)
     """
     print("\n" + "="*60)
     print("6. BASIS COVERAGE ANALYSIS")
@@ -594,6 +682,10 @@ def analyze_basis_coverage(model, dataloader, device, max_batches=5):
     version = detect_model_version(model)
     basis, basis_name = get_basis_for_qkv(model)
     print(f"📌 Analyzing {basis_name} (v{version})")
+
+    if version == "7.8":
+        print(f"   (v7.8: 뉴런별 W 행렬 분석 - basis 없음)")
+
     n_basis, D, rank = basis.shape
 
     # 1. Flatten basis for analysis
@@ -666,7 +758,8 @@ def analyze_basis_coverage(model, dataloader, device, max_batches=5):
 def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
     """Measure information loss in O projection
 
-    Supports v7.5 (shared basis.T), v7.6 (independent basis_up), and v7.7 (basis_qk/basis_vo)
+    Supports v7.5 (shared basis.T), v7.6 (independent basis_up), v7.7 (basis_qk/basis_vo),
+    and v7.8 (neuron W_Q/K/V/O - no basis mixing)
     """
     print("\n" + "="*60)
     print("7. ⭐ O PROJECTION INFORMATION LOSS (KEY SUSPECT)")
@@ -678,7 +771,12 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
     # Detect model version
     version = detect_model_version(model)
 
-    if version == "7.7":
+    if version == "7.8":
+        print("\n📌 Detected v7.8 model with independent neuron W_Q/K/V/O")
+        print(f"   (뉴런별 독립 W, basis mixing 없음)")
+        results['basis_correspondence'] = None  # N/A for v7.8
+
+    elif version == "7.7":
         print("\n📌 Detected v7.7 model with basis_qk (Q/K) and basis_vo (V/O)")
 
         # Analyze basis_vo - O uses basis_vo.T, so they share the same basis
@@ -740,28 +838,42 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
                 weights = F.softmax(topk_scores, dim=-1)
 
-                # Generate Q, K, V
-                recipe_Q = F.softmax((qkv.neuron_recipe_Q[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
-                recipe_K = F.softmax((qkv.neuron_recipe_K[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
-                recipe_V = F.softmax((qkv.neuron_recipe_V[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                # Get W_Q, W_K, W_V based on version
+                if version == "7.8":
+                    # v7.8: Direct neuron W matrices (no recipe/basis)
+                    nb = qkv.neuron_bank
+                    W_Q_neurons = nb.get_W_Q(topk_idx)  # [B, S, k, D, rank]
+                    W_K_neurons = nb.get_W_K(topk_idx)
+                    W_V_neurons = nb.get_W_V(topk_idx)
 
-                # Get basis based on version
-                if version == "7.7":
-                    basis_qk = qkv.shared_basis.basis_qk  # Q/K share this
-                    basis_vo = qkv.shared_basis.basis_vo  # V uses this
-                    W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis_qk)
-                    W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis_qk)
-                    W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis_vo)
-                elif version == "7.6":
-                    basis = qkv.shared_basis.get_basis_down()
-                    W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
-                    W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
-                    W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
+                    # Weighted average of neuron W matrices
+                    weights_exp = weights.unsqueeze(-1).unsqueeze(-1)  # [B, S, k, 1, 1]
+                    W_Q = (W_Q_neurons * weights_exp).sum(dim=2)  # [B, S, D, rank]
+                    W_K = (W_K_neurons * weights_exp).sum(dim=2)
+                    W_V = (W_V_neurons * weights_exp).sum(dim=2)
                 else:
-                    basis = qkv.shared_basis()
-                    W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
-                    W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
-                    W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
+                    # Generate Q, K, V recipes (v7.5/7.6/7.7)
+                    recipe_Q = F.softmax((qkv.neuron_recipe_Q[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                    recipe_K = F.softmax((qkv.neuron_recipe_K[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                    recipe_V = F.softmax((qkv.neuron_recipe_V[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+
+                    # Get basis based on version
+                    if version == "7.7":
+                        basis_qk = qkv.shared_basis.basis_qk  # Q/K share this
+                        basis_vo = qkv.shared_basis.basis_vo  # V uses this
+                        W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis_qk)
+                        W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis_qk)
+                        W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis_vo)
+                    elif version == "7.6":
+                        basis = qkv.shared_basis.get_basis_down()
+                        W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
+                        W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
+                        W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
+                    else:
+                        basis = qkv.shared_basis()
+                        W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
+                        W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
+                        W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
 
                 # ============================================================
                 # STAGE 0: Input (normed x)
@@ -870,14 +982,19 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 # ============================================================
                 attn_out_before_O = attn_out.clone()  # [B, S, rank]
 
-                recipe_O = F.softmax((qkv.neuron_recipe_O[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
-                if version == "7.7":
-                    basis_up = qkv.shared_basis.get_basis_o()  # [n_basis, rank, D] = basis_vo.T
-                elif version == "7.6":
-                    basis_up = qkv.shared_basis.get_basis_up()  # [n_basis, rank, D]
+                if version == "7.8":
+                    # v7.8: Direct neuron W_O matrices
+                    W_O_neurons = nb.get_W_O(topk_idx)  # [B, S, k, rank, D]
+                    W_O = (W_O_neurons * weights_exp).sum(dim=2)  # [B, S, rank, D]
                 else:
-                    basis_up = qkv.shared_basis().transpose(-1, -2)  # [n_basis, rank, D]
-                W_O = torch.einsum('bsn,nrd->bsrd', recipe_O, basis_up)  # [B, S, rank, D]
+                    recipe_O = F.softmax((qkv.neuron_recipe_O[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
+                    if version == "7.7":
+                        basis_up = qkv.shared_basis.get_basis_o()  # [n_basis, rank, D] = basis_vo.T
+                    elif version == "7.6":
+                        basis_up = qkv.shared_basis.get_basis_up()  # [n_basis, rank, D]
+                    else:
+                        basis_up = qkv.shared_basis().transpose(-1, -2)  # [n_basis, rank, D]
+                    W_O = torch.einsum('bsn,nrd->bsrd', recipe_O, basis_up)  # [B, S, rank, D]
                 attn_out_after_O = torch.einsum('bsr,bsrd->bsd', attn_out, W_O)  # [B, S, D]
 
                 var_after_o = attn_out_after_O.var(dim=-1).mean()  # O projection 후 분산
@@ -1064,11 +1181,27 @@ def analyze_mixing_condition(model, dataloader, device, max_batches=3):
     results = {f'layer_{i}': [] for i in range(len(model.layers))}
 
     # ============================================================
-    # STAGE A: Single Basis Condition Numbers
+    # STAGE A: Single Basis/Neuron Condition Numbers
     # ============================================================
-    print("\n📊 [Stage A] Single Basis Condition Numbers")
+    print("\n📊 [Stage A] Single Basis/Neuron Condition Numbers")
 
-    if version == "7.7":
+    if version == "7.8":
+        print(f"  (v7.8: 뉴런별 W 조건수 - basis 없음)")
+        nb = model.shared_basis  # NeuronBank
+        n_neurons = nb.n_neurons
+
+        cond_per_neuron = {'W_Q': [], 'W_K': [], 'W_V': [], 'W_O': []}
+        for i in range(n_neurons):
+            for name, W in [('W_Q', nb.W_Q), ('W_K', nb.W_K), ('W_V', nb.W_V), ('W_O', nb.W_O)]:
+                _, s, _ = torch.linalg.svd(W[i], full_matrices=False)
+                cond_per_neuron[name].append((s[0] / (s[-1] + 1e-10)).item())
+
+        for name in ['W_Q', 'W_K', 'W_V', 'W_O']:
+            conds = cond_per_neuron[name]
+            print(f"  {name}: mean={np.mean(conds):.2f}, max={np.max(conds):.2f}, min={np.min(conds):.2f}")
+        results['single_neuron_cond'] = cond_per_neuron
+
+    elif version == "7.7":
         basis_qk = model.shared_basis.basis_qk  # [n_basis, D, rank]
         basis_vo = model.shared_basis.basis_vo
 
@@ -1138,68 +1271,108 @@ def analyze_mixing_condition(model, dataloader, device, max_batches=3):
                 topk_scores, topk_idx = torch.topk(scores, qkv.k, dim=-1)
                 weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-                # Get basis
-                if version == "7.7":
-                    basis = qkv.shared_basis.basis_vo  # Use V basis for analysis
-                elif version == "7.6":
-                    basis = qkv.shared_basis.get_basis_down()
-                else:
-                    basis = qkv.shared_basis()
-
                 # --------------------------------------------------------
-                # Stage B: Single neuron recipe → W (no mixing)
+                # Stage B & C: Version-specific analysis
                 # --------------------------------------------------------
-                # For each of the top-k neurons, compute W individually
-                single_neuron_conds = []
-                for k_idx in range(qkv.k):
-                    neuron_idx = topk_idx[:, :, k_idx]  # [B, S]
-                    recipe = qkv.neuron_recipe_V[neuron_idx]  # [B, S, n_basis]
-                    recipe_norm = F.softmax(recipe, dim=-1)
+                if version == "7.8":
+                    # v7.8: No basis mixing, only neuron W mixing
+                    nb = qkv.neuron_bank
 
-                    # W from single neuron: [B, S, D, rank]
-                    W_single = torch.einsum('bsn,ndr->bsdr', recipe_norm, basis)
+                    # Stage B: Single neuron W (no mixing)
+                    single_neuron_conds = []
+                    for k_idx in range(qkv.k):
+                        neuron_idx = topk_idx[:, :, k_idx]  # [B, S]
+                        W_V_single = nb.W_V[neuron_idx]  # [B, S, D, rank] - direct lookup
+                        W_flat = W_V_single.view(B * S, -1)
+                        sample_idx = torch.randperm(B * S, device=device)[:min(50, B * S)]
+                        W_sample = W_flat[sample_idx]
+                        _, s_vals, _ = torch.linalg.svd(W_sample, full_matrices=False)
+                        cond = (s_vals[0] / (s_vals[-1] + 1e-10)).item()
+                        single_neuron_conds.append(cond)
 
-                    # Sample and compute condition
-                    W_flat = W_single.view(B * S, -1)
+                    avg_single_neuron_cond = np.mean(single_neuron_conds)
+
+                    # Stage C: Mixed neurons → W
+                    W_V_neurons = nb.get_W_V(topk_idx)  # [B, S, k, D, rank]
+                    weights_exp = weights.unsqueeze(-1).unsqueeze(-1)
+                    W_mixed = (W_V_neurons * weights_exp).sum(dim=2)  # [B, S, D, rank]
+
+                    W_flat = W_mixed.view(B * S, -1)
                     sample_idx = torch.randperm(B * S, device=device)[:min(50, B * S)]
                     W_sample = W_flat[sample_idx]
                     _, s_vals, _ = torch.linalg.svd(W_sample, full_matrices=False)
-                    cond = (s_vals[0] / (s_vals[-1] + 1e-10)).item()
-                    single_neuron_conds.append(cond)
+                    mixed_neuron_cond = (s_vals[0] / (s_vals[-1] + 1e-10)).item()
 
-                avg_single_neuron_cond = np.mean(single_neuron_conds)
+                    # Stage D: Neuron weight entropy (instead of recipe entropy)
+                    neuron_entropy = -torch.sum(
+                        weights * torch.log(weights + 1e-10), dim=-1
+                    ).mean().item()
+                    max_neuron_weight = weights.max(dim=-1)[0].mean().item()
 
-                # --------------------------------------------------------
-                # Stage C: Mixed neurons (top-k weighted) → W
-                # --------------------------------------------------------
-                recipe_mixed = (qkv.neuron_recipe_V[topk_idx] * weights.unsqueeze(-1)).sum(dim=2)
-                recipe_mixed_norm = F.softmax(recipe_mixed, dim=-1)  # [B, S, n_basis]
+                    results[f'layer_{layer_idx}'].append({
+                        'single_neuron_cond': avg_single_neuron_cond,
+                        'mixed_neuron_cond': mixed_neuron_cond,
+                        'cond_ratio': mixed_neuron_cond / (avg_single_neuron_cond + 1e-10),
+                        'recipe_entropy': neuron_entropy,  # Using neuron weight entropy
+                        'max_recipe_weight': max_neuron_weight,
+                    })
+                else:
+                    # v7.5/7.6/7.7: Basis mixing analysis
+                    # Get basis
+                    if version == "7.7":
+                        basis = qkv.shared_basis.basis_vo  # Use V basis for analysis
+                    elif version == "7.6":
+                        basis = qkv.shared_basis.get_basis_down()
+                    else:
+                        basis = qkv.shared_basis()
 
-                W_mixed = torch.einsum('bsn,ndr->bsdr', recipe_mixed_norm, basis)
+                    # Stage B: Single neuron recipe → W (no mixing)
+                    single_neuron_conds = []
+                    for k_idx in range(qkv.k):
+                        neuron_idx = topk_idx[:, :, k_idx]  # [B, S]
+                        recipe = qkv.neuron_recipe_V[neuron_idx]  # [B, S, n_basis]
+                        recipe_norm = F.softmax(recipe, dim=-1)
 
-                W_flat = W_mixed.view(B * S, -1)
-                sample_idx = torch.randperm(B * S, device=device)[:min(50, B * S)]
-                W_sample = W_flat[sample_idx]
-                _, s_vals, _ = torch.linalg.svd(W_sample, full_matrices=False)
-                mixed_neuron_cond = (s_vals[0] / (s_vals[-1] + 1e-10)).item()
+                        # W from single neuron: [B, S, D, rank]
+                        W_single = torch.einsum('bsn,ndr->bsdr', recipe_norm, basis)
 
-                # --------------------------------------------------------
-                # Stage D: Recipe entropy (how spread is the recipe?)
-                # --------------------------------------------------------
-                recipe_entropy = -torch.sum(
-                    recipe_mixed_norm * torch.log(recipe_mixed_norm + 1e-10), dim=-1
-                ).mean().item()
+                        # Sample and compute condition
+                        W_flat = W_single.view(B * S, -1)
+                        sample_idx = torch.randperm(B * S, device=device)[:min(50, B * S)]
+                        W_sample = W_flat[sample_idx]
+                        _, s_vals, _ = torch.linalg.svd(W_sample, full_matrices=False)
+                        cond = (s_vals[0] / (s_vals[-1] + 1e-10)).item()
+                        single_neuron_conds.append(cond)
 
-                # Max weight in recipe (specialization)
-                max_recipe_weight = recipe_mixed_norm.max(dim=-1)[0].mean().item()
+                    avg_single_neuron_cond = np.mean(single_neuron_conds)
 
-                results[f'layer_{layer_idx}'].append({
-                    'single_neuron_cond': avg_single_neuron_cond,
-                    'mixed_neuron_cond': mixed_neuron_cond,
-                    'cond_ratio': mixed_neuron_cond / (avg_single_neuron_cond + 1e-10),
-                    'recipe_entropy': recipe_entropy,
-                    'max_recipe_weight': max_recipe_weight,
-                })
+                    # Stage C: Mixed neurons (top-k weighted) → W
+                    recipe_mixed = (qkv.neuron_recipe_V[topk_idx] * weights.unsqueeze(-1)).sum(dim=2)
+                    recipe_mixed_norm = F.softmax(recipe_mixed, dim=-1)  # [B, S, n_basis]
+
+                    W_mixed = torch.einsum('bsn,ndr->bsdr', recipe_mixed_norm, basis)
+
+                    W_flat = W_mixed.view(B * S, -1)
+                    sample_idx = torch.randperm(B * S, device=device)[:min(50, B * S)]
+                    W_sample = W_flat[sample_idx]
+                    _, s_vals, _ = torch.linalg.svd(W_sample, full_matrices=False)
+                    mixed_neuron_cond = (s_vals[0] / (s_vals[-1] + 1e-10)).item()
+
+                    # Stage D: Recipe entropy (how spread is the recipe?)
+                    recipe_entropy = -torch.sum(
+                        recipe_mixed_norm * torch.log(recipe_mixed_norm + 1e-10), dim=-1
+                    ).mean().item()
+
+                    # Max weight in recipe (specialization)
+                    max_recipe_weight = recipe_mixed_norm.max(dim=-1)[0].mean().item()
+
+                    results[f'layer_{layer_idx}'].append({
+                        'single_neuron_cond': avg_single_neuron_cond,
+                        'mixed_neuron_cond': mixed_neuron_cond,
+                        'cond_ratio': mixed_neuron_cond / (avg_single_neuron_cond + 1e-10),
+                        'recipe_entropy': recipe_entropy,
+                        'max_recipe_weight': max_recipe_weight,
+                    })
 
                 # Forward to next layer
                 attn_out, _ = qkv(normed, mask)
@@ -1210,12 +1383,21 @@ def analyze_mixing_condition(model, dataloader, device, max_batches=3):
     # Output Results
     # ============================================================
     print("\n⭐ MIXING CONDITION ANALYSIS RESULTS:")
-    print("\n  Stages:")
-    print("    A: Single basis condition (orthogonal init → should be ~1)")
-    print("    B: Single neuron recipe → W (basis mixing only)")
-    print("    C: Mixed neurons → W (neuron + basis mixing)")
-    print("\n  If B >> A: Basis mixing causes explosion")
-    print("  If C >> B: Neuron mixing causes explosion")
+
+    if version == "7.8":
+        print("\n  Stages (v7.8 - No Basis Mixing):")
+        print("    A: Single neuron W condition (orthogonal init → should be ~1)")
+        print("    B: Single neuron W (no mixing)")
+        print("    C: Mixed neurons → W (neuron mixing only)")
+        print("\n  If C >> B: Neuron mixing causes explosion")
+        print("  (v7.8 eliminates basis mixing)")
+    else:
+        print("\n  Stages:")
+        print("    A: Single basis condition (orthogonal init → should be ~1)")
+        print("    B: Single neuron recipe → W (basis mixing only)")
+        print("    C: Mixed neurons → W (neuron + basis mixing)")
+        print("\n  If B >> A: Basis mixing causes explosion")
+        print("  If C >> B: Neuron mixing causes explosion")
 
     for layer_idx in range(len(model.layers)):
         key = f'layer_{layer_idx}'
@@ -1237,18 +1419,24 @@ def analyze_mixing_condition(model, dataloader, device, max_batches=3):
         if avg_ratio > 2.0:
             print(f"    │ ⚠️  Neuron mixing causes {avg_ratio:.1f}x condition explosion!")
             explosion_source = "NEURON_MIXING"
-        elif avg_single > 50:
+        elif avg_single > 50 and version != "7.8":
             print(f"    │ ⚠️  Basis mixing already causes high condition!")
             explosion_source = "BASIS_MIXING"
+        elif avg_single > 50 and version == "7.8":
+            print(f"    │ ⚠️  Single neuron W has high condition (check orthogonality)!")
+            explosion_source = "INIT_DEGRADED"
         else:
             print(f"    │ ✓  Mixing ratio = {avg_ratio:.2f}x (acceptable)")
             explosion_source = None
 
         print(f"    │")
-        print(f"    │ Recipe stats: entropy={avg_entropy:.2f}, max_weight={avg_max_weight:.3f}")
+        if version == "7.8":
+            print(f"    │ Neuron weight stats: entropy={avg_entropy:.2f}, max_weight={avg_max_weight:.3f}")
+        else:
+            print(f"    │ Recipe stats: entropy={avg_entropy:.2f}, max_weight={avg_max_weight:.3f}")
 
         if avg_max_weight > 0.5:
-            print(f"    │ ⚠️  High specialization (max_weight > 0.5) - recipe nearly one-hot")
+            print(f"    │ ⚠️  High specialization (max_weight > 0.5)")
 
         print(f"    └─────────────────────────────────────────────────────────")
 
@@ -1381,10 +1569,14 @@ def main():
     state_dict = checkpoint[state_dict_key]
 
     # Detect model version from state_dict
+    has_neuron_bank_W = any('neuron_bank.W_Q' in k for k in state_dict.keys())
     has_qk_vo_basis = any('basis_qk' in k or 'basis_vo' in k for k in state_dict.keys())
     has_split_basis = any('basis_down' in k or 'basis_up' in k for k in state_dict.keys())
 
-    if has_qk_vo_basis:
+    if has_neuron_bank_W:
+        detected_version = '7.8'
+        print("  Detected v7.8 from state_dict (neuron_bank.W_Q/K/V/O)")
+    elif has_qk_vo_basis:
         detected_version = '7.7'
         print("  Detected v7.7 from state_dict (basis_qk/basis_vo)")
     elif has_split_basis:
@@ -1406,18 +1598,33 @@ def main():
         model_config['model_version'] = model_version
     else:
         # Infer model config from state_dict
-        sample_layer = 'layers.0.qkv_dynamic'
-        n_neurons = state_dict[f'{sample_layer}.neuron_recipe_Q'].shape[0]
-        n_basis = state_dict[f'{sample_layer}.neuron_recipe_Q'].shape[1]
+        if model_version == '7.8':
+            # v7.8: NeuronBank W matrices
+            n_neurons = state_dict['neuron_bank.W_Q'].shape[0]
+            rank = state_dict['neuron_bank.W_Q'].shape[2]
+            n_basis = n_neurons  # For compatibility
 
-        model_config = {
-            'vocab_size': state_dict['token_emb.weight'].shape[0],
-            'd_model': state_dict['token_emb.weight'].shape[1],
-            'n_layers': sum(1 for k in state_dict.keys() if k.startswith('layers.') and '.norm1.weight' in k),
-            'n_neurons': n_neurons,
-            'n_basis': n_basis,
-            'model_version': model_version,
-        }
+            model_config = {
+                'vocab_size': state_dict['token_emb.weight'].shape[0],
+                'd_model': state_dict['token_emb.weight'].shape[1],
+                'n_layers': sum(1 for k in state_dict.keys() if k.startswith('layers.') and '.norm1.weight' in k),
+                'n_neurons': n_neurons,
+                'rank': rank,
+                'model_version': model_version,
+            }
+        else:
+            sample_layer = 'layers.0.qkv_dynamic'
+            n_neurons = state_dict[f'{sample_layer}.neuron_recipe_Q'].shape[0]
+            n_basis = state_dict[f'{sample_layer}.neuron_recipe_Q'].shape[1]
+
+            model_config = {
+                'vocab_size': state_dict['token_emb.weight'].shape[0],
+                'd_model': state_dict['token_emb.weight'].shape[1],
+                'n_layers': sum(1 for k in state_dict.keys() if k.startswith('layers.') and '.norm1.weight' in k),
+                'n_neurons': n_neurons,
+                'n_basis': n_basis,
+                'model_version': model_version,
+            }
         print(f"  Inferred config: {model_config}")
 
     # Create model
