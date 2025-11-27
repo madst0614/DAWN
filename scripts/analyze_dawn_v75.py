@@ -309,17 +309,17 @@ def analyze_recipes(model):
         # Cross-type similarity (Q vs K, Q vs V, etc.)
         W_types = {'Q': nb.W_Q, 'K': nb.W_K, 'V': nb.W_V, 'O': nb.W_O}
         cross_sim = {}
-        for name1, W1 in W_types.items():
-            for name2, W2 in W_types.items():
-                if name1 >= name2:
-                    continue
-                # Per-neuron similarity
-                W1_flat = W1.view(n_neurons, -1)
-                W2_flat = W2.view(n_neurons, -1)
-                W1_norm = F.normalize(W1_flat, dim=-1)
-                W2_norm = F.normalize(W2_flat, dim=-1)
-                sim = (W1_norm * W2_norm).sum(dim=-1).mean().item()
-                cross_sim[f'{name1}_{name2}'] = sim
+        pairs = [('Q', 'K'), ('Q', 'V'), ('Q', 'O'), ('K', 'V'), ('K', 'O'), ('V', 'O')]
+        for name1, name2 in pairs:
+            W1 = W_types[name1]
+            W2 = W_types[name2]
+            # Per-neuron similarity
+            W1_flat = W1.view(n_neurons, -1)
+            W2_flat = W2.view(n_neurons, -1)
+            W1_norm = F.normalize(W1_flat, dim=-1)
+            W2_norm = F.normalize(W2_flat, dim=-1)
+            sim = (W1_norm * W2_norm).sum(dim=-1).mean().item()
+            cross_sim[f'{name1}_{name2}'] = sim
 
         results['cross_similarity'] = cross_sim
         print(f"\n  Cross-type similarity:")
