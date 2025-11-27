@@ -620,7 +620,7 @@ class DAWN(nn.Module):
 
     def get_auxiliary_losses(self):
         return {
-            'orthogonality': self.orthogonality_loss(),
+            'orth_total': self.orthogonality_loss(),
             'process_norm': self.process_norm_loss(),
         }
 
