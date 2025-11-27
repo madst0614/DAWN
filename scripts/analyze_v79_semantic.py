@@ -488,7 +488,7 @@ class SemanticAnalyzer:
             }
 
             neurons = top.indices.tolist()[:3]
-            print(f"    {pos:6s} (n={pos_counts[pos]:6d}): L0 neurons {neurons}")
+            print(f"    {pos:6s} (n={int(pos_counts[pos]):6d}): L0 neurons {neurons}")
 
         return results
 
