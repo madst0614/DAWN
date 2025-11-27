@@ -1,5 +1,5 @@
 """
-DAWN v7.9 Semantic Analysis Script
+DAWN Semantic Analysis Script (v7.9 / v8.0 compatible)
 뉴런이 무엇을 배웠는지 분석
 
 핵심 질문:
@@ -14,7 +14,7 @@ DAWN v7.9 Semantic Analysis Script
 5. 뉴런 클러스터링
 6. Layer별 역할 분화
 7. Attention과 뉴런 상관관계
-8. Q/K/V별 뉴런 역할 차이
+8. Q/K/V별 뉴런 역할 차이 (v7.9) / Memory 분석 (v8.0)
 """
 
 import argparse
@@ -35,7 +35,11 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.model_v79 import DAWN
+# Version-agnostic utilities
+from scripts.analysis_utils import (
+    load_model, get_underlying_model, get_routing_info_compat,
+    get_neurons, has_memory, VersionAdapter
+)
 
 # Optional imports
 try:
@@ -128,17 +132,24 @@ def simple_pos_tag(token):
 
 
 class SemanticAnalyzer:
-    """GPU-optimized semantic analysis for DAWN v7.9"""
+    """GPU-optimized semantic analysis for DAWN v7.9 / v8.0"""
 
-    def __init__(self, model, tokenizer, device):
+    def __init__(self, model, tokenizer, device, version="7.9"):
         self.model = get_underlying_model(model)
         self.tokenizer = tokenizer
         self.device = device
+        self.version = version
 
         self.n_layers = len(self.model.layers)
         self.n_process = self.model.n_process
         self.process_k = self.model.process_k
         self.vocab_size = self.tokenizer.vocab_size
+
+        # v8.0 specific
+        self.has_memory = has_memory(version)
+        if self.has_memory:
+            self.n_knowledge = self.model.n_knowledge
+            self.knowledge_k = self.model.knowledge_k
 
         # ⚡ GPU tensors for accumulation
         # Token -> Neuron mapping: [vocab_size, n_layers, n_process]
@@ -217,7 +228,9 @@ class SemanticAnalyzer:
             pos_bin_idx = torch.bucketize(pos_flat, pos_bins_tensor)  # [B*S]
 
             for layer_idx, routing_info in enumerate(routing_infos):
-                process_idx = routing_info['routing_down']['process_indices']  # [B, S, k]
+                # Version-agnostic routing info access
+                compat = get_routing_info_compat(routing_info, self.version)
+                process_idx = compat['process_indices']  # [B, S, k]
 
                 # ⚡ Token-Neuron mapping (GPU scatter)
                 # For each (token, layer), increment selected neurons
@@ -912,38 +925,9 @@ def main():
                 raise FileNotFoundError(f"No .pt files found in {args.checkpoint}")
         print(f"Found checkpoint: {checkpoint_path}")
 
-    # Load checkpoint
+    # Load model (version-agnostic)
     print(f"\nLoading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    config = checkpoint.get('model_config', checkpoint.get('config', {}))
-
-    # Create model
-    print(f"\nCreating model v7.9...")
-    model = DAWN(
-        vocab_size=config.get('vocab_size', 30522),
-        d_model=config.get('d_model', 256),
-        n_layers=config.get('n_layers', 4),
-        n_heads=config.get('n_heads', 4),
-        d_ff=config.get('d_ff', 1024),
-        max_seq_len=config.get('max_seq_len', 128),
-        rank=config.get('rank', config.get('basis_rank', 64)),
-        n_input=config.get('n_input', 8),
-        n_process=config.get('n_process', 32),
-        n_output=config.get('n_output', 8),
-        process_k=config.get('process_k', 3),
-        dropout=config.get('dropout', 0.1),
-        use_soft_selection=config.get('use_soft_selection', True),
-    )
-
-    # Load weights
-    state_dict = checkpoint.get('model_state_dict', checkpoint)
-    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
-        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-
-    model.load_state_dict(state_dict, strict=False)
-    model = model.to(device)
-    model.eval()
+    model, version, config = load_model(checkpoint_path, device)
 
     print(f"Model: DAWN v{model.__version__}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -989,7 +973,7 @@ def main():
     # Run Analysis
     # ============================================================
 
-    analyzer = SemanticAnalyzer(model, tokenizer, device)
+    analyzer = SemanticAnalyzer(model, tokenizer, device, version=version)
 
     # 1. Collect data
     analyzer.collect_data(dataloader, max_batches=args.max_batches)

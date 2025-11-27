@@ -1,11 +1,11 @@
 """
-DAWN v7.9 Deep Analysis Script
-심층 분석: 뉴런 흐름, Householder 변환, Attention-FFN 상호작용
+DAWN Deep Analysis Script (v7.9 / v8.0 compatible)
+심층 분석: 뉴런 흐름, Householder 변환, Attention-FFN/Memory 상호작용
 
 분석 항목:
 1. 레이어간 뉴런 흐름 추적 (Sankey diagram)
 2. Householder 변환 효과 분석
-3. Attention-FFN 상호작용 분석
+3. Attention-FFN 상호작용 분석 (v7.9) / Attention-Memory 분석 (v8.0)
 """
 
 import argparse
@@ -26,7 +26,11 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.model_v79 import DAWN
+# Version-agnostic utilities
+from scripts.analysis_utils import (
+    load_model, get_underlying_model, get_routing_info_compat,
+    get_neurons, get_layer_neurons, has_ffn, has_memory
+)
 
 # Optional imports
 try:
@@ -90,17 +94,25 @@ def simple_pos_tag(token):
 
 
 class DeepAnalyzer:
-    """Deep analysis for DAWN v7.9"""
+    """Deep analysis for DAWN v7.9 / v8.0"""
 
-    def __init__(self, model, tokenizer, device):
+    def __init__(self, model, tokenizer, device, version="7.9"):
         self.model = get_underlying_model(model)
         self.tokenizer = tokenizer
         self.device = device
+        self.version = version
 
         self.n_layers = len(self.model.layers)
         self.n_process = self.model.n_process
         self.process_k = self.model.process_k
         self.vocab_size = self.tokenizer.vocab_size
+
+        # Version-specific
+        self.has_ffn = has_ffn(version)
+        self.has_memory = has_memory(version)
+        if self.has_memory:
+            self.n_knowledge = self.model.n_knowledge
+            self.knowledge_k = self.model.knowledge_k
 
     # ============================================================
     # Analysis 1: Layer-wise Neuron Flow
@@ -167,7 +179,8 @@ class DeepAnalyzer:
                     # Collect neuron indices across layers
                     layer_path = []
                     for layer_idx, routing_info in enumerate(routing_infos):
-                        neurons = routing_info['routing_down']['process_indices'][b, s].tolist()
+                        compat = get_routing_info_compat(routing_info, self.version)
+                        neurons = compat['process_indices'][b, s].tolist()
                         neurons_tuple = tuple(sorted(neurons))
                         layer_path.append(neurons_tuple)
 
@@ -359,6 +372,12 @@ class DeepAnalyzer:
         print("ANALYSIS 2: HOUSEHOLDER TRANSFORMATION EFFECT")
         print("=" * 60)
 
+        # v8.0 uses SharedNeurons - different internal structure
+        if self.version == "8.0":
+            print("  Note: v8.0 uses SharedNeurons (different structure)")
+            print("  Analyzing shared process neurons...")
+            return self._analyze_householder_v8(dataloader, max_batches)
+
         self.model.eval()
 
         # Track transformation effects
@@ -506,6 +525,62 @@ class DeepAnalyzer:
 
         return results, combination_counts, neuron_effects
 
+    def _analyze_householder_v8(self, dataloader, max_batches=30):
+        """v8.0 version: Analyze SharedNeurons Householder transformations"""
+        self.model.eval()
+
+        # v8.0 has shared neurons across all layers
+        shared = self.model.shared_neurons
+        process_neurons = shared.process_neurons.data  # [n_process, rank]
+
+        # Analyze process neuron properties
+        results = {'neurons': {}, 'combinations': {}, 'layers': {}}
+        combination_counts = Counter()
+        neuron_effects = {n: {'cos_sim': [], 'norm_change': []} for n in range(self.n_process)}
+
+        # Compute cosine similarity matrix of process neurons
+        v_norm = F.normalize(process_neurons, dim=-1)
+        cos_sim_matrix = v_norm @ v_norm.T
+        mask = ~torch.eye(self.n_process, dtype=torch.bool, device=cos_sim_matrix.device)
+        avg_sim = cos_sim_matrix[mask].abs().mean().item()
+
+        print(f"\n  Process neurons similarity: avg={avg_sim:.4f}")
+
+        # Collect routing info
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Householder (v8)", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            for routing_info in routing_infos:
+                compat = get_routing_info_compat(routing_info, self.version)
+                process_idx = compat['process_indices']
+                if process_idx is not None:
+                    for b in range(min(process_idx.shape[0], 4)):
+                        for s in range(min(process_idx.shape[1], 32)):
+                            combo = tuple(sorted(process_idx[b, s].tolist()))
+                            combination_counts[combo] += 1
+
+        # Top combinations
+        print("\n  Top 10 process neuron combinations:")
+        for i, (combo, count) in enumerate(combination_counts.most_common(10)):
+            print(f"    {i+1}. {combo}: {count}x")
+            results['combinations'][str(combo)] = {'count': count}
+
+        # Neuron norms
+        norms = process_neurons.norm(dim=-1).cpu().numpy()
+        print(f"\n  Process neuron norms: mean={norms.mean():.4f}, std={norms.std():.4f}")
+
+        for n in range(self.n_process):
+            results['neurons'][n] = {
+                'norm': float(norms[n]),
+                'avg_sim_to_others': float(cos_sim_matrix[n, mask[n]].abs().mean().item())
+            }
+
+        return results, combination_counts, neuron_effects
+
     def visualize_householder(self, combination_counts, neuron_effects, output_dir):
         """Visualize Householder transformation effects"""
         print("\n  Creating Householder visualizations...")
@@ -517,7 +592,8 @@ class DeepAnalyzer:
 
         # 1. Process neuron vectors heatmap
         print("    Creating process neuron heatmap...")
-        process_neurons = self.model.layers[0].qkv_circuit.circuit_Q.process_neurons.data.cpu().numpy()
+        neurons_data = get_neurons(self.model, self.version)
+        process_neurons = neurons_data['process_neurons'].cpu().numpy()
 
         fig, ax = plt.subplots(figsize=(14, 8))
         im = ax.imshow(process_neurons, aspect='auto', cmap='RdBu', vmin=-0.3, vmax=0.3)
@@ -604,20 +680,23 @@ class DeepAnalyzer:
 
     @torch.no_grad()
     def analyze_attention_ffn(self, dataloader, max_batches=30):
-        """Analyze interaction between NeuronAttention and FFN"""
+        """Analyze interaction between NeuronAttention and FFN/Memory"""
         print("\n" + "=" * 60)
-        print("ANALYSIS 3: ATTENTION-FFN INTERACTION")
+        if self.has_memory:
+            print("ANALYSIS 3: ATTENTION-MEMORY INTERACTION (v8.0)")
+        else:
+            print("ANALYSIS 3: ATTENTION-FFN INTERACTION")
         print("=" * 60)
 
         self.model.eval()
 
-        # Track contributions
+        # Track contributions (ffn = FFN for v7.9, Memory for v8.0)
         layer_stats = {l: {
             'attn_norm': [],
-            'ffn_norm': [],
-            'attn_contribution': [],  # |attn| / (|attn| + |ffn|)
+            'ffn_norm': [],  # Or memory_norm for v8.0
+            'attn_contribution': [],  # |attn| / (|attn| + |ffn/mem|)
             'residual_growth': [],
-            'attn_ffn_cos': [],  # cosine sim between attn and ffn outputs
+            'attn_ffn_cos': [],  # cosine sim between attn and ffn/mem outputs
         } for l in range(self.n_layers)}
 
         # POS-specific tracking
@@ -962,38 +1041,9 @@ def main():
                 raise FileNotFoundError(f"No .pt files found in {args.checkpoint}")
         print(f"Found checkpoint: {checkpoint_path}")
 
-    # Load checkpoint
+    # Load model (version-agnostic)
     print(f"\nLoading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    config = checkpoint.get('model_config', checkpoint.get('config', {}))
-
-    # Create model
-    print(f"\nCreating model v7.9...")
-    model = DAWN(
-        vocab_size=config.get('vocab_size', 30522),
-        d_model=config.get('d_model', 256),
-        n_layers=config.get('n_layers', 4),
-        n_heads=config.get('n_heads', 4),
-        d_ff=config.get('d_ff', 1024),
-        max_seq_len=config.get('max_seq_len', 128),
-        rank=config.get('rank', config.get('basis_rank', 64)),
-        n_input=config.get('n_input', 8),
-        n_process=config.get('n_process', 32),
-        n_output=config.get('n_output', 8),
-        process_k=config.get('process_k', 3),
-        dropout=config.get('dropout', 0.1),
-        use_soft_selection=config.get('use_soft_selection', True),
-    )
-
-    # Load weights
-    state_dict = checkpoint.get('model_state_dict', checkpoint)
-    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
-        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-
-    model.load_state_dict(state_dict, strict=False)
-    model = model.to(device)
-    model.eval()
+    model, version, config = load_model(checkpoint_path, device)
 
     print(f"Model: DAWN v{model.__version__}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -1039,7 +1089,7 @@ def main():
     # Run Analysis
     # ============================================================
 
-    analyzer = DeepAnalyzer(model, tokenizer, device)
+    analyzer = DeepAnalyzer(model, tokenizer, device, version=version)
     all_results = {}
 
     # Analysis 1: Neuron Flow
