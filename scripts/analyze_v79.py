@@ -210,15 +210,17 @@ def analyze_neuron_orthogonality(model):
     results['input']['condition_mean'] = np.mean(input_conds)
     results['input']['condition_max'] = np.max(input_conds)
 
-    # Input neuron overlap (should be low for diversity)
+    # ⚡ Input neuron overlap (GPU vectorized)
     print(f"\n  Input neuron overlap (W_i^T @ W_j Frobenius norm):")
-    overlap_matrix = torch.zeros(n_input, n_input)
-    for i in range(n_input):
-        for j in range(n_input):
-            if i != j:
-                overlap = (input_neurons[i].T @ input_neurons[j]).norm().item()
-                overlap_matrix[i, j] = overlap
-    off_diag = overlap_matrix[overlap_matrix != 0]
+    # input_neurons: [n_input, d_model, rank]
+    # Compute all pairwise W_i.T @ W_j products at once
+    input_T = input_neurons.transpose(1, 2)  # [n_input, rank, d_model]
+    products = torch.einsum('iad,jdb->ijab', input_T, input_neurons)  # [n_input, n_input, rank, rank]
+    overlap_matrix = products.norm(dim=(-2, -1))  # [n_input, n_input]
+
+    # Mask diagonal
+    mask = ~torch.eye(n_input, dtype=torch.bool, device=overlap_matrix.device)
+    off_diag = overlap_matrix[mask]
     print(f"    Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
     results['input']['overlap_mean'] = off_diag.mean().item()
     results['input']['overlap_max'] = off_diag.max().item()
@@ -247,15 +249,16 @@ def analyze_neuron_orthogonality(model):
     results['output']['condition_mean'] = np.mean(output_conds)
     results['output']['condition_max'] = np.max(output_conds)
 
-    # Output neuron overlap
+    # ⚡ Output neuron overlap (GPU vectorized)
     print(f"\n  Output neuron overlap:")
-    overlap_matrix = torch.zeros(n_output, n_output)
-    for i in range(n_output):
-        for j in range(n_output):
-            if i != j:
-                overlap = (output_neurons[i] @ output_neurons[j].T).norm().item()
-                overlap_matrix[i, j] = overlap
-    off_diag = overlap_matrix[overlap_matrix != 0]
+    # output_neurons: [n_output, rank, d_model]
+    # Compute all pairwise W_i @ W_j.T products at once
+    products = torch.einsum('iad,jbd->ijab', output_neurons, output_neurons)  # [n_output, n_output, rank, rank]
+    overlap_matrix = products.norm(dim=(-2, -1))  # [n_output, n_output]
+
+    # Mask diagonal
+    mask = ~torch.eye(n_output, dtype=torch.bool, device=overlap_matrix.device)
+    off_diag = overlap_matrix[mask]
     print(f"    Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
     results['output']['overlap_mean'] = off_diag.mean().item()
     results['output']['overlap_max'] = off_diag.max().item()
@@ -264,11 +267,11 @@ def analyze_neuron_orthogonality(model):
 
 
 # ============================================================
-# 3. Routing Pattern Deep Analysis
+# 3. Routing Pattern Deep Analysis (GPU Optimized)
 # ============================================================
 
 def analyze_routing_patterns(model, dataloader, device, max_batches=10):
-    """Deep analysis of routing patterns"""
+    """Deep analysis of routing patterns - GPU optimized"""
     print("\n" + "=" * 60)
     print("3. ROUTING PATTERN DEEP ANALYSIS")
     print("=" * 60)
@@ -280,20 +283,10 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
     n_process = model.n_process
     process_k = model.process_k
 
-    # Accumulators
-    # Process neuron usage per Q/K/V/O
-    usage_down = {f'layer_{i}': {'Q': torch.zeros(n_process, device=device),
-                                  'K': torch.zeros(n_process, device=device),
-                                  'V': torch.zeros(n_process, device=device)}
-                  for i in range(n_layers)}
-    usage_up = {f'layer_{i}': torch.zeros(n_process, device=device) for i in range(n_layers)}
-
-    # Co-occurrence matrix (which neurons are selected together)
-    cooccurrence = {f'layer_{i}': torch.zeros(n_process, n_process, device=device)
-                    for i in range(n_layers)}
-
-    # Q-K-V correlation (do same tokens select similar neurons?)
-    qkv_correlations = []
+    # ⚡ GPU tensors for accumulation
+    usage_down = torch.zeros(n_layers, n_process, device=device)
+    usage_up = torch.zeros(n_layers, n_process, device=device)
+    cooccurrence = torch.zeros(n_layers, n_process, n_process, device=device)
 
     total_tokens = 0
 
@@ -313,84 +306,91 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
                 routing_down = routing_info['routing_down']
                 routing_up = routing_info['routing_up']
 
-                # Process indices from down routing (shared for Q/K/V in current impl)
-                process_idx = routing_down['process_indices']  # [B, S, k]
+                # Process indices [B, S, k]
+                process_idx = routing_down['process_indices']
+                up_idx = routing_up['process_indices']
 
-                # Update usage counts
-                for qkv_type in ['Q', 'K', 'V']:
-                    idx_flat = process_idx.reshape(-1)
-                    counts = torch.bincount(idx_flat, minlength=n_process).float()
-                    usage_down[f'layer_{layer_idx}'][qkv_type] += counts
+                # ⚡ Vectorized usage count (GPU bincount)
+                idx_flat = process_idx.reshape(-1)
+                usage_down[layer_idx] += torch.bincount(idx_flat, minlength=n_process).float()
 
-                # Update co-occurrence
-                for b in range(B):
-                    for s in range(S):
-                        indices = process_idx[b, s]  # [k]
-                        for i in range(process_k):
-                            for j in range(process_k):
-                                cooccurrence[f'layer_{layer_idx}'][indices[i], indices[j]] += 1
+                up_flat = up_idx.reshape(-1)
+                usage_up[layer_idx] += torch.bincount(up_flat, minlength=n_process).float()
 
-                # Up routing
-                up_idx = routing_up['process_indices']  # [B, S, k]
-                idx_flat = up_idx.reshape(-1)
-                counts = torch.bincount(idx_flat, minlength=n_process).float()
-                usage_up[f'layer_{layer_idx}'] += counts
+                # ⚡ Vectorized co-occurrence (GPU scatter_add)
+                # For each token, all pairs (i,j) where i,j in selected indices
+                # Shape: [B*S, k] -> create all k*k pairs
+                idx_2d = process_idx.reshape(-1, process_k)  # [B*S, k]
+                n_tokens = idx_2d.shape[0]
 
-    # Compute statistics
+                # Expand to get all pairs: [n_tokens, k, k]
+                idx_i = idx_2d.unsqueeze(2).expand(-1, -1, process_k)  # [n_tokens, k, k]
+                idx_j = idx_2d.unsqueeze(1).expand(-1, process_k, -1)  # [n_tokens, k, k]
+
+                # Flatten and compute linear indices for scatter_add
+                idx_i_flat = idx_i.reshape(-1)  # [n_tokens * k * k]
+                idx_j_flat = idx_j.reshape(-1)  # [n_tokens * k * k]
+
+                # Linear index into n_process x n_process matrix
+                linear_idx = idx_i_flat * n_process + idx_j_flat
+                ones = torch.ones_like(linear_idx, dtype=torch.float32)
+                cooccurrence[layer_idx].view(-1).scatter_add_(0, linear_idx, ones)
+
+    # ⚡ Compute statistics (all on GPU)
     results = {'layers': {}, 'global': {}}
 
     print("\n📌 Per-Layer Routing Statistics:")
-    all_ginis = []
-    all_entropies = []
 
+    # Normalize usage per layer
+    usage_sum = usage_down.sum(dim=1, keepdim=True) + 1e-10
+    usage_norm = usage_down / usage_sum  # [n_layers, n_process]
+
+    # ⚡ Vectorized entropy computation
+    entropy = -(usage_norm * torch.log(usage_norm + 1e-10)).sum(dim=1)  # [n_layers]
+    max_entropy = math.log(n_process)
+    normalized_entropy = entropy / max_entropy
+
+    # ⚡ Vectorized Gini computation
+    sorted_usage, _ = torch.sort(usage_norm, dim=1)
+    n = n_process
+    index = torch.arange(1, n + 1, dtype=torch.float32, device=device).unsqueeze(0)
+    gini = ((2 * index - n - 1) * sorted_usage).sum(dim=1) / (n * sorted_usage.sum(dim=1) + 1e-10)
+
+    # ⚡ Usage rate and top-k
+    usage_rate = (usage_norm > 1e-6).float().mean(dim=1)
+    top5_usage = torch.topk(usage_norm, 5, dim=1)[0].sum(dim=1)
+    top10_usage = torch.topk(usage_norm, 10, dim=1)[0].sum(dim=1)
+
+    # ⚡ Co-occurrence self ratio
+    cooc_diag = cooccurrence.diagonal(dim1=1, dim2=2).sum(dim=1)  # [n_layers]
+    cooc_total = cooccurrence.sum(dim=(1, 2)) + 1e-10
+    cooc_self_ratio = cooc_diag / cooc_total
+
+    # Print results
     for layer_idx in range(n_layers):
         layer_key = f'layer_{layer_idx}'
+        ent = normalized_entropy[layer_idx].item()
+        g = gini[layer_idx].item()
+        ur = usage_rate[layer_idx].item()
+        t5 = top5_usage[layer_idx].item()
+        t10 = top10_usage[layer_idx].item()
+        csr = cooc_self_ratio[layer_idx].item()
 
-        # Combine Q/K/V usage
-        total_usage = (usage_down[layer_key]['Q'] +
-                       usage_down[layer_key]['K'] +
-                       usage_down[layer_key]['V'])
-        total_usage = total_usage / total_usage.sum()
-
-        # Entropy (higher = more uniform)
-        entropy = -(total_usage * torch.log(total_usage + 1e-10)).sum().item()
-        max_entropy = math.log(n_process)
-        normalized_entropy = entropy / max_entropy
-
-        # Gini (lower = more uniform)
-        gini = compute_gini(total_usage).item()
-
-        # Usage rate
-        usage_rate = (total_usage > 1e-6).float().mean().item()
-
-        # Top-k concentration
-        top5_usage = torch.topk(total_usage, 5)[0].sum().item()
-        top10_usage = torch.topk(total_usage, 10)[0].sum().item()
-
-        all_ginis.append(gini)
-        all_entropies.append(normalized_entropy)
-
-        print(f"  Layer {layer_idx}: entropy={normalized_entropy:.3f}, gini={gini:.3f}, "
-              f"usage={usage_rate:.1%}, top5={top5_usage:.1%}, top10={top10_usage:.1%}")
-
-        # Co-occurrence analysis
-        cooc = cooccurrence[layer_key]
-        cooc_diag = cooc.diag()
-        cooc_offdiag = cooc.clone()
-        cooc_offdiag.fill_diagonal_(0)
+        print(f"  Layer {layer_idx}: entropy={ent:.3f}, gini={g:.3f}, "
+              f"usage={ur:.1%}, top5={t5:.1%}, top10={t10:.1%}")
 
         results['layers'][layer_key] = {
-            'entropy': normalized_entropy,
-            'gini': gini,
-            'usage_rate': usage_rate,
-            'top5_concentration': top5_usage,
-            'top10_concentration': top10_usage,
-            'cooccurrence_self_ratio': (cooc_diag.sum() / cooc.sum()).item() if cooc.sum() > 0 else 0,
+            'entropy': ent,
+            'gini': g,
+            'usage_rate': ur,
+            'top5_concentration': t5,
+            'top10_concentration': t10,
+            'cooccurrence_self_ratio': csr,
         }
 
     results['global'] = {
-        'avg_entropy': np.mean(all_entropies),
-        'avg_gini': np.mean(all_ginis),
+        'avg_entropy': normalized_entropy.mean().item(),
+        'avg_gini': gini.mean().item(),
     }
 
     print(f"\n  Global: avg_entropy={results['global']['avg_entropy']:.3f}, "
