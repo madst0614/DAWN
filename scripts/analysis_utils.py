@@ -102,6 +102,25 @@ def get_routing_info_compat(routing_info, version):
     """
     버전별 routing_info 통일
 
+    v7.9 structure:
+        routing_info = {
+            'routing_down': {'process_indices': ..., 'input_weights': ...},
+            'routing_up': {'process_indices': ..., 'output_weights': ...},
+        }
+
+    v8.0 structure:
+        routing_info = {
+            'attention': {
+                'routing_Q': {'process_indices': ...},
+                'routing_K': {'process_indices': ...},
+                'routing_V': {'process_indices': ...},
+                'routing_O': {'process_indices': ...},
+                'neuron_indices': ...,
+            },
+            'memory': {'top_indices': ..., 'top_weights': ...},
+            'neuron_indices': ...,
+        }
+
     Returns:
         process_indices: [B, S, k] - process neuron indices
         input_weights: [B, S, n_input] or None
@@ -112,11 +131,23 @@ def get_routing_info_compat(routing_info, version):
         attn_routing = routing_info.get('attention', {})
         mem_routing = routing_info.get('memory', {})
 
+        # Get process_indices from attention routing
+        # Use neuron_indices (which is routing_Q['process_indices'])
+        process_indices = attn_routing.get('neuron_indices')
+        if process_indices is None:
+            # Fallback: try routing_Q directly
+            routing_Q = attn_routing.get('routing_Q', {})
+            process_indices = routing_Q.get('process_indices')
+
+        # Also try top-level neuron_indices as last fallback
+        if process_indices is None:
+            process_indices = routing_info.get('neuron_indices')
+
         return {
-            'process_indices': attn_routing.get('process_indices'),
-            'input_weights': attn_routing.get('input_weights'),
-            'output_weights': attn_routing.get('output_weights'),
-            'memory_indices': mem_routing.get('top_indices'),  # knowledge retrieval indices
+            'process_indices': process_indices,
+            'input_weights': attn_routing.get('routing_Q', {}).get('input_weights'),
+            'output_weights': attn_routing.get('routing_O', {}).get('output_weights'),
+            'memory_indices': mem_routing.get('top_indices'),
             'memory_weights': mem_routing.get('top_weights'),
         }
     else:  # 7.9
