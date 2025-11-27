@@ -763,27 +763,54 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                     W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
                     W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
 
+                # ============================================================
+                # STAGE 0: Input (normed x)
+                # ============================================================
+                var_input = normed.var(dim=-1).mean()  # [D] 공간 분산
+
+                # ============================================================
+                # STAGE 1: V Projection (x → V)
+                # ============================================================
                 Q = torch.einsum('bsd,bsdr->bsr', normed, W_Q)
                 K = torch.einsum('bsd,bsdr->bsr', normed, W_K)
-                V = torch.einsum('bsd,bsdr->bsr', normed, W_V)
+                V = torch.einsum('bsd,bsdr->bsr', normed, W_V)  # [B, S, rank]
 
-                # Perform attention
+                var_after_v = V.var(dim=-1).mean()  # V projection 후 분산
+                var_ratio_v = (var_after_v / (var_input + 1e-10)).item()
+
+                # W_V condition number
+                W_V_flat = W_V.view(B * S, -1)
+                W_V_sample = W_V_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
+                _, S_vals_v, _ = torch.linalg.svd(W_V_sample, full_matrices=False)
+                cond_num_v = (S_vals_v[0] / (S_vals_v[-1] + 1e-10)).item()
+
+                # ============================================================
+                # STAGE 2: Attention Mixing (V → Attention(V))
+                # ============================================================
                 d_head = qkv.d_head
                 n_heads = qkv.n_heads
-                Q = Q.view(B, S, n_heads, d_head).transpose(1, 2)
-                K = K.view(B, S, n_heads, d_head).transpose(1, 2)
-                V = V.view(B, S, n_heads, d_head).transpose(1, 2)
+                Q_heads = Q.view(B, S, n_heads, d_head).transpose(1, 2)
+                K_heads = K.view(B, S, n_heads, d_head).transpose(1, 2)
+                V_heads = V.view(B, S, n_heads, d_head).transpose(1, 2)
 
-                attn_scores = Q @ K.transpose(-2, -1) / (d_head ** 0.5)
+                attn_scores = Q_heads @ K_heads.transpose(-2, -1) / (d_head ** 0.5)
                 attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
                 attn_weights = F.softmax(attn_scores, dim=-1)
-                attn_out = attn_weights @ V  # [B, H, S, d_head]
+
+                # Attention entropy (정보 혼합 정도)
+                attn_entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-10), dim=-1).mean().item()
+
+                attn_out = attn_weights @ V_heads  # [B, H, S, d_head]
                 attn_out = attn_out.transpose(1, 2).reshape(B, S, qkv.basis_rank)  # [B, S, rank]
 
-                # ⭐ KEY: Compare before and after O projection
+                var_after_attn = attn_out.var(dim=-1).mean()  # Attention 후 분산
+                var_ratio_attn = (var_after_attn / (var_after_v + 1e-10)).item()
+
+                # ============================================================
+                # STAGE 3: O Projection (Attention → Output)
+                # ============================================================
                 attn_out_before_O = attn_out.clone()  # [B, S, rank]
 
-                # Perform O projection based on version
                 recipe_O = F.softmax((qkv.neuron_recipe_O[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
                 if version == "7.7":
                     basis_up = qkv.shared_basis.get_basis_o()  # [n_basis, rank, D] = basis_vo.T
@@ -794,28 +821,38 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 W_O = torch.einsum('bsn,nrd->bsrd', recipe_O, basis_up)  # [B, S, rank, D]
                 attn_out_after_O = torch.einsum('bsr,bsrd->bsd', attn_out, W_O)  # [B, S, D]
 
-                # ⭐ Metric 1: Variance ratio (information preservation)
-                # 투영 전후 분산 비교 - 1에 가까울수록 정보 보존됨
-                var_before = attn_out_before_O.var(dim=-1).mean()  # rank 공간 분산
-                var_after = attn_out_after_O.var(dim=-1).mean()    # D 공간 분산
-                var_ratio = (var_after / (var_before + 1e-10)).item()
+                var_after_o = attn_out_after_O.var(dim=-1).mean()  # O projection 후 분산
+                var_ratio_o = (var_after_o / (var_after_attn + 1e-10)).item()
 
-                # ⭐ Metric 2: W_O condition number (projection quality)
-                # 낮을수록 W_O가 잘 학습됨
+                # W_O condition number
                 W_O_flat = W_O.view(B * S, -1)
                 W_O_sample = W_O_flat[torch.randperm(B * S, device=device)[:min(100, B * S)]]
-                _, S_vals, _ = torch.linalg.svd(W_O_sample, full_matrices=False)
-                condition_number = (S_vals[0] / (S_vals[-1] + 1e-10)).item()
+                _, S_vals_o, _ = torch.linalg.svd(W_O_sample, full_matrices=False)
+                cond_num_o = (S_vals_o[0] / (S_vals_o[-1] + 1e-10)).item()
 
-                # Metric 3: W_O effective rank (표현력)
-                S_norm = S_vals / S_vals.sum()
-                entropy = -torch.sum(S_norm * torch.log(S_norm + 1e-10))
-                eff_rank = torch.exp(entropy).item()
+                # W_O effective rank
+                S_norm_o = S_vals_o / S_vals_o.sum()
+                entropy_o = -torch.sum(S_norm_o * torch.log(S_norm_o + 1e-10))
+                eff_rank_o = torch.exp(entropy_o).item()
+
+                # ============================================================
+                # FULL PIPELINE: x → V → Attn → O
+                # ============================================================
+                var_ratio_total = (var_after_o / (var_input + 1e-10)).item()
 
                 results[f'layer_{layer_idx}'].append({
-                    'var_ratio': var_ratio,
-                    'condition_number': condition_number,
-                    'w_o_effective_rank': eff_rank,
+                    # Stage 1: V projection
+                    'var_ratio_v': var_ratio_v,
+                    'cond_num_v': cond_num_v,
+                    # Stage 2: Attention
+                    'var_ratio_attn': var_ratio_attn,
+                    'attn_entropy': attn_entropy,
+                    # Stage 3: O projection
+                    'var_ratio_o': var_ratio_o,
+                    'cond_num_o': cond_num_o,
+                    'eff_rank_o': eff_rank_o,
+                    # Full pipeline
+                    'var_ratio_total': var_ratio_total,
                 })
 
                 # Forward to next layer
@@ -823,35 +860,63 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 x = x + layer.dropout(layer.w_down(F.gelu(layer.w_up(layer.norm2(x)))))
 
     # Output results
-    print("\n⭐ O PROJECTION ANALYSIS:")
+    print("\n⭐ FULL PIPELINE ANALYSIS: x → V → Attention → O")
+    print("\n  Pipeline stages:")
+    print("    Stage 1: V Projection (x → V)")
+    print("    Stage 2: Attention Mixing (V → Attn(V))")
+    print("    Stage 3: O Projection (Attn → Output)")
     print("\n  Metrics explanation:")
-    print("    - Variance ratio: var(after)/var(before), ~1 = good preservation")
-    print("    - Condition number: σ_max/σ_min of W_O, lower = better")
-    print("    - Effective rank: expressiveness of W_O")
+    print("    - var_ratio: var(after)/var(before), ~1 = good preservation")
+    print("    - cond_num: σ_max/σ_min, lower = better conditioned")
+    print("    - attn_entropy: higher = more uniform attention")
 
     for layer_idx in range(len(model.layers)):
         key = f'layer_{layer_idx}'
         data = results[key]
-        avg_var_ratio = np.mean([d['var_ratio'] for d in data])
-        avg_cond_num = np.mean([d['condition_number'] for d in data])
-        avg_eff_rank = np.mean([d['w_o_effective_rank'] for d in data])
+
+        # Aggregate metrics
+        avg_var_v = np.mean([d['var_ratio_v'] for d in data])
+        avg_cond_v = np.mean([d['cond_num_v'] for d in data])
+        avg_var_attn = np.mean([d['var_ratio_attn'] for d in data])
+        avg_entropy = np.mean([d['attn_entropy'] for d in data])
+        avg_var_o = np.mean([d['var_ratio_o'] for d in data])
+        avg_cond_o = np.mean([d['cond_num_o'] for d in data])
+        avg_eff_rank = np.mean([d['eff_rank_o'] for d in data])
+        avg_total = np.mean([d['var_ratio_total'] for d in data])
 
         print(f"\n  Layer {layer_idx}:")
-        print(f"    Variance ratio: {avg_var_ratio:.4f}", end="")
-        if avg_var_ratio < 0.5:
-            print(" ⚠️  LOW - variance collapse")
-        elif avg_var_ratio > 2.0:
-            print(" ⚠️  HIGH - variance explosion")
-        else:
-            print(" ✓")
+        print(f"    ┌─────────────────────────────────────────────────────────")
 
-        print(f"    W_O condition number: {avg_cond_num:.2f}", end="")
-        if avg_cond_num > 100:
-            print(" ⚠️  HIGH - ill-conditioned projection")
-        else:
-            print(" ✓")
+        # Stage 1: V Projection
+        status_v = "⚠️ COLLAPSE" if avg_var_v < 0.3 else ("⚠️ EXPLODE" if avg_var_v > 3.0 else "✓")
+        cond_v_status = "⚠️" if avg_cond_v > 100 else ""
+        print(f"    │ [V Proj]  var_ratio={avg_var_v:.4f} {status_v}  cond_num={avg_cond_v:.1f} {cond_v_status}")
 
-        print(f"    W_O effective rank: {avg_eff_rank:.2f}")
+        # Stage 2: Attention
+        status_attn = "⚠️ COLLAPSE" if avg_var_attn < 0.3 else ("⚠️ EXPLODE" if avg_var_attn > 3.0 else "✓")
+        print(f"    │ [Attn]    var_ratio={avg_var_attn:.4f} {status_attn}  entropy={avg_entropy:.2f}")
+
+        # Stage 3: O Projection
+        status_o = "⚠️ COLLAPSE" if avg_var_o < 0.3 else ("⚠️ EXPLODE" if avg_var_o > 3.0 else "✓")
+        cond_o_status = "⚠️" if avg_cond_o > 100 else ""
+        print(f"    │ [O Proj]  var_ratio={avg_var_o:.4f} {status_o}  cond_num={avg_cond_o:.1f} {cond_o_status}  eff_rank={avg_eff_rank:.1f}")
+
+        # Total pipeline
+        print(f"    └─────────────────────────────────────────────────────────")
+        status_total = "⚠️ COLLAPSE" if avg_total < 0.1 else ("⚠️ EXPLODE" if avg_total > 10.0 else "✓")
+        print(f"    │ [TOTAL]   x→O var_ratio={avg_total:.4f} {status_total}")
+
+        # Identify bottleneck
+        bottleneck = None
+        if avg_var_v < 0.3:
+            bottleneck = "V Projection"
+        elif avg_var_attn < 0.3:
+            bottleneck = "Attention"
+        elif avg_var_o < 0.3:
+            bottleneck = "O Projection"
+
+        if bottleneck:
+            print(f"    │ 🎯 BOTTLENECK: {bottleneck}")
 
     return results
 
