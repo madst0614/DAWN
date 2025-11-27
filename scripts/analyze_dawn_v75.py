@@ -1,5 +1,5 @@
 """
-DAWN v7.5/v7.6 Checkpoint Analysis
+DAWN v7.5/v7.6/v7.7 Checkpoint Analysis
 Dynamic Q/K/V Generation (v8 design)
 
 분석 항목:
@@ -22,6 +22,11 @@ v7.6 특징 (개선):
 - 독립적인 O projection 학습
 - Recipe diversity loss 추가
 
+v7.7 특징 (개선):
+- basis_qk (Q/K용)과 basis_vo (V/O용) 분리
+- O는 basis_vo.T 사용 (V와 대칭)
+- Gradient 균형: QK 2개, VO 2개
+
 핵심 지표 해석 가이드:
 | 지표                    | 정상 범위   | 문제 신호                      |
 |------------------------|------------|-------------------------------|
@@ -30,7 +35,7 @@ v7.6 특징 (개선):
 | O proj variance ratio  | 0.5 ~ 2.0  | < 0.5 collapse, > 2.0 explode |
 | O proj condition #     | < 100      | > 100 → ill-conditioned W_O   |
 | Attention entropy      | 1.5 ~ 3.0  | < 1.0 또는 > 4.0              |
-| Basis correspondence   | < 0.3      | > 0.7 → basis_up 미학습 (v7.6) |
+| Basis correspondence   | < 0.3      | > 0.7 → basis_up/vo 미학습     |
 
 Usage:
     python scripts/analyze_dawn_v75.py --checkpoint /path/to/checkpoint_folder
@@ -73,6 +78,59 @@ def compute_gini(values):
     return ((2 * index - n - 1) * sorted_values).sum() / (n * sorted_values.sum())
 
 
+def detect_model_version(model):
+    """Detect model version from shared_basis structure
+
+    Returns:
+        str: "7.7", "7.6", or "7.5"
+    """
+    sb = model.shared_basis
+    if hasattr(sb, 'basis_qk'):
+        return "7.7"
+    elif hasattr(sb, 'get_basis_down'):
+        return "7.6"
+    else:
+        return "7.5"
+
+
+def get_basis_for_qkv(model):
+    """Get basis used for Q/K/V projection
+
+    Returns:
+        basis: Tensor [n_basis, D, rank]
+        name: str describing the basis
+    """
+    version = detect_model_version(model)
+    sb = model.shared_basis
+
+    if version == "7.7":
+        # v7.7: Q/K use basis_qk, V uses basis_vo
+        return sb.basis_qk, "basis_qk"
+    elif version == "7.6":
+        return sb.get_basis_down(), "basis_down"
+    else:
+        return sb.basis, "basis"
+
+
+def get_basis_for_o(model):
+    """Get basis used for O projection
+
+    Returns:
+        basis: Tensor [n_basis, rank, D]
+        name: str describing the basis
+    """
+    version = detect_model_version(model)
+    sb = model.shared_basis
+
+    if version == "7.7":
+        # v7.7: O uses basis_vo.T
+        return sb.get_basis_o(), "basis_vo.T"
+    elif version == "7.6":
+        return sb.get_basis_up(), "basis_up"
+    else:
+        return sb.basis.transpose(-1, -2), "basis.T"
+
+
 # ============================================================
 # 1. Basis Orthogonality Analysis
 # ============================================================
@@ -80,14 +138,13 @@ def compute_gini(values):
 def analyze_basis_orthogonality(model):
     """Verify that basis is perfectly orthogonal
 
-    Supports both v7.5 (single basis) and v7.6 (separate basis_down/basis_up)
+    Supports v7.5 (single basis), v7.6 (basis_down/basis_up), and v7.7 (basis_qk/basis_vo)
     """
     print("\n" + "="*60)
     print("1. BASIS ORTHOGONALITY VERIFICATION")
     print("="*60)
 
-    # Detect model version
-    is_v76 = hasattr(model.shared_basis, 'get_basis_down')
+    version = detect_model_version(model)
     n_basis = model.n_basis
     results = {}
 
@@ -117,8 +174,29 @@ def analyze_basis_orthogonality(model):
             'max_across_basis': max_errors,
         }
 
-    if is_v76:
-        print("\n📌 v7.6 model: Checking both basis_down and basis_up")
+    if version == "7.7":
+        print(f"\n📌 v7.7 model: Checking both basis_qk and basis_vo")
+
+        # Check basis_qk
+        basis_qk = model.shared_basis.basis_qk
+        results['basis_qk'] = check_orthogonality(basis_qk, 'basis_qk')
+        print(f"\nBasis_QK orthogonality:")
+        print(f"  Max off-diagonal: {results['basis_qk']['max_off_diagonal']:.2e}")
+        print(f"  Mean off-diagonal: {results['basis_qk']['mean_off_diagonal']:.2e}")
+
+        # Check basis_vo
+        basis_vo = model.shared_basis.basis_vo
+        results['basis_vo'] = check_orthogonality(basis_vo, 'basis_vo')
+        print(f"\nBasis_VO orthogonality:")
+        print(f"  Max off-diagonal: {results['basis_vo']['max_off_diagonal']:.2e}")
+        print(f"  Mean off-diagonal: {results['basis_vo']['mean_off_diagonal']:.2e}")
+
+        max_error = max(results['basis_qk']['max_off_diagonal'],
+                       results['basis_vo']['max_off_diagonal'])
+        results['basis'] = {'max_off_diagonal': max_error}
+
+    elif version == "7.6":
+        print(f"\n📌 v7.6 model: Checking both basis_down and basis_up")
 
         # Check basis_down
         basis_down = model.shared_basis.get_basis_down()
@@ -506,19 +584,16 @@ def analyze_w_dynamics(model, dataloader, device, max_batches=5):
 def analyze_basis_coverage(model, dataloader, device, max_batches=5):
     """Analyze how well basis covers the space
 
-    Supports both v7.5 (single basis) and v7.6 (separate basis_down/basis_up)
+    Supports v7.5 (single basis), v7.6 (basis_down/basis_up), and v7.7 (basis_qk/basis_vo)
     """
     print("\n" + "="*60)
     print("6. BASIS COVERAGE ANALYSIS")
     print("="*60)
 
-    # Detect model version and get basis
-    is_v76 = hasattr(model.shared_basis, 'get_basis_down')
-    if is_v76:
-        basis = model.shared_basis.get_basis_down()  # [n_basis, D, rank]
-        print("📌 Analyzing basis_down (v7.6)")
-    else:
-        basis = model.shared_basis.basis  # [n_basis, D, rank]
+    # Detect model version and get basis using helper
+    version = detect_model_version(model)
+    basis, basis_name = get_basis_for_qkv(model)
+    print(f"📌 Analyzing {basis_name} (v{version})")
     n_basis, D, rank = basis.shape
 
     # 1. Flatten basis for analysis
@@ -591,7 +666,7 @@ def analyze_basis_coverage(model, dataloader, device, max_batches=5):
 def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
     """Measure information loss in O projection
 
-    Supports both v7.5 (shared basis.T) and v7.6 (independent basis_up)
+    Supports v7.5 (shared basis.T), v7.6 (independent basis_up), and v7.7 (basis_qk/basis_vo)
     """
     print("\n" + "="*60)
     print("7. ⭐ O PROJECTION INFORMATION LOSS (KEY SUSPECT)")
@@ -601,8 +676,24 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
     results = {f'layer_{i}': [] for i in range(len(model.layers))}
 
     # Detect model version
-    is_v76 = hasattr(model.shared_basis, 'get_basis_up')
-    if is_v76:
+    version = detect_model_version(model)
+
+    if version == "7.7":
+        print("\n📌 Detected v7.7 model with basis_qk (Q/K) and basis_vo (V/O)")
+
+        # Analyze basis_vo - O uses basis_vo.T, so they share the same basis
+        basis_vo = model.shared_basis.basis_vo  # [n_basis, D, rank]
+        basis_o = model.shared_basis.get_basis_o()  # [n_basis, rank, D] = basis_vo.T
+
+        print(f"\n📊 V-O Basis Relationship (v7.7):")
+        print(f"  V uses basis_vo: {list(basis_vo.shape)}")
+        print(f"  O uses basis_vo.T: {list(basis_o.shape)}")
+        print(f"  (Symmetric design - gradient balance 2:2)")
+
+        # For v7.7, correspondence should be 1.0 by design
+        results['basis_correspondence'] = 1.0  # By design V and O share basis_vo
+
+    elif version == "7.6":
         print("\n📌 Detected v7.6 model with independent basis_up")
 
         # Analyze basis down-up correspondence
@@ -654,15 +745,23 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 recipe_K = F.softmax((qkv.neuron_recipe_K[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
                 recipe_V = F.softmax((qkv.neuron_recipe_V[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
 
-                # Get basis (v7.6: use get_basis_down, v7.5: use forward)
-                if is_v76:
+                # Get basis based on version
+                if version == "7.7":
+                    basis_qk = qkv.shared_basis.basis_qk  # Q/K share this
+                    basis_vo = qkv.shared_basis.basis_vo  # V uses this
+                    W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis_qk)
+                    W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis_qk)
+                    W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis_vo)
+                elif version == "7.6":
                     basis = qkv.shared_basis.get_basis_down()
+                    W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
+                    W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
+                    W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
                 else:
                     basis = qkv.shared_basis()
-
-                W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
-                W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
-                W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
+                    W_Q = torch.einsum('bsn,ndr->bsdr', recipe_Q, basis)
+                    W_K = torch.einsum('bsn,ndr->bsdr', recipe_K, basis)
+                    W_V = torch.einsum('bsn,ndr->bsdr', recipe_V, basis)
 
                 Q = torch.einsum('bsd,bsdr->bsr', normed, W_Q)
                 K = torch.einsum('bsd,bsdr->bsr', normed, W_K)
@@ -684,9 +783,11 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 # ⭐ KEY: Compare before and after O projection
                 attn_out_before_O = attn_out.clone()  # [B, S, rank]
 
-                # Perform O projection (v7.6: use get_basis_up, v7.5: use transpose)
+                # Perform O projection based on version
                 recipe_O = F.softmax((qkv.neuron_recipe_O[topk_idx] * weights.unsqueeze(-1)).sum(dim=2), dim=-1)
-                if is_v76:
+                if version == "7.7":
+                    basis_up = qkv.shared_basis.get_basis_o()  # [n_basis, rank, D] = basis_vo.T
+                elif version == "7.6":
                     basis_up = qkv.shared_basis.get_basis_up()  # [n_basis, rank, D]
                 else:
                     basis_up = qkv.shared_basis().transpose(-1, -2)  # [n_basis, rank, D]
@@ -877,9 +978,14 @@ def main():
     state_dict_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'model'
     state_dict = checkpoint[state_dict_key]
 
-    # Detect v7.6 from state_dict (has basis_down/basis_up instead of basis)
+    # Detect model version from state_dict
+    has_qk_vo_basis = any('basis_qk' in k or 'basis_vo' in k for k in state_dict.keys())
     has_split_basis = any('basis_down' in k or 'basis_up' in k for k in state_dict.keys())
-    if has_split_basis:
+
+    if has_qk_vo_basis:
+        detected_version = '7.7'
+        print("  Detected v7.7 from state_dict (basis_qk/basis_vo)")
+    elif has_split_basis:
         detected_version = '7.6'
         print("  Detected v7.6 from state_dict (split basis_down/basis_up)")
     elif 'layers.0.qkv_dynamic.neuron_recipe_Q' in state_dict:
