@@ -19,7 +19,7 @@ model:
   n_layers: 4             # Number of transformer layers
   n_heads: 4              # Number of attention heads
 
-  # TransformNeurons parameters (shared across layers) - same as v8.0
+  # TransformNeurons parameters (shared across layers)
   rank: 64                # Projection rank (4 heads x 16 d_head)
   n_input: 8              # Number of input neurons (256 -> 64 compression)
   n_process: 32           # Number of Householder process neurons
