@@ -91,7 +91,11 @@ class DebugLogger:
 
     def log_basis_stats(self, model, epoch, step=None):
         """
-        Log basis_up statistics at specific epochs
+        Log basis statistics at specific epochs
+
+        Supports both:
+        - v7.6: basis_down / basis_up
+        - v7.7: basis_qk / basis_vo
 
         Tracks:
         - Singular value distribution per basis
@@ -100,34 +104,50 @@ class DebugLogger:
         """
         base_model = get_underlying_model(model)
 
-        # Only for v7.6 models with shared_basis
+        # Only for v7.6/v7.7 models with shared_basis
         if not hasattr(base_model, 'shared_basis'):
             return
 
         step_str = f" Step {step}" if step else ""
         self.log_section(f"Basis Stats - Epoch {epoch}{step_str}")
 
-        with torch.no_grad():
-            basis_up = base_model.shared_basis.basis_up.detach()  # [n_basis, rank, D]
-            n_basis = basis_up.shape[0]
+        sb = base_model.shared_basis
 
-            # Per-basis singular values
-            self.log("\n[Per-Basis Singular Values (top 5)]")
+        # Detect v7.7 (basis_qk/basis_vo) vs v7.6 (basis_down/basis_up)
+        is_v77 = hasattr(sb, 'basis_qk')
+
+        with torch.no_grad():
+            if is_v77:
+                # v7.7: basis_vo is the "output" basis (O uses its transpose)
+                basis_o = sb.basis_vo.detach()  # [n_basis, D, rank]
+                basis_o_name = "Basis_VO"
+                basis_qk = sb.basis_qk.detach()  # [n_basis, D, rank]
+                basis_qk_name = "Basis_QK"
+            else:
+                # v7.6: basis_up is the "output" basis
+                basis_o = sb.basis_up.detach()  # [n_basis, rank, D]
+                basis_o_name = "Basis_up"
+                basis_qk = sb.basis_down.detach()  # [n_basis, D, rank]
+                basis_qk_name = "Basis_down"
+
+            n_basis = basis_o.shape[0]
+
+            # Per-basis singular values for O projection basis
+            self.log(f"\n[{basis_o_name} Per-Basis Singular Values (top 5)]")
             all_singular_values = []
             for i in range(n_basis):
-                # basis_up[i]: [rank, D] -> SVD
-                _, S, _ = torch.linalg.svd(basis_up[i])
+                _, S, _ = torch.linalg.svd(basis_o[i])
                 all_singular_values.extend(S.cpu().tolist())
-                self.log(f"  Basis_up[{i}]: {S[:5].cpu().numpy()}")
+                self.log(f"  {basis_o_name}[{i}]: {S[:5].cpu().numpy()}")
 
-            # Overall condition number
-            B_up_flat = basis_up.view(n_basis, -1)  # [n_basis, rank*D]
-            _, S_all, _ = torch.linalg.svd(B_up_flat)
+            # Overall condition number for O basis
+            B_o_flat = basis_o.view(n_basis, -1)
+            _, S_all, _ = torch.linalg.svd(B_o_flat)
             sigma_max = S_all[0].item()
             sigma_min = S_all[-1].item()
             condition_number = sigma_max / (sigma_min + 1e-10)
 
-            self.log(f"\n[Overall Condition Number]")
+            self.log(f"\n[{basis_o_name} Overall Condition Number]")
             self.log(f"  σ_max = {sigma_max:.6f}")
             self.log(f"  σ_min = {sigma_min:.10f}")
             self.log(f"  Condition number = {condition_number:.2e}")
@@ -140,16 +160,15 @@ class DebugLogger:
             else:
                 self.log(f"  ✓ Condition number is healthy")
 
-            # Also log basis_down for comparison
-            basis_down = base_model.shared_basis.basis_down.detach()  # [n_basis, D, rank]
-            B_down_flat = basis_down.view(n_basis, -1)
-            _, S_down, _ = torch.linalg.svd(B_down_flat)
-            cond_down = S_down[0].item() / (S_down[-1].item() + 1e-10)
+            # Also log QK basis for comparison
+            B_qk_flat = basis_qk.view(n_basis, -1)
+            _, S_qk, _ = torch.linalg.svd(B_qk_flat)
+            cond_qk = S_qk[0].item() / (S_qk[-1].item() + 1e-10)
 
-            self.log(f"\n[Basis_down Condition Number (for comparison)]")
-            self.log(f"  σ_max = {S_down[0].item():.6f}")
-            self.log(f"  σ_min = {S_down[-1].item():.10f}")
-            self.log(f"  Condition number = {cond_down:.2e}")
+            self.log(f"\n[{basis_qk_name} Condition Number (for comparison)]")
+            self.log(f"  σ_max = {S_qk[0].item():.6f}")
+            self.log(f"  σ_min = {S_qk[-1].item():.10f}")
+            self.log(f"  Condition number = {cond_qk:.2e}")
 
     def log_gradient_flow(self, model, epoch, step=None):
         """
@@ -190,9 +209,12 @@ class DebugLogger:
         """
         Log orthogonality loss breakdown
 
+        Supports both:
+        - v7.6: basis_down / basis_up
+        - v7.7: basis_qk / basis_vo
+
         Tracks:
-        - ortho_down loss
-        - ortho_up loss
+        - ortho loss for each basis
         - Which direction dominates
         """
         base_model = get_underlying_model(model)
@@ -206,40 +228,73 @@ class DebugLogger:
         with torch.no_grad():
             sb = base_model.shared_basis
             n_basis = sb.n_basis
-            I = torch.eye(n_basis, device=sb.basis_down.device)
 
-            # basis_down orthogonality
-            B_down = sb.basis_down.view(n_basis, -1)
-            gram_down = B_down @ B_down.T
-            ortho_down = ((gram_down - I) ** 2).mean().item()
+            # Detect v7.7 (basis_qk/basis_vo) vs v7.6 (basis_down/basis_up)
+            is_v77 = hasattr(sb, 'basis_qk')
 
-            # basis_up orthogonality (with normalization)
-            B_up = sb.basis_up.view(n_basis, -1)
-            B_up_norm = F.normalize(B_up, dim=-1)
-            gram_up = B_up_norm @ B_up_norm.T
-            off_diagonal_mask = ~I.bool()
-            ortho_up = (gram_up[off_diagonal_mask] ** 2).mean().item()
+            if is_v77:
+                # v7.7: basis_qk and basis_vo (both QR initialized)
+                I = torch.eye(n_basis, device=sb.basis_qk.device)
+                B_qk = sb.basis_qk.view(n_basis, -1)
+                B_vo = sb.basis_vo.view(n_basis, -1)
+                gram_qk = B_qk @ B_qk.T
+                gram_vo = B_vo @ B_vo.T
+                ortho_qk = ((gram_qk - I) ** 2).mean().item()
+                ortho_vo = ((gram_vo - I) ** 2).mean().item()
+                off_diagonal_mask = ~I.bool()
 
-            self.log(f"\n[Orthogonality Loss Components]")
-            self.log(f"  ortho_down = {ortho_down:.8f}")
-            self.log(f"  ortho_up   = {ortho_up:.8f}")
-            self.log(f"  total (avg) = {(ortho_down + ortho_up) / 2:.8f}")
+                self.log(f"\n[Orthogonality Loss Components (v7.7)]")
+                self.log(f"  ortho_qk = {ortho_qk:.8f}")
+                self.log(f"  ortho_vo = {ortho_vo:.8f}")
+                self.log(f"  total (avg) = {(ortho_qk + ortho_vo) / 2:.8f}")
 
-            # Gram matrix diagnostics
-            self.log(f"\n[Gram Matrix Diagnostics]")
-            self.log(f"  gram_down diagonal mean: {gram_down.diag().mean().item():.6f} (target: 1.0)")
-            self.log(f"  gram_down off-diag mean: {gram_down[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
-            self.log(f"  gram_up diagonal mean: {gram_up.diag().mean().item():.6f} (target: 1.0)")
-            self.log(f"  gram_up off-diag mean: {gram_up[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+                self.log(f"\n[Gram Matrix Diagnostics]")
+                self.log(f"  gram_qk diagonal mean: {gram_qk.diag().mean().item():.6f} (target: 1.0)")
+                self.log(f"  gram_qk off-diag mean: {gram_qk[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+                self.log(f"  gram_vo diagonal mean: {gram_vo.diag().mean().item():.6f} (target: 1.0)")
+                self.log(f"  gram_vo off-diag mean: {gram_vo[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
 
-            if ortho_up > ortho_down * 10:
-                self.log(f"\n  ⚠️  ortho_up >> ortho_down: O projection learning may be unstable")
-            elif ortho_down > ortho_up * 10:
-                self.log(f"\n  ⚠️  ortho_down >> ortho_up: Q/K/V projection learning may be unstable")
+                if ortho_vo > ortho_qk * 10:
+                    self.log(f"\n  ⚠️  ortho_vo >> ortho_qk: V/O projection learning may be unstable")
+                elif ortho_qk > ortho_vo * 10:
+                    self.log(f"\n  ⚠️  ortho_qk >> ortho_vo: Q/K projection learning may be unstable")
+            else:
+                # v7.6: basis_down and basis_up
+                I = torch.eye(n_basis, device=sb.basis_down.device)
+                B_down = sb.basis_down.view(n_basis, -1)
+                gram_down = B_down @ B_down.T
+                ortho_down = ((gram_down - I) ** 2).mean().item()
+
+                # basis_up orthogonality (with normalization for v7.6)
+                B_up = sb.basis_up.view(n_basis, -1)
+                B_up_norm = F.normalize(B_up, dim=-1)
+                gram_up = B_up_norm @ B_up_norm.T
+                off_diagonal_mask = ~I.bool()
+                ortho_up = (gram_up[off_diagonal_mask] ** 2).mean().item()
+
+                self.log(f"\n[Orthogonality Loss Components (v7.6)]")
+                self.log(f"  ortho_down = {ortho_down:.8f}")
+                self.log(f"  ortho_up   = {ortho_up:.8f}")
+                self.log(f"  total (avg) = {(ortho_down + ortho_up) / 2:.8f}")
+
+                self.log(f"\n[Gram Matrix Diagnostics]")
+                self.log(f"  gram_down diagonal mean: {gram_down.diag().mean().item():.6f} (target: 1.0)")
+                self.log(f"  gram_down off-diag mean: {gram_down[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+                self.log(f"  gram_up diagonal mean: {gram_up.diag().mean().item():.6f} (target: 1.0)")
+                self.log(f"  gram_up off-diag mean: {gram_up[off_diagonal_mask].mean().item():.6f} (target: 0.0)")
+
+                if ortho_up > ortho_down * 10:
+                    self.log(f"\n  ⚠️  ortho_up >> ortho_down: O projection learning may be unstable")
+                elif ortho_down > ortho_up * 10:
+                    self.log(f"\n  ⚠️  ortho_down >> ortho_up: Q/K/V projection learning may be unstable")
 
     def log_recipe_analysis(self, model, sample_input, epoch, step=None):
         """
         Log Recipe → W_O analysis
+
+        Supports both:
+        - v7.6: get_basis_up()
+        - v7.7: get_basis_o() (basis_vo.T)
 
         Tracks:
         - Recipe entropy (diversity)
@@ -253,6 +308,9 @@ class DebugLogger:
 
         step_str = f" Step {step}" if step else ""
         self.log_section(f"Recipe → W_O Analysis - Epoch {epoch}{step_str}")
+
+        sb = base_model.shared_basis
+        is_v77 = hasattr(sb, 'basis_qk')
 
         base_model.eval()
         with torch.no_grad():
@@ -291,15 +349,21 @@ class DebugLogger:
             if max_weight.item() > 0.8:
                 self.log(f"  ⚠️  WARNING: Recipe too concentrated on single basis!")
 
-            # W_O singular values
-            basis_up = base_model.shared_basis.get_basis_up()
-            W_O = torch.einsum('bsn,nrd->bsrd', token_recipe_O, basis_up)  # [B, S, rank, D]
+            # W_O singular values - handle v7.6 vs v7.7
+            if is_v77:
+                basis_o = sb.get_basis_o()  # [n_basis, rank, D] = basis_vo.T
+                self.log(f"\n[W_O Construction (v7.7): recipe_O @ basis_vo.T]")
+            else:
+                basis_o = sb.get_basis_up()  # [n_basis, rank, D]
+                self.log(f"\n[W_O Construction (v7.6): recipe_O @ basis_up]")
+
+            W_O = torch.einsum('bsn,nrd->bsrd', token_recipe_O, basis_o)  # [B, S, rank, D]
 
             # Analyze first token's W_O
             W_O_sample = W_O[0, 0]  # [rank, D]
             _, S_wo, _ = torch.linalg.svd(W_O_sample)
 
-            self.log(f"\n[W_O Singular Values (sample token)]")
+            self.log(f"[W_O Singular Values (sample token)]")
             self.log(f"  Top 5: {S_wo[:5].cpu().numpy()}")
             self.log(f"  σ_max/σ_min: {(S_wo[0] / (S_wo[-1] + 1e-10)).item():.2e}")
 
@@ -329,14 +393,14 @@ def get_underlying_model(model):
 
 
 def is_v75_or_v76_model(model):
-    """Robust detection of v7.5/v7.6 models, handling torch.compile() wrapped models"""
+    """Robust detection of v7.5/v7.6/v7.7 models, handling torch.compile() wrapped models"""
     base_model = get_underlying_model(model)
 
     # Check model version attribute
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7"]:
         return True
 
-    # Check for qkv_dynamic attribute on layers (v7.5/v7.6 specific structure)
+    # Check for qkv_dynamic attribute on layers (v7.5/v7.6/v7.7 specific structure)
     if hasattr(base_model, 'layers') and len(base_model.layers) > 0:
         if hasattr(base_model.layers[0], 'qkv_dynamic'):
             return True
@@ -1147,7 +1211,7 @@ def main():
             model_kwargs['mod_rank'] = args.mod_rank
 
     # Create model
-    if model_version in ['7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
