@@ -815,6 +815,35 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                 eff_rank_v = torch.exp(entropy_v).item()
 
                 # ============================================================
+                # Token Similarity Analysis (Q/K/V)
+                # ============================================================
+                # Compute cosine similarity between tokens after projection
+                # High similarity = tokens are not distinguishable (collapse)
+
+                def compute_token_similarity(X):
+                    """Compute avg cosine similarity between tokens"""
+                    # X: [B, S, rank]
+                    X_flat = X.view(B * S, -1)  # [B*S, rank]
+                    X_norm = F.normalize(X_flat, dim=-1)
+
+                    # Sample tokens for efficiency
+                    n_samples = min(200, B * S)
+                    sample_idx = torch.randperm(B * S, device=device)[:n_samples]
+                    X_sampled = X_norm[sample_idx]
+
+                    # Compute pairwise similarity
+                    sim_matrix = X_sampled @ X_sampled.T  # [n_samples, n_samples]
+
+                    # Get off-diagonal mean (exclude self-similarity)
+                    mask_diag = ~torch.eye(n_samples, dtype=torch.bool, device=device)
+                    off_diag_sim = sim_matrix[mask_diag].mean().item()
+                    return off_diag_sim
+
+                token_sim_q = compute_token_similarity(Q)
+                token_sim_k = compute_token_similarity(K)
+                token_sim_v = compute_token_similarity(V)
+
+                # ============================================================
                 # STAGE 2: Attention Mixing (V → Attention(V))
                 # ============================================================
                 d_head = qkv.d_head
@@ -875,12 +904,15 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
                     'var_ratio_q': var_ratio_q,
                     'cond_num_q': cond_num_q,
                     'eff_rank_q': eff_rank_q,
+                    'token_sim_q': token_sim_q,
                     'var_ratio_k': var_ratio_k,
                     'cond_num_k': cond_num_k,
                     'eff_rank_k': eff_rank_k,
+                    'token_sim_k': token_sim_k,
                     'var_ratio_v': var_ratio_v,
                     'cond_num_v': cond_num_v,
                     'eff_rank_v': eff_rank_v,
+                    'token_sim_v': token_sim_v,
                     # Stage 2: Attention
                     'var_ratio_attn': var_ratio_attn,
                     'attn_entropy': attn_entropy,
@@ -905,6 +937,7 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
     print("\n  Metrics explanation:")
     print("    - var_ratio: var(after)/var(before), ~1 = good preservation")
     print("    - cond_num: σ_max/σ_min, lower = better conditioned")
+    print("    - token_sim: cosine similarity between tokens, <0.7 = distinguishable")
     print("    - attn_entropy: higher = more uniform attention")
 
     for layer_idx in range(len(model.layers)):
@@ -915,12 +948,15 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
         avg_var_q = np.mean([d['var_ratio_q'] for d in data])
         avg_cond_q = np.mean([d['cond_num_q'] for d in data])
         avg_eff_q = np.mean([d['eff_rank_q'] for d in data])
+        avg_sim_q = np.mean([d['token_sim_q'] for d in data])
         avg_var_k = np.mean([d['var_ratio_k'] for d in data])
         avg_cond_k = np.mean([d['cond_num_k'] for d in data])
         avg_eff_k = np.mean([d['eff_rank_k'] for d in data])
+        avg_sim_k = np.mean([d['token_sim_k'] for d in data])
         avg_var_v = np.mean([d['var_ratio_v'] for d in data])
         avg_cond_v = np.mean([d['cond_num_v'] for d in data])
         avg_eff_v = np.mean([d['eff_rank_v'] for d in data])
+        avg_sim_v = np.mean([d['token_sim_v'] for d in data])
         # Attention
         avg_var_attn = np.mean([d['var_ratio_attn'] for d in data])
         avg_entropy = np.mean([d['attn_entropy'] for d in data])
@@ -931,29 +967,38 @@ def analyze_o_projection_loss(model, dataloader, device, max_batches=5):
         avg_total = np.mean([d['var_ratio_total'] for d in data])
 
         print(f"\n  Layer {layer_idx}:")
-        print(f"    ┌─────────────────────────────────────────────────────────────────")
+        print(f"    ┌──────────────────────────────────────────────────────────────────────────")
 
         # Stage 1: Q/K/V Projection comparison
         print(f"    │ [Stage 1: Q/K/V Projection]")
 
         status_q = "⚠️ COLLAPSE" if avg_var_q < 0.3 else ("⚠️ EXPLODE" if avg_var_q > 3.0 else "✓")
         cond_q_status = "⚠️" if avg_cond_q > 100 else ""
-        print(f"    │   Q: var={avg_var_q:.3f} {status_q}  cond={avg_cond_q:.1f} {cond_q_status}  eff_rank={avg_eff_q:.1f}")
+        sim_q_status = "⚠️" if avg_sim_q > 0.9 else ""
+        print(f"    │   Q: var={avg_var_q:.3f} {status_q}  cond={avg_cond_q:.1f} {cond_q_status}  eff_rank={avg_eff_q:.1f}  token_sim={avg_sim_q:.3f} {sim_q_status}")
 
         status_k = "⚠️ COLLAPSE" if avg_var_k < 0.3 else ("⚠️ EXPLODE" if avg_var_k > 3.0 else "✓")
         cond_k_status = "⚠️" if avg_cond_k > 100 else ""
-        print(f"    │   K: var={avg_var_k:.3f} {status_k}  cond={avg_cond_k:.1f} {cond_k_status}  eff_rank={avg_eff_k:.1f}")
+        sim_k_status = "⚠️" if avg_sim_k > 0.9 else ""
+        print(f"    │   K: var={avg_var_k:.3f} {status_k}  cond={avg_cond_k:.1f} {cond_k_status}  eff_rank={avg_eff_k:.1f}  token_sim={avg_sim_k:.3f} {sim_k_status}")
 
         status_v = "⚠️ COLLAPSE" if avg_var_v < 0.3 else ("⚠️ EXPLODE" if avg_var_v > 3.0 else "✓")
         cond_v_status = "⚠️" if avg_cond_v > 100 else ""
-        print(f"    │   V: var={avg_var_v:.3f} {status_v}  cond={avg_cond_v:.1f} {cond_v_status}  eff_rank={avg_eff_v:.1f}")
+        sim_v_status = "⚠️" if avg_sim_v > 0.9 else ""
+        print(f"    │   V: var={avg_var_v:.3f} {status_v}  cond={avg_cond_v:.1f} {cond_v_status}  eff_rank={avg_eff_v:.1f}  token_sim={avg_sim_v:.3f} {sim_v_status}")
 
         # Q/K/V comparison summary
         qkv_vars = [('Q', avg_var_q), ('K', avg_var_k), ('V', avg_var_v)]
         min_proj = min(qkv_vars, key=lambda x: x[1])
         max_proj = max(qkv_vars, key=lambda x: x[1])
         if max_proj[1] / (min_proj[1] + 1e-10) > 2.0:
-            print(f"    │   ⚠️  Imbalance: {max_proj[0]} >> {min_proj[0]} (ratio={max_proj[1]/min_proj[1]:.2f}x)")
+            print(f"    │   ⚠️  Var imbalance: {max_proj[0]} >> {min_proj[0]} (ratio={max_proj[1]/min_proj[1]:.2f}x)")
+
+        # Token similarity warning
+        max_sim = max(avg_sim_q, avg_sim_k, avg_sim_v)
+        if max_sim > 0.9:
+            worst = 'Q' if avg_sim_q == max_sim else ('K' if avg_sim_k == max_sim else 'V')
+            print(f"    │   ⚠️  High token similarity in {worst} ({max_sim:.3f}) - tokens not distinguishable!")
 
         print(f"    ├─────────────────────────────────────────────────────────────────")
 
