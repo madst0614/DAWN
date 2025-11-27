@@ -262,7 +262,18 @@ class HouseholderAnalyzer:
 def analyze_process_neuron_pool(model):
     """전체 process neuron pool 분석"""
     shared = model.shared_neurons
-    process_neurons = shared.process_neurons.detach()  # [n_process, rank]
+
+    # v8.1 QK/VO 분리 지원
+    if hasattr(shared, 'process_neurons_qk'):
+        # v8.1: QK/VO 분리
+        process_qk = shared.process_neurons_qk.detach()
+        process_vo = shared.process_neurons_vo.detach()
+        process_neurons = torch.cat([process_qk, process_vo], dim=0)
+        is_split = True
+    else:
+        # v8.0: 단일 pool
+        process_neurons = shared.process_neurons.detach()
+        is_split = False
 
     # 정규화
     process_normalized = F.normalize(process_neurons, dim=-1)
@@ -278,7 +289,7 @@ def analyze_process_neuron_pool(model):
     # Norm 분포
     norms = process_neurons.norm(dim=-1)
 
-    return {
+    result = {
         'pool_sim_mean': off_diag.mean().item(),
         'pool_sim_std': off_diag.std().item(),
         'pool_sim_max': off_diag.max().item(),
@@ -287,8 +298,11 @@ def analyze_process_neuron_pool(model):
         'pool_norm_std': norms.std().item(),
         'pool_norm_min': norms.min().item(),
         'pool_norm_max': norms.max().item(),
+        'is_qk_vo_split': is_split,
         'sim_matrix': sim_matrix.cpu().numpy(),
     }
+
+    return result
 
 
 def plot_results(summary, pool_stats, output_dir):
