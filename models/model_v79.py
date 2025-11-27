@@ -409,6 +409,8 @@ class NeuronCircuitQKV(nn.Module):
         routing_info = {
             'routing_down': routing_down,
             'routing_up': routing_up,
+            # For compatibility with train.py load balance loss
+            'neuron_indices': process_indices_down,  # [B, S, k]
         }
 
         return attn_out, routing_info
