@@ -1,7 +1,8 @@
 """
 DAWN Models Module
 
-v8.0: SharedNeurons + NeuronMemory (FFN 대체) - NEW
+v8.1: v8.0 + Expanded KnowledgeNeurons (n_knowledge=128, knowledge_k=16)
+v8.0: SharedNeurons + NeuronMemory (FFN 대체)
 v7.9: NeuronCircuit with Householder Transformations
 v7.8: Independent Neuron Projections (No Basis Mixing)
 v7.7: QK/VO Basis Separation with Symmetric O Projection
@@ -77,7 +78,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "8.0", "7.9", "7.8", "7.7", "7.6", "7.5", "7.4", "7.2", "7.1", "7.0", "6.0", or "baseline"
+        version: "8.1", "8.0", "7.9", "7.8", "7.7", "7.6", "7.5", "7.4", "7.2", "7.1", "7.0", "6.0", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -85,7 +86,7 @@ def create_model_by_version(version, config):
     """
     version = str(version)
 
-    if version in ["8.0", "8", "80"]:
+    if version in ["8.1", "81", "8.0", "8", "80"]:
         from .model_v8 import DAWN as DAWN_v8
         return DAWN_v8(**config)
     elif version in ["7.9", "79"]:
@@ -125,4 +126,4 @@ def create_model_by_version(version, config):
         return VanillaTransformer(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 8.0, 7.9, 7.8, 7.7, 7.6, 7.5, 7.4, 7.2, 7.1, 7.0, 6.0, baseline")
+                        f"Supported versions: 8.1, 8.0, 7.9, 7.8, 7.7, 7.6, 7.5, 7.4, 7.2, 7.1, 7.0, 6.0, baseline")
