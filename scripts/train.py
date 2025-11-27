@@ -549,7 +549,7 @@ def is_v75_or_v76_model(model):
     base_model = get_underlying_model(model)
 
     # Check model version attribute
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7", "7.8", "7.9"]:
         return True
 
     # Check for qkv_dynamic attribute on layers (v7.5/v7.6/v7.7 specific structure)
@@ -1675,10 +1675,10 @@ def main():
                    f"{val_loss:.6f},{val_acc:.6f},"
                    f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}\n")
 
-        # Analyze activations periodically (skip for v7.5 - uses different architecture)
+        # Analyze activations periodically (skip for v7.5+ - uses different architecture)
         if epoch % 10 == 0:
             model_version = getattr(model, '__version__', None)
-            if model_version != "7.5":
+            if model_version not in ["7.5", "7.8", "7.9"]:
                 sample_batch = next(iter(val_loader))
                 sample_ids = sample_batch['input_ids'][:1].to(device)
                 act_stats = analyze_activations(model, sample_ids, device)
@@ -1687,8 +1687,8 @@ def main():
                     print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
                           f"({stats['usage_ratio']:.2%} usage)")
             else:
-                # v7.5 uses dynamic Q/K/V/O - activation analysis not applicable
-                print(f"\n  (Neuron usage analysis skipped for v7.5 - use analyze_dawn_v75.py instead)")
+                # v7.5/v7.8/v7.9 uses dynamic Q/K/V/O - activation analysis not applicable
+                print(f"\n  (Neuron usage analysis skipped for {model_version} - use analyze_dawn_v75.py instead)")
 
         # Debug: Log epoch summary for specific epochs
         if debug_logger and debug_logger.should_log_epoch(epoch):
