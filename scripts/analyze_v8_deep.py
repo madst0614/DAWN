@@ -1,5 +1,5 @@
 """
-DAWN v8.0 Deep Analysis Script
+DAWN v8.x Deep Analysis Script
 심층 분석: 뉴런 흐름, SharedNeurons 효과, Attention-Memory 상호작용
 
 분석 항목:
@@ -25,7 +25,7 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.model_v8 import DAWN
+from models import create_model_by_version
 
 # Optional imports
 try:
@@ -327,11 +327,17 @@ class DeepAnalyzerV8:
         self.model.eval()
         shared = self.model.shared_neurons
 
-        # Get process neurons
-        process_neurons = shared.process_neurons.data  # [n_process, rank]
+        # Get process neurons (v8.x version aware)
+        # For Q compressor analysis, use QK pool if available
+        if hasattr(shared, 'process_neurons_qk'):
+            process_neurons = shared.process_neurons_qk.data  # v8.1+
+            pool_version = 'QK (v8.1+)'
+        else:
+            process_neurons = shared.process_neurons.data  # v8.0
+            pool_version = 'single (v8.0)'
 
         # Analyze process neuron properties
-        print("\n📌 Process Neurons (Householder Vectors):")
+        print(f"\n📌 Process Neurons (Householder Vectors) - {pool_version}:")
 
         # Norms (should be ~1)
         norms = process_neurons.norm(dim=-1)
@@ -340,14 +346,16 @@ class DeepAnalyzerV8:
         # Cosine similarity
         v_norm = F.normalize(process_neurons, dim=-1)
         cos_sim = v_norm @ v_norm.T
-        mask = ~torch.eye(self.n_process, dtype=torch.bool, device=cos_sim.device)
+        n_neurons = process_neurons.shape[0]
+        mask = ~torch.eye(n_neurons, dtype=torch.bool, device=cos_sim.device)
         off_diag = cos_sim[mask]
         print(f"  Cosine similarity: mean={off_diag.abs().mean().item():.4f}, max={off_diag.abs().max().item():.4f}")
 
         # Track combination effects
         combination_counts = Counter()
         combination_effects = defaultdict(list)  # {combo: [(before_norm, after_norm, cos_sim), ...]}
-        neuron_effects = {n: {'cos_sim': [], 'norm_change': []} for n in range(self.n_process)}
+        n_process_neurons = process_neurons.shape[0]
+        neuron_effects = {n: {'cos_sim': [], 'norm_change': []} for n in range(n_process_neurons)}
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Householder Analysis", total=max_batches)):
             if batch_idx >= max_batches:
@@ -468,15 +476,21 @@ class DeepAnalyzerV8:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        # 1. Process neuron vectors heatmap
+        # 1. Process neuron vectors heatmap (v8.x version aware)
         print("    Creating process neuron heatmap...")
-        process_neurons = self.model.shared_neurons.process_neurons.data.cpu().numpy()
+        shared = self.model.shared_neurons
+        if hasattr(shared, 'process_neurons_qk'):
+            process_neurons = shared.process_neurons_qk.data.cpu().numpy()
+            title_suffix = ' (QK pool)'
+        else:
+            process_neurons = shared.process_neurons.data.cpu().numpy()
+            title_suffix = ''
 
         fig, ax = plt.subplots(figsize=(14, 8))
         im = ax.imshow(process_neurons, aspect='auto', cmap='RdBu', vmin=-0.3, vmax=0.3)
         ax.set_xlabel('Rank Dimension')
         ax.set_ylabel('Process Neuron')
-        ax.set_title('SharedNeurons Process Vectors (Householder)')
+        ax.set_title(f'SharedNeurons Process Vectors (Householder){title_suffix}')
         plt.colorbar(im, ax=ax)
 
         plt.tight_layout()
@@ -509,9 +523,14 @@ class DeepAnalyzerV8:
             plt.close()
         print(f"    Saved: process_combinations.png")
 
-        # 3. Neuron cosine similarity matrix
+        # 3. Neuron cosine similarity matrix (v8.x version aware)
         print("    Creating neuron similarity matrix...")
-        process_neurons_tensor = self.model.shared_neurons.process_neurons.data
+        if hasattr(shared, 'process_neurons_qk'):
+            process_neurons_tensor = shared.process_neurons_qk.data
+            sim_title = 'Process Neuron Cosine Similarity (QK pool)'
+        else:
+            process_neurons_tensor = shared.process_neurons.data
+            sim_title = 'Process Neuron Cosine Similarity'
         v_norm = F.normalize(process_neurons_tensor, dim=-1)
         cos_sim = (v_norm @ v_norm.T).cpu().numpy()
 
@@ -519,7 +538,7 @@ class DeepAnalyzerV8:
         im = ax.imshow(cos_sim, cmap='RdBu', vmin=-1, vmax=1)
         ax.set_xlabel('Process Neuron')
         ax.set_ylabel('Process Neuron')
-        ax.set_title('Process Neuron Cosine Similarity')
+        ax.set_title(sim_title)
         plt.colorbar(im, ax=ax)
 
         plt.tight_layout()
@@ -734,7 +753,7 @@ class DeepAnalyzerV8:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='DAWN v8.0 Deep Analysis')
+    parser = argparse.ArgumentParser(description='DAWN v8.x Deep Analysis')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to checkpoint file')
     parser.add_argument('--val_data', type=str,
@@ -771,26 +790,51 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
+    model_version = config.get('model_version', '8.0')
+    print(f"Checkpoint model version: {model_version}")
 
-    model = DAWN(
-        vocab_size=config.get('vocab_size', 30522),
-        d_model=config.get('d_model', 256),
-        n_layers=config.get('n_layers', 4),
-        n_heads=config.get('n_heads', 4),
-        rank=config.get('rank', config.get('basis_rank', 64)),
-        max_seq_len=config.get('max_seq_len', 128),
-        n_input=config.get('n_input', 8),
-        n_process=config.get('n_process', 32),
-        n_output=config.get('n_output', 8),
-        process_k=config.get('process_k', 3),
-        n_knowledge=config.get('n_knowledge', 64),
-        knowledge_k=config.get('knowledge_k', 8),
-        dropout=config.get('dropout', 0.1),
-    )
+    model_kwargs = {
+        'vocab_size': config.get('vocab_size', 30522),
+        'd_model': config.get('d_model', 256),
+        'n_layers': config.get('n_layers', 4),
+        'n_heads': config.get('n_heads', 4),
+        'rank': config.get('rank', config.get('basis_rank', 64)),
+        'max_seq_len': config.get('max_seq_len', 128),
+        'n_input': config.get('n_input', 8),
+        'n_process': config.get('n_process', 32),
+        'n_output': config.get('n_output', 8),
+        'process_k': config.get('process_k', 3),
+        'n_knowledge': config.get('n_knowledge', 64),
+        'knowledge_k': config.get('knowledge_k', 8),
+        'dropout': config.get('dropout', 0.1),
+    }
+    model = create_model_by_version(model_version, model_kwargs)
 
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        print("  Removing torch.compile wrapper prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    # Handle checkpoint conversion for version compatibility
+    if any('process_neurons_vo' in k for k in state_dict.keys()):
+        print("  Converting v8.1 checkpoint (process_neurons_vo → v + o + m)...")
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if 'process_neurons_vo' in k:
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_v')] = v.clone()
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_o')] = v.clone()
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_m')] = v.clone()
+            else:
+                new_state_dict[k] = v
+        state_dict = new_state_dict
+    elif any('process_neurons_o' in k for k in state_dict.keys()) and not any('process_neurons_m' in k for k in state_dict.keys()):
+        print("  Converting v8.2 checkpoint (adding process_neurons_m)...")
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_state_dict[k] = v
+            if 'process_neurons_o' in k:
+                new_state_dict[k.replace('process_neurons_o', 'process_neurons_m')] = v.clone()
+        state_dict = new_state_dict
 
     model.load_state_dict(state_dict, strict=False)
     model = model.to(device)

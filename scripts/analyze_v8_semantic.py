@@ -1,5 +1,5 @@
 """
-DAWN v8.0 Semantic Analysis Script
+DAWN v8.x Semantic Analysis Script
 뉴런이 무엇을 배웠는지 분석
 
 핵심 질문:
@@ -35,7 +35,7 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.model_v8 import DAWN
+from models import create_model_by_version
 
 # Optional imports
 try:
@@ -667,7 +667,7 @@ class SemanticAnalyzerV8:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='DAWN v8.0 Semantic Analysis')
+    parser = argparse.ArgumentParser(description='DAWN v8.x Semantic Analysis')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to checkpoint file')
     parser.add_argument('--val_data', type=str,
@@ -704,26 +704,51 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
+    model_version = config.get('model_version', '8.0')
+    print(f"Checkpoint model version: {model_version}")
 
-    model = DAWN(
-        vocab_size=config.get('vocab_size', 30522),
-        d_model=config.get('d_model', 256),
-        n_layers=config.get('n_layers', 4),
-        n_heads=config.get('n_heads', 4),
-        rank=config.get('rank', config.get('basis_rank', 64)),
-        max_seq_len=config.get('max_seq_len', 128),
-        n_input=config.get('n_input', 8),
-        n_process=config.get('n_process', 32),
-        n_output=config.get('n_output', 8),
-        process_k=config.get('process_k', 3),
-        n_knowledge=config.get('n_knowledge', 64),
-        knowledge_k=config.get('knowledge_k', 8),
-        dropout=config.get('dropout', 0.1),
-    )
+    model_kwargs = {
+        'vocab_size': config.get('vocab_size', 30522),
+        'd_model': config.get('d_model', 256),
+        'n_layers': config.get('n_layers', 4),
+        'n_heads': config.get('n_heads', 4),
+        'rank': config.get('rank', config.get('basis_rank', 64)),
+        'max_seq_len': config.get('max_seq_len', 128),
+        'n_input': config.get('n_input', 8),
+        'n_process': config.get('n_process', 32),
+        'n_output': config.get('n_output', 8),
+        'process_k': config.get('process_k', 3),
+        'n_knowledge': config.get('n_knowledge', 64),
+        'knowledge_k': config.get('knowledge_k', 8),
+        'dropout': config.get('dropout', 0.1),
+    }
+    model = create_model_by_version(model_version, model_kwargs)
 
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        print("  Removing torch.compile wrapper prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    # Handle checkpoint conversion for version compatibility
+    if any('process_neurons_vo' in k for k in state_dict.keys()):
+        print("  Converting v8.1 checkpoint (process_neurons_vo → v + o + m)...")
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if 'process_neurons_vo' in k:
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_v')] = v.clone()
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_o')] = v.clone()
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_m')] = v.clone()
+            else:
+                new_state_dict[k] = v
+        state_dict = new_state_dict
+    elif any('process_neurons_o' in k for k in state_dict.keys()) and not any('process_neurons_m' in k for k in state_dict.keys()):
+        print("  Converting v8.2 checkpoint (adding process_neurons_m)...")
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_state_dict[k] = v
+            if 'process_neurons_o' in k:
+                new_state_dict[k.replace('process_neurons_o', 'process_neurons_m')] = v.clone()
+        state_dict = new_state_dict
 
     model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
