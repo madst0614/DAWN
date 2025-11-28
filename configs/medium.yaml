@@ -10,7 +10,7 @@ model:
   rank: 64
   max_seq_len: 256
   n_input: 8
-  n_process: 32
+  n_process: 128
   n_output: 8
   process_k: 4
   n_knowledge: 128
