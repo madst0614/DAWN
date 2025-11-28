@@ -9,9 +9,9 @@ model:
   n_heads: 4
   rank: 64
   max_seq_len: 256
-  n_input: 8
-  n_process: 128
-  n_output: 8
+  n_input: 32
+  n_process: 32
+  n_output: 32
   process_k: 4
   n_knowledge: 128
   knowledge_k: 12

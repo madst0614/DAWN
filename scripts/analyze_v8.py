@@ -79,49 +79,74 @@ def analyze_shared_neurons(model):
     shared = model.shared_neurons
     results = {}
 
-    # ========== Input Neurons ==========
+    # ========== Input Neurons (타입별 분리: QK, V, M) ==========
     print("\n📌 Input Neurons: [n_input, d_model, rank]")
-    input_neurons = shared.input_neurons.data  # [n_input, d_model, rank]
-    n_input, d_model, rank = input_neurons.shape
 
-    input_results = {'shape': [n_input, d_model, rank], 'neurons': {}}
+    # v8.3+: 타입별 분리된 input neurons 분석
+    input_neuron_types = {}
+    if hasattr(shared, 'input_neurons_qk'):
+        input_neuron_types['QK'] = shared.input_neurons_qk.data
+    if hasattr(shared, 'input_neurons_v'):
+        input_neuron_types['V'] = shared.input_neurons_v.data
+    if hasattr(shared, 'input_neurons_m'):
+        input_neuron_types['M'] = shared.input_neurons_m.data
 
-    # Condition numbers and orthogonality
-    input_conds = []
-    input_orth_errors = []
-    for i in range(n_input):
-        W = input_neurons[i]  # [d_model, rank]
-        _, s, _ = torch.linalg.svd(W, full_matrices=False)
-        cond = (s[0] / (s[-1] + 1e-10)).item()
-        input_conds.append(cond)
+    # Fallback for legacy models
+    if not input_neuron_types:
+        input_neuron_types['all'] = shared.input_neurons.data
 
-        # W.T @ W should be identity (rank × rank)
-        WtW = W.T @ W
-        I = torch.eye(rank, device=W.device)
-        orth_error = (WtW - I).abs().max().item()
-        input_orth_errors.append(orth_error)
+    input_results = {'types': {}}
 
-        input_results['neurons'][i] = {
-            'condition': cond,
-            'orthogonality_error': orth_error,
-            'singular_range': [s[-1].item(), s[0].item()]
-        }
+    for neuron_type, input_neurons in input_neuron_types.items():
+        n_input, d_model, rank = input_neurons.shape
+        type_results = {'shape': [n_input, d_model, rank], 'neurons': {}}
 
-        print(f"  Neuron {i}: cond={cond:.2f}, orth_err={orth_error:.2e}, σ=[{s[-1].item():.4f}, {s[0].item():.4f}]")
+        print(f"\n  📌 Input Neurons ({neuron_type}): [{n_input}, {d_model}, {rank}]")
 
-    input_results['avg_condition'] = np.mean(input_conds)
-    input_results['avg_orth_error'] = np.mean(input_orth_errors)
+        # Condition numbers and orthogonality
+        input_conds = []
+        input_orth_errors = []
+        for i in range(n_input):
+            W = input_neurons[i]  # [d_model, rank]
+            _, s, _ = torch.linalg.svd(W, full_matrices=False)
+            cond = (s[0] / (s[-1] + 1e-10)).item()
+            input_conds.append(cond)
 
-    # Input neuron overlap (how similar are different input neurons)
-    print(f"\n  Input neuron overlap (W_i.T @ W_j Frobenius norm):")
-    input_T = input_neurons.transpose(1, 2)  # [n_input, rank, d_model]
-    products = torch.einsum('iad,jdb->ijab', input_T, input_neurons)  # [n_input, n_input, rank, rank]
-    overlap_matrix = products.norm(dim=(-2, -1))  # [n_input, n_input]
-    mask = ~torch.eye(n_input, dtype=torch.bool, device=overlap_matrix.device)
-    off_diag = overlap_matrix[mask]
-    print(f"    Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
-    input_results['overlap_mean'] = off_diag.mean().item()
-    input_results['overlap_max'] = off_diag.max().item()
+            # W.T @ W should be identity (rank × rank)
+            WtW = W.T @ W
+            I = torch.eye(rank, device=W.device)
+            orth_error = (WtW - I).abs().max().item()
+            input_orth_errors.append(orth_error)
+
+            type_results['neurons'][i] = {
+                'condition': cond,
+                'orthogonality_error': orth_error,
+                'singular_range': [s[-1].item(), s[0].item()]
+            }
+
+            print(f"    Neuron {i}: cond={cond:.2f}, orth_err={orth_error:.2e}, σ=[{s[-1].item():.4f}, {s[0].item():.4f}]")
+
+        type_results['avg_condition'] = np.mean(input_conds)
+        type_results['avg_orth_error'] = np.mean(input_orth_errors)
+
+        # Input neuron overlap (how similar are different input neurons)
+        print(f"    {neuron_type} overlap (W_i.T @ W_j Frobenius norm):")
+        input_T = input_neurons.transpose(1, 2)  # [n_input, rank, d_model]
+        products = torch.einsum('iad,jdb->ijab', input_T, input_neurons)  # [n_input, n_input, rank, rank]
+        overlap_matrix = products.norm(dim=(-2, -1))  # [n_input, n_input]
+        mask = ~torch.eye(n_input, dtype=torch.bool, device=overlap_matrix.device)
+        off_diag = overlap_matrix[mask]
+        print(f"      Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
+        type_results['overlap_mean'] = off_diag.mean().item()
+        type_results['overlap_max'] = off_diag.max().item()
+
+        input_results['types'][neuron_type] = type_results
+
+    # Aggregate stats
+    all_conds = [input_results['types'][t]['avg_condition'] for t in input_results['types']]
+    all_orth_errs = [input_results['types'][t]['avg_orth_error'] for t in input_results['types']]
+    input_results['avg_condition'] = np.mean(all_conds)
+    input_results['avg_orth_error'] = np.mean(all_orth_errs)
 
     results['input'] = input_results
 
@@ -213,46 +238,66 @@ def analyze_shared_neurons(model):
     print(f"  Version: {process_results['version']}")
     results['process'] = process_results
 
-    # ========== Output Neurons ==========
+    # ========== Output Neurons (타입별 분리: O) ==========
     print("\n📌 Output Neurons: [n_output, rank, d_model]")
-    output_neurons = shared.output_neurons.data  # [n_output, rank, d_model]
-    n_output = output_neurons.shape[0]
 
-    output_results = {'shape': [n_output, rank, d_model], 'neurons': {}}
+    # v8.3+: 타입별 분리된 output neurons 분석
+    output_neuron_types = {}
+    if hasattr(shared, 'output_neurons_o'):
+        output_neuron_types['O'] = shared.output_neurons_o.data
+    # Fallback for legacy models
+    if not output_neuron_types:
+        output_neuron_types['all'] = shared.output_neurons.data
 
-    output_conds = []
-    output_orth_errors = []
-    for i in range(n_output):
-        W = output_neurons[i]  # [rank, d_model]
-        _, s, _ = torch.linalg.svd(W, full_matrices=False)
-        cond = (s[0] / (s[-1] + 1e-10)).item()
-        output_conds.append(cond)
+    output_results = {'types': {}}
 
-        # W @ W.T should be identity (rank × rank)
-        WWt = W @ W.T
-        I = torch.eye(rank, device=W.device)
-        orth_error = (WWt - I).abs().max().item()
-        output_orth_errors.append(orth_error)
+    for neuron_type, output_neurons in output_neuron_types.items():
+        n_output, rank_out, d_model_out = output_neurons.shape
+        type_results = {'shape': [n_output, rank_out, d_model_out], 'neurons': {}}
 
-        output_results['neurons'][i] = {
-            'condition': cond,
-            'orthogonality_error': orth_error
-        }
+        print(f"\n  📌 Output Neurons ({neuron_type}): [{n_output}, {rank_out}, {d_model_out}]")
 
-        print(f"  Neuron {i}: cond={cond:.2f}, orth_err={orth_error:.2e}")
+        output_conds = []
+        output_orth_errors = []
+        for i in range(n_output):
+            W = output_neurons[i]  # [rank, d_model]
+            _, s, _ = torch.linalg.svd(W, full_matrices=False)
+            cond = (s[0] / (s[-1] + 1e-10)).item()
+            output_conds.append(cond)
 
-    output_results['avg_condition'] = np.mean(output_conds)
-    output_results['avg_orth_error'] = np.mean(output_orth_errors)
+            # W @ W.T should be identity (rank × rank)
+            WWt = W @ W.T
+            I = torch.eye(rank, device=W.device)
+            orth_error = (WWt - I).abs().max().item()
+            output_orth_errors.append(orth_error)
 
-    # Output neuron overlap
-    print(f"\n  Output neuron overlap:")
-    products = torch.einsum('iad,jbd->ijab', output_neurons, output_neurons)
-    overlap_matrix = products.norm(dim=(-2, -1))
-    mask = ~torch.eye(n_output, dtype=torch.bool, device=overlap_matrix.device)
-    off_diag = overlap_matrix[mask]
-    print(f"    Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
-    output_results['overlap_mean'] = off_diag.mean().item()
-    output_results['overlap_max'] = off_diag.max().item()
+            type_results['neurons'][i] = {
+                'condition': cond,
+                'orthogonality_error': orth_error
+            }
+
+            print(f"    Neuron {i}: cond={cond:.2f}, orth_err={orth_error:.2e}")
+
+        type_results['avg_condition'] = np.mean(output_conds)
+        type_results['avg_orth_error'] = np.mean(output_orth_errors)
+
+        # Output neuron overlap
+        print(f"    {neuron_type} overlap:")
+        products = torch.einsum('iad,jbd->ijab', output_neurons, output_neurons)
+        overlap_matrix = products.norm(dim=(-2, -1))
+        mask = ~torch.eye(n_output, dtype=torch.bool, device=overlap_matrix.device)
+        off_diag = overlap_matrix[mask]
+        print(f"      Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
+        type_results['overlap_mean'] = off_diag.mean().item()
+        type_results['overlap_max'] = off_diag.max().item()
+
+        output_results['types'][neuron_type] = type_results
+
+    # Aggregate stats
+    all_conds = [output_results['types'][t]['avg_condition'] for t in output_results['types']]
+    all_orth_errs = [output_results['types'][t]['avg_orth_error'] for t in output_results['types']]
+    output_results['avg_condition'] = np.mean(all_conds)
+    output_results['avg_orth_error'] = np.mean(all_orth_errs)
 
     results['output'] = output_results
 
@@ -972,14 +1017,30 @@ def create_visualizations(all_results, output_dir):
 
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
-        # Input neurons condition
+        # Input neurons condition (타입별 분리)
         if 'input' in shared:
-            n_input = len(shared['input']['neurons'])
-            input_conds = [shared['input']['neurons'][i]['condition'] for i in range(n_input)]
-            axes[0, 0].bar(range(len(input_conds)), input_conds, color='steelblue')
-            axes[0, 0].set_xlabel('Input Neuron')
-            axes[0, 0].set_ylabel('Condition Number')
-            axes[0, 0].set_title('Input Neurons Condition Numbers')
+            input_data = shared['input']
+            if 'types' in input_data:
+                # v8.3+: 타입별 분리 구조
+                all_conds = []
+                labels = []
+                for neuron_type, type_data in input_data['types'].items():
+                    n_neurons = len(type_data['neurons'])
+                    for i in range(n_neurons):
+                        all_conds.append(type_data['neurons'][str(i)]['condition'])
+                        labels.append(f'{neuron_type}_{i}')
+                axes[0, 0].bar(range(len(all_conds)), all_conds, color='steelblue')
+                axes[0, 0].set_xlabel('Input Neuron (Type_Index)')
+                axes[0, 0].set_ylabel('Condition Number')
+                axes[0, 0].set_title(f'Input Neurons Condition ({list(input_data["types"].keys())})')
+            elif 'neurons' in input_data:
+                # Legacy 구조
+                n_input = len(input_data['neurons'])
+                input_conds = [input_data['neurons'][i]['condition'] for i in range(n_input)]
+                axes[0, 0].bar(range(len(input_conds)), input_conds, color='steelblue')
+                axes[0, 0].set_xlabel('Input Neuron')
+                axes[0, 0].set_ylabel('Condition Number')
+                axes[0, 0].set_title('Input Neurons Condition Numbers')
 
         # Process neurons norms
         if 'process' in shared:
@@ -1003,14 +1064,30 @@ def create_visualizations(all_results, output_dir):
                 axes[0, 1].set_title('Process Neurons Norms (should be ~1)')
                 axes[0, 1].axhline(y=1.0, color='g', linestyle='--', alpha=0.5)
 
-        # Output neurons condition
+        # Output neurons condition (타입별 분리)
         if 'output' in shared:
-            n_output = len(shared['output']['neurons'])
-            output_conds = [shared['output']['neurons'][i]['condition'] for i in range(n_output)]
-            axes[1, 0].bar(range(len(output_conds)), output_conds, color='seagreen')
-            axes[1, 0].set_xlabel('Output Neuron')
-            axes[1, 0].set_ylabel('Condition Number')
-            axes[1, 0].set_title('Output Neurons Condition Numbers')
+            output_data = shared['output']
+            if 'types' in output_data:
+                # v8.3+: 타입별 분리 구조
+                all_conds = []
+                labels = []
+                for neuron_type, type_data in output_data['types'].items():
+                    n_neurons = len(type_data['neurons'])
+                    for i in range(n_neurons):
+                        all_conds.append(type_data['neurons'][str(i)]['condition'])
+                        labels.append(f'{neuron_type}_{i}')
+                axes[1, 0].bar(range(len(all_conds)), all_conds, color='seagreen')
+                axes[1, 0].set_xlabel('Output Neuron (Type_Index)')
+                axes[1, 0].set_ylabel('Condition Number')
+                axes[1, 0].set_title(f'Output Neurons Condition ({list(output_data["types"].keys())})')
+            elif 'neurons' in output_data:
+                # Legacy 구조
+                n_output = len(output_data['neurons'])
+                output_conds = [output_data['neurons'][i]['condition'] for i in range(n_output)]
+                axes[1, 0].bar(range(len(output_conds)), output_conds, color='seagreen')
+                axes[1, 0].set_xlabel('Output Neuron')
+                axes[1, 0].set_ylabel('Condition Number')
+                axes[1, 0].set_title('Output Neurons Condition Numbers')
 
         # Knowledge statistics
         if 'knowledge' in shared:

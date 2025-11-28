@@ -10,12 +10,14 @@ DAWN v8 - Dynamic Architecture With Neurons
 구조:
     SharedNeurons (공유 뉴런 풀 - 레이어 간 공유)
     ├── TransformNeurons (변환용)
-    │     ├── input_neurons:      [n_input, d_model, rank]
+    │     ├── input_neurons_qk:   [n_input, d_model, rank] — Q, K 압축용
+    │     ├── input_neurons_v:    [n_input, d_model, rank] — V 압축용
+    │     ├── input_neurons_m:    [n_input, d_model, rank] — Memory Query 압축용
     │     ├── process_neurons_qk: [n_process, rank] — Q, K용
     │     ├── process_neurons_v:  [n_process, rank] — V용
     │     ├── process_neurons_o:  [n_process, rank] — O용
     │     ├── process_neurons_m:  [n_process, rank] — Memory Query용
-    │     └── output_neurons:     [n_output, rank, d_model]
+    │     └── output_neurons_o:   [n_output, rank, d_model] — O 확장용
     │
     └── KnowledgeNeurons (지식용)
           ├── knowledge_K: [n_knowledge, rank]
@@ -44,12 +46,14 @@ class SharedNeurons(nn.Module):
     공유 뉴런 풀 - 모든 레이어에서 참조
 
     TransformNeurons:
-        - input_neurons: 차원 압축용 [n_input, d_model, rank]
+        - input_neurons_qk: Q, K 압축용 [n_input, d_model, rank]
+        - input_neurons_v: V 압축용 [n_input, d_model, rank]
+        - input_neurons_m: Memory Query 압축용 [n_input, d_model, rank]
         - process_neurons_qk: Q, K용 Householder 변환 [n_process, rank]
         - process_neurons_v: V용 Householder 변환 [n_process, rank]
         - process_neurons_o: O용 Householder 변환 [n_process, rank]
         - process_neurons_m: Memory Query용 Householder 변환 [n_process, rank]
-        - output_neurons: 차원 복원용 [n_output, rank, d_model]
+        - output_neurons_o: O 확장용 [n_output, rank, d_model]
 
     KnowledgeNeurons:
         - knowledge_K: 지식 검색 키 [n_knowledge, rank]
@@ -72,14 +76,23 @@ class SharedNeurons(nn.Module):
         self.n_output = n_output
         self.n_knowledge = n_knowledge
 
-        # TransformNeurons
-        self.input_neurons = nn.Parameter(torch.zeros(n_input, d_model, rank))
-        # Process neurons 분리: QK용 / V용 / O용 / M(Memory Query)용
+        # TransformNeurons - Input (타입별 분리)
+        self.input_neurons_qk = nn.Parameter(torch.zeros(n_input, d_model, rank))
+        self.input_neurons_v = nn.Parameter(torch.zeros(n_input, d_model, rank))
+        self.input_neurons_m = nn.Parameter(torch.zeros(n_input, d_model, rank))
+
+        # TransformNeurons - Process (타입별 분리)
         self.process_neurons_qk = nn.Parameter(torch.zeros(n_process, rank))
         self.process_neurons_v = nn.Parameter(torch.zeros(n_process, rank))
         self.process_neurons_o = nn.Parameter(torch.zeros(n_process, rank))
         self.process_neurons_m = nn.Parameter(torch.zeros(n_process, rank))
-        self.output_neurons = nn.Parameter(torch.zeros(n_output, rank, d_model))
+
+        # TransformNeurons - Output (타입별 분리)
+        self.output_neurons_o = nn.Parameter(torch.zeros(n_output, rank, d_model))
+
+        # Legacy compatibility: keep references for old code
+        self.input_neurons = self.input_neurons_qk  # backward compat
+        self.output_neurons = self.output_neurons_o  # backward compat
 
         # KnowledgeNeurons
         self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, rank))
@@ -89,43 +102,61 @@ class SharedNeurons(nn.Module):
 
     def _init_weights(self):
         """뉴런 초기화"""
-        # input_neurons: 직교 초기화 (QR)
+        # input_neurons_qk: 직교 초기화 (QR)
         for i in range(self.n_input):
             if self.d_model >= self.rank:
                 q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
-                self.input_neurons.data[i] = q
+                self.input_neurons_qk.data[i] = q
             else:
                 q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
-                self.input_neurons.data[i] = q.T
+                self.input_neurons_qk.data[i] = q.T
+
+        # input_neurons_v: 직교 초기화
+        for i in range(self.n_input):
+            if self.d_model >= self.rank:
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.input_neurons_v.data[i] = q
+            else:
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.input_neurons_v.data[i] = q.T
+
+        # input_neurons_m: 직교 초기화
+        for i in range(self.n_input):
+            if self.d_model >= self.rank:
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.input_neurons_m.data[i] = q
+            else:
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.input_neurons_m.data[i] = q.T
 
         # process_neurons_qk: 단위 벡터 초기화
         for i in range(self.n_process):
             v = torch.randn(self.rank)
             self.process_neurons_qk.data[i] = v / (v.norm() + 1e-8)
 
-        # process_neurons_v: 단위 벡터 초기화 (V용)
+        # process_neurons_v: 단위 벡터 초기화
         for i in range(self.n_process):
             v = torch.randn(self.rank)
             self.process_neurons_v.data[i] = v / (v.norm() + 1e-8)
 
-        # process_neurons_o: 단위 벡터 초기화 (O용)
+        # process_neurons_o: 단위 벡터 초기화
         for i in range(self.n_process):
             v = torch.randn(self.rank)
             self.process_neurons_o.data[i] = v / (v.norm() + 1e-8)
 
-        # process_neurons_m: 단위 벡터 초기화 (Memory Query용)
+        # process_neurons_m: 단위 벡터 초기화
         for i in range(self.n_process):
             v = torch.randn(self.rank)
             self.process_neurons_m.data[i] = v / (v.norm() + 1e-8)
 
-        # output_neurons: 직교 초기화 (QR)
+        # output_neurons_o: 직교 초기화 (QR)
         for i in range(self.n_output):
             if self.rank >= self.d_model:
                 q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
-                self.output_neurons.data[i] = q
+                self.output_neurons_o.data[i] = q
             else:
                 q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
-                self.output_neurons.data[i] = q.T  # [rank, d_model]
+                self.output_neurons_o.data[i] = q.T  # [rank, d_model]
 
         # knowledge_K: 정규분포 + 정규화
         nn.init.normal_(self.knowledge_K, std=0.02)
@@ -134,6 +165,17 @@ class SharedNeurons(nn.Module):
 
         # knowledge_V: 정규분포
         nn.init.normal_(self.knowledge_V, std=0.02)
+
+    def get_input_neurons(self, neuron_type: str):
+        """neuron_type에 따라 적절한 input neurons 반환"""
+        if neuron_type == 'qk':
+            return self.input_neurons_qk
+        elif neuron_type == 'v':
+            return self.input_neurons_v
+        elif neuron_type == 'm':
+            return self.input_neurons_m
+        else:
+            raise ValueError(f"Unknown neuron_type: {neuron_type}. Use 'qk', 'v', or 'm'.")
 
     def get_process_neurons(self, neuron_type: str):
         """neuron_type에 따라 적절한 process neurons 반환"""
@@ -147,6 +189,13 @@ class SharedNeurons(nn.Module):
             return self.process_neurons_m
         else:
             raise ValueError(f"Unknown neuron_type: {neuron_type}. Use 'qk', 'v', 'o', or 'm'.")
+
+    def get_output_neurons(self, neuron_type: str):
+        """neuron_type에 따라 적절한 output neurons 반환"""
+        if neuron_type == 'o':
+            return self.output_neurons_o
+        else:
+            raise ValueError(f"Unknown neuron_type: {neuron_type}. Use 'o'.")
 
     def apply_householder(self, x, v):
         """
@@ -215,8 +264,9 @@ class Compressor(nn.Module):
         input_weights = F.softmax(input_scores, dim=-1)  # [B, S, n_input]
 
         # 2. Project: d_model → rank
-        # input_neurons: [n_input, d_model, rank]
-        all_proj = torch.einsum('bsd,ndr->bsnr', x, self.shared_neurons.input_neurons)
+        # input_neurons: [n_input, d_model, rank] - 타입별로 분리된 neuron pool 사용
+        input_neurons = self.shared_neurons.get_input_neurons(self.neuron_type)
+        all_proj = torch.einsum('bsd,ndr->bsnr', x, input_neurons)
         x_compressed = (all_proj * input_weights.unsqueeze(-1)).sum(dim=2)  # [B, S, rank]
 
         # 3. Process neuron selection (top-k) - 압축 후 결정
@@ -304,8 +354,9 @@ class Expander(nn.Module):
         output_weights = F.softmax(output_scores, dim=-1)  # [B, S, n_output]
 
         # 4. Project: rank → d_model
-        # output_neurons: [n_output, rank, d_model]
-        all_proj = torch.einsum('bsr,nrd->bsnd', x, self.shared_neurons.output_neurons)
+        # output_neurons: [n_output, rank, d_model] - 타입별로 분리된 neuron pool 사용
+        output_neurons = self.shared_neurons.get_output_neurons(self.neuron_type)
+        all_proj = torch.einsum('bsr,nrd->bsnd', x, output_neurons)
         x_expanded = (all_proj * output_weights.unsqueeze(-1)).sum(dim=2)  # [B, S, d_model]
 
         routing_info = {
