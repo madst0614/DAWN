@@ -1344,10 +1344,13 @@ def main():
         args.knowledge_k = checkpoint_config.get('knowledge_k', getattr(args, 'knowledge_k', 8))
 
         if checkpoint_training_config:
-            # Training hyperparameters
-            args.batch_size = checkpoint_training_config.get('batch_size', args.batch_size)
-            args.num_epochs = checkpoint_training_config.get('num_epochs', args.num_epochs)
-            args.lr = checkpoint_training_config.get('lr', args.lr)
+            # Training hyperparameters (only if not overridden by CLI)
+            if cli_args.batch_size is None:
+                args.batch_size = checkpoint_training_config.get('batch_size', args.batch_size)
+            if cli_args.epochs is None:
+                args.num_epochs = checkpoint_training_config.get('num_epochs', args.num_epochs)
+            if cli_args.lr is None:
+                args.lr = checkpoint_training_config.get('lr', args.lr)
             args.warmup_ratio = checkpoint_training_config.get('warmup_ratio', args.warmup_ratio)
             args.weight_decay = checkpoint_training_config.get('weight_decay', args.weight_decay)
             # Loss weights
