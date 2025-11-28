@@ -911,8 +911,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     return avg_loss, avg_acc, last_neuron_metrics
 
 
-def evaluate(model, dataloader, device, args, tokenizer=None):
-    """Evaluate model with MLM masking"""
+def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
+    """Evaluate model with MLM masking
+
+    Args:
+        max_batches: Maximum number of batches to evaluate (default 200 for faster eval)
+    """
     model.eval()
     total_loss = 0
     total_tokens = 0
@@ -927,7 +931,9 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
     eval_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating", leave=False):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating", leave=False, total=min(max_batches, len(dataloader)))):
+            if batch_idx >= max_batches:
+                break
             input_ids = batch["input_ids"].to(device)
 
             # Apply same MLM masking as training
