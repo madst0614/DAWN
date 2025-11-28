@@ -971,13 +971,25 @@ def create_visualizations(all_results, output_dir):
 
         # Process neurons norms
         if 'process' in shared:
-            n_process = len(shared['process']['neurons'])
-            process_norms = [shared['process']['neurons'][i]['norm'] for i in range(n_process)]
-            axes[0, 1].bar(range(len(process_norms)), process_norms, color='coral')
-            axes[0, 1].set_xlabel('Process Neuron')
-            axes[0, 1].set_ylabel('Norm')
-            axes[0, 1].set_title('Process Neurons Norms (should be ~1)')
-            axes[0, 1].axhline(y=1.0, color='g', linestyle='--', alpha=0.5)
+            process_data = shared['process']
+            if 'pools' in process_data:
+                # v8.1+: pooled structure
+                pool_names = list(process_data['pools'].keys())
+                norm_means = [process_data['pools'][p]['norm_mean'] for p in pool_names]
+                axes[0, 1].bar(pool_names, norm_means, color='coral')
+                axes[0, 1].set_xlabel('Process Pool')
+                axes[0, 1].set_ylabel('Norm Mean')
+                axes[0, 1].set_title(f'Process Neurons Norms ({process_data.get("version", "?")})')
+                axes[0, 1].axhline(y=1.0, color='g', linestyle='--', alpha=0.5)
+            elif 'neurons' in process_data:
+                # v8.0: individual neurons
+                n_process = len(process_data['neurons'])
+                process_norms = [process_data['neurons'][i]['norm'] for i in range(n_process)]
+                axes[0, 1].bar(range(len(process_norms)), process_norms, color='coral')
+                axes[0, 1].set_xlabel('Process Neuron')
+                axes[0, 1].set_ylabel('Norm')
+                axes[0, 1].set_title('Process Neurons Norms (should be ~1)')
+                axes[0, 1].axhline(y=1.0, color='g', linestyle='--', alpha=0.5)
 
         # Output neurons condition
         if 'output' in shared:
