@@ -1,11 +1,17 @@
 # DAWN v8 Small Configuration
 # For development and quick experiments
 
-# Data
+# Data (~100M train / ~20M val tokens)
 data:
   base_dir: /content/drive/MyDrive/data
-  train_file: train/wikitext_5to1_texts.pkl
-  val_file: validation/wikitext_5to1_texts.pkl
+  train_files:
+    - train/c4_5to1_texts.pkl
+    - train/openwebtext_5to1_texts.pkl
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/c4_5to1_texts.pkl
+    - validation/openwebtext_5to1_texts.pkl
+    - validation/wikitext_5to1_texts.pkl
 
 # Model Architecture (v8.0)
 model:
