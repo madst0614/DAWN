@@ -1,0 +1,42 @@
+# DAWN v8 Small (~8M params)
+# For development and quick experiments
+
+model:
+  model_version: "8.0"
+  vocab_size: 30522
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  rank: 64
+  max_seq_len: 128
+  n_input: 8
+  n_process: 32
+  n_output: 8
+  process_k: 3
+  n_knowledge: 64
+  knowledge_k: 8
+  dropout: 0.1
+
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4_5to1_texts.pkl
+    - train/openwebtext_5to1_texts.pkl
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/c4_5to1_texts.pkl
+    - validation/openwebtext_5to1_texts.pkl
+    - validation/wikitext_5to1_texts.pkl
+
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  orthogonality_weight: 0.01
+  load_balance_weight: 0.01
+
+use_amp: true
+checkpoint_dir: checkpoints/small
+log_dir: logs/small

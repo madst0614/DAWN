@@ -1135,7 +1135,8 @@ def main():
     args.num_epochs = cfg['training']['num_epochs']
     args.lr = cfg['training']['lr']
     args.weight_decay = cfg['training']['weight_decay']
-    args.warmup_epochs = cfg['training'].get('warmup_epochs', 1)
+    args.warmup_epochs = cfg['training'].get('warmup_epochs', None)
+    args.warmup_ratio = cfg['training'].get('warmup_ratio', None)  # Alternative to warmup_epochs
 
     # Regularization weights
     args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.0)  # v6.0 compat
@@ -1500,8 +1501,15 @@ def main():
     )
 
     # Warmup + Cosine scheduler
-    warmup_steps = args.warmup_epochs * len(train_loader)
     total_steps = args.num_epochs * len(train_loader)
+
+    # Support both warmup_ratio and warmup_epochs
+    if args.warmup_ratio is not None:
+        warmup_steps = int(total_steps * args.warmup_ratio)
+    elif args.warmup_epochs is not None:
+        warmup_steps = args.warmup_epochs * len(train_loader)
+    else:
+        warmup_steps = len(train_loader)  # Default: 1 epoch
 
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
