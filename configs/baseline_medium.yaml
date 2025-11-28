@@ -1,0 +1,37 @@
+# Vanilla Transformer Baseline (~16-17M params)
+# For fair comparison with DAWN v8.0 medium
+# Same data, epochs, and training conditions
+
+model:
+  model_version: "baseline"
+  vocab_size: 30522
+  d_model: 304
+  n_layers: 6
+  n_heads: 4
+  d_ff: 1216  # 4 * d_model
+  max_seq_len: 256
+  dropout: 0.1
+
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4_5to1_texts.pkl
+    - train/openwebtext_5to1_texts.pkl
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/c4_5to1_texts.pkl
+    - validation/openwebtext_5to1_texts.pkl
+    - validation/wikitext_5to1_texts.pkl
+
+training:
+  batch_size: 128
+  num_epochs: 3
+  lr: 0.00028
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  orthogonality_weight: 0.0  # Not used for baseline
+  load_balance_weight: 0.0   # Not used for baseline
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_baseline
+log_dir: /content/drive/MyDrive/dawn/checkpoints_baseline
