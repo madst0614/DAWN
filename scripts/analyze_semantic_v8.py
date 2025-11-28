@@ -1098,6 +1098,33 @@ class SemanticAnalyzer:
         routing = data['routing']
         sentence_ids = data['sentence_ids']
 
+        # Debug: Check token presence and routing structure
+        print(f"\n[DEBUG] Polysemy Analysis Diagnostics:")
+        print(f"  Total tokens collected: {len(tokens)}")
+        print(f"  Total routing entries: {len(routing)}")
+
+        # Check tokenizer IDs for polysemous words
+        print(f"\n  Tokenizer IDs:")
+        for word in polysemous_words[:5]:  # First 5
+            try:
+                token_id = self.tokenizer.convert_tokens_to_ids(word)
+                # Also check with ## prefix
+                subword_id = self.tokenizer.convert_tokens_to_ids(f"##{word}")
+                print(f"    '{word}': id={token_id}, '##'{word}': id={subword_id}")
+            except:
+                print(f"    '{word}': error getting ID")
+
+        # Count occurrences
+        token_counts = defaultdict(int)
+        for token in tokens:
+            clean = token.replace('##', '').lower()
+            if clean in polysemous_words:
+                token_counts[clean] += 1
+
+        print(f"\n  Token occurrences in data:")
+        for word in polysemous_words:
+            print(f"    '{word}': {token_counts[word]} times")
+
         # Collect contexts for polysemous words
         word_contexts = defaultdict(list)
 
@@ -1109,6 +1136,24 @@ class SemanticAnalyzer:
                     'routing': route,
                     'position': i
                 })
+
+        # Debug: Check routing structure for each word
+        print(f"\n  Contexts with routing data:")
+        for word in polysemous_words:
+            if word in word_contexts:
+                contexts = word_contexts[word]
+                valid_vectors = 0
+                empty_first_layer = 0
+                for ctx in contexts[:50]:
+                    if ctx['routing'] and len(ctx['routing']) > 0:
+                        first_layer = ctx['routing'][0]
+                        if len(first_layer) > 0:
+                            valid_vectors += 1
+                        else:
+                            empty_first_layer += 1
+                print(f"    '{word}': {len(contexts)} contexts, {valid_vectors} valid vectors, {empty_first_layer} empty first layer")
+            else:
+                print(f"    '{word}': NOT in word_contexts")
 
         results = {}
 
