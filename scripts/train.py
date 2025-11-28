@@ -1101,6 +1101,8 @@ def main():
                         help='Start training from scratch (disable auto-resume)')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging to debug.txt (basis_up analysis, gradients, etc.)')
+    parser.add_argument('--compile', action='store_true',
+                        help='Enable torch.compile for faster training (may cause issues with variable seq lengths)')
     cli_args = parser.parse_args()
 
     # Load config
@@ -1499,8 +1501,8 @@ def main():
     model = model.to(device)
     print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
 
-    # PyTorch 2.0+ compilation for speed boost
-    if hasattr(torch, 'compile'):
+    # PyTorch 2.0+ compilation for speed boost (optional)
+    if cli_args.compile and hasattr(torch, 'compile'):
         print(f"\nCompiling model with torch.compile...")
         model = torch.compile(model, mode='reduce-overhead')
         print(f"  Model compiled successfully!")
