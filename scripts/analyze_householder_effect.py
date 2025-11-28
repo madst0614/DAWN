@@ -288,8 +288,16 @@ def analyze_process_neuron_pool(model):
     """전체 process neuron pool 분석"""
     shared = model.shared_neurons
 
-    # v8.0/v8.1/v8.2 호환
-    if hasattr(shared, 'process_neurons_o'):
+    # v8.0/v8.1/v8.2/v8.3 호환
+    if hasattr(shared, 'process_neurons_m'):
+        # v8.3: QK/V/O/M 분리
+        process_qk = shared.process_neurons_qk.detach()
+        process_v = shared.process_neurons_v.detach()
+        process_o = shared.process_neurons_o.detach()
+        process_m = shared.process_neurons_m.detach()
+        process_neurons = torch.cat([process_qk, process_v, process_o, process_m], dim=0)
+        is_split = True
+    elif hasattr(shared, 'process_neurons_o'):
         # v8.2: QK/V/O 분리
         process_qk = shared.process_neurons_qk.detach()
         process_v = shared.process_neurons_v.detach()
@@ -519,20 +527,37 @@ def main():
         print("  Detected torch.compile() checkpoint, stripping '_orig_mod.' prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Handle v8.1 → v8.2 checkpoint conversion (process_neurons_vo → process_neurons_v + process_neurons_o)
+    # Handle v8.1 → v8.3 checkpoint conversion (process_neurons_vo → v + o + m)
     if any('process_neurons_vo' in k for k in state_dict.keys()):
-        print("  Converting v8.1 checkpoint to v8.2 format (process_neurons_vo → v + o)...")
+        print("  Converting v8.1 checkpoint to v8.3 format (process_neurons_vo → v + o + m)...")
         new_state_dict = {}
         for k, v in state_dict.items():
             if 'process_neurons_vo' in k:
-                # Copy vo to both v and o
+                # Copy vo to v, o, and m
                 new_state_dict[k.replace('process_neurons_vo', 'process_neurons_v')] = v.clone()
                 new_state_dict[k.replace('process_neurons_vo', 'process_neurons_o')] = v.clone()
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_m')] = v.clone()
             else:
                 new_state_dict[k] = v
         state_dict = new_state_dict
+    # Handle v8.2 → v8.3 checkpoint conversion (add process_neurons_m)
+    elif any('process_neurons_o' in k for k in state_dict.keys()) and not any('process_neurons_m' in k for k in state_dict.keys()):
+        print("  Converting v8.2 checkpoint to v8.3 format (adding process_neurons_m)...")
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_state_dict[k] = v
+            if 'process_neurons_o' in k:
+                # Copy o to m (new key)
+                new_state_dict[k.replace('process_neurons_o', 'process_neurons_m')] = v.clone()
+        state_dict = new_state_dict
 
-    model.load_state_dict(state_dict)
+    # Load state dict (strict=False for version conversion)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys:
+        print(f"  Note: {len(missing_keys)} missing keys (new params initialized randomly)")
+    if unexpected_keys:
+        print(f"  Note: {len(unexpected_keys)} unexpected keys (old params ignored)")
+
     model = model.to(device)
     model.eval()
 
