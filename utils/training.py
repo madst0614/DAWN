@@ -72,9 +72,14 @@ class CheckpointManager:
         else:
             model_version = getattr(model, '__version__', 'unknown')
 
+        # Get state dict and strip _orig_mod. prefix from torch.compile() wrapped models
+        state_dict = model.state_dict()
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
         checkpoint = {
             'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': state_dict,
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': loss,
             'metrics': metrics,

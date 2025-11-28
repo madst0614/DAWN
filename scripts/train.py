@@ -1612,8 +1612,15 @@ def main():
 
         # Load model state (strict if using checkpoint config)
         use_strict = checkpoint_config is not None
+
+        # Handle torch.compile() wrapped checkpoints - strip _orig_mod. prefix
+        state_dict = checkpoint['model_state_dict']
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            print("📌 Detected torch.compile() checkpoint - stripping _orig_mod. prefix")
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
         missing_keys, unexpected_keys = model.load_state_dict(
-            checkpoint['model_state_dict'], strict=use_strict
+            state_dict, strict=use_strict
         )
 
         if use_strict:
