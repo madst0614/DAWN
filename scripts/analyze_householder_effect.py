@@ -59,6 +59,12 @@ class HouseholderAnalyzer:
             hook = self._make_expander_hook(layer_idx, 'O', expander)
             self.hooks.append(expander.register_forward_hook(hook))
 
+            # NeuronMemory의 query_compressor (M) - v8.3+
+            if hasattr(layer, 'memory') and hasattr(layer.memory, 'query_compressor'):
+                mem_compressor = layer.memory.query_compressor
+                hook = self._make_compressor_hook(layer_idx, 'M', mem_compressor)
+                self.hooks.append(mem_compressor.register_forward_hook(hook))
+
     def _make_compressor_hook(self, layer_idx, comp_name, compressor):
         """Compressor forward hook 생성"""
         def hook(module, input, output):
@@ -109,9 +115,19 @@ class HouseholderAnalyzer:
         process_k = process_indices.shape[-1]
         rank = x_after_input.shape[-1]
 
-        # 선택된 process neurons 가져오기 (v8.0/v8.1/v8.2 호환)
+        # 선택된 process neurons 가져오기 (v8.0/v8.1/v8.2/v8.3 호환)
         idx_expanded = process_indices.unsqueeze(-1).expand(B, S, process_k, rank)
-        if hasattr(shared, 'process_neurons_v'):
+        if hasattr(shared, 'process_neurons_m'):
+            # v8.3: QK/V/O/M 분리
+            if comp_name in ['Q', 'K']:
+                process_neurons = shared.process_neurons_qk
+            elif comp_name == 'V':
+                process_neurons = shared.process_neurons_v
+            elif comp_name == 'M':
+                process_neurons = shared.process_neurons_m
+            else:  # Should not happen
+                process_neurons = shared.process_neurons_qk
+        elif hasattr(shared, 'process_neurons_v'):
             # v8.2: QK/V/O 분리
             if comp_name in ['Q', 'K']:
                 process_neurons = shared.process_neurons_qk
@@ -350,13 +366,14 @@ def plot_results(summary, pool_stats, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. v·x 분포 히스토그램 (전체)
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    # 1. v·x 분포 히스토그램 (전체) - 5 components (Q, K, V, O, M)
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
 
     # Layer별, Component별 v·x 분포
-    components = ['Q', 'K', 'V', 'O']
+    components = ['Q', 'K', 'V', 'O', 'M']
     for idx, comp in enumerate(components):
-        ax = axes[idx // 2, idx % 2]
+        ax = axes[idx]
 
         all_vdotx = []
         for key in summary:
@@ -370,16 +387,23 @@ def plot_results(summary, pool_stats, output_dir):
             ax.set_title(f'{comp} v·x Distribution (mean={combined.mean():.4f})')
             ax.set_xlabel('v·x')
             ax.set_ylabel('Density')
+        else:
+            ax.set_title(f'{comp} (no data)')
+            ax.set_visible(False)
+
+    # Hide empty subplot
+    axes[5].set_visible(False)
 
     plt.tight_layout()
     plt.savefig(output_dir / 'vdotx_distribution.png', dpi=150)
     plt.close()
 
     # 2. 선택된 neuron 조합 similarity 분포
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
 
     for idx, comp in enumerate(components):
-        ax = axes[idx // 2, idx % 2]
+        ax = axes[idx]
 
         all_sim = []
         for key in summary:
@@ -392,6 +416,12 @@ def plot_results(summary, pool_stats, output_dir):
             ax.set_title(f'{comp} Selected Neuron Pairwise Sim (mean={combined.mean():.4f})')
             ax.set_xlabel('Cosine Similarity')
             ax.set_ylabel('Density')
+        else:
+            ax.set_title(f'{comp} (no data)')
+            ax.set_visible(False)
+
+    # Hide empty subplot
+    axes[5].set_visible(False)
 
     plt.tight_layout()
     plt.savefig(output_dir / 'selected_neuron_similarity.png', dpi=150)
@@ -408,14 +438,14 @@ def plot_results(summary, pool_stats, output_dir):
     plt.savefig(output_dir / 'process_neuron_pool_sim.png', dpi=150)
     plt.close()
 
-    # 4. Input vs Process 변화량 비교
-    fig, ax = plt.subplots(figsize=(10, 6))
+    # 4. Input vs Process 변화량 비교 (5 components)
+    fig, ax = plt.subplots(figsize=(12, 6))
 
     layers = []
-    q_sims, k_sims, v_sims, o_sims = [], [], [], []
+    q_sims, k_sims, v_sims, o_sims, m_sims = [], [], [], [], []
 
     for layer_idx in range(10):  # 최대 10 레이어
-        for comp, sim_list in [('Q', q_sims), ('K', k_sims), ('V', v_sims), ('O', o_sims)]:
+        for comp, sim_list in [('Q', q_sims), ('K', k_sims), ('V', v_sims), ('O', o_sims), ('M', m_sims)]:
             key = f'L{layer_idx}_{comp}_cos_sim_input_process'
             if key in summary:
                 sim_list.append(summary[key]['mean'])
@@ -424,11 +454,13 @@ def plot_results(summary, pool_stats, output_dir):
 
     if layers:
         x = np.arange(len(layers))
-        width = 0.2
-        ax.bar(x - 1.5*width, q_sims, width, label='Q', alpha=0.8)
-        ax.bar(x - 0.5*width, k_sims, width, label='K', alpha=0.8)
-        ax.bar(x + 0.5*width, v_sims, width, label='V', alpha=0.8)
-        ax.bar(x + 1.5*width, o_sims, width, label='O', alpha=0.8)
+        width = 0.15
+        ax.bar(x - 2*width, q_sims, width, label='Q', alpha=0.8)
+        ax.bar(x - 1*width, k_sims, width, label='K', alpha=0.8)
+        ax.bar(x, v_sims, width, label='V', alpha=0.8)
+        ax.bar(x + 1*width, o_sims, width, label='O', alpha=0.8)
+        if m_sims:  # M is only available in v8.3+
+            ax.bar(x + 2*width, m_sims, width, label='M', alpha=0.8)
         ax.set_xlabel('Layer')
         ax.set_ylabel('Cosine Similarity (Input → After Process)')
         ax.set_title('Vector Change by Householder Transform')
@@ -441,11 +473,12 @@ def plot_results(summary, pool_stats, output_dir):
     plt.savefig(output_dir / 'input_vs_process_change.png', dpi=150)
     plt.close()
 
-    # 5. Step별 v·x 절대값 평균
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    # 5. Step별 v·x 절대값 평균 (5 components)
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
 
     for idx, comp in enumerate(components):
-        ax = axes[idx // 2, idx % 2]
+        ax = axes[idx]
 
         step_means = defaultdict(list)
         for key in summary:
@@ -460,6 +493,12 @@ def plot_results(summary, pool_stats, output_dir):
             ax.set_xlabel('Householder Step')
             ax.set_ylabel('|v·x| Mean')
             ax.set_title(f'{comp} |v·x| by Householder Step')
+        else:
+            ax.set_title(f'{comp} (no data)')
+            ax.set_visible(False)
+
+    # Hide empty subplot
+    axes[5].set_visible(False)
 
     plt.tight_layout()
     plt.savefig(output_dir / 'vdotx_by_step.png', dpi=150)
@@ -607,7 +646,7 @@ def main():
     # 레이어/컴포넌트별 요약
     for layer_idx in range(model_kwargs['n_layers']):
         print(f"\n--- Layer {layer_idx} ---")
-        for comp in ['Q', 'K', 'V', 'O']:
+        for comp in ['Q', 'K', 'V', 'O', 'M']:
             prefix = f"L{layer_idx}_{comp}"
 
             vdotx_key = f"{prefix}_vdotx_abs_mean"
