@@ -484,6 +484,217 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
 
 
 # ============================================================
+# 2.5. Q/K Separation Analysis (v8.1+)
+# ============================================================
+
+def analyze_qk_separation(model, dataloader, device, max_batches=10):
+    """
+    Analyze Q/K separation effectiveness (v8.1+)
+
+    1. Q vs K input neuron selection comparison (Jaccard similarity)
+    2. Q/K neuron characteristics (overlap, cross-similarity)
+    3. Role differentiation analysis
+    """
+    print("\n" + "=" * 60)
+    print("2.5. Q/K SEPARATION ANALYSIS (v8.1+)")
+    print("=" * 60)
+
+    model = get_underlying_model(model)
+    model.eval()
+    shared = model.shared_neurons
+
+    # Check if v8.1+ (Q/K separated)
+    has_qk_separation = hasattr(shared, 'input_neurons_q') and hasattr(shared, 'input_neurons_k')
+
+    if not has_qk_separation:
+        print("  ⚠️ Model is v8.0 (Q/K shared). Skipping Q/K separation analysis.")
+        return {'version': 'v8.0 (QK shared)', 'qk_separated': False}
+
+    results = {'version': 'v8.1+ (Q/K separated)', 'qk_separated': True}
+
+    n_layers = len(model.layers)
+    n_input = model.n_input
+    n_process = model.n_process
+
+    # ========== 1. Q/K Neuron Characteristics ==========
+    print("\n📌 Q/K Input Neuron Characteristics:")
+
+    input_q = shared.input_neurons_q.data  # [n_input, d_model, rank]
+    input_k = shared.input_neurons_k.data  # [n_input, d_model, rank]
+
+    # Q neuron overlap (within Q)
+    q_T = input_q.transpose(1, 2)  # [n_input, rank, d_model]
+    q_products = torch.einsum('iad,jdb->ijab', q_T, input_q)
+    q_overlap = q_products.norm(dim=(-2, -1))
+    q_mask = ~torch.eye(n_input, dtype=torch.bool, device=q_overlap.device)
+    q_off_diag = q_overlap[q_mask]
+
+    # K neuron overlap (within K)
+    k_T = input_k.transpose(1, 2)
+    k_products = torch.einsum('iad,jdb->ijab', k_T, input_k)
+    k_overlap = k_products.norm(dim=(-2, -1))
+    k_off_diag = k_overlap[q_mask]
+
+    # Q-K cross similarity (between Q and K)
+    qk_products = torch.einsum('iad,jdb->ijab', q_T, input_k)
+    qk_cross = qk_products.norm(dim=(-2, -1))  # [n_input, n_input]
+
+    print(f"  Q-neuron overlap (within): mean={q_off_diag.mean().item():.4f}, max={q_off_diag.max().item():.4f}")
+    print(f"  K-neuron overlap (within): mean={k_off_diag.mean().item():.4f}, max={k_off_diag.max().item():.4f}")
+    print(f"  Q-K cross similarity: mean={qk_cross.mean().item():.4f}, max={qk_cross.max().item():.4f}")
+
+    # Diagonal similarity (Q_i vs K_i - corresponding neurons)
+    qk_diag = torch.diagonal(qk_cross)
+    print(f"  Q_i vs K_i (diagonal): mean={qk_diag.mean().item():.4f}, std={qk_diag.std().item():.4f}")
+
+    results['input_neurons'] = {
+        'q_overlap_mean': q_off_diag.mean().item(),
+        'q_overlap_max': q_off_diag.max().item(),
+        'k_overlap_mean': k_off_diag.mean().item(),
+        'k_overlap_max': k_off_diag.max().item(),
+        'qk_cross_mean': qk_cross.mean().item(),
+        'qk_cross_max': qk_cross.max().item(),
+        'qk_diagonal_mean': qk_diag.mean().item(),
+        'qk_diagonal_std': qk_diag.std().item(),
+    }
+
+    # ========== 2. Process Neurons Q vs K ==========
+    print("\n📌 Q/K Process Neuron Characteristics:")
+
+    process_q = shared.process_neurons_q.data  # [n_process, rank]
+    process_k = shared.process_neurons_k.data  # [n_process, rank]
+
+    # Normalize for cosine similarity
+    pq_norm = F.normalize(process_q, dim=-1)
+    pk_norm = F.normalize(process_k, dim=-1)
+
+    # Q-Q similarity
+    qq_sim = pq_norm @ pq_norm.T
+    qq_mask = ~torch.eye(n_process, dtype=torch.bool, device=qq_sim.device)
+    qq_off = qq_sim[qq_mask]
+
+    # K-K similarity
+    kk_sim = pk_norm @ pk_norm.T
+    kk_off = kk_sim[qq_mask]
+
+    # Q-K cross similarity
+    qk_sim = pq_norm @ pk_norm.T
+    qk_diag_process = torch.diagonal(qk_sim)
+
+    print(f"  Q-Q cosine sim: mean={qq_off.abs().mean().item():.4f}")
+    print(f"  K-K cosine sim: mean={kk_off.abs().mean().item():.4f}")
+    print(f"  Q-K cross sim: mean={qk_sim.abs().mean().item():.4f}")
+    print(f"  Q_i vs K_i (process): mean={qk_diag_process.mean().item():.4f}")
+
+    results['process_neurons'] = {
+        'qq_sim_mean': qq_off.abs().mean().item(),
+        'kk_sim_mean': kk_off.abs().mean().item(),
+        'qk_cross_mean': qk_sim.abs().mean().item(),
+        'qk_diagonal_mean': qk_diag_process.mean().item(),
+    }
+
+    # ========== 3. Q/K Routing Pattern Comparison ==========
+    print("\n📌 Q/K Routing Comparison (per layer):")
+
+    # Track Q and K input neuron selections
+    q_input_usage = torch.zeros(n_layers, n_input, device=device)
+    k_input_usage = torch.zeros(n_layers, n_input, device=device)
+    q_process_usage = torch.zeros(n_layers, n_process, device=device)
+    k_process_usage = torch.zeros(n_layers, n_process, device=device)
+
+    # Jaccard similarity per layer
+    qk_input_jaccard = torch.zeros(n_layers, device=device)
+    qk_process_jaccard = torch.zeros(n_layers, device=device)
+
+    total_tokens = 0
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Q/K Routing", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            B, S = input_ids.shape
+            total_tokens += B * S
+
+            _, routing_infos = model(input_ids, return_routing_info=True)
+
+            for layer_idx, routing_info in enumerate(routing_infos):
+                attn_routing = routing_info['attention']
+
+                # Get Q and K routing info
+                q_routing = attn_routing['routing_Q']
+                k_routing = attn_routing['routing_K']
+
+                # Input neuron weights (soft selection)
+                q_input_w = q_routing['input_weights']  # [B, S, n_input]
+                k_input_w = k_routing['input_weights']
+
+                # Process neuron indices (hard selection)
+                q_process_idx = q_routing['process_indices']  # [B, S, k]
+                k_process_idx = k_routing['process_indices']
+
+                # Accumulate usage
+                q_input_usage[layer_idx] += q_input_w.sum(dim=(0, 1))
+                k_input_usage[layer_idx] += k_input_w.sum(dim=(0, 1))
+
+                q_flat = q_process_idx.reshape(-1)
+                k_flat = k_process_idx.reshape(-1)
+                q_process_usage[layer_idx] += torch.bincount(q_flat, minlength=n_process).float()
+                k_process_usage[layer_idx] += torch.bincount(k_flat, minlength=n_process).float()
+
+                # Jaccard similarity (for this batch)
+                for b in range(B):
+                    for s in range(S):
+                        q_set = set(q_process_idx[b, s].tolist())
+                        k_set = set(k_process_idx[b, s].tolist())
+                        intersection = len(q_set & k_set)
+                        union = len(q_set | k_set)
+                        qk_process_jaccard[layer_idx] += intersection / (union + 1e-10)
+
+    # Normalize Jaccard
+    qk_process_jaccard /= total_tokens
+
+    # Compute input neuron Jaccard (using top-k of soft weights)
+    topk_input = 5  # Compare top-5 input neurons
+    for layer_idx in range(n_layers):
+        q_top = torch.topk(q_input_usage[layer_idx], topk_input).indices.tolist()
+        k_top = torch.topk(k_input_usage[layer_idx], topk_input).indices.tolist()
+        intersection = len(set(q_top) & set(k_top))
+        union = len(set(q_top) | set(k_top))
+        qk_input_jaccard[layer_idx] = intersection / (union + 1e-10)
+
+    results['routing'] = {
+        'qk_process_jaccard': qk_process_jaccard.tolist(),
+        'qk_input_jaccard': qk_input_jaccard.tolist(),
+        'avg_process_jaccard': qk_process_jaccard.mean().item(),
+        'avg_input_jaccard': qk_input_jaccard.mean().item(),
+    }
+
+    print(f"\n  {'Layer':<8} {'Input Jaccard':<15} {'Process Jaccard':<15}")
+    print(f"  {'-'*38}")
+    for layer_idx in range(n_layers):
+        print(f"  {layer_idx:<8} {qk_input_jaccard[layer_idx].item():<15.3f} {qk_process_jaccard[layer_idx].item():<15.3f}")
+
+    print(f"\n  Average Input Jaccard: {qk_input_jaccard.mean().item():.3f}")
+    print(f"  Average Process Jaccard: {qk_process_jaccard.mean().item():.3f}")
+
+    # ========== 4. Q/K Specialization Analysis ==========
+    print("\n📌 Q/K Specialization (Top neurons per component):")
+
+    for layer_idx in [0, n_layers // 2, n_layers - 1]:
+        print(f"\n  Layer {layer_idx}:")
+        q_top5 = torch.topk(q_process_usage[layer_idx], 5).indices.tolist()
+        k_top5 = torch.topk(k_process_usage[layer_idx], 5).indices.tolist()
+        overlap = set(q_top5) & set(k_top5)
+        print(f"    Q top-5 process neurons: {q_top5}")
+        print(f"    K top-5 process neurons: {k_top5}")
+        print(f"    Overlap: {len(overlap)}/5 ({overlap})")
+
+    return results
+
+
+# ============================================================
 # 3. Information Flow Analysis
 # ============================================================
 
@@ -933,6 +1144,51 @@ def create_visualizations(all_results, output_dir):
             plt.close()
         print(f"  Saved: routing_qkvo.png")
 
+    # 1.5. Q/K Separation visualization (v8.1+)
+    if 'qk_separation' in all_results and all_results['qk_separation'].get('qk_separated', False):
+        qk = all_results['qk_separation']
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Q/K Process Jaccard per layer
+        n_layers = len(qk['routing']['qk_process_jaccard'])
+        layers = list(range(n_layers))
+
+        axes[0].bar(layers, qk['routing']['qk_process_jaccard'], color='steelblue', alpha=0.7, label='Process Jaccard')
+        axes[0].bar(layers, qk['routing']['qk_input_jaccard'], color='coral', alpha=0.7, label='Input Jaccard')
+        axes[0].set_xlabel('Layer')
+        axes[0].set_ylabel('Jaccard Similarity')
+        axes[0].set_title('Q vs K Routing Similarity per Layer')
+        axes[0].legend()
+        axes[0].set_ylim(0, 1)
+        axes[0].axhline(y=qk['routing']['avg_process_jaccard'], color='steelblue', linestyle='--', alpha=0.5)
+        axes[0].axhline(y=qk['routing']['avg_input_jaccard'], color='coral', linestyle='--', alpha=0.5)
+
+        # Q/K Neuron characteristics
+        input_data = qk['input_neurons']
+        categories = ['Q overlap', 'K overlap', 'Q-K cross']
+        values = [input_data['q_overlap_mean'], input_data['k_overlap_mean'], input_data['qk_cross_mean']]
+        colors = ['steelblue', 'coral', 'purple']
+        axes[1].bar(categories, values, color=colors)
+        axes[1].set_ylabel('Mean Overlap/Similarity')
+        axes[1].set_title('Input Neuron Characteristics')
+
+        # Process neuron similarity
+        process_data = qk['process_neurons']
+        categories = ['Q-Q sim', 'K-K sim', 'Q-K cross']
+        values = [process_data['qq_sim_mean'], process_data['kk_sim_mean'], process_data['qk_cross_mean']]
+        axes[2].bar(categories, values, color=colors)
+        axes[2].set_ylabel('Mean Cosine Similarity')
+        axes[2].set_title('Process Neuron Characteristics')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'qk_separation.png'), dpi=150)
+        if IN_NOTEBOOK:
+            plt.show()
+        else:
+            plt.close()
+        print(f"  Saved: qk_separation.png")
+
     # 2. Information flow
     if 'info_flow' in all_results:
         info_flow = all_results['info_flow']
@@ -1282,6 +1538,9 @@ def main():
     routing_results, usage, cooccurrence = analyze_routing_patterns(model, dataloader, device, args.max_batches)
     all_results['routing'] = routing_results
 
+    # 2.5. Q/K Separation Analysis (v8.1+)
+    all_results['qk_separation'] = analyze_qk_separation(model, dataloader, device, args.max_batches)
+
     # 3. Information Flow
     all_results['info_flow'] = analyze_information_flow(model, dataloader, device, max_batches=5)
 
@@ -1308,6 +1567,14 @@ def main():
     print(f"  Process norm loss: {underlying.process_norm_loss().item():.6f}")
     print(f"  Knowledge diversity loss: {underlying.knowledge_diversity_loss().item():.6f}")
     print(f"  Avg routing entropy: {all_results['routing']['global']['avg_entropy']:.3f}")
+
+    # Q/K Separation (v8.1+)
+    if all_results['qk_separation'].get('qk_separated', False):
+        qk = all_results['qk_separation']
+        print(f"\n📊 Q/K Separation (v8.1+):")
+        print(f"  Q-K Input cross-sim: {qk['input_neurons']['qk_cross_mean']:.4f}")
+        print(f"  Q-K Process cross-sim: {qk['process_neurons']['qk_cross_mean']:.4f}")
+        print(f"  Avg Process Jaccard: {qk['routing']['avg_process_jaccard']:.3f}")
     print(f"  Avg routing gini: {all_results['routing']['global']['avg_gini']:.3f}")
     print(f"  Avg memory entropy: {all_results['memory']['global']['avg_entropy']:.3f}")
     print(f"  Dead knowledge neurons: {all_results['memory']['global']['dead_count']}")
