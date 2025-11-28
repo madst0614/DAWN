@@ -1479,11 +1479,10 @@ def main():
     print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
 
     # PyTorch 2.0+ compilation for speed boost
-    # DISABLED: torch.compile causing issues with variable sequence lengths
-    # if hasattr(torch, 'compile'):
-    #     print(f"\nCompiling model with torch.compile (dynamic=True)...")
-    #     model = torch.compile(model, mode='reduce-overhead', dynamic=True)
-    #     print(f"  Model compiled successfully!")
+    if hasattr(torch, 'compile'):
+        print(f"\nCompiling model with torch.compile...")
+        model = torch.compile(model, mode='reduce-overhead')
+        print(f"  Model compiled successfully!")
 
     # Model statistics
     total_params = sum(p.numel() for p in model.parameters())
