@@ -29,9 +29,9 @@ data:
     - validation/wikitext_5to1_texts.pkl
 
 training:
-  batch_size: 64
+  batch_size: 128
   num_epochs: 3
-  lr: 0.0002
+  lr: 0.00028
   warmup_ratio: 0.1
   weight_decay: 0.01
   orthogonality_weight: 0.01

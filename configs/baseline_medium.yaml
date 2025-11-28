@@ -1,20 +1,15 @@
-# DAWN v8 Small (~8M params)
-# For development and quick experiments
+# Vanilla Transformer Baseline (~16-17M params)
+# For fair comparison with DAWN v8.0 medium
+# Same data, epochs, and training conditions
 
 model:
-  model_version: "8.0"
+  model_version: "baseline"
   vocab_size: 30522
-  d_model: 256
-  n_layers: 4
+  d_model: 304
+  n_layers: 6
   n_heads: 4
-  rank: 64
-  max_seq_len: 128
-  n_input: 8
-  n_process: 32
-  n_output: 8
-  process_k: 3
-  n_knowledge: 64
-  knowledge_k: 8
+  d_ff: 1216  # 4 * d_model
+  max_seq_len: 256
   dropout: 0.1
 
 data:
@@ -34,9 +29,9 @@ training:
   lr: 0.00028
   warmup_ratio: 0.1
   weight_decay: 0.01
-  orthogonality_weight: 0.01
-  load_balance_weight: 0.01
+  orthogonality_weight: 0.0  # Not used for baseline
+  load_balance_weight: 0.0   # Not used for baseline
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v83
-log_dir: /content/drive/MyDrive/dawn/checkpoints_v83
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_baseline
+log_dir: /content/drive/MyDrive/dawn/checkpoints_baseline

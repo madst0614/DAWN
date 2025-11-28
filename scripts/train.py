@@ -11,6 +11,9 @@ Usage:
     # 특정 체크포인트 폴더에서 이어서 학습
     python scripts/train.py --resume checkpoints/run_20240101_120000_1234
 
+    # 특정 .pt 파일에서 이어서 학습
+    python scripts/train.py --resume /path/to/checkpoint_epoch1_step5000.pt
+
     # 커스텀 config 파일 사용
     python scripts/train.py --config configs/my_config.yaml
 
@@ -18,6 +21,7 @@ Checkpoint Options:
     (기본)           - 자동으로 최신 best_model.pt 탐색 후 이어서 학습
     --from-scratch   - 자동 탐색 비활성화, 처음부터 시작
     --resume <폴더>  - 지정한 폴더의 best_model.pt에서 이어서 학습
+    --resume <파일>  - 지정한 .pt 파일에서 직접 이어서 학습
 """
 
 import sys
@@ -564,7 +568,8 @@ def is_v75_or_v76_model(model):
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, debug_logger=None):
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, debug_logger=None,
+                ckpt_manager=None, model_config=None):
     """Train for one epoch"""
     model.train()
 
@@ -871,6 +876,26 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             window_acc_valid = 0
             window_count = 0
 
+        # Save checkpoint every 1000 steps
+        if ckpt_manager is not None and (step + 1) % 1000 == 0:
+            avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
+            avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
+            step_metrics = {
+                'train_loss': avg_loss,
+                'train_acc': avg_acc,
+                'step': step + 1,
+            }
+            ckpt_manager.save_checkpoint(
+                model, optimizer, epoch, avg_loss, step_metrics, is_best=False,
+                scheduler=scheduler, scaler=scaler, model_config=model_config,
+                filename=f'checkpoint_epoch{epoch}_step{step+1}.pt'
+            )
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "acc": f"{step_acc:.4f}",
+                "ckpt": f"step{step+1}"
+            })
+
     # Log remaining steps at end of epoch
     if log_file and window_count > 0:
         avg_window_loss = window_loss / window_count
@@ -886,16 +911,29 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     return avg_loss, avg_acc, last_neuron_metrics
 
 
-def evaluate(model, dataloader, device, args, tokenizer=None):
-    """Evaluate model with MLM masking"""
+def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
+    """Evaluate model with MLM masking
+
+    Args:
+        max_batches: Maximum number of batches to evaluate (default 200 for faster eval)
+    """
     model.eval()
     total_loss = 0
     total_tokens = 0
     total_correct = 0
     total_valid_tokens = 0
 
+    # Clear CUDA cache before evaluation (helps with torch.compile memory)
+    if device.type == 'cuda' if hasattr(device, 'type') else 'cuda' in str(device):
+        torch.cuda.empty_cache()
+
+    # Use original model if torch.compiled (avoids CUDA graph memory issues)
+    eval_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating", leave=False):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating", leave=False, total=min(max_batches, len(dataloader)))):
+            if batch_idx >= max_batches:
+                break
             input_ids = batch["input_ids"].to(device)
 
             # Apply same MLM masking as training
@@ -905,7 +943,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
                 masked_input_ids = input_ids
                 labels = input_ids.clone()
 
-            logits = model(masked_input_ids)
+            logits = eval_model(masked_input_ids)
 
             B, S, V = logits.shape
             loss = F.cross_entropy(
@@ -1080,6 +1118,15 @@ def main():
                         help='Start training from scratch (disable auto-resume)')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging to debug.txt (basis_up analysis, gradients, etc.)')
+    parser.add_argument('--compile', action='store_true',
+                        help='Enable torch.compile for faster training (may cause issues with variable seq lengths)')
+    # Training parameter overrides
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override num_epochs from config')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Override batch_size from config')
+    parser.add_argument('--lr', type=float, default=None,
+                        help='Override learning rate from config')
     cli_args = parser.parse_args()
 
     # Load config
@@ -1135,6 +1182,17 @@ def main():
     args.num_epochs = cfg['training']['num_epochs']
     args.lr = cfg['training']['lr']
     args.weight_decay = cfg['training']['weight_decay']
+
+    # CLI overrides (takes precedence over config)
+    if cli_args.epochs is not None:
+        args.num_epochs = cli_args.epochs
+        print(f"📌 CLI override: epochs={args.num_epochs}")
+    if cli_args.batch_size is not None:
+        args.batch_size = cli_args.batch_size
+        print(f"📌 CLI override: batch_size={args.batch_size}")
+    if cli_args.lr is not None:
+        args.lr = cli_args.lr
+        print(f"📌 CLI override: lr={args.lr}")
     args.warmup_epochs = cfg['training'].get('warmup_epochs', None)
     args.warmup_ratio = cfg['training'].get('warmup_ratio', None)  # Alternative to warmup_epochs
 
@@ -1161,20 +1219,34 @@ def main():
     checkpoint_dir = None
 
     if cli_args.resume:
-        # Explicit resume from folder - use existing folder
-        resume_folder = Path(cli_args.resume)
-        if not resume_folder.is_absolute():
-            resume_folder = Path(args.checkpoint_dir) / resume_folder.name
+        # Explicit resume - can be either a .pt file or a folder
+        resume_path = Path(cli_args.resume)
 
-        best_ckpt = resume_folder / 'best_model.pt'
-        if best_ckpt.exists():
-            latest_best_checkpoint = best_ckpt
-            checkpoint_dir = resume_folder  # Use existing folder
-            print(f"\n✓ Resuming from: {latest_best_checkpoint}")
-            print(f"✓ Continuing in same folder: {checkpoint_dir}")
+        if resume_path.suffix == '.pt':
+            # Direct .pt file path
+            if resume_path.exists():
+                latest_best_checkpoint = resume_path
+                checkpoint_dir = resume_path.parent  # Use the folder containing the checkpoint
+                print(f"\n✓ Resuming from checkpoint file: {latest_best_checkpoint}")
+                print(f"✓ Continuing in same folder: {checkpoint_dir}")
+            else:
+                print(f"\n⚠️  Warning: Checkpoint file not found at {resume_path}")
+                print(f"    Starting from scratch instead.")
         else:
-            print(f"\n⚠️  Warning: Checkpoint not found at {best_ckpt}")
-            print(f"    Starting from scratch instead.")
+            # Folder path - look for best_model.pt inside
+            resume_folder = resume_path
+            if not resume_folder.is_absolute():
+                resume_folder = Path(args.checkpoint_dir) / resume_folder.name
+
+            best_ckpt = resume_folder / 'best_model.pt'
+            if best_ckpt.exists():
+                latest_best_checkpoint = best_ckpt
+                checkpoint_dir = resume_folder  # Use existing folder
+                print(f"\n✓ Resuming from: {latest_best_checkpoint}")
+                print(f"✓ Continuing in same folder: {checkpoint_dir}")
+            else:
+                print(f"\n⚠️  Warning: Checkpoint not found at {best_ckpt}")
+                print(f"    Starting from scratch instead.")
 
     elif not cli_args.from_scratch:
         # Auto-resume: find latest checkpoint and use its folder
@@ -1236,6 +1308,9 @@ def main():
                 saved_cfg = json.load(f)
                 checkpoint_config = saved_cfg.get('model')
                 checkpoint_training_config = saved_cfg.get('training')
+                # Also load top-level settings
+                if 'use_amp' in saved_cfg:
+                    args.use_amp = saved_cfg['use_amp']
                 print(f"✅ Loaded config.json from checkpoint folder")
         else:
             temp_checkpoint = torch.load(resume_checkpoint, map_location='cpu')
@@ -1258,12 +1333,32 @@ def main():
         args.max_seq_len = checkpoint_config.get('max_seq_len', args.max_seq_len)
         args.dropout = checkpoint_config.get('dropout', args.dropout)
 
+        # v8.0+ parameters
+        args.rank = checkpoint_config.get('rank', getattr(args, 'rank', 64))
+        args.basis_rank = args.rank  # Sync basis_rank with rank for model creation
+        args.n_input = checkpoint_config.get('n_input', getattr(args, 'n_input', 8))
+        args.n_process = checkpoint_config.get('n_process', getattr(args, 'n_process', 32))
+        args.n_output = checkpoint_config.get('n_output', getattr(args, 'n_output', 8))
+        args.process_k = checkpoint_config.get('process_k', getattr(args, 'process_k', 3))
+        args.n_knowledge = checkpoint_config.get('n_knowledge', getattr(args, 'n_knowledge', 64))
+        args.knowledge_k = checkpoint_config.get('knowledge_k', getattr(args, 'knowledge_k', 8))
+
         if checkpoint_training_config:
+            # Training hyperparameters
+            args.batch_size = checkpoint_training_config.get('batch_size', args.batch_size)
+            args.num_epochs = checkpoint_training_config.get('num_epochs', args.num_epochs)
+            args.lr = checkpoint_training_config.get('lr', args.lr)
+            args.warmup_ratio = checkpoint_training_config.get('warmup_ratio', args.warmup_ratio)
+            args.weight_decay = checkpoint_training_config.get('weight_decay', args.weight_decay)
+            # Loss weights
             args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
             args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
             args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
+            print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
+        if args.model_version in ['8.0', '8.1', '8.2', '8.3']:
+            print(f"   → v8.0+ params: n_knowledge={args.n_knowledge}, knowledge_k={args.knowledge_k}, rank={args.rank}")
 
     # ============================================================
     # STEP 2: Print configuration summary (using updated args)
@@ -1478,11 +1573,7 @@ def main():
     model = model.to(device)
     print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
 
-    # PyTorch 2.0+ compilation for speed boost
-    if hasattr(torch, 'compile'):
-        print(f"\nCompiling model with torch.compile (dynamic=True)...")
-        model = torch.compile(model, mode='reduce-overhead', dynamic=True)
-        print(f"  Model compiled successfully!")
+    # NOTE: torch.compile() is applied AFTER checkpoint loading to avoid _orig_mod. prefix issues
 
     # Model statistics
     total_params = sum(p.numel() for p in model.parameters())
@@ -1564,8 +1655,15 @@ def main():
 
         # Load model state (strict if using checkpoint config)
         use_strict = checkpoint_config is not None
+
+        # Handle torch.compile() wrapped checkpoints - strip _orig_mod. prefix
+        state_dict = checkpoint['model_state_dict']
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            print("📌 Detected torch.compile() checkpoint - stripping _orig_mod. prefix")
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
         missing_keys, unexpected_keys = model.load_state_dict(
-            checkpoint['model_state_dict'], strict=use_strict
+            state_dict, strict=use_strict
         )
 
         if use_strict:
@@ -1638,6 +1736,13 @@ def main():
     else:
         print(f"\n🆕 Starting fresh training (no checkpoint found)")
 
+    # PyTorch 2.0+ compilation for speed boost (optional)
+    # Applied AFTER checkpoint loading to avoid _orig_mod. prefix issues
+    if cli_args.compile and hasattr(torch, 'compile'):
+        print(f"\nCompiling model with torch.compile...")
+        model = torch.compile(model, mode='reduce-overhead')
+        print(f"  Model compiled successfully!")
+
     # Checkpoint & Monitor
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
     monitor = TrainingMonitor(str(log_dir))
@@ -1690,7 +1795,9 @@ def main():
             orthogonality_weight=args.orthogonality_weight,
             diversity_weight=args.diversity_weight,
             load_balance_weight=args.load_balance_weight,
-            debug_logger=debug_logger
+            debug_logger=debug_logger,
+            ckpt_manager=ckpt_manager,
+            model_config=model_kwargs
         )
 
         # Evaluate

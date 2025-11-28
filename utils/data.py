@@ -496,12 +496,22 @@ class TextDataset(Dataset):
         }
 
 
-def collate_fn_dynamic_padding(batch, tokenizer):
+def collate_fn_dynamic_padding(batch, tokenizer, max_seq_len=None):
     """
-    Collate function with DYNAMIC padding (배치별 최대 길이만큼만 padding)
+    Collate function with padding.
+
+    Args:
+        batch: List of samples
+        tokenizer: Tokenizer with pad_token_id
+        max_seq_len: If provided, pad to this fixed length. Otherwise, pad to batch max (dynamic).
     """
-    # Find max length in this batch
-    max_len = max(item['input_ids'].size(0) for item in batch)
+    # Determine target length
+    if max_seq_len is not None:
+        # Fixed padding to max_seq_len
+        max_len = max_seq_len
+    else:
+        # Dynamic padding to batch max
+        max_len = max(item['input_ids'].size(0) for item in batch)
 
     input_ids_list = []
     attention_mask_list = []
@@ -511,7 +521,13 @@ def collate_fn_dynamic_padding(batch, tokenizer):
         attention_mask = item['attention_mask']
         seq_len = input_ids.size(0)
 
-        # Pad to batch max length
+        # Truncate if longer than max_len
+        if seq_len > max_len:
+            input_ids = input_ids[:max_len]
+            attention_mask = attention_mask[:max_len]
+            seq_len = max_len
+
+        # Pad to max_len
         if seq_len < max_len:
             padding_len = max_len - seq_len
             input_ids = torch.cat([
@@ -520,7 +536,7 @@ def collate_fn_dynamic_padding(batch, tokenizer):
             ])
             attention_mask = torch.cat([
                 attention_mask,
-                torch.zeros(padding_len, dtype=torch.long)
+                torch.zeros(padding_len, dtype=torch.long)  # 0 for padding positions
             ])
 
         input_ids_list.append(input_ids)
@@ -533,7 +549,7 @@ def collate_fn_dynamic_padding(batch, tokenizer):
 
 
 def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
-    """Load data from config paths with DYNAMIC padding
+    """Load data from config paths with FIXED padding to max_length
 
     Supports both single file and multiple files:
     - Single file: data_config['train_file'], data_config['val_file']
@@ -590,10 +606,10 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
     train_dataset = TextDataset(train_texts, tokenizer, max_length)
     val_dataset = TextDataset(val_texts, tokenizer, max_length)
 
-    # Create collate function with tokenizer
-    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+    # Create collate function with tokenizer and fixed max_length
+    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer, max_seq_len=max_length)
 
-    # Create dataloaders with DYNAMIC padding
+    # Create dataloaders with FIXED padding to max_length
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
