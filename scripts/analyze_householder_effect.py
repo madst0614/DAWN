@@ -519,6 +519,19 @@ def main():
         print("  Detected torch.compile() checkpoint, stripping '_orig_mod.' prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
+    # Handle v8.1 → v8.2 checkpoint conversion (process_neurons_vo → process_neurons_v + process_neurons_o)
+    if any('process_neurons_vo' in k for k in state_dict.keys()):
+        print("  Converting v8.1 checkpoint to v8.2 format (process_neurons_vo → v + o)...")
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if 'process_neurons_vo' in k:
+                # Copy vo to both v and o
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_v')] = v.clone()
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_o')] = v.clone()
+            else:
+                new_state_dict[k] = v
+        state_dict = new_state_dict
+
     model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
