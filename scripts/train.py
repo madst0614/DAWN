@@ -545,16 +545,19 @@ def get_underlying_model(model):
 
 
 def is_v75_or_v76_model(model):
-    """Robust detection of v7.5/v7.6/v7.7 models, handling torch.compile() wrapped models"""
+    """Robust detection of v7.5+ models (including v8.x), handling torch.compile() wrapped models"""
     base_model = get_underlying_model(model)
 
     # Check model version attribute
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7", "7.8", "7.9"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7", "7.8", "7.9", "8.0", "8.1", "8.2", "8.3"]:
         return True
 
     # Check for qkv_dynamic attribute on layers (v7.5/v7.6/v7.7 specific structure)
     if hasattr(base_model, 'layers') and len(base_model.layers) > 0:
         if hasattr(base_model.layers[0], 'qkv_dynamic'):
+            return True
+        # Check for v8.x structure (NeuronCircuit with attention and memory)
+        if hasattr(base_model.layers[0], 'attention') and hasattr(base_model.layers[0], 'memory'):
             return True
 
     return False
