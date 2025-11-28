@@ -1120,6 +1120,13 @@ def main():
                         help='Enable debug logging to debug.txt (basis_up analysis, gradients, etc.)')
     parser.add_argument('--compile', action='store_true',
                         help='Enable torch.compile for faster training (may cause issues with variable seq lengths)')
+    # Training parameter overrides
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override num_epochs from config')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Override batch_size from config')
+    parser.add_argument('--lr', type=float, default=None,
+                        help='Override learning rate from config')
     cli_args = parser.parse_args()
 
     # Load config
@@ -1175,6 +1182,17 @@ def main():
     args.num_epochs = cfg['training']['num_epochs']
     args.lr = cfg['training']['lr']
     args.weight_decay = cfg['training']['weight_decay']
+
+    # CLI overrides (takes precedence over config)
+    if cli_args.epochs is not None:
+        args.num_epochs = cli_args.epochs
+        print(f"📌 CLI override: epochs={args.num_epochs}")
+    if cli_args.batch_size is not None:
+        args.batch_size = cli_args.batch_size
+        print(f"📌 CLI override: batch_size={args.batch_size}")
+    if cli_args.lr is not None:
+        args.lr = cli_args.lr
+        print(f"📌 CLI override: lr={args.lr}")
     args.warmup_epochs = cfg['training'].get('warmup_epochs', None)
     args.warmup_ratio = cfg['training'].get('warmup_ratio', None)  # Alternative to warmup_epochs
 
