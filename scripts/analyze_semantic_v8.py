@@ -1841,9 +1841,9 @@ def main():
                        help='Path to validation data pickle')
     parser.add_argument('--output', type=str, required=True,
                        help='Output directory for results')
-    parser.add_argument('--max-samples', type=int, default=500,
+    parser.add_argument('--max-samples', type=int, default=5000,
                        help='Maximum number of text samples to process')
-    parser.add_argument('--max-tokens', type=int, default=30000,
+    parser.add_argument('--max-tokens', type=int, default=150000,
                        help='Maximum number of tokens to analyze')
     parser.add_argument('--batch-size', type=int, default=32,
                        help='Batch size for GPU processing')
