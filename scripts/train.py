@@ -915,6 +915,13 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
     total_correct = 0
     total_valid_tokens = 0
 
+    # Clear CUDA cache before evaluation (helps with torch.compile memory)
+    if device.type == 'cuda' if hasattr(device, 'type') else 'cuda' in str(device):
+        torch.cuda.empty_cache()
+
+    # Use original model if torch.compiled (avoids CUDA graph memory issues)
+    eval_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
             input_ids = batch["input_ids"].to(device)
@@ -926,7 +933,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None):
                 masked_input_ids = input_ids
                 labels = input_ids.clone()
 
-            logits = model(masked_input_ids)
+            logits = eval_model(masked_input_ids)
 
             B, S, V = logits.shape
             loss = F.cross_entropy(
