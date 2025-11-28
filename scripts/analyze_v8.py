@@ -664,8 +664,14 @@ def analyze_layer_routers(model):
         layer_results['process_O'] = attn.expander_O.process_router.weight.norm().item()
         layer_results['output_O'] = attn.expander_O.output_router.weight.norm().item()
 
-        # Memory query
-        layer_results['memory_Q'] = mem.W_Q.weight.norm().item()
+        # Memory query (v8.3: query_compressor, v8.0-v8.2: W_Q)
+        if hasattr(mem, 'query_compressor'):
+            # v8.3: query_compressor has input_router and process_router
+            layer_results['memory_input'] = mem.query_compressor.input_router.weight.norm().item()
+            layer_results['memory_process'] = mem.query_compressor.process_router.weight.norm().item()
+        elif hasattr(mem, 'W_Q'):
+            # v8.0-v8.2: W_Q is a Linear layer
+            layer_results['memory_Q'] = mem.W_Q.weight.norm().item()
 
         results['layers'][f'layer_{layer_idx}'] = layer_results
 
@@ -673,7 +679,10 @@ def analyze_layer_routers(model):
         print(f"    Input routers (Q/K/V): {layer_results['input_Q']:.4f} / {layer_results['input_K']:.4f} / {layer_results['input_V']:.4f}")
         print(f"    Process routers (Q/K/V/O): {layer_results['process_Q']:.4f} / {layer_results['process_K']:.4f} / {layer_results['process_V']:.4f} / {layer_results['process_O']:.4f}")
         print(f"    Output router: {layer_results['output_O']:.4f}")
-        print(f"    Memory W_Q: {layer_results['memory_Q']:.4f}")
+        if 'memory_input' in layer_results:
+            print(f"    Memory (query_compressor): input={layer_results['memory_input']:.4f}, process={layer_results['memory_process']:.4f}")
+        elif 'memory_Q' in layer_results:
+            print(f"    Memory W_Q: {layer_results['memory_Q']:.4f}")
 
     # Cross-layer similarity
     print("\n📌 Router Similarity Across Layers:")
