@@ -533,7 +533,12 @@ def collate_fn_dynamic_padding(batch, tokenizer):
 
 
 def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
-    """Load data from config paths with DYNAMIC padding"""
+    """Load data from config paths with DYNAMIC padding
+
+    Supports both single file and multiple files:
+    - Single file: data_config['train_file'], data_config['val_file']
+    - Multiple files: data_config['train_files'], data_config['val_files'] (list)
+    """
     from transformers import AutoTokenizer
     from functools import partial
 
@@ -544,24 +549,42 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
 
     # Load data from config paths
     base_dir = data_config['base_dir']
-    train_path = os.path.join(base_dir, data_config['train_file'])
-    val_path = os.path.join(base_dir, data_config['val_file'])
+
+    # Support both single file and multiple files
+    train_files = data_config.get('train_files', [data_config.get('train_file')])
+    val_files = data_config.get('val_files', [data_config.get('val_file')])
+
+    # Ensure lists
+    if isinstance(train_files, str):
+        train_files = [train_files]
+    if isinstance(val_files, str):
+        val_files = [val_files]
 
     print(f"Loading data from: {base_dir}")
 
-    # Load train texts
-    if not os.path.exists(train_path):
-        raise FileNotFoundError(f"Train data not found: {train_path}")
-    with open(train_path, 'rb') as f:
-        train_texts = pickle.load(f)
+    # Load train texts from all files
+    train_texts = []
+    for train_file in train_files:
+        train_path = os.path.join(base_dir, train_file)
+        if not os.path.exists(train_path):
+            raise FileNotFoundError(f"Train data not found: {train_path}")
+        with open(train_path, 'rb') as f:
+            texts = pickle.load(f)
+            train_texts.extend(texts)
+            print(f"  Loaded {len(texts):,} texts from {train_file}")
 
-    # Load validation texts
-    if not os.path.exists(val_path):
-        raise FileNotFoundError(f"Validation data not found: {val_path}")
-    with open(val_path, 'rb') as f:
-        val_texts = pickle.load(f)
+    # Load validation texts from all files
+    val_texts = []
+    for val_file in val_files:
+        val_path = os.path.join(base_dir, val_file)
+        if not os.path.exists(val_path):
+            raise FileNotFoundError(f"Validation data not found: {val_path}")
+        with open(val_path, 'rb') as f:
+            texts = pickle.load(f)
+            val_texts.extend(texts)
+            print(f"  Loaded {len(texts):,} texts from {val_file}")
 
-    print(f"Loaded {len(train_texts)} train texts, {len(val_texts)} val texts")
+    print(f"Total: {len(train_texts):,} train texts, {len(val_texts):,} val texts")
 
     # Create datasets
     train_dataset = TextDataset(train_texts, tokenizer, max_length)

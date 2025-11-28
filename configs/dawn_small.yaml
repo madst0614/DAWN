@@ -1,0 +1,55 @@
+# DAWN v8 Small Configuration
+# For development and quick experiments
+
+# Data (~100M train / ~20M val tokens)
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4_5to1_texts.pkl
+    - train/openwebtext_5to1_texts.pkl
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/c4_5to1_texts.pkl
+    - validation/openwebtext_5to1_texts.pkl
+    - validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v8.0)
+model:
+  model_version: "8.0"
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+
+  # TransformNeurons (shared across layers)
+  rank: 64                # d_model / 4
+  n_input: 8
+  n_process: 32
+  n_output: 8
+  process_k: 3
+
+  # KnowledgeNeurons
+  n_knowledge: 64
+  knowledge_k: 8
+
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+
+  # Regularization
+  orthogonality_weight: 0.01
+  process_norm_weight: 0.01
+  load_balance_weight: 0.01
+
+# Mixed precision
+use_amp: true
+
+# Paths
+checkpoint_dir: checkpoints/dawn_small
+log_dir: logs/dawn_small

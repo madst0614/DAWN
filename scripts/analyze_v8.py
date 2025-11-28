@@ -1,10 +1,10 @@
 """
-DAWN v8.0 Analysis Script
+DAWN v8.x Analysis Script
 SharedNeurons + NeuronMemory Architecture
 
 분석 항목:
 1. SharedNeurons 분석 (Input/Process/Output/Knowledge Neurons)
-2. Routing Pattern 분석 (Q/K/V/O별 라우팅)
+2. Routing Pattern 분석 (Q/K/V/O/M별 라우팅)
 3. Information Flow 분석 (Attention + Memory)
 4. Memory/Knowledge 분석 (지식 검색 패턴)
 5. Layer별 라우터 비교
@@ -28,7 +28,7 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.model_v8 import DAWN
+from models import create_model_by_version
 
 # Optional: matplotlib for visualization
 try:
@@ -126,45 +126,91 @@ def analyze_shared_neurons(model):
     results['input'] = input_results
 
     # ========== Process Neurons (Householder vectors) ==========
+    # v8.0: QK/V/O/M split (unified architecture)
     print("\n📌 Process Neurons (Householder): [n_process, rank]")
-    process_neurons = shared.process_neurons.data  # [n_process, rank]
-    n_process = process_neurons.shape[0]
 
-    process_results = {'shape': [n_process, rank], 'neurons': {}}
+    def analyze_process_pool(neurons, pool_name):
+        """Analyze a single process neuron pool"""
+        n = neurons.shape[0]
+        norms = neurons.norm(dim=-1)
+        v_normalized = F.normalize(neurons, dim=-1)
+        cos_sim = v_normalized @ v_normalized.T
+        mask = ~torch.eye(n, dtype=torch.bool, device=cos_sim.device)
+        off_diag_sim = cos_sim[mask]
 
-    # Norm distribution (should be ≈ 1 for Householder)
-    norms = process_neurons.norm(dim=-1)
-    print(f"  Norms: mean={norms.mean().item():.4f}, std={norms.std().item():.4f}, range=[{norms.min().item():.4f}, {norms.max().item():.4f}]")
+        # Householder condition numbers (sample)
+        cond_numbers = []
+        for i in range(min(n, 10)):  # Sample first 10
+            v = neurons[i]
+            v_norm = v / (v.norm() + 1e-8)
+            H = torch.eye(rank, device=v.device) - 2 * torch.outer(v_norm, v_norm)
+            _, s, _ = torch.linalg.svd(H)
+            cond = (s[0] / (s[-1] + 1e-10)).item()
+            cond_numbers.append(cond)
 
-    # Cosine similarity (diversity)
-    v_normalized = F.normalize(process_neurons, dim=-1)
-    cos_sim = v_normalized @ v_normalized.T
-    mask = ~torch.eye(n_process, dtype=torch.bool, device=cos_sim.device)
-    off_diag_sim = cos_sim[mask]
-    print(f"  Cosine similarity: mean={off_diag_sim.abs().mean().item():.4f}, max={off_diag_sim.abs().max().item():.4f}")
+        print(f"  {pool_name}: n={n}, norms mean={norms.mean().item():.4f}, cos_sim={off_diag_sim.abs().mean().item():.4f}, cond={np.mean(cond_numbers):.4f}")
 
-    process_results['norm_mean'] = norms.mean().item()
-    process_results['norm_std'] = norms.std().item()
-    process_results['cosine_sim_mean'] = off_diag_sim.abs().mean().item()
-    process_results['cosine_sim_max'] = off_diag_sim.abs().max().item()
-
-    # Householder matrix condition numbers
-    cond_numbers = []
-    for i in range(n_process):
-        v = process_neurons[i]
-        v_norm = v / (v.norm() + 1e-8)
-        H = torch.eye(rank, device=v.device) - 2 * torch.outer(v_norm, v_norm)
-        _, s, _ = torch.linalg.svd(H)
-        cond = (s[0] / (s[-1] + 1e-10)).item()
-        cond_numbers.append(cond)
-        process_results['neurons'][i] = {
-            'norm': norms[i].item(),
-            'condition': cond
+        return {
+            'n': n,
+            'norm_mean': norms.mean().item(),
+            'norm_std': norms.std().item(),
+            'cosine_sim_mean': off_diag_sim.abs().mean().item(),
+            'cosine_sim_max': off_diag_sim.abs().max().item(),
+            'condition_mean': np.mean(cond_numbers)
         }
 
-    print(f"  Householder condition: mean={np.mean(cond_numbers):.4f}, max={np.max(cond_numbers):.4f}")
-    process_results['condition_mean'] = np.mean(cond_numbers)
+    process_results = {'pools': {}}
 
+    if hasattr(shared, 'process_neurons_m'):
+        # v8.0: QK/V/O/M split (unified architecture)
+        process_results['version'] = 'v8.0 (QK/V/O/M split)'
+        process_results['pools']['QK'] = analyze_process_pool(shared.process_neurons_qk.data, 'QK')
+        process_results['pools']['V'] = analyze_process_pool(shared.process_neurons_v.data, 'V')
+        process_results['pools']['O'] = analyze_process_pool(shared.process_neurons_o.data, 'O')
+        process_results['pools']['M'] = analyze_process_pool(shared.process_neurons_m.data, 'M')
+    elif hasattr(shared, 'process_neurons_o'):
+        # v8.2: QK/V/O split
+        process_results['version'] = 'v8.2 (QK/V/O split)'
+        process_results['pools']['QK'] = analyze_process_pool(shared.process_neurons_qk.data, 'QK')
+        process_results['pools']['V'] = analyze_process_pool(shared.process_neurons_v.data, 'V')
+        process_results['pools']['O'] = analyze_process_pool(shared.process_neurons_o.data, 'O')
+    elif hasattr(shared, 'process_neurons_qk'):
+        # v8.1: QK/VO split
+        process_results['version'] = 'v8.1 (QK/VO split)'
+        process_results['pools']['QK'] = analyze_process_pool(shared.process_neurons_qk.data, 'QK')
+        process_results['pools']['VO'] = analyze_process_pool(shared.process_neurons_vo.data, 'VO')
+    else:
+        # v8.0: single pool
+        process_results['version'] = 'v8.0 (single pool)'
+        process_neurons = shared.process_neurons.data
+        n_process = process_neurons.shape[0]
+
+        norms = process_neurons.norm(dim=-1)
+        v_normalized = F.normalize(process_neurons, dim=-1)
+        cos_sim = v_normalized @ v_normalized.T
+        mask = ~torch.eye(n_process, dtype=torch.bool, device=cos_sim.device)
+        off_diag_sim = cos_sim[mask]
+
+        cond_numbers = []
+        for i in range(n_process):
+            v = process_neurons[i]
+            v_norm = v / (v.norm() + 1e-8)
+            H = torch.eye(rank, device=v.device) - 2 * torch.outer(v_norm, v_norm)
+            _, s, _ = torch.linalg.svd(H)
+            cond = (s[0] / (s[-1] + 1e-10)).item()
+            cond_numbers.append(cond)
+
+        print(f"  Single pool: n={n_process}, norms mean={norms.mean().item():.4f}, cos_sim={off_diag_sim.abs().mean().item():.4f}")
+        process_results['pools']['all'] = {
+            'n': n_process,
+            'norm_mean': norms.mean().item(),
+            'norm_std': norms.std().item(),
+            'cosine_sim_mean': off_diag_sim.abs().mean().item(),
+            'cosine_sim_max': off_diag_sim.abs().max().item(),
+            'condition_mean': np.mean(cond_numbers)
+        }
+
+    print(f"  Version: {process_results['version']}")
     results['process'] = process_results
 
     # ========== Output Neurons ==========
@@ -242,13 +288,13 @@ def analyze_shared_neurons(model):
 
 
 # ============================================================
-# 2. Routing Pattern Analysis (Q/K/V/O)
+# 2. Routing Pattern Analysis (Q/K/V/O/M)
 # ============================================================
 
 def analyze_routing_patterns(model, dataloader, device, max_batches=10):
-    """Analyze routing patterns for Q/K/V/O separately"""
+    """Analyze routing patterns for Q/K/V/O/M separately"""
     print("\n" + "=" * 60)
-    print("2. ROUTING PATTERN ANALYSIS (Q/K/V/O)")
+    print("2. ROUTING PATTERN ANALYSIS (Q/K/V/O/M)")
     print("=" * 60)
 
     model = get_underlying_model(model)
@@ -258,8 +304,13 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
     n_process = model.n_process
     process_k = model.process_k
 
+    # Check if M (Memory Query) routing is available (v8.0)
+    has_memory_routing = hasattr(model.layers[0].memory, 'query_compressor')
+
     # Track usage per component
     components = ['Q', 'K', 'V', 'O']
+    if has_memory_routing:
+        components.append('M')
     usage = {comp: torch.zeros(n_layers, n_process, device=device) for comp in components}
     cooccurrence = {comp: torch.zeros(n_layers, n_process, n_process, device=device) for comp in components}
 
@@ -280,11 +331,17 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
 
             for layer_idx, routing_info in enumerate(routing_infos):
                 attn_routing = routing_info['attention']
+                mem_routing = routing_info.get('memory', {})
 
                 # Process each component
                 for comp in components:
                     if comp == 'O':
                         routing = attn_routing['routing_O']
+                    elif comp == 'M':
+                        # v8.0: Memory Query routing from query_compressor
+                        routing = mem_routing.get('query_routing', None)
+                        if routing is None:
+                            continue
                     else:
                         routing = attn_routing[f'routing_{comp}']
 
@@ -618,8 +675,14 @@ def analyze_layer_routers(model):
         layer_results['process_O'] = attn.expander_O.process_router.weight.norm().item()
         layer_results['output_O'] = attn.expander_O.output_router.weight.norm().item()
 
-        # Memory query
-        layer_results['memory_Q'] = mem.W_Q.weight.norm().item()
+        # Memory query (query_compressor)
+        if hasattr(mem, 'query_compressor'):
+            # v8.0: query_compressor has input_router and process_router
+            layer_results['memory_input'] = mem.query_compressor.input_router.weight.norm().item()
+            layer_results['memory_process'] = mem.query_compressor.process_router.weight.norm().item()
+        elif hasattr(mem, 'W_Q'):
+            # Legacy: W_Q is a Linear layer (old checkpoint)
+            layer_results['memory_Q'] = mem.W_Q.weight.norm().item()
 
         results['layers'][f'layer_{layer_idx}'] = layer_results
 
@@ -627,7 +690,10 @@ def analyze_layer_routers(model):
         print(f"    Input routers (Q/K/V): {layer_results['input_Q']:.4f} / {layer_results['input_K']:.4f} / {layer_results['input_V']:.4f}")
         print(f"    Process routers (Q/K/V/O): {layer_results['process_Q']:.4f} / {layer_results['process_K']:.4f} / {layer_results['process_V']:.4f} / {layer_results['process_O']:.4f}")
         print(f"    Output router: {layer_results['output_O']:.4f}")
-        print(f"    Memory W_Q: {layer_results['memory_Q']:.4f}")
+        if 'memory_input' in layer_results:
+            print(f"    Memory (query_compressor): input={layer_results['memory_input']:.4f}, process={layer_results['memory_process']:.4f}")
+        elif 'memory_Q' in layer_results:
+            print(f"    Memory W_Q: {layer_results['memory_Q']:.4f}")
 
     # Cross-layer similarity
     print("\n📌 Router Similarity Across Layers:")
@@ -767,10 +833,11 @@ def create_visualizations(all_results, output_dir):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Routing comparison across Q/K/V/O
+    # 1. Routing comparison across Q/K/V/O/M
     if 'routing' in all_results:
         routing = all_results['routing']
-        components = ['Q', 'K', 'V', 'O']
+        # Dynamically get components from results (includes M for v8.0)
+        components = list(routing['components'].keys())
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -916,13 +983,25 @@ def create_visualizations(all_results, output_dir):
 
         # Process neurons norms
         if 'process' in shared:
-            n_process = len(shared['process']['neurons'])
-            process_norms = [shared['process']['neurons'][i]['norm'] for i in range(n_process)]
-            axes[0, 1].bar(range(len(process_norms)), process_norms, color='coral')
-            axes[0, 1].set_xlabel('Process Neuron')
-            axes[0, 1].set_ylabel('Norm')
-            axes[0, 1].set_title('Process Neurons Norms (should be ~1)')
-            axes[0, 1].axhline(y=1.0, color='g', linestyle='--', alpha=0.5)
+            process_data = shared['process']
+            if 'pools' in process_data:
+                # v8.1+: pooled structure
+                pool_names = list(process_data['pools'].keys())
+                norm_means = [process_data['pools'][p]['norm_mean'] for p in pool_names]
+                axes[0, 1].bar(pool_names, norm_means, color='coral')
+                axes[0, 1].set_xlabel('Process Pool')
+                axes[0, 1].set_ylabel('Norm Mean')
+                axes[0, 1].set_title(f'Process Neurons Norms ({process_data.get("version", "?")})')
+                axes[0, 1].axhline(y=1.0, color='g', linestyle='--', alpha=0.5)
+            elif 'neurons' in process_data:
+                # v8.0: individual neurons
+                n_process = len(process_data['neurons'])
+                process_norms = [process_data['neurons'][i]['norm'] for i in range(n_process)]
+                axes[0, 1].bar(range(len(process_norms)), process_norms, color='coral')
+                axes[0, 1].set_xlabel('Process Neuron')
+                axes[0, 1].set_ylabel('Norm')
+                axes[0, 1].set_title('Process Neurons Norms (should be ~1)')
+                axes[0, 1].axhline(y=1.0, color='g', linestyle='--', alpha=0.5)
 
         # Output neurons condition
         if 'output' in shared:
@@ -958,7 +1037,7 @@ def create_visualizations(all_results, output_dir):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='DAWN v8.0 Analysis')
+    parser = argparse.ArgumentParser(description='DAWN v8.x Analysis')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to checkpoint file')
     parser.add_argument('--val_data', type=str,
@@ -998,33 +1077,51 @@ def main():
     model_version = config.get('model_version', '8.0')
     print(f"Checkpoint model version: {model_version}")
 
-    if model_version != "8.0":
-        print(f"Warning: This script is for v8.0, but checkpoint is v{model_version}")
-        print("Consider using analyze_v79.py instead.")
-
-    # Create model
-    print(f"\nCreating model v8.0...")
-    model = DAWN(
-        vocab_size=config.get('vocab_size', 30522),
-        d_model=config.get('d_model', 256),
-        n_layers=config.get('n_layers', 4),
-        n_heads=config.get('n_heads', 4),
-        rank=config.get('rank', config.get('basis_rank', 64)),
-        max_seq_len=config.get('max_seq_len', 128),
-        n_input=config.get('n_input', 8),
-        n_process=config.get('n_process', 32),
-        n_output=config.get('n_output', 8),
-        process_k=config.get('process_k', 3),
-        n_knowledge=config.get('n_knowledge', 64),
-        knowledge_k=config.get('knowledge_k', 8),
-        dropout=config.get('dropout', 0.1),
-    )
+    # Create model using version-aware factory
+    print(f"\nCreating model v{model_version}...")
+    model_kwargs = {
+        'vocab_size': config.get('vocab_size', 30522),
+        'd_model': config.get('d_model', 256),
+        'n_layers': config.get('n_layers', 4),
+        'n_heads': config.get('n_heads', 4),
+        'rank': config.get('rank', config.get('basis_rank', 64)),
+        'max_seq_len': config.get('max_seq_len', 128),
+        'n_input': config.get('n_input', 8),
+        'n_process': config.get('n_process', 32),
+        'n_output': config.get('n_output', 8),
+        'process_k': config.get('process_k', 3),
+        'n_knowledge': config.get('n_knowledge', 64),
+        'knowledge_k': config.get('knowledge_k', 8),
+        'dropout': config.get('dropout', 0.1),
+    }
+    model = create_model_by_version(model_version, model_kwargs)
 
     # Load weights
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
         print("  Removing torch.compile wrapper prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    # Handle checkpoint conversion to v8.0 format
+    if any('process_neurons_vo' in k for k in state_dict.keys()):
+        print("  Converting v8.1 checkpoint to v8.0 (process_neurons_vo → v + o + m)...")
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if 'process_neurons_vo' in k:
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_v')] = v.clone()
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_o')] = v.clone()
+                new_state_dict[k.replace('process_neurons_vo', 'process_neurons_m')] = v.clone()
+            else:
+                new_state_dict[k] = v
+        state_dict = new_state_dict
+    elif any('process_neurons_o' in k for k in state_dict.keys()) and not any('process_neurons_m' in k for k in state_dict.keys()):
+        print("  Converting v8.2 checkpoint to v8.0 (adding process_neurons_m)...")
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_state_dict[k] = v
+            if 'process_neurons_o' in k:
+                new_state_dict[k.replace('process_neurons_o', 'process_neurons_m')] = v.clone()
+        state_dict = new_state_dict
 
     model.load_state_dict(state_dict, strict=False)
     model = model.to(device)

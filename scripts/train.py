@@ -545,16 +545,19 @@ def get_underlying_model(model):
 
 
 def is_v75_or_v76_model(model):
-    """Robust detection of v7.5/v7.6/v7.7 models, handling torch.compile() wrapped models"""
+    """Robust detection of v7.5+ models (including v8.x), handling torch.compile() wrapped models"""
     base_model = get_underlying_model(model)
 
     # Check model version attribute
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7", "7.8", "7.9"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7", "7.8", "7.9", "8.0", "8.1", "8.2", "8.3"]:
         return True
 
     # Check for qkv_dynamic attribute on layers (v7.5/v7.6/v7.7 specific structure)
     if hasattr(base_model, 'layers') and len(base_model.layers) > 0:
         if hasattr(base_model.layers[0], 'qkv_dynamic'):
+            return True
+        # Check for v8.x structure (NeuronCircuit with attention and memory)
+        if hasattr(base_model.layers[0], 'attention') and hasattr(base_model.layers[0], 'memory'):
             return True
 
     return False
@@ -1132,7 +1135,8 @@ def main():
     args.num_epochs = cfg['training']['num_epochs']
     args.lr = cfg['training']['lr']
     args.weight_decay = cfg['training']['weight_decay']
-    args.warmup_epochs = cfg['training'].get('warmup_epochs', 1)
+    args.warmup_epochs = cfg['training'].get('warmup_epochs', None)
+    args.warmup_ratio = cfg['training'].get('warmup_ratio', None)  # Alternative to warmup_epochs
 
     # Regularization weights
     args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.0)  # v6.0 compat
@@ -1476,8 +1480,8 @@ def main():
 
     # PyTorch 2.0+ compilation for speed boost
     if hasattr(torch, 'compile'):
-        print(f"\nCompiling model with torch.compile...")
-        model = torch.compile(model, mode='reduce-overhead')
+        print(f"\nCompiling model with torch.compile (dynamic=True)...")
+        model = torch.compile(model, mode='reduce-overhead', dynamic=True)
         print(f"  Model compiled successfully!")
 
     # Model statistics
@@ -1497,8 +1501,15 @@ def main():
     )
 
     # Warmup + Cosine scheduler
-    warmup_steps = args.warmup_epochs * len(train_loader)
     total_steps = args.num_epochs * len(train_loader)
+
+    # Support both warmup_ratio and warmup_epochs
+    if args.warmup_ratio is not None:
+        warmup_steps = int(total_steps * args.warmup_ratio)
+    elif args.warmup_epochs is not None:
+        warmup_steps = args.warmup_epochs * len(train_loader)
+    else:
+        warmup_steps = len(train_loader)  # Default: 1 epoch
 
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,

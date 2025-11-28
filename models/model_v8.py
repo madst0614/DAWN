@@ -1,5 +1,5 @@
 """
-DAWN v8.3 - Dynamic Architecture With Neurons
+DAWN v8 - Dynamic Architecture With Neurons
 
 핵심 철학:
 - 모든 연산이 "뉴런 선택 + 조합"으로 이루어짐
@@ -31,13 +31,6 @@ DAWN v8.3 - Dynamic Architecture With Neurons
     └── NeuronMemory (FFN 대체)
           ├── query_compressor (neuron_type='m')
           └── 내적 기반 지식 조회
-
-v8.2 대비 변경점:
-1. NeuronMemory의 W_Q → query_compressor로 변경
-   - W_Q: Linear(d_model → rank) 삭제
-   - query_compressor: Compressor(neuron_type='m') 추가
-2. process_neurons_m 추가 (Memory Query용 Householder 벡터)
-3. 파라미터: 32×64×4 = 8192 (v8.2: 6144, +2048)
 """
 
 import torch
@@ -571,7 +564,7 @@ class DAWN(nn.Module):
     - NeuronCircuit: NeuronAttention + NeuronMemory
     - 라우터/W_Q만 레이어/모듈별로 독립
     """
-    __version__ = "8.3"
+    __version__ = "8.0"
 
     def __init__(
         self,
