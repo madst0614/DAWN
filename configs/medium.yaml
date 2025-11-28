@@ -38,5 +38,5 @@ training:
   load_balance_weight: 0.01
 
 use_amp: true
-checkpoint_dir: checkpoints/medium
-log_dir: logs/medium
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v83
+log_dir: /content/drive/MyDrive/dawn/checkpoints_v83
