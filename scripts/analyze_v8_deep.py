@@ -127,8 +127,12 @@ class DeepAnalyzerV8:
         token_layer_neurons = defaultdict(lambda: defaultdict(lambda: Counter()))
         token_counts = Counter()
 
-        # Also track Q/K/V separately
-        component_flows = {comp: defaultdict(lambda: Counter()) for comp in ['Q', 'K', 'V', 'O']}
+        # Also track Q/K/V/O/M separately (M for v8.3+)
+        has_memory_routing = hasattr(self.model.layers[0].memory, 'query_compressor')
+        components = ['Q', 'K', 'V', 'O']
+        if has_memory_routing:
+            components.append('M')
+        component_flows = {comp: defaultdict(lambda: Counter()) for comp in components}
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Neuron Flow", total=max_batches)):
             if batch_idx >= max_batches:
@@ -164,24 +168,27 @@ class DeepAnalyzerV8:
 
                     flow_counts[token][tuple(layer_path)] += 1
 
-                    # Track Q/K/V/O separately
-                    for comp in ['Q', 'K', 'V', 'O']:
-                        if comp == 'O':
-                            routing = attn_routing['routing_O']
-                        else:
-                            routing = attn_routing[f'routing_{comp}']
-
+                    # Track Q/K/V/O/M separately
+                    for comp in components:
                         comp_path = []
                         for layer_idx, routing_info in enumerate(routing_infos):
                             attn_r = routing_info['attention']
+                            mem_r = routing_info.get('memory', {})
+
                             if comp == 'O':
                                 r = attn_r['routing_O']
+                            elif comp == 'M':
+                                # v8.3: Memory Query routing
+                                r = mem_r.get('query_routing', None)
+                                if r is None:
+                                    break
                             else:
                                 r = attn_r[f'routing_{comp}']
                             neurons = r['process_indices'][b, s].tolist()
                             comp_path.append(tuple(sorted(neurons)))
 
-                        component_flows[comp][token][tuple(comp_path)] += 1
+                        if comp_path:  # Only add if we got routing for all layers
+                            component_flows[comp][token][tuple(comp_path)] += 1
 
         # Build results
         results = {'tokens': {}, 'summary': {}}

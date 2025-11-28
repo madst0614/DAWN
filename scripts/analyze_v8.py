@@ -288,13 +288,13 @@ def analyze_shared_neurons(model):
 
 
 # ============================================================
-# 2. Routing Pattern Analysis (Q/K/V/O)
+# 2. Routing Pattern Analysis (Q/K/V/O/M)
 # ============================================================
 
 def analyze_routing_patterns(model, dataloader, device, max_batches=10):
-    """Analyze routing patterns for Q/K/V/O separately"""
+    """Analyze routing patterns for Q/K/V/O/M separately"""
     print("\n" + "=" * 60)
-    print("2. ROUTING PATTERN ANALYSIS (Q/K/V/O)")
+    print("2. ROUTING PATTERN ANALYSIS (Q/K/V/O/M)")
     print("=" * 60)
 
     model = get_underlying_model(model)
@@ -304,8 +304,13 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
     n_process = model.n_process
     process_k = model.process_k
 
+    # Check if M (Memory Query) routing is available (v8.3+)
+    has_memory_routing = hasattr(model.layers[0].memory, 'query_compressor')
+
     # Track usage per component
     components = ['Q', 'K', 'V', 'O']
+    if has_memory_routing:
+        components.append('M')
     usage = {comp: torch.zeros(n_layers, n_process, device=device) for comp in components}
     cooccurrence = {comp: torch.zeros(n_layers, n_process, n_process, device=device) for comp in components}
 
@@ -326,11 +331,17 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
 
             for layer_idx, routing_info in enumerate(routing_infos):
                 attn_routing = routing_info['attention']
+                mem_routing = routing_info.get('memory', {})
 
                 # Process each component
                 for comp in components:
                     if comp == 'O':
                         routing = attn_routing['routing_O']
+                    elif comp == 'M':
+                        # v8.3: Memory Query routing from query_compressor
+                        routing = mem_routing.get('query_routing', None)
+                        if routing is None:
+                            continue
                     else:
                         routing = attn_routing[f'routing_{comp}']
 
@@ -822,10 +833,11 @@ def create_visualizations(all_results, output_dir):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Routing comparison across Q/K/V/O
+    # 1. Routing comparison across Q/K/V/O/M
     if 'routing' in all_results:
         routing = all_results['routing']
-        components = ['Q', 'K', 'V', 'O']
+        # Dynamically get components from results (includes M for v8.3+)
+        components = list(routing['components'].keys())
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 

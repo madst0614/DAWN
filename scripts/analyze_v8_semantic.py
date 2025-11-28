@@ -118,7 +118,11 @@ class SemanticAnalyzerV8:
 
         # ⚡ GPU tensors for accumulation
         # Token -> Neuron mapping per component: [vocab_size, n_layers, n_process]
+        # v8.3+: includes M (Memory Query routing)
+        self.has_memory_routing = hasattr(self.model.layers[0].memory, 'query_compressor')
         self.components = ['Q', 'K', 'V', 'O']
+        if self.has_memory_routing:
+            self.components.append('M')
         self.token_neuron_count = {
             comp: torch.zeros(self.vocab_size, self.n_layers, self.n_process,
                               device=device, dtype=torch.float32)
@@ -148,7 +152,7 @@ class SemanticAnalyzerV8:
     def collect_data(self, dataloader, max_batches=100):
         """Collect token-neuron activation data"""
         print("\n" + "=" * 60)
-        print("COLLECTING SEMANTIC DATA (v8.0)")
+        print("COLLECTING SEMANTIC DATA (v8.x)")
         print("=" * 60)
 
         self.model.eval()
@@ -176,10 +180,15 @@ class SemanticAnalyzerV8:
                 attn_routing = routing_info['attention']
                 mem_routing = routing_info['memory']
 
-                # Process Q/K/V/O routing
+                # Process Q/K/V/O/M routing
                 for comp in self.components:
                     if comp == 'O':
                         routing = attn_routing['routing_O']
+                    elif comp == 'M':
+                        # v8.3: Memory Query routing from query_compressor
+                        routing = mem_routing.get('query_routing', None)
+                        if routing is None:
+                            continue
                     else:
                         routing = attn_routing[f'routing_{comp}']
 
