@@ -1480,8 +1480,8 @@ def main():
 
     # PyTorch 2.0+ compilation for speed boost
     if hasattr(torch, 'compile'):
-        print(f"\nCompiling model with torch.compile...")
-        model = torch.compile(model, mode='reduce-overhead')
+        print(f"\nCompiling model with torch.compile (dynamic=True)...")
+        model = torch.compile(model, mode='reduce-overhead', dynamic=True)
         print(f"  Model compiled successfully!")
 
     # Model statistics
