@@ -637,15 +637,35 @@ class SemanticAnalyzer:
             )
             input_ids = encoding['input_ids'].to(self.device)
 
+            routing_infos = None
+
             with torch.no_grad():
+                # Try multiple methods to get routing info
                 try:
                     outputs = self.model(input_ids, return_routing_info=True)
-                    if isinstance(outputs, tuple) and len(outputs) >= 3:
-                        _, _, routing_infos = outputs
-                    else:
-                        continue
+                    if isinstance(outputs, tuple):
+                        if len(outputs) >= 3:
+                            routing_infos = outputs[2]
+                        elif len(outputs) == 2 and isinstance(outputs[1], (list, dict)):
+                            routing_infos = outputs[1]
                 except:
-                    continue
+                    pass
+
+                if routing_infos is None:
+                    try:
+                        _ = self.model(input_ids)
+                        routing_infos = []
+                        for layer in self.model.layers:
+                            if hasattr(layer, 'last_routing_info'):
+                                routing_infos.append(layer.last_routing_info)
+                            elif hasattr(layer, 'attention') and hasattr(layer.attention, 'last_routing'):
+                                routing_infos.append(layer.attention.last_routing)
+                    except:
+                        pass
+
+            if not routing_infos:
+                print(f"  Sentence {sent_id}: No routing info available")
+                continue
 
             tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0].cpu().numpy())
 
@@ -669,21 +689,36 @@ class SemanticAnalyzer:
             token_offset = 0
             layer_offset = len(tokens[:20])
 
+            # Helper to get indices from layer_info
+            def get_layer_indices(layer_info, batch_idx, pos):
+                if isinstance(layer_info, dict):
+                    for key in ['neuron_indices', 'process_indices', 'indices', 'selected_neurons']:
+                        if key in layer_info:
+                            tensor = layer_info[key]
+                            if tensor.dim() >= 2 and pos < tensor.shape[-1]:
+                                return tensor[batch_idx, pos].cpu().numpy()
+                elif isinstance(layer_info, torch.Tensor):
+                    if layer_info.dim() >= 2 and pos < layer_info.shape[-1]:
+                        return layer_info[batch_idx, pos].cpu().numpy()
+                return None
+
             for pos, token in enumerate(tokens[:20]):
                 if token in ['[CLS]', '[SEP]', '[PAD]']:
                     continue
 
                 for layer_idx, layer_info in enumerate(routing_infos[:n_layers_to_show]):
-                    if isinstance(layer_info, dict) and 'neuron_indices' in layer_info:
-                        indices = layer_info['neuron_indices'][0, pos].cpu().numpy()
-
+                    indices = get_layer_indices(layer_info, 0, pos)
+                    if indices is not None:
                         for neuron_idx in indices:
                             if layer_idx == 0:
                                 source = pos
                             else:
                                 # Previous layer neuron
-                                prev_indices = routing_infos[layer_idx-1]['neuron_indices'][0, pos].cpu().numpy()
-                                source = layer_offset + (layer_idx - 1) * self.n_process + int(prev_indices[0])
+                                prev_indices = get_layer_indices(routing_infos[layer_idx-1], 0, pos)
+                                if prev_indices is not None and len(prev_indices) > 0:
+                                    source = layer_offset + (layer_idx - 1) * self.n_process + int(prev_indices[0])
+                                else:
+                                    source = pos
 
                             target = layer_offset + layer_idx * self.n_process + int(neuron_idx)
 
