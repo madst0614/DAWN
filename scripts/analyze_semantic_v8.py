@@ -784,7 +784,11 @@ class SemanticAnalyzer:
                     height=800
                 )
 
-                fig.write_image(str(sankey_dir / f'sentence_{sent_id}_sankey.png'))
+                # Try PNG first (requires kaleido), fallback to HTML
+                try:
+                    fig.write_image(str(sankey_dir / f'sentence_{sent_id}_sankey.png'))
+                except (ValueError, ImportError):
+                    fig.write_html(str(sankey_dir / f'sentence_{sent_id}_sankey.html'))
 
                 results.append({
                     'sentence_id': sent_id,
