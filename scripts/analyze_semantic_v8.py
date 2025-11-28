@@ -187,16 +187,16 @@ class SemanticAnalyzer:
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
-        self.device = device
+        self.device = torch.device(device) if isinstance(device, str) else device
 
         # Extract model info
         self.n_layers = config.get('n_layers', 12)
         self.n_process = config.get('n_process', 32)
         self.n_knowledge = config.get('n_knowledge', 128)
 
-    def collect_routing_info(self, texts, max_tokens=50000):
-        """Collect routing information for all tokens"""
-        print("\nCollecting routing information...")
+    def collect_routing_info(self, texts, max_tokens=50000, batch_size=32):
+        """Collect routing information for all tokens (GPU optimized with batching)"""
+        print("\nCollecting routing information (GPU optimized)...")
 
         all_tokens = []
         all_routing = []
@@ -208,23 +208,27 @@ class SemanticAnalyzer:
         token_count = 0
         successful_texts = 0
 
-        for sent_id, text in enumerate(tqdm(texts, desc="Processing texts")):
+        # Process in batches for GPU efficiency
+        for batch_start in tqdm(range(0, len(texts), batch_size), desc="Processing batches"):
             if token_count >= max_tokens:
                 break
 
-            # Tokenize
-            encoding = self.tokenizer(
-                text,
+            batch_texts = texts[batch_start:batch_start + batch_size]
+
+            # Batch tokenize
+            encodings = self.tokenizer(
+                batch_texts,
                 return_tensors='pt',
                 max_length=256,
                 truncation=True,
-                padding=False
+                padding=True
             )
-            input_ids = encoding['input_ids'].to(self.device)
+            input_ids = encodings['input_ids'].to(self.device)
+            attention_mask = encodings['attention_mask'].to(self.device)
 
             routing_infos = None
 
-            with torch.no_grad():
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.device.type == 'cuda'):
                 # Try multiple methods to get routing info
                 try:
                     # Method 1: return_routing_info=True
@@ -263,64 +267,73 @@ class SemanticAnalyzer:
             if not routing_infos:
                 continue
 
-            successful_texts += 1
+            # Process all samples in batch
+            batch_size_actual = input_ids.shape[0]
+            for batch_idx in range(batch_size_actual):
+                sent_id = batch_start + batch_idx
+                successful_texts += 1
 
-            # Process tokens
-            tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0].cpu().numpy())
-            seq_len = len(tokens)
+                # Get tokens for this sample
+                sample_ids = input_ids[batch_idx].cpu().numpy()
+                sample_mask = attention_mask[batch_idx].cpu().numpy()
+                tokens = self.tokenizer.convert_ids_to_tokens(sample_ids)
+                seq_len = int(sample_mask.sum())  # Actual sequence length
 
-            for pos, token in enumerate(tokens):
-                if token in ['[CLS]', '[SEP]', '[PAD]']:
-                    continue
-
-                all_tokens.append(token)
-                all_positions.append(pos / seq_len)  # Normalized position
-                all_sentence_ids.append(sent_id)
-
-                # Collect routing per layer
-                layer_routing = []
-                layer_knowledge = []
-                layer_qkvo = []
-
-                for layer_info in routing_infos:
-                    try:
-                        if isinstance(layer_info, dict):
-                            # Process neuron routing - try multiple keys
-                            for key in ['neuron_indices', 'process_indices', 'indices', 'selected_neurons']:
-                                if key in layer_info:
-                                    tensor = layer_info[key]
-                                    if tensor.dim() >= 2 and pos < tensor.shape[1]:
-                                        indices = tensor[0, pos].cpu().numpy()
-                                        layer_routing.append(indices)
-                                        break
-
-                            # Process knowledge routing
-                            for key in ['knowledge_indices', 'memory_indices', 'k_indices']:
-                                if key in layer_info:
-                                    tensor = layer_info[key]
-                                    if tensor.dim() >= 2 and pos < tensor.shape[1]:
-                                        k_indices = tensor[0, pos].cpu().numpy()
-                                        layer_knowledge.append(k_indices)
-                                        break
-
-                            # Process Q/K/V/O routing
-                            if 'qkvo_routing' in layer_info:
-                                qkvo = layer_info['qkvo_routing'][0, pos].cpu().numpy()
-                                layer_qkvo.append(qkvo)
-
-                        elif isinstance(layer_info, torch.Tensor):
-                            # Direct tensor - assume it's neuron indices
-                            if layer_info.dim() >= 2 and pos < layer_info.shape[1]:
-                                indices = layer_info[0, pos].cpu().numpy()
-                                layer_routing.append(indices)
-                    except Exception as e:
+                for pos, token in enumerate(tokens):
+                    if token in ['[CLS]', '[SEP]', '[PAD]'] or sample_mask[pos] == 0:
                         continue
 
-                all_routing.append(layer_routing)
-                all_knowledge_routing.append(layer_knowledge)
-                all_qkvo_routing.append(layer_qkvo)
+                    all_tokens.append(token)
+                    all_positions.append(pos / seq_len)  # Normalized position
+                    all_sentence_ids.append(sent_id)
 
-                token_count += 1
+                    # Collect routing per layer
+                    layer_routing = []
+                    layer_knowledge = []
+                    layer_qkvo = []
+
+                    for layer_info in routing_infos:
+                        try:
+                            if isinstance(layer_info, dict):
+                                # Process neuron routing - try multiple keys
+                                for key in ['neuron_indices', 'process_indices', 'indices', 'selected_neurons']:
+                                    if key in layer_info:
+                                        tensor = layer_info[key]
+                                        if tensor.dim() >= 2 and batch_idx < tensor.shape[0] and pos < tensor.shape[1]:
+                                            indices = tensor[batch_idx, pos].cpu().numpy()
+                                            layer_routing.append(indices)
+                                            break
+
+                                # Process knowledge routing
+                                for key in ['knowledge_indices', 'memory_indices', 'k_indices']:
+                                    if key in layer_info:
+                                        tensor = layer_info[key]
+                                        if tensor.dim() >= 2 and batch_idx < tensor.shape[0] and pos < tensor.shape[1]:
+                                            k_indices = tensor[batch_idx, pos].cpu().numpy()
+                                            layer_knowledge.append(k_indices)
+                                            break
+
+                                # Process Q/K/V/O routing
+                                if 'qkvo_routing' in layer_info:
+                                    qkvo = layer_info['qkvo_routing'][batch_idx, pos].cpu().numpy()
+                                    layer_qkvo.append(qkvo)
+
+                            elif isinstance(layer_info, torch.Tensor):
+                                # Direct tensor - assume it's neuron indices
+                                if layer_info.dim() >= 2 and batch_idx < layer_info.shape[0] and pos < layer_info.shape[1]:
+                                    indices = layer_info[batch_idx, pos].cpu().numpy()
+                                    layer_routing.append(indices)
+                        except Exception as e:
+                            continue
+
+                    all_routing.append(layer_routing)
+                    all_knowledge_routing.append(layer_knowledge)
+                    all_qkvo_routing.append(layer_qkvo)
+
+                    token_count += 1
+                    if token_count >= max_tokens:
+                        break
+
                 if token_count >= max_tokens:
                     break
 
@@ -341,23 +354,27 @@ class SemanticAnalyzer:
         }
 
     def _create_embedding_routing(self, texts, tokens, max_tokens):
-        """Create synthetic routing based on token embeddings when actual routing unavailable"""
-        print("Creating embedding-based pseudo-routing...")
+        """Create synthetic routing based on token embeddings (GPU optimized)"""
+        print("Creating embedding-based pseudo-routing (GPU accelerated)...")
 
-        # Get token embeddings from model
-        embeddings = []
-        for token in tokens[:max_tokens]:
-            token_id = self.tokenizer.convert_tokens_to_ids(token)
-            with torch.no_grad():
-                if hasattr(self.model, 'token_emb'):
-                    emb = self.model.token_emb.weight[token_id].cpu().numpy()
-                elif hasattr(self.model, 'embedding'):
-                    emb = self.model.embedding.weight[token_id].cpu().numpy()
-                else:
-                    emb = np.random.randn(256)
-                embeddings.append(emb)
+        # Get all unique tokens and their IDs
+        unique_tokens = list(set(tokens[:max_tokens]))
+        token_to_idx = {t: i for i, t in enumerate(unique_tokens)}
 
-        embeddings = np.array(embeddings)
+        # Batch get embeddings on GPU
+        token_ids = [self.tokenizer.convert_tokens_to_ids(t) for t in unique_tokens]
+        token_ids_tensor = torch.tensor(token_ids, device=self.device)
+
+        with torch.no_grad():
+            if hasattr(self.model, 'token_emb'):
+                unique_embeddings = self.model.token_emb(token_ids_tensor).cpu().numpy()
+            elif hasattr(self.model, 'embedding'):
+                unique_embeddings = self.model.embedding(token_ids_tensor).cpu().numpy()
+            else:
+                unique_embeddings = np.random.randn(len(unique_tokens), 256)
+
+        # Map back to original token order
+        embeddings = np.array([unique_embeddings[token_to_idx[t]] for t in tokens[:max_tokens]])
 
         # Cluster embeddings to create pseudo-routing
         from sklearn.cluster import KMeans
@@ -371,8 +388,7 @@ class SemanticAnalyzer:
         # Convert to routing format (list of lists)
         routing = []
         for label in cluster_labels:
-            # Create pseudo layer routing
-            layer_routing = [np.array([label])]  # Single neuron per layer
+            layer_routing = [np.array([label])]
             routing.append(layer_routing)
 
         return routing
@@ -1700,6 +1716,8 @@ def main():
                        help='Maximum number of text samples to process')
     parser.add_argument('--max-tokens', type=int, default=30000,
                        help='Maximum number of tokens to analyze')
+    parser.add_argument('--batch-size', type=int, default=32,
+                       help='Batch size for GPU processing')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use (cuda/cpu)')
 
@@ -1710,11 +1728,20 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("DAWN v8.0 Comprehensive Semantic Analysis")
+    print("DAWN v8.0 Comprehensive Semantic Analysis (GPU Optimized)")
+    print("=" * 60)
+
+    # Check GPU
+    device = args.device if torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        print("Running on CPU (slower)")
+    print(f"Batch size: {args.batch_size}")
     print("=" * 60)
 
     # Load model
-    device = args.device if torch.cuda.is_available() else 'cpu'
     model, tokenizer, config = load_model_and_tokenizer(args.checkpoint, device)
 
     # Load data
@@ -1723,8 +1750,8 @@ def main():
     # Create analyzer
     analyzer = SemanticAnalyzer(model, tokenizer, config, device)
 
-    # Collect routing information
-    data = analyzer.collect_routing_info(texts, max_tokens=args.max_tokens)
+    # Collect routing information (GPU optimized batching)
+    data = analyzer.collect_routing_info(texts, max_tokens=args.max_tokens, batch_size=args.batch_size)
 
     # Run all analyses
     all_results = {}
