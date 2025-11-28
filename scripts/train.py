@@ -1538,11 +1538,7 @@ def main():
     model = model.to(device)
     print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
 
-    # PyTorch 2.0+ compilation for speed boost (optional)
-    if cli_args.compile and hasattr(torch, 'compile'):
-        print(f"\nCompiling model with torch.compile...")
-        model = torch.compile(model, mode='reduce-overhead')
-        print(f"  Model compiled successfully!")
+    # NOTE: torch.compile() is applied AFTER checkpoint loading to avoid _orig_mod. prefix issues
 
     # Model statistics
     total_params = sum(p.numel() for p in model.parameters())
@@ -1704,6 +1700,13 @@ def main():
 
     else:
         print(f"\n🆕 Starting fresh training (no checkpoint found)")
+
+    # PyTorch 2.0+ compilation for speed boost (optional)
+    # Applied AFTER checkpoint loading to avoid _orig_mod. prefix issues
+    if cli_args.compile and hasattr(torch, 'compile'):
+        print(f"\nCompiling model with torch.compile...")
+        model = torch.compile(model, mode='reduce-overhead')
+        print(f"  Model compiled successfully!")
 
     # Checkpoint & Monitor
     ckpt_manager = CheckpointManager(str(checkpoint_dir), keep_best_n=3)
