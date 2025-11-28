@@ -127,7 +127,7 @@ class DeepAnalyzerV8:
         token_layer_neurons = defaultdict(lambda: defaultdict(lambda: Counter()))
         token_counts = Counter()
 
-        # Also track Q/K/V/O/M separately (M for v8.3+)
+        # Also track Q/K/V/O/M separately (M for v8.0)
         has_memory_routing = hasattr(self.model.layers[0].memory, 'query_compressor')
         components = ['Q', 'K', 'V', 'O']
         if has_memory_routing:
@@ -178,7 +178,7 @@ class DeepAnalyzerV8:
                             if comp == 'O':
                                 r = attn_r['routing_O']
                             elif comp == 'M':
-                                # v8.3: Memory Query routing
+                                # v8.0: Memory Query routing
                                 r = mem_r.get('query_routing', None)
                                 if r is None:
                                     break
@@ -337,11 +337,11 @@ class DeepAnalyzerV8:
         # Get process neurons (v8.x version aware)
         # For Q compressor analysis, use QK pool if available
         if hasattr(shared, 'process_neurons_qk'):
-            process_neurons = shared.process_neurons_qk.data  # v8.1+
-            pool_version = 'QK (v8.1+)'
+            process_neurons = shared.process_neurons_qk.data  # v8.0
+            pool_version = 'QK (v8.0)'
         else:
-            process_neurons = shared.process_neurons.data  # v8.0
-            pool_version = 'single (v8.0)'
+            process_neurons = shared.process_neurons.data  # legacy
+            pool_version = 'single (legacy)'
 
         # Analyze process neuron properties
         print(f"\n📌 Process Neurons (Householder Vectors) - {pool_version}:")
@@ -822,9 +822,9 @@ def main():
         print("  Removing torch.compile wrapper prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Handle checkpoint conversion for version compatibility
+    # Handle checkpoint conversion to v8.0 format
     if any('process_neurons_vo' in k for k in state_dict.keys()):
-        print("  Converting v8.1 checkpoint (process_neurons_vo → v + o + m)...")
+        print("  Converting v8.1 checkpoint to v8.0 (process_neurons_vo → v + o + m)...")
         new_state_dict = {}
         for k, v in state_dict.items():
             if 'process_neurons_vo' in k:
@@ -835,7 +835,7 @@ def main():
                 new_state_dict[k] = v
         state_dict = new_state_dict
     elif any('process_neurons_o' in k for k in state_dict.keys()) and not any('process_neurons_m' in k for k in state_dict.keys()):
-        print("  Converting v8.2 checkpoint (adding process_neurons_m)...")
+        print("  Converting v8.2 checkpoint to v8.0 (adding process_neurons_m)...")
         new_state_dict = {}
         for k, v in state_dict.items():
             new_state_dict[k] = v

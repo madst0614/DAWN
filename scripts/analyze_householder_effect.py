@@ -59,7 +59,7 @@ class HouseholderAnalyzer:
             hook = self._make_expander_hook(layer_idx, 'O', expander)
             self.hooks.append(expander.register_forward_hook(hook))
 
-            # NeuronMemory의 query_compressor (M) - v8.3+
+            # NeuronMemory의 query_compressor (M) - v8.0
             if hasattr(layer, 'memory') and hasattr(layer.memory, 'query_compressor'):
                 mem_compressor = layer.memory.query_compressor
                 hook = self._make_compressor_hook(layer_idx, 'M', mem_compressor)
@@ -115,10 +115,10 @@ class HouseholderAnalyzer:
         process_k = process_indices.shape[-1]
         rank = x_after_input.shape[-1]
 
-        # 선택된 process neurons 가져오기 (v8.0/v8.1/v8.2/v8.3 호환)
+        # 선택된 process neurons 가져오기 (v8.0: QK/V/O/M 분리)
         idx_expanded = process_indices.unsqueeze(-1).expand(B, S, process_k, rank)
         if hasattr(shared, 'process_neurons_m'):
-            # v8.3: QK/V/O/M 분리
+            # v8.0: QK/V/O/M 분리
             if comp_name in ['Q', 'K']:
                 process_neurons = shared.process_neurons_qk
             elif comp_name == 'V':
@@ -304,9 +304,9 @@ def analyze_process_neuron_pool(model):
     """전체 process neuron pool 분석"""
     shared = model.shared_neurons
 
-    # v8.0/v8.1/v8.2/v8.3 호환
+    # v8.0: QK/V/O/M split (with legacy checkpoint compatibility)
     if hasattr(shared, 'process_neurons_m'):
-        # v8.3: QK/V/O/M 분리
+        # v8.0: QK/V/O/M 분리
         process_qk = shared.process_neurons_qk.detach()
         process_v = shared.process_neurons_v.detach()
         process_o = shared.process_neurons_o.detach()
@@ -566,9 +566,9 @@ def main():
         print("  Detected torch.compile() checkpoint, stripping '_orig_mod.' prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Handle v8.1 → v8.3 checkpoint conversion (process_neurons_vo → v + o + m)
+    # Handle v8.1 → v8.0 checkpoint conversion (process_neurons_vo → v + o + m)
     if any('process_neurons_vo' in k for k in state_dict.keys()):
-        print("  Converting v8.1 checkpoint to v8.3 format (process_neurons_vo → v + o + m)...")
+        print("  Converting v8.1 checkpoint to v8.0 format (process_neurons_vo → v + o + m)...")
         new_state_dict = {}
         for k, v in state_dict.items():
             if 'process_neurons_vo' in k:
@@ -579,9 +579,9 @@ def main():
             else:
                 new_state_dict[k] = v
         state_dict = new_state_dict
-    # Handle v8.2 → v8.3 checkpoint conversion (add process_neurons_m)
+    # Handle v8.2 → v8.0 checkpoint conversion (add process_neurons_m)
     elif any('process_neurons_o' in k for k in state_dict.keys()) and not any('process_neurons_m' in k for k in state_dict.keys()):
-        print("  Converting v8.2 checkpoint to v8.3 format (adding process_neurons_m)...")
+        print("  Converting v8.2 checkpoint to v8.0 format (adding process_neurons_m)...")
         new_state_dict = {}
         for k, v in state_dict.items():
             new_state_dict[k] = v

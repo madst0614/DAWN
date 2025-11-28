@@ -126,7 +126,7 @@ def analyze_shared_neurons(model):
     results['input'] = input_results
 
     # ========== Process Neurons (Householder vectors) ==========
-    # v8.3: QK/V/O/M split, v8.2: QK/V/O split, v8.1: QK/VO split, v8.0: single pool
+    # v8.0: QK/V/O/M split (unified architecture)
     print("\n📌 Process Neurons (Householder): [n_process, rank]")
 
     def analyze_process_pool(neurons, pool_name):
@@ -162,8 +162,8 @@ def analyze_shared_neurons(model):
     process_results = {'pools': {}}
 
     if hasattr(shared, 'process_neurons_m'):
-        # v8.3: QK/V/O/M split
-        process_results['version'] = 'v8.3 (QK/V/O/M split)'
+        # v8.0: QK/V/O/M split (unified architecture)
+        process_results['version'] = 'v8.0 (QK/V/O/M split)'
         process_results['pools']['QK'] = analyze_process_pool(shared.process_neurons_qk.data, 'QK')
         process_results['pools']['V'] = analyze_process_pool(shared.process_neurons_v.data, 'V')
         process_results['pools']['O'] = analyze_process_pool(shared.process_neurons_o.data, 'O')
@@ -304,7 +304,7 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
     n_process = model.n_process
     process_k = model.process_k
 
-    # Check if M (Memory Query) routing is available (v8.3+)
+    # Check if M (Memory Query) routing is available (v8.0)
     has_memory_routing = hasattr(model.layers[0].memory, 'query_compressor')
 
     # Track usage per component
@@ -338,7 +338,7 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
                     if comp == 'O':
                         routing = attn_routing['routing_O']
                     elif comp == 'M':
-                        # v8.3: Memory Query routing from query_compressor
+                        # v8.0: Memory Query routing from query_compressor
                         routing = mem_routing.get('query_routing', None)
                         if routing is None:
                             continue
@@ -675,13 +675,13 @@ def analyze_layer_routers(model):
         layer_results['process_O'] = attn.expander_O.process_router.weight.norm().item()
         layer_results['output_O'] = attn.expander_O.output_router.weight.norm().item()
 
-        # Memory query (v8.3: query_compressor, v8.0-v8.2: W_Q)
+        # Memory query (query_compressor)
         if hasattr(mem, 'query_compressor'):
-            # v8.3: query_compressor has input_router and process_router
+            # v8.0: query_compressor has input_router and process_router
             layer_results['memory_input'] = mem.query_compressor.input_router.weight.norm().item()
             layer_results['memory_process'] = mem.query_compressor.process_router.weight.norm().item()
         elif hasattr(mem, 'W_Q'):
-            # v8.0-v8.2: W_Q is a Linear layer
+            # Legacy: W_Q is a Linear layer (old checkpoint)
             layer_results['memory_Q'] = mem.W_Q.weight.norm().item()
 
         results['layers'][f'layer_{layer_idx}'] = layer_results
@@ -836,7 +836,7 @@ def create_visualizations(all_results, output_dir):
     # 1. Routing comparison across Q/K/V/O/M
     if 'routing' in all_results:
         routing = all_results['routing']
-        # Dynamically get components from results (includes M for v8.3+)
+        # Dynamically get components from results (includes M for v8.0)
         components = list(routing['components'].keys())
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -1102,9 +1102,9 @@ def main():
         print("  Removing torch.compile wrapper prefix...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Handle checkpoint conversion for version compatibility
+    # Handle checkpoint conversion to v8.0 format
     if any('process_neurons_vo' in k for k in state_dict.keys()):
-        print("  Converting v8.1 checkpoint (process_neurons_vo → v + o + m)...")
+        print("  Converting v8.1 checkpoint to v8.0 (process_neurons_vo → v + o + m)...")
         new_state_dict = {}
         for k, v in state_dict.items():
             if 'process_neurons_vo' in k:
@@ -1115,7 +1115,7 @@ def main():
                 new_state_dict[k] = v
         state_dict = new_state_dict
     elif any('process_neurons_o' in k for k in state_dict.keys()) and not any('process_neurons_m' in k for k in state_dict.keys()):
-        print("  Converting v8.2 checkpoint (adding process_neurons_m)...")
+        print("  Converting v8.2 checkpoint to v8.0 (adding process_neurons_m)...")
         new_state_dict = {}
         for k, v in state_dict.items():
             new_state_dict[k] = v
