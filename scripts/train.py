@@ -11,6 +11,9 @@ Usage:
     # 특정 체크포인트 폴더에서 이어서 학습
     python scripts/train.py --resume checkpoints/run_20240101_120000_1234
 
+    # 특정 .pt 파일에서 이어서 학습
+    python scripts/train.py --resume /path/to/checkpoint_epoch1_step5000.pt
+
     # 커스텀 config 파일 사용
     python scripts/train.py --config configs/my_config.yaml
 
@@ -18,6 +21,7 @@ Checkpoint Options:
     (기본)           - 자동으로 최신 best_model.pt 탐색 후 이어서 학습
     --from-scratch   - 자동 탐색 비활성화, 처음부터 시작
     --resume <폴더>  - 지정한 폴더의 best_model.pt에서 이어서 학습
+    --resume <파일>  - 지정한 .pt 파일에서 직접 이어서 학습
 """
 
 import sys
@@ -1191,20 +1195,34 @@ def main():
     checkpoint_dir = None
 
     if cli_args.resume:
-        # Explicit resume from folder - use existing folder
-        resume_folder = Path(cli_args.resume)
-        if not resume_folder.is_absolute():
-            resume_folder = Path(args.checkpoint_dir) / resume_folder.name
+        # Explicit resume - can be either a .pt file or a folder
+        resume_path = Path(cli_args.resume)
 
-        best_ckpt = resume_folder / 'best_model.pt'
-        if best_ckpt.exists():
-            latest_best_checkpoint = best_ckpt
-            checkpoint_dir = resume_folder  # Use existing folder
-            print(f"\n✓ Resuming from: {latest_best_checkpoint}")
-            print(f"✓ Continuing in same folder: {checkpoint_dir}")
+        if resume_path.suffix == '.pt':
+            # Direct .pt file path
+            if resume_path.exists():
+                latest_best_checkpoint = resume_path
+                checkpoint_dir = resume_path.parent  # Use the folder containing the checkpoint
+                print(f"\n✓ Resuming from checkpoint file: {latest_best_checkpoint}")
+                print(f"✓ Continuing in same folder: {checkpoint_dir}")
+            else:
+                print(f"\n⚠️  Warning: Checkpoint file not found at {resume_path}")
+                print(f"    Starting from scratch instead.")
         else:
-            print(f"\n⚠️  Warning: Checkpoint not found at {best_ckpt}")
-            print(f"    Starting from scratch instead.")
+            # Folder path - look for best_model.pt inside
+            resume_folder = resume_path
+            if not resume_folder.is_absolute():
+                resume_folder = Path(args.checkpoint_dir) / resume_folder.name
+
+            best_ckpt = resume_folder / 'best_model.pt'
+            if best_ckpt.exists():
+                latest_best_checkpoint = best_ckpt
+                checkpoint_dir = resume_folder  # Use existing folder
+                print(f"\n✓ Resuming from: {latest_best_checkpoint}")
+                print(f"✓ Continuing in same folder: {checkpoint_dir}")
+            else:
+                print(f"\n⚠️  Warning: Checkpoint not found at {best_ckpt}")
+                print(f"    Starting from scratch instead.")
 
     elif not cli_args.from_scratch:
         # Auto-resume: find latest checkpoint and use its folder
