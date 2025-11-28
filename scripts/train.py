@@ -564,7 +564,8 @@ def is_v75_or_v76_model(model):
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, debug_logger=None):
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, debug_logger=None,
+                ckpt_manager=None, model_config=None):
     """Train for one epoch"""
     model.train()
 
@@ -870,6 +871,22 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             window_acc_correct = 0
             window_acc_valid = 0
             window_count = 0
+
+        # Save checkpoint every 1000 steps
+        if ckpt_manager is not None and (step + 1) % 1000 == 0:
+            avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
+            avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
+            step_metrics = {
+                'train_loss': avg_loss,
+                'train_acc': avg_acc,
+                'step': step + 1,
+            }
+            ckpt_manager.save_checkpoint(
+                model, optimizer, epoch, avg_loss, step_metrics, is_best=False,
+                scheduler=scheduler, scaler=scaler, model_config=model_config,
+                filename=f'checkpoint_epoch{epoch}_step{step+1}.pt'
+            )
+            print(f"\n  💾 Checkpoint saved at epoch {epoch}, step {step+1}")
 
     # Log remaining steps at end of epoch
     if log_file and window_count > 0:
@@ -1690,7 +1707,9 @@ def main():
             orthogonality_weight=args.orthogonality_weight,
             diversity_weight=args.diversity_weight,
             load_balance_weight=args.load_balance_weight,
-            debug_logger=debug_logger
+            debug_logger=debug_logger,
+            ckpt_manager=ckpt_manager,
+            model_config=model_kwargs
         )
 
         # Evaluate
