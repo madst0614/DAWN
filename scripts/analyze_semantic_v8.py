@@ -38,14 +38,26 @@ import matplotlib.patches as mpatches
 import seaborn as sns
 from wordcloud import WordCloud
 
-# Dimensionality reduction
-from sklearn.manifold import TSNE
+# Dimensionality reduction - Try GPU-accelerated cuML first
+HAS_CUML = False
+try:
+    from cuml.manifold import TSNE as cuTSNE
+    from cuml.manifold import UMAP as cuUMAP
+    from cuml.cluster import KMeans as cuKMeans
+    import cupy as cp
+    HAS_CUML = True
+    print("✓ cuML (RAPIDS) available - GPU-accelerated t-SNE/UMAP/KMeans enabled")
+except ImportError:
+    from sklearn.manifold import TSNE
+    print("Note: cuML not installed. Using CPU-based sklearn (slower).")
+
 try:
     import umap
     HAS_UMAP = True
 except ImportError:
     HAS_UMAP = False
-    print("Warning: umap-learn not installed. Using t-SNE only.")
+    if not HAS_CUML:
+        print("Warning: umap-learn not installed. Using t-SNE only.")
 
 # NLP tools
 try:
@@ -376,14 +388,21 @@ class SemanticAnalyzer:
         # Map back to original token order
         embeddings = np.array([unique_embeddings[token_to_idx[t]] for t in tokens[:max_tokens]])
 
-        # Cluster embeddings to create pseudo-routing
-        from sklearn.cluster import KMeans
+        # Cluster embeddings to create pseudo-routing (GPU-accelerated if cuML available)
         n_clusters = min(self.n_process, len(embeddings) // 10)
         if n_clusters < 2:
             n_clusters = 2
 
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        cluster_labels = kmeans.fit_predict(embeddings)
+        if HAS_CUML:
+            print("  Using cuML GPU-accelerated KMeans...")
+            embeddings_gpu = cp.asarray(embeddings.astype(np.float32))
+            kmeans = cuKMeans(n_clusters=n_clusters, random_state=42)
+            cluster_labels = kmeans.fit_predict(embeddings_gpu)
+            cluster_labels = cp.asnumpy(cluster_labels)
+        else:
+            from sklearn.cluster import KMeans
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(embeddings)
 
         # Convert to routing format (list of lists)
         routing = []
@@ -429,11 +448,19 @@ class SemanticAnalyzer:
         vectors = padded_vectors
         tokens = valid_tokens
 
-        # t-SNE
+        # t-SNE (GPU-accelerated if cuML available)
         print(f"Running t-SNE on {len(vectors)} vectors...")
         perplexity = max(5, min(30, len(vectors) // 4))
-        tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
-        coords_tsne = tsne.fit_transform(vectors)
+
+        if HAS_CUML:
+            print("  Using cuML GPU-accelerated t-SNE...")
+            vectors_gpu = cp.asarray(vectors.astype(np.float32))
+            tsne = cuTSNE(n_components=2, random_state=42, perplexity=perplexity)
+            coords_tsne = tsne.fit_transform(vectors_gpu)
+            coords_tsne = cp.asnumpy(coords_tsne)
+        else:
+            tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
+            coords_tsne = tsne.fit_transform(vectors)
 
         # Get POS tags
         if HAS_NLTK:
@@ -475,11 +502,18 @@ class SemanticAnalyzer:
         plt.savefig(output_dir / 'token_clusters_tsne.png', dpi=150)
         plt.close()
 
-        # UMAP if available
-        if HAS_UMAP:
+        # UMAP (GPU-accelerated if cuML available)
+        if HAS_CUML or HAS_UMAP:
             print("Running UMAP...")
-            reducer = umap.UMAP(n_components=2, random_state=42)
-            coords_umap = reducer.fit_transform(vectors)
+            if HAS_CUML:
+                print("  Using cuML GPU-accelerated UMAP...")
+                vectors_gpu = cp.asarray(vectors.astype(np.float32))
+                reducer = cuUMAP(n_components=2, random_state=42)
+                coords_umap = reducer.fit_transform(vectors_gpu)
+                coords_umap = cp.asnumpy(coords_umap)
+            else:
+                reducer = umap.UMAP(n_components=2, random_state=42)
+                coords_umap = reducer.fit_transform(vectors)
 
             fig, ax = plt.subplots(figsize=(14, 10))
             for cat in categories:
@@ -815,10 +849,16 @@ class SemanticAnalyzer:
             for i, v in enumerate(layer_vectors):
                 padded[i, :len(v)] = v
 
-            # t-SNE
+            # t-SNE (GPU-accelerated if cuML available)
             if len(padded) > 10:
-                tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(padded)//4))
-                coords = tsne.fit_transform(padded)
+                perp = min(30, len(padded)//4)
+                if HAS_CUML:
+                    padded_gpu = cp.asarray(padded.astype(np.float32))
+                    tsne = cuTSNE(n_components=2, random_state=42, perplexity=perp)
+                    coords = cp.asnumpy(tsne.fit_transform(padded_gpu))
+                else:
+                    tsne = TSNE(n_components=2, random_state=42, perplexity=perp)
+                    coords = tsne.fit_transform(padded)
 
                 ax = axes[ax_idx]
                 for cat in categories:
@@ -1091,11 +1131,16 @@ class SemanticAnalyzer:
                     for i, v in enumerate(vectors):
                         padded[i, :len(v)] = v
 
-                    # t-SNE
+                    # t-SNE (GPU-accelerated if cuML available)
                     if len(padded) > 5:
                         perp = min(5, len(padded) - 1)
-                        tsne = TSNE(n_components=2, random_state=42, perplexity=perp)
-                        coords = tsne.fit_transform(padded)
+                        if HAS_CUML:
+                            padded_gpu = cp.asarray(padded.astype(np.float32))
+                            tsne = cuTSNE(n_components=2, random_state=42, perplexity=perp)
+                            coords = cp.asnumpy(tsne.fit_transform(padded_gpu))
+                        else:
+                            tsne = TSNE(n_components=2, random_state=42, perplexity=perp)
+                            coords = tsne.fit_transform(padded)
 
                         ax.scatter(coords[:, 0], coords[:, 1], alpha=0.6, s=30)
                         ax.set_title(f'"{word}" contexts', fontsize=10)
