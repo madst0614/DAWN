@@ -1306,12 +1306,24 @@ def main():
         args.max_seq_len = checkpoint_config.get('max_seq_len', args.max_seq_len)
         args.dropout = checkpoint_config.get('dropout', args.dropout)
 
+        # v8.0+ parameters
+        args.rank = checkpoint_config.get('rank', getattr(args, 'rank', 64))
+        args.basis_rank = args.rank  # Sync basis_rank with rank for model creation
+        args.n_input = checkpoint_config.get('n_input', getattr(args, 'n_input', 8))
+        args.n_process = checkpoint_config.get('n_process', getattr(args, 'n_process', 32))
+        args.n_output = checkpoint_config.get('n_output', getattr(args, 'n_output', 8))
+        args.process_k = checkpoint_config.get('process_k', getattr(args, 'process_k', 3))
+        args.n_knowledge = checkpoint_config.get('n_knowledge', getattr(args, 'n_knowledge', 64))
+        args.knowledge_k = checkpoint_config.get('knowledge_k', getattr(args, 'knowledge_k', 8))
+
         if checkpoint_training_config:
             args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
             args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
             args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
+        if args.model_version in ['8.0', '8.1', '8.2', '8.3']:
+            print(f"   → v8.0+ params: n_knowledge={args.n_knowledge}, knowledge_k={args.knowledge_k}, rank={args.rank}")
 
     # ============================================================
     # STEP 2: Print configuration summary (using updated args)
