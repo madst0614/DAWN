@@ -2,7 +2,7 @@
 # Balanced performance for serious training
 
 model:
-  model_version: "8.0"
+  model_version: "8.1"
   vocab_size: 30522
   d_model: 512
   n_layers: 12

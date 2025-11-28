@@ -82,16 +82,26 @@ def analyze_shared_neurons(model):
     # ========== Input Neurons (타입별 분리: QK, V, M) ==========
     print("\n📌 Input Neurons: [n_input, d_model, rank]")
 
-    # v8.3+: 타입별 분리된 input neurons 분석
+    # v8.1+: Q/K 분리된 input neurons 분석
     input_neuron_types = {}
-    if hasattr(shared, 'input_neurons_qk'):
-        input_neuron_types['QK'] = shared.input_neurons_qk.data
+    if hasattr(shared, 'input_neurons_q'):
+        input_neuron_types['Q'] = shared.input_neurons_q.data
+    if hasattr(shared, 'input_neurons_k'):
+        input_neuron_types['K'] = shared.input_neurons_k.data
     if hasattr(shared, 'input_neurons_v'):
         input_neuron_types['V'] = shared.input_neurons_v.data
     if hasattr(shared, 'input_neurons_m'):
         input_neuron_types['M'] = shared.input_neurons_m.data
 
-    # Fallback for legacy models
+    # v8.0 fallback (QK shared)
+    if not input_neuron_types and hasattr(shared, 'input_neurons_qk'):
+        input_neuron_types['QK'] = shared.input_neurons_qk.data
+        if hasattr(shared, 'input_neurons_v'):
+            input_neuron_types['V'] = shared.input_neurons_v.data
+        if hasattr(shared, 'input_neurons_m'):
+            input_neuron_types['M'] = shared.input_neurons_m.data
+
+    # Legacy fallback
     if not input_neuron_types:
         input_neuron_types['all'] = shared.input_neurons.data
 
@@ -186,7 +196,15 @@ def analyze_shared_neurons(model):
 
     process_results = {'pools': {}}
 
-    if hasattr(shared, 'process_neurons_m'):
+    if hasattr(shared, 'process_neurons_q') and hasattr(shared, 'process_neurons_k'):
+        # v8.1: Q/K/V/O/M split (full separation)
+        process_results['version'] = 'v8.1 (Q/K/V/O/M split)'
+        process_results['pools']['Q'] = analyze_process_pool(shared.process_neurons_q.data, 'Q')
+        process_results['pools']['K'] = analyze_process_pool(shared.process_neurons_k.data, 'K')
+        process_results['pools']['V'] = analyze_process_pool(shared.process_neurons_v.data, 'V')
+        process_results['pools']['O'] = analyze_process_pool(shared.process_neurons_o.data, 'O')
+        process_results['pools']['M'] = analyze_process_pool(shared.process_neurons_m.data, 'M')
+    elif hasattr(shared, 'process_neurons_m'):
         # v8.0: QK/V/O/M split (unified architecture)
         process_results['version'] = 'v8.0 (QK/V/O/M split)'
         process_results['pools']['QK'] = analyze_process_pool(shared.process_neurons_qk.data, 'QK')
