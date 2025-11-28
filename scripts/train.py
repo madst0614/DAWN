@@ -1789,6 +1789,11 @@ def main():
         debug_logger.log_epoch_summary(model, sample_batch_for_debug, epoch=0)
 
     for epoch in range(start_epoch, args.num_epochs + 1):
+        # Clear CUDA cache at start of each epoch (helps with torch.compile memory)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
         epoch_start = time.time()
 
         # Train
