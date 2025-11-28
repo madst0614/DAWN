@@ -886,7 +886,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 scheduler=scheduler, scaler=scaler, model_config=model_config,
                 filename=f'checkpoint_epoch{epoch}_step{step+1}.pt'
             )
-            print(f"\n  💾 Checkpoint saved at epoch {epoch}, step {step+1}")
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "acc": f"{step_acc:.4f}",
+                "ckpt": f"step{step+1}"
+            })
 
     # Log remaining steps at end of epoch
     if log_file and window_count > 0:
