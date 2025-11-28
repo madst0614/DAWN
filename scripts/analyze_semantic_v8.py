@@ -1106,7 +1106,7 @@ class SemanticAnalyzer:
                         results[word] = {
                             'n_occurrences': len(contexts),
                             'variance': float(variance),
-                            'context_sensitive': variance > 1.0
+                            'context_sensitive': bool(variance > 1.0)
                         }
                     else:
                         ax.text(0.5, 0.5, f'"{word}"\ninsufficient data', ha='center', va='center')
