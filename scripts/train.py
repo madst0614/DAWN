@@ -1284,6 +1284,9 @@ def main():
                 saved_cfg = json.load(f)
                 checkpoint_config = saved_cfg.get('model')
                 checkpoint_training_config = saved_cfg.get('training')
+                # Also load top-level settings
+                if 'use_amp' in saved_cfg:
+                    args.use_amp = saved_cfg['use_amp']
                 print(f"✅ Loaded config.json from checkpoint folder")
         else:
             temp_checkpoint = torch.load(resume_checkpoint, map_location='cpu')
@@ -1317,9 +1320,17 @@ def main():
         args.knowledge_k = checkpoint_config.get('knowledge_k', getattr(args, 'knowledge_k', 8))
 
         if checkpoint_training_config:
+            # Training hyperparameters
+            args.batch_size = checkpoint_training_config.get('batch_size', args.batch_size)
+            args.num_epochs = checkpoint_training_config.get('num_epochs', args.num_epochs)
+            args.lr = checkpoint_training_config.get('lr', args.lr)
+            args.warmup_ratio = checkpoint_training_config.get('warmup_ratio', args.warmup_ratio)
+            args.weight_decay = checkpoint_training_config.get('weight_decay', args.weight_decay)
+            # Loss weights
             args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
             args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
             args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
+            print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
         if args.model_version in ['8.0', '8.1', '8.2', '8.3']:
