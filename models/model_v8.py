@@ -76,6 +76,7 @@ class SharedNeurons(nn.Module):
         n_process: int,
         n_output: int,
         n_knowledge: int,
+        skip_householder: bool = False,  # Ablation: skip Householder transforms
     ):
         super().__init__()
         self.d_model = d_model
@@ -84,6 +85,7 @@ class SharedNeurons(nn.Module):
         self.n_process = n_process
         self.n_output = n_output
         self.n_knowledge = n_knowledge
+        self.skip_householder = skip_householder  # Ablation flag
 
         # TransformNeurons - Input (Q/K 분리)
         self.input_neurons_q = nn.Parameter(torch.zeros(n_input, d_model, rank))
@@ -243,8 +245,12 @@ class SharedNeurons(nn.Module):
             v: [B, S, rank] or [B, S, d_model]
 
         Returns:
-            H @ x: same shape as x
+            H @ x: same shape as x (or x unchanged if skip_householder=True)
         """
+        # Ablation: skip Householder transform
+        if self.skip_householder:
+            return x
+
         v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-8
         v_normalized = v / v_norm_sq.sqrt()
         vTx = (x * v_normalized).sum(dim=-1, keepdim=True)
@@ -673,6 +679,7 @@ class DAWN(nn.Module):
         n_knowledge: int = 64,
         knowledge_k: int = 8,
         dropout: float = 0.1,
+        skip_householder: bool = False,  # Ablation: skip all Householder transforms
         **kwargs
     ):
         super().__init__()
@@ -683,6 +690,7 @@ class DAWN(nn.Module):
         self.n_heads = n_heads
         self.rank = rank
         self.max_seq_len = max_seq_len
+        self.skip_householder = skip_householder  # Ablation flag
 
         # Config 저장
         self.n_input = n_input
@@ -708,6 +716,7 @@ class DAWN(nn.Module):
             n_process=n_process,
             n_output=n_output,
             n_knowledge=n_knowledge,
+            skip_householder=skip_householder,  # Pass ablation flag
         )
 
         # Layers (모두 같은 SharedNeurons 참조)

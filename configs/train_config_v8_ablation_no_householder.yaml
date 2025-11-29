@@ -1,0 +1,61 @@
+# DAWN v8.0 Ablation: No Householder Transform
+#
+# Householder 변환을 스킵하고 학습
+# 비교 실험: Householder가 실제로 도움이 되는지 확인
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v8.0 - Householder 스킵)
+model:
+  model_version: "8.0"
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+
+  # TransformNeurons parameters
+  rank: 64
+  n_input: 16
+  n_process: 32
+  n_output: 16
+  process_k: 3
+
+  # KnowledgeNeurons parameters
+  n_knowledge: 64
+  knowledge_k: 8
+
+  # Architecture
+  max_seq_len: 128
+  dropout: 0.1
+
+  # ========================================
+  # ABLATION: Skip Householder transforms
+  # ========================================
+  skip_householder: true
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+
+  orthogonality_weight: 0.01
+  process_norm_weight: 0.01
+  load_balance_weight: 0.01
+
+use_amp: true
+
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v8_ablation_no_householder
+log_dir: /content/drive/MyDrive/dawn/logs_v8_ablation_no_householder
+
+# 실험 목적:
+#   - Householder 변환 없이 학습하면 어떻게 되는지
+#   - 예상: Householder가 없으면 process neurons가 무의미해짐
+#   - 결과 비교: v8 full vs v8 no-householder

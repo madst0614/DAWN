@@ -1128,6 +1128,9 @@ def main():
                         help='Override batch_size from config')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override learning rate from config')
+    # Ablation options
+    parser.add_argument('--skip-householder', action='store_true',
+                        help='Ablation: skip Householder transforms (v8 only)')
     cli_args = parser.parse_args()
 
     # Load config
@@ -1178,6 +1181,9 @@ def main():
     args.n_knowledge = cfg['model'].get('n_knowledge', 64)
     args.knowledge_k = cfg['model'].get('knowledge_k', 8)
 
+    # v8.0 Ablation: skip Householder (from config or CLI)
+    args.skip_householder = cfg['model'].get('skip_householder', False)
+
     # v9.0 Compress/Expand/Reflection parameters
     args.n_compress = cfg['model'].get('n_compress', 4)
     args.n_expand = cfg['model'].get('n_expand', 4)
@@ -1203,6 +1209,9 @@ def main():
     if cli_args.lr is not None:
         args.lr = cli_args.lr
         print(f"📌 CLI override: lr={args.lr}")
+    if cli_args.skip_householder:
+        args.skip_householder = True
+        print(f"📌 CLI override: skip_householder=True (ablation mode)")
     args.warmup_epochs = cfg['training'].get('warmup_epochs', None)
     args.warmup_ratio = cfg['training'].get('warmup_ratio', None)  # Alternative to warmup_epochs
 
@@ -1517,6 +1526,7 @@ def main():
             'n_knowledge': getattr(args, 'n_knowledge', 64),
             'knowledge_k': getattr(args, 'knowledge_k', 8),
             'rank': args.basis_rank,
+            'skip_householder': getattr(args, 'skip_householder', False),  # Ablation
         })
 
     # Create model
