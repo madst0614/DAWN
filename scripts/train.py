@@ -1177,6 +1177,12 @@ def main():
     args.n_knowledge = cfg['model'].get('n_knowledge', 64)
     args.knowledge_k = cfg['model'].get('knowledge_k', 8)
 
+    # v9.0 Compress/Expand/Reflection parameters
+    args.n_compress = cfg['model'].get('n_compress', 4)
+    args.n_expand = cfg['model'].get('n_expand', 4)
+    args.n_reflect = cfg['model'].get('n_reflect', cfg['model'].get('n_process', 128))
+    args.reflect_k = cfg['model'].get('reflect_k', cfg['model'].get('process_k', 3))
+
     # Training
     args.batch_size = cfg['training']['batch_size']
     args.num_epochs = cfg['training']['num_epochs']
@@ -1381,24 +1387,18 @@ def main():
 
         if model_version == "9.0":
             # v9.0: CompressNeurons + ExpandNeurons + ReflectionNeurons
-            rank = getattr(args, 'rank', args.basis_rank)
-            n_compress = getattr(args, 'n_compress', 4)
-            n_expand = getattr(args, 'n_expand', 4)
-            n_reflect = getattr(args, 'n_reflect', getattr(args, 'n_process', 128))
-            reflect_k = getattr(args, 'reflect_k', getattr(args, 'process_k', 3))
-            n_knowledge = getattr(args, 'n_knowledge', 64)
-            knowledge_k = getattr(args, 'knowledge_k', 8)
+            rank = args.basis_rank
             print(f"SharedNeurons (v{model_version}): rank={rank}")
-            print(f"  CompressNeurons: {n_compress} × {args.d_model} × {rank}")
-            print(f"  ExpandNeurons: {n_expand} × {rank} × {args.d_model}")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank}")
+            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model}")
             print(f"  ReflectionNeurons (unified pool):")
-            print(f"    - reflect_d: {n_reflect} × {args.d_model}")
-            print(f"    - reflect_r: {n_reflect} × {rank}")
-            print(f"    - Reflect top-k: {reflect_k}")
+            print(f"    - reflect_d: {args.n_reflect} × {args.d_model}")
+            print(f"    - reflect_r: {args.n_reflect} × {rank}")
+            print(f"    - Reflect top-k: {args.reflect_k}")
             print(f"  KnowledgeNeurons:")
-            print(f"    - K: {n_knowledge} × {rank}")
-            print(f"    - V: {n_knowledge} × {args.d_model}")
-            print(f"    - Knowledge top-k: {knowledge_k}")
+            print(f"    - K: {args.n_knowledge} × {rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
         elif model_version in ["8.0", "8.1", "8.2", "8.3"]:
             # v8.0/v8.1/v8.2/v8.3: SharedNeurons + NeuronMemory (FFN 대체)
             rank = getattr(args, 'rank', args.basis_rank)
@@ -1590,12 +1590,12 @@ def main():
         # v9.0 CompressNeurons + ExpandNeurons + ReflectionNeurons
         if model_version == '9.0':
             model_kwargs.update({
-                'n_compress': getattr(args, 'n_compress', 4),
-                'n_expand': getattr(args, 'n_expand', 4),
-                'n_reflect': getattr(args, 'n_reflect', getattr(args, 'n_process', 128)),
-                'reflect_k': getattr(args, 'reflect_k', getattr(args, 'process_k', 3)),
-                'n_knowledge': getattr(args, 'n_knowledge', 64),
-                'knowledge_k': getattr(args, 'knowledge_k', 8),
+                'n_compress': args.n_compress,
+                'n_expand': args.n_expand,
+                'n_reflect': args.n_reflect,
+                'reflect_k': args.reflect_k,
+                'n_knowledge': args.n_knowledge,
+                'knowledge_k': args.knowledge_k,
                 'rank': args.basis_rank,
             })
 
