@@ -1,0 +1,63 @@
+# DAWN v8.0 Training Config (Compress + GELU Ablation)
+# SharedNeurons + NeuronMemory with GELU after compress
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v8.0 - Compress + GELU)
+model:
+  model_version: "8.0"
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+
+  # TransformNeurons parameters
+  rank: 64
+  n_input: 16
+  n_process: 32
+  n_output: 16
+  process_k: 3
+
+  # KnowledgeNeurons parameters
+  n_knowledge: 64
+  knowledge_k: 8
+
+  # Architecture
+  max_seq_len: 128
+  dropout: 0.1
+
+  # Ablation: add GELU after compress (before expand)
+  compress_gelu: true
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+
+  orthogonality_weight: 0.01
+  process_norm_weight: 0.01
+  load_balance_weight: 0.01
+
+use_amp: true
+
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v8_compress_gelu
+log_dir: /content/drive/MyDrive/dawn/logs_v8_compress_gelu
+
+# Ablation study:
+#   compress → GELU → expand
+#
+#   - compress가 "GELU 축"에 맞춰 정보 정리
+#   - 노이즈는 음수로 밀려서 GELU에 의해 제거
+#   - expand가 정제된 정보 복원
+#
+#   Hypothesis:
+#   - compress 출력에서 "불필요한 정보"가 음수로 표현되면 GELU가 제거
+#   - 정보 병목(bottleneck)과 비선형 정제(refinement) 조합

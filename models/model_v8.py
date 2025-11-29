@@ -77,7 +77,7 @@ class SharedNeurons(nn.Module):
         n_output: int,
         n_knowledge: int,
         skip_householder: bool = False,  # Ablation: skip Householder transforms
-        householder_nonlinearity: bool = False,  # Ablation: add GELU after Householder
+        compress_gelu: bool = False,  # Ablation: add GELU after compress
     ):
         super().__init__()
         self.d_model = d_model
@@ -87,7 +87,7 @@ class SharedNeurons(nn.Module):
         self.n_output = n_output
         self.n_knowledge = n_knowledge
         self.skip_householder = skip_householder  # Ablation flag
-        self.householder_nonlinearity = householder_nonlinearity  # GELU flag
+        self.compress_gelu = compress_gelu  # GELU after compress
 
         # TransformNeurons - Input (Q/K 분리)
         self.input_neurons_q = nn.Parameter(torch.zeros(n_input, d_model, rank))
@@ -256,13 +256,7 @@ class SharedNeurons(nn.Module):
         v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-8
         v_normalized = v / v_norm_sq.sqrt()
         vTx = (x * v_normalized).sum(dim=-1, keepdim=True)
-        x = x - 2 * v_normalized * vTx
-
-        # Ablation: add GELU nonlinearity after Householder
-        if self.householder_nonlinearity:
-            x = F.gelu(x)
-
-        return x
+        return x - 2 * v_normalized * vTx
 
 
 class Compressor(nn.Module):
@@ -272,6 +266,7 @@ class Compressor(nn.Module):
     흐름:
     1. Input neuron selection (soft) → d_model → rank 압축
     2. Process neuron selection (top-k) → Householder 순차 적용
+    3. (Optional) GELU for noise removal (shared_neurons.compress_gelu)
 
     v7.9의 NeuronCircuitDown과 동일한 로직
     """
@@ -333,6 +328,10 @@ class Compressor(nn.Module):
         for i in range(self.process_k):
             v = selected_v[:, :, i, :]  # [B, S, rank]
             x_compressed = self.shared_neurons.apply_householder(x_compressed, v)
+
+        # 5. (Optional) GELU: noise removal in compressed space
+        if self.shared_neurons.compress_gelu:
+            x_compressed = F.gelu(x_compressed)
 
         routing_info = {
             'input_weights': input_weights,
@@ -688,7 +687,7 @@ class DAWN(nn.Module):
         knowledge_k: int = 8,
         dropout: float = 0.1,
         skip_householder: bool = False,  # Ablation: skip all Householder transforms
-        householder_nonlinearity: bool = False,  # Ablation: add GELU after Householder
+        compress_gelu: bool = False,  # Ablation: add GELU after compress
         **kwargs
     ):
         super().__init__()
@@ -700,7 +699,7 @@ class DAWN(nn.Module):
         self.rank = rank
         self.max_seq_len = max_seq_len
         self.skip_householder = skip_householder  # Ablation flag
-        self.householder_nonlinearity = householder_nonlinearity  # GELU flag
+        self.compress_gelu = compress_gelu  # GELU after compress
 
         # Config 저장
         self.n_input = n_input
@@ -727,7 +726,7 @@ class DAWN(nn.Module):
             n_output=n_output,
             n_knowledge=n_knowledge,
             skip_householder=skip_householder,  # Pass ablation flag
-            householder_nonlinearity=householder_nonlinearity,  # Pass GELU flag
+            compress_gelu=compress_gelu,  # Pass GELU flag
         )
 
         # Layers (모두 같은 SharedNeurons 참조)
