@@ -1,16 +1,20 @@
 """
 DAWN v9.0 - Dynamic Architecture With Neurons
 
-핵심 아이디어: base input/output 1개 + Householder로 동적 변형
+핵심 아이디어: base input/output + Householder를 x에 직접 적용
+
+속도 최적화:
+    기존: H @ W 계산 후 x @ (H @ W) → [B, S, d_model, rank] 중간 텐서 생성
+    최적화: (H @ x) @ W → 벡터 연산만으로 처리
 
 구조:
     SharedNeurons (공유 뉴런 풀 - 레이어 간 공유)
     ├── TransformNeurons
     │     ├── base_input:          [d_model, rank] — 기본 압축 행렬
     │     ├── base_output:         [rank, d_model] — 기본 확장 행렬
-    │     ├── input_householder:   [n_process, d_model] — Input 변형용 통합 풀
+    │     ├── input_householder:   [n_process, d_model] — x 변형용 통합 풀
     │     ├── process_householder: [n_process, rank] — 64차원 변환용 통합 풀
-    │     └── output_householder:  [n_process, d_model] — Output 변형용 통합 풀
+    │     └── output_householder:  [n_process, d_model] — 결과 변형용 통합 풀
     │
     └── KnowledgeNeurons
           ├── knowledge_K: [n_knowledge, rank]
@@ -159,9 +163,9 @@ class Compressor(nn.Module):
     """
     d_model → rank 압축
 
-    v9.0:
-    1. Input Householder 선택 → base_input 동적 변형
-    2. 동적 압축: x @ dynamic_input
+    v9.0 (최적화):
+    1. Input Householder 선택 → x에 직접 적용
+    2. 변형된 x를 base_input으로 projection
     3. Process Householder 선택 → rank 공간에서 변환
     """
     def __init__(
@@ -204,13 +208,11 @@ class Compressor(nn.Module):
         # 가중 평균으로 Householder 벡터 생성
         v_input = input_weights @ self.shared_neurons.input_householder  # [B, S, d_model]
 
-        # 2. base_input을 Householder로 변형
-        dynamic_input = self.shared_neurons.apply_householder_to_matrix(
-            self.shared_neurons.base_input, v_input
-        )  # [B, S, d_model, rank]
+        # 2. x에 Householder 직접 적용 (H @ x)
+        x_transformed = self.shared_neurons.apply_householder_to_vector(x, v_input)  # [B, S, d_model]
 
-        # 3. 동적 압축
-        x_compressed = torch.einsum('bsd,bsdr->bsr', x, dynamic_input)  # [B, S, rank]
+        # 3. base_input으로 압축
+        x_compressed = x_transformed @ self.shared_neurons.base_input  # [B, S, rank]
 
         # 4. Process Householder 선택 (top-k)
         process_scores = self.process_router(x_compressed)  # [B, S, n_process]
@@ -238,10 +240,10 @@ class Expander(nn.Module):
     """
     rank → d_model 복원
 
-    v9.0:
+    v9.0 (최적화):
     1. Process Householder 선택 → rank 공간에서 변환
-    2. Output Householder 선택 → base_output 동적 변형
-    3. 동적 확장: x @ dynamic_output
+    2. base_output으로 확장
+    3. Output Householder 선택 → 결과에 직접 적용
     """
     def __init__(
         self,
@@ -290,24 +292,18 @@ class Expander(nn.Module):
             v = selected_v[:, :, i, :]  # [B, S, rank]
             x = self.shared_neurons.apply_householder_to_vector(x, v)
 
-        # 3. Output Householder 선택 (soft selection)
+        # 3. Output Householder 선택 (soft selection) - 확장 전에 라우팅 결정
         output_scores = self.output_router(x)  # [B, S, n_process]
         output_weights = F.softmax(output_scores, dim=-1)  # [B, S, n_process]
 
         # 가중 평균으로 Householder 벡터 생성
         v_output = output_weights @ self.shared_neurons.output_householder  # [B, S, d_model]
 
-        # 4. base_output을 Householder로 변형
-        # base_output: [rank, d_model] -> apply H from left
-        # H @ base_output.T = (base_output @ H.T).T
-        # 더 간단하게: base_output.T를 변형 후 다시 transpose
-        dynamic_output = self.shared_neurons.apply_householder_to_matrix(
-            self.shared_neurons.base_output.T, v_output
-        )  # [B, S, d_model, rank]
-        dynamic_output = dynamic_output.transpose(-1, -2)  # [B, S, rank, d_model]
+        # 4. base_output으로 확장
+        x_expanded = x @ self.shared_neurons.base_output  # [B, S, d_model]
 
-        # 5. 동적 확장
-        x_expanded = torch.einsum('bsr,bsrd->bsd', x, dynamic_output)  # [B, S, d_model]
+        # 5. 결과에 Householder 직접 적용 (H @ x_expanded)
+        x_expanded = self.shared_neurons.apply_householder_to_vector(x_expanded, v_output)
 
         routing_info = {
             'process_indices': process_indices,
