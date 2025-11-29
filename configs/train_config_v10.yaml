@@ -16,7 +16,7 @@ model:
   d_model: 320
   n_layers: 4
   n_heads: 4
-  rank: 80
+  rank: 64
 
   # CompressNeurons / ExpandNeurons (통합 풀)
   n_compress: 48          # Q/K/V/M 공유 (줄임)
