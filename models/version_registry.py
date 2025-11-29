@@ -46,6 +46,27 @@ from typing import Dict, Any, List, Optional, Callable
 #   - module: Module name to import from
 
 VERSION_REGISTRY = {
+    "10.0": {
+        "description": "Simplified Compress/Expand (No Householder, Q/K/V/M 통합)",
+        "aliases": ["10", "100"],
+        "module": "model_v10",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v10.0): rank={args.get('rank', args.get('basis_rank'))} - No Householder!",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (Q/K/V/M shared)",
+            f"  ExpandNeurons: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (O shared)",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('rank', args.get('basis_rank'))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - Knowledge top-k: {args.get('knowledge_k')}",
+        ],
+    },
     "9.1": {
         "description": "v9.0 + hard selection + gated reflection + separate reflect pools",
         "aliases": ["91"],
