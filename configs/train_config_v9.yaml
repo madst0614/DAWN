@@ -1,5 +1,5 @@
 # DAWN v9.0 Training Config
-# Simplified Input/Output: Single shared neurons, diversity from Process Householder only
+# Per-type Input neurons (Q/K/V/M each 1), shared Output (1), no routers
 
 # Data (~100M train / ~20M val tokens)
 data:
@@ -56,21 +56,24 @@ log_dir: logs/v9
 
 # Architecture v9.0:
 #   SharedNeurons (shared across all layers):
-#     - input_neuron: [d_model, rank]           # Single shared compression matrix
+#     - input_neuron_q: [d_model, rank]         # Q compression matrix
+#     - input_neuron_k: [d_model, rank]         # K compression matrix
+#     - input_neuron_v: [d_model, rank]         # V compression matrix
+#     - input_neuron_m: [d_model, rank]         # Memory Query compression matrix
 #     - process_neurons_q: [n_process, rank]    # Q Householder pool
 #     - process_neurons_k: [n_process, rank]    # K Householder pool
 #     - process_neurons_v: [n_process, rank]    # V Householder pool
 #     - process_neurons_o: [n_process, rank]    # O Householder pool
 #     - process_neurons_m: [n_process, rank]    # Memory Query Householder pool
-#     - output_neuron: [rank, d_model]          # Single shared expansion matrix
+#     - output_neuron: [rank, d_model]          # Shared expansion matrix
 #     - knowledge_K: [n_knowledge, rank]
 #     - knowledge_V: [n_knowledge, d_model]
 #
 #   Key differences from v8.1:
-#     - No input_router in Compressor (just x @ input_neuron)
-#     - No output_router in Expander (just x @ output_neuron)
-#     - All diversity from Process Householder selection
+#     - Per-type input neurons (Q/K/V/M each 1), no input_router
+#     - Single shared output_neuron, no output_router
+#     - Diversity from Process Householder selection
 #
 #   Parameter savings (vs v8.1):
-#     - Input: 4 * n_input * d_model * rank -> d_model * rank (~524K -> 16K)
+#     - Input: 4 * n_input * d_model * rank -> 4 * d_model * rank (~524K -> 65K)
 #     - Output: n_output * rank * d_model -> rank * d_model (~131K -> 16K)

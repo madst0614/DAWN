@@ -1,7 +1,7 @@
 """
 DAWN Models Module
 
-v9.0: Simplified Input/Output (single shared neurons, diversity from Process only)
+v9.0: Per-type Input neurons (Q/K/V/M each 1), shared Output, no routers
 v8.0: SharedNeurons + NeuronMemory (QK/V/O/M 분리, Query Compressor)
 v7.9: NeuronCircuit with Householder Transformations
 v7.8: Independent Neuron Projections (No Basis Mixing)
