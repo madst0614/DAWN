@@ -1,5 +1,6 @@
 # DAWN v10.0 Training Config
-# Simplified Compress/Expand Architecture (No Householder)
+# Simplified architecture: Compress + Expand (no Householder)
+# Unified neuron pools for all Q/K/V/O/M
 
 # Data
 data:
@@ -12,14 +13,14 @@ data:
 # Model Architecture (v10.0)
 model:
   model_version: "10.0"
-  d_model: 320            # 256 → 320 for 11M target
+  d_model: 320
   n_layers: 4
   n_heads: 4
-  rank: 80                # 64 → 80
 
-  # CompressNeurons/ExpandNeurons (통합 풀)
-  n_compress: 64          # Q/K/V/M 공유
-  n_expand: 64            # O 공유
+  # CompressNeurons / ExpandNeurons (통합 풀)
+  rank: 80
+  n_compress: 80          # Q/K/V/M 공유 (4:1 비율)
+  n_expand: 20            # O 공유
 
   # KnowledgeNeurons
   n_knowledge: 80
@@ -35,36 +36,22 @@ training:
   num_epochs: 30
   lr: 0.0003
   weight_decay: 0.1
-  warmup_epochs: 2
+  warmup_ratio: 0.05
 
-  # Regularization
   orthogonality_weight: 0.01
-  load_balance_weight: 0.0   # soft routing이라 필요 없음
+  load_balance_weight: 0.01
 
-# Mixed precision
 use_amp: true
-
-# Paths
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10
 log_dir: /content/drive/MyDrive/dawn/logs_v10
 
-# Architecture v10.0:
-#   SharedNeurons:
-#     CompressNeurons: [64, 320, 80] = 1.6M (Q/K/V/M 공유)
-#     ExpandNeurons: [64, 80, 320] = 1.6M (O 공유)
-#     KnowledgeNeurons: 80×80 + 80×320 = 32K
+# 파라미터 계산:
+#   compress: 80 × 320 × 80 = 2,048,000
+#   expand: 20 × 80 × 320 = 512,000
+#   knowledge: 80×80 + 80×320 = 32,000
+#   SharedNeurons 총: ~2.59M
 #
-#   Key simplifications:
-#     - No ProcessNeurons (Householder 제거)
-#     - Q/K/V/M 모두 같은 compress_neurons 사용 (라우터만 독립)
-#     - O는 expand_neurons 사용
-#     - Soft routing only (top-k 없음)
+#   embeddings: 30522 × 320 = 9,767,040
+#   layernorms, routers 등: ~0.5M
 #
-#   Parameter breakdown:
-#     compress_neurons: 64 × 320 × 80 = 1,638,400
-#     expand_neurons: 64 × 80 × 320 = 1,638,400
-#     knowledge_K: 80 × 80 = 6,400
-#     knowledge_V: 80 × 320 = 25,600
-#     embeddings: 30K × 320 = 9,600,000
-#     routers/norms: ~500K
-#     Total: ~13.4M (weight tying으로 ~11M)
+#   예상 전체: ~11M (Vanilla Transformer와 동급)
