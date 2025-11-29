@@ -2,15 +2,14 @@
 DAWN v9.0 - Dynamic Architecture With Neurons
 
 핵심 철학:
-- 모든 변환이 "기저(Projection) + 반사(Reflection)" 조합
+- 다중 압축/확장 뉴런 + 반사 변환 조합
 - ReflectionNeurons 풀을 Q/K/V/O/M이 공유
 - 라우터만 타입별/레이어별 독립 → 다른 조합 선택
 
 구조:
     SharedNeurons
-    ├── ProjectionNeurons (투영 기저)
-    │   ├── base_input: [d_model, rank]
-    │   └── base_output: [rank, d_model]
+    ├── CompressNeurons: [n_compress, d_model, rank]   # 다중 압축 행렬
+    ├── ExpandNeurons: [n_expand, rank, d_model]       # 다중 확장 행렬
     │
     ├── ReflectionNeurons (반사 변환 - 통합 풀)
     │   ├── reflect_d: [n_reflect, d_model]  # d_model 차원용
@@ -23,29 +22,31 @@ DAWN v9.0 - Dynamic Architecture With Neurons
 변환 흐름:
     [Compressor: d_model → rank]
     x [d_model]
-    → reflect_d 적용 (d_model 공간 반사)
-    → @ base_input (압축)
+    → reflect_d 적용 (관점 변환)
+    → compress_neuron 선택 (soft combination)
     → output [rank]
 
     [Expander: rank → d_model]
     x [rank]
-    → reflect_r 적용 (rank 공간 반사)
-    → @ base_output (확장)
-    → reflect_d 적용 (d_model 공간 반사)
+    → reflect_r 적용 (잠재 공간 변환)
+    → expand_neuron 선택 (soft combination)
+    → reflect_d 적용 (출력 관점 변환)
     → output [d_model]
 
 역할 분리:
-    - reflect_d: 입출력 관점 (256차원, Compressor/Expander 양쪽)
+    - reflect_d: 입출력 관점 (256차원)
     - reflect_r: 잠재 공간 변환 (64차원, Expander에서만)
+    - compress_neurons: 다중 압축 기저
+    - expand_neurons: 다중 확장 기저
 
-파라미터:
-- base_input: 256 × 64 = 16K
-- base_output: 64 × 256 = 16K
-- reflect_d: 32 × 256 = 8K
-- reflect_r: 32 × 64 = 2K
+파라미터 (n_compress=4, n_expand=4, n_reflect=128):
+- compress_neurons: 4 × 256 × 64 = 64K
+- expand_neurons: 4 × 64 × 256 = 64K
+- reflect_d: 128 × 256 = 32K
+- reflect_r: 128 × 64 = 8K
 - knowledge_K: 64 × 64 = 4K
 - knowledge_V: 64 × 256 = 16K
-- 총: ~62K (vs v8.1 655K, 90% 절감)
+- 총: ~188K
 """
 
 import torch
@@ -59,7 +60,7 @@ class SharedNeurons(nn.Module):
     공유 뉴런 풀 - 모든 레이어에서 참조
 
     v9.0:
-    - ProjectionNeurons: base_input/output
+    - CompressNeurons/ExpandNeurons: 다중 압축/확장 행렬
     - ReflectionNeurons: reflect_d/reflect_r (통합 풀, 라우터만 분리)
     - KnowledgeNeurons: knowledge_K/V
     """
@@ -67,6 +68,8 @@ class SharedNeurons(nn.Module):
         self,
         d_model: int,
         rank: int,
+        n_compress: int,
+        n_expand: int,
         n_reflect: int,
         n_knowledge: int,
         # Legacy params (ignored)
@@ -77,12 +80,16 @@ class SharedNeurons(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
+        self.n_compress = n_compress
+        self.n_expand = n_expand
         self.n_reflect = n_reflect
         self.n_knowledge = n_knowledge
 
-        # ProjectionNeurons
-        self.base_input = nn.Parameter(torch.zeros(d_model, rank))
-        self.base_output = nn.Parameter(torch.zeros(rank, d_model))
+        # CompressNeurons (다중 압축 행렬)
+        self.compress_neurons = nn.Parameter(torch.zeros(n_compress, d_model, rank))
+
+        # ExpandNeurons (다중 확장 행렬)
+        self.expand_neurons = nn.Parameter(torch.zeros(n_expand, rank, d_model))
 
         # ReflectionNeurons (통합 풀)
         self.reflect_d = nn.Parameter(torch.zeros(n_reflect, d_model))
@@ -96,21 +103,23 @@ class SharedNeurons(nn.Module):
 
     def _init_weights(self):
         """뉴런 초기화"""
-        # base_input: 직교 초기화 (QR)
-        if self.d_model >= self.rank:
-            q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
-            self.base_input.data = q
-        else:
-            q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
-            self.base_input.data = q.T
+        # compress_neurons: 각각 직교 초기화
+        for i in range(self.n_compress):
+            if self.d_model >= self.rank:
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.compress_neurons.data[i] = q
+            else:
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.compress_neurons.data[i] = q.T
 
-        # base_output: 직교 초기화 (QR)
-        if self.rank >= self.d_model:
-            q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
-            self.base_output.data = q
-        else:
-            q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
-            self.base_output.data = q.T
+        # expand_neurons: 각각 직교 초기화
+        for i in range(self.n_expand):
+            if self.rank >= self.d_model:
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.expand_neurons.data[i] = q
+            else:
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.expand_neurons.data[i] = q.T
 
         # reflect_d: 단위 벡터 초기화
         for i in range(self.n_reflect):
@@ -151,14 +160,15 @@ class Compressor(nn.Module):
     """
     d_model → rank 압축
 
-    1. reflect_d 적용 (d_model 공간 반사)
-    2. @ base_input (압축)
+    1. reflect_d 적용 (관점 변환)
+    2. compress_neuron 선택 (soft combination)
     """
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
         rank: int,
+        n_compress: int,
         n_reflect: int,
         reflect_k: int,
         neuron_type: str = 'q',
@@ -171,12 +181,14 @@ class Compressor(nn.Module):
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.rank = rank
+        self.n_compress = n_compress
         self.n_reflect = n_reflect
         self.reflect_k = reflect_k
         self.neuron_type = neuron_type
 
         # 독립 라우터 (타입별/레이어별)
         self.router_d = nn.Linear(d_model, n_reflect, bias=False)
+        self.router_compress = nn.Linear(d_model, n_compress, bias=False)
 
     def forward(self, x):
         """
@@ -199,11 +211,19 @@ class Compressor(nn.Module):
             v = sn.reflect_d[idx]  # [B, S, d_model]
             x = sn.apply_reflection(x, v)
 
-        # 2. 압축
-        x = x @ sn.base_input  # [B, S, rank]
+        # 2. compress_neuron 선택 (soft combination)
+        scores_c = self.router_compress(x)  # [B, S, n_compress]
+        weights_c = F.softmax(scores_c, dim=-1)  # [B, S, n_compress]
+
+        # Soft combination: weighted sum of projections
+        # x: [B, S, d_model], compress_neurons: [n_compress, d_model, rank]
+        # x @ compress_neurons[i] for each i, then weighted sum
+        x = torch.einsum('bsd,cdr->bscr', x, sn.compress_neurons)  # [B, S, n_compress, rank]
+        x = torch.einsum('bscr,bsc->bsr', x, weights_c)  # [B, S, rank]
 
         routing_info = {
             'indices_d': indices_d,
+            'weights_compress': weights_c,
         }
 
         return x, routing_info
@@ -213,15 +233,16 @@ class Expander(nn.Module):
     """
     rank → d_model 확장
 
-    1. reflect_r 적용 (rank 공간 반사)
-    2. @ base_output (확장)
-    3. reflect_d 적용 (d_model 공간 반사)
+    1. reflect_r 적용 (잠재 공간 변환)
+    2. expand_neuron 선택 (soft combination)
+    3. reflect_d 적용 (출력 관점 변환)
     """
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
         rank: int,
+        n_expand: int,
         n_reflect: int,
         reflect_k: int,
         neuron_type: str = 'o',
@@ -234,12 +255,14 @@ class Expander(nn.Module):
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.rank = rank
+        self.n_expand = n_expand
         self.n_reflect = n_reflect
         self.reflect_k = reflect_k
         self.neuron_type = neuron_type
 
         # 독립 라우터
         self.router_r = nn.Linear(rank, n_reflect, bias=False)
+        self.router_expand = nn.Linear(rank, n_expand, bias=False)
         self.router_d = nn.Linear(d_model, n_reflect, bias=False)
 
     def forward(self, x):
@@ -263,8 +286,14 @@ class Expander(nn.Module):
             v = sn.reflect_r[idx]  # [B, S, rank]
             x = sn.apply_reflection(x, v)
 
-        # 2. 확장
-        x = x @ sn.base_output  # [B, S, d_model]
+        # 2. expand_neuron 선택 (soft combination)
+        scores_e = self.router_expand(x)  # [B, S, n_expand]
+        weights_e = F.softmax(scores_e, dim=-1)  # [B, S, n_expand]
+
+        # Soft combination: weighted sum of expansions
+        # x: [B, S, rank], expand_neurons: [n_expand, rank, d_model]
+        x = torch.einsum('bsr,erd->bsed', x, sn.expand_neurons)  # [B, S, n_expand, d_model]
+        x = torch.einsum('bsed,bse->bsd', x, weights_e)  # [B, S, d_model]
 
         # 3. d_model 공간 반사 (top-k)
         scores_d = self.router_d(x)  # [B, S, n_reflect]
@@ -277,6 +306,7 @@ class Expander(nn.Module):
 
         routing_info = {
             'indices_r': indices_r,
+            'weights_expand': weights_e,
             'indices_d': indices_d,
         }
 
@@ -293,6 +323,8 @@ class NeuronAttention(nn.Module):
         d_model: int,
         n_heads: int,
         rank: int,
+        n_compress: int,
+        n_expand: int,
         n_reflect: int,
         reflect_k: int,
         dropout: float = 0.1,
@@ -309,11 +341,11 @@ class NeuronAttention(nn.Module):
         self.d_head = rank // n_heads
         self.rank = rank
 
-        # Q/K/V/O - 같은 ReflectionNeurons 풀 공유, 라우터만 독립
-        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='q')
-        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='k')
-        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='v')
-        self.expander_O = Expander(shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='o')
+        # Q/K/V/O - 같은 풀 공유, 라우터만 독립
+        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_compress, n_reflect, reflect_k, neuron_type='q')
+        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_compress, n_reflect, reflect_k, neuron_type='k')
+        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_compress, n_reflect, reflect_k, neuron_type='v')
+        self.expander_O = Expander(shared_neurons, d_model, rank, n_expand, n_reflect, reflect_k, neuron_type='o')
 
         self.dropout = nn.Dropout(dropout)
 
@@ -364,6 +396,7 @@ class NeuronMemory(nn.Module):
         shared_neurons: SharedNeurons,
         d_model: int,
         rank: int,
+        n_compress: int,
         n_reflect: int,
         reflect_k: int,
         knowledge_k: int = 8,
@@ -379,7 +412,7 @@ class NeuronMemory(nn.Module):
         self.knowledge_k = knowledge_k
 
         self.query_compressor = Compressor(
-            shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='m'
+            shared_neurons, d_model, rank, n_compress, n_reflect, reflect_k, neuron_type='m'
         )
 
     def forward(self, x):
@@ -416,6 +449,8 @@ class NeuronCircuit(nn.Module):
         d_model: int,
         n_heads: int,
         rank: int,
+        n_compress: int,
+        n_expand: int,
         n_reflect: int,
         reflect_k: int,
         knowledge_k: int,
@@ -433,6 +468,8 @@ class NeuronCircuit(nn.Module):
             d_model=d_model,
             n_heads=n_heads,
             rank=rank,
+            n_compress=n_compress,
+            n_expand=n_expand,
             n_reflect=n_reflect,
             reflect_k=reflect_k,
             dropout=dropout,
@@ -442,6 +479,7 @@ class NeuronCircuit(nn.Module):
             shared_neurons=shared_neurons,
             d_model=d_model,
             rank=rank,
+            n_compress=n_compress,
             n_reflect=n_reflect,
             reflect_k=reflect_k,
             knowledge_k=knowledge_k,
@@ -471,8 +509,8 @@ class DAWN(nn.Module):
     """
     DAWN v9.0 - Dynamic Architecture With Neurons
 
-    핵심: Projection + Reflection 조합
-    - ProjectionNeurons: base_input/output
+    핵심: 다중 Compress/Expand + Reflection 조합
+    - CompressNeurons/ExpandNeurons: 다중 압축/확장 행렬 (soft selection)
     - ReflectionNeurons: reflect_d/reflect_r (통합 풀)
     - 각 Q/K/V/O/M이 같은 풀 공유, 라우터만 독립
     """
@@ -486,7 +524,9 @@ class DAWN(nn.Module):
         n_heads: int = 4,
         rank: int = 64,
         max_seq_len: int = 128,
-        n_reflect: int = 32,
+        n_compress: int = 4,
+        n_expand: int = 4,
+        n_reflect: int = 128,
         reflect_k: int = 3,
         n_knowledge: int = 64,
         knowledge_k: int = 8,
@@ -513,6 +553,8 @@ class DAWN(nn.Module):
         self.rank = rank
         self.max_seq_len = max_seq_len
 
+        self.n_compress = n_compress
+        self.n_expand = n_expand
         self.n_reflect = n_reflect
         self.reflect_k = reflect_k
         self.n_knowledge = n_knowledge
@@ -530,6 +572,8 @@ class DAWN(nn.Module):
         self.shared_neurons = SharedNeurons(
             d_model=d_model,
             rank=rank,
+            n_compress=n_compress,
+            n_expand=n_expand,
             n_reflect=n_reflect,
             n_knowledge=n_knowledge,
         )
@@ -540,6 +584,8 @@ class DAWN(nn.Module):
                 d_model=d_model,
                 n_heads=n_heads,
                 rank=rank,
+                n_compress=n_compress,
+                n_expand=n_expand,
                 n_reflect=n_reflect,
                 reflect_k=reflect_k,
                 knowledge_k=knowledge_k,
@@ -614,21 +660,24 @@ class DAWN(nn.Module):
         return (loss, logits) if labels is not None else logits
 
     def orthogonality_loss(self):
-        """ProjectionNeurons 직교성 유지"""
+        """Compress/ExpandNeurons 직교성 유지"""
         loss = 0.0
 
-        # base_input: [d_model, rank] -> W.T @ W ≈ I
-        inp = self.shared_neurons.base_input
-        WtW = inp.T @ inp
-        I = torch.eye(self.rank, device=inp.device)
-        loss += ((WtW - I) ** 2).mean()
+        # compress_neurons: 각 [d_model, rank] -> W.T @ W ≈ I
+        for i in range(self.n_compress):
+            W = self.shared_neurons.compress_neurons[i]
+            WtW = W.T @ W
+            I = torch.eye(self.rank, device=W.device)
+            loss += ((WtW - I) ** 2).mean()
 
-        # base_output: [rank, d_model] -> W @ W.T ≈ I
-        out = self.shared_neurons.base_output
-        WWt = out @ out.T
-        loss += ((WWt - I) ** 2).mean()
+        # expand_neurons: 각 [rank, d_model] -> W @ W.T ≈ I
+        for i in range(self.n_expand):
+            W = self.shared_neurons.expand_neurons[i]
+            WWt = W @ W.T
+            I = torch.eye(self.rank, device=W.device)
+            loss += ((WWt - I) ** 2).mean()
 
-        return loss / 2
+        return loss / (self.n_compress + self.n_expand)
 
     def reflection_norm_loss(self):
         """ReflectionNeurons ||v|| ≈ 1 유지"""
@@ -670,6 +719,8 @@ class DAWN(nn.Module):
             'n_heads': self.n_heads,
             'rank': self.rank,
             'max_seq_len': self.max_seq_len,
+            'n_compress': self.n_compress,
+            'n_expand': self.n_expand,
             'n_reflect': self.n_reflect,
             'reflect_k': self.reflect_k,
             'n_knowledge': self.n_knowledge,

@@ -1380,16 +1380,17 @@ def main():
         print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
         if model_version == "9.0":
-            # v9.0: ProjectionNeurons + ReflectionNeurons
+            # v9.0: CompressNeurons + ExpandNeurons + ReflectionNeurons
             rank = getattr(args, 'rank', args.basis_rank)
-            n_reflect = getattr(args, 'n_reflect', getattr(args, 'n_process', 32))
+            n_compress = getattr(args, 'n_compress', 4)
+            n_expand = getattr(args, 'n_expand', 4)
+            n_reflect = getattr(args, 'n_reflect', getattr(args, 'n_process', 128))
             reflect_k = getattr(args, 'reflect_k', getattr(args, 'process_k', 3))
             n_knowledge = getattr(args, 'n_knowledge', 64)
             knowledge_k = getattr(args, 'knowledge_k', 8)
             print(f"SharedNeurons (v{model_version}): rank={rank}")
-            print(f"  ProjectionNeurons:")
-            print(f"    - base_input: {args.d_model} × {rank}")
-            print(f"    - base_output: {rank} × {args.d_model}")
+            print(f"  CompressNeurons: {n_compress} × {args.d_model} × {rank}")
+            print(f"  ExpandNeurons: {n_expand} × {rank} × {args.d_model}")
             print(f"  ReflectionNeurons (unified pool):")
             print(f"    - reflect_d: {n_reflect} × {args.d_model}")
             print(f"    - reflect_r: {n_reflect} × {rank}")
@@ -1586,11 +1587,13 @@ def main():
                 'rank': args.basis_rank,  # v8.x uses 'rank' instead of 'basis_rank'
             })
 
-        # v9.0 ProjectionNeurons + ReflectionNeurons
+        # v9.0 CompressNeurons + ExpandNeurons + ReflectionNeurons
         if model_version == '9.0':
             model_kwargs.update({
-                'n_reflect': getattr(args, 'n_reflect', args.n_process),
-                'reflect_k': getattr(args, 'reflect_k', args.process_k),
+                'n_compress': getattr(args, 'n_compress', 4),
+                'n_expand': getattr(args, 'n_expand', 4),
+                'n_reflect': getattr(args, 'n_reflect', getattr(args, 'n_process', 128)),
+                'reflect_k': getattr(args, 'reflect_k', getattr(args, 'process_k', 3)),
                 'n_knowledge': getattr(args, 'n_knowledge', 64),
                 'knowledge_k': getattr(args, 'knowledge_k', 8),
                 'rank': args.basis_rank,

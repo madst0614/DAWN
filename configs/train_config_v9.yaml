@@ -1,5 +1,5 @@
 # DAWN v9.0 Training Config
-# ProjectionNeurons + ReflectionNeurons (unified pool)
+# CompressNeurons + ExpandNeurons + ReflectionNeurons
 
 # Data (~100M train / ~20M val tokens)
 data:
@@ -13,16 +13,20 @@ data:
     - validation/openwebtext_5to1_texts.pkl
     - validation/wikitext_5to1_texts.pkl
 
-# Model Architecture (v9.0: Projection + Reflection)
+# Model Architecture (v9.0: Compress/Expand + Reflection)
 model:
   model_version: "9.0"    # DAWN v9.0
   d_model: 256            # Hidden dimension
   n_layers: 4             # Number of transformer layers
   n_heads: 4              # Number of attention heads
 
-  # ProjectionNeurons + ReflectionNeurons parameters
+  # Compress/Expand Neurons parameters
   rank: 64                # Projection rank (4 heads x 16 d_head)
-  n_reflect: 32           # Size of ReflectionNeurons pool
+  n_compress: 4           # Number of compress neurons (soft selection)
+  n_expand: 4             # Number of expand neurons (soft selection)
+
+  # ReflectionNeurons parameters
+  n_reflect: 128          # Size of ReflectionNeurons pool
   reflect_k: 3            # Number of reflections to select (top-k)
 
   # KnowledgeNeurons parameters
@@ -42,7 +46,7 @@ training:
   warmup_epochs: 2        # Warmup epochs
 
   # Regularization
-  orthogonality_weight: 0.01   # Projection orthogonality loss
+  orthogonality_weight: 0.01   # Compress/Expand orthogonality loss
   process_norm_weight: 0.01    # Reflection norm regularization (||v|| = 1)
   load_balance_weight: 0.01    # Load balance loss for routing
 
@@ -55,9 +59,8 @@ log_dir: logs/v9
 
 # Architecture v9.0:
 #   SharedNeurons (shared across all layers):
-#     ProjectionNeurons:
-#       - base_input: [d_model, rank]       # Base compression matrix
-#       - base_output: [rank, d_model]      # Base expansion matrix
+#     CompressNeurons: [n_compress, d_model, rank]   # Multiple compression matrices
+#     ExpandNeurons: [n_expand, rank, d_model]       # Multiple expansion matrices
 #
 #     ReflectionNeurons (unified pool):
 #       - reflect_d: [n_reflect, d_model]   # d_model space reflections
@@ -68,16 +71,16 @@ log_dir: logs/v9
 #       - knowledge_V: [n_knowledge, d_model]
 #
 #   Key design:
-#     - Q/K/V/O/M share same ReflectionNeurons pool
+#     - Q/K/V/O/M share same Compress/Expand/Reflection pools
 #     - Only routers are independent per type/layer
-#     - Compressor: reflect_d → base_input → reflect_r
-#     - Expander: reflect_r → base_output → reflect_d
+#     - Compressor: reflect_d → compress_neuron (soft) → output
+#     - Expander: reflect_r → expand_neuron (soft) → reflect_d → output
 #
-#   Parameter breakdown:
-#     - base_input: 256 × 64 = 16K
-#     - base_output: 64 × 256 = 16K
-#     - reflect_d: 32 × 256 = 8K
-#     - reflect_r: 32 × 64 = 2K
+#   Parameter breakdown (n_compress=4, n_expand=4, n_reflect=128):
+#     - compress_neurons: 4 × 256 × 64 = 64K
+#     - expand_neurons: 4 × 64 × 256 = 64K
+#     - reflect_d: 128 × 256 = 32K
+#     - reflect_r: 128 × 64 = 8K
 #     - knowledge_K: 64 × 64 = 4K
 #     - knowledge_V: 64 × 256 = 16K
-#     - Total: ~62K (vs v8.1 655K, 90% reduction)
+#     - Total: ~188K
