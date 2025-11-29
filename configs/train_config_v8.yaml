@@ -52,8 +52,8 @@ training:
 use_amp: true
 
 # Paths
-checkpoint_dir: checkpoints/v8
-log_dir: logs/v8
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v8
+log_dir: /content/drive/MyDrive/dawn/logs_v8
 
 # Architecture:
 #   SharedNeurons (shared across all layers):

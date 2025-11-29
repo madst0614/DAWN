@@ -54,8 +54,8 @@ training:
 use_amp: true
 
 # Paths
-checkpoint_dir: checkpoints/v9
-log_dir: logs/v9
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v9
+log_dir: /content/drive/MyDrive/dawn/logs_v9
 
 # Architecture v9.0:
 #   SharedNeurons (shared across all layers):

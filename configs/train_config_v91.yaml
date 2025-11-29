@@ -55,8 +55,8 @@ training:
 use_amp: true
 
 # Paths
-checkpoint_dir: checkpoints/v91
-log_dir: logs/v91
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v91
+log_dir: /content/drive/MyDrive/dawn/logs_v91
 
 # v9.0 -> v9.1 Changes:
 #   1. Compress/Expand: soft (weighted sum) -> hard (argmax)
