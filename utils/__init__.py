@@ -1,7 +1,7 @@
 """
 DAWN Utilities
 
-Data processing and training utilities.
+Data processing, training, and checkpoint utilities.
 """
 
 # Data utilities
@@ -21,6 +21,16 @@ from .training import (
     count_parameters,
 )
 
+# Checkpoint utilities
+from .checkpoint import (
+    VERSION_PARAM_CHANGES,
+    strip_compile_prefix,
+    categorize_keys,
+    load_checkpoint_smart,
+    print_load_info,
+    load_optimizer_state,
+)
+
 __all__ = [
     # Data utilities
     "SpanMasker",
@@ -33,4 +43,11 @@ __all__ = [
     "TrainingMonitor",
     "format_time",
     "count_parameters",
+    # Checkpoint utilities
+    "VERSION_PARAM_CHANGES",
+    "strip_compile_prefix",
+    "categorize_keys",
+    "load_checkpoint_smart",
+    "print_load_info",
+    "load_optimizer_state",
 ]
