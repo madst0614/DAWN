@@ -1,16 +1,12 @@
 # DAWN v8.0 Training Config
 # Unified v8 architecture: SharedNeurons + NeuronMemory with Query Compressor
 
-# Data (~100M train / ~20M val tokens)
+# Data
 data:
   base_dir: /content/drive/MyDrive/data
   train_files:
-    - train/c4_5to1_texts.pkl
-    - train/openwebtext_5to1_texts.pkl
     - train/wikitext_5to1_texts.pkl
   val_files:
-    - validation/c4_5to1_texts.pkl
-    - validation/openwebtext_5to1_texts.pkl
     - validation/wikitext_5to1_texts.pkl
 
 # Model Architecture (v8.0: Unified)
