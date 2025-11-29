@@ -569,8 +569,8 @@ def is_v75_or_v76_model(model):
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, debug_logger=None,
-                ckpt_manager=None, model_config=None):
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, process_norm_weight=0.0,
+                debug_logger=None, ckpt_manager=None, model_config=None):
     """Train for one epoch"""
     model.train()
 
@@ -689,8 +689,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             lb_loss += ((freq - uniform) ** 2).sum() * base_model.n_neurons
                         lb_loss = lb_loss / len(routing_infos)
 
+                    # Process neuron norm loss (v8.0+)
+                    norm_loss = 0.0
+                    if process_norm_weight > 0 and hasattr(base_model, 'process_norm_loss'):
+                        norm_loss = base_model.process_norm_loss()
+
                     # Total loss
-                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + process_norm_weight * norm_loss
 
             scaler.scale(loss).backward()
 
@@ -786,8 +791,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         lb_loss += ((freq - uniform) ** 2).sum() * base_model.n_neurons
                     lb_loss = lb_loss / len(routing_infos)
 
+                # Process neuron norm loss (v8.0+)
+                norm_loss = 0.0
+                if process_norm_weight > 0 and hasattr(base_model, 'process_norm_loss'):
+                    norm_loss = base_model.process_norm_loss()
+
                 # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + process_norm_weight * norm_loss
 
             loss.backward()
 
@@ -1219,6 +1229,7 @@ def main():
     args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.0)  # v6.0 compat
     args.diversity_weight = cfg['training'].get('diversity_weight', 0.0)  # v7.0: recipe diversity
     args.load_balance_weight = cfg['training'].get('load_balance_weight', 0.0)  # v7.0: load balance
+    args.process_norm_weight = cfg['training'].get('process_norm_weight', 0.0)  # v8.0: process neuron norm
 
     # Other
     args.use_amp = cfg.get('use_amp', True)
@@ -1376,6 +1387,7 @@ def main():
             args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
             args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
             args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
+            args.process_norm_weight = checkpoint_training_config.get('process_norm_weight', args.process_norm_weight)
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
@@ -1675,6 +1687,7 @@ def main():
             orthogonality_weight=args.orthogonality_weight,
             diversity_weight=args.diversity_weight,
             load_balance_weight=args.load_balance_weight,
+            process_norm_weight=args.process_norm_weight,
             debug_logger=debug_logger,
             ckpt_manager=ckpt_manager,
             model_config=model_kwargs
