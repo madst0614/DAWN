@@ -52,8 +52,9 @@ import math
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
-from models import DAWN, DAWNLanguageModel, create_model_by_version  # v7.1 default, version-aware loading
+from models import create_model_by_version, print_version_info, normalize_version
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
+from utils.checkpoint import load_checkpoint_smart, load_optimizer_state, strip_compile_prefix
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
 
 
@@ -1142,7 +1143,7 @@ def main():
     args = Args()
 
     # Model (Dynamic Neuron Transformer)
-    args.model_version = cfg['model'].get('model_version', '7.1')  # Default to latest
+    args.model_version = cfg['model'].get('model_version', '9.0')  # Default to v9.0
     args.d_model = cfg['model'].get('d_model', 512)
     args.n_layers = cfg['model'].get('n_layers', 6)
     args.n_heads = cfg['model'].get('n_heads', 8)
@@ -1176,6 +1177,15 @@ def main():
     # v8.0 KnowledgeNeurons parameters
     args.n_knowledge = cfg['model'].get('n_knowledge', 64)
     args.knowledge_k = cfg['model'].get('knowledge_k', 8)
+
+    # v9.0 Compress/Expand/Reflection parameters
+    args.n_compress = cfg['model'].get('n_compress', 4)
+    args.n_expand = cfg['model'].get('n_expand', 4)
+    args.n_reflect = cfg['model'].get('n_reflect', cfg['model'].get('n_process', 128))
+    args.reflect_k = cfg['model'].get('reflect_k', cfg['model'].get('process_k', 3))
+    # v9.1: separate reflection pools
+    args.n_reflect_d = cfg['model'].get('n_reflect_d', cfg['model'].get('n_reflect', 64))
+    args.n_reflect_r = cfg['model'].get('n_reflect_r', cfg['model'].get('n_reflect', 64))
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -1274,7 +1284,7 @@ def main():
         kst = timezone(timedelta(hours=9))
         timestamp = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
         random_suffix = random.randint(1000, 9999)
-        version = cfg['model'].get('model_version', DAWN.__version__)
+        version = cfg['model'].get('model_version', '9.0')
         run_name = f"run_v{version}_{timestamp}_{random_suffix}"
         checkpoint_dir = base_checkpoint_dir / run_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -1282,7 +1292,7 @@ def main():
 
         # Save config for new runs (add model version if not present)
         if 'model_version' not in cfg['model']:
-            cfg['model']['model_version'] = DAWN.__version__
+            cfg['model']['model_version'] = '9.0'
         with open(checkpoint_dir / 'config.json', 'w') as f:
             json.dump(cfg, f, indent=2)
 
@@ -1367,7 +1377,7 @@ def main():
     # STEP 2: Print configuration summary (using updated args)
     # ============================================================
     print(f"\n{'='*60}")
-    model_version = getattr(args, 'model_version', '7.1')
+    model_version = getattr(args, 'model_version', '9.0')
     if model_version == 'baseline':
         print(f"Vanilla Transformer Baseline Training")
     else:
@@ -1377,10 +1387,36 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
-
-        if model_version in ["8.0", "8.1", "8.2", "8.3"]:
-            # v8.0/v8.1/v8.2/v8.3: SharedNeurons + NeuronMemory (FFN 대체)
+        if model_version == "9.1":
+            # v9.1: hard selection + gated reflection + separate pools
+            rank = args.basis_rank
+            print(f"SharedNeurons (v{model_version}): rank={rank}")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (hard selection)")
+            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model} (hard selection)")
+            print(f"  ReflectionNeurons (gated, separate pools):")
+            print(f"    - reflect_d: {args.n_reflect_d} × {args.d_model}")
+            print(f"    - reflect_r: {args.n_reflect_r} × {rank}")
+            print(f"    - Reflect top-k: {args.reflect_k}")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "9.0":
+            # v9.0: CompressNeurons + ExpandNeurons + ReflectionNeurons
+            rank = args.basis_rank
+            print(f"SharedNeurons (v{model_version}): rank={rank}")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank}")
+            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model}")
+            print(f"  ReflectionNeurons (unified pool):")
+            print(f"    - reflect_d: {args.n_reflect} × {args.d_model}")
+            print(f"    - reflect_r: {args.n_reflect} × {rank}")
+            print(f"    - Reflect top-k: {args.reflect_k}")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version in ["8.0", "8.1", "8.2", "8.3"]:
+            # v8.x: SharedNeurons + NeuronMemory
             rank = getattr(args, 'rank', args.basis_rank)
             n_input = getattr(args, 'n_input', 8)
             n_process = getattr(args, 'n_process', 32)
@@ -1389,90 +1425,10 @@ def main():
             n_knowledge = getattr(args, 'n_knowledge', 64)
             knowledge_k = getattr(args, 'knowledge_k', 8)
             print(f"SharedNeurons + NeuronMemory (v{model_version}): rank={rank}")
-            print(f"  TransformNeurons (Shared):")
-            print(f"    - InputNeuron: {n_input} × {args.d_model} × {rank}")
-            if model_version == "8.3":
-                # v8.3: QK/V/O/M 분리 (Memory Query용 추가)
-                print(f"    - ProcessNeuron_QK: {n_process} × {rank} (Q, K용 Householder)")
-                print(f"    - ProcessNeuron_V: {n_process} × {rank} (V용 Householder)")
-                print(f"    - ProcessNeuron_O: {n_process} × {rank} (O용 Householder)")
-                print(f"    - ProcessNeuron_M: {n_process} × {rank} (Memory Query용 Householder)")
-            elif model_version == "8.2":
-                # v8.2: QK/V/O 분리
-                print(f"    - ProcessNeuron_QK: {n_process} × {rank} (Q, K용 Householder)")
-                print(f"    - ProcessNeuron_V: {n_process} × {rank} (V용 Householder)")
-                print(f"    - ProcessNeuron_O: {n_process} × {rank} (O용 Householder)")
-            elif model_version == "8.1":
-                # v8.1: QK/VO 분리
-                print(f"    - ProcessNeuron_QK: {n_process} × {rank} (Q, K용 Householder)")
-                print(f"    - ProcessNeuron_VO: {n_process} × {rank} (V, O용 Householder)")
-            else:
-                print(f"    - ProcessNeuron: {n_process} × {rank} (Householder vectors)")
-            print(f"    - OutputNeuron: {n_output} × {rank} × {args.d_model}")
-            print(f"    - Process top-k: {process_k}")
-            print(f"  KnowledgeNeurons (Shared):")
-            print(f"    - K: {n_knowledge} × {rank}")
-            print(f"    - V: {n_knowledge} × {args.d_model}")
-            print(f"    - Knowledge top-k: {knowledge_k}")
-            if args.orthogonality_weight > 0:
-                print(f"  - Orthogonality Loss (orth_weight={args.orthogonality_weight})")
-        elif model_version == "7.9":
-            # v7.9: NeuronCircuit with Householder Transformations
-            rank = getattr(args, 'rank', args.basis_rank)
-            n_input = getattr(args, 'n_input', 8)
-            n_process = getattr(args, 'n_process', 32)
-            n_output = getattr(args, 'n_output', 8)
-            process_k = getattr(args, 'process_k', 3)
-            print(f"NeuronCircuit with Householder (v7.9): rank={rank}")
-            print(f"  - InputNeuron: {n_input} × {args.d_model} × {rank}")
-            print(f"  - ProcessNeuron: {n_process} × {rank} (Householder vectors)")
-            print(f"  - OutputNeuron: {n_output} × {rank} × {args.d_model}")
-            print(f"  - Process top-k: {process_k}")
-            if args.orthogonality_weight > 0:
-                print(f"  - Orthogonality Loss (orth_weight={args.orthogonality_weight})")
-        elif model_version == "7.8":
-            # v7.8: Independent Neuron W_Q/K/V/O (No Basis Mixing)
-            rank = getattr(args, 'rank', args.basis_rank)  # v7.8 uses 'rank', fallback to basis_rank
-            print(f"Independent Neuron Projections (v7.8): rank={rank}")
-            print(f"  - NeuronBank: {args.n_neurons} neurons × W_Q/K/V/O each")
-            print(f"  - No basis mixing (condition number stability)")
-            if args.orthogonality_weight > 0:
-                print(f"  - Neuron W Orthogonality Loss (orth_weight={args.orthogonality_weight})")
-        elif model_version == "7.7":
-            # v7.7: QK/VO Basis Separation
-            print(f"QK/VO Basis Separation (v7.7): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
-            print(f"  - basis_qk: Q/K share (gradient 2x)")
-            print(f"  - basis_vo: V/O share (O uses transpose)")
-            if args.orthogonality_weight > 0:
-                print(f"  - Orthogonality Loss (orth_weight={args.orthogonality_weight})")
-        elif model_version == "7.6":
-            # v7.6: Independent O Basis
-            print(f"Independent O Basis (v7.6): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
-            print(f"  - basis_down: Q/K/V projection")
-            print(f"  - basis_up: O projection (independent)")
-            if args.orthogonality_weight > 0:
-                print(f"  - Orthogonality Loss (orth_weight={args.orthogonality_weight})")
-        elif model_version == "7.5":
-            print(f"Dynamic Q/K/V/O Generation (v7.5): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
-            if args.orthogonality_weight > 0:
-                print(f"  - Learnable Basis (orth_weight={args.orthogonality_weight})")
-            else:
-                print(f"  - Fixed Basis")
-            if args.load_balance_weight > 0:
-                print(f"  - Load Balance Loss (lb_weight={args.load_balance_weight})")
-            print(f"  - Simple Router (x only)")
-        elif model_version == "7.4":
-            print(f"TT Karcher Mean FFN: n_basis={args.n_basis}, basis_rank={args.basis_rank}")
-        elif model_version == "7.2":
-            print(f"FFN: Standard FFN with Neuron Augmentation (d_ff={args.d_ff})")
+            print(f"  TransformNeurons: input={n_input}, process={n_process}, output={n_output}")
+            print(f"  KnowledgeNeurons: {n_knowledge} (top-k: {knowledge_k})")
         else:
-            if model_version == "7.1":
-                basis_note = "v7.1: Symmetric Basis FFN"
-            elif model_version == "7.0":
-                basis_note = "v7.0: Fixed Orthogonal Basis"
-            else:
-                basis_note = "v6.0: Learned Basis"
-            print(f"Basis FFN ({basis_note}): n_basis={args.n_basis}, basis_rank={args.basis_rank}")
+            print(f"⚠️  Unsupported version: {model_version}")
     else:
         print(f"Standard FFN: d_ff={args.d_ff}")
 
@@ -1514,7 +1470,7 @@ def main():
     print(f"{'='*60}")
 
     # Build model kwargs from args (already updated from checkpoint if resuming)
-    model_version = getattr(args, 'model_version', '7.1')
+    model_version = getattr(args, 'model_version', '9.0')
 
     # Common parameters
     model_kwargs = {
@@ -1527,51 +1483,44 @@ def main():
         'dropout': args.dropout,
     }
 
-    # Add DAWN-specific parameters
-    if model_version != 'baseline':
+    # Add version-specific parameters
+    if model_version == '9.1':
+        # v9.1: hard selection + gated reflection + separate pools
         model_kwargs.update({
-            'n_neurons': args.n_neurons,
-            'neuron_k': args.k,
-            'n_basis': args.n_basis,
-            'basis_rank': args.basis_rank,
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_reflect_d': args.n_reflect_d,
+            'n_reflect_r': args.n_reflect_r,
+            'reflect_k': args.reflect_k,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'rank': args.basis_rank,
+        })
+    elif model_version == '9.0':
+        # v9.0: CompressNeurons + ExpandNeurons + ReflectionNeurons
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_reflect': args.n_reflect,
+            'reflect_k': args.reflect_k,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'rank': args.basis_rank,
+        })
+    elif model_version in ['8.0', '8.1', '8.2', '8.3']:
+        # v8.x: SharedNeurons + NeuronMemory
+        model_kwargs.update({
+            'n_input': args.n_input,
+            'n_process': args.n_process,
+            'n_output': args.n_output,
+            'process_k': args.process_k,
+            'n_knowledge': getattr(args, 'n_knowledge', 64),
+            'knowledge_k': getattr(args, 'knowledge_k', 8),
+            'rank': args.basis_rank,
         })
 
-        # v6.0 compatibility (ignored by v7.0+)
-        if args.router_temperature is not None:
-            model_kwargs['router_temperature'] = args.router_temperature
-        if args.neuron_rank is not None:
-            model_kwargs['neuron_rank'] = args.neuron_rank
-        if args.mod_rank is not None:
-            model_kwargs['mod_rank'] = args.mod_rank
-
-        # v7.9 NeuronCircuit parameters
-        if model_version == '7.9':
-            model_kwargs.update({
-                'n_input': args.n_input,
-                'n_process': args.n_process,
-                'n_output': args.n_output,
-                'process_k': args.process_k,
-                'use_soft_selection': args.use_soft_selection,
-                'rank': args.basis_rank,  # v7.9 uses 'rank' instead of 'basis_rank'
-            })
-
-        # v8.0/v8.1/v8.2/v8.3 SharedNeurons + NeuronMemory parameters
-        if model_version in ['8.0', '8.1', '8.2', '8.3']:
-            model_kwargs.update({
-                'n_input': args.n_input,
-                'n_process': args.n_process,
-                'n_output': args.n_output,
-                'process_k': args.process_k,
-                'n_knowledge': getattr(args, 'n_knowledge', 64),
-                'knowledge_k': getattr(args, 'knowledge_k', 8),
-                'rank': args.basis_rank,  # v8.x uses 'rank' instead of 'basis_rank'
-            })
-
     # Create model
-    if model_version in ['8.3', '8.2', '8.1', '8.0', '7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
-        model = create_model_by_version(model_version, model_kwargs)
-    else:
-        model = DAWN(**model_kwargs)
+    model = create_model_by_version(model_version, model_kwargs)
 
     model = model.to(device)
     print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
@@ -1637,105 +1586,18 @@ def main():
         print(f"\n{'='*60}")
         print("Loading checkpoint weights...")
         print(f"{'='*60}")
-        checkpoint = torch.load(resume_checkpoint, map_location=device)
 
-        # Version check (should match if we used checkpoint config)
-        checkpoint_version = checkpoint.get('model_version', 'unknown')
-        current_version = getattr(model, '__version__', 'unknown')
-
-        if checkpoint_config:
-            # We used checkpoint config, so architecture should match perfectly
-            print(f"✅ Architecture matches (both v{current_version})")
-        else:
-            # We used YAML config, check for mismatch
-            print(f"📌 Checkpoint version: {checkpoint_version}")
-            print(f"📌 Current model version: {current_version}")
-
-            if checkpoint_version != current_version and checkpoint_version != 'unknown':
-                print(f"\n⚠️  Version mismatch detected!")
-                print(f"   Checkpoint: v{checkpoint_version} → Current: v{current_version}")
-                print(f"   Will attempt partial loading (architecture-compatible parameters only)")
-
-        # Load model state (strict if using checkpoint config)
+        # Use smart checkpoint loading with version awareness
         use_strict = checkpoint_config is not None
-
-        # Handle torch.compile() wrapped checkpoints - strip _orig_mod. prefix
-        state_dict = checkpoint['model_state_dict']
-        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
-            print("📌 Detected torch.compile() checkpoint - stripping _orig_mod. prefix")
-            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-
-        missing_keys, unexpected_keys = model.load_state_dict(
-            state_dict, strict=use_strict
+        checkpoint, load_info = load_checkpoint_smart(
+            model, str(resume_checkpoint), device=device,
+            strict=use_strict, verbose=True
         )
 
-        if use_strict:
-            print(f"✅ Weights loaded successfully (strict mode)")
-
-        # Categorize missing keys (only when not using strict mode)
-        if not use_strict and missing_keys:
-            # v5.0 new parameters
-            v5_new_params = [k for k in missing_keys if any(x in k for x in
-                ['neuron_A', 'neuron_B', 'basis_A', 'basis_B',
-                 'neuron_coef', 'token_mod'])]
-            # v4.5 old parameters that are now missing
-            v4_old_params = [k for k in missing_keys if any(x in k for x in
-                ['pattern_queries', 'pattern_up', 'neuron_q', 'neuron_k', 'neuron_v'])]
-            other_missing = [k for k in missing_keys if k not in v5_new_params and k not in v4_old_params]
-
-            if v5_new_params:
-                print(f"\n✨ v5.0 new parameters (randomly initialized): {len(v5_new_params)}")
-                print(f"   - Low-rank neurons, basis FFN, token modulation")
-            if other_missing:
-                print(f"\n⚠️  Other missing keys: {len(other_missing)}")
-                if len(other_missing) <= 5:
-                    for k in other_missing:
-                        print(f"      - {k}")
-
-        if not use_strict and unexpected_keys:
-            # v4.5 parameters not in v5.0
-            v4_deprecated = [k for k in unexpected_keys if any(x in k for x in
-                ['pattern_queries', 'pattern_up', 'neuron_q', 'neuron_k', 'neuron_v',
-                 'neuron_interaction', 'up_base', 'path_proj'])]
-            other_unexpected = [k for k in unexpected_keys if k not in v4_deprecated]
-
-            if v4_deprecated:
-                print(f"\n♻️  v4.5 deprecated parameters (ignored): {len(v4_deprecated)}")
-            if other_unexpected:
-                print(f"\n⚠️  Other unexpected keys: {len(other_unexpected)}")
-                if len(other_unexpected) <= 5:
-                    for k in other_unexpected:
-                        print(f"      - {k}")
-
-        if not missing_keys and not unexpected_keys:
-            print("\n✅ Perfect match! All parameters loaded successfully!")
-
-        # Try to load optimizer state even with version mismatch
-        try:
-            if checkpoint_version != DAWN.__version__ and checkpoint_version != 'unknown':
-                print(f"\n🔄 Loading optimizer state (cross-version)...")
-                print(f"   New parameters will use default optimizer settings")
-
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-            if 'scheduler_state_dict' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            if 'scaler_state_dict' in checkpoint and scaler is not None:
-                scaler.load_state_dict(checkpoint['scaler_state_dict'])
-
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
-
-            print(f"✅ Optimizer/scheduler loaded successfully")
-            print(f"✅ Resuming from epoch {start_epoch} (best val loss: {best_val_loss:.4f})")
-
-        except Exception as e:
-            print(f"\n⚠️  Could not load optimizer state: {str(e)[:100]}")
-            print(f"   Starting with fresh optimizer (model weights preserved)")
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
-            print(f"   Epoch count: {start_epoch}, Best val loss: {best_val_loss:.4f}")
-
+        # Load optimizer, scheduler, and scaler states
+        start_epoch, best_val_loss = load_optimizer_state(
+            optimizer, checkpoint, scheduler=scheduler, scaler=scaler, verbose=True
+        )
     else:
         print(f"\n🆕 Starting fresh training (no checkpoint found)")
 
@@ -1853,21 +1715,6 @@ def main():
             f.write(f"EPOCH,{epoch},{train_loss:.6f},{train_acc:.6f},"
                    f"{val_loss:.6f},{val_acc:.6f},"
                    f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}\n")
-
-        # Analyze activations periodically (skip for v7.5+ - uses different architecture)
-        if epoch % 10 == 0:
-            model_version = getattr(model, '__version__', None)
-            if model_version not in ["7.5", "7.8", "7.9", "8.0", "8.1"]:
-                sample_batch = next(iter(val_loader))
-                sample_ids = sample_batch['input_ids'][:1].to(device)
-                act_stats = analyze_activations(model, sample_ids, device)
-                print(f"\n  Neuron Usage Analysis (Epoch {epoch}):")
-                for layer_name, stats in act_stats.items():
-                    print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
-                          f"({stats['usage_ratio']:.2%} usage)")
-            else:
-                # v7.5/v7.8/v7.9/v8.x uses dynamic Q/K/V/O - activation analysis not applicable
-                print(f"\n  (Neuron usage analysis skipped for v{model_version} - use analyze_dawn_v75.py instead)")
 
         # Debug: Log epoch summary for specific epochs
         if debug_logger and debug_logger.should_log_epoch(epoch):

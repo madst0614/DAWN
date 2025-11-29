@@ -1,20 +1,28 @@
-# DAWN v8 Medium (~18-20M params)
+# DAWN v9.1 Medium (~18-20M params)
 # Balanced performance for serious training
 
 model:
-  model_version: "8.1"
+  model_version: "9.1"
   vocab_size: 30522
   d_model: 512
   n_layers: 12
-  n_heads: 4
-  rank: 64
+  n_heads: 8
+  rank: 128
   max_seq_len: 256
-  n_input: 32
-  n_process: 32
-  n_output: 32
-  process_k: 4
+
+  # Compress/Expand (hard selection)
+  n_compress: 8
+  n_expand: 8
+
+  # Reflection (gated, separate pools)
+  n_reflect_d: 128
+  n_reflect_r: 128
+  reflect_k: 4
+
+  # Knowledge
   n_knowledge: 128
   knowledge_k: 12
+
   dropout: 0.1
 
 data:
@@ -38,5 +46,5 @@ training:
   load_balance_weight: 0.01
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v83
-log_dir: /content/drive/MyDrive/dawn/checkpoints_v83
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v91
+log_dir: /content/drive/MyDrive/dawn/logs_v91

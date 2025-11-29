@@ -1,42 +1,29 @@
 """
 DAWN Models Module
 
-v8.0: SharedNeurons + NeuronMemory (QK/V/O/M 분리, Query Compressor)
-v7.9: NeuronCircuit with Householder Transformations
-v7.8: Independent Neuron Projections (No Basis Mixing)
-v7.7: QK/VO Basis Separation with Symmetric O Projection
-v7.6: Independent O Basis + Recipe Diversity
-v7.5: Dynamic Q/K/V Generation (v8 design)
-v7.4: TT Weighted Karcher Mean
-v7.2: Standard FFN + Neuron Routing (병목 탐색 실험)
-v7.1: Symmetric Basis FFN (W_down 제거) - DEFAULT
-v7.0: Fixed Orthogonal Basis
-v6.0: Orthogonal Basis FFN with Token-level Dynamic FFN (legacy)
+v9.0: CompressNeurons + ExpandNeurons + ReflectionNeurons
+v8.x: SharedNeurons + NeuronMemory (QK/V/O/M 분리)
+baseline: Vanilla Transformer
 """
 
-# v7.1 (default) - Symmetric Basis FFN
-from .model_v71 import (
-    DAWN,
-    DAWNLanguageModel,
-    SimpleRouter,
-    SymmetricBasisFFN,
-    FixedOrthogonalBasis,
-    DAWNLayer,
-    create_model,
-    count_parameters,
-)
-
-# v8, v7.9, v7.8, v7.7, v7.6, v7.5, v7.4, v7.2, v7.0 and v6.0 compatibility imports
+# v9.1 (current) - hard selection + gated reflection
+from . import model_v91 as model_v91
+# v9.0 - CompressNeurons + ExpandNeurons + ReflectionNeurons (soft selection)
+from . import model_v9 as model_v9
 from . import model_v8 as model_v8
-from . import model_v79 as model_v79
-from . import model_v78 as model_v78
-from . import model_v77 as model_v77
-from . import model_v76 as model_v76
-from . import model_v75 as model_v75
-from . import model_v74 as model_v74
-from . import model_v72 as model_v72
-from . import model_v7 as model_v70
-from . import model as model_v6
+
+# Version registry
+from .version_registry import (
+    VERSION_REGISTRY,
+    normalize_version,
+    get_version_info,
+    get_required_params,
+    get_optional_params,
+    build_model_kwargs,
+    print_version_info,
+    list_versions,
+    get_all_versions_info,
+)
 
 # Baseline Vanilla Transformer
 try:
@@ -48,28 +35,25 @@ except ImportError:
     VanillaTransformer = None
 
 __all__ = [
-    'DAWN',
-    'DAWNLanguageModel',
-    'SimpleRouter',
-    'SymmetricBasisFFN',
-    'FixedOrthogonalBasis',
-    'DAWNLayer',
-    'create_model',
-    'count_parameters',
-    'model_v8',   # Access v8.0 via models.model_v8
-    'model_v79',  # Access v7.9 via models.model_v79
-    'model_v78',  # Access v7.8 via models.model_v78
-    'model_v77',  # Access v7.7 via models.model_v77
-    'model_v76',  # Access v7.6 via models.model_v76
-    'model_v75',  # Access v7.5 via models.model_v75
-    'model_v74',  # Access v7.4 via models.model_v74
-    'model_v72',  # Access v7.2 via models.model_v72
-    'model_v70',  # Access v7.0 via models.model_v70
-    'model_v6',   # Access v6.0 via models.model_v6
-    'VanillaTransformer',  # Baseline model
+    # Models
+    'model_v91',
+    'model_v9',
+    'model_v8',
+    'VanillaTransformer',
+    # Version utilities
+    'VERSION_REGISTRY',
+    'normalize_version',
+    'get_version_info',
+    'get_required_params',
+    'get_optional_params',
+    'build_model_kwargs',
+    'print_version_info',
+    'list_versions',
+    'get_all_versions_info',
+    'create_model_by_version',
 ]
 
-__version__ = "7.1"
+__version__ = "9.1"
 
 
 # Helper function to create model based on version
@@ -77,47 +61,23 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "8.0", "7.9", "7.8", "7.7", "7.6", "7.5", "7.4", "7.2", "7.1", "7.0", "6.0", or "baseline"
+        version: "9.1", "9.0", "8.0", "8.1", "8.2", "8.3", or "baseline"
         config: Model configuration dict
 
     Returns:
         DAWN or VanillaTransformer model instance
     """
-    version = str(version)
+    version = normalize_version(version)
 
-    if version in ["8.3", "83", "8.2", "82", "8.1", "81", "8.0", "8", "80"]:
+    if version == "9.1":
+        from .model_v91 import DAWN as DAWN_v91
+        return DAWN_v91(**config)
+    elif version == "9.0":
+        from .model_v9 import DAWN as DAWN_v9
+        return DAWN_v9(**config)
+    elif version in ["8.0", "8.1", "8.2", "8.3"]:
         from .model_v8 import DAWN as DAWN_v8
         return DAWN_v8(**config)
-    elif version in ["7.9", "79"]:
-        from .model_v79 import DAWN as DAWN_v79
-        return DAWN_v79(**config)
-    elif version in ["7.8", "78"]:
-        from .model_v78 import DAWN as DAWN_v78
-        return DAWN_v78(**config)
-    elif version in ["7.7", "77"]:
-        from .model_v77 import DAWN as DAWN_v77
-        return DAWN_v77(**config)
-    elif version in ["7.6", "76"]:
-        from .model_v76 import DAWN as DAWN_v76
-        return DAWN_v76(**config)
-    elif version in ["7.5", "75"]:
-        from .model_v75 import DAWN as DAWN_v75
-        return DAWN_v75(**config)
-    elif version in ["7.4", "74"]:
-        from .model_v74 import DAWN as DAWN_v74
-        return DAWN_v74(**config)
-    elif version in ["7.2", "72"]:
-        from .model_v72 import DAWN as DAWN_v72
-        return DAWN_v72(**config)
-    elif version in ["7.1", "7", "71"]:
-        from .model_v71 import DAWN as DAWN_v71
-        return DAWN_v71(**config)
-    elif version in ["7.0", "70"]:
-        from .model_v7 import DAWN as DAWN_v70
-        return DAWN_v70(**config)
-    elif version in ["6.0", "6", "60"]:
-        from .model import DAWN as DAWN_v60
-        return DAWN_v60(**config)
     elif version == "baseline":
         if VanillaTransformer is None:
             raise ImportError("VanillaTransformer not available. "
@@ -125,4 +85,4 @@ def create_model_by_version(version, config):
         return VanillaTransformer(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 8.0, 7.9, 7.8, 7.7, 7.6, 7.5, 7.4, 7.2, 7.1, 7.0, 6.0, baseline")
+                        f"Supported versions: {list_versions()}")
