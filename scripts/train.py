@@ -549,28 +549,30 @@ def get_underlying_model(model):
     return model
 
 
-def is_v75_or_v76_model(model):
-    """Robust detection of v7.5+ models (including v8.x), handling torch.compile() wrapped models"""
+def is_modern_dawn_model(model):
+    """Check if model is DAWN v10.0"""
     base_model = get_underlying_model(model)
 
-    # Check model version attribute
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["7.5", "7.6", "7.7", "7.8", "7.9", "8.0", "8.1", "8.2", "8.3"]:
+    # Check for v10 structure
+    if hasattr(base_model, '__version__') and base_model.__version__ == "10.0":
         return True
 
-    # Check for qkv_dynamic attribute on layers (v7.5/v7.6/v7.7 specific structure)
+    # Structure check: v10 has layers with .attn and .memory
     if hasattr(base_model, 'layers') and len(base_model.layers) > 0:
-        if hasattr(base_model.layers[0], 'qkv_dynamic'):
-            return True
-        # Check for v8.x structure (NeuronCircuit with attention and memory)
-        if hasattr(base_model.layers[0], 'attention') and hasattr(base_model.layers[0], 'memory'):
+        if hasattr(base_model.layers[0], 'attn') and hasattr(base_model.layers[0], 'memory'):
             return True
 
     return False
 
 
+# Backward compatibility alias
+def is_v75_or_v76_model(model):
+    return is_modern_dawn_model(model)
+
+
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, debug_logger=None,
-                ckpt_manager=None, model_config=None):
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, process_norm_weight=0.0,
+                debug_logger=None, ckpt_manager=None, model_config=None):
     """Train for one epoch"""
     model.train()
 
@@ -611,86 +613,31 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
-                # v7.0: Use model's get_loss method (handles diversity & load balance)
-                if hasattr(base_model, 'get_loss') and orthogonality_weight == 0:
-                    loss, loss_dict, logits = model.get_loss(
-                        input_ids, labels,
-                        diversity_weight=diversity_weight,
-                        load_balance_weight=load_balance_weight
-                    )
+                # v10: DAWN model forward
+                if load_balance_weight > 0:
+                    ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                 else:
-                    # v7.5+: Dynamic Q/K/V with routing
-                    # v6.0: compatibility
-                    if is_v75_or_v76_model(model):
-                        # v7.5/v7.6: Get routing info for load balance loss
-                        if load_balance_weight > 0:
-                            ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
-                        else:
-                            ce_loss, logits = model(input_ids, labels)
-                            routing_infos = None
+                    ce_loss, logits = model(input_ids, labels)
+                    routing_infos = None
 
-                        # Basis orthogonality loss (v7.5/v7.6)
-                        if orthogonality_weight > 0:
-                            orth_loss = base_model.orthogonality_loss()
-                        else:
-                            orth_loss = 0.0
+                # Orthogonality loss
+                orth_loss = 0.0
+                if orthogonality_weight > 0 and hasattr(base_model, 'orthogonality_loss'):
+                    orth_loss = base_model.orthogonality_loss()
 
-                        # Recipe diversity loss (v7.6 only - built-in method)
-                        if diversity_weight > 0 and hasattr(base_model, 'recipe_diversity_loss'):
-                            diversity_loss = base_model.recipe_diversity_loss()
-                        else:
-                            diversity_loss = 0.0
-                    elif orthogonality_weight > 0:
-                        logits, losses = model(input_ids, return_losses=True)
-                        orth_loss = losses['orth_total']
-                        ce_loss = F.cross_entropy(
-                            logits.view(-1, logits.size(-1)),
-                            labels.view(-1),
-                            ignore_index=-100
-                        )
-                        diversity_loss = 0.0
-                        routing_infos = None
-                    else:
-                        logits = model(input_ids)
-                        orth_loss = 0.0
-                        diversity_loss = 0.0
-                        routing_infos = None
+                # Knowledge diversity loss
+                diversity_loss = 0.0
+                if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
+                    diversity_loss = base_model.knowledge_diversity_loss()
 
-                        # Cross-entropy loss
-                        B, S, V = logits.shape
-                        ce_loss = F.cross_entropy(
-                            logits.view(B * S, V),
-                            labels.view(B * S),
-                            ignore_index=-100
-                        )
+                # Load balance loss
+                lb_loss = 0.0
+                if load_balance_weight > 0 and routing_infos is not None:
+                    if hasattr(base_model, 'load_balance_loss'):
+                        lb_loss = base_model.load_balance_loss(routing_infos)
 
-                    # Recipe diversity loss (v7.0-v7.4)
-                    if diversity_weight > 0 and hasattr(base_model.layers[0], 'ffn') and hasattr(base_model.layers[0].ffn, 'neuron_recipe'):
-                        for layer in base_model.layers:
-                            recipe = layer.ffn.neuron_recipe
-                            recipe_norm = F.softmax(recipe, dim=-1)
-                            recipe_normalized = F.normalize(recipe_norm, dim=-1)
-                            similarity = torch.mm(recipe_normalized, recipe_normalized.T)
-                            mask = 1 - torch.eye(base_model.n_neurons, device=similarity.device)
-                            avg_similarity = (similarity * mask).sum() / mask.sum()
-                            diversity_loss += avg_similarity
-                        diversity_loss = diversity_loss / len(base_model.layers)
-
-                    # Load balance loss (v7.5+)
-                    lb_loss = 0.0
-                    if load_balance_weight > 0 and routing_infos is not None:
-                        for routing_info in routing_infos:
-                            neuron_indices = routing_info['neuron_indices']  # [B, S, k]
-                            # Count neuron usage
-                            counts = torch.bincount(neuron_indices.reshape(-1), minlength=base_model.n_neurons)
-                            freq = counts.float() / (counts.sum() + 1e-8)
-                            # L2 distance from uniform distribution
-                            uniform = 1.0 / base_model.n_neurons
-                            lb_loss += ((freq - uniform) ** 2).sum() * base_model.n_neurons
-                        lb_loss = lb_loss / len(routing_infos)
-
-                    # Total loss
-                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+                # Total loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             scaler.scale(loss).backward()
 
@@ -705,89 +652,34 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             scaler.step(optimizer)
             scaler.update()
         else:
-            # Get underlying model for attribute checks (handles torch.compile)
+            # Non-AMP training (CPU or no CUDA)
             base_model = get_underlying_model(model)
 
-            # v7.0: Use model's get_loss method (handles diversity & load balance)
-            if hasattr(base_model, 'get_loss') and orthogonality_weight == 0:
-                loss, loss_dict, logits = model.get_loss(
-                    input_ids, labels,
-                    diversity_weight=diversity_weight,
-                    load_balance_weight=load_balance_weight
-                )
+            # v10: DAWN model forward
+            if load_balance_weight > 0:
+                ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
             else:
-                # v7.5+: Dynamic Q/K/V with routing
-                # v6.0: compatibility
-                if is_v75_or_v76_model(model):
-                    # v7.5/v7.6: Get routing info for load balance loss
-                    if load_balance_weight > 0:
-                        ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
-                    else:
-                        ce_loss, logits = model(input_ids, labels)
-                        routing_infos = None
+                ce_loss, logits = model(input_ids, labels)
+                routing_infos = None
 
-                    # Basis orthogonality loss (v7.5/v7.6)
-                    if orthogonality_weight > 0:
-                        orth_loss = base_model.orthogonality_loss()
-                    else:
-                        orth_loss = 0.0
+            # Orthogonality loss
+            orth_loss = 0.0
+            if orthogonality_weight > 0 and hasattr(base_model, 'orthogonality_loss'):
+                orth_loss = base_model.orthogonality_loss()
 
-                    # Recipe diversity loss (v7.6 only - built-in method)
-                    if diversity_weight > 0 and hasattr(base_model, 'recipe_diversity_loss'):
-                        diversity_loss = base_model.recipe_diversity_loss()
-                    else:
-                        diversity_loss = 0.0
-                elif orthogonality_weight > 0:
-                    logits, losses = model(input_ids, return_losses=True)
-                    orth_loss = losses['orth_total']
-                    ce_loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        labels.view(-1),
-                        ignore_index=-100
-                    )
-                    diversity_loss = 0.0
-                    routing_infos = None
-                else:
-                    logits = model(input_ids)
-                    orth_loss = 0.0
-                    diversity_loss = 0.0
-                    routing_infos = None
+            # Knowledge diversity loss
+            diversity_loss = 0.0
+            if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
+                diversity_loss = base_model.knowledge_diversity_loss()
 
-                    # Cross-entropy loss
-                    B, S, V = logits.shape
-                    ce_loss = F.cross_entropy(
-                        logits.view(B * S, V),
-                        labels.view(B * S),
-                        ignore_index=-100
-                    )
+            # Load balance loss
+            lb_loss = 0.0
+            if load_balance_weight > 0 and routing_infos is not None:
+                if hasattr(base_model, 'load_balance_loss'):
+                    lb_loss = base_model.load_balance_loss(routing_infos)
 
-                # Recipe diversity loss (v7.0-v7.4)
-                if diversity_weight > 0 and hasattr(base_model.layers[0], 'ffn') and hasattr(base_model.layers[0].ffn, 'neuron_recipe'):
-                    for layer in base_model.layers:
-                        recipe = layer.ffn.neuron_recipe
-                        recipe_norm = F.softmax(recipe, dim=-1)
-                        recipe_normalized = F.normalize(recipe_norm, dim=-1)
-                        similarity = torch.mm(recipe_normalized, recipe_normalized.T)
-                        mask = 1 - torch.eye(base_model.n_neurons, device=similarity.device)
-                        avg_similarity = (similarity * mask).sum() / mask.sum()
-                        diversity_loss += avg_similarity
-                    diversity_loss = diversity_loss / len(base_model.layers)
-
-                # Load balance loss (v7.5+)
-                lb_loss = 0.0
-                if load_balance_weight > 0 and routing_infos is not None:
-                    for routing_info in routing_infos:
-                        neuron_indices = routing_info['neuron_indices']  # [B, S, k]
-                        # Count neuron usage
-                        counts = torch.bincount(neuron_indices.reshape(-1), minlength=base_model.n_neurons)
-                        freq = counts.float() / (counts.sum() + 1e-8)
-                        # L2 distance from uniform distribution
-                        uniform = 1.0 / base_model.n_neurons
-                        lb_loss += ((freq - uniform) ** 2).sum() * base_model.n_neurons
-                    lb_loss = lb_loss / len(routing_infos)
-
-                # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+            # Total loss
+            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             loss.backward()
 
@@ -1128,6 +1020,11 @@ def main():
                         help='Override batch_size from config')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override learning rate from config')
+    # Ablation options
+    parser.add_argument('--skip-householder', action='store_true',
+                        help='Ablation: skip Householder transforms (v8 only)')
+    parser.add_argument('--gelu-only', action='store_true',
+                        help='Ablation: add GELU after compress (v8 only)')
     cli_args = parser.parse_args()
 
     # Load config
@@ -1178,6 +1075,10 @@ def main():
     args.n_knowledge = cfg['model'].get('n_knowledge', 64)
     args.knowledge_k = cfg['model'].get('knowledge_k', 8)
 
+    # v8.0 Ablation: skip Householder (from config or CLI)
+    args.skip_householder = cfg['model'].get('skip_householder', False)
+    args.compress_gelu = cfg['model'].get('compress_gelu', False)
+
     # v9.0 Compress/Expand/Reflection parameters
     args.n_compress = cfg['model'].get('n_compress', 4)
     args.n_expand = cfg['model'].get('n_expand', 4)
@@ -1203,6 +1104,12 @@ def main():
     if cli_args.lr is not None:
         args.lr = cli_args.lr
         print(f"📌 CLI override: lr={args.lr}")
+    if cli_args.skip_householder:
+        args.skip_householder = True
+        print(f"📌 CLI override: skip_householder=True (ablation mode)")
+    if cli_args.gelu_only:
+        args.compress_gelu = True
+        print(f"📌 CLI override: compress_gelu=True (GELU after compress)")
     args.warmup_epochs = cfg['training'].get('warmup_epochs', None)
     args.warmup_ratio = cfg['training'].get('warmup_ratio', None)  # Alternative to warmup_epochs
 
@@ -1210,6 +1117,7 @@ def main():
     args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.0)  # v6.0 compat
     args.diversity_weight = cfg['training'].get('diversity_weight', 0.0)  # v7.0: recipe diversity
     args.load_balance_weight = cfg['training'].get('load_balance_weight', 0.0)  # v7.0: load balance
+    args.process_norm_weight = cfg['training'].get('process_norm_weight', 0.0)  # v8.0: process neuron norm
 
     # Other
     args.use_amp = cfg.get('use_amp', True)
@@ -1367,6 +1275,7 @@ def main():
             args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
             args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
             args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
+            args.process_norm_weight = checkpoint_training_config.get('process_norm_weight', args.process_norm_weight)
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
@@ -1387,7 +1296,17 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "9.1":
+        if model_version == "10.0":
+            # v10.0: Simplified Compress/Expand
+            rank = args.basis_rank
+            print(f"SharedNeurons (v{model_version}): rank={rank} - No Householder!")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (Q/K/V/M shared)")
+            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model} (O shared)")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "9.1":
             # v9.1: hard selection + gated reflection + separate pools
             rank = args.basis_rank
             print(f"SharedNeurons (v{model_version}): rank={rank}")
@@ -1484,7 +1403,16 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '9.1':
+    if model_version == '10.0':
+        # v10.0: Simplified Compress/Expand (No Householder)
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'rank': args.basis_rank,
+        })
+    elif model_version == '9.1':
         # v9.1: hard selection + gated reflection + separate pools
         model_kwargs.update({
             'n_compress': args.n_compress,
@@ -1517,6 +1445,8 @@ def main():
             'n_knowledge': getattr(args, 'n_knowledge', 64),
             'knowledge_k': getattr(args, 'knowledge_k', 8),
             'rank': args.basis_rank,
+            'skip_householder': getattr(args, 'skip_householder', False),  # Ablation
+            'compress_gelu': getattr(args, 'compress_gelu', False),  # GELU after compress
         })
 
     # Create model
@@ -1665,6 +1595,7 @@ def main():
             orthogonality_weight=args.orthogonality_weight,
             diversity_weight=args.diversity_weight,
             load_balance_weight=args.load_balance_weight,
+            process_norm_weight=args.process_norm_weight,
             debug_logger=debug_logger,
             ckpt_manager=ckpt_manager,
             model_config=model_kwargs

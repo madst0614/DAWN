@@ -1,0 +1,67 @@
+# DAWN v10.0 Training Config (Fair Comparison with v8)
+# Simplified architecture: Compress + Expand (no Householder)
+# Parameter-matched with v8_matched (~9M target)
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v10.0 - v8 matched scale)
+model:
+  model_version: "10.0"
+  d_model: 256            # v8과 동일
+  n_layers: 4
+  n_heads: 4
+  rank: 64                # v8과 동일
+
+  # CompressNeurons / ExpandNeurons (통합 풀)
+  n_compress: 64          # Q/K/V/M 공유
+  n_expand: 16            # O 공유 (4:1 비율)
+
+  # KnowledgeNeurons
+  n_knowledge: 64         # v8과 동일
+  knowledge_k: 8          # v8과 동일
+
+  # Architecture
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+
+  # Regularization
+  orthogonality_weight: 0.01    # compress/expand 직교성
+  diversity_weight: 0.1         # knowledge diversity
+  load_balance_weight: 0.01     # routing 균등 분포
+  process_norm_weight: 0.0      # v10 미지원 (process neurons 없음)
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10_matched
+log_dir: /content/drive/MyDrive/dawn/logs_v10_matched
+
+# 파라미터 계산 (v8 matched scale):
+#   compress: 64 × 256 × 64 = 1,048,576 (1.05M)
+#   expand: 16 × 64 × 256 = 262,144 (0.26M)
+#   knowledge: 64×64 + 64×256 = 20,480 (20K)
+#   SharedNeurons 총: ~1.33M
+#
+#   embeddings: 30522 × 256 = 7.8M
+#   pos_emb: 128 × 256 = 33K
+#   routers per layer: (3+1) × 256×64 + 1 × 64×16 = 66K
+#   4 layers routers: 264K
+#   layernorms: 4 × 2 × 256 × 2 = 4K
+#
+#   Total: ~9.4M (v8_matched와 유사)
+#
+# v8 vs v10 비교:
+#   v8: InputNeurons(Q/K/V/M분리) + ProcessNeurons(Householder) + OutputNeurons
+#   v10: CompressNeurons(통합) + ExpandNeurons(통합) - No Householder

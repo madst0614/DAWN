@@ -1,0 +1,62 @@
+# DAWN v10.0 Training Config
+# Simplified architecture: Compress + Expand (no Householder)
+# Unified neuron pools for all Q/K/V/O/M
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v10.0 - 11M target)
+model:
+  model_version: "10.0"
+  d_model: 320
+  n_layers: 4
+  n_heads: 4
+  rank: 80
+
+  # CompressNeurons / ExpandNeurons (통합 풀)
+  n_compress: 48          # Q/K/V/M 공유 (줄임)
+  n_expand: 12            # O 공유 (4:1 비율)
+
+  # KnowledgeNeurons
+  n_knowledge: 80
+  knowledge_k: 10
+
+  # Architecture
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+
+  # Regularization
+  orthogonality_weight: 0.01    # compress/expand 직교성
+  diversity_weight: 0.1         # knowledge diversity
+  load_balance_weight: 0.01     # routing 균등 분포
+  process_norm_weight: 0.0      # v10 미지원 (process neurons 없음)
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10
+log_dir: /content/drive/MyDrive/dawn/logs_v10
+
+# 파라미터 계산:
+#   compress: 48 × 320 × 80 = 1,228,800 (1.23M)
+#   expand: 12 × 80 × 320 = 307,200 (0.31M)
+#   knowledge: 80×80 + 80×320 = 32,000 (32K)
+#   SharedNeurons 총: ~1.57M
+#
+#   embeddings: 30522 × 320 = 9.77M
+#   pos_emb: 128 × 320 = 41K
+#   routers: ~300K
+#   layernorms: ~10K
+#
+#   Total: ~11.6M
