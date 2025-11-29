@@ -1193,6 +1193,7 @@ def main():
 
     # v8.0 Ablation: skip Householder (from config or CLI)
     args.skip_householder = cfg['model'].get('skip_householder', False)
+    args.householder_nonlinearity = cfg['model'].get('householder_nonlinearity', False)
 
     # v9.0 Compress/Expand/Reflection parameters
     args.n_compress = cfg['model'].get('n_compress', 4)
@@ -1539,6 +1540,7 @@ def main():
             'knowledge_k': getattr(args, 'knowledge_k', 8),
             'rank': args.basis_rank,
             'skip_householder': getattr(args, 'skip_householder', False),  # Ablation
+            'householder_nonlinearity': getattr(args, 'householder_nonlinearity', False),  # GELU ablation
         })
 
     # Create model
