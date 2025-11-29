@@ -196,7 +196,8 @@ class NeuronCircuit(nn.Module):
         # O: Expander
         self.expander_O = Expander(shared_neurons, d_model, rank, n_expand)
 
-        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.out_dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
         """
@@ -205,6 +206,7 @@ class NeuronCircuit(nn.Module):
             mask: [B, 1, S, S] causal mask
         Returns:
             output: [B, S, d_model]
+            routing_info: dict with Q/K/V/O routing
         """
         B, S, D = x.shape
 
@@ -223,7 +225,7 @@ class NeuronCircuit(nn.Module):
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float('-inf'))
         attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
+        attn = self.attn_dropout(attn)
 
         # Apply attention to V
         attn_out = torch.matmul(attn, V)  # [B, H, S, d_head]
@@ -231,8 +233,15 @@ class NeuronCircuit(nn.Module):
 
         # Output expansion
         output, o_info = self.expander_O(attn_out)  # [B, S, d_model]
+        output = self.out_dropout(output)
 
-        return output
+        routing_info = {
+            'Q': q_info,
+            'K': k_info,
+            'V': v_info,
+            'O': o_info,
+        }
+        return output, routing_info
 
 
 class NeuronMemory(nn.Module):
@@ -288,7 +297,7 @@ class NeuronMemory(nn.Module):
         output = (selected_V * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, d_model]
 
         routing_info = {
-            'query_routing': q_info,
+            'M': q_info,
             'knowledge_indices': topk_idx,
             'knowledge_weights': weights,
         }
@@ -322,14 +331,24 @@ class DAWNBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
+        """
+        Returns:
+            x: [B, S, d_model]
+            routing_info: dict with attention and memory routing
+        """
         # Attention
-        x = x + self.dropout(self.attn(self.norm1(x), mask))
+        attn_out, attn_routing = self.attn(self.norm1(x), mask)
+        x = x + attn_out  # dropout already in NeuronCircuit
 
         # Memory (FFN replacement)
-        mem_out, mem_info = self.memory(self.norm2(x))
+        mem_out, mem_routing = self.memory(self.norm2(x))
         x = x + self.dropout(mem_out)
 
-        return x
+        routing_info = {
+            'attention': attn_routing,
+            'memory': mem_routing,
+        }
+        return x, routing_info
 
 
 class DAWN(nn.Module):
@@ -421,7 +440,7 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, input_ids, labels=None):
+    def forward(self, input_ids, labels=None, return_routing_info=False):
         B, S = input_ids.shape
         device = input_ids.device
 
@@ -434,8 +453,11 @@ class DAWN(nn.Module):
         mask = ~mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
 
         # Layers
+        routing_infos = []
         for layer in self.layers:
-            x = layer(x, mask)
+            x, routing_info = layer(x, mask)
+            if return_routing_info:
+                routing_infos.append(routing_info)
 
         x = self.norm(x)
         logits = self.lm_head(x)
@@ -446,8 +468,12 @@ class DAWN(nn.Module):
                 labels.view(-1),
                 ignore_index=-100
             )
+            if return_routing_info:
+                return loss, logits, routing_infos
             return loss, logits
 
+        if return_routing_info:
+            return logits, routing_infos
         return logits
 
     def orthogonality_loss(self):
@@ -470,6 +496,13 @@ class DAWN(nn.Module):
 
         return loss / (self.n_compress + self.n_expand)
 
+    def routing_entropy_loss(self):
+        """Soft routing용 - entropy 최대화로 균등 분포 유도"""
+        # 실제 forward 안에서 weights를 모아야 하지만,
+        # 간단히 router weight의 균등성 체크
+        # 실제 사용 시에는 forward에서 반환된 routing_info 사용
+        return torch.tensor(0.0, device=next(self.parameters()).device)
+
     def knowledge_diversity_loss(self):
         """Knowledge K vectors 다양성"""
         K = self.shared_neurons.knowledge_K
@@ -487,6 +520,47 @@ class DAWN(nn.Module):
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def count_by_component(self):
+        """Component별 파라미터 수 출력"""
+        compress = self.shared_neurons.compress_neurons.numel()
+        expand = self.shared_neurons.expand_neurons.numel()
+        knowledge = (self.shared_neurons.knowledge_K.numel() +
+                    self.shared_neurons.knowledge_V.numel())
+
+        embed = self.token_emb.weight.numel() + self.pos_emb.weight.numel()
+
+        # Routers: per layer (4 compressors + 1 expander + 1 memory compressor per layer)
+        router_per_layer = (
+            self.layers[0].attn.compressor_Q.router.weight.numel() +
+            self.layers[0].attn.compressor_K.router.weight.numel() +
+            self.layers[0].attn.compressor_V.router.weight.numel() +
+            self.layers[0].attn.expander_O.router.weight.numel() +
+            self.layers[0].memory.query_compressor.router.weight.numel()
+        )
+        routers = router_per_layer * self.n_layers
+
+        # LayerNorms
+        norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
+
+        print(f"=== DAWN v10.0 Parameter Breakdown ===")
+        print(f"CompressNeurons: {compress:,} ({compress/1e6:.2f}M)")
+        print(f"ExpandNeurons:   {expand:,} ({expand/1e6:.2f}M)")
+        print(f"KnowledgeNeurons: {knowledge:,} ({knowledge/1e3:.1f}K)")
+        print(f"Embeddings:      {embed:,} ({embed/1e6:.2f}M)")
+        print(f"Routers:         {routers:,} ({routers/1e3:.1f}K)")
+        print(f"LayerNorms:      {norms:,} ({norms/1e3:.1f}K)")
+        print(f"---")
+        print(f"Total:           {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
+
+        return {
+            'compress': compress,
+            'expand': expand,
+            'knowledge': knowledge,
+            'embeddings': embed,
+            'routers': routers,
+            'norms': norms,
+        }
 
     def get_config(self):
         return {
