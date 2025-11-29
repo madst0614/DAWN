@@ -2,16 +2,16 @@
 # Balanced performance for serious training
 
 model:
-  model_version: "8.0"
+  model_version: "8.1"
   vocab_size: 30522
   d_model: 512
   n_layers: 12
   n_heads: 4
   rank: 64
   max_seq_len: 256
-  n_input: 8
+  n_input: 32
   n_process: 32
-  n_output: 8
+  n_output: 32
   process_k: 4
   n_knowledge: 128
   knowledge_k: 12
@@ -29,9 +29,9 @@ data:
     - validation/wikitext_5to1_texts.pkl
 
 training:
-  batch_size: 128
+  batch_size: 64
   num_epochs: 3
-  lr: 0.00028
+  lr: 0.00014
   warmup_ratio: 0.1
   weight_decay: 0.01
   orthogonality_weight: 0.01

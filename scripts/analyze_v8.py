@@ -79,49 +79,84 @@ def analyze_shared_neurons(model):
     shared = model.shared_neurons
     results = {}
 
-    # ========== Input Neurons ==========
+    # ========== Input Neurons (타입별 분리: QK, V, M) ==========
     print("\n📌 Input Neurons: [n_input, d_model, rank]")
-    input_neurons = shared.input_neurons.data  # [n_input, d_model, rank]
-    n_input, d_model, rank = input_neurons.shape
 
-    input_results = {'shape': [n_input, d_model, rank], 'neurons': {}}
+    # v8.1+: Q/K 분리된 input neurons 분석
+    input_neuron_types = {}
+    if hasattr(shared, 'input_neurons_q'):
+        input_neuron_types['Q'] = shared.input_neurons_q.data
+    if hasattr(shared, 'input_neurons_k'):
+        input_neuron_types['K'] = shared.input_neurons_k.data
+    if hasattr(shared, 'input_neurons_v'):
+        input_neuron_types['V'] = shared.input_neurons_v.data
+    if hasattr(shared, 'input_neurons_m'):
+        input_neuron_types['M'] = shared.input_neurons_m.data
 
-    # Condition numbers and orthogonality
-    input_conds = []
-    input_orth_errors = []
-    for i in range(n_input):
-        W = input_neurons[i]  # [d_model, rank]
-        _, s, _ = torch.linalg.svd(W, full_matrices=False)
-        cond = (s[0] / (s[-1] + 1e-10)).item()
-        input_conds.append(cond)
+    # v8.0 fallback (QK shared)
+    if not input_neuron_types and hasattr(shared, 'input_neurons_qk'):
+        input_neuron_types['QK'] = shared.input_neurons_qk.data
+        if hasattr(shared, 'input_neurons_v'):
+            input_neuron_types['V'] = shared.input_neurons_v.data
+        if hasattr(shared, 'input_neurons_m'):
+            input_neuron_types['M'] = shared.input_neurons_m.data
 
-        # W.T @ W should be identity (rank × rank)
-        WtW = W.T @ W
-        I = torch.eye(rank, device=W.device)
-        orth_error = (WtW - I).abs().max().item()
-        input_orth_errors.append(orth_error)
+    # Legacy fallback
+    if not input_neuron_types:
+        input_neuron_types['all'] = shared.input_neurons.data
 
-        input_results['neurons'][i] = {
-            'condition': cond,
-            'orthogonality_error': orth_error,
-            'singular_range': [s[-1].item(), s[0].item()]
-        }
+    input_results = {'types': {}}
 
-        print(f"  Neuron {i}: cond={cond:.2f}, orth_err={orth_error:.2e}, σ=[{s[-1].item():.4f}, {s[0].item():.4f}]")
+    for neuron_type, input_neurons in input_neuron_types.items():
+        n_input, d_model, rank = input_neurons.shape
+        type_results = {'shape': [n_input, d_model, rank], 'neurons': {}}
 
-    input_results['avg_condition'] = np.mean(input_conds)
-    input_results['avg_orth_error'] = np.mean(input_orth_errors)
+        print(f"\n  📌 Input Neurons ({neuron_type}): [{n_input}, {d_model}, {rank}]")
 
-    # Input neuron overlap (how similar are different input neurons)
-    print(f"\n  Input neuron overlap (W_i.T @ W_j Frobenius norm):")
-    input_T = input_neurons.transpose(1, 2)  # [n_input, rank, d_model]
-    products = torch.einsum('iad,jdb->ijab', input_T, input_neurons)  # [n_input, n_input, rank, rank]
-    overlap_matrix = products.norm(dim=(-2, -1))  # [n_input, n_input]
-    mask = ~torch.eye(n_input, dtype=torch.bool, device=overlap_matrix.device)
-    off_diag = overlap_matrix[mask]
-    print(f"    Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
-    input_results['overlap_mean'] = off_diag.mean().item()
-    input_results['overlap_max'] = off_diag.max().item()
+        # Condition numbers and orthogonality
+        input_conds = []
+        input_orth_errors = []
+        for i in range(n_input):
+            W = input_neurons[i]  # [d_model, rank]
+            _, s, _ = torch.linalg.svd(W, full_matrices=False)
+            cond = (s[0] / (s[-1] + 1e-10)).item()
+            input_conds.append(cond)
+
+            # W.T @ W should be identity (rank × rank)
+            WtW = W.T @ W
+            I = torch.eye(rank, device=W.device)
+            orth_error = (WtW - I).abs().max().item()
+            input_orth_errors.append(orth_error)
+
+            type_results['neurons'][i] = {
+                'condition': cond,
+                'orthogonality_error': orth_error,
+                'singular_range': [s[-1].item(), s[0].item()]
+            }
+
+            print(f"    Neuron {i}: cond={cond:.2f}, orth_err={orth_error:.2e}, σ=[{s[-1].item():.4f}, {s[0].item():.4f}]")
+
+        type_results['avg_condition'] = np.mean(input_conds)
+        type_results['avg_orth_error'] = np.mean(input_orth_errors)
+
+        # Input neuron overlap (how similar are different input neurons)
+        print(f"    {neuron_type} overlap (W_i.T @ W_j Frobenius norm):")
+        input_T = input_neurons.transpose(1, 2)  # [n_input, rank, d_model]
+        products = torch.einsum('iad,jdb->ijab', input_T, input_neurons)  # [n_input, n_input, rank, rank]
+        overlap_matrix = products.norm(dim=(-2, -1))  # [n_input, n_input]
+        mask = ~torch.eye(n_input, dtype=torch.bool, device=overlap_matrix.device)
+        off_diag = overlap_matrix[mask]
+        print(f"      Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
+        type_results['overlap_mean'] = off_diag.mean().item()
+        type_results['overlap_max'] = off_diag.max().item()
+
+        input_results['types'][neuron_type] = type_results
+
+    # Aggregate stats
+    all_conds = [input_results['types'][t]['avg_condition'] for t in input_results['types']]
+    all_orth_errs = [input_results['types'][t]['avg_orth_error'] for t in input_results['types']]
+    input_results['avg_condition'] = np.mean(all_conds)
+    input_results['avg_orth_error'] = np.mean(all_orth_errs)
 
     results['input'] = input_results
 
@@ -161,7 +196,15 @@ def analyze_shared_neurons(model):
 
     process_results = {'pools': {}}
 
-    if hasattr(shared, 'process_neurons_m'):
+    if hasattr(shared, 'process_neurons_q') and hasattr(shared, 'process_neurons_k'):
+        # v8.1: Q/K/V/O/M split (full separation)
+        process_results['version'] = 'v8.1 (Q/K/V/O/M split)'
+        process_results['pools']['Q'] = analyze_process_pool(shared.process_neurons_q.data, 'Q')
+        process_results['pools']['K'] = analyze_process_pool(shared.process_neurons_k.data, 'K')
+        process_results['pools']['V'] = analyze_process_pool(shared.process_neurons_v.data, 'V')
+        process_results['pools']['O'] = analyze_process_pool(shared.process_neurons_o.data, 'O')
+        process_results['pools']['M'] = analyze_process_pool(shared.process_neurons_m.data, 'M')
+    elif hasattr(shared, 'process_neurons_m'):
         # v8.0: QK/V/O/M split (unified architecture)
         process_results['version'] = 'v8.0 (QK/V/O/M split)'
         process_results['pools']['QK'] = analyze_process_pool(shared.process_neurons_qk.data, 'QK')
@@ -213,46 +256,66 @@ def analyze_shared_neurons(model):
     print(f"  Version: {process_results['version']}")
     results['process'] = process_results
 
-    # ========== Output Neurons ==========
+    # ========== Output Neurons (타입별 분리: O) ==========
     print("\n📌 Output Neurons: [n_output, rank, d_model]")
-    output_neurons = shared.output_neurons.data  # [n_output, rank, d_model]
-    n_output = output_neurons.shape[0]
 
-    output_results = {'shape': [n_output, rank, d_model], 'neurons': {}}
+    # v8.3+: 타입별 분리된 output neurons 분석
+    output_neuron_types = {}
+    if hasattr(shared, 'output_neurons_o'):
+        output_neuron_types['O'] = shared.output_neurons_o.data
+    # Fallback for legacy models
+    if not output_neuron_types:
+        output_neuron_types['all'] = shared.output_neurons.data
 
-    output_conds = []
-    output_orth_errors = []
-    for i in range(n_output):
-        W = output_neurons[i]  # [rank, d_model]
-        _, s, _ = torch.linalg.svd(W, full_matrices=False)
-        cond = (s[0] / (s[-1] + 1e-10)).item()
-        output_conds.append(cond)
+    output_results = {'types': {}}
 
-        # W @ W.T should be identity (rank × rank)
-        WWt = W @ W.T
-        I = torch.eye(rank, device=W.device)
-        orth_error = (WWt - I).abs().max().item()
-        output_orth_errors.append(orth_error)
+    for neuron_type, output_neurons in output_neuron_types.items():
+        n_output, rank_out, d_model_out = output_neurons.shape
+        type_results = {'shape': [n_output, rank_out, d_model_out], 'neurons': {}}
 
-        output_results['neurons'][i] = {
-            'condition': cond,
-            'orthogonality_error': orth_error
-        }
+        print(f"\n  📌 Output Neurons ({neuron_type}): [{n_output}, {rank_out}, {d_model_out}]")
 
-        print(f"  Neuron {i}: cond={cond:.2f}, orth_err={orth_error:.2e}")
+        output_conds = []
+        output_orth_errors = []
+        for i in range(n_output):
+            W = output_neurons[i]  # [rank, d_model]
+            _, s, _ = torch.linalg.svd(W, full_matrices=False)
+            cond = (s[0] / (s[-1] + 1e-10)).item()
+            output_conds.append(cond)
 
-    output_results['avg_condition'] = np.mean(output_conds)
-    output_results['avg_orth_error'] = np.mean(output_orth_errors)
+            # W @ W.T should be identity (rank × rank)
+            WWt = W @ W.T
+            I = torch.eye(rank, device=W.device)
+            orth_error = (WWt - I).abs().max().item()
+            output_orth_errors.append(orth_error)
 
-    # Output neuron overlap
-    print(f"\n  Output neuron overlap:")
-    products = torch.einsum('iad,jbd->ijab', output_neurons, output_neurons)
-    overlap_matrix = products.norm(dim=(-2, -1))
-    mask = ~torch.eye(n_output, dtype=torch.bool, device=overlap_matrix.device)
-    off_diag = overlap_matrix[mask]
-    print(f"    Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
-    output_results['overlap_mean'] = off_diag.mean().item()
-    output_results['overlap_max'] = off_diag.max().item()
+            type_results['neurons'][i] = {
+                'condition': cond,
+                'orthogonality_error': orth_error
+            }
+
+            print(f"    Neuron {i}: cond={cond:.2f}, orth_err={orth_error:.2e}")
+
+        type_results['avg_condition'] = np.mean(output_conds)
+        type_results['avg_orth_error'] = np.mean(output_orth_errors)
+
+        # Output neuron overlap
+        print(f"    {neuron_type} overlap:")
+        products = torch.einsum('iad,jbd->ijab', output_neurons, output_neurons)
+        overlap_matrix = products.norm(dim=(-2, -1))
+        mask = ~torch.eye(n_output, dtype=torch.bool, device=overlap_matrix.device)
+        off_diag = overlap_matrix[mask]
+        print(f"      Mean: {off_diag.mean().item():.4f}, Max: {off_diag.max().item():.4f}")
+        type_results['overlap_mean'] = off_diag.mean().item()
+        type_results['overlap_max'] = off_diag.max().item()
+
+        output_results['types'][neuron_type] = type_results
+
+    # Aggregate stats
+    all_conds = [output_results['types'][t]['avg_condition'] for t in output_results['types']]
+    all_orth_errs = [output_results['types'][t]['avg_orth_error'] for t in output_results['types']]
+    output_results['avg_condition'] = np.mean(all_conds)
+    output_results['avg_orth_error'] = np.mean(all_orth_errs)
 
     results['output'] = output_results
 
@@ -418,6 +481,217 @@ def analyze_routing_patterns(model, dataloader, device, max_batches=10):
     }
 
     return results, usage, cooccurrence
+
+
+# ============================================================
+# 2.5. Q/K Separation Analysis (v8.1+)
+# ============================================================
+
+def analyze_qk_separation(model, dataloader, device, max_batches=10):
+    """
+    Analyze Q/K separation effectiveness (v8.1+)
+
+    1. Q vs K input neuron selection comparison (Jaccard similarity)
+    2. Q/K neuron characteristics (overlap, cross-similarity)
+    3. Role differentiation analysis
+    """
+    print("\n" + "=" * 60)
+    print("2.5. Q/K SEPARATION ANALYSIS (v8.1+)")
+    print("=" * 60)
+
+    model = get_underlying_model(model)
+    model.eval()
+    shared = model.shared_neurons
+
+    # Check if v8.1+ (Q/K separated)
+    has_qk_separation = hasattr(shared, 'input_neurons_q') and hasattr(shared, 'input_neurons_k')
+
+    if not has_qk_separation:
+        print("  ⚠️ Model is v8.0 (Q/K shared). Skipping Q/K separation analysis.")
+        return {'version': 'v8.0 (QK shared)', 'qk_separated': False}
+
+    results = {'version': 'v8.1+ (Q/K separated)', 'qk_separated': True}
+
+    n_layers = len(model.layers)
+    n_input = model.n_input
+    n_process = model.n_process
+
+    # ========== 1. Q/K Neuron Characteristics ==========
+    print("\n📌 Q/K Input Neuron Characteristics:")
+
+    input_q = shared.input_neurons_q.data  # [n_input, d_model, rank]
+    input_k = shared.input_neurons_k.data  # [n_input, d_model, rank]
+
+    # Q neuron overlap (within Q)
+    q_T = input_q.transpose(1, 2)  # [n_input, rank, d_model]
+    q_products = torch.einsum('iad,jdb->ijab', q_T, input_q)
+    q_overlap = q_products.norm(dim=(-2, -1))
+    q_mask = ~torch.eye(n_input, dtype=torch.bool, device=q_overlap.device)
+    q_off_diag = q_overlap[q_mask]
+
+    # K neuron overlap (within K)
+    k_T = input_k.transpose(1, 2)
+    k_products = torch.einsum('iad,jdb->ijab', k_T, input_k)
+    k_overlap = k_products.norm(dim=(-2, -1))
+    k_off_diag = k_overlap[q_mask]
+
+    # Q-K cross similarity (between Q and K)
+    qk_products = torch.einsum('iad,jdb->ijab', q_T, input_k)
+    qk_cross = qk_products.norm(dim=(-2, -1))  # [n_input, n_input]
+
+    print(f"  Q-neuron overlap (within): mean={q_off_diag.mean().item():.4f}, max={q_off_diag.max().item():.4f}")
+    print(f"  K-neuron overlap (within): mean={k_off_diag.mean().item():.4f}, max={k_off_diag.max().item():.4f}")
+    print(f"  Q-K cross similarity: mean={qk_cross.mean().item():.4f}, max={qk_cross.max().item():.4f}")
+
+    # Diagonal similarity (Q_i vs K_i - corresponding neurons)
+    qk_diag = torch.diagonal(qk_cross)
+    print(f"  Q_i vs K_i (diagonal): mean={qk_diag.mean().item():.4f}, std={qk_diag.std().item():.4f}")
+
+    results['input_neurons'] = {
+        'q_overlap_mean': q_off_diag.mean().item(),
+        'q_overlap_max': q_off_diag.max().item(),
+        'k_overlap_mean': k_off_diag.mean().item(),
+        'k_overlap_max': k_off_diag.max().item(),
+        'qk_cross_mean': qk_cross.mean().item(),
+        'qk_cross_max': qk_cross.max().item(),
+        'qk_diagonal_mean': qk_diag.mean().item(),
+        'qk_diagonal_std': qk_diag.std().item(),
+    }
+
+    # ========== 2. Process Neurons Q vs K ==========
+    print("\n📌 Q/K Process Neuron Characteristics:")
+
+    process_q = shared.process_neurons_q.data  # [n_process, rank]
+    process_k = shared.process_neurons_k.data  # [n_process, rank]
+
+    # Normalize for cosine similarity
+    pq_norm = F.normalize(process_q, dim=-1)
+    pk_norm = F.normalize(process_k, dim=-1)
+
+    # Q-Q similarity
+    qq_sim = pq_norm @ pq_norm.T
+    qq_mask = ~torch.eye(n_process, dtype=torch.bool, device=qq_sim.device)
+    qq_off = qq_sim[qq_mask]
+
+    # K-K similarity
+    kk_sim = pk_norm @ pk_norm.T
+    kk_off = kk_sim[qq_mask]
+
+    # Q-K cross similarity
+    qk_sim = pq_norm @ pk_norm.T
+    qk_diag_process = torch.diagonal(qk_sim)
+
+    print(f"  Q-Q cosine sim: mean={qq_off.abs().mean().item():.4f}")
+    print(f"  K-K cosine sim: mean={kk_off.abs().mean().item():.4f}")
+    print(f"  Q-K cross sim: mean={qk_sim.abs().mean().item():.4f}")
+    print(f"  Q_i vs K_i (process): mean={qk_diag_process.mean().item():.4f}")
+
+    results['process_neurons'] = {
+        'qq_sim_mean': qq_off.abs().mean().item(),
+        'kk_sim_mean': kk_off.abs().mean().item(),
+        'qk_cross_mean': qk_sim.abs().mean().item(),
+        'qk_diagonal_mean': qk_diag_process.mean().item(),
+    }
+
+    # ========== 3. Q/K Routing Pattern Comparison ==========
+    print("\n📌 Q/K Routing Comparison (per layer):")
+
+    # Track Q and K input neuron selections
+    q_input_usage = torch.zeros(n_layers, n_input, device=device)
+    k_input_usage = torch.zeros(n_layers, n_input, device=device)
+    q_process_usage = torch.zeros(n_layers, n_process, device=device)
+    k_process_usage = torch.zeros(n_layers, n_process, device=device)
+
+    # Jaccard similarity per layer
+    qk_input_jaccard = torch.zeros(n_layers, device=device)
+    qk_process_jaccard = torch.zeros(n_layers, device=device)
+
+    total_tokens = 0
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Q/K Routing", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            B, S = input_ids.shape
+            total_tokens += B * S
+
+            _, routing_infos = model(input_ids, return_routing_info=True)
+
+            for layer_idx, routing_info in enumerate(routing_infos):
+                attn_routing = routing_info['attention']
+
+                # Get Q and K routing info
+                q_routing = attn_routing['routing_Q']
+                k_routing = attn_routing['routing_K']
+
+                # Input neuron weights (soft selection)
+                q_input_w = q_routing['input_weights']  # [B, S, n_input]
+                k_input_w = k_routing['input_weights']
+
+                # Process neuron indices (hard selection)
+                q_process_idx = q_routing['process_indices']  # [B, S, k]
+                k_process_idx = k_routing['process_indices']
+
+                # Accumulate usage
+                q_input_usage[layer_idx] += q_input_w.sum(dim=(0, 1))
+                k_input_usage[layer_idx] += k_input_w.sum(dim=(0, 1))
+
+                q_flat = q_process_idx.reshape(-1)
+                k_flat = k_process_idx.reshape(-1)
+                q_process_usage[layer_idx] += torch.bincount(q_flat, minlength=n_process).float()
+                k_process_usage[layer_idx] += torch.bincount(k_flat, minlength=n_process).float()
+
+                # Jaccard similarity (for this batch)
+                for b in range(B):
+                    for s in range(S):
+                        q_set = set(q_process_idx[b, s].tolist())
+                        k_set = set(k_process_idx[b, s].tolist())
+                        intersection = len(q_set & k_set)
+                        union = len(q_set | k_set)
+                        qk_process_jaccard[layer_idx] += intersection / (union + 1e-10)
+
+    # Normalize Jaccard
+    qk_process_jaccard /= total_tokens
+
+    # Compute input neuron Jaccard (using top-k of soft weights)
+    topk_input = 5  # Compare top-5 input neurons
+    for layer_idx in range(n_layers):
+        q_top = torch.topk(q_input_usage[layer_idx], topk_input).indices.tolist()
+        k_top = torch.topk(k_input_usage[layer_idx], topk_input).indices.tolist()
+        intersection = len(set(q_top) & set(k_top))
+        union = len(set(q_top) | set(k_top))
+        qk_input_jaccard[layer_idx] = intersection / (union + 1e-10)
+
+    results['routing'] = {
+        'qk_process_jaccard': qk_process_jaccard.tolist(),
+        'qk_input_jaccard': qk_input_jaccard.tolist(),
+        'avg_process_jaccard': qk_process_jaccard.mean().item(),
+        'avg_input_jaccard': qk_input_jaccard.mean().item(),
+    }
+
+    print(f"\n  {'Layer':<8} {'Input Jaccard':<15} {'Process Jaccard':<15}")
+    print(f"  {'-'*38}")
+    for layer_idx in range(n_layers):
+        print(f"  {layer_idx:<8} {qk_input_jaccard[layer_idx].item():<15.3f} {qk_process_jaccard[layer_idx].item():<15.3f}")
+
+    print(f"\n  Average Input Jaccard: {qk_input_jaccard.mean().item():.3f}")
+    print(f"  Average Process Jaccard: {qk_process_jaccard.mean().item():.3f}")
+
+    # ========== 4. Q/K Specialization Analysis ==========
+    print("\n📌 Q/K Specialization (Top neurons per component):")
+
+    for layer_idx in [0, n_layers // 2, n_layers - 1]:
+        print(f"\n  Layer {layer_idx}:")
+        q_top5 = torch.topk(q_process_usage[layer_idx], 5).indices.tolist()
+        k_top5 = torch.topk(k_process_usage[layer_idx], 5).indices.tolist()
+        overlap = set(q_top5) & set(k_top5)
+        print(f"    Q top-5 process neurons: {q_top5}")
+        print(f"    K top-5 process neurons: {k_top5}")
+        print(f"    Overlap: {len(overlap)}/5 ({overlap})")
+
+    return results
 
 
 # ============================================================
@@ -870,6 +1144,51 @@ def create_visualizations(all_results, output_dir):
             plt.close()
         print(f"  Saved: routing_qkvo.png")
 
+    # 1.5. Q/K Separation visualization (v8.1+)
+    if 'qk_separation' in all_results and all_results['qk_separation'].get('qk_separated', False):
+        qk = all_results['qk_separation']
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        # Q/K Process Jaccard per layer
+        n_layers = len(qk['routing']['qk_process_jaccard'])
+        layers = list(range(n_layers))
+
+        axes[0].bar(layers, qk['routing']['qk_process_jaccard'], color='steelblue', alpha=0.7, label='Process Jaccard')
+        axes[0].bar(layers, qk['routing']['qk_input_jaccard'], color='coral', alpha=0.7, label='Input Jaccard')
+        axes[0].set_xlabel('Layer')
+        axes[0].set_ylabel('Jaccard Similarity')
+        axes[0].set_title('Q vs K Routing Similarity per Layer')
+        axes[0].legend()
+        axes[0].set_ylim(0, 1)
+        axes[0].axhline(y=qk['routing']['avg_process_jaccard'], color='steelblue', linestyle='--', alpha=0.5)
+        axes[0].axhline(y=qk['routing']['avg_input_jaccard'], color='coral', linestyle='--', alpha=0.5)
+
+        # Q/K Neuron characteristics
+        input_data = qk['input_neurons']
+        categories = ['Q overlap', 'K overlap', 'Q-K cross']
+        values = [input_data['q_overlap_mean'], input_data['k_overlap_mean'], input_data['qk_cross_mean']]
+        colors = ['steelblue', 'coral', 'purple']
+        axes[1].bar(categories, values, color=colors)
+        axes[1].set_ylabel('Mean Overlap/Similarity')
+        axes[1].set_title('Input Neuron Characteristics')
+
+        # Process neuron similarity
+        process_data = qk['process_neurons']
+        categories = ['Q-Q sim', 'K-K sim', 'Q-K cross']
+        values = [process_data['qq_sim_mean'], process_data['kk_sim_mean'], process_data['qk_cross_mean']]
+        axes[2].bar(categories, values, color=colors)
+        axes[2].set_ylabel('Mean Cosine Similarity')
+        axes[2].set_title('Process Neuron Characteristics')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'qk_separation.png'), dpi=150)
+        if IN_NOTEBOOK:
+            plt.show()
+        else:
+            plt.close()
+        print(f"  Saved: qk_separation.png")
+
     # 2. Information flow
     if 'info_flow' in all_results:
         info_flow = all_results['info_flow']
@@ -972,14 +1291,30 @@ def create_visualizations(all_results, output_dir):
 
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
-        # Input neurons condition
+        # Input neurons condition (타입별 분리)
         if 'input' in shared:
-            n_input = len(shared['input']['neurons'])
-            input_conds = [shared['input']['neurons'][i]['condition'] for i in range(n_input)]
-            axes[0, 0].bar(range(len(input_conds)), input_conds, color='steelblue')
-            axes[0, 0].set_xlabel('Input Neuron')
-            axes[0, 0].set_ylabel('Condition Number')
-            axes[0, 0].set_title('Input Neurons Condition Numbers')
+            input_data = shared['input']
+            if 'types' in input_data:
+                # v8.3+: 타입별 분리 구조
+                all_conds = []
+                labels = []
+                for neuron_type, type_data in input_data['types'].items():
+                    n_neurons = len(type_data['neurons'])
+                    for i in range(n_neurons):
+                        all_conds.append(type_data['neurons'][str(i)]['condition'])
+                        labels.append(f'{neuron_type}_{i}')
+                axes[0, 0].bar(range(len(all_conds)), all_conds, color='steelblue')
+                axes[0, 0].set_xlabel('Input Neuron (Type_Index)')
+                axes[0, 0].set_ylabel('Condition Number')
+                axes[0, 0].set_title(f'Input Neurons Condition ({list(input_data["types"].keys())})')
+            elif 'neurons' in input_data:
+                # Legacy 구조
+                n_input = len(input_data['neurons'])
+                input_conds = [input_data['neurons'][i]['condition'] for i in range(n_input)]
+                axes[0, 0].bar(range(len(input_conds)), input_conds, color='steelblue')
+                axes[0, 0].set_xlabel('Input Neuron')
+                axes[0, 0].set_ylabel('Condition Number')
+                axes[0, 0].set_title('Input Neurons Condition Numbers')
 
         # Process neurons norms
         if 'process' in shared:
@@ -1003,14 +1338,30 @@ def create_visualizations(all_results, output_dir):
                 axes[0, 1].set_title('Process Neurons Norms (should be ~1)')
                 axes[0, 1].axhline(y=1.0, color='g', linestyle='--', alpha=0.5)
 
-        # Output neurons condition
+        # Output neurons condition (타입별 분리)
         if 'output' in shared:
-            n_output = len(shared['output']['neurons'])
-            output_conds = [shared['output']['neurons'][i]['condition'] for i in range(n_output)]
-            axes[1, 0].bar(range(len(output_conds)), output_conds, color='seagreen')
-            axes[1, 0].set_xlabel('Output Neuron')
-            axes[1, 0].set_ylabel('Condition Number')
-            axes[1, 0].set_title('Output Neurons Condition Numbers')
+            output_data = shared['output']
+            if 'types' in output_data:
+                # v8.3+: 타입별 분리 구조
+                all_conds = []
+                labels = []
+                for neuron_type, type_data in output_data['types'].items():
+                    n_neurons = len(type_data['neurons'])
+                    for i in range(n_neurons):
+                        all_conds.append(type_data['neurons'][str(i)]['condition'])
+                        labels.append(f'{neuron_type}_{i}')
+                axes[1, 0].bar(range(len(all_conds)), all_conds, color='seagreen')
+                axes[1, 0].set_xlabel('Output Neuron (Type_Index)')
+                axes[1, 0].set_ylabel('Condition Number')
+                axes[1, 0].set_title(f'Output Neurons Condition ({list(output_data["types"].keys())})')
+            elif 'neurons' in output_data:
+                # Legacy 구조
+                n_output = len(output_data['neurons'])
+                output_conds = [output_data['neurons'][i]['condition'] for i in range(n_output)]
+                axes[1, 0].bar(range(len(output_conds)), output_conds, color='seagreen')
+                axes[1, 0].set_xlabel('Output Neuron')
+                axes[1, 0].set_ylabel('Condition Number')
+                axes[1, 0].set_title('Output Neurons Condition Numbers')
 
         # Knowledge statistics
         if 'knowledge' in shared:
@@ -1187,6 +1538,9 @@ def main():
     routing_results, usage, cooccurrence = analyze_routing_patterns(model, dataloader, device, args.max_batches)
     all_results['routing'] = routing_results
 
+    # 2.5. Q/K Separation Analysis (v8.1+)
+    all_results['qk_separation'] = analyze_qk_separation(model, dataloader, device, args.max_batches)
+
     # 3. Information Flow
     all_results['info_flow'] = analyze_information_flow(model, dataloader, device, max_batches=5)
 
@@ -1213,6 +1567,14 @@ def main():
     print(f"  Process norm loss: {underlying.process_norm_loss().item():.6f}")
     print(f"  Knowledge diversity loss: {underlying.knowledge_diversity_loss().item():.6f}")
     print(f"  Avg routing entropy: {all_results['routing']['global']['avg_entropy']:.3f}")
+
+    # Q/K Separation (v8.1+)
+    if all_results['qk_separation'].get('qk_separated', False):
+        qk = all_results['qk_separation']
+        print(f"\n📊 Q/K Separation (v8.1+):")
+        print(f"  Q-K Input cross-sim: {qk['input_neurons']['qk_cross_mean']:.4f}")
+        print(f"  Q-K Process cross-sim: {qk['process_neurons']['qk_cross_mean']:.4f}")
+        print(f"  Avg Process Jaccard: {qk['routing']['avg_process_jaccard']:.3f}")
     print(f"  Avg routing gini: {all_results['routing']['global']['avg_gini']:.3f}")
     print(f"  Avg memory entropy: {all_results['memory']['global']['avg_entropy']:.3f}")
     print(f"  Dead knowledge neurons: {all_results['memory']['global']['dead_count']}")

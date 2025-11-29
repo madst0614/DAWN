@@ -1,5 +1,5 @@
 """
-DAWN v8 - Dynamic Architecture With Neurons
+DAWN v8.1 - Dynamic Architecture With Neurons
 
 핵심 철학:
 - 모든 연산이 "뉴런 선택 + 조합"으로 이루어짐
@@ -10,12 +10,16 @@ DAWN v8 - Dynamic Architecture With Neurons
 구조:
     SharedNeurons (공유 뉴런 풀 - 레이어 간 공유)
     ├── TransformNeurons (변환용)
-    │     ├── input_neurons:      [n_input, d_model, rank]
-    │     ├── process_neurons_qk: [n_process, rank] — Q, K용
+    │     ├── input_neurons_q:    [n_input, d_model, rank] — Q 압축용
+    │     ├── input_neurons_k:    [n_input, d_model, rank] — K 압축용
+    │     ├── input_neurons_v:    [n_input, d_model, rank] — V 압축용
+    │     ├── input_neurons_m:    [n_input, d_model, rank] — Memory Query 압축용
+    │     ├── process_neurons_q:  [n_process, rank] — Q용
+    │     ├── process_neurons_k:  [n_process, rank] — K용
     │     ├── process_neurons_v:  [n_process, rank] — V용
     │     ├── process_neurons_o:  [n_process, rank] — O용
     │     ├── process_neurons_m:  [n_process, rank] — Memory Query용
-    │     └── output_neurons:     [n_output, rank, d_model]
+    │     └── output_neurons_o:   [n_output, rank, d_model] — O 확장용
     │
     └── KnowledgeNeurons (지식용)
           ├── knowledge_K: [n_knowledge, rank]
@@ -23,7 +27,8 @@ DAWN v8 - Dynamic Architecture With Neurons
 
     NeuronCircuit (Transformer Block)
     ├── NeuronAttention (Attention 대체)
-    │     ├── Compressor_Q, K (neuron_type='qk')
+    │     ├── Compressor_Q (neuron_type='q')
+    │     ├── Compressor_K (neuron_type='k')
     │     ├── Compressor_V (neuron_type='v')
     │     ├── Expander_O (neuron_type='o')
     │     └── Multi-Head Attention 연산
@@ -44,12 +49,16 @@ class SharedNeurons(nn.Module):
     공유 뉴런 풀 - 모든 레이어에서 참조
 
     TransformNeurons:
-        - input_neurons: 차원 압축용 [n_input, d_model, rank]
-        - process_neurons_qk: Q, K용 Householder 변환 [n_process, rank]
+        - input_neurons_q: Q 압축용 [n_input, d_model, rank]
+        - input_neurons_k: K 압축용 [n_input, d_model, rank]
+        - input_neurons_v: V 압축용 [n_input, d_model, rank]
+        - input_neurons_m: Memory Query 압축용 [n_input, d_model, rank]
+        - process_neurons_q: Q용 Householder 변환 [n_process, rank]
+        - process_neurons_k: K용 Householder 변환 [n_process, rank]
         - process_neurons_v: V용 Householder 변환 [n_process, rank]
         - process_neurons_o: O용 Householder 변환 [n_process, rank]
         - process_neurons_m: Memory Query용 Householder 변환 [n_process, rank]
-        - output_neurons: 차원 복원용 [n_output, rank, d_model]
+        - output_neurons_o: O 확장용 [n_output, rank, d_model]
 
     KnowledgeNeurons:
         - knowledge_K: 지식 검색 키 [n_knowledge, rank]
@@ -72,14 +81,27 @@ class SharedNeurons(nn.Module):
         self.n_output = n_output
         self.n_knowledge = n_knowledge
 
-        # TransformNeurons
-        self.input_neurons = nn.Parameter(torch.zeros(n_input, d_model, rank))
-        # Process neurons 분리: QK용 / V용 / O용 / M(Memory Query)용
-        self.process_neurons_qk = nn.Parameter(torch.zeros(n_process, rank))
+        # TransformNeurons - Input (Q/K 분리)
+        self.input_neurons_q = nn.Parameter(torch.zeros(n_input, d_model, rank))
+        self.input_neurons_k = nn.Parameter(torch.zeros(n_input, d_model, rank))
+        self.input_neurons_v = nn.Parameter(torch.zeros(n_input, d_model, rank))
+        self.input_neurons_m = nn.Parameter(torch.zeros(n_input, d_model, rank))
+
+        # TransformNeurons - Process (Q/K 분리)
+        self.process_neurons_q = nn.Parameter(torch.zeros(n_process, rank))
+        self.process_neurons_k = nn.Parameter(torch.zeros(n_process, rank))
         self.process_neurons_v = nn.Parameter(torch.zeros(n_process, rank))
         self.process_neurons_o = nn.Parameter(torch.zeros(n_process, rank))
         self.process_neurons_m = nn.Parameter(torch.zeros(n_process, rank))
-        self.output_neurons = nn.Parameter(torch.zeros(n_output, rank, d_model))
+
+        # TransformNeurons - Output (타입별 분리)
+        self.output_neurons_o = nn.Parameter(torch.zeros(n_output, rank, d_model))
+
+        # Legacy compatibility: keep references for old code
+        self.input_neurons = self.input_neurons_q  # backward compat
+        self.input_neurons_qk = self.input_neurons_q  # backward compat for v8.0
+        self.process_neurons_qk = self.process_neurons_q  # backward compat for v8.0
+        self.output_neurons = self.output_neurons_o  # backward compat
 
         # KnowledgeNeurons
         self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, rank))
@@ -89,43 +111,75 @@ class SharedNeurons(nn.Module):
 
     def _init_weights(self):
         """뉴런 초기화"""
-        # input_neurons: 직교 초기화 (QR)
+        # input_neurons_q: 직교 초기화 (QR)
         for i in range(self.n_input):
             if self.d_model >= self.rank:
                 q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
-                self.input_neurons.data[i] = q
+                self.input_neurons_q.data[i] = q
             else:
                 q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
-                self.input_neurons.data[i] = q.T
+                self.input_neurons_q.data[i] = q.T
 
-        # process_neurons_qk: 단위 벡터 초기화
+        # input_neurons_k: 직교 초기화 (QR)
+        for i in range(self.n_input):
+            if self.d_model >= self.rank:
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.input_neurons_k.data[i] = q
+            else:
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.input_neurons_k.data[i] = q.T
+
+        # input_neurons_v: 직교 초기화
+        for i in range(self.n_input):
+            if self.d_model >= self.rank:
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.input_neurons_v.data[i] = q
+            else:
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.input_neurons_v.data[i] = q.T
+
+        # input_neurons_m: 직교 초기화
+        for i in range(self.n_input):
+            if self.d_model >= self.rank:
+                q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
+                self.input_neurons_m.data[i] = q
+            else:
+                q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
+                self.input_neurons_m.data[i] = q.T
+
+        # process_neurons_q: 단위 벡터 초기화
         for i in range(self.n_process):
             v = torch.randn(self.rank)
-            self.process_neurons_qk.data[i] = v / (v.norm() + 1e-8)
+            self.process_neurons_q.data[i] = v / (v.norm() + 1e-8)
 
-        # process_neurons_v: 단위 벡터 초기화 (V용)
+        # process_neurons_k: 단위 벡터 초기화
+        for i in range(self.n_process):
+            v = torch.randn(self.rank)
+            self.process_neurons_k.data[i] = v / (v.norm() + 1e-8)
+
+        # process_neurons_v: 단위 벡터 초기화
         for i in range(self.n_process):
             v = torch.randn(self.rank)
             self.process_neurons_v.data[i] = v / (v.norm() + 1e-8)
 
-        # process_neurons_o: 단위 벡터 초기화 (O용)
+        # process_neurons_o: 단위 벡터 초기화
         for i in range(self.n_process):
             v = torch.randn(self.rank)
             self.process_neurons_o.data[i] = v / (v.norm() + 1e-8)
 
-        # process_neurons_m: 단위 벡터 초기화 (Memory Query용)
+        # process_neurons_m: 단위 벡터 초기화
         for i in range(self.n_process):
             v = torch.randn(self.rank)
             self.process_neurons_m.data[i] = v / (v.norm() + 1e-8)
 
-        # output_neurons: 직교 초기화 (QR)
+        # output_neurons_o: 직교 초기화 (QR)
         for i in range(self.n_output):
             if self.rank >= self.d_model:
                 q, _ = torch.linalg.qr(torch.randn(self.rank, self.d_model))
-                self.output_neurons.data[i] = q
+                self.output_neurons_o.data[i] = q
             else:
                 q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
-                self.output_neurons.data[i] = q.T  # [rank, d_model]
+                self.output_neurons_o.data[i] = q.T  # [rank, d_model]
 
         # knowledge_K: 정규분포 + 정규화
         nn.init.normal_(self.knowledge_K, std=0.02)
@@ -135,10 +189,31 @@ class SharedNeurons(nn.Module):
         # knowledge_V: 정규분포
         nn.init.normal_(self.knowledge_V, std=0.02)
 
+    def get_input_neurons(self, neuron_type: str):
+        """neuron_type에 따라 적절한 input neurons 반환"""
+        if neuron_type == 'q':
+            return self.input_neurons_q
+        elif neuron_type == 'k':
+            return self.input_neurons_k
+        elif neuron_type == 'qk':
+            # v8.0 backward compat
+            return self.input_neurons_q
+        elif neuron_type == 'v':
+            return self.input_neurons_v
+        elif neuron_type == 'm':
+            return self.input_neurons_m
+        else:
+            raise ValueError(f"Unknown neuron_type: {neuron_type}. Use 'q', 'k', 'v', or 'm'.")
+
     def get_process_neurons(self, neuron_type: str):
         """neuron_type에 따라 적절한 process neurons 반환"""
-        if neuron_type == 'qk':
-            return self.process_neurons_qk
+        if neuron_type == 'q':
+            return self.process_neurons_q
+        elif neuron_type == 'k':
+            return self.process_neurons_k
+        elif neuron_type == 'qk':
+            # v8.0 backward compat
+            return self.process_neurons_q
         elif neuron_type == 'v':
             return self.process_neurons_v
         elif neuron_type == 'o':
@@ -146,7 +221,14 @@ class SharedNeurons(nn.Module):
         elif neuron_type == 'm':
             return self.process_neurons_m
         else:
-            raise ValueError(f"Unknown neuron_type: {neuron_type}. Use 'qk', 'v', 'o', or 'm'.")
+            raise ValueError(f"Unknown neuron_type: {neuron_type}. Use 'q', 'k', 'v', 'o', or 'm'.")
+
+    def get_output_neurons(self, neuron_type: str):
+        """neuron_type에 따라 적절한 output neurons 반환"""
+        if neuron_type == 'o':
+            return self.output_neurons_o
+        else:
+            raise ValueError(f"Unknown neuron_type: {neuron_type}. Use 'o'.")
 
     def apply_householder(self, x, v):
         """
@@ -215,8 +297,9 @@ class Compressor(nn.Module):
         input_weights = F.softmax(input_scores, dim=-1)  # [B, S, n_input]
 
         # 2. Project: d_model → rank
-        # input_neurons: [n_input, d_model, rank]
-        all_proj = torch.einsum('bsd,ndr->bsnr', x, self.shared_neurons.input_neurons)
+        # input_neurons: [n_input, d_model, rank] - 타입별로 분리된 neuron pool 사용
+        input_neurons = self.shared_neurons.get_input_neurons(self.neuron_type)
+        all_proj = torch.einsum('bsd,ndr->bsnr', x, input_neurons)
         x_compressed = (all_proj * input_weights.unsqueeze(-1)).sum(dim=2)  # [B, S, rank]
 
         # 3. Process neuron selection (top-k) - 압축 후 결정
@@ -304,8 +387,9 @@ class Expander(nn.Module):
         output_weights = F.softmax(output_scores, dim=-1)  # [B, S, n_output]
 
         # 4. Project: rank → d_model
-        # output_neurons: [n_output, rank, d_model]
-        all_proj = torch.einsum('bsr,nrd->bsnd', x, self.shared_neurons.output_neurons)
+        # output_neurons: [n_output, rank, d_model] - 타입별로 분리된 neuron pool 사용
+        output_neurons = self.shared_neurons.get_output_neurons(self.neuron_type)
+        all_proj = torch.einsum('bsr,nrd->bsnd', x, output_neurons)
         x_expanded = (all_proj * output_weights.unsqueeze(-1)).sum(dim=2)  # [B, S, d_model]
 
         routing_info = {
@@ -321,15 +405,17 @@ class NeuronAttention(nn.Module):
     Attention 대체 - Compressor/Expander 기반
 
     구조:
-        x → Compressor_Q (qk) → Q
-        x → Compressor_K (qk) → K
-        x → Compressor_V (vo) → V
+        x → Compressor_Q (q) → Q
+        x → Compressor_K (k) → K
+        x → Compressor_V (v) → V
         attention(Q, K, V) → attn_out
-        attn_out → Expander_O (vo) → output
+        attn_out → Expander_O (o) → output
 
-    v8.1: process_neurons를 QK/VO로 분리
-        - Q, K는 process_neurons_qk 사용
-        - V, O는 process_neurons_vo 사용
+    v8.1: Q/K 완전 분리
+        - Q는 input_neurons_q, process_neurons_q 사용
+        - K는 input_neurons_k, process_neurons_k 사용
+        - V는 input_neurons_v, process_neurons_v 사용
+        - O는 process_neurons_o, output_neurons_o 사용
     """
     def __init__(
         self,
@@ -350,9 +436,11 @@ class NeuronAttention(nn.Module):
         self.d_head = rank // n_heads
         self.rank = rank
 
-        # Q/K는 'qk' neuron pool 사용
-        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_input, n_process, process_k, neuron_type='qk')
-        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_input, n_process, process_k, neuron_type='qk')
+        # Q는 'q' neuron pool 사용
+        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_input, n_process, process_k, neuron_type='q')
+
+        # K는 'k' neuron pool 사용
+        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_input, n_process, process_k, neuron_type='k')
 
         # V는 'v' neuron pool 사용
         self.compressor_V = Compressor(shared_neurons, d_model, rank, n_input, n_process, process_k, neuron_type='v')
@@ -564,7 +652,7 @@ class DAWN(nn.Module):
     - NeuronCircuit: NeuronAttention + NeuronMemory
     - 라우터/W_Q만 레이어/모듈별로 독립
     """
-    __version__ = "8.0"
+    __version__ = "8.1"
 
     def __init__(
         self,
@@ -741,10 +829,14 @@ class DAWN(nn.Module):
         return loss / 2
 
     def process_norm_loss(self):
-        """process neurons ||v|| ≈ 1 유지 (QK/V/O/M 네 풀 모두)"""
-        # QK pool
-        norms_qk = self.shared_neurons.process_neurons_qk.norm(dim=-1)
-        loss_qk = ((norms_qk - 1.0) ** 2).mean()
+        """process neurons ||v|| ≈ 1 유지 (Q/K/V/O/M 다섯 풀 모두)"""
+        # Q pool
+        norms_q = self.shared_neurons.process_neurons_q.norm(dim=-1)
+        loss_q = ((norms_q - 1.0) ** 2).mean()
+
+        # K pool
+        norms_k = self.shared_neurons.process_neurons_k.norm(dim=-1)
+        loss_k = ((norms_k - 1.0) ** 2).mean()
 
         # V pool
         norms_v = self.shared_neurons.process_neurons_v.norm(dim=-1)
@@ -758,7 +850,7 @@ class DAWN(nn.Module):
         norms_m = self.shared_neurons.process_neurons_m.norm(dim=-1)
         loss_m = ((norms_m - 1.0) ** 2).mean()
 
-        return (loss_qk + loss_v + loss_o + loss_m) / 4
+        return (loss_q + loss_k + loss_v + loss_o + loss_m) / 5
 
     def knowledge_diversity_loss(self):
         """
