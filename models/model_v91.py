@@ -2,18 +2,23 @@
 DAWN v9.1 - Dynamic Architecture With Neurons
 
 v9.0 → v9.1 변경:
-1. Compress/Expand: soft → hard selection
-   - v9.0: weights = softmax(scores), weighted sum
-   - v9.1: idx = argmax(scores), direct indexing
+1. Compress/Expand: soft weighted sum (v8 스타일, 배치 병렬화 가능)
+   - weights = softmax(scores)
+   - all_proj = einsum(x, neurons)
+   - output = (all_proj * weights).sum()
 
 2. Reflection: hard → gated
    - v9.0: x = apply_reflection(x, v)  # 100% 적용
    - v9.1: gate = sigmoid(score), x = gate * reflected + (1 - gate) * x
 
+3. ReflectionNeurons: separate pools
+   - reflect_d: [n_reflect_d, d_model]
+   - reflect_r: [n_reflect_r, rank]
+
 구조:
     SharedNeurons
-    ├── CompressNeurons: [n_compress, d_model, rank]   # hard selection
-    ├── ExpandNeurons: [n_expand, rank, d_model]       # hard selection
+    ├── CompressNeurons: [n_compress, d_model, rank]   # soft weighted sum
+    ├── ExpandNeurons: [n_expand, rank, d_model]       # soft weighted sum
     │
     ├── ReflectionNeurons (gated application, separate pools)
     │   ├── reflect_d: [n_reflect_d, d_model]   # d_model space reflections
@@ -27,13 +32,13 @@ v9.0 → v9.1 변경:
     [Compressor: d_model → rank]
     x [d_model]
     → reflect_d gated 적용 (관점 변환, 부분 적용)
-    → compress_neuron hard 선택 (argmax)
+    → compress_neuron soft 선택 (weighted sum)
     → output [rank]
 
     [Expander: rank → d_model]
     x [rank]
     → reflect_r gated 적용
-    → expand_neuron hard 선택 (argmax)
+    → expand_neuron soft 선택 (weighted sum)
     → reflect_d gated 적용
     → output [d_model]
 """
@@ -49,7 +54,7 @@ class SharedNeurons(nn.Module):
     공유 뉴런 풀 - 모든 레이어에서 참조
 
     v9.1:
-    - CompressNeurons/ExpandNeurons: hard selection (argmax)
+    - CompressNeurons/ExpandNeurons: soft weighted sum (배치 병렬화)
     - ReflectionNeurons: gated application (sigmoid gate), separate pools
     - KnowledgeNeurons: knowledge_K/V
     """
@@ -168,7 +173,7 @@ class Compressor(nn.Module):
     d_model → rank 압축 (v9.1)
 
     1. reflect_d gated 적용 (관점 변환, 부분 적용)
-    2. compress_neuron hard 선택 (argmax)
+    2. compress_neuron soft 선택 (weighted sum, 배치 병렬화)
     """
     def __init__(
         self,
@@ -220,23 +225,20 @@ class Compressor(nn.Module):
             gate = torch.sigmoid(topk_scores[:, :, i:i+1])  # [B, S, 1]
             x = sn.apply_gated_reflection(x, v, gate)
 
-        # 2. compress_neuron hard 선택 (argmax)
+        # 2. compress_neuron soft 선택 (weighted sum)
         scores_c = self.router_compress(x)  # [B, S, n_compress]
-        idx_c = scores_c.argmax(dim=-1)  # [B, S]
+        weights_c = F.softmax(scores_c, dim=-1)  # [B, S, n_compress]
 
-        # Hard selection: x @ compress_neurons[idx]
-        # Gather selected neurons for each position
-        idx_c_expanded = idx_c.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, D, self.rank)  # [B, S, d_model, rank]
-        compress_selected = sn.compress_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)  # [B, S, n_compress, d_model, rank]
-        compress_selected = compress_selected.gather(2, idx_c_expanded.unsqueeze(2)).squeeze(2)  # [B, S, d_model, rank]
-
-        # x: [B, S, d_model] @ compress_selected: [B, S, d_model, rank] -> [B, S, rank]
-        x = torch.einsum('bsd,bsdr->bsr', x, compress_selected)
+        # Soft selection: weighted sum of all projections
+        # all_proj: [B, S, n_compress, rank]
+        all_proj = torch.einsum('bsd,ndr->bsnr', x, sn.compress_neurons)
+        # output: [B, S, rank]
+        x = (all_proj * weights_c.unsqueeze(-1)).sum(dim=2)
 
         routing_info = {
             'indices_d': indices_d,
             'gates_d': torch.sigmoid(topk_scores),
-            'idx_compress': idx_c,
+            'weights_compress': weights_c,
         }
 
         return x, routing_info
@@ -247,7 +249,7 @@ class Expander(nn.Module):
     rank → d_model 확장 (v9.1)
 
     1. reflect_r gated 적용 (잠재 공간 변환)
-    2. expand_neuron hard 선택 (argmax)
+    2. expand_neuron soft 선택 (weighted sum, 배치 병렬화)
     3. reflect_d gated 적용 (출력 관점 변환)
     """
     def __init__(
@@ -303,17 +305,15 @@ class Expander(nn.Module):
             gate = torch.sigmoid(topk_scores_r[:, :, i:i+1])  # [B, S, 1]
             x = sn.apply_gated_reflection(x, v, gate)
 
-        # 2. expand_neuron hard 선택 (argmax)
+        # 2. expand_neuron soft 선택 (weighted sum)
         scores_e = self.router_expand(x)  # [B, S, n_expand]
-        idx_e = scores_e.argmax(dim=-1)  # [B, S]
+        weights_e = F.softmax(scores_e, dim=-1)  # [B, S, n_expand]
 
-        # Hard selection: x @ expand_neurons[idx]
-        idx_e_expanded = idx_e.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, R, self.d_model)  # [B, S, rank, d_model]
-        expand_selected = sn.expand_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)  # [B, S, n_expand, rank, d_model]
-        expand_selected = expand_selected.gather(2, idx_e_expanded.unsqueeze(2)).squeeze(2)  # [B, S, rank, d_model]
-
-        # x: [B, S, rank] @ expand_selected: [B, S, rank, d_model] -> [B, S, d_model]
-        x = torch.einsum('bsr,bsrd->bsd', x, expand_selected)
+        # Soft selection: weighted sum of all projections
+        # all_proj: [B, S, n_expand, d_model]
+        all_proj = torch.einsum('bsr,nrd->bsnd', x, sn.expand_neurons)
+        # output: [B, S, d_model]
+        x = (all_proj * weights_e.unsqueeze(-1)).sum(dim=2)
 
         # 3. d_model 공간 반사 (gated, top-k)
         scores_d = self.router_d(x)  # [B, S, n_reflect]
@@ -328,7 +328,7 @@ class Expander(nn.Module):
         routing_info = {
             'indices_r': indices_r,
             'gates_r': torch.sigmoid(topk_scores_r),
-            'idx_expand': idx_e,
+            'weights_expand': weights_e,
             'indices_d': indices_d,
             'gates_d': torch.sigmoid(topk_scores_d),
         }
@@ -538,9 +538,9 @@ class DAWN(nn.Module):
     """
     DAWN v9.1 - Dynamic Architecture With Neurons
 
-    v9.0 → v9.1 변경:
-    - Compress/Expand: soft (weighted sum) → hard (argmax)
-    - Reflection: hard 100% → gated (sigmoid gate)
+    v9.1 특징:
+    - Compress/Expand: soft weighted sum (v8 스타일, 배치 병렬화 가능)
+    - Reflection: gated (sigmoid gate)
     - ReflectionNeurons: separate pools (n_reflect_d, n_reflect_r)
     """
     __version__ = "9.1"
