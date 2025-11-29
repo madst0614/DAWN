@@ -25,7 +25,6 @@ DAWN v9.0 - Dynamic Architecture With Neurons
     x [d_model]
     → reflect_d 적용 (d_model 공간 반사)
     → @ base_input (압축)
-    → reflect_r 적용 (rank 공간 반사)
     → output [rank]
 
     [Expander: rank → d_model]
@@ -34,6 +33,10 @@ DAWN v9.0 - Dynamic Architecture With Neurons
     → @ base_output (확장)
     → reflect_d 적용 (d_model 공간 반사)
     → output [d_model]
+
+역할 분리:
+    - reflect_d: 입출력 관점 (256차원, Compressor/Expander 양쪽)
+    - reflect_r: 잠재 공간 변환 (64차원, Expander에서만)
 
 파라미터:
 - base_input: 256 × 64 = 16K
@@ -150,7 +153,6 @@ class Compressor(nn.Module):
 
     1. reflect_d 적용 (d_model 공간 반사)
     2. @ base_input (압축)
-    3. reflect_r 적용 (rank 공간 반사)
     """
     def __init__(
         self,
@@ -175,7 +177,6 @@ class Compressor(nn.Module):
 
         # 독립 라우터 (타입별/레이어별)
         self.router_d = nn.Linear(d_model, n_reflect, bias=False)
-        self.router_r = nn.Linear(rank, n_reflect, bias=False)
 
     def forward(self, x):
         """
@@ -201,18 +202,8 @@ class Compressor(nn.Module):
         # 2. 압축
         x = x @ sn.base_input  # [B, S, rank]
 
-        # 3. rank 공간 반사 (top-k)
-        scores_r = self.router_r(x)  # [B, S, n_reflect]
-        _, indices_r = torch.topk(scores_r, self.reflect_k, dim=-1)  # [B, S, k]
-
-        for i in range(self.reflect_k):
-            idx = indices_r[:, :, i]  # [B, S]
-            v = sn.reflect_r[idx]  # [B, S, rank]
-            x = sn.apply_reflection(x, v)
-
         routing_info = {
             'indices_d': indices_d,
-            'indices_r': indices_r,
         }
 
         return x, routing_info
