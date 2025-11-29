@@ -47,12 +47,12 @@ from typing import Dict, Any, List, Optional, Callable
 
 VERSION_REGISTRY = {
     "9.1": {
-        "description": "v9.0 + hard selection + gated reflection",
+        "description": "v9.0 + hard selection + gated reflection + separate reflect pools",
         "aliases": ["91"],
         "module": "model_v91",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_compress", "n_expand", "n_reflect", "reflect_k",
+            "n_compress", "n_expand", "n_reflect_d", "n_reflect_r", "reflect_k",
             "n_knowledge", "knowledge_k", "rank",
         ],
         "optional_params": {
@@ -62,9 +62,9 @@ VERSION_REGISTRY = {
             f"SharedNeurons (v9.1): rank={args.get('rank', args.get('basis_rank'))}",
             f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (hard selection)",
             f"  ExpandNeurons: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (hard selection)",
-            f"  ReflectionNeurons (gated):",
-            f"    - reflect_d: {args.get('n_reflect')} × {args.get('d_model')}",
-            f"    - reflect_r: {args.get('n_reflect')} × {args.get('rank', args.get('basis_rank'))}",
+            f"  ReflectionNeurons (gated, separate pools):",
+            f"    - reflect_d: {args.get('n_reflect_d')} × {args.get('d_model')}",
+            f"    - reflect_r: {args.get('n_reflect_r')} × {args.get('rank', args.get('basis_rank'))}",
             f"    - Reflect top-k: {args.get('reflect_k')}",
             f"  KnowledgeNeurons:",
             f"    - K: {args.get('n_knowledge')} × {args.get('rank', args.get('basis_rank'))}",

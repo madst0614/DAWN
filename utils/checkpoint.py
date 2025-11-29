@@ -17,11 +17,15 @@ from typing import Dict, Any, Optional, Tuple, List
 
 VERSION_PARAM_CHANGES = {
     "9.1": {
-        "description": "v9.0 + hard selection + gated reflection",
-        "added": [],  # Same structure as v9.0, just behavior change
+        "description": "v9.0 + hard selection + gated reflection + separate reflect pools",
+        "added": [
+            # v9.1: separate n_reflect_d / n_reflect_r (instead of shared n_reflect)
+            "shared_neurons.reflect_d",  # [n_reflect_d, d_model]
+            "shared_neurons.reflect_r",  # [n_reflect_r, rank]
+        ],
         "removed": [],
         "renamed": {},
-        "notes": "Compatible with v9.0 checkpoints (same parameters, different behavior)",
+        "notes": "v9.1 separates reflect_d/reflect_r pool sizes (n_reflect_d, n_reflect_r)",
     },
     "9.0": {
         "description": "CompressNeurons + ExpandNeurons + ReflectionNeurons",

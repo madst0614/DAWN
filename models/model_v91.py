@@ -15,9 +15,9 @@ v9.0 → v9.1 변경:
     ├── CompressNeurons: [n_compress, d_model, rank]   # hard selection
     ├── ExpandNeurons: [n_expand, rank, d_model]       # hard selection
     │
-    ├── ReflectionNeurons (gated application)
-    │   ├── reflect_d: [n_reflect, d_model]
-    │   └── reflect_r: [n_reflect, rank]
+    ├── ReflectionNeurons (gated application, separate pools)
+    │   ├── reflect_d: [n_reflect_d, d_model]   # d_model space reflections
+    │   └── reflect_r: [n_reflect_r, rank]       # rank space reflections
     │
     └── KnowledgeNeurons
         ├── knowledge_K: [n_knowledge, rank]
@@ -50,7 +50,7 @@ class SharedNeurons(nn.Module):
 
     v9.1:
     - CompressNeurons/ExpandNeurons: hard selection (argmax)
-    - ReflectionNeurons: gated application (sigmoid gate)
+    - ReflectionNeurons: gated application (sigmoid gate), separate pools
     - KnowledgeNeurons: knowledge_K/V
     """
     def __init__(
@@ -59,19 +59,22 @@ class SharedNeurons(nn.Module):
         rank: int,
         n_compress: int,
         n_expand: int,
-        n_reflect: int,
+        n_reflect_d: int,
+        n_reflect_r: int,
         n_knowledge: int,
         # Legacy params (ignored)
         n_process: int = None,
         n_input: int = None,
         n_output: int = None,
+        n_reflect: int = None,  # Legacy: use n_reflect_d/n_reflect_r instead
     ):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
         self.n_compress = n_compress
         self.n_expand = n_expand
-        self.n_reflect = n_reflect
+        self.n_reflect_d = n_reflect_d
+        self.n_reflect_r = n_reflect_r
         self.n_knowledge = n_knowledge
 
         # CompressNeurons (다중 압축 행렬)
@@ -80,9 +83,9 @@ class SharedNeurons(nn.Module):
         # ExpandNeurons (다중 확장 행렬)
         self.expand_neurons = nn.Parameter(torch.zeros(n_expand, rank, d_model))
 
-        # ReflectionNeurons (통합 풀)
-        self.reflect_d = nn.Parameter(torch.zeros(n_reflect, d_model))
-        self.reflect_r = nn.Parameter(torch.zeros(n_reflect, rank))
+        # ReflectionNeurons (분리된 풀)
+        self.reflect_d = nn.Parameter(torch.zeros(n_reflect_d, d_model))
+        self.reflect_r = nn.Parameter(torch.zeros(n_reflect_r, rank))
 
         # KnowledgeNeurons
         self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, rank))
@@ -111,12 +114,12 @@ class SharedNeurons(nn.Module):
                 self.expand_neurons.data[i] = q.T
 
         # reflect_d: 단위 벡터 초기화
-        for i in range(self.n_reflect):
+        for i in range(self.n_reflect_d):
             v = torch.randn(self.d_model)
             self.reflect_d.data[i] = v / (v.norm() + 1e-8)
 
         # reflect_r: 단위 벡터 초기화
-        for i in range(self.n_reflect):
+        for i in range(self.n_reflect_r):
             v = torch.randn(self.rank)
             self.reflect_r.data[i] = v / (v.norm() + 1e-8)
 
@@ -173,25 +176,26 @@ class Compressor(nn.Module):
         d_model: int,
         rank: int,
         n_compress: int,
-        n_reflect: int,
+        n_reflect_d: int,
         reflect_k: int,
         neuron_type: str = 'q',
         # Legacy params
         n_process: int = None,
         process_k: int = None,
         n_input: int = None,
+        n_reflect: int = None,  # Legacy
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.rank = rank
         self.n_compress = n_compress
-        self.n_reflect = n_reflect
+        self.n_reflect_d = n_reflect_d
         self.reflect_k = reflect_k
         self.neuron_type = neuron_type
 
         # 독립 라우터 (타입별/레이어별)
-        self.router_d = nn.Linear(d_model, n_reflect, bias=False)
+        self.router_d = nn.Linear(d_model, n_reflect_d, bias=False)
         self.router_compress = nn.Linear(d_model, n_compress, bias=False)
 
     def forward(self, x):
@@ -252,27 +256,30 @@ class Expander(nn.Module):
         d_model: int,
         rank: int,
         n_expand: int,
-        n_reflect: int,
+        n_reflect_d: int,
+        n_reflect_r: int,
         reflect_k: int,
         neuron_type: str = 'o',
         # Legacy params
         n_process: int = None,
         process_k: int = None,
         n_output: int = None,
+        n_reflect: int = None,  # Legacy
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.rank = rank
         self.n_expand = n_expand
-        self.n_reflect = n_reflect
+        self.n_reflect_d = n_reflect_d
+        self.n_reflect_r = n_reflect_r
         self.reflect_k = reflect_k
         self.neuron_type = neuron_type
 
         # 독립 라우터
-        self.router_r = nn.Linear(rank, n_reflect, bias=False)
+        self.router_r = nn.Linear(rank, n_reflect_r, bias=False)
         self.router_expand = nn.Linear(rank, n_expand, bias=False)
-        self.router_d = nn.Linear(d_model, n_reflect, bias=False)
+        self.router_d = nn.Linear(d_model, n_reflect_d, bias=False)
 
     def forward(self, x):
         """
@@ -341,7 +348,8 @@ class NeuronAttention(nn.Module):
         rank: int,
         n_compress: int,
         n_expand: int,
-        n_reflect: int,
+        n_reflect_d: int,
+        n_reflect_r: int,
         reflect_k: int,
         dropout: float = 0.1,
         # Legacy params
@@ -349,6 +357,7 @@ class NeuronAttention(nn.Module):
         process_k: int = None,
         n_input: int = None,
         n_output: int = None,
+        n_reflect: int = None,  # Legacy
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
@@ -358,10 +367,10 @@ class NeuronAttention(nn.Module):
         self.rank = rank
 
         # Q/K/V/O - 같은 풀 공유, 라우터만 독립
-        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_compress, n_reflect, reflect_k, neuron_type='q')
-        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_compress, n_reflect, reflect_k, neuron_type='k')
-        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_compress, n_reflect, reflect_k, neuron_type='v')
-        self.expander_O = Expander(shared_neurons, d_model, rank, n_expand, n_reflect, reflect_k, neuron_type='o')
+        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_compress, n_reflect_d, reflect_k, neuron_type='q')
+        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_compress, n_reflect_d, reflect_k, neuron_type='k')
+        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_compress, n_reflect_d, reflect_k, neuron_type='v')
+        self.expander_O = Expander(shared_neurons, d_model, rank, n_expand, n_reflect_d, n_reflect_r, reflect_k, neuron_type='o')
 
         self.dropout = nn.Dropout(dropout)
 
@@ -413,13 +422,14 @@ class NeuronMemory(nn.Module):
         d_model: int,
         rank: int,
         n_compress: int,
-        n_reflect: int,
+        n_reflect_d: int,
         reflect_k: int,
         knowledge_k: int = 8,
         # Legacy params
         n_process: int = None,
         process_k: int = None,
         n_input: int = None,
+        n_reflect: int = None,  # Legacy
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
@@ -428,7 +438,7 @@ class NeuronMemory(nn.Module):
         self.knowledge_k = knowledge_k
 
         self.query_compressor = Compressor(
-            shared_neurons, d_model, rank, n_compress, n_reflect, reflect_k, neuron_type='m'
+            shared_neurons, d_model, rank, n_compress, n_reflect_d, reflect_k, neuron_type='m'
         )
 
     def forward(self, x):
@@ -467,7 +477,8 @@ class NeuronCircuit(nn.Module):
         rank: int,
         n_compress: int,
         n_expand: int,
-        n_reflect: int,
+        n_reflect_d: int,
+        n_reflect_r: int,
         reflect_k: int,
         knowledge_k: int,
         dropout: float = 0.1,
@@ -476,6 +487,7 @@ class NeuronCircuit(nn.Module):
         process_k: int = None,
         n_input: int = None,
         n_output: int = None,
+        n_reflect: int = None,  # Legacy
     ):
         super().__init__()
 
@@ -486,7 +498,8 @@ class NeuronCircuit(nn.Module):
             rank=rank,
             n_compress=n_compress,
             n_expand=n_expand,
-            n_reflect=n_reflect,
+            n_reflect_d=n_reflect_d,
+            n_reflect_r=n_reflect_r,
             reflect_k=reflect_k,
             dropout=dropout,
         )
@@ -496,7 +509,7 @@ class NeuronCircuit(nn.Module):
             d_model=d_model,
             rank=rank,
             n_compress=n_compress,
-            n_reflect=n_reflect,
+            n_reflect_d=n_reflect_d,
             reflect_k=reflect_k,
             knowledge_k=knowledge_k,
         )
@@ -528,6 +541,7 @@ class DAWN(nn.Module):
     v9.0 → v9.1 변경:
     - Compress/Expand: soft (weighted sum) → hard (argmax)
     - Reflection: hard 100% → gated (sigmoid gate)
+    - ReflectionNeurons: separate pools (n_reflect_d, n_reflect_r)
     """
     __version__ = "9.1"
 
@@ -541,7 +555,8 @@ class DAWN(nn.Module):
         max_seq_len: int = 128,
         n_compress: int = 4,
         n_expand: int = 4,
-        n_reflect: int = 128,
+        n_reflect_d: int = 64,
+        n_reflect_r: int = 64,
         reflect_k: int = 3,
         n_knowledge: int = 64,
         knowledge_k: int = 8,
@@ -551,13 +566,17 @@ class DAWN(nn.Module):
         process_k: int = None,
         n_input: int = None,
         n_output: int = None,
+        n_reflect: int = None,  # Legacy: use n_reflect_d/n_reflect_r
         **kwargs
     ):
         super().__init__()
 
         # Legacy param mapping
-        if n_reflect is None and n_process is not None:
-            n_reflect = n_process
+        if n_reflect is not None:
+            # Legacy: single n_reflect -> split equally
+            if n_reflect_d == 64 and n_reflect_r == 64:
+                n_reflect_d = n_reflect
+                n_reflect_r = n_reflect
         if reflect_k is None and process_k is not None:
             reflect_k = process_k
 
@@ -570,14 +589,16 @@ class DAWN(nn.Module):
 
         self.n_compress = n_compress
         self.n_expand = n_expand
-        self.n_reflect = n_reflect
+        self.n_reflect_d = n_reflect_d
+        self.n_reflect_r = n_reflect_r
         self.reflect_k = reflect_k
         self.n_knowledge = n_knowledge
         self.knowledge_k = knowledge_k
 
         # Legacy compatibility
-        self.n_neurons = n_reflect
-        self.n_process = n_reflect
+        self.n_reflect = n_reflect_d  # For backward compat
+        self.n_neurons = n_reflect_d
+        self.n_process = n_reflect_d
         self.process_k = reflect_k
         self.basis_rank = rank
 
@@ -589,7 +610,8 @@ class DAWN(nn.Module):
             rank=rank,
             n_compress=n_compress,
             n_expand=n_expand,
-            n_reflect=n_reflect,
+            n_reflect_d=n_reflect_d,
+            n_reflect_r=n_reflect_r,
             n_knowledge=n_knowledge,
         )
 
@@ -601,7 +623,8 @@ class DAWN(nn.Module):
                 rank=rank,
                 n_compress=n_compress,
                 n_expand=n_expand,
-                n_reflect=n_reflect,
+                n_reflect_d=n_reflect_d,
+                n_reflect_r=n_reflect_r,
                 reflect_k=reflect_k,
                 knowledge_k=knowledge_k,
                 dropout=dropout,
@@ -736,7 +759,8 @@ class DAWN(nn.Module):
             'max_seq_len': self.max_seq_len,
             'n_compress': self.n_compress,
             'n_expand': self.n_expand,
-            'n_reflect': self.n_reflect,
+            'n_reflect_d': self.n_reflect_d,
+            'n_reflect_r': self.n_reflect_r,
             'reflect_k': self.reflect_k,
             'n_knowledge': self.n_knowledge,
             'knowledge_k': self.knowledge_k,

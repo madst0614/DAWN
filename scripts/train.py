@@ -1183,6 +1183,9 @@ def main():
     args.n_expand = cfg['model'].get('n_expand', 4)
     args.n_reflect = cfg['model'].get('n_reflect', cfg['model'].get('n_process', 128))
     args.reflect_k = cfg['model'].get('reflect_k', cfg['model'].get('process_k', 3))
+    # v9.1: separate reflection pools
+    args.n_reflect_d = cfg['model'].get('n_reflect_d', cfg['model'].get('n_reflect', 64))
+    args.n_reflect_r = cfg['model'].get('n_reflect_r', cfg['model'].get('n_reflect', 64))
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -1384,7 +1387,21 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "9.0":
+        if model_version == "9.1":
+            # v9.1: hard selection + gated reflection + separate pools
+            rank = args.basis_rank
+            print(f"SharedNeurons (v{model_version}): rank={rank}")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (hard selection)")
+            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model} (hard selection)")
+            print(f"  ReflectionNeurons (gated, separate pools):")
+            print(f"    - reflect_d: {args.n_reflect_d} × {args.d_model}")
+            print(f"    - reflect_r: {args.n_reflect_r} × {rank}")
+            print(f"    - Reflect top-k: {args.reflect_k}")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "9.0":
             # v9.0: CompressNeurons + ExpandNeurons + ReflectionNeurons
             rank = args.basis_rank
             print(f"SharedNeurons (v{model_version}): rank={rank}")
@@ -1467,7 +1484,19 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '9.0':
+    if model_version == '9.1':
+        # v9.1: hard selection + gated reflection + separate pools
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_reflect_d': args.n_reflect_d,
+            'n_reflect_r': args.n_reflect_r,
+            'reflect_k': args.reflect_k,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'rank': args.basis_rank,
+        })
+    elif model_version == '9.0':
         # v9.0: CompressNeurons + ExpandNeurons + ReflectionNeurons
         model_kwargs.update({
             'n_compress': args.n_compress,
