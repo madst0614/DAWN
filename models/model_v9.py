@@ -1,32 +1,48 @@
 """
 DAWN v9.0 - Dynamic Architecture With Neurons
 
-핵심 아이디어: base input/output + Householder를 x에 직접 적용
-
-속도 최적화:
-    기존: H @ W 계산 후 x @ (H @ W) → [B, S, d_model, rank] 중간 텐서 생성
-    최적화: (H @ x) @ W → 벡터 연산만으로 처리
+핵심 철학:
+- 모든 변환이 "기저(Projection) + 반사(Reflection)" 조합
+- ReflectionNeurons 풀을 Q/K/V/O/M이 공유
+- 라우터만 타입별/레이어별 독립 → 다른 조합 선택
 
 구조:
-    SharedNeurons (공유 뉴런 풀 - 레이어 간 공유)
-    ├── TransformNeurons
-    │     ├── base_input:          [d_model, rank] — 기본 압축 행렬
-    │     ├── base_output:         [rank, d_model] — 기본 확장 행렬
-    │     ├── input_householder:   [n_process, d_model] — x 변형용 통합 풀
-    │     ├── process_householder: [n_process, rank] — 64차원 변환용 통합 풀
-    │     └── output_householder:  [n_process, d_model] — 결과 변형용 통합 풀
+    SharedNeurons
+    ├── ProjectionNeurons (투영 기저)
+    │   ├── base_input: [d_model, rank]
+    │   └── base_output: [rank, d_model]
     │
-    └── KnowledgeNeurons
-          ├── knowledge_K: [n_knowledge, rank]
-          └── knowledge_V: [n_knowledge, d_model]
+    ├── ReflectionNeurons (반사 변환 - 통합 풀)
+    │   ├── reflect_d: [n_reflect, d_model]  # d_model 차원용
+    │   └── reflect_r: [n_reflect, rank]     # rank 차원용
+    │
+    └── KnowledgeNeurons (지식)
+        ├── knowledge_K: [n_knowledge, rank]
+        └── knowledge_V: [n_knowledge, d_model]
+
+변환 흐름:
+    [Compressor: d_model → rank]
+    x [d_model]
+    → reflect_d 적용 (d_model 공간 반사)
+    → @ base_input (압축)
+    → reflect_r 적용 (rank 공간 반사)
+    → output [rank]
+
+    [Expander: rank → d_model]
+    x [rank]
+    → reflect_r 적용 (rank 공간 반사)
+    → @ base_output (확장)
+    → reflect_d 적용 (d_model 공간 반사)
+    → output [d_model]
 
 파라미터:
 - base_input: 256 × 64 = 16K
 - base_output: 64 × 256 = 16K
-- input_householder: 32 × 256 = 8K
-- process_householder: 32 × 64 = 2K
-- output_householder: 32 × 256 = 8K
-- 총: ~50K (vs v8.1의 655K, 92% 절감)
+- reflect_d: 32 × 256 = 8K
+- reflect_r: 32 × 64 = 2K
+- knowledge_K: 64 × 64 = 4K
+- knowledge_V: 64 × 256 = 16K
+- 총: ~62K (vs v8.1 655K, 90% 절감)
 """
 
 import torch
@@ -40,34 +56,34 @@ class SharedNeurons(nn.Module):
     공유 뉴런 풀 - 모든 레이어에서 참조
 
     v9.0:
-    - base_input/output: 기본 변환 행렬 (1개씩)
-    - input/process/output_householder: 통합 Householder 풀
-    - 각 Compressor/Expander가 독립 라우터로 같은 풀에서 다른 조합 선택
+    - ProjectionNeurons: base_input/output
+    - ReflectionNeurons: reflect_d/reflect_r (통합 풀, 라우터만 분리)
+    - KnowledgeNeurons: knowledge_K/V
     """
     def __init__(
         self,
         d_model: int,
         rank: int,
-        n_process: int,
+        n_reflect: int,
         n_knowledge: int,
         # Legacy params (ignored)
+        n_process: int = None,
         n_input: int = None,
         n_output: int = None,
     ):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
-        self.n_process = n_process
+        self.n_reflect = n_reflect
         self.n_knowledge = n_knowledge
 
-        # Base matrices (1개씩)
+        # ProjectionNeurons
         self.base_input = nn.Parameter(torch.zeros(d_model, rank))
         self.base_output = nn.Parameter(torch.zeros(rank, d_model))
 
-        # Unified Householder pools
-        self.input_householder = nn.Parameter(torch.zeros(n_process, d_model))
-        self.process_householder = nn.Parameter(torch.zeros(n_process, rank))
-        self.output_householder = nn.Parameter(torch.zeros(n_process, d_model))
+        # ReflectionNeurons (통합 풀)
+        self.reflect_d = nn.Parameter(torch.zeros(n_reflect, d_model))
+        self.reflect_r = nn.Parameter(torch.zeros(n_reflect, rank))
 
         # KnowledgeNeurons
         self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, rank))
@@ -93,20 +109,15 @@ class SharedNeurons(nn.Module):
             q, _ = torch.linalg.qr(torch.randn(self.d_model, self.rank))
             self.base_output.data = q.T
 
-        # input_householder: 단위 벡터 초기화
-        for i in range(self.n_process):
+        # reflect_d: 단위 벡터 초기화
+        for i in range(self.n_reflect):
             v = torch.randn(self.d_model)
-            self.input_householder.data[i] = v / (v.norm() + 1e-8)
+            self.reflect_d.data[i] = v / (v.norm() + 1e-8)
 
-        # process_householder: 단위 벡터 초기화
-        for i in range(self.n_process):
+        # reflect_r: 단위 벡터 초기화
+        for i in range(self.n_reflect):
             v = torch.randn(self.rank)
-            self.process_householder.data[i] = v / (v.norm() + 1e-8)
-
-        # output_householder: 단위 벡터 초기화
-        for i in range(self.n_process):
-            v = torch.randn(self.d_model)
-            self.output_householder.data[i] = v / (v.norm() + 1e-8)
+            self.reflect_r.data[i] = v / (v.norm() + 1e-8)
 
         # knowledge_K: 정규분포 + 정규화
         nn.init.normal_(self.knowledge_K, std=0.02)
@@ -116,79 +127,55 @@ class SharedNeurons(nn.Module):
         # knowledge_V: 정규분포
         nn.init.normal_(self.knowledge_V, std=0.02)
 
-    def apply_householder_to_vector(self, x, v):
+    def apply_reflection(self, x, v):
         """
-        Householder 변환 (벡터에 적용): H @ x = x - 2 * v * (v.T @ x) / ||v||²
+        Householder 반사: x - 2 * v * (v.T @ x) / ||v||²
 
         Args:
             x: [B, S, dim]
             v: [B, S, dim]
 
         Returns:
-            H @ x: [B, S, dim]
+            reflected x: [B, S, dim]
         """
         v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-8
         v_normalized = v / v_norm_sq.sqrt()
         vTx = (x * v_normalized).sum(dim=-1, keepdim=True)
         return x - 2 * v_normalized * vTx
 
-    def apply_householder_to_matrix(self, W, v):
-        """
-        Householder 변환 (행렬에 적용): H @ W where H = I - 2*vv^T/||v||^2
-
-        Args:
-            W: [dim1, dim2] base matrix
-            v: [B, S, dim1] householder vectors
-
-        Returns:
-            H @ W: [B, S, dim1, dim2]
-        """
-        # v 정규화
-        v_norm_sq = (v * v).sum(-1, keepdim=True) + 1e-8
-        v_normalized = v / v_norm_sq.sqrt()  # [B, S, dim1]
-
-        # v^T @ W: [B, S, dim2]
-        vTW = torch.einsum('bsd,dr->bsr', v_normalized, W)
-
-        # H @ W = W - 2 * v * (v^T @ W)
-        # W: [dim1, dim2] -> [1, 1, dim1, dim2]
-        # v_normalized: [B, S, dim1] -> [B, S, dim1, 1]
-        # vTW: [B, S, dim2] -> [B, S, 1, dim2]
-        dynamic_W = W.unsqueeze(0).unsqueeze(0) - 2 * v_normalized.unsqueeze(-1) * vTW.unsqueeze(-2)
-
-        return dynamic_W  # [B, S, dim1, dim2]
-
 
 class Compressor(nn.Module):
     """
     d_model → rank 압축
 
-    v9.0 (최적화):
-    1. Input Householder 선택 → x에 직접 적용
-    2. 변형된 x를 base_input으로 projection
-    3. Process Householder 선택 → rank 공간에서 변환
+    1. reflect_d 적용 (d_model 공간 반사)
+    2. @ base_input (압축)
+    3. reflect_r 적용 (rank 공간 반사)
     """
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
         rank: int,
-        n_process: int,
-        process_k: int,
+        n_reflect: int,
+        reflect_k: int,
         neuron_type: str = 'q',
+        # Legacy params
+        n_process: int = None,
+        process_k: int = None,
         n_input: int = None,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.rank = rank
-        self.n_process = n_process
-        self.process_k = process_k
+        self.n_reflect = n_reflect
+        self.reflect_k = reflect_k
         self.neuron_type = neuron_type
 
-        # 독립 라우터 (같은 풀에서 다른 조합 선택)
-        self.input_router = nn.Linear(d_model, n_process, bias=False)
-        self.process_router = nn.Linear(rank, n_process, bias=False)
+        # 독립 라우터 (타입별/레이어별)
+        self.router_d = nn.Linear(d_model, n_reflect, bias=False)
+        self.router_r = nn.Linear(rank, n_reflect, bias=False)
 
     def forward(self, x):
         """
@@ -200,72 +187,69 @@ class Compressor(nn.Module):
             routing_info: dict
         """
         B, S, D = x.shape
+        sn = self.shared_neurons
 
-        # 1. Input Householder 선택 (soft selection)
-        input_scores = self.input_router(x)  # [B, S, n_process]
-        input_weights = F.softmax(input_scores, dim=-1)  # [B, S, n_process]
+        # 1. d_model 공간 반사 (top-k)
+        scores_d = self.router_d(x)  # [B, S, n_reflect]
+        _, indices_d = torch.topk(scores_d, self.reflect_k, dim=-1)  # [B, S, k]
 
-        # 가중 평균으로 Householder 벡터 생성
-        v_input = input_weights @ self.shared_neurons.input_householder  # [B, S, d_model]
+        for i in range(self.reflect_k):
+            idx = indices_d[:, :, i]  # [B, S]
+            v = sn.reflect_d[idx]  # [B, S, d_model]
+            x = sn.apply_reflection(x, v)
 
-        # 2. x에 Householder 직접 적용 (H @ x)
-        x_transformed = self.shared_neurons.apply_householder_to_vector(x, v_input)  # [B, S, d_model]
+        # 2. 압축
+        x = x @ sn.base_input  # [B, S, rank]
 
-        # 3. base_input으로 압축
-        x_compressed = x_transformed @ self.shared_neurons.base_input  # [B, S, rank]
+        # 3. rank 공간 반사 (top-k)
+        scores_r = self.router_r(x)  # [B, S, n_reflect]
+        _, indices_r = torch.topk(scores_r, self.reflect_k, dim=-1)  # [B, S, k]
 
-        # 4. Process Householder 선택 (top-k)
-        process_scores = self.process_router(x_compressed)  # [B, S, n_process]
-        _, process_indices = torch.topk(process_scores, self.process_k, dim=-1)  # [B, S, k]
-
-        # 5. Householder 순차 적용
-        process_neurons = self.shared_neurons.process_householder
-        idx_expanded = process_indices.unsqueeze(-1).expand(B, S, self.process_k, self.rank)
-        selected_v = process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
-        selected_v = selected_v.gather(2, idx_expanded)  # [B, S, k, rank]
-
-        for i in range(self.process_k):
-            v = selected_v[:, :, i, :]  # [B, S, rank]
-            x_compressed = self.shared_neurons.apply_householder_to_vector(x_compressed, v)
+        for i in range(self.reflect_k):
+            idx = indices_r[:, :, i]  # [B, S]
+            v = sn.reflect_r[idx]  # [B, S, rank]
+            x = sn.apply_reflection(x, v)
 
         routing_info = {
-            'input_weights': input_weights,
-            'process_indices': process_indices,
+            'indices_d': indices_d,
+            'indices_r': indices_r,
         }
 
-        return x_compressed, routing_info
+        return x, routing_info
 
 
 class Expander(nn.Module):
     """
-    rank → d_model 복원
+    rank → d_model 확장
 
-    v9.0 (최적화):
-    1. Process Householder 선택 → rank 공간에서 변환
-    2. base_output으로 확장
-    3. Output Householder 선택 → 결과에 직접 적용
+    1. reflect_r 적용 (rank 공간 반사)
+    2. @ base_output (확장)
+    3. reflect_d 적용 (d_model 공간 반사)
     """
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
         rank: int,
-        n_process: int,
-        process_k: int,
+        n_reflect: int,
+        reflect_k: int,
         neuron_type: str = 'o',
+        # Legacy params
+        n_process: int = None,
+        process_k: int = None,
         n_output: int = None,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.rank = rank
-        self.n_process = n_process
-        self.process_k = process_k
+        self.n_reflect = n_reflect
+        self.reflect_k = reflect_k
         self.neuron_type = neuron_type
 
         # 독립 라우터
-        self.process_router = nn.Linear(rank, n_process, bias=False)
-        self.output_router = nn.Linear(rank, n_process, bias=False)
+        self.router_r = nn.Linear(rank, n_reflect, bias=False)
+        self.router_d = nn.Linear(d_model, n_reflect, bias=False)
 
     def forward(self, x):
         """
@@ -277,40 +261,35 @@ class Expander(nn.Module):
             routing_info: dict
         """
         B, S, _ = x.shape
+        sn = self.shared_neurons
 
-        # 1. Process Householder 선택 (top-k)
-        process_scores = self.process_router(x)  # [B, S, n_process]
-        _, process_indices = torch.topk(process_scores, self.process_k, dim=-1)  # [B, S, k]
+        # 1. rank 공간 반사 (top-k)
+        scores_r = self.router_r(x)  # [B, S, n_reflect]
+        _, indices_r = torch.topk(scores_r, self.reflect_k, dim=-1)  # [B, S, k]
 
-        # 2. Householder 순차 적용
-        process_neurons = self.shared_neurons.process_householder
-        idx_expanded = process_indices.unsqueeze(-1).expand(B, S, self.process_k, self.rank)
-        selected_v = process_neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
-        selected_v = selected_v.gather(2, idx_expanded)  # [B, S, k, rank]
+        for i in range(self.reflect_k):
+            idx = indices_r[:, :, i]  # [B, S]
+            v = sn.reflect_r[idx]  # [B, S, rank]
+            x = sn.apply_reflection(x, v)
 
-        for i in range(self.process_k):
-            v = selected_v[:, :, i, :]  # [B, S, rank]
-            x = self.shared_neurons.apply_householder_to_vector(x, v)
+        # 2. 확장
+        x = x @ sn.base_output  # [B, S, d_model]
 
-        # 3. Output Householder 선택 (soft selection) - 확장 전에 라우팅 결정
-        output_scores = self.output_router(x)  # [B, S, n_process]
-        output_weights = F.softmax(output_scores, dim=-1)  # [B, S, n_process]
+        # 3. d_model 공간 반사 (top-k)
+        scores_d = self.router_d(x)  # [B, S, n_reflect]
+        _, indices_d = torch.topk(scores_d, self.reflect_k, dim=-1)  # [B, S, k]
 
-        # 가중 평균으로 Householder 벡터 생성
-        v_output = output_weights @ self.shared_neurons.output_householder  # [B, S, d_model]
-
-        # 4. base_output으로 확장
-        x_expanded = x @ self.shared_neurons.base_output  # [B, S, d_model]
-
-        # 5. 결과에 Householder 직접 적용 (H @ x_expanded)
-        x_expanded = self.shared_neurons.apply_householder_to_vector(x_expanded, v_output)
+        for i in range(self.reflect_k):
+            idx = indices_d[:, :, i]  # [B, S]
+            v = sn.reflect_d[idx]  # [B, S, d_model]
+            x = sn.apply_reflection(x, v)
 
         routing_info = {
-            'process_indices': process_indices,
-            'output_weights': output_weights,
+            'indices_r': indices_r,
+            'indices_d': indices_d,
         }
 
-        return x_expanded, routing_info
+        return x, routing_info
 
 
 class NeuronAttention(nn.Module):
@@ -323,9 +302,12 @@ class NeuronAttention(nn.Module):
         d_model: int,
         n_heads: int,
         rank: int,
-        n_process: int,
-        process_k: int,
+        n_reflect: int,
+        reflect_k: int,
         dropout: float = 0.1,
+        # Legacy params
+        n_process: int = None,
+        process_k: int = None,
         n_input: int = None,
         n_output: int = None,
     ):
@@ -336,11 +318,11 @@ class NeuronAttention(nn.Module):
         self.d_head = rank // n_heads
         self.rank = rank
 
-        # Q/K/V/O - 각각 독립 라우터, 같은 Householder 풀 공유
-        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_process, process_k, neuron_type='q')
-        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_process, process_k, neuron_type='k')
-        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_process, process_k, neuron_type='v')
-        self.expander_O = Expander(shared_neurons, d_model, rank, n_process, process_k, neuron_type='o')
+        # Q/K/V/O - 같은 ReflectionNeurons 풀 공유, 라우터만 독립
+        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='q')
+        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='k')
+        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='v')
+        self.expander_O = Expander(shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='o')
 
         self.dropout = nn.Dropout(dropout)
 
@@ -376,7 +358,7 @@ class NeuronAttention(nn.Module):
             'routing_K': routing_K,
             'routing_V': routing_V,
             'routing_O': routing_O,
-            'neuron_indices': routing_Q['process_indices'],
+            'neuron_indices': routing_Q['indices_d'],
         }
 
         return out, routing_info
@@ -391,9 +373,12 @@ class NeuronMemory(nn.Module):
         shared_neurons: SharedNeurons,
         d_model: int,
         rank: int,
-        n_process: int,
-        process_k: int,
+        n_reflect: int,
+        reflect_k: int,
         knowledge_k: int = 8,
+        # Legacy params
+        n_process: int = None,
+        process_k: int = None,
         n_input: int = None,
     ):
         super().__init__()
@@ -403,7 +388,7 @@ class NeuronMemory(nn.Module):
         self.knowledge_k = knowledge_k
 
         self.query_compressor = Compressor(
-            shared_neurons, d_model, rank, n_process, process_k, neuron_type='m'
+            shared_neurons, d_model, rank, n_reflect, reflect_k, neuron_type='m'
         )
 
     def forward(self, x):
@@ -440,10 +425,13 @@ class NeuronCircuit(nn.Module):
         d_model: int,
         n_heads: int,
         rank: int,
-        n_process: int,
-        process_k: int,
+        n_reflect: int,
+        reflect_k: int,
         knowledge_k: int,
         dropout: float = 0.1,
+        # Legacy params
+        n_process: int = None,
+        process_k: int = None,
         n_input: int = None,
         n_output: int = None,
     ):
@@ -454,8 +442,8 @@ class NeuronCircuit(nn.Module):
             d_model=d_model,
             n_heads=n_heads,
             rank=rank,
-            n_process=n_process,
-            process_k=process_k,
+            n_reflect=n_reflect,
+            reflect_k=reflect_k,
             dropout=dropout,
         )
 
@@ -463,8 +451,8 @@ class NeuronCircuit(nn.Module):
             shared_neurons=shared_neurons,
             d_model=d_model,
             rank=rank,
-            n_process=n_process,
-            process_k=process_k,
+            n_reflect=n_reflect,
+            reflect_k=reflect_k,
             knowledge_k=knowledge_k,
         )
 
@@ -492,9 +480,10 @@ class DAWN(nn.Module):
     """
     DAWN v9.0 - Dynamic Architecture With Neurons
 
-    핵심: base input/output + Householder로 동적 변형
-    - 통합 Householder 풀 (input/process/output)
-    - 각 Compressor/Expander가 독립 라우터로 같은 풀에서 다른 조합 선택
+    핵심: Projection + Reflection 조합
+    - ProjectionNeurons: base_input/output
+    - ReflectionNeurons: reflect_d/reflect_r (통합 풀)
+    - 각 Q/K/V/O/M이 같은 풀 공유, 라우터만 독립
     """
     __version__ = "9.0"
 
@@ -506,16 +495,25 @@ class DAWN(nn.Module):
         n_heads: int = 4,
         rank: int = 64,
         max_seq_len: int = 128,
-        n_process: int = 32,
-        process_k: int = 3,
+        n_reflect: int = 32,
+        reflect_k: int = 3,
         n_knowledge: int = 64,
         knowledge_k: int = 8,
         dropout: float = 0.1,
+        # Legacy params (mapped)
+        n_process: int = None,
+        process_k: int = None,
         n_input: int = None,
         n_output: int = None,
         **kwargs
     ):
         super().__init__()
+
+        # Legacy param mapping
+        if n_reflect is None and n_process is not None:
+            n_reflect = n_process
+        if reflect_k is None and process_k is not None:
+            reflect_k = process_k
 
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -524,12 +522,15 @@ class DAWN(nn.Module):
         self.rank = rank
         self.max_seq_len = max_seq_len
 
-        self.n_process = n_process
-        self.process_k = process_k
+        self.n_reflect = n_reflect
+        self.reflect_k = reflect_k
         self.n_knowledge = n_knowledge
         self.knowledge_k = knowledge_k
 
-        self.n_neurons = n_process
+        # Legacy compatibility
+        self.n_neurons = n_reflect
+        self.n_process = n_reflect
+        self.process_k = reflect_k
         self.basis_rank = rank
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -538,7 +539,7 @@ class DAWN(nn.Module):
         self.shared_neurons = SharedNeurons(
             d_model=d_model,
             rank=rank,
-            n_process=n_process,
+            n_reflect=n_reflect,
             n_knowledge=n_knowledge,
         )
 
@@ -548,8 +549,8 @@ class DAWN(nn.Module):
                 d_model=d_model,
                 n_heads=n_heads,
                 rank=rank,
-                n_process=n_process,
-                process_k=process_k,
+                n_reflect=n_reflect,
+                reflect_k=reflect_k,
                 knowledge_k=knowledge_k,
                 dropout=dropout,
             )
@@ -622,7 +623,7 @@ class DAWN(nn.Module):
         return (loss, logits) if labels is not None else logits
 
     def orthogonality_loss(self):
-        """base input/output 직교성 유지"""
+        """ProjectionNeurons 직교성 유지"""
         loss = 0.0
 
         # base_input: [d_model, rank] -> W.T @ W ≈ I
@@ -638,23 +639,19 @@ class DAWN(nn.Module):
 
         return loss / 2
 
-    def householder_norm_loss(self):
-        """Householder vectors ||v|| ≈ 1 유지"""
+    def reflection_norm_loss(self):
+        """ReflectionNeurons ||v|| ≈ 1 유지"""
         loss = 0.0
 
-        # input_householder
-        norms = self.shared_neurons.input_householder.norm(dim=-1)
+        # reflect_d
+        norms = self.shared_neurons.reflect_d.norm(dim=-1)
         loss += ((norms - 1.0) ** 2).mean()
 
-        # process_householder
-        norms = self.shared_neurons.process_householder.norm(dim=-1)
+        # reflect_r
+        norms = self.shared_neurons.reflect_r.norm(dim=-1)
         loss += ((norms - 1.0) ** 2).mean()
 
-        # output_householder
-        norms = self.shared_neurons.output_householder.norm(dim=-1)
-        loss += ((norms - 1.0) ** 2).mean()
-
-        return loss / 3
+        return loss / 2
 
     def knowledge_diversity_loss(self):
         K = self.shared_neurons.knowledge_K
@@ -666,7 +663,7 @@ class DAWN(nn.Module):
     def get_auxiliary_losses(self):
         return {
             'orth_total': self.orthogonality_loss(),
-            'process_norm': self.householder_norm_loss(),
+            'process_norm': self.reflection_norm_loss(),
             'knowledge_div': self.knowledge_diversity_loss(),
         }
 
@@ -682,8 +679,8 @@ class DAWN(nn.Module):
             'n_heads': self.n_heads,
             'rank': self.rank,
             'max_seq_len': self.max_seq_len,
-            'n_process': self.n_process,
-            'process_k': self.process_k,
+            'n_reflect': self.n_reflect,
+            'reflect_k': self.reflect_k,
             'n_knowledge': self.n_knowledge,
             'knowledge_k': self.knowledge_k,
         }
