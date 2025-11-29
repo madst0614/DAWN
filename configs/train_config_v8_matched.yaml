@@ -34,7 +34,7 @@ model:
 # Training
 training:
   batch_size: 128
-  num_epochs: 10          # 10 epoch만
+  num_epochs: 30          # 30 epochs
   lr: 0.0003
   weight_decay: 0.1
   warmup_epochs: 2
