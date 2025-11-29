@@ -1,0 +1,70 @@
+# DAWN v10.0 Training Config
+# Simplified Compress/Expand Architecture (No Householder)
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v10.0)
+model:
+  model_version: "10.0"
+  d_model: 320            # 256 → 320 for 11M target
+  n_layers: 4
+  n_heads: 4
+  rank: 80                # 64 → 80
+
+  # CompressNeurons/ExpandNeurons (통합 풀)
+  n_compress: 64          # Q/K/V/M 공유
+  n_expand: 64            # O 공유
+
+  # KnowledgeNeurons
+  n_knowledge: 80
+  knowledge_k: 10
+
+  # Architecture
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+
+  # Regularization
+  orthogonality_weight: 0.01
+  load_balance_weight: 0.0   # soft routing이라 필요 없음
+
+# Mixed precision
+use_amp: true
+
+# Paths
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10
+log_dir: /content/drive/MyDrive/dawn/logs_v10
+
+# Architecture v10.0:
+#   SharedNeurons:
+#     CompressNeurons: [64, 320, 80] = 1.6M (Q/K/V/M 공유)
+#     ExpandNeurons: [64, 80, 320] = 1.6M (O 공유)
+#     KnowledgeNeurons: 80×80 + 80×320 = 32K
+#
+#   Key simplifications:
+#     - No ProcessNeurons (Householder 제거)
+#     - Q/K/V/M 모두 같은 compress_neurons 사용 (라우터만 독립)
+#     - O는 expand_neurons 사용
+#     - Soft routing only (top-k 없음)
+#
+#   Parameter breakdown:
+#     compress_neurons: 64 × 320 × 80 = 1,638,400
+#     expand_neurons: 64 × 80 × 320 = 1,638,400
+#     knowledge_K: 80 × 80 = 6,400
+#     knowledge_V: 80 × 320 = 25,600
+#     embeddings: 30K × 320 = 9,600,000
+#     routers/norms: ~500K
+#     Total: ~13.4M (weight tying으로 ~11M)

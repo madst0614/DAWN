@@ -1414,7 +1414,17 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "9.1":
+        if model_version == "10.0":
+            # v10.0: Simplified Compress/Expand
+            rank = args.basis_rank
+            print(f"SharedNeurons (v{model_version}): rank={rank} - No Householder!")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (Q/K/V/M shared)")
+            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model} (O shared)")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "9.1":
             # v9.1: hard selection + gated reflection + separate pools
             rank = args.basis_rank
             print(f"SharedNeurons (v{model_version}): rank={rank}")
@@ -1511,7 +1521,16 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '9.1':
+    if model_version == '10.0':
+        # v10.0: Simplified Compress/Expand (No Householder)
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'rank': args.basis_rank,
+        })
+    elif model_version == '9.1':
         # v9.1: hard selection + gated reflection + separate pools
         model_kwargs.update({
             'n_compress': args.n_compress,

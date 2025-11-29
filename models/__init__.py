@@ -1,12 +1,15 @@
 """
 DAWN Models Module
 
+v10.0: Simplified Compress/Expand (No Householder)
 v9.0: CompressNeurons + ExpandNeurons + ReflectionNeurons
 v8.x: SharedNeurons + NeuronMemory (QK/V/O/M 분리)
 baseline: Vanilla Transformer
 """
 
-# v9.1 (current) - hard selection + gated reflection
+# v10.0 (current) - simplified compress/expand, no householder
+from . import model_v10 as model_v10
+# v9.1 - hard selection + gated reflection
 from . import model_v91 as model_v91
 # v9.0 - CompressNeurons + ExpandNeurons + ReflectionNeurons (soft selection)
 from . import model_v9 as model_v9
@@ -36,6 +39,7 @@ except ImportError:
 
 __all__ = [
     # Models
+    'model_v10',
     'model_v91',
     'model_v9',
     'model_v8',
@@ -53,7 +57,7 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "9.1"
+__version__ = "10.0"
 
 
 # Helper function to create model based on version
@@ -61,7 +65,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "9.1", "9.0", "8.0", "8.1", "8.2", "8.3", or "baseline"
+        version: "10.0", "9.1", "9.0", "8.0", "8.1", "8.2", "8.3", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -69,7 +73,10 @@ def create_model_by_version(version, config):
     """
     version = normalize_version(version)
 
-    if version == "9.1":
+    if version == "10.0":
+        from .model_v10 import DAWN as DAWN_v10
+        return DAWN_v10(**config)
+    elif version == "9.1":
         from .model_v91 import DAWN as DAWN_v91
         return DAWN_v91(**config)
     elif version == "9.0":
