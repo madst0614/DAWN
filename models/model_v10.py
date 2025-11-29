@@ -511,6 +511,43 @@ class DAWN(nn.Module):
         mask = ~torch.eye(self.n_knowledge, dtype=torch.bool, device=K.device)
         return sim[mask].abs().mean()
 
+    def load_balance_loss(self, routing_infos):
+        """
+        Soft routing weights 균등 분포 유도
+
+        Args:
+            routing_infos: forward에서 반환된 layer별 routing 정보
+        Returns:
+            load balance loss (lower = more balanced)
+        """
+        loss = 0.0
+        count = 0
+
+        for layer_info in routing_infos:
+            # Attention Q/K/V compressors
+            for comp in ['Q', 'K', 'V']:
+                weights = layer_info['attention'][comp]['weights']  # [B, S, n_compress]
+                usage = weights.mean(dim=(0, 1))  # [n_compress]
+                target = 1.0 / self.n_compress
+                loss += ((usage - target) ** 2).sum() * self.n_compress
+                count += 1
+
+            # O expander
+            o_weights = layer_info['attention']['O']['weights']  # [B, S, n_expand]
+            o_usage = o_weights.mean(dim=(0, 1))
+            target_o = 1.0 / self.n_expand
+            loss += ((o_usage - target_o) ** 2).sum() * self.n_expand
+            count += 1
+
+            # Memory M compressor
+            m_weights = layer_info['memory']['M']['weights']  # [B, S, n_compress]
+            m_usage = m_weights.mean(dim=(0, 1))
+            target = 1.0 / self.n_compress
+            loss += ((m_usage - target) ** 2).sum() * self.n_compress
+            count += 1
+
+        return loss / (count + 1e-10)
+
     def get_auxiliary_losses(self):
         """train.py 호환"""
         return {

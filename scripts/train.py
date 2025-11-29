@@ -549,28 +549,25 @@ def get_underlying_model(model):
     return model
 
 
-def is_v75_or_v76_model(model):
-    """Robust detection of v7.5+ models (including v8.x, v9.x, v10.x), handling torch.compile() wrapped models"""
+def is_modern_dawn_model(model):
+    """Check if model is DAWN v10.0"""
     base_model = get_underlying_model(model)
 
-    # Check model version attribute
-    if hasattr(base_model, '__version__'):
-        version = base_model.__version__
-        if version in ["7.5", "7.6", "7.7", "7.8", "7.9", "8.0", "8.1", "8.2", "8.3", "9.0", "9.1", "10.0"]:
-            return True
+    # Check for v10 structure
+    if hasattr(base_model, '__version__') and base_model.__version__ == "10.0":
+        return True
 
-    # Check for qkv_dynamic attribute on layers (v7.5/v7.6/v7.7 specific structure)
+    # Structure check: v10 has layers with .attn and .memory
     if hasattr(base_model, 'layers') and len(base_model.layers) > 0:
-        if hasattr(base_model.layers[0], 'qkv_dynamic'):
-            return True
-        # Check for v8.x structure (NeuronCircuit with attention and memory)
-        if hasattr(base_model.layers[0], 'attention') and hasattr(base_model.layers[0], 'memory'):
-            return True
-        # Check for v10.x structure (DAWNBlock with attn and memory)
         if hasattr(base_model.layers[0], 'attn') and hasattr(base_model.layers[0], 'memory'):
             return True
 
     return False
+
+
+# Backward compatibility alias
+def is_v75_or_v76_model(model):
+    return is_modern_dawn_model(model)
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
@@ -616,91 +613,31 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
-                # v7.0: Use model's get_loss method (handles diversity & load balance)
-                if hasattr(base_model, 'get_loss') and orthogonality_weight == 0:
-                    loss, loss_dict, logits = model.get_loss(
-                        input_ids, labels,
-                        diversity_weight=diversity_weight,
-                        load_balance_weight=load_balance_weight
-                    )
+                # v10: DAWN model forward
+                if load_balance_weight > 0:
+                    ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                 else:
-                    # v7.5+: Dynamic Q/K/V with routing
-                    # v6.0: compatibility
-                    if is_v75_or_v76_model(model):
-                        # v7.5/v7.6: Get routing info for load balance loss
-                        if load_balance_weight > 0:
-                            ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
-                        else:
-                            ce_loss, logits = model(input_ids, labels)
-                            routing_infos = None
+                    ce_loss, logits = model(input_ids, labels)
+                    routing_infos = None
 
-                        # Basis orthogonality loss (v7.5/v7.6)
-                        if orthogonality_weight > 0:
-                            orth_loss = base_model.orthogonality_loss()
-                        else:
-                            orth_loss = 0.0
+                # Orthogonality loss
+                orth_loss = 0.0
+                if orthogonality_weight > 0 and hasattr(base_model, 'orthogonality_loss'):
+                    orth_loss = base_model.orthogonality_loss()
 
-                        # Recipe diversity loss (v7.6 only - built-in method)
-                        if diversity_weight > 0 and hasattr(base_model, 'recipe_diversity_loss'):
-                            diversity_loss = base_model.recipe_diversity_loss()
-                        else:
-                            diversity_loss = 0.0
-                    elif orthogonality_weight > 0:
-                        logits, losses = model(input_ids, return_losses=True)
-                        orth_loss = losses['orth_total']
-                        ce_loss = F.cross_entropy(
-                            logits.view(-1, logits.size(-1)),
-                            labels.view(-1),
-                            ignore_index=-100
-                        )
-                        diversity_loss = 0.0
-                        routing_infos = None
-                    else:
-                        logits = model(input_ids)
-                        orth_loss = 0.0
-                        diversity_loss = 0.0
-                        routing_infos = None
+                # Knowledge diversity loss
+                diversity_loss = 0.0
+                if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
+                    diversity_loss = base_model.knowledge_diversity_loss()
 
-                        # Cross-entropy loss
-                        B, S, V = logits.shape
-                        ce_loss = F.cross_entropy(
-                            logits.view(B * S, V),
-                            labels.view(B * S),
-                            ignore_index=-100
-                        )
+                # Load balance loss
+                lb_loss = 0.0
+                if load_balance_weight > 0 and routing_infos is not None:
+                    if hasattr(base_model, 'load_balance_loss'):
+                        lb_loss = base_model.load_balance_loss(routing_infos)
 
-                    # Recipe diversity loss (v7.0-v7.4)
-                    if diversity_weight > 0 and hasattr(base_model.layers[0], 'ffn') and hasattr(base_model.layers[0].ffn, 'neuron_recipe'):
-                        for layer in base_model.layers:
-                            recipe = layer.ffn.neuron_recipe
-                            recipe_norm = F.softmax(recipe, dim=-1)
-                            recipe_normalized = F.normalize(recipe_norm, dim=-1)
-                            similarity = torch.mm(recipe_normalized, recipe_normalized.T)
-                            mask = 1 - torch.eye(base_model.n_neurons, device=similarity.device)
-                            avg_similarity = (similarity * mask).sum() / mask.sum()
-                            diversity_loss += avg_similarity
-                        diversity_loss = diversity_loss / len(base_model.layers)
-
-                    # Load balance loss (v7.5+)
-                    lb_loss = 0.0
-                    if load_balance_weight > 0 and routing_infos is not None:
-                        for routing_info in routing_infos:
-                            neuron_indices = routing_info['neuron_indices']  # [B, S, k]
-                            # Count neuron usage
-                            counts = torch.bincount(neuron_indices.reshape(-1), minlength=base_model.n_neurons)
-                            freq = counts.float() / (counts.sum() + 1e-8)
-                            # L2 distance from uniform distribution
-                            uniform = 1.0 / base_model.n_neurons
-                            lb_loss += ((freq - uniform) ** 2).sum() * base_model.n_neurons
-                        lb_loss = lb_loss / len(routing_infos)
-
-                    # Process neuron norm loss (v8.0+)
-                    norm_loss = 0.0
-                    if process_norm_weight > 0 and hasattr(base_model, 'process_norm_loss'):
-                        norm_loss = base_model.process_norm_loss()
-
-                    # Total loss
-                    loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + process_norm_weight * norm_loss
+                # Total loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             scaler.scale(loss).backward()
 
@@ -715,94 +652,34 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             scaler.step(optimizer)
             scaler.update()
         else:
-            # Get underlying model for attribute checks (handles torch.compile)
+            # Non-AMP training (CPU or no CUDA)
             base_model = get_underlying_model(model)
 
-            # v7.0: Use model's get_loss method (handles diversity & load balance)
-            if hasattr(base_model, 'get_loss') and orthogonality_weight == 0:
-                loss, loss_dict, logits = model.get_loss(
-                    input_ids, labels,
-                    diversity_weight=diversity_weight,
-                    load_balance_weight=load_balance_weight
-                )
+            # v10: DAWN model forward
+            if load_balance_weight > 0:
+                ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
             else:
-                # v7.5+: Dynamic Q/K/V with routing
-                # v6.0: compatibility
-                if is_v75_or_v76_model(model):
-                    # v7.5/v7.6: Get routing info for load balance loss
-                    if load_balance_weight > 0:
-                        ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
-                    else:
-                        ce_loss, logits = model(input_ids, labels)
-                        routing_infos = None
+                ce_loss, logits = model(input_ids, labels)
+                routing_infos = None
 
-                    # Basis orthogonality loss (v7.5/v7.6)
-                    if orthogonality_weight > 0:
-                        orth_loss = base_model.orthogonality_loss()
-                    else:
-                        orth_loss = 0.0
+            # Orthogonality loss
+            orth_loss = 0.0
+            if orthogonality_weight > 0 and hasattr(base_model, 'orthogonality_loss'):
+                orth_loss = base_model.orthogonality_loss()
 
-                    # Recipe diversity loss (v7.6 only - built-in method)
-                    if diversity_weight > 0 and hasattr(base_model, 'recipe_diversity_loss'):
-                        diversity_loss = base_model.recipe_diversity_loss()
-                    else:
-                        diversity_loss = 0.0
-                elif orthogonality_weight > 0:
-                    logits, losses = model(input_ids, return_losses=True)
-                    orth_loss = losses['orth_total']
-                    ce_loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        labels.view(-1),
-                        ignore_index=-100
-                    )
-                    diversity_loss = 0.0
-                    routing_infos = None
-                else:
-                    logits = model(input_ids)
-                    orth_loss = 0.0
-                    diversity_loss = 0.0
-                    routing_infos = None
+            # Knowledge diversity loss
+            diversity_loss = 0.0
+            if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
+                diversity_loss = base_model.knowledge_diversity_loss()
 
-                    # Cross-entropy loss
-                    B, S, V = logits.shape
-                    ce_loss = F.cross_entropy(
-                        logits.view(B * S, V),
-                        labels.view(B * S),
-                        ignore_index=-100
-                    )
+            # Load balance loss
+            lb_loss = 0.0
+            if load_balance_weight > 0 and routing_infos is not None:
+                if hasattr(base_model, 'load_balance_loss'):
+                    lb_loss = base_model.load_balance_loss(routing_infos)
 
-                # Recipe diversity loss (v7.0-v7.4)
-                if diversity_weight > 0 and hasattr(base_model.layers[0], 'ffn') and hasattr(base_model.layers[0].ffn, 'neuron_recipe'):
-                    for layer in base_model.layers:
-                        recipe = layer.ffn.neuron_recipe
-                        recipe_norm = F.softmax(recipe, dim=-1)
-                        recipe_normalized = F.normalize(recipe_norm, dim=-1)
-                        similarity = torch.mm(recipe_normalized, recipe_normalized.T)
-                        mask = 1 - torch.eye(base_model.n_neurons, device=similarity.device)
-                        avg_similarity = (similarity * mask).sum() / mask.sum()
-                        diversity_loss += avg_similarity
-                    diversity_loss = diversity_loss / len(base_model.layers)
-
-                # Load balance loss (v7.5+)
-                lb_loss = 0.0
-                if load_balance_weight > 0 and routing_infos is not None:
-                    for routing_info in routing_infos:
-                        neuron_indices = routing_info['neuron_indices']  # [B, S, k]
-                        # Count neuron usage
-                        counts = torch.bincount(neuron_indices.reshape(-1), minlength=base_model.n_neurons)
-                        freq = counts.float() / (counts.sum() + 1e-8)
-                        # L2 distance from uniform distribution
-                        uniform = 1.0 / base_model.n_neurons
-                        lb_loss += ((freq - uniform) ** 2).sum() * base_model.n_neurons
-                    lb_loss = lb_loss / len(routing_infos)
-
-                # Process neuron norm loss (v8.0+)
-                norm_loss = 0.0
-                if process_norm_weight > 0 and hasattr(base_model, 'process_norm_loss'):
-                    norm_loss = base_model.process_norm_loss()
-
-                # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + process_norm_weight * norm_loss
+            # Total loss
+            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             loss.backward()
 

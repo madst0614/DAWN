@@ -1,19 +1,15 @@
 """
 DAWN Models Module
 
-v10.0: Simplified Compress/Expand (No Householder)
-v9.0: CompressNeurons + ExpandNeurons + ReflectionNeurons
-v8.x: SharedNeurons + NeuronMemory (QK/V/O/M 분리)
-baseline: Vanilla Transformer
+v10.0: Simplified Compress/Expand Architecture
+- CompressNeurons: Q/K/V/M 통합 [n_compress, d_model, rank]
+- ExpandNeurons: O 통합 [n_expand, rank, d_model]
+- KnowledgeNeurons: [n_knowledge, rank] + [n_knowledge, d_model]
+- Soft routing (no Householder)
 """
 
-# v10.0 (current) - simplified compress/expand, no householder
-from . import model_v10 as model_v10
-# v9.1 - hard selection + gated reflection
-from . import model_v91 as model_v91
-# v9.0 - CompressNeurons + ExpandNeurons + ReflectionNeurons (soft selection)
-from . import model_v9 as model_v9
-from . import model_v8 as model_v8
+# v10.0 - current stable version
+from .model_v10 import DAWN
 
 # Version registry
 from .version_registry import (
@@ -28,22 +24,9 @@ from .version_registry import (
     get_all_versions_info,
 )
 
-# Baseline Vanilla Transformer
-try:
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-    from baseline_transformer import VanillaTransformer
-except ImportError:
-    VanillaTransformer = None
-
 __all__ = [
     # Models
-    'model_v10',
-    'model_v91',
-    'model_v9',
-    'model_v8',
-    'VanillaTransformer',
+    'DAWN',
     # Version utilities
     'VERSION_REGISTRY',
     'normalize_version',
@@ -60,36 +43,20 @@ __all__ = [
 __version__ = "10.0"
 
 
-# Helper function to create model based on version
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "10.0", "9.1", "9.0", "8.0", "8.1", "8.2", "8.3", or "baseline"
+        version: "10.0" or "10"
         config: Model configuration dict
 
     Returns:
-        DAWN or VanillaTransformer model instance
+        DAWN model instance
     """
     version = normalize_version(version)
 
     if version == "10.0":
-        from .model_v10 import DAWN as DAWN_v10
-        return DAWN_v10(**config)
-    elif version == "9.1":
-        from .model_v91 import DAWN as DAWN_v91
-        return DAWN_v91(**config)
-    elif version == "9.0":
-        from .model_v9 import DAWN as DAWN_v9
-        return DAWN_v9(**config)
-    elif version in ["8.0", "8.1", "8.2", "8.3"]:
-        from .model_v8 import DAWN as DAWN_v8
-        return DAWN_v8(**config)
-    elif version == "baseline":
-        if VanillaTransformer is None:
-            raise ImportError("VanillaTransformer not available. "
-                            "Make sure baseline_transformer.py is in the project root.")
-        return VanillaTransformer(**config)
+        return DAWN(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: {list_versions()}")
+                        f"Supported version: 10.0")

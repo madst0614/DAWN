@@ -38,11 +38,11 @@ training:
   weight_decay: 0.1
   warmup_ratio: 0.05
 
-  # Regularization (v10 호환)
-  orthogonality_weight: 0.01
-  diversity_weight: 0.0
-  load_balance_weight: 0.0
-  process_norm_weight: 0.0
+  # Regularization
+  orthogonality_weight: 0.01    # compress/expand 직교성
+  diversity_weight: 0.1         # knowledge diversity
+  load_balance_weight: 0.01     # routing 균등 분포
+  process_norm_weight: 0.0      # v10 미지원 (process neurons 없음)
 
 use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10
