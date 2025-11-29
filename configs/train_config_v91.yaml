@@ -18,8 +18,8 @@ model:
 
   # Compress/Expand Neurons parameters
   rank: 64                # Projection rank (4 heads x 16 d_head)
-  n_compress: 4           # Number of compress neurons (hard selection)
-  n_expand: 4             # Number of expand neurons (hard selection)
+  n_compress: 32          # Number of compress neurons (soft weighted sum)
+  n_expand: 32            # Number of expand neurons (soft weighted sum)
 
   # ReflectionNeurons parameters (separate pools)
   n_reflect_d: 64         # Size of d_model space reflection pool
@@ -54,23 +54,24 @@ use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v91
 log_dir: /content/drive/MyDrive/dawn/logs_v91
 
-# v9.0 -> v9.1 Changes:
-#   1. Compress/Expand: soft (weighted sum) -> hard (argmax)
-#      - idx = router(x).argmax(-1)
-#      - output = x @ compress_neurons[idx]
+# v9.1 특징:
+#   1. Compress/Expand: soft weighted sum (배치 병렬화 가능)
+#      - weights = softmax(router(x))
+#      - all_proj = einsum(x, neurons)
+#      - output = (all_proj * weights).sum()
 #
-#   2. Reflection: hard 100% -> gated (sigmoid)
+#   2. Reflection: gated (sigmoid gate)
 #      - gate = sigmoid(score)
 #      - x = gate * reflected + (1 - gate) * x
 #
-#   3. ReflectionNeurons: shared -> separate pools
+#   3. ReflectionNeurons: separate pools
 #      - reflect_d: [n_reflect_d, d_model] for d_model space
 #      - reflect_r: [n_reflect_r, rank] for rank space
 #
 # Architecture v9.1:
 #   SharedNeurons (shared across all layers):
-#     CompressNeurons: [n_compress, d_model, rank]   # Hard selection
-#     ExpandNeurons: [n_expand, rank, d_model]       # Hard selection
+#     CompressNeurons: [n_compress, d_model, rank]   # Soft weighted sum
+#     ExpandNeurons: [n_expand, rank, d_model]       # Soft weighted sum
 #
 #     ReflectionNeurons (gated, separate pools):
 #       - reflect_d: [n_reflect_d, d_model]   # d_model space reflections
@@ -80,11 +81,11 @@ log_dir: /content/drive/MyDrive/dawn/logs_v91
 #       - knowledge_K: [n_knowledge, rank]
 #       - knowledge_V: [n_knowledge, d_model]
 #
-#   Parameter breakdown (n_compress=4, n_expand=4, n_reflect_d=64, n_reflect_r=64):
-#     - compress_neurons: 4 x 256 x 64 = 64K
-#     - expand_neurons: 4 x 64 x 256 = 64K
+#   Parameter breakdown (n_compress=32, n_expand=32, n_reflect_d=64, n_reflect_r=64):
+#     - compress_neurons: 32 x 256 x 64 = 524K
+#     - expand_neurons: 32 x 64 x 256 = 524K
 #     - reflect_d: 64 x 256 = 16K
 #     - reflect_r: 64 x 64 = 4K
 #     - knowledge_K: 64 x 64 = 4K
 #     - knowledge_V: 64 x 256 = 16K
-#     - Total: ~168K
+#     - Total SharedNeurons: ~1.1M
