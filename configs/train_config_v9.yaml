@@ -1,5 +1,5 @@
 # DAWN v9.0 Training Config
-# Per-type Input neurons (Q/K/V/M each 1), shared Output (1), no routers
+# Unified Householder pools with base input/output matrices
 
 # Data (~100M train / ~20M val tokens)
 data:
@@ -13,7 +13,7 @@ data:
     - validation/openwebtext_5to1_texts.pkl
     - validation/wikitext_5to1_texts.pkl
 
-# Model Architecture (v9.0: Simplified Input/Output)
+# Model Architecture (v9.0: Unified Householder Pools)
 model:
   model_version: "9.0"    # DAWN v9.0
   d_model: 256            # Hidden dimension
@@ -22,8 +22,8 @@ model:
 
   # TransformNeurons parameters (shared across layers)
   rank: 64                # Projection rank (4 heads x 16 d_head)
-  # v9.0: n_input, n_output removed (single shared input_neuron/output_neuron)
-  n_process: 32           # Number of Householder process neurons (Q/K/V/O/M pools)
+  # v9.0: base_input/output + unified Householder pools (input/process/output)
+  n_process: 32           # Size of unified Householder pools
   process_k: 3            # Number of process neurons to select (top-k)
 
   # KnowledgeNeurons parameters
@@ -56,24 +56,24 @@ log_dir: logs/v9
 
 # Architecture v9.0:
 #   SharedNeurons (shared across all layers):
-#     - input_neuron_q: [d_model, rank]         # Q compression matrix
-#     - input_neuron_k: [d_model, rank]         # K compression matrix
-#     - input_neuron_v: [d_model, rank]         # V compression matrix
-#     - input_neuron_m: [d_model, rank]         # Memory Query compression matrix
-#     - process_neurons_q: [n_process, rank]    # Q Householder pool
-#     - process_neurons_k: [n_process, rank]    # K Householder pool
-#     - process_neurons_v: [n_process, rank]    # V Householder pool
-#     - process_neurons_o: [n_process, rank]    # O Householder pool
-#     - process_neurons_m: [n_process, rank]    # Memory Query Householder pool
-#     - output_neuron: [rank, d_model]          # Shared expansion matrix
+#     - base_input: [d_model, rank]             # Base compression matrix (1개)
+#     - base_output: [rank, d_model]            # Base expansion matrix (1개)
+#     - input_householder: [n_process, d_model] # Unified input Householder pool
+#     - process_householder: [n_process, rank]  # Unified process Householder pool
+#     - output_householder: [n_process, d_model]# Unified output Householder pool
 #     - knowledge_K: [n_knowledge, rank]
 #     - knowledge_V: [n_knowledge, d_model]
 #
 #   Key differences from v8.1:
-#     - Per-type input neurons (Q/K/V/M each 1), no input_router
-#     - Single shared output_neuron, no output_router
-#     - Diversity from Process Householder selection
+#     - Single base_input/base_output matrices
+#     - Unified Householder pools (same pool, independent routers per component)
+#     - Dynamic transformation: H @ W = W - 2 * v * (v^T @ W)
+#     - Soft selection for input/output Householder, top-k for process
 #
 #   Parameter savings (vs v8.1):
-#     - Input: 4 * n_input * d_model * rank -> 4 * d_model * rank (~524K -> 65K)
-#     - Output: n_output * rank * d_model -> rank * d_model (~131K -> 16K)
+#     - base_input: d_model × rank = 16K
+#     - base_output: rank × d_model = 16K
+#     - input_householder: n_process × d_model = 8K
+#     - process_householder: n_process × rank = 2K
+#     - output_householder: n_process × d_model = 8K
+#     - Total: ~50K (vs v8.1의 655K, 92% 절감)
