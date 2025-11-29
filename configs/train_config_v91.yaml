@@ -1,0 +1,94 @@
+# DAWN v9.1 Training Config
+# Hard selection + Gated reflection + Separate reflect pools
+
+# Data (~100M train / ~20M val tokens)
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4_5to1_texts.pkl
+    - train/openwebtext_5to1_texts.pkl
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/c4_5to1_texts.pkl
+    - validation/openwebtext_5to1_texts.pkl
+    - validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v9.1)
+model:
+  model_version: "9.1"    # DAWN v9.1
+  d_model: 256            # Hidden dimension
+  n_layers: 4             # Number of transformer layers
+  n_heads: 4              # Number of attention heads
+
+  # Compress/Expand Neurons parameters
+  rank: 64                # Projection rank (4 heads x 16 d_head)
+  n_compress: 4           # Number of compress neurons (hard selection)
+  n_expand: 4             # Number of expand neurons (hard selection)
+
+  # ReflectionNeurons parameters (separate pools)
+  n_reflect_d: 64         # Size of d_model space reflection pool
+  n_reflect_r: 64         # Size of rank space reflection pool
+  reflect_k: 3            # Number of reflections to select (top-k, gated)
+
+  # KnowledgeNeurons parameters
+  n_knowledge: 64         # Number of knowledge neurons
+  knowledge_k: 8          # Number of knowledge neurons to retrieve (top-k)
+
+  # Architecture
+  max_seq_len: 128        # Maximum sequence length
+  dropout: 0.1            # Dropout rate
+
+# Training
+training:
+  batch_size: 128         # Batch size
+  num_epochs: 30          # Total epochs
+  lr: 0.0003              # Learning rate
+  weight_decay: 0.1       # Weight decay for regularization
+  warmup_ratio: 0.1       # Warmup ratio (10% of total steps)
+
+  # Regularization
+  orthogonality_weight: 0.01   # Compress/Expand orthogonality loss
+  process_norm_weight: 0.01    # Reflection norm regularization (||v|| = 1)
+  load_balance_weight: 0.01    # Load balance loss for routing
+
+# Mixed precision
+use_amp: true
+
+# Paths
+checkpoint_dir: checkpoints/v91
+log_dir: logs/v91
+
+# v9.0 -> v9.1 Changes:
+#   1. Compress/Expand: soft (weighted sum) -> hard (argmax)
+#      - idx = router(x).argmax(-1)
+#      - output = x @ compress_neurons[idx]
+#
+#   2. Reflection: hard 100% -> gated (sigmoid)
+#      - gate = sigmoid(score)
+#      - x = gate * reflected + (1 - gate) * x
+#
+#   3. ReflectionNeurons: shared -> separate pools
+#      - reflect_d: [n_reflect_d, d_model] for d_model space
+#      - reflect_r: [n_reflect_r, rank] for rank space
+#
+# Architecture v9.1:
+#   SharedNeurons (shared across all layers):
+#     CompressNeurons: [n_compress, d_model, rank]   # Hard selection
+#     ExpandNeurons: [n_expand, rank, d_model]       # Hard selection
+#
+#     ReflectionNeurons (gated, separate pools):
+#       - reflect_d: [n_reflect_d, d_model]   # d_model space reflections
+#       - reflect_r: [n_reflect_r, rank]      # rank space reflections
+#
+#     KnowledgeNeurons:
+#       - knowledge_K: [n_knowledge, rank]
+#       - knowledge_V: [n_knowledge, d_model]
+#
+#   Parameter breakdown (n_compress=4, n_expand=4, n_reflect_d=64, n_reflect_r=64):
+#     - compress_neurons: 4 x 256 x 64 = 64K
+#     - expand_neurons: 4 x 64 x 256 = 64K
+#     - reflect_d: 64 x 256 = 16K
+#     - reflect_r: 64 x 64 = 4K
+#     - knowledge_K: 64 x 64 = 4K
+#     - knowledge_V: 64 x 256 = 16K
+#     - Total: ~168K
