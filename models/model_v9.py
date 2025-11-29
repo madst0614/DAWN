@@ -693,6 +693,10 @@ class DAWN(nn.Module):
 
         return loss / 2
 
+    def process_norm_loss(self):
+        """Alias for reflection_norm_loss (train.py compatibility)"""
+        return self.reflection_norm_loss()
+
     def knowledge_diversity_loss(self):
         K = self.shared_neurons.knowledge_K
         K_norm = F.normalize(K, dim=-1)
