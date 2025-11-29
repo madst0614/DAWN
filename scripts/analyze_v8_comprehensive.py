@@ -513,19 +513,23 @@ class ComprehensiveAnalyzer:
 
     @torch.no_grad()
     def analyze_householder_effect(self, dataloader, max_batches=20):
-        """Analyze how Householder transforms change representations"""
+        """Analyze how Householder transforms change representations in d_model space"""
         print("\n" + "=" * 60)
         print("5. HOUSEHOLDER TRANSFORM EFFECT")
         print("=" * 60)
+        print("  Comparing in d_model (256) space after expand")
 
         self.model.eval()
         shared = self.model.shared_neurons
 
-        # Get process neurons
+        # Get process neurons (for Householder)
         if hasattr(shared, 'process_neurons_qk'):
             process_neurons = shared.process_neurons_qk.data
         else:
             process_neurons = shared.process_neurons.data
+
+        # Get output neurons (for expand)
+        output_neurons = shared.output_neurons.data  # [n_output, rank, d_model]
 
         # Track transformation effects
         combination_effects = defaultdict(list)  # {combo: [(cos_sim, norm_ratio), ...]}
@@ -550,7 +554,7 @@ class ComprehensiveAnalyzer:
             # Get Q compression details
             compressor = layer0.attention.compressor_Q
 
-            # Input projection
+            # Input projection (256 → 64)
             input_scores = compressor.input_router(x_norm)
             input_weights = F.softmax(input_scores, dim=-1)
 
@@ -563,11 +567,15 @@ class ComprehensiveAnalyzer:
                 input_neurons = shared.input_neurons
 
             all_proj = torch.einsum('bsd,ndr->bsnr', x_norm, input_neurons)
-            x_compressed = (all_proj * input_weights.unsqueeze(-1)).sum(dim=2)
+            x_compressed = (all_proj * input_weights.unsqueeze(-1)).sum(dim=2)  # [B, S, rank]
 
             # Process routing
             process_scores = compressor.process_router(x_compressed)
             _, process_indices = torch.topk(process_scores, self.process_k, dim=-1)
+
+            # Get output routing (for expand)
+            # Use uniform output weights for simplicity (or get from expander)
+            output_weights = torch.ones(self.n_output, device=self.device) / self.n_output
 
             # Sample and analyze
             for _ in range(min(50, B * S)):
@@ -576,25 +584,39 @@ class ComprehensiveAnalyzer:
 
                 combo = tuple(sorted(process_indices[b, s].tolist()))
 
-                x_before = x_compressed[b, s].clone()
-                before_norm = x_before.norm().item()
+                x_before = x_compressed[b, s].clone()  # [rank] = 64
 
-                # Apply Householder transforms
-                x_after = x_before.clone()
+                # Apply Householder transforms (in rank space)
+                x_transformed = x_before.clone()
                 for i in range(self.process_k):
                     v = process_neurons[process_indices[b, s, i]]
-                    x_after = shared.apply_householder(
-                        x_after.unsqueeze(0).unsqueeze(0),
+                    x_transformed = shared.apply_householder(
+                        x_transformed.unsqueeze(0).unsqueeze(0),
                         v.unsqueeze(0).unsqueeze(0)
                     ).squeeze()
 
-                after_norm = x_after.norm().item()
+                # Expand BOTH to d_model space (64 → 256)
+                # x_with_transform = expand(x_transformed)
+                # x_no_transform = expand(x_before)
+
+                # Expand: weighted sum of output neurons
+                # output_neurons: [n_output, rank, d_model]
+                x_with_transform = torch.einsum('r,nrd->d', x_transformed, output_neurons)
+                x_with_transform = (x_with_transform * output_weights.sum())  # scale
+
+                x_no_transform = torch.einsum('r,nrd->d', x_before, output_neurons)
+                x_no_transform = (x_no_transform * output_weights.sum())
+
+                # Compare in d_model space (256)
                 cos_sim = F.cosine_similarity(
-                    x_before.unsqueeze(0),
-                    x_after.unsqueeze(0)
+                    x_with_transform.unsqueeze(0),
+                    x_no_transform.unsqueeze(0)
                 ).item()
 
-                combination_effects[combo].append((cos_sim, after_norm / (before_norm + 1e-10)))
+                norm_with = x_with_transform.norm().item()
+                norm_without = x_no_transform.norm().item()
+
+                combination_effects[combo].append((cos_sim, norm_with / (norm_without + 1e-10)))
 
         # Aggregate results
         results = {'combinations': {}, 'summary': {}}
@@ -628,9 +650,9 @@ class ComprehensiveAnalyzer:
             'unique_combinations': len(combination_effects)
         }
 
-        print(f"\nSummary:")
-        print(f"  Average cos similarity (before/after): {results['summary']['avg_cos_sim']:.3f}")
-        print(f"  Average norm ratio: {results['summary']['avg_norm_ratio']:.3f}")
+        print(f"\nSummary (in d_model=256 space):")
+        print(f"  cos(with_H, no_H): {results['summary']['avg_cos_sim']:.3f}  (1.0=no effect, 0.0=orthogonal)")
+        print(f"  norm ratio (with/without): {results['summary']['avg_norm_ratio']:.3f}")
         print(f"  Unique combinations: {results['summary']['unique_combinations']}")
 
         return results, combination_effects
