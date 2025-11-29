@@ -1,0 +1,76 @@
+# DAWN v9.0 Training Config
+# Simplified Input/Output: Single shared neurons, diversity from Process Householder only
+
+# Data (~100M train / ~20M val tokens)
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4_5to1_texts.pkl
+    - train/openwebtext_5to1_texts.pkl
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/c4_5to1_texts.pkl
+    - validation/openwebtext_5to1_texts.pkl
+    - validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v9.0: Simplified Input/Output)
+model:
+  model_version: "9.0"    # DAWN v9.0
+  d_model: 256            # Hidden dimension
+  n_layers: 4             # Number of transformer layers
+  n_heads: 4              # Number of attention heads
+
+  # TransformNeurons parameters (shared across layers)
+  rank: 64                # Projection rank (4 heads x 16 d_head)
+  # v9.0: n_input, n_output removed (single shared input_neuron/output_neuron)
+  n_process: 32           # Number of Householder process neurons (Q/K/V/O/M pools)
+  process_k: 3            # Number of process neurons to select (top-k)
+
+  # KnowledgeNeurons parameters
+  n_knowledge: 64         # Number of knowledge neurons
+  knowledge_k: 8          # Number of knowledge neurons to retrieve (top-k)
+
+  # Architecture
+  max_seq_len: 128        # Maximum sequence length
+  dropout: 0.1            # Dropout rate
+
+# Training
+training:
+  batch_size: 128         # Batch size
+  num_epochs: 30          # Total epochs
+  lr: 0.0003              # Learning rate
+  weight_decay: 0.1       # Weight decay for regularization
+  warmup_epochs: 2        # Warmup epochs
+
+  # Regularization
+  orthogonality_weight: 0.01   # Input/Output neuron orthogonality loss
+  process_norm_weight: 0.01    # Process neuron norm regularization (||v|| = 1)
+  load_balance_weight: 0.01    # Load balance loss for routing
+
+# Mixed precision
+use_amp: true
+
+# Paths
+checkpoint_dir: checkpoints/v9
+log_dir: logs/v9
+
+# Architecture v9.0:
+#   SharedNeurons (shared across all layers):
+#     - input_neuron: [d_model, rank]           # Single shared compression matrix
+#     - process_neurons_q: [n_process, rank]    # Q Householder pool
+#     - process_neurons_k: [n_process, rank]    # K Householder pool
+#     - process_neurons_v: [n_process, rank]    # V Householder pool
+#     - process_neurons_o: [n_process, rank]    # O Householder pool
+#     - process_neurons_m: [n_process, rank]    # Memory Query Householder pool
+#     - output_neuron: [rank, d_model]          # Single shared expansion matrix
+#     - knowledge_K: [n_knowledge, rank]
+#     - knowledge_V: [n_knowledge, d_model]
+#
+#   Key differences from v8.1:
+#     - No input_router in Compressor (just x @ input_neuron)
+#     - No output_router in Expander (just x @ output_neuron)
+#     - All diversity from Process Householder selection
+#
+#   Parameter savings (vs v8.1):
+#     - Input: 4 * n_input * d_model * rank -> d_model * rank (~524K -> 16K)
+#     - Output: n_output * rank * d_model -> rank * d_model (~131K -> 16K)
