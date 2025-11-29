@@ -1886,21 +1886,6 @@ def main():
                    f"{val_loss:.6f},{val_acc:.6f},"
                    f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}\n")
 
-        # Analyze activations periodically (skip for v7.5+ - uses different architecture)
-        if epoch % 10 == 0:
-            model_version = getattr(model, '__version__', None)
-            if model_version not in ["7.5", "7.8", "7.9", "8.0", "8.1", "8.2", "8.3", "9.0"]:
-                sample_batch = next(iter(val_loader))
-                sample_ids = sample_batch['input_ids'][:1].to(device)
-                act_stats = analyze_activations(model, sample_ids, device)
-                print(f"\n  Neuron Usage Analysis (Epoch {epoch}):")
-                for layer_name, stats in act_stats.items():
-                    print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
-                          f"({stats['usage_ratio']:.2%} usage)")
-            else:
-                # v7.5+/v8.x/v9.x uses dynamic Q/K/V/O - activation analysis not applicable
-                print(f"\n  (Neuron usage analysis skipped for v{model_version} - use analyze scripts instead)")
-
         # Debug: Log epoch summary for specific epochs
         if debug_logger and debug_logger.should_log_epoch(epoch):
             debug_logger.log_section(f"End of Epoch {epoch}")
