@@ -1,5 +1,5 @@
 """
-DAWN v8.1 - Dynamic Architecture With Neurons
+DAWN v8.0 - Dynamic Architecture With Neurons
 
 핵심 철학:
 - 모든 연산이 "뉴런 선택 + 조합"으로 이루어짐
@@ -9,16 +9,16 @@ DAWN v8.1 - Dynamic Architecture With Neurons
 
 구조:
     SharedNeurons (공유 뉴런 풀 - 레이어 간 공유)
-    ├── TransformNeurons (변환용)
+    ├── TransformNeurons (변환용, Q/K/V/O/M 분리)
     │     ├── input_neurons_q:    [n_input, d_model, rank] — Q 압축용
     │     ├── input_neurons_k:    [n_input, d_model, rank] — K 압축용
     │     ├── input_neurons_v:    [n_input, d_model, rank] — V 압축용
     │     ├── input_neurons_m:    [n_input, d_model, rank] — Memory Query 압축용
-    │     ├── process_neurons_q:  [n_process, rank] — Q용
-    │     ├── process_neurons_k:  [n_process, rank] — K용
-    │     ├── process_neurons_v:  [n_process, rank] — V용
-    │     ├── process_neurons_o:  [n_process, rank] — O용
-    │     ├── process_neurons_m:  [n_process, rank] — Memory Query용
+    │     ├── process_neurons_q:  [n_process, rank] — Q Householder
+    │     ├── process_neurons_k:  [n_process, rank] — K Householder
+    │     ├── process_neurons_v:  [n_process, rank] — V Householder
+    │     ├── process_neurons_o:  [n_process, rank] — O Householder
+    │     ├── process_neurons_m:  [n_process, rank] — M Householder
     │     └── output_neurons_o:   [n_output, rank, d_model] — O 확장용
     │
     └── KnowledgeNeurons (지식용)
@@ -27,15 +27,19 @@ DAWN v8.1 - Dynamic Architecture With Neurons
 
     NeuronCircuit (Transformer Block)
     ├── NeuronAttention (Attention 대체)
-    │     ├── Compressor_Q (neuron_type='q')
-    │     ├── Compressor_K (neuron_type='k')
-    │     ├── Compressor_V (neuron_type='v')
-    │     ├── Expander_O (neuron_type='o')
+    │     ├── Compressor_Q/K/V (각각 독립 input/process neurons 사용)
+    │     ├── Expander_O (output_neurons + process_o 사용)
     │     └── Multi-Head Attention 연산
     │
     └── NeuronMemory (FFN 대체)
-          ├── query_compressor (neuron_type='m')
+          ├── query_compressor (input_m + process_m 사용)
           └── 내적 기반 지식 조회
+
+파라미터 구성 (n_input=8, n_process=32, n_output=8 기준):
+    - input_neurons: 4타입 × 8개 × 256 × 64 = 524,288
+    - process_neurons: 5타입 × 32개 × 64 = 10,240
+    - output_neurons: 1타입 × 8개 × 64 × 256 = 131,072
+    - knowledge: K(64×64) + V(64×256) = 20,480
 """
 
 import torch
@@ -652,7 +656,7 @@ class DAWN(nn.Module):
     - NeuronCircuit: NeuronAttention + NeuronMemory
     - 라우터/W_Q만 레이어/모듈별로 독립
     """
-    __version__ = "8.1"
+    __version__ = "8.0"
 
     def __init__(
         self,

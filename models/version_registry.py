@@ -98,48 +98,9 @@ VERSION_REGISTRY = {
             f"    - Knowledge top-k: {args.get('knowledge_k')}",
         ],
     },
-    "8.3": {
-        "description": "SharedNeurons + NeuronMemory (QK/V/O/M 분리)",
-        "aliases": ["83"],
-        "module": "model_v8",
-        "required_params": [
-            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_input", "n_process", "n_output", "process_k",
-            "n_knowledge", "knowledge_k", "rank",
-        ],
-        "optional_params": {
-            "dropout": 0.1,
-        },
-    },
-    "8.2": {
-        "description": "SharedNeurons + NeuronMemory (QK/V/O 분리)",
-        "aliases": ["82"],
-        "module": "model_v8",
-        "required_params": [
-            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_input", "n_process", "n_output", "process_k",
-            "n_knowledge", "knowledge_k", "rank",
-        ],
-        "optional_params": {
-            "dropout": 0.1,
-        },
-    },
-    "8.1": {
-        "description": "SharedNeurons + NeuronMemory (QK/VO 분리)",
-        "aliases": ["81"],
-        "module": "model_v8",
-        "required_params": [
-            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_input", "n_process", "n_output", "process_k",
-            "n_knowledge", "knowledge_k", "rank",
-        ],
-        "optional_params": {
-            "dropout": 0.1,
-        },
-    },
     "8.0": {
-        "description": "SharedNeurons + NeuronMemory",
-        "aliases": ["8", "80"],
+        "description": "SharedNeurons + NeuronMemory (Q/K/V/O/M 분리)",
+        "aliases": ["8", "80", "81", "82", "83", "8.1", "8.2", "8.3"],
         "module": "model_v8",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
@@ -149,6 +110,17 @@ VERSION_REGISTRY = {
         "optional_params": {
             "dropout": 0.1,
         },
+        "display_info": lambda args: [
+            f"SharedNeurons (v8.0): rank={args.get('rank')}",
+            f"  InputNeurons (Q/K/V/M 분리): 4 × {args.get('n_input')} × {args.get('d_model')} × {args.get('rank')}",
+            f"  ProcessNeurons (Q/K/V/O/M 분리): 5 × {args.get('n_process')} × {args.get('rank')}",
+            f"  OutputNeurons: {args.get('n_output')} × {args.get('rank')} × {args.get('d_model')}",
+            f"  Process top-k: {args.get('process_k')}",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('rank')}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - Knowledge top-k: {args.get('knowledge_k')}",
+        ],
     },
     "baseline": {
         "description": "Vanilla Transformer (no DAWN)",
