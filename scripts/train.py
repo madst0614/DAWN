@@ -1379,7 +1379,28 @@ def main():
     if model_version != 'baseline':
         print(f"Neurons: n_neurons={args.n_neurons}, neuron_k={args.k}")
 
-        if model_version in ["8.0", "8.1", "8.2", "8.3"]:
+        if model_version == "9.0":
+            # v9.0: Simplified Input/Output (single shared neurons)
+            rank = getattr(args, 'rank', args.basis_rank)
+            n_process = getattr(args, 'n_process', 32)
+            process_k = getattr(args, 'process_k', 3)
+            n_knowledge = getattr(args, 'n_knowledge', 64)
+            knowledge_k = getattr(args, 'knowledge_k', 8)
+            print(f"SharedNeurons Simplified (v{model_version}): rank={rank}")
+            print(f"  TransformNeurons (Shared):")
+            print(f"    - input_neuron: {args.d_model} × {rank} (single shared)")
+            print(f"    - ProcessNeuron_Q: {n_process} × {rank}")
+            print(f"    - ProcessNeuron_K: {n_process} × {rank}")
+            print(f"    - ProcessNeuron_V: {n_process} × {rank}")
+            print(f"    - ProcessNeuron_O: {n_process} × {rank}")
+            print(f"    - ProcessNeuron_M: {n_process} × {rank}")
+            print(f"    - output_neuron: {rank} × {args.d_model} (single shared)")
+            print(f"    - Process top-k: {process_k}")
+            print(f"  KnowledgeNeurons (Shared):")
+            print(f"    - K: {n_knowledge} × {rank}")
+            print(f"    - V: {n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {knowledge_k}")
+        elif model_version in ["8.0", "8.1", "8.2", "8.3"]:
             # v8.0/v8.1/v8.2/v8.3: SharedNeurons + NeuronMemory (FFN 대체)
             rank = getattr(args, 'rank', args.basis_rank)
             n_input = getattr(args, 'n_input', 8)
@@ -1567,8 +1588,18 @@ def main():
                 'rank': args.basis_rank,  # v8.x uses 'rank' instead of 'basis_rank'
             })
 
+        # v9.0 Simplified Input/Output parameters (no n_input, n_output)
+        if model_version == '9.0':
+            model_kwargs.update({
+                'n_process': args.n_process,
+                'process_k': args.process_k,
+                'n_knowledge': getattr(args, 'n_knowledge', 64),
+                'knowledge_k': getattr(args, 'knowledge_k', 8),
+                'rank': args.basis_rank,  # v9.0 uses 'rank'
+            })
+
     # Create model
-    if model_version in ['8.3', '8.2', '8.1', '8.0', '7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
+    if model_version in ['9.0', '8.3', '8.2', '8.1', '8.0', '7.9', '7.8', '7.7', '7.6', '7.5', '7.4', '7.2', '7.1', '7.0', '6.0', 'baseline']:
         model = create_model_by_version(model_version, model_kwargs)
     else:
         model = DAWN(**model_kwargs)
@@ -1857,7 +1888,7 @@ def main():
         # Analyze activations periodically (skip for v7.5+ - uses different architecture)
         if epoch % 10 == 0:
             model_version = getattr(model, '__version__', None)
-            if model_version not in ["7.5", "7.8", "7.9", "8.0", "8.1"]:
+            if model_version not in ["7.5", "7.8", "7.9", "8.0", "8.1", "8.2", "8.3", "9.0"]:
                 sample_batch = next(iter(val_loader))
                 sample_ids = sample_batch['input_ids'][:1].to(device)
                 act_stats = analyze_activations(model, sample_ids, device)
@@ -1866,8 +1897,8 @@ def main():
                     print(f"    {layer_name}: {stats['unique_neurons']}/{stats['total_neurons']} neurons "
                           f"({stats['usage_ratio']:.2%} usage)")
             else:
-                # v7.5/v7.8/v7.9/v8.x uses dynamic Q/K/V/O - activation analysis not applicable
-                print(f"\n  (Neuron usage analysis skipped for v{model_version} - use analyze_dawn_v75.py instead)")
+                # v7.5+/v8.x/v9.x uses dynamic Q/K/V/O - activation analysis not applicable
+                print(f"\n  (Neuron usage analysis skipped for v{model_version} - use analyze scripts instead)")
 
         # Debug: Log epoch summary for specific epochs
         if debug_logger and debug_logger.should_log_epoch(epoch):
