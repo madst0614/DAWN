@@ -2,6 +2,34 @@
 DAWN Model Version Registry
 
 Centralized version information and model creation utilities.
+
+=============================================================================
+새 버전 추가 체크리스트 (New Version Checklist)
+=============================================================================
+1. models/model_vXX.py 생성
+   - DAWN 클래스 작성 (__version__ = "X.X")
+   - SharedNeurons, Compressor, Expander 등 구현
+
+2. models/version_registry.py (이 파일)
+   - VERSION_REGISTRY에 새 버전 항목 추가
+   - required_params, optional_params 정의
+   - display_info 람다 함수 (선택)
+
+3. models/__init__.py
+   - import 추가: from . import model_vXX as model_vXX
+   - __all__에 추가
+   - create_model_by_version()에 분기 추가
+
+4. utils/checkpoint.py
+   - VERSION_PARAM_CHANGES에 새 버전의 added/removed 파라미터 추가
+
+5. scripts/train.py (선택)
+   - model_kwargs에 새 버전용 파라미터 처리 추가
+   - 버전별 print 정보 추가
+
+6. 테스트
+   - python -c "from models.model_vXX import DAWN; print(DAWN.__version__)"
+=============================================================================
 """
 
 from typing import Dict, Any, List, Optional, Callable
@@ -18,6 +46,32 @@ from typing import Dict, Any, List, Optional, Callable
 #   - module: Module name to import from
 
 VERSION_REGISTRY = {
+    "9.1": {
+        "description": "v9.0 + hard selection + gated reflection",
+        "aliases": ["91"],
+        "module": "model_v91",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_reflect", "reflect_k",
+            "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v9.1): rank={args.get('rank', args.get('basis_rank'))}",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (hard selection)",
+            f"  ExpandNeurons: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (hard selection)",
+            f"  ReflectionNeurons (gated):",
+            f"    - reflect_d: {args.get('n_reflect')} × {args.get('d_model')}",
+            f"    - reflect_r: {args.get('n_reflect')} × {args.get('rank', args.get('basis_rank'))}",
+            f"    - Reflect top-k: {args.get('reflect_k')}",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('rank', args.get('basis_rank'))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - Knowledge top-k: {args.get('knowledge_k')}",
+        ],
+    },
     "9.0": {
         "description": "CompressNeurons + ExpandNeurons + ReflectionNeurons",
         "aliases": ["9", "90"],

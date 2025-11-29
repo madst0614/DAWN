@@ -16,6 +16,13 @@ from typing import Dict, Any, Optional, Tuple, List
 # Key: version string, Value: dict with 'added', 'removed', 'renamed' lists
 
 VERSION_PARAM_CHANGES = {
+    "9.1": {
+        "description": "v9.0 + hard selection + gated reflection",
+        "added": [],  # Same structure as v9.0, just behavior change
+        "removed": [],
+        "renamed": {},
+        "notes": "Compatible with v9.0 checkpoints (same parameters, different behavior)",
+    },
     "9.0": {
         "description": "CompressNeurons + ExpandNeurons + ReflectionNeurons",
         "added": [
