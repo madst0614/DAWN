@@ -1230,20 +1230,33 @@ class DAWNDeepAnalysis:
 
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
 
-        # Detect model version and get config
+        # Detect model version from state_dict keys
+        state_dict = checkpoint['model_state_dict']
+        state_keys = list(state_dict.keys())
+
+        # v10.0 has per-layer shared_neurons: layers.0.attn.shared_neurons.*
+        # v10.1 has global shared_neurons: shared_neurons.*
+        has_per_layer_neurons = any('layers.0.attn.shared_neurons' in k for k in state_keys)
+        has_global_neurons = any(k.startswith('shared_neurons.') for k in state_keys)
+
         config = checkpoint.get('config', {})
 
-        # Try v10.1 first, then v10.0
-        try:
+        if has_per_layer_neurons:
+            # v10.0 checkpoint
+            from models.model_v10 import DAWN
+            print("Using model_v10 (detected per-layer shared_neurons)")
+        elif has_global_neurons:
+            # v10.1 checkpoint
             from models.model_v10_1 import DAWN
-            print("Using model_v10_1")
-        except ImportError:
+            print("Using model_v10_1 (detected global shared_neurons)")
+        else:
+            # Fallback
             try:
                 from models.model_v10 import DAWN
-                print("Using model_v10")
+                print("Using model_v10 (fallback)")
             except ImportError:
                 from models.model import DAWN
-                print("Using base model")
+                print("Using base model (fallback)")
 
         # Create model with config kwargs
         if isinstance(config, dict):
@@ -1253,7 +1266,7 @@ class DAWNDeepAnalysis:
             config_dict = {k: v for k, v in vars(config).items() if not k.startswith('_')}
             self.model = DAWN(**config_dict)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()
 
