@@ -1133,8 +1133,8 @@ class AdvancedVisualizer:
         input_ids = torch.tensor([tokens], device=self.device)
         token_strs = [self.tokenizer.decode([t]).strip() for t in tokens]
 
-        # Get outputs with attention
-        outputs = self.model(input_ids, return_routing_info=True, output_attentions=True)
+        # Get outputs with routing info
+        outputs = self.model(input_ids, return_routing_info=True)
 
         # This depends on model architecture - adjust as needed
         if len(outputs) >= 2:
