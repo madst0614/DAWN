@@ -27,9 +27,9 @@ model:
 
 # Training
 training:
-  batch_size: 384
-  num_epochs: 3
-  lr: 0.00045               # 0.0003 × √1.5 (batch 256→384)
+  batch_size: 256
+  num_epochs: 5
+  lr: 0.0004                # batch 256에 맞춤
   weight_decay: 0.1
   warmup_ratio: 0.05
 
