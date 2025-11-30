@@ -29,7 +29,7 @@ model:
 
   n_knowledge: 64
   knowledge_k: 8
-  knowledge_rank: 32      # knowledge 전용 rank
+  knowledge_rank: 64      # knowledge 전용 rank
 
   max_seq_len: 128
   dropout: 0.1
