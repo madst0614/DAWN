@@ -114,9 +114,11 @@ class Compressor(nn.Module):
         """
         B, S, D = x.shape
         neurons = self.shared_neurons.compress_neurons  # [N, D, R]
+        N = self.n_compress
+        R = self.rank
 
         # 1. Router scores
-        scores = self.router(x)  # [B, S, n_compress]
+        scores = self.router(x)  # [B, S, N]
 
         # Add noise for exploration during training
         if add_noise and self.training and self.router_noise > 0:
@@ -126,29 +128,17 @@ class Compressor(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 배치 합치기
-        x_flat = x.view(B * S, D)  # [B*S, D]
-        idx_flat = topk_idx.view(B * S, self.top_k)  # [B*S, k]
-        weights_flat = weights.view(B * S, self.top_k)  # [B*S, k]
+        # 3. 모든 projection 한번에 계산 (v10.0과 동일 비용)
+        # neurons: [N, D, R] → [D, N*R]
+        neurons_flat = neurons.permute(1, 0, 2).reshape(D, N * R)
+        all_proj = (x @ neurons_flat).view(B, S, N, R)  # [B, S, N, R]
 
-        # 4. k개씩 루프 처리 (메모리 효율: [B*S, D, R] vs [B*S*k, D, R])
-        # Before: 5.4B elements = 10GB → OOM
-        # After: 671M elements = 1.3GB × k (순차 재사용)
-        output = x.new_zeros(B * S, self.rank)
+        # 4. top-k만 gather (추가 비용 거의 없음)
+        idx_exp = topk_idx.unsqueeze(-1).expand(B, S, self.top_k, R)
+        selected = all_proj.gather(2, idx_exp)  # [B, S, k, R]
 
-        for i in range(self.top_k):
-            idx_i = idx_flat[:, i]  # [B*S]
-            w_i = weights_flat[:, i:i+1]  # [B*S, 1]
-
-            # 선택된 뉴런: [B*S, D, R]
-            sel = neurons[idx_i]
-
-            # [B*S, D] × [B*S, D, R] → [B*S, R]
-            proj = torch.einsum('bd,bdr->br', x_flat, sel)
-
-            output = output + w_i * proj
-
-        output = output.view(B, S, self.rank)
+        # 5. Weighted sum
+        output = (selected * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
 
         routing_info = {
             'weights': weights,
@@ -201,9 +191,11 @@ class Expander(nn.Module):
         """
         B, S, R = x.shape
         neurons = self.shared_neurons.expand_neurons  # [N, R, D]
+        N = self.n_expand
+        D = self.d_model
 
         # 1. Router scores
-        scores = self.router(x)  # [B, S, n_expand]
+        scores = self.router(x)  # [B, S, N]
 
         # Add noise for exploration during training
         if add_noise and self.training and self.router_noise > 0:
@@ -213,27 +205,17 @@ class Expander(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 배치 합치기
-        x_flat = x.view(B * S, R)  # [B*S, R]
-        idx_flat = topk_idx.view(B * S, self.top_k)  # [B*S, k]
-        weights_flat = weights.view(B * S, self.top_k)  # [B*S, k]
+        # 3. 모든 projection 한번에 계산 (v10.0과 동일 비용)
+        # neurons: [N, R, D] → [R, N*D]
+        neurons_flat = neurons.permute(1, 0, 2).reshape(R, N * D)
+        all_proj = (x @ neurons_flat).view(B, S, N, D)  # [B, S, N, D]
 
-        # 4. k개씩 루프 처리 (메모리 효율: [B*S, R, D] vs [B*S*k, R, D])
-        output = x.new_zeros(B * S, self.d_model)
+        # 4. top-k만 gather (추가 비용 거의 없음)
+        idx_exp = topk_idx.unsqueeze(-1).expand(B, S, self.top_k, D)
+        selected = all_proj.gather(2, idx_exp)  # [B, S, k, D]
 
-        for i in range(self.top_k):
-            idx_i = idx_flat[:, i]  # [B*S]
-            w_i = weights_flat[:, i:i+1]  # [B*S, 1]
-
-            # 선택된 뉴런: [B*S, R, D]
-            sel = neurons[idx_i]
-
-            # [B*S, R] × [B*S, R, D] → [B*S, D]
-            proj = torch.einsum('br,brd->bd', x_flat, sel)
-
-            output = output + w_i * proj
-
-        output = output.view(B, S, self.d_model)
+        # 5. Weighted sum
+        output = (selected * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         routing_info = {
             'weights': weights,
