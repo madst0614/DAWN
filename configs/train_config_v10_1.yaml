@@ -1,0 +1,94 @@
+# DAWN v10.1 Training Config
+# Top-K Sparse Compress/Expand Architecture
+# Memory efficient: ~15GB vs ~50GB (v10.0)
+# Speed improvement: ~3x faster
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - validation/wikitext_5to1_texts.pkl
+
+# Model Architecture (v10.1 - Top-K Sparse)
+model:
+  model_version: "10.1"
+  d_model: 320
+  n_layers: 4
+  n_heads: 4
+  rank: 64
+
+  # CompressNeurons / ExpandNeurons (통합 풀)
+  n_compress: 224        # Q/K/V/M 공유 (더 많은 뉴런, top-k로 선택)
+  n_expand: 56           # O 공유 (4:1 비율)
+
+  # Top-K Selection (핵심!)
+  compress_top_k: 8      # 224개 중 8개만 선택
+  expand_top_k: 4        # 56개 중 4개만 선택
+  router_noise: 0.1      # 학습 시 탐색용 noise
+
+  # KnowledgeNeurons
+  n_knowledge: 80
+  knowledge_k: 10
+
+  # Architecture
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+
+  # Regularization
+  orthogonality_weight: 0.01    # compress/expand 직교성
+  diversity_weight: 0.1         # knowledge diversity
+  load_balance_weight: 0.1      # routing 균등 분포 (top-k에서 중요!)
+  process_norm_weight: 0.0      # v10 미지원 (process neurons 없음)
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10_1
+log_dir: /content/drive/MyDrive/dawn/logs_v10_1
+
+# =============================================================================
+# v10.1 vs v10.0 비교
+# =============================================================================
+#
+# | 항목              | v10.0 (soft)    | v10.1 (top-k)    |
+# |-------------------|-----------------|------------------|
+# | Compressor 연산   | 224개 전부       | 8개만            |
+# | Expander 연산     | 56개 전부        | 4개만            |
+# | 메모리            | ~50GB           | ~15GB            |
+# | 속도              | 1.37 it/s       | 3~4 it/s 예상    |
+#
+# =============================================================================
+# 파라미터 계산:
+# =============================================================================
+#   compress: 224 × 320 × 64 = 4,587,520 (4.59M)
+#   expand: 56 × 64 × 320 = 1,146,880 (1.15M)
+#   knowledge: 80×64 + 80×320 = 30,720 (31K)
+#   SharedNeurons 총: ~5.77M
+#
+#   embeddings: 30522 × 320 = 9.77M
+#   pos_emb: 128 × 320 = 41K
+#   routers: ~1.1M (더 많은 뉴런 → 더 큰 라우터)
+#   layernorms: ~10K
+#
+#   Total: ~16.7M
+#
+# =============================================================================
+# 학습 팁:
+# =============================================================================
+# 학습 초반:
+#   - top-k가 특정 뉴런에 몰릴 수 있음
+#   - load_balance_weight 높게 (0.1)
+#   - router_noise로 탐색 유도
+#
+# 학습 후반:
+#   - router_noise 줄이기 고려
+#   - 전문화 허용
+# =============================================================================
