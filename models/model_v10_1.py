@@ -28,7 +28,7 @@ except ImportError:
     TRITON_AVAILABLE = False
 
 # Global flag to control backend
-USE_TRITON = False  # Set to True to use Triton kernels
+USE_TRITON = True  # Use Triton kernels by default (faster)
 
 
 class SharedNeurons(nn.Module):
