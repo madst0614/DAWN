@@ -1,18 +1,15 @@
 """
-DAWN v10.1: Top-K Sparse Compress/Expand Architecture
+DAWN v10.1: True Sparse MoE-Style Architecture
 
-Key changes from v10.0:
-- Top-K selection for Compressor (default k=8)
-- Top-K selection for Expander (default k=4)
-- Load balance loss for routing균등 분포
-- Router noise for exploration during training
-- Significant memory reduction (~15GB vs ~50GB)
-- Speed improvement (~3-4x faster)
+v10.0 대비 변경:
+- 모든 뉴런 계산 후 선택 → 선택 후 해당 뉴런만 계산
+- 메모리: O(B×S×N×R) → O(B×S×k×R)
+- 속도: 바닐라 Transformer와 유사하거나 더 빠름
 
-Architecture:
-    x (d_model)
-    → Compressor: router → top-k → softmax → weighted selected neurons → (rank)
-    → Expander: router → top-k → softmax → weighted selected neurons → (d_model)
+핵심 아이디어:
+1. 라우터로 top-k 뉴런 인덱스 먼저 결정 (가벼운 연산)
+2. 선택된 뉴런 weight만 gather
+3. 해당 뉴런들로만 projection 계산
 """
 
 import math
@@ -23,10 +20,10 @@ import torch.nn.functional as F
 
 class SharedNeurons(nn.Module):
     """
-    v10.1: SharedNeurons (same as v10.0)
+    SharedNeurons (v10.0과 동일)
 
-    - CompressNeurons: [n_compress, d_model, rank] - Q/K/V/M 공유
-    - ExpandNeurons: [n_expand, rank, d_model] - O 공유
+    - CompressNeurons: [n_compress, d_model, rank]
+    - ExpandNeurons: [n_expand, rank, d_model]
     - KnowledgeNeurons: [n_knowledge, rank] + [n_knowledge, d_model]
     """
     def __init__(
@@ -44,44 +41,28 @@ class SharedNeurons(nn.Module):
         self.n_expand = n_expand
         self.n_knowledge = n_knowledge
 
-        # CompressNeurons: d_model → rank (Q/K/V/M 공유)
         self.compress_neurons = nn.Parameter(torch.zeros(n_compress, d_model, rank))
-
-        # ExpandNeurons: rank → d_model (O 공유)
         self.expand_neurons = nn.Parameter(torch.zeros(n_expand, rank, d_model))
-
-        # KnowledgeNeurons
         self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, rank))
         self.knowledge_V = nn.Parameter(torch.zeros(n_knowledge, d_model))
 
         self._init_parameters()
 
     def _init_parameters(self):
-        # CompressNeurons: 직교 초기화
         for i in range(self.n_compress):
             nn.init.orthogonal_(self.compress_neurons.data[i])
-
-        # ExpandNeurons: 직교 초기화
         for i in range(self.n_expand):
             nn.init.orthogonal_(self.expand_neurons.data[i])
-
-        # KnowledgeNeurons
         nn.init.normal_(self.knowledge_K, std=0.02)
         nn.init.normal_(self.knowledge_V, std=0.02)
 
 
-class Compressor(nn.Module):
+class SparseCompressor(nn.Module):
     """
-    v10.1: Top-K Sparse Compressor
+    True Sparse Compressor: 선택된 뉴런만 연산
 
-    d_model → rank 압축 (Top-K 선택)
-
-    흐름:
-    1. Router → scores
-    2. Top-K 선택
-    3. Softmax on selected
-    4. Gather selected neurons only
-    5. Weighted projection
+    기존: x @ all_neurons → select top-k (N번 연산)
+    개선: select top-k → x @ selected_neurons (k번 연산)
     """
     def __init__(
         self,
@@ -100,45 +81,47 @@ class Compressor(nn.Module):
         self.top_k = top_k
         self.router_noise = router_noise
 
-        # 독립 라우터
         self.router = nn.Linear(d_model, n_compress, bias=False)
 
     def forward(self, x, add_noise: bool = False):
         """
         Args:
             x: [B, S, d_model]
-            add_noise: Whether to add noise to router scores (for training exploration)
         Returns:
             output: [B, S, rank]
-            routing_info: dict with weights and indices
+            routing_info: dict
         """
         B, S, D = x.shape
-        neurons = self.shared_neurons.compress_neurons  # [N, D, R]
-        N = self.n_compress
+        k = self.top_k
         R = self.rank
 
-        # 1. Router scores
+        # 1. 라우터 스코어 (가벼운 연산)
         scores = self.router(x)  # [B, S, N]
 
-        # Add noise for exploration during training
         if add_noise and self.training and self.router_noise > 0:
             scores = scores + torch.randn_like(scores) * self.router_noise
 
-        # 2. Top-k selection
-        topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
+        # 2. Top-k 선택
+        topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 모든 projection 한번에 계산 (v10.0과 동일 비용)
-        # neurons: [N, D, R] → [D, N*R]
-        neurons_flat = neurons.permute(1, 0, 2).reshape(D, N * R)
-        all_proj = (x @ neurons_flat).view(B, S, N, R)  # [B, S, N, R]
+        # 3. 선택된 뉴런만 gather: [B, S, k, D, R]
+        neurons = self.shared_neurons.compress_neurons  # [N, D, R]
 
-        # 4. top-k만 gather (추가 비용 거의 없음)
-        idx_exp = topk_idx.unsqueeze(-1).expand(B, S, self.top_k, R)
-        selected = all_proj.gather(2, idx_exp)  # [B, S, k, R]
+        # 인덱스 확장: [B, S, k] → [B, S, k, D, R]
+        idx_expanded = topk_idx.view(B, S, k, 1, 1).expand(B, S, k, D, R)
+        neurons_expanded = neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)
+        selected_neurons = neurons_expanded.gather(2, idx_expanded)  # [B, S, k, D, R]
+
+        # 4. 선택된 뉴런으로만 projection
+        # x: [B, S, D] → [B, S, 1, D]
+        # selected_neurons: [B, S, k, D, R]
+        # einsum: bsd, bskdr → bskr
+        x_unsq = x.unsqueeze(2)  # [B, S, 1, D]
+        proj = torch.einsum('bsod,bskdr->bskr', x_unsq, selected_neurons)  # [B, S, k, R]
 
         # 5. Weighted sum
-        output = (selected * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
+        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
 
         routing_info = {
             'weights': weights,
@@ -147,18 +130,9 @@ class Compressor(nn.Module):
         return output, routing_info
 
 
-class Expander(nn.Module):
+class SparseExpander(nn.Module):
     """
-    v10.1: Top-K Sparse Expander
-
-    rank → d_model 확장 (Top-K 선택)
-
-    흐름:
-    1. Router → scores
-    2. Top-K 선택
-    3. Softmax on selected
-    4. Gather selected neurons only
-    5. Weighted projection
+    True Sparse Expander: 선택된 뉴런만 연산
     """
     def __init__(
         self,
@@ -177,45 +151,43 @@ class Expander(nn.Module):
         self.top_k = top_k
         self.router_noise = router_noise
 
-        # 독립 라우터
         self.router = nn.Linear(rank, n_expand, bias=False)
 
     def forward(self, x, add_noise: bool = False):
         """
         Args:
             x: [B, S, rank]
-            add_noise: Whether to add noise to router scores (for training exploration)
         Returns:
             output: [B, S, d_model]
-            routing_info: dict with weights and indices
+            routing_info: dict
         """
         B, S, R = x.shape
-        neurons = self.shared_neurons.expand_neurons  # [N, R, D]
-        N = self.n_expand
+        k = self.top_k
         D = self.d_model
 
-        # 1. Router scores
+        # 1. 라우터 스코어
         scores = self.router(x)  # [B, S, N]
 
-        # Add noise for exploration during training
         if add_noise and self.training and self.router_noise > 0:
             scores = scores + torch.randn_like(scores) * self.router_noise
 
-        # 2. Top-k selection
-        topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
+        # 2. Top-k 선택
+        topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 모든 projection 한번에 계산 (v10.0과 동일 비용)
-        # neurons: [N, R, D] → [R, N*D]
-        neurons_flat = neurons.permute(1, 0, 2).reshape(R, N * D)
-        all_proj = (x @ neurons_flat).view(B, S, N, D)  # [B, S, N, D]
+        # 3. 선택된 뉴런만 gather: [B, S, k, R, D]
+        neurons = self.shared_neurons.expand_neurons  # [N, R, D]
 
-        # 4. top-k만 gather (추가 비용 거의 없음)
-        idx_exp = topk_idx.unsqueeze(-1).expand(B, S, self.top_k, D)
-        selected = all_proj.gather(2, idx_exp)  # [B, S, k, D]
+        idx_expanded = topk_idx.view(B, S, k, 1, 1).expand(B, S, k, R, D)
+        neurons_expanded = neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)
+        selected_neurons = neurons_expanded.gather(2, idx_expanded)  # [B, S, k, R, D]
+
+        # 4. 선택된 뉴런으로만 projection
+        x_unsq = x.unsqueeze(2)  # [B, S, 1, R]
+        proj = torch.einsum('bsor,bskrd->bskd', x_unsq, selected_neurons)  # [B, S, k, D]
 
         # 5. Weighted sum
-        output = (selected * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
+        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         routing_info = {
             'weights': weights,
@@ -226,10 +198,7 @@ class Expander(nn.Module):
 
 class NeuronCircuit(nn.Module):
     """
-    v10.1 Attention Layer with Top-K routing
-
-    Q/K/V 각각 독립 Compressor (같은 compress_neurons 공유)
-    O는 Expander
+    Attention Layer with True Sparse routing
     """
     def __init__(
         self,
@@ -245,74 +214,49 @@ class NeuronCircuit(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = rank // n_heads
         self.rank = rank
 
-        # Q/K/V: 각각 독립 Compressor (compress_neurons 공유)
-        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
-        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
-        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
-
-        # O: Expander
-        self.expander_O = Expander(shared_neurons, d_model, rank, n_expand, expand_top_k, router_noise)
+        self.compressor_Q = SparseCompressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
+        self.compressor_K = SparseCompressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
+        self.compressor_V = SparseCompressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
+        self.expander_O = SparseExpander(shared_neurons, d_model, rank, n_expand, expand_top_k, router_noise)
 
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None, add_noise: bool = False):
-        """
-        Args:
-            x: [B, S, d_model]
-            mask: [B, 1, S, S] causal mask
-            add_noise: Whether to add noise to routers
-        Returns:
-            output: [B, S, d_model]
-            routing_info: dict with Q/K/V/O routing
-        """
         B, S, D = x.shape
 
-        # Q/K/V compression with top-k
-        Q, q_info = self.compressor_Q(x, add_noise)  # [B, S, rank]
-        K, k_info = self.compressor_K(x, add_noise)  # [B, S, rank]
-        V, v_info = self.compressor_V(x, add_noise)  # [B, S, rank]
+        Q, q_info = self.compressor_Q(x, add_noise)
+        K, k_info = self.compressor_K(x, add_noise)
+        V, v_info = self.compressor_V(x, add_noise)
 
-        # Reshape for multi-head attention
-        Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)  # [B, H, S, d_head]
+        Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         K = K.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Attention
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float('-inf'))
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
 
-        # Apply attention to V
-        attn_out = torch.matmul(attn, V)  # [B, H, S, d_head]
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.rank)  # [B, S, rank]
+        attn_out = torch.matmul(attn, V)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.rank)
 
-        # Output expansion with top-k
-        output, o_info = self.expander_O(attn_out, add_noise)  # [B, S, d_model]
+        output, o_info = self.expander_O(attn_out, add_noise)
         output = self.out_dropout(output)
 
-        routing_info = {
-            'Q': q_info,
-            'K': k_info,
-            'V': v_info,
-            'O': o_info,
-        }
+        routing_info = {'Q': q_info, 'K': k_info, 'V': v_info, 'O': o_info}
         return output, routing_info
 
 
 class NeuronMemory(nn.Module):
     """
-    v10.1 Knowledge Retrieval (same as v10.0)
-
-    Query compression → Knowledge lookup → Output
+    Knowledge Retrieval with Sparse Compressor
     """
     def __init__(
         self,
@@ -330,38 +274,25 @@ class NeuronMemory(nn.Module):
         self.rank = rank
         self.knowledge_k = knowledge_k
 
-        # Query Compressor (with top-k)
-        self.query_compressor = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
+        self.query_compressor = SparseCompressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
 
     def forward(self, x, add_noise: bool = False):
-        """
-        Args:
-            x: [B, S, d_model]
-            add_noise: Whether to add noise to router
-        Returns:
-            output: [B, S, d_model]
-            routing_info: dict
-        """
         B, S, D = x.shape
 
-        # Query compression
-        Q, q_info = self.query_compressor(x, add_noise)  # [B, S, rank]
+        Q, q_info = self.query_compressor(x, add_noise)
 
-        # Knowledge lookup
-        K = self.shared_neurons.knowledge_K  # [n_knowledge, rank]
-        V = self.shared_neurons.knowledge_V  # [n_knowledge, d_model]
+        K = self.shared_neurons.knowledge_K
+        V = self.shared_neurons.knowledge_V
 
-        scores = Q @ K.T / math.sqrt(self.rank)  # [B, S, n_knowledge]
+        scores = Q @ K.T / math.sqrt(self.rank)
         topk_scores, topk_idx = torch.topk(scores, self.knowledge_k, dim=-1)
-        weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
+        weights = F.softmax(topk_scores, dim=-1)
 
-        # 선택된 V 가져오기 (메모리 효율적 - 직접 인덱싱)
-        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
-        selected_V = V[flat_idx]  # [B*S*k, d_model]
-        selected_V = selected_V.view(B, S, self.knowledge_k, self.d_model)  # [B, S, k, d_model]
+        # 직접 인덱싱 (메모리 효율적)
+        flat_idx = topk_idx.reshape(-1)
+        selected_V = V[flat_idx].view(B, S, self.knowledge_k, self.d_model)
 
-        # Weighted sum
-        output = (selected_V * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, d_model]
+        output = (selected_V * weights.unsqueeze(-1)).sum(dim=2)
 
         routing_info = {
             'M': q_info,
@@ -372,7 +303,7 @@ class NeuronMemory(nn.Module):
 
 
 class DAWNBlock(nn.Module):
-    """Single DAWN v10.1 block: Attention + FFN(Memory) + LayerNorms"""
+    """Single DAWN block"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
@@ -403,36 +334,24 @@ class DAWNBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None, add_noise: bool = False):
-        """
-        Returns:
-            x: [B, S, d_model]
-            routing_info: dict with attention and memory routing
-        """
-        # Attention
         attn_out, attn_routing = self.attn(self.norm1(x), mask, add_noise)
-        x = x + attn_out  # dropout already in NeuronCircuit
+        x = x + attn_out
 
-        # Memory (FFN replacement)
         mem_out, mem_routing = self.memory(self.norm2(x), add_noise)
         x = x + self.dropout(mem_out)
 
-        routing_info = {
-            'attention': attn_routing,
-            'memory': mem_routing,
-        }
+        routing_info = {'attention': attn_routing, 'memory': mem_routing}
         return x, routing_info
 
 
 class DAWN(nn.Module):
     """
-    DAWN v10.1: Top-K Sparse Compress/Expand Architecture
+    DAWN v10.1: True Sparse MoE-Style Architecture
 
-    - CompressNeurons: Q/K/V/M 통합 with top-k selection
-    - ExpandNeurons: O 통합 with top-k selection
-    - Load balance loss for routing均等分布
-    - Router noise for exploration
-
-    Memory efficient: Only compute with k selected neurons instead of all
+    핵심 개선:
+    - 선택 후 연산 (vs 연산 후 선택)
+    - 메모리 효율: O(k) vs O(N)
+    - 속도: 바닐라 수준으로 개선
     """
     __version__ = "10.1"
 
@@ -463,7 +382,6 @@ class DAWN(nn.Module):
         self.rank = rank
         self.max_seq_len = max_seq_len
 
-        # Config 저장
         self.n_compress = n_compress
         self.n_expand = n_expand
         self.n_knowledge = n_knowledge
@@ -472,15 +390,15 @@ class DAWN(nn.Module):
         self.expand_top_k = expand_top_k
         self.router_noise = router_noise
 
-        # train.py 호환용
-        self.n_neurons = n_compress  # For load balance loss (if needed)
-        self.basis_rank = rank  # For analysis scripts
+        # 호환용
+        self.n_neurons = n_compress
+        self.basis_rank = rank
 
         # Embeddings
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
 
-        # SharedNeurons (전체 레이어 공유)
+        # SharedNeurons
         self.shared_neurons = SharedNeurons(
             d_model=d_model,
             rank=rank,
@@ -509,8 +427,6 @@ class DAWN(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-
-        # Weight tying
         self.lm_head.weight = self.token_emb.weight
 
         self._init_weights()
@@ -525,29 +441,18 @@ class DAWN(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
 
     def forward(self, input_ids, labels=None, return_routing_info=False, add_noise=None):
-        """
-        Args:
-            input_ids: [B, S]
-            labels: [B, S] for loss computation
-            return_routing_info: Whether to return routing information
-            add_noise: Override for training noise (default: self.training)
-        """
         B, S = input_ids.shape
         device = input_ids.device
 
-        # Default: add noise during training
         if add_noise is None:
             add_noise = self.training
 
-        # Embeddings
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
         x = self.token_emb(input_ids) + self.pos_emb(positions)
 
-        # Causal mask
         mask = torch.triu(torch.ones(S, S, device=device), diagonal=1).bool()
-        mask = ~mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
+        mask = ~mask.unsqueeze(0).unsqueeze(0)
 
-        # Layers
         routing_infos = []
         for layer in self.layers:
             x, routing_info = layer(x, mask, add_noise)
@@ -572,31 +477,23 @@ class DAWN(nn.Module):
         return logits
 
     def orthogonality_loss(self):
-        """CompressNeurons/ExpandNeurons 직교성 유지"""
         loss = 0.0
-
-        # compress_neurons: 각 [d_model, rank] → W.T @ W ≈ I
         for i in range(self.n_compress):
             W = self.shared_neurons.compress_neurons[i]
             WtW = W.T @ W
             I = torch.eye(self.rank, device=W.device)
             loss += ((WtW - I) ** 2).mean()
-
-        # expand_neurons: 각 [rank, d_model] → W @ W.T ≈ I
         for i in range(self.n_expand):
             W = self.shared_neurons.expand_neurons[i]
             WWt = W @ W.T
             I = torch.eye(self.rank, device=W.device)
             loss += ((WWt - I) ** 2).mean()
-
         return loss / (self.n_compress + self.n_expand)
 
     def routing_entropy_loss(self):
-        """Placeholder for entropy-based routing loss"""
         return torch.tensor(0.0, device=next(self.parameters()).device)
 
     def knowledge_diversity_loss(self):
-        """Knowledge K vectors 다양성"""
         K = self.shared_neurons.knowledge_K
         K_norm = F.normalize(K, dim=-1)
         sim = K_norm @ K_norm.T
@@ -604,43 +501,26 @@ class DAWN(nn.Module):
         return sim[mask].abs().mean()
 
     def load_balance_loss(self, routing_infos):
-        """
-        v10.1: Top-k routing load balance loss
-
-        각 뉴런이 선택된 횟수를 균등하게 유지
-
-        Args:
-            routing_infos: forward에서 반환된 layer별 routing 정보
-        Returns:
-            load balance loss (lower = more balanced)
-        """
         loss = 0.0
         count = 0
 
         for layer_info in routing_infos:
-            # Attention Q/K/V compressors
             for comp in ['Q', 'K', 'V']:
-                indices = layer_info['attention'][comp]['indices']  # [B, S, k]
-
-                # 각 뉴런이 선택된 횟수 카운트
-                flat_idx = indices.reshape(-1)  # [B*S*k]
+                indices = layer_info['attention'][comp]['indices']
+                flat_idx = indices.reshape(-1)
                 counts = torch.bincount(flat_idx, minlength=self.n_compress).float()
-
-                # 균등 분포와의 차이
                 target = flat_idx.numel() / self.n_compress
                 loss += ((counts - target) ** 2).mean() / (target ** 2 + 1e-10)
                 count += 1
 
-            # O expander
-            o_indices = layer_info['attention']['O']['indices']  # [B, S, k]
+            o_indices = layer_info['attention']['O']['indices']
             flat_idx = o_indices.reshape(-1)
             counts = torch.bincount(flat_idx, minlength=self.n_expand).float()
             target = flat_idx.numel() / self.n_expand
             loss += ((counts - target) ** 2).mean() / (target ** 2 + 1e-10)
             count += 1
 
-            # Memory M compressor
-            m_indices = layer_info['memory']['M']['indices']  # [B, S, k]
+            m_indices = layer_info['memory']['M']['indices']
             flat_idx = m_indices.reshape(-1)
             counts = torch.bincount(flat_idx, minlength=self.n_compress).float()
             target = flat_idx.numel() / self.n_compress
@@ -650,7 +530,6 @@ class DAWN(nn.Module):
         return loss / (count + 1e-10)
 
     def get_auxiliary_losses(self):
-        """train.py 호환"""
         return {
             'orth_total': self.orthogonality_loss(),
             'knowledge_div': self.knowledge_diversity_loss(),
@@ -660,15 +539,12 @@ class DAWN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def count_by_component(self):
-        """Component별 파라미터 수 출력"""
         compress = self.shared_neurons.compress_neurons.numel()
         expand = self.shared_neurons.expand_neurons.numel()
         knowledge = (self.shared_neurons.knowledge_K.numel() +
                     self.shared_neurons.knowledge_V.numel())
-
         embed = self.token_emb.weight.numel() + self.pos_emb.weight.numel()
 
-        # Routers: per layer (4 compressors + 1 expander + 1 memory compressor per layer)
         router_per_layer = (
             self.layers[0].attn.compressor_Q.router.weight.numel() +
             self.layers[0].attn.compressor_K.router.weight.numel() +
@@ -677,11 +553,9 @@ class DAWN(nn.Module):
             self.layers[0].memory.query_compressor.router.weight.numel()
         )
         routers = router_per_layer * self.n_layers
-
-        # LayerNorms
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        print(f"=== DAWN v10.1 Parameter Breakdown ===")
+        print(f"=== DAWN v10.1 (True Sparse) Parameter Breakdown ===")
         print(f"CompressNeurons: {compress:,} ({compress/1e6:.2f}M)")
         print(f"ExpandNeurons:   {expand:,} ({expand/1e6:.2f}M)")
         print(f"KnowledgeNeurons: {knowledge:,} ({knowledge/1e3:.1f}K)")
