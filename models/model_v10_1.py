@@ -3,8 +3,8 @@ DAWN v10.1: Top-K Compress/Expand Architecture
 
 Architecture:
     x (d_model)
-    → Compressor: router → top-k → softmax → weighted projection → (rank)
-    → Expander: router → top-k → softmax → weighted projection → (d_model)
+    → Compressor: router → top-k → 뉴런별 배치 처리 → (rank)
+    → Expander: router → top-k → 뉴런별 배치 처리 → (d_model)
 
 Components:
     - CompressNeurons: [n_compress, d_model, rank] - Q/K/V/M 공유
@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 class SharedNeurons(nn.Module):
     """
-    SharedNeurons (v10.0과 동일)
+    SharedNeurons
 
     - CompressNeurons: [n_compress, d_model, rank]
     - ExpandNeurons: [n_expand, rank, d_model]
@@ -61,7 +61,7 @@ class Compressor(nn.Module):
     """
     d_model → rank 압축
 
-    Top-K 뉴런 선택 후 weighted projection
+    뉴런 단위 배치 처리: 같은 뉴런을 선택한 토큰들끼리 묶어서 연산
     """
     def __init__(
         self,
@@ -93,6 +93,7 @@ class Compressor(nn.Module):
         B, S, D = x.shape
         k = self.top_k
         R = self.rank
+        N = self.n_compress
 
         # 1. 라우터 스코어
         scores = self.router(x)  # [B, S, N]
@@ -104,22 +105,38 @@ class Compressor(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 선택된 뉴런만 가져오기 (메모리 효율적)
+        # 3. 뉴런 단위 배치 처리
         neurons = self.shared_neurons.compress_neurons  # [N, D, R]
+        x_flat = x.view(B * S, D)  # [B*S, D]
 
-        # flatten indices → 직접 인덱싱
-        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
-        selected_neurons = neurons[flat_idx]  # [B*S*k, D, R]
-        selected_neurons = selected_neurons.view(B, S, k, D, R)  # [B, S, k, D, R]
+        # 출력 버퍼
+        output = torch.zeros(B * S, k, R, device=x.device, dtype=x.dtype)
 
-        # 4. Batch matmul: x @ selected_neurons
-        # x: [B, S, D] → [B, S, 1, 1, D]
-        # selected: [B, S, k, D, R]
-        # 결과: [B, S, k, R]
-        proj = torch.einsum('bsd,bskdr->bskr', x, selected_neurons)
+        # 각 top-k 슬롯별로 처리
+        for slot in range(k):
+            slot_idx = topk_idx[:, :, slot].reshape(-1)  # [B*S]
 
-        # 5. Weighted sum
-        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
+            # 이 슬롯에서 활성화된 뉴런들
+            active_neurons = slot_idx.unique()
+
+            for neuron_idx in active_neurons:
+                # 이 뉴런을 선택한 토큰 마스크
+                mask = (slot_idx == neuron_idx)  # [B*S]
+
+                if mask.sum() == 0:
+                    continue
+
+                # 해당 토큰들만 추출해서 배치 matmul
+                tokens = x_flat[mask]  # [num_tokens, D]
+                neuron_weight = neurons[neuron_idx]  # [D, R]
+                proj = tokens @ neuron_weight  # [num_tokens, R]
+
+                # 결과를 출력 버퍼에 scatter
+                output[mask, slot, :] = proj
+
+        # 4. Weighted sum
+        output = output.view(B, S, k, R)
+        output = (output * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
 
         routing_info = {
             'weights': weights,
@@ -132,7 +149,7 @@ class Expander(nn.Module):
     """
     rank → d_model 확장
 
-    Top-K 뉴런 선택 후 weighted projection
+    뉴런 단위 배치 처리
     """
     def __init__(
         self,
@@ -164,6 +181,7 @@ class Expander(nn.Module):
         B, S, R = x.shape
         k = self.top_k
         D = self.d_model
+        N = self.n_expand
 
         # 1. 라우터 스코어
         scores = self.router(x)  # [B, S, N]
@@ -175,18 +193,31 @@ class Expander(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 선택된 뉴런만 가져오기 (메모리 효율적)
+        # 3. 뉴런 단위 배치 처리
         neurons = self.shared_neurons.expand_neurons  # [N, R, D]
+        x_flat = x.view(B * S, R)  # [B*S, R]
 
-        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
-        selected_neurons = neurons[flat_idx]  # [B*S*k, R, D]
-        selected_neurons = selected_neurons.view(B, S, k, R, D)  # [B, S, k, R, D]
+        output = torch.zeros(B * S, k, D, device=x.device, dtype=x.dtype)
 
-        # 4. Batch matmul
-        proj = torch.einsum('bsr,bskrd->bskd', x, selected_neurons)  # [B, S, k, D]
+        for slot in range(k):
+            slot_idx = topk_idx[:, :, slot].reshape(-1)  # [B*S]
+            active_neurons = slot_idx.unique()
 
-        # 5. Weighted sum
-        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
+            for neuron_idx in active_neurons:
+                mask = (slot_idx == neuron_idx)
+
+                if mask.sum() == 0:
+                    continue
+
+                tokens = x_flat[mask]  # [num_tokens, R]
+                neuron_weight = neurons[neuron_idx]  # [R, D]
+                proj = tokens @ neuron_weight  # [num_tokens, D]
+
+                output[mask, slot, :] = proj
+
+        # 4. Weighted sum
+        output = output.view(B, S, k, D)
+        output = (output * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         routing_info = {
             'weights': weights,
@@ -197,7 +228,10 @@ class Expander(nn.Module):
 
 class NeuronCircuit(nn.Module):
     """
-    Attention Layer with True Sparse routing
+    Attention Layer
+
+    Q/K/V: Compressor (compress_neurons 공유)
+    O: Expander (expand_neurons 공유)
     """
     def __init__(
         self,
@@ -255,7 +289,7 @@ class NeuronCircuit(nn.Module):
 
 class NeuronMemory(nn.Module):
     """
-    Knowledge Retrieval with Sparse Compressor
+    Knowledge Retrieval
     """
     def __init__(
         self,
@@ -287,7 +321,6 @@ class NeuronMemory(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.knowledge_k, dim=-1)
         weights = F.softmax(topk_scores, dim=-1)
 
-        # 직접 인덱싱 (메모리 효율적)
         flat_idx = topk_idx.reshape(-1)
         selected_V = V[flat_idx].view(B, S, self.knowledge_k, self.d_model)
 
