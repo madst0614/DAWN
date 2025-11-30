@@ -295,21 +295,19 @@ class NeuronAnalyzer:
                     tokens_str.append(f"'{tok}'({cnt})")
                 print(f"  Neuron {neuron_id}: {', '.join(tokens_str)}")
 
-        # Save detailed results
+        # Save detailed results (Layer 0 only - memory optimized)
         for comp in ['Q', 'K', 'V', 'M']:
             results['neuron_top_tokens'][comp] = {}
-            for layer_idx in range(self.n_layers):
-                results['neuron_top_tokens'][comp][f'L{layer_idx}'] = {}
-                for neuron_id in range(self.n_compress):
-                    top_tokens = neuron_token_counts[comp][layer_idx][neuron_id].most_common(50)
-                    if top_tokens:
-                        results['neuron_top_tokens'][comp][f'L{layer_idx}'][neuron_id] = [
-                            {'token': self.tokenizer.decode([tid]).strip(),
-                             'token_id': tid,
-                             'count': cnt,
-                             'avg_weight': neuron_token_weights[comp][layer_idx][neuron_id][tid] / cnt}
-                            for tid, cnt in top_tokens
-                        ]
+            results['neuron_top_tokens'][comp]['L0'] = {}
+            for neuron_id in range(self.n_compress):
+                top_tokens = neuron_token_counts[comp][0][neuron_id].most_common(50)
+                if top_tokens:
+                    results['neuron_top_tokens'][comp]['L0'][neuron_id] = [
+                        {'token': self.tokenizer.decode([tid]).strip(),
+                         'token_id': tid,
+                         'count': cnt}
+                        for tid, cnt in top_tokens
+                    ]
 
         # 1.2 토큰별 뉴런 프로파일
         print("\n--- 1.2 Token Neuron Profiles (Top tokens) ---")
