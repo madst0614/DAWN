@@ -1,15 +1,15 @@
 """
-DAWN v10.1: True Sparse MoE-Style Architecture
+DAWN v10.1: Top-K Compress/Expand Architecture
 
-v10.0 대비 변경:
-- 모든 뉴런 계산 후 선택 → 선택 후 해당 뉴런만 계산
-- 메모리: O(B×S×N×R) → O(B×S×k×R)
-- 속도: 바닐라 Transformer와 유사하거나 더 빠름
+Architecture:
+    x (d_model)
+    → Compressor: router → top-k → softmax → weighted projection → (rank)
+    → Expander: router → top-k → softmax → weighted projection → (d_model)
 
-핵심 아이디어:
-1. 라우터로 top-k 뉴런 인덱스 먼저 결정 (가벼운 연산)
-2. 선택된 뉴런 weight만 gather
-3. 해당 뉴런들로만 projection 계산
+Components:
+    - CompressNeurons: [n_compress, d_model, rank] - Q/K/V/M 공유
+    - ExpandNeurons: [n_expand, rank, d_model] - O 공유
+    - KnowledgeNeurons: [n_knowledge, rank] + [n_knowledge, d_model]
 """
 
 import math
@@ -57,12 +57,11 @@ class SharedNeurons(nn.Module):
         nn.init.normal_(self.knowledge_V, std=0.02)
 
 
-class SparseCompressor(nn.Module):
+class Compressor(nn.Module):
     """
-    True Sparse Compressor: 선택된 뉴런만 연산
+    d_model → rank 압축
 
-    기존: x @ all_neurons → select top-k (N번 연산)
-    개선: select top-k → x @ selected_neurons (k번 연산)
+    Top-K 뉴런 선택 후 weighted projection
     """
     def __init__(
         self,
@@ -95,7 +94,7 @@ class SparseCompressor(nn.Module):
         k = self.top_k
         R = self.rank
 
-        # 1. 라우터 스코어 (가벼운 연산)
+        # 1. 라우터 스코어
         scores = self.router(x)  # [B, S, N]
 
         if add_noise and self.training and self.router_noise > 0:
@@ -105,20 +104,19 @@ class SparseCompressor(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 선택된 뉴런만 gather: [B, S, k, D, R]
+        # 3. 선택된 뉴런만 가져오기 (메모리 효율적)
         neurons = self.shared_neurons.compress_neurons  # [N, D, R]
 
-        # 인덱스 확장: [B, S, k] → [B, S, k, D, R]
-        idx_expanded = topk_idx.view(B, S, k, 1, 1).expand(B, S, k, D, R)
-        neurons_expanded = neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)
-        selected_neurons = neurons_expanded.gather(2, idx_expanded)  # [B, S, k, D, R]
+        # flatten indices → 직접 인덱싱
+        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
+        selected_neurons = neurons[flat_idx]  # [B*S*k, D, R]
+        selected_neurons = selected_neurons.view(B, S, k, D, R)  # [B, S, k, D, R]
 
-        # 4. 선택된 뉴런으로만 projection
-        # x: [B, S, D] → [B, S, 1, D]
-        # selected_neurons: [B, S, k, D, R]
-        # einsum: bsd, bskdr → bskr
-        x_unsq = x.unsqueeze(2)  # [B, S, 1, D]
-        proj = torch.einsum('bsod,bskdr->bskr', x_unsq, selected_neurons)  # [B, S, k, R]
+        # 4. Batch matmul: x @ selected_neurons
+        # x: [B, S, D] → [B, S, 1, 1, D]
+        # selected: [B, S, k, D, R]
+        # 결과: [B, S, k, R]
+        proj = torch.einsum('bsd,bskdr->bskr', x, selected_neurons)
 
         # 5. Weighted sum
         output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
@@ -130,9 +128,11 @@ class SparseCompressor(nn.Module):
         return output, routing_info
 
 
-class SparseExpander(nn.Module):
+class Expander(nn.Module):
     """
-    True Sparse Expander: 선택된 뉴런만 연산
+    rank → d_model 확장
+
+    Top-K 뉴런 선택 후 weighted projection
     """
     def __init__(
         self,
@@ -175,16 +175,15 @@ class SparseExpander(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 선택된 뉴런만 gather: [B, S, k, R, D]
+        # 3. 선택된 뉴런만 가져오기 (메모리 효율적)
         neurons = self.shared_neurons.expand_neurons  # [N, R, D]
 
-        idx_expanded = topk_idx.view(B, S, k, 1, 1).expand(B, S, k, R, D)
-        neurons_expanded = neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)
-        selected_neurons = neurons_expanded.gather(2, idx_expanded)  # [B, S, k, R, D]
+        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
+        selected_neurons = neurons[flat_idx]  # [B*S*k, R, D]
+        selected_neurons = selected_neurons.view(B, S, k, R, D)  # [B, S, k, R, D]
 
-        # 4. 선택된 뉴런으로만 projection
-        x_unsq = x.unsqueeze(2)  # [B, S, 1, R]
-        proj = torch.einsum('bsor,bskrd->bskd', x_unsq, selected_neurons)  # [B, S, k, D]
+        # 4. Batch matmul
+        proj = torch.einsum('bsr,bskrd->bskd', x, selected_neurons)  # [B, S, k, D]
 
         # 5. Weighted sum
         output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
@@ -219,10 +218,10 @@ class NeuronCircuit(nn.Module):
         self.d_head = rank // n_heads
         self.rank = rank
 
-        self.compressor_Q = SparseCompressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
-        self.compressor_K = SparseCompressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
-        self.compressor_V = SparseCompressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
-        self.expander_O = SparseExpander(shared_neurons, d_model, rank, n_expand, expand_top_k, router_noise)
+        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
+        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
+        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
+        self.expander_O = Expander(shared_neurons, d_model, rank, n_expand, expand_top_k, router_noise)
 
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
@@ -274,7 +273,7 @@ class NeuronMemory(nn.Module):
         self.rank = rank
         self.knowledge_k = knowledge_k
 
-        self.query_compressor = SparseCompressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
+        self.query_compressor = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k, router_noise)
 
     def forward(self, x, add_noise: bool = False):
         B, S, D = x.shape
@@ -346,12 +345,7 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v10.1: True Sparse MoE-Style Architecture
-
-    핵심 개선:
-    - 선택 후 연산 (vs 연산 후 선택)
-    - 메모리 효율: O(k) vs O(N)
-    - 속도: 바닐라 수준으로 개선
+    DAWN v10.1: Top-K Compress/Expand Architecture
     """
     __version__ = "10.1"
 
@@ -555,7 +549,7 @@ class DAWN(nn.Module):
         routers = router_per_layer * self.n_layers
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        print(f"=== DAWN v10.1 (True Sparse) Parameter Breakdown ===")
+        print(f"=== DAWN v10.1 Parameter Breakdown ===")
         print(f"CompressNeurons: {compress:,} ({compress/1e6:.2f}M)")
         print(f"ExpandNeurons:   {expand:,} ({expand/1e6:.2f}M)")
         print(f"KnowledgeNeurons: {knowledge:,} ({knowledge/1e3:.1f}K)")
