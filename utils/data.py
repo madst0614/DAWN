@@ -642,6 +642,10 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
     Supports both formats:
     - .pkl: List of text strings (will be tokenized)
     - .pt: Pre-tokenized tensor with 'tokens' key
+
+    Optional config options:
+    - max_train_tokens: Limit training data (e.g., 360000000 for 360M)
+    - max_val_tokens: Limit validation data (default: 10M)
     """
     from transformers import AutoTokenizer
     from functools import partial
@@ -650,6 +654,10 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
     if tokenizer_path is None:
         tokenizer_path = "bert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    # Get optional token limits from config
+    max_train_tokens = data_config.get('max_train_tokens', None)
+    max_val_tokens = data_config.get('max_val_tokens', 10_000_000)  # Default 10M
 
     # Load data from config paths
     base_dir = data_config['base_dir']
@@ -716,6 +724,12 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
     if train_is_pretokenized:
         # Concatenate all token tensors
         train_tokens = torch.cat(train_data, dim=0) if len(train_data) > 1 else train_data[0]
+        # Limit training data if specified
+        if max_train_tokens is not None:
+            max_train_seqs = max_train_tokens // max_length
+            if len(train_tokens) > max_train_seqs:
+                train_tokens = train_tokens[:max_train_seqs]
+                print(f"  Limited training to {max_train_seqs:,} sequences ({max_train_tokens/1e6:.0f}M tokens)")
         train_dataset = TokenDataset(train_tokens, max_length)
         print(f"Total: {len(train_tokens):,} train sequences (pre-tokenized)")
     else:
@@ -724,8 +738,7 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
 
     if val_is_pretokenized:
         val_tokens = torch.cat(val_data, dim=0) if len(val_data) > 1 else val_data[0]
-        # Limit validation to 10M tokens (prevents memory issues with large datasets)
-        max_val_tokens = 10_000_000
+        # Limit validation data
         max_val_seqs = max_val_tokens // max_length
         if len(val_tokens) > max_val_seqs:
             val_tokens = val_tokens[:max_val_seqs]

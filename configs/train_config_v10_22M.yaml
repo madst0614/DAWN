@@ -8,6 +8,8 @@ data:
     - train/c4/c4_raw_000.pt
   val_files:
     - val/c4/c4_val_50M.pt
+  max_train_tokens: 360000000  # 360M tokens
+  max_val_tokens: 10000000     # 10M tokens
 
 # Model Architecture (v10.0 - 22M target)
 model:
@@ -31,7 +33,7 @@ model:
 
 # Training
 training:
-  batch_size: 128
+  batch_size: 256
   num_epochs: 30
   lr: 0.0003
   weight_decay: 0.1
