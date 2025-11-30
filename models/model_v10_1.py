@@ -105,38 +105,23 @@ class Compressor(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 뉴런 단위 배치 처리
+        # 3. 활성화된 뉴런만 추출
         neurons = self.shared_neurons.compress_neurons  # [N, D, R]
-        x_flat = x.view(B * S, D)  # [B*S, D]
+        active = topk_idx.unique()  # 실제 사용된 뉴런들
 
-        # 출력 버퍼 (AMP 호환: neurons dtype 사용)
-        output = torch.zeros(B * S, k, R, device=x.device, dtype=neurons.dtype)
+        # 4. 단일 matmul: 활성화된 뉴런들만
+        active_weights = neurons[active]  # [num_active, D, R]
+        active_flat = active_weights.permute(1, 0, 2).reshape(D, -1)  # [D, num_active * R]
+        proj = (x @ active_flat).view(B, S, len(active), R)  # [B, S, num_active, R]
 
-        # 각 top-k 슬롯별로 처리
-        for slot in range(k):
-            slot_idx = topk_idx[:, :, slot].reshape(-1)  # [B*S]
+        # 5. 인덱스 매핑: global → local
+        idx_map = torch.full((N,), -1, device=x.device, dtype=torch.long)
+        idx_map[active] = torch.arange(len(active), device=x.device)
+        local_idx = idx_map[topk_idx]  # [B, S, k]
 
-            # 이 슬롯에서 활성화된 뉴런들
-            active_neurons = slot_idx.unique()
-
-            for neuron_idx in active_neurons:
-                # 이 뉴런을 선택한 토큰 마스크
-                mask = (slot_idx == neuron_idx)  # [B*S]
-
-                if mask.sum() == 0:
-                    continue
-
-                # 해당 토큰들만 추출해서 배치 matmul
-                tokens = x_flat[mask]  # [num_tokens, D]
-                neuron_weight = neurons[neuron_idx]  # [D, R]
-                proj = tokens @ neuron_weight  # [num_tokens, R]
-
-                # 결과를 출력 버퍼에 scatter
-                output[mask, slot, :] = proj
-
-        # 4. Weighted sum
-        output = output.view(B, S, k, R)
-        output = (output * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
+        # 6. gather + weighted sum
+        selected = proj.gather(2, local_idx.unsqueeze(-1).expand(-1, -1, -1, R))  # [B, S, k, R]
+        output = (selected * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
 
         routing_info = {
             'weights': weights,
@@ -193,32 +178,23 @@ class Expander(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 뉴런 단위 배치 처리
+        # 3. 활성화된 뉴런만 추출
         neurons = self.shared_neurons.expand_neurons  # [N, R, D]
-        x_flat = x.view(B * S, R)  # [B*S, R]
+        active = topk_idx.unique()  # 실제 사용된 뉴런들
 
-        # 출력 버퍼 (AMP 호환: neurons dtype 사용)
-        output = torch.zeros(B * S, k, D, device=x.device, dtype=neurons.dtype)
+        # 4. 단일 matmul: 활성화된 뉴런들만
+        active_weights = neurons[active]  # [num_active, R, D]
+        active_flat = active_weights.permute(1, 0, 2).reshape(R, -1)  # [R, num_active * D]
+        proj = (x @ active_flat).view(B, S, len(active), D)  # [B, S, num_active, D]
 
-        for slot in range(k):
-            slot_idx = topk_idx[:, :, slot].reshape(-1)  # [B*S]
-            active_neurons = slot_idx.unique()
+        # 5. 인덱스 매핑: global → local
+        idx_map = torch.full((N,), -1, device=x.device, dtype=torch.long)
+        idx_map[active] = torch.arange(len(active), device=x.device)
+        local_idx = idx_map[topk_idx]  # [B, S, k]
 
-            for neuron_idx in active_neurons:
-                mask = (slot_idx == neuron_idx)
-
-                if mask.sum() == 0:
-                    continue
-
-                tokens = x_flat[mask]  # [num_tokens, R]
-                neuron_weight = neurons[neuron_idx]  # [R, D]
-                proj = tokens @ neuron_weight  # [num_tokens, D]
-
-                output[mask, slot, :] = proj
-
-        # 4. Weighted sum
-        output = output.view(B, S, k, D)
-        output = (output * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
+        # 6. gather + weighted sum
+        selected = proj.gather(2, local_idx.unsqueeze(-1).expand(-1, -1, -1, D))  # [B, S, k, D]
+        output = (selected * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         routing_info = {
             'weights': weights,
