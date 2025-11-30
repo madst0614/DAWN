@@ -1665,7 +1665,7 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to checkpoint file')
     parser.add_argument('--val_data', type=str,
-                        default='/content/drive/MyDrive/data/validation/wikitext_5to1_texts.pkl',
+                        default='/content/drive/MyDrive/data/val/wikitext_5to1_texts.pkl',
                         help='Path to validation data')
     parser.add_argument('--max_batches', type=int, default=50,
                         help='Max batches for analysis')
