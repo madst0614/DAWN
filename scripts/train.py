@@ -1087,6 +1087,7 @@ def main():
     # v8.0 KnowledgeNeurons parameters
     args.n_knowledge = cfg['model'].get('n_knowledge', 64)
     args.knowledge_k = cfg['model'].get('knowledge_k', 8)
+    args.knowledge_rank = cfg['model'].get('knowledge_rank', None)  # None = use rank
 
     # v8.0 Ablation: skip Householder (from config or CLI)
     args.skip_householder = cfg['model'].get('skip_householder', False)
@@ -1444,6 +1445,7 @@ def main():
             'n_expand': args.n_expand,
             'n_knowledge': args.n_knowledge,
             'knowledge_k': args.knowledge_k,
+            'knowledge_rank': args.knowledge_rank,  # None = use rank
             'rank': args.basis_rank,
         })
     elif model_version == '9.1':
