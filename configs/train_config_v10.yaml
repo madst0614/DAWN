@@ -19,7 +19,7 @@ model:
   rank: 64
 
   # CompressNeurons / ExpandNeurons (통합 풀)
-  n_compress: 48          # Q/K/V/M 공유 (줄임)
+  n_compress: 48          # Q/K/V/M 공유
   n_expand: 12            # O 공유 (4:1 비율)
 
   # KnowledgeNeurons
@@ -48,15 +48,18 @@ use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10
 log_dir: /content/drive/MyDrive/dawn/logs_v10
 
+# =============================================================================
 # 파라미터 계산:
-#   compress: 48 × 320 × 80 = 1,228,800 (1.23M)
-#   expand: 12 × 80 × 320 = 307,200 (0.31M)
-#   knowledge: 80×80 + 80×320 = 32,000 (32K)
-#   SharedNeurons 총: ~1.57M
+# =============================================================================
+#   compress: 48 × 320 × 64 = 983,040 (0.98M)
+#   expand: 12 × 64 × 320 = 245,760 (0.25M)
+#   knowledge: 80×64 + 80×320 = 30,720 (31K)
+#   SharedNeurons 총: ~1.26M
 #
 #   embeddings: 30522 × 320 = 9.77M
 #   pos_emb: 128 × 320 = 41K
 #   routers: ~300K
 #   layernorms: ~10K
 #
-#   Total: ~11.6M
+#   Total: ~11.4M
+# =============================================================================

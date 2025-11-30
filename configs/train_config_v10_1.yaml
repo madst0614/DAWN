@@ -1,7 +1,6 @@
 # DAWN v10.1 Training Config
 # Top-K Sparse Compress/Expand Architecture
-# Memory efficient: ~15GB vs ~50GB (v10.0)
-# Speed improvement: ~3x faster
+# v10.0과 동일한 파라미터로 비교용 설정
 
 # Data
 data:
@@ -11,7 +10,7 @@ data:
   val_files:
     - validation/wikitext_5to1_texts.pkl
 
-# Model Architecture (v10.1 - Top-K Sparse)
+# Model Architecture (v10.1 - v10.0과 동일 파라미터)
 model:
   model_version: "10.1"
   d_model: 320
@@ -19,14 +18,14 @@ model:
   n_heads: 4
   rank: 64
 
-  # CompressNeurons / ExpandNeurons (통합 풀)
-  n_compress: 224        # Q/K/V/M 공유 (더 많은 뉴런, top-k로 선택)
-  n_expand: 56           # O 공유 (4:1 비율)
+  # CompressNeurons / ExpandNeurons (v10.0과 동일)
+  n_compress: 48          # Q/K/V/M 공유
+  n_expand: 12            # O 공유 (4:1 비율)
 
-  # Top-K Selection (핵심!)
-  compress_top_k: 8      # 224개 중 8개만 선택
-  expand_top_k: 4        # 56개 중 4개만 선택
-  router_noise: 0.1      # 학습 시 탐색용 noise
+  # Top-K Selection (v10.1 핵심)
+  compress_top_k: 8       # 48개 중 8개만 선택 (16.7%)
+  expand_top_k: 4         # 12개 중 4개만 선택 (33.3%)
+  router_noise: 0.1       # 학습 시 탐색용 noise
 
   # KnowledgeNeurons
   n_knowledge: 80
@@ -36,7 +35,7 @@ model:
   max_seq_len: 128
   dropout: 0.1
 
-# Training
+# Training (v10.0과 동일)
 training:
   batch_size: 128
   num_epochs: 30
@@ -47,7 +46,7 @@ training:
   # Regularization
   orthogonality_weight: 0.01    # compress/expand 직교성
   diversity_weight: 0.1         # knowledge diversity
-  load_balance_weight: 0.1      # routing 균등 분포 (top-k에서 중요!)
+  load_balance_weight: 0.01     # routing 균등 분포
   process_norm_weight: 0.0      # v10 미지원 (process neurons 없음)
 
 use_amp: true
@@ -55,40 +54,42 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10_1
 log_dir: /content/drive/MyDrive/dawn/logs_v10_1
 
 # =============================================================================
-# v10.1 vs v10.0 비교
+# v10.0 vs v10.1 비교 (동일 파라미터)
 # =============================================================================
 #
-# | 항목              | v10.0 (soft)    | v10.1 (top-k)    |
-# |-------------------|-----------------|------------------|
-# | Compressor 연산   | 224개 전부       | 8개만            |
-# | Expander 연산     | 56개 전부        | 4개만            |
-# | 메모리            | ~50GB           | ~15GB            |
-# | 속도              | 1.37 it/s       | 3~4 it/s 예상    |
+# | 항목              | v10.0 (soft)      | v10.1 (top-k)        |
+# |-------------------|-------------------|----------------------|
+# | n_compress        | 48                | 48                   |
+# | n_expand          | 12                | 12                   |
+# | Compressor 연산   | 48개 전부          | 8개만 (top-k)        |
+# | Expander 연산     | 12개 전부          | 4개만 (top-k)        |
+# | 메모리            | 더 많음            | 절약 (~3x)           |
+# | 속도              | 기준               | 더 빠름 (~2-3x)      |
 #
 # =============================================================================
-# 파라미터 계산:
+# 파라미터 계산 (v10.0과 동일):
 # =============================================================================
-#   compress: 224 × 320 × 64 = 4,587,520 (4.59M)
-#   expand: 56 × 64 × 320 = 1,146,880 (1.15M)
+#   compress: 48 × 320 × 64 = 983,040 (0.98M)
+#   expand: 12 × 64 × 320 = 245,760 (0.25M)
 #   knowledge: 80×64 + 80×320 = 30,720 (31K)
-#   SharedNeurons 총: ~5.77M
+#   SharedNeurons 총: ~1.26M
 #
 #   embeddings: 30522 × 320 = 9.77M
 #   pos_emb: 128 × 320 = 41K
-#   routers: ~1.1M (더 많은 뉴런 → 더 큰 라우터)
+#   routers: ~300K
 #   layernorms: ~10K
 #
-#   Total: ~16.7M
+#   Total: ~11.4M (v10.0과 동일)
 #
 # =============================================================================
-# 학습 팁:
+# 비교 실험 방법:
 # =============================================================================
-# 학습 초반:
-#   - top-k가 특정 뉴런에 몰릴 수 있음
-#   - load_balance_weight 높게 (0.1)
-#   - router_noise로 탐색 유도
+# 1. v10.0으로 학습: python train.py --config train_config_v10.yaml
+# 2. v10.1로 학습: python train.py --config train_config_v10_1.yaml
+# 3. 동일 epoch에서 val_loss, 속도, 메모리 비교
 #
-# 학습 후반:
-#   - router_noise 줄이기 고려
-#   - 전문화 허용
+# 기대 결과:
+# - v10.1이 같은 파라미터로 더 빠르게 학습
+# - top-k sparse selection으로 메모리 효율 증가
+# - 성능은 비슷하거나 약간 낮을 수 있음 (sparse routing의 trade-off)
 # =============================================================================
