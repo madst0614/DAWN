@@ -724,6 +724,12 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
 
     if val_is_pretokenized:
         val_tokens = torch.cat(val_data, dim=0) if len(val_data) > 1 else val_data[0]
+        # Limit validation to 10M tokens (prevents memory issues with large datasets)
+        max_val_tokens = 10_000_000
+        max_val_seqs = max_val_tokens // max_length
+        if len(val_tokens) > max_val_seqs:
+            val_tokens = val_tokens[:max_val_seqs]
+            print(f"  Limited validation to {max_val_seqs:,} sequences ({max_val_tokens/1e6:.0f}M tokens)")
         val_dataset = TokenDataset(val_tokens, max_length)
         print(f"Total: {len(val_tokens):,} val sequences (pre-tokenized)")
     else:
