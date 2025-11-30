@@ -858,44 +858,167 @@ def test_correctness():
 
 
 def benchmark():
-    """속도 벤치마크"""
+    """상세 속도 벤치마크 - 병목 식별"""
+    import time
+
+    print("\n" + "="*60)
+    print("TRITON KERNEL BENCHMARK")
+    print("="*60)
+
     if not TRITON_AVAILABLE:
         print("Triton not available")
         return
 
-    import time
+    # 실제 DAWN v10.1 크기
+    configs = [
+        # (B, S, D, R, N, k, name)
+        (8, 128, 320, 64, 224, 8, "Training batch"),
+        (1, 128, 320, 64, 224, 8, "Single sample"),
+        (32, 128, 320, 64, 224, 8, "Large batch"),
+    ]
 
-    B, S, D, R, N, k = 256, 128, 320, 64, 224, 8
+    for B, S, D, R, N, k, name in configs:
+        print(f"\n--- {name}: B={B}, S={S}, D={D}, R={R}, N={N}, k={k} ---")
 
-    x = torch.randn(B, S, D, device='cuda', dtype=torch.float32)
-    neurons = torch.randn(N, D, R, device='cuda', dtype=torch.float32)
-    topk_idx = torch.randint(0, N, (B, S, k), device='cuda')
-    weights = torch.softmax(torch.randn(B, S, k, device='cuda'), dim=-1)
+        x_compress = torch.randn(B, S, D, device='cuda', dtype=torch.float32, requires_grad=True)
+        x_expand = torch.randn(B, S, R, device='cuda', dtype=torch.float32, requires_grad=True)
+        neurons = torch.randn(N, D, R, device='cuda', dtype=torch.float32, requires_grad=True)
+        topk_idx = torch.randint(0, N, (B, S, k), device='cuda')
+        weights = torch.softmax(torch.randn(B, S, k, device='cuda'), dim=-1).requires_grad_(True)
 
-    # Warmup
-    for _ in range(10):
-        _ = triton_compress(x, neurons, topk_idx, weights)
-        _ = pytorch_compress_fallback(x, neurons, topk_idx, weights)
-    torch.cuda.synchronize()
+        n_iters = 20
+        torch.cuda.synchronize()
 
-    # Benchmark Triton
-    start = time.time()
-    for _ in range(100):
-        _ = triton_compress(x, neurons, topk_idx, weights)
-    torch.cuda.synchronize()
-    triton_time = (time.time() - start) / 100
+        # ============ COMPRESS FORWARD ============
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(n_iters):
+            out = triton_compress(x_compress, neurons, topk_idx, weights)
+        torch.cuda.synchronize()
+        compress_fwd_triton = (time.time() - start) / n_iters * 1000
 
-    # Benchmark PyTorch
-    start = time.time()
-    for _ in range(100):
-        _ = pytorch_compress_fallback(x, neurons, topk_idx, weights)
-    torch.cuda.synchronize()
-    pytorch_time = (time.time() - start) / 100
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(n_iters):
+            out = pytorch_compress_fallback(x_compress.detach(), neurons.detach(), topk_idx, weights.detach())
+        torch.cuda.synchronize()
+        compress_fwd_pytorch = (time.time() - start) / n_iters * 1000
 
-    print(f"\n=== Benchmark (B={B}, S={S}, D={D}, R={R}, N={N}, k={k}) ===")
-    print(f"Triton:  {triton_time*1000:.2f} ms")
-    print(f"PyTorch: {pytorch_time*1000:.2f} ms")
-    print(f"Speedup: {pytorch_time/triton_time:.2f}x")
+        # ============ COMPRESS BACKWARD ============
+        x_c = x_compress.detach().clone().requires_grad_(True)
+        n_c = neurons.detach().clone().requires_grad_(True)
+        w_c = weights.detach().clone().requires_grad_(True)
+        out_c = triton_compress(x_c, n_c, topk_idx, w_c)
+        grad_out = torch.randn_like(out_c)
+
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(n_iters):
+            if x_c.grad is not None:
+                x_c.grad.zero_()
+                n_c.grad.zero_()
+                w_c.grad.zero_()
+            out_c = triton_compress(x_c, n_c, topk_idx, w_c)
+            out_c.backward(grad_out, retain_graph=True)
+        torch.cuda.synchronize()
+        compress_bwd_triton = (time.time() - start) / n_iters * 1000
+
+        x_p = x_compress.detach().clone().requires_grad_(True)
+        n_p = neurons.detach().clone().requires_grad_(True)
+        w_p = weights.detach().clone().requires_grad_(True)
+
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(n_iters):
+            if x_p.grad is not None:
+                x_p.grad.zero_()
+                n_p.grad.zero_()
+                w_p.grad.zero_()
+            out_p = pytorch_compress_fallback(x_p, n_p, topk_idx, w_p)
+            out_p.backward(grad_out, retain_graph=True)
+        torch.cuda.synchronize()
+        compress_bwd_pytorch = (time.time() - start) / n_iters * 1000
+
+        # ============ EXPAND FORWARD ============
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(n_iters):
+            out = triton_expand(x_expand, neurons, topk_idx, weights)
+        torch.cuda.synchronize()
+        expand_fwd_triton = (time.time() - start) / n_iters * 1000
+
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(n_iters):
+            out = pytorch_expand_fallback(x_expand.detach(), neurons.detach(), topk_idx, weights.detach())
+        torch.cuda.synchronize()
+        expand_fwd_pytorch = (time.time() - start) / n_iters * 1000
+
+        # ============ EXPAND BACKWARD ============
+        x_e = x_expand.detach().clone().requires_grad_(True)
+        n_e = neurons.detach().clone().requires_grad_(True)
+        w_e = weights.detach().clone().requires_grad_(True)
+        out_e = triton_expand(x_e, n_e, topk_idx, w_e)
+        grad_out_e = torch.randn_like(out_e)
+
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(n_iters):
+            if x_e.grad is not None:
+                x_e.grad.zero_()
+                n_e.grad.zero_()
+                w_e.grad.zero_()
+            out_e = triton_expand(x_e, n_e, topk_idx, w_e)
+            out_e.backward(grad_out_e, retain_graph=True)
+        torch.cuda.synchronize()
+        expand_bwd_triton = (time.time() - start) / n_iters * 1000
+
+        x_ep = x_expand.detach().clone().requires_grad_(True)
+        n_ep = neurons.detach().clone().requires_grad_(True)
+        w_ep = weights.detach().clone().requires_grad_(True)
+
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(n_iters):
+            if x_ep.grad is not None:
+                x_ep.grad.zero_()
+                n_ep.grad.zero_()
+                w_ep.grad.zero_()
+            out_ep = pytorch_expand_fallback(x_ep, n_ep, topk_idx, w_ep)
+            out_ep.backward(grad_out_e, retain_graph=True)
+        torch.cuda.synchronize()
+        expand_bwd_pytorch = (time.time() - start) / n_iters * 1000
+
+        # ============ RESULTS ============
+        print(f"\n{'Operation':<25} {'Triton (ms)':<15} {'PyTorch (ms)':<15} {'Speedup':<10}")
+        print("-" * 65)
+        print(f"{'Compress Forward':<25} {compress_fwd_triton:<15.2f} {compress_fwd_pytorch:<15.2f} {compress_fwd_pytorch/compress_fwd_triton:<10.2f}x")
+        print(f"{'Compress Backward':<25} {compress_bwd_triton:<15.2f} {compress_bwd_pytorch:<15.2f} {compress_bwd_pytorch/compress_bwd_triton:<10.2f}x")
+        print(f"{'Expand Forward':<25} {expand_fwd_triton:<15.2f} {expand_fwd_pytorch:<15.2f} {expand_fwd_pytorch/expand_fwd_triton:<10.2f}x")
+        print(f"{'Expand Backward':<25} {expand_bwd_triton:<15.2f} {expand_bwd_pytorch:<15.2f} {expand_bwd_pytorch/expand_bwd_triton:<10.2f}x")
+
+        total_triton = compress_fwd_triton + compress_bwd_triton + expand_fwd_triton + expand_bwd_triton
+        total_pytorch = compress_fwd_pytorch + compress_bwd_pytorch + expand_fwd_pytorch + expand_bwd_pytorch
+        print(f"\n{'TOTAL (one layer)':<25} {total_triton:<15.2f} {total_pytorch:<15.2f} {total_pytorch/total_triton:<10.2f}x")
+        print(f"{'8 layers estimate':<25} {total_triton*8:<15.2f} {total_pytorch*8:<15.2f}")
+
+        # 병목 식별
+        print(f"\n🔍 Bottleneck Analysis:")
+        ops = [
+            ("Compress Fwd", compress_fwd_triton),
+            ("Compress Bwd", compress_bwd_triton),
+            ("Expand Fwd", expand_fwd_triton),
+            ("Expand Bwd", expand_bwd_triton),
+        ]
+        ops.sort(key=lambda x: x[1], reverse=True)
+        for name, time_ms in ops:
+            pct = time_ms / total_triton * 100
+            bar = "█" * int(pct / 5)
+            print(f"  {name:<15} {time_ms:>8.2f} ms ({pct:>5.1f}%) {bar}")
+
+    print("\n" + "="*60)
+    print("If Triton is slower than PyTorch, disable with USE_TRITON=False")
+    print("="*60)
 
 
 if __name__ == "__main__":
