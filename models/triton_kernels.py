@@ -791,12 +791,13 @@ def pytorch_compress_fallback(x, neurons, topk_idx, weights):
 
 
 def pytorch_expand_fallback(x, neurons, topk_idx, weights):
-    """PyTorch fallback"""
+    """PyTorch fallback for expand: [B,S,R] -> [B,S,D]"""
     B, S, R = x.shape
-    N, _, D = neurons.shape
+    N, D, R_check = neurons.shape  # neurons is [N, D, R]
     k = topk_idx.shape[-1]
 
-    neurons_flat = neurons.permute(1, 0, 2).reshape(R, N * D)
+    # x @ neurons^T: [B,S,R] @ [R, N*D] -> [B,S,N*D]
+    neurons_flat = neurons.permute(2, 0, 1).reshape(R, N * D)  # [R, N*D]
     all_proj = (x @ neurons_flat).view(B, S, N, D)
 
     topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, -1, D)
