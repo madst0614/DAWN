@@ -113,38 +113,32 @@ class Compressor(nn.Module):
             routing_info: dict with weights and indices
         """
         B, S, D = x.shape
+        neurons = self.shared_neurons.compress_neurons  # [N, D, R]
 
         # 1. Router scores
         scores = self.router(x)  # [B, S, n_compress]
 
         # Add noise for exploration during training
         if add_noise and self.training and self.router_noise > 0:
-            noise = torch.randn_like(scores) * self.router_noise
-            scores = scores + noise
+            scores = scores + torch.randn_like(scores) * self.router_noise
 
         # 2. Top-k selection
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 각 k에 대해 순차 처리 (메모리 효율 - 5차원 텐서 대신 루프)
-        # Before: [B, S, k, d_model, rank] = 10GB → OOM
-        # After: [B, S, d_model, rank] × k번 = ~2-3GB peak
-        neurons = self.shared_neurons.compress_neurons  # [n_compress, d_model, rank]
+        # 3. 효율적 처리: repeat_interleave + einsum (루프 없이, 5D 텐서 없이)
+        # [N, D, R] → [B*S*k, D, R]
+        selected = neurons[topk_idx.view(-1)]
 
-        output = torch.zeros(B, S, self.rank, device=x.device, dtype=x.dtype)
+        # [B, S, D] → [B*S, D] → [B*S*k, D]
+        x_rep = x.view(B * S, D).repeat_interleave(self.top_k, dim=0)
 
-        for i in range(self.top_k):
-            idx_i = topk_idx[:, :, i]  # [B, S]
-            weight_i = weights[:, :, i:i+1]  # [B, S, 1]
+        # [B*S*k, D] @ [B*S*k, D, R] → [B*S*k, R]
+        proj = torch.einsum('nd,ndr->nr', x_rep, selected)
+        proj = proj.view(B, S, self.top_k, self.rank)
 
-            # 선택된 뉴런 가져오기
-            selected = neurons[idx_i.reshape(-1)]  # [B*S, d_model, rank]
-            selected = selected.view(B, S, D, self.rank)  # [B, S, d_model, rank]
-
-            # Projection: [B, S, d_model] @ [B, S, d_model, rank] → [B, S, rank]
-            proj = torch.einsum('bsd,bsdr->bsr', x, selected)  # [B, S, rank]
-
-            output = output + weight_i * proj
+        # 4. Weighted sum
+        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
 
         routing_info = {
             'weights': weights,
@@ -196,38 +190,32 @@ class Expander(nn.Module):
             routing_info: dict with weights and indices
         """
         B, S, R = x.shape
+        neurons = self.shared_neurons.expand_neurons  # [N, R, D]
 
         # 1. Router scores
         scores = self.router(x)  # [B, S, n_expand]
 
         # Add noise for exploration during training
         if add_noise and self.training and self.router_noise > 0:
-            noise = torch.randn_like(scores) * self.router_noise
-            scores = scores + noise
+            scores = scores + torch.randn_like(scores) * self.router_noise
 
         # 2. Top-k selection
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 각 k에 대해 순차 처리 (메모리 효율 - 5차원 텐서 대신 루프)
-        # Before: [B, S, k, rank, d_model] = OOM
-        # After: [B, S, rank, d_model] × k번 = peak memory 크게 감소
-        neurons = self.shared_neurons.expand_neurons  # [n_expand, rank, d_model]
+        # 3. 효율적 처리: repeat_interleave + einsum (루프 없이, 5D 텐서 없이)
+        # [N, R, D] → [B*S*k, R, D]
+        selected = neurons[topk_idx.view(-1)]
 
-        output = torch.zeros(B, S, self.d_model, device=x.device, dtype=x.dtype)
+        # [B, S, R] → [B*S, R] → [B*S*k, R]
+        x_rep = x.view(B * S, R).repeat_interleave(self.top_k, dim=0)
 
-        for i in range(self.top_k):
-            idx_i = topk_idx[:, :, i]  # [B, S]
-            weight_i = weights[:, :, i:i+1]  # [B, S, 1]
+        # [B*S*k, R] @ [B*S*k, R, D] → [B*S*k, D]
+        proj = torch.einsum('nr,nrd->nd', x_rep, selected)
+        proj = proj.view(B, S, self.top_k, self.d_model)
 
-            # 선택된 뉴런 가져오기
-            selected = neurons[idx_i.reshape(-1)]  # [B*S, rank, d_model]
-            selected = selected.view(B, S, R, self.d_model)  # [B, S, rank, d_model]
-
-            # Projection: [B, S, rank] @ [B, S, rank, d_model] → [B, S, d_model]
-            proj = torch.einsum('bsr,bsrd->bsd', x, selected)  # [B, S, d_model]
-
-            output = output + weight_i * proj
+        # 4. Weighted sum
+        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         routing_info = {
             'weights': weights,
