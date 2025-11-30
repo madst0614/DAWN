@@ -665,9 +665,11 @@ class NeuronAnalyzer:
         self.model.eval()
         results = {}
 
-        # Knowledge neuron usage
-        knowledge_usage = torch.zeros(self.n_knowledge, device=self.device)
-        knowledge_token_counts = {n: Counter() for n in range(self.n_knowledge)}
+        # Knowledge neuron usage - GPU vectorized
+        knowledge_usage = torch.zeros(self.n_knowledge, device=self.device, dtype=torch.float32)
+        vocab_size = self.tokenizer.vocab_size
+        # Matrix for neuron-token co-occurrence (on GPU)
+        knowledge_token_matrix = torch.zeros(self.n_knowledge, vocab_size, device=self.device, dtype=torch.float32)
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Knowledge Analysis", total=max_batches)):
             if batch_idx >= max_batches:
@@ -682,15 +684,31 @@ class NeuronAnalyzer:
                 mem = routing_info['memory']
                 k_idx = mem['knowledge_indices']  # [B, S, knowledge_k]
                 k_weights = mem['knowledge_weights']  # [B, S, knowledge_k]
+                knowledge_k = k_idx.shape[-1]
 
-                # Count usage
-                for b in range(B):
-                    for s in range(S):
-                        token_id = input_ids[b, s].item()
-                        for k_i in range(self.knowledge_k):
-                            neuron_id = k_idx[b, s, k_i].item()
-                            knowledge_usage[neuron_id] += k_weights[b, s, k_i]
-                            knowledge_token_counts[neuron_id][token_id] += 1
+                # GPU vectorized: scatter_add for usage
+                flat_idx = k_idx.view(-1)  # [B*S*k]
+                flat_weights = k_weights.view(-1).float()  # [B*S*k]
+                knowledge_usage.scatter_add_(0, flat_idx, flat_weights)
+
+                # GPU vectorized: token co-occurrence matrix
+                # Expand token ids to match k_idx shape
+                tokens_expanded = input_ids.unsqueeze(-1).expand(-1, -1, knowledge_k)  # [B, S, k]
+                flat_tokens = tokens_expanded.reshape(-1)  # [B*S*k]
+                flat_neurons = flat_idx  # [B*S*k]
+
+                # Create 1D index for 2D matrix and scatter_add
+                idx_2d = flat_neurons * vocab_size + flat_tokens
+                ones = torch.ones_like(idx_2d, dtype=torch.float32)
+                knowledge_token_matrix.view(-1).scatter_add_(0, idx_2d, ones)
+
+        # Convert matrix to Counter-like dict for compatibility with rest of code
+        knowledge_token_counts = {}
+        knowledge_token_matrix_cpu = knowledge_token_matrix.cpu().numpy()
+        for n in range(self.n_knowledge):
+            row = knowledge_token_matrix_cpu[n]
+            nonzero_idx = np.nonzero(row)[0]
+            knowledge_token_counts[n] = Counter({int(tid): int(row[tid]) for tid in nonzero_idx})
 
         # 4.1 Knowledge 뉴런 특화
         print("\n--- 4.1 Knowledge Neuron Specialization ---")
