@@ -14,7 +14,7 @@ data:
 model:
   model_version: "10.0"  # v10 모델 사용, 설정만 다름 (rank=32 실험)
   d_model: 256
-  n_layers: 4
+  n_layers: 6
   n_heads: 4
   rank: 32                # 64 → 32 (2배 압축)
 
