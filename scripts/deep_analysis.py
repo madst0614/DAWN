@@ -1212,7 +1212,6 @@ class DAWNDeepAnalysis:
 
         # Create output directories
         self.dirs = {
-            'sentence': os.path.join(output_dir, 'sentence_visualizations'),
             'ablation': os.path.join(output_dir, 'ablation'),
             'semantic': os.path.join(output_dir, 'semantic'),
             'catalog': os.path.join(output_dir, 'catalog'),
@@ -1306,48 +1305,9 @@ class DAWNDeepAnalysis:
         """Run all analyses"""
         all_results = {}
 
-        # 1. Sentence Visualization
+        # 1. Ablation Experiments
         print("\n" + "="*60)
-        print("1. SENTENCE VISUALIZATION")
-        print("="*60)
-
-        visualizer = SentenceVisualizer(self.model, self.tokenizer, self.device)
-
-        test_sentences = [
-            "The cat sat on the mat.",
-            "She quickly ran to the store and bought milk.",
-            "In 1990, the president signed the bill.",
-            "The quick brown fox jumps over the lazy dog.",
-            "Scientists discovered a new species in the Amazon.",
-            "He said that she would come tomorrow.",
-            "The book on the table is mine.",
-            "They have been working here since 2010.",
-            "If it rains, we will stay home.",
-            "The company announced record profits yesterday.",
-        ]
-
-        for i, sentence in enumerate(test_sentences):
-            print(f"\n  Analyzing: '{sentence[:40]}...'")
-            analysis = visualizer.analyze_sentence(sentence)
-
-            # Token-wise visualization (auto-detect layer count)
-            n_layers = len(analysis['layer_data'])
-            show_layers = [0, n_layers//2, n_layers-1] if n_layers > 2 else list(range(n_layers))
-            visualizer.visualize_sentence(
-                analysis,
-                os.path.join(self.dirs['sentence'], f'sentence_{i+1:02d}_tokenwise.png'),
-                show_layers=show_layers
-            )
-
-            # Layer progression
-            visualizer.visualize_layer_progression(
-                analysis,
-                os.path.join(self.dirs['sentence'], f'sentence_{i+1:02d}_layerwise.png')
-            )
-
-        # 2. Ablation Experiments
-        print("\n" + "="*60)
-        print("2. ABLATION EXPERIMENTS")
+        print("1. ABLATION EXPERIMENTS")
         print("="*60)
 
         # Clear CUDA cache before ablation
@@ -1383,9 +1343,9 @@ class DAWNDeepAnalysis:
 
         torch.cuda.empty_cache()
 
-        # 3. Semantic Analysis
+        # 2. Semantic Analysis
         print("\n" + "="*60)
-        print("3. SEMANTIC ANALYSIS")
+        print("2. SEMANTIC ANALYSIS")
         print("="*60)
 
         semantic = SemanticAnalyzer(self.model, self.tokenizer, self.device)
@@ -1402,9 +1362,9 @@ class DAWNDeepAnalysis:
             os.path.join(self.dirs['semantic'], 'category_heatmap.png')
         )
 
-        # 4. Neuron Catalog
+        # 3. Neuron Catalog
         print("\n" + "="*60)
-        print("4. NEURON CATALOG")
+        print("3. NEURON CATALOG")
         print("="*60)
 
         catalog_builder = NeuronCatalog(self.model, self.tokenizer, self.device)
@@ -1422,9 +1382,9 @@ class DAWNDeepAnalysis:
             os.path.join(self.dirs['catalog'], 'neuron_roles_summary.png')
         )
 
-        # 5. Advanced Visualizations
+        # 4. Advanced Visualizations
         print("\n" + "="*60)
-        print("5. ADVANCED VISUALIZATIONS")
+        print("4. ADVANCED VISUALIZATIONS")
         print("="*60)
 
         adv_viz = AdvancedVisualizer(self.model, self.tokenizer, self.device)
@@ -1439,7 +1399,7 @@ class DAWNDeepAnalysis:
         # Attention + Neuron combined
         adv_viz.visualize_attention_neuron(
             "The president signed the new economic bill yesterday.",
-            os.path.join(self.dirs['sentence'], 'attention_neuron_combined.png')
+            os.path.join(self.dirs['catalog'], 'attention_neuron_combined.png')
         )
 
         # Generate report
