@@ -1,6 +1,6 @@
 # DAWN v10.2 Training Config
-# 실험: rank=32, 뉴런 2배 (v10 대비 동일 파라미터)
-# 가설: rank=32가 sweet spot일 수 있음 (v10 rank=64, v11 rank=16의 중간)
+# 실험: d=320, rank=32 vs rank=64 비교
+# 가설: rank=32가 sweet spot일 수 있음
 
 # Data
 data:
@@ -12,25 +12,24 @@ data:
 
 # Model Architecture
 model:
-  model_version: "10.0"  # v10 모델 사용, 설정만 다름 (rank=32 실험)
-  d_model: 256
+  model_version: "10.0"
+  d_model: 320            # 320 유지
   n_layers: 4
   n_heads: 4
-  rank: 32                # 64 → 32 (2배 압축)
+  rank: 32                # 64 → 32
 
   # 뉴런 수 2배 증가 (파라미터 동일 유지)
-  n_compress: 160         # 64 → 160
-  n_expand: 40            # 16 → 40
+  n_compress: 96          # 48 → 96 (2배)
+  n_expand: 24            # 12 → 24 (2배)
 
   # Top-K Selection
-  compress_top_k: 12      # 128개 중 12개 선택 (9.4%)
-  expand_top_k: 8         # 32개 중 8개 선택 (25%)
-  router_noise: 0.1       # 학습 시 탐색용 noise
+  compress_top_k: 12
+  expand_top_k: 8
+  router_noise: 0.1
 
-  n_knowledge: 64
-  knowledge_k: 8
-  knowledge_rank: 64      # knowledge 전용 rank
-
+  n_knowledge: 80         # 기존과 동일
+  knowledge_k: 10
+  knowledge_rank: 64
   max_seq_len: 128
   dropout: 0.1
 
@@ -41,8 +40,6 @@ training:
   lr: 0.0003
   weight_decay: 0.1
   warmup_epochs: 2
-
-  # Regularization
   orthogonality_weight: 0.01
   diversity_weight: 0.1
   load_balance_weight: 0.01
@@ -53,24 +50,18 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10_2
 log_dir: /content/drive/MyDrive/dawn/logs_v10_2
 
 # =============================================================================
-# Rank Ablation 비교 (동일 파라미터 ~1.05M compress)
+# Rank Ablation 비교 (d=320, 4L, 동일 파라미터)
 # =============================================================================
 #
-# | 항목              | v10.0 (baseline)  | v10.2 (this)       | v11.0              |
-# |-------------------|-------------------|--------------------|--------------------|
-# | rank              | 64                | 32                 | 16                 |
-# | n_compress        | 64                | 128                | 256                |
-# | n_expand          | 16                | 32                 | 64                 |
-# | compress params   | 64×256×64=1.05M   | 128×256×32=1.05M   | 256×256×16=1.05M   |
-# | expand params     | 16×64×256=0.26M   | 32×32×256=0.26M    | 64×16×256=0.26M    |
-# | 표현력 (k×rank)   | 8×64=512          | 12×32=384          | 16×16=256          |
-# | 뉴런 granularity  | 큰 덩어리         | 중간               | 작은 조각          |
-#
-# =============================================================================
-#
-# 가설:
-# - 성능: v10.0 ≈ v10.2 > v11.0
-# - 해석 가능성: v11.0 > v10.2 > v10.0
-# - v10.2가 성능-해석 트레이드오프의 sweet spot일 수 있음
+# | 항목              | v10.0 (baseline)  | v10.2 (this)       |
+# |-------------------|-------------------|--------------------|
+# | d_model           | 320               | 320                |
+# | rank              | 64                | 32                 |
+# | n_compress        | 48                | 96                 |
+# | n_expand          | 12                | 24                 |
+# | compress params   | 48×320×64=0.98M   | 96×320×32=0.98M    |
+# | expand params     | 12×64×320=0.25M   | 24×32×320=0.25M    |
+# | 표현력 (k×rank)   | 8×64=512          | 12×32=384          |
+# | 뉴런 granularity  | 큰 덩어리         | 중간               |
 #
 # =============================================================================
