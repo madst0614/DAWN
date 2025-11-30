@@ -649,14 +649,20 @@ class SemanticAnalyzer:
             _, routing_infos = self.model(input_ids, return_routing_info=True)
 
             # Only use first layer for simplicity
-            routing_info = routing_infos[0]
+            layer_info = routing_infos[0]
+            attn_routing = layer_info.get('attention', layer_info)
+            mem_routing = layer_info.get('memory', {})
 
-            for comp_key in ['compress_Q', 'compress_K', 'compress_V', 'compress_M']:
-                if comp_key not in routing_info:
-                    continue
+            # Collect routing data from attention Q/K/V and memory M
+            comp_data = {}
+            for key in ['Q', 'K', 'V']:
+                if key in attn_routing:
+                    comp_data[key] = attn_routing[key]
+            if 'M' in mem_routing:
+                comp_data['M'] = mem_routing['M']
 
-                data = routing_info[comp_key]
-                weights = data['weights']  # [B, S, k]
+            for comp_key, data in comp_data.items():
+                weights = data['weights']  # [B, S, N] or [B, S, k]
 
                 if 'indices' in data:
                     indices = data['indices']  # [B, S, k]
@@ -697,16 +703,16 @@ class SemanticAnalyzer:
                             positions = (input_ids[b] == token_id).nonzero(as_tuple=True)[0]
                             for pos in positions:
                                 if pos < S:
-                                    for comp_key in ['compress_Q']:
-                                        if comp_key in routing_info:
-                                            data = routing_info[comp_key]
-                                            if 'indices' in data:
-                                                indices = data['indices'][b, pos].cpu().numpy()
-                                            else:
-                                                _, idx = torch.topk(data['weights'][b, pos], 8)
-                                                indices = idx.cpu().numpy()
-                                            for ni in indices:
-                                                ner_neuron_counts[label][ni] += 1
+                                    # Use Q routing from attention
+                                    if 'Q' in attn_routing:
+                                        data = attn_routing['Q']
+                                        if 'indices' in data:
+                                            indices = data['indices'][b, pos].cpu().numpy()
+                                        else:
+                                            _, idx = torch.topk(data['weights'][b, pos], 8)
+                                            indices = idx.cpu().numpy()
+                                        for ni in indices:
+                                            ner_neuron_counts[label][ni] += 1
 
         # Find top neurons for each category
         results = {
@@ -1156,39 +1162,56 @@ class AdvancedVisualizer:
         for layer_idx in range(min(4, len(routing_infos))):
             ax = axes[0, layer_idx]
 
-            routing_info = routing_infos[layer_idx]
-            if 'compress_Q' in routing_info:
-                data = routing_info['compress_Q']
-                if 'indices' in data:
-                    indices = data['indices'][0].cpu().numpy()
-                else:
-                    _, indices = torch.topk(data['weights'][0], 8, dim=-1)
-                    indices = indices.cpu().numpy()
+            layer_info = routing_infos[layer_idx]
+            attn_routing = layer_info.get('attention', layer_info)
 
-                weights = data['weights'][0].cpu().numpy()
+            if 'Q' in attn_routing:
+                data = attn_routing['Q']
+                weights = data['weights'][0].cpu().numpy()  # [S, N] or [S, k]
+
+                if 'indices' in data:
+                    indices = data['indices'][0].cpu().numpy()  # [S, k]
+                else:
+                    k = min(8, weights.shape[-1])
+                    _, idx = torch.topk(torch.tensor(weights), k, dim=-1)
+                    indices = idx.numpy()
 
                 # Heatmap of top-k neurons
                 unique_neurons = sorted(set(indices.flatten()))[:30]
                 neuron_to_idx = {n: i for i, n in enumerate(unique_neurons)}
 
                 heatmap = np.zeros((n_tokens, len(unique_neurons)))
-                for t in range(n_tokens):
+                for t in range(min(n_tokens, indices.shape[0])):
                     for ki in range(indices.shape[1]):
                         n_idx = indices[t, ki]
                         if n_idx in neuron_to_idx:
-                            heatmap[t, neuron_to_idx[n_idx]] += weights[t, ki]
+                            w_idx = ki if weights.shape[-1] == indices.shape[-1] else n_idx
+                            heatmap[t, neuron_to_idx[n_idx]] += weights[t, w_idx] if w_idx < weights.shape[-1] else 0
 
                 ax.imshow(heatmap.T, aspect='auto', cmap='Blues')
                 ax.set_xticks(range(n_tokens))
                 ax.set_xticklabels(token_strs, rotation=45, ha='right', fontsize=7)
-                ax.set_title(f'Layer {layer_idx} Neurons')
+                ax.set_title(f'Layer {layer_idx} Q Neurons')
 
-        # Bottom row: Could show attention patterns if available
-        for i in range(4):
-            ax = axes[1, i]
-            ax.text(0.5, 0.5, f'Attention L{i}\n(if available)',
-                   ha='center', va='center', fontsize=12)
-            ax.axis('off')
+        # Bottom row: Show attention patterns
+        for layer_idx in range(min(4, len(routing_infos))):
+            ax = axes[1, layer_idx]
+            layer_info = routing_infos[layer_idx]
+            attn_routing = layer_info.get('attention', layer_info)
+
+            if 'attn_weights' in attn_routing:
+                # attn_weights: [B, H, S, S]
+                attn = attn_routing['attn_weights'][0].mean(dim=0).cpu().numpy()  # [S, S] average over heads
+                ax.imshow(attn[:n_tokens, :n_tokens], aspect='auto', cmap='Blues')
+                ax.set_xticks(range(n_tokens))
+                ax.set_xticklabels(token_strs, rotation=45, ha='right', fontsize=7)
+                ax.set_yticks(range(n_tokens))
+                ax.set_yticklabels(token_strs, fontsize=7)
+                ax.set_title(f'Layer {layer_idx} Attention')
+            else:
+                ax.text(0.5, 0.5, f'Attention L{layer_idx}\n(not available)',
+                       ha='center', va='center', fontsize=12)
+                ax.axis('off')
 
         plt.suptitle(f'Attention + Neuron: "{text[:50]}..."')
         plt.tight_layout()

@@ -240,6 +240,7 @@ class NeuronCircuit(nn.Module):
             'K': k_info,
             'V': v_info,
             'O': o_info,
+            'attn_weights': attn.detach(),  # [B, H, S, S] attention weights
         }
         return output, routing_info
 
