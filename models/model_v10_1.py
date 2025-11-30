@@ -126,20 +126,25 @@ class Compressor(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 선택된 뉴런만 가져오기 (메모리 효율적 - 직접 인덱싱)
+        # 3. 각 k에 대해 순차 처리 (메모리 효율 - 5차원 텐서 대신 루프)
+        # Before: [B, S, k, d_model, rank] = 10GB → OOM
+        # After: [B, S, d_model, rank] × k번 = ~2-3GB peak
         neurons = self.shared_neurons.compress_neurons  # [n_compress, d_model, rank]
 
-        # Flatten indices for efficient gather
-        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
-        selected_neurons = neurons[flat_idx]  # [B*S*k, d_model, rank]
-        selected_neurons = selected_neurons.view(B, S, self.top_k, D, self.rank)  # [B, S, k, d_model, rank]
+        output = torch.zeros(B, S, self.rank, device=x.device, dtype=x.dtype)
 
-        # 4. Batched projection
-        # x: [B, S, d_model], selected_neurons: [B, S, k, d_model, rank]
-        proj = torch.einsum('bsd,bskdr->bskr', x, selected_neurons)  # [B, S, k, rank]
+        for i in range(self.top_k):
+            idx_i = topk_idx[:, :, i]  # [B, S]
+            weight_i = weights[:, :, i:i+1]  # [B, S, 1]
 
-        # 5. Weighted sum
-        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, rank]
+            # 선택된 뉴런 가져오기
+            selected = neurons[idx_i.reshape(-1)]  # [B*S, d_model, rank]
+            selected = selected.view(B, S, D, self.rank)  # [B, S, d_model, rank]
+
+            # Projection: [B, S, d_model] @ [B, S, d_model, rank] → [B, S, rank]
+            proj = torch.einsum('bsd,bsdr->bsr', x, selected)  # [B, S, rank]
+
+            output = output + weight_i * proj
 
         routing_info = {
             'weights': weights,
@@ -204,26 +209,29 @@ class Expander(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 선택된 뉴런만 가져오기 (메모리 효율적 - 직접 인덱싱)
+        # 3. 각 k에 대해 순차 처리 (메모리 효율 - 5차원 텐서 대신 루프)
+        # Before: [B, S, k, rank, d_model] = OOM
+        # After: [B, S, rank, d_model] × k번 = peak memory 크게 감소
         neurons = self.shared_neurons.expand_neurons  # [n_expand, rank, d_model]
 
-        # Flatten indices for efficient gather
-        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
-        selected_neurons = neurons[flat_idx]  # [B*S*k, rank, d_model]
-        selected_neurons = selected_neurons.view(B, S, self.top_k, R, self.d_model)  # [B, S, k, rank, d_model]
+        output = torch.zeros(B, S, self.d_model, device=x.device, dtype=x.dtype)
 
-        # 4. Batched projection
-        # x: [B, S, rank], selected_neurons: [B, S, k, rank, d_model]
-        proj = torch.einsum('bsr,bskrd->bskd', x, selected_neurons)  # [B, S, k, d_model]
-        # proj: [B, S, k, d_model]
+        for i in range(self.top_k):
+            idx_i = topk_idx[:, :, i]  # [B, S]
+            weight_i = weights[:, :, i:i+1]  # [B, S, 1]
 
-        # 5. Weighted sum
-        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, d_model]
+            # 선택된 뉴런 가져오기
+            selected = neurons[idx_i.reshape(-1)]  # [B*S, rank, d_model]
+            selected = selected.view(B, S, R, self.d_model)  # [B, S, rank, d_model]
+
+            # Projection: [B, S, rank] @ [B, S, rank, d_model] → [B, S, d_model]
+            proj = torch.einsum('bsr,bsrd->bsd', x, selected)  # [B, S, d_model]
+
+            output = output + weight_i * proj
 
         routing_info = {
             'weights': weights,
             'indices': topk_idx,
-            'scores': scores,  # For load balance loss
         }
         return output, routing_info
 
