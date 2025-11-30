@@ -8,7 +8,7 @@ data:
   train_files:
     - train/wikitext_5to1_texts.pkl
   val_files:
-    - validation/wikitext_5to1_texts.pkl
+    - val/wikitext_5to1_texts.pkl
 
 # Model Architecture
 model:
