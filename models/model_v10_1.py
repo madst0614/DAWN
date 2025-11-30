@@ -10,12 +10,25 @@ Components:
     - CompressNeurons: [n_compress, d_model, rank] - Q/K/V/M 공유
     - ExpandNeurons: [n_expand, rank, d_model] - O 공유
     - KnowledgeNeurons: [n_knowledge, rank] + [n_knowledge, d_model]
+
+Backends:
+    - PyTorch: gather + batched matmul (default)
+    - Triton: grouped GEMM kernels (if available)
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Try to import Triton kernels
+try:
+    from .triton_kernels import triton_compress, triton_expand, TRITON_AVAILABLE
+except ImportError:
+    TRITON_AVAILABLE = False
+
+# Global flag to control backend
+USE_TRITON = False  # Set to True to use Triton kernels
 
 
 class SharedNeurons(nn.Module):
@@ -99,15 +112,17 @@ class Compressor(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 2. Gather selected neurons (vectorized, no loop)
+        # 2. Compute projection
         neurons = self.shared_neurons.compress_neurons  # [N, D, R]
-        selected = neurons[topk_idx]  # [B, S, k, D, R]
 
-        # 3. Batched matmul: [B, S, k, 1, D] @ [B, S, k, D, R] → [B, S, k, 1, R]
-        proj = torch.matmul(x.unsqueeze(2).unsqueeze(3), selected).squeeze(3)  # [B, S, k, R]
-
-        # 4. Weighted sum
-        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
+        if USE_TRITON and TRITON_AVAILABLE and x.is_cuda:
+            # Triton grouped GEMM
+            output = triton_compress(x, neurons, topk_idx, weights)
+        else:
+            # PyTorch: gather + batched matmul
+            selected = neurons[topk_idx]  # [B, S, k, D, R]
+            proj = torch.matmul(x.unsqueeze(2).unsqueeze(3), selected).squeeze(3)  # [B, S, k, R]
+            output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
 
         routing_info = {
             'weights': weights,
@@ -158,15 +173,17 @@ class Expander(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 2. Gather selected neurons (vectorized, no loop)
+        # 2. Compute projection
         neurons = self.shared_neurons.expand_neurons  # [N, R, D]
-        selected = neurons[topk_idx]  # [B, S, k, R, D]
 
-        # 3. Batched matmul: [B, S, k, 1, R] @ [B, S, k, R, D] → [B, S, k, 1, D]
-        proj = torch.matmul(x.unsqueeze(2).unsqueeze(3), selected).squeeze(3)  # [B, S, k, D]
-
-        # 4. Weighted sum
-        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
+        if USE_TRITON and TRITON_AVAILABLE and x.is_cuda:
+            # Triton grouped GEMM
+            output = triton_expand(x, neurons, topk_idx, weights)
+        else:
+            # PyTorch: gather + batched matmul
+            selected = neurons[topk_idx]  # [B, S, k, R, D]
+            proj = torch.matmul(x.unsqueeze(2).unsqueeze(3), selected).squeeze(3)  # [B, S, k, D]
+            output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         routing_info = {
             'weights': weights,
