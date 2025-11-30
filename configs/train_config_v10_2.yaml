@@ -14,13 +14,13 @@ data:
 model:
   model_version: "10.0"  # v10 모델 사용, 설정만 다름 (rank=32 실험)
   d_model: 256
-  n_layers: 6
+  n_layers: 4
   n_heads: 4
   rank: 32                # 64 → 32 (2배 압축)
 
   # 뉴런 수 2배 증가 (파라미터 동일 유지)
-  n_compress: 128         # 64 → 128
-  n_expand: 32            # 16 → 32
+  n_compress: 160         # 64 → 160
+  n_expand: 40            # 16 → 40
 
   # Top-K Selection
   compress_top_k: 12      # 128개 중 12개 선택 (9.4%)
