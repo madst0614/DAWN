@@ -194,9 +194,17 @@ class NeuronAnalyzer:
                 }
 
                 for comp, data in comp_data.items():
-                    # indices: [B, S, k] - 선택된 뉴런
-                    indices = data['indices']  # [B, S, k]
-                    k = indices.shape[-1]
+                    # v10.0: weights only [B, S, N], v10.1: weights + indices
+                    weights = data['weights']  # [B, S, N] or [B, S, k]
+
+                    if 'indices' in data:
+                        # v10.1: Top-K selected
+                        indices = data['indices']  # [B, S, k]
+                        k = indices.shape[-1]
+                    else:
+                        # v10.0: All neurons, get top-k from weights
+                        k = min(8, weights.shape[-1])
+                        _, indices = torch.topk(weights, k, dim=-1)  # [B, S, k]
 
                     # 뉴런 사용 빈도 업데이트 (GPU에서 bincount)
                     flat_indices = indices.view(-1)  # [B*S*k]
