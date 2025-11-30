@@ -631,9 +631,23 @@ def main():
     # Save
     os.makedirs(args.output_dir, exist_ok=True)
 
+    def convert_to_serializable(obj):
+        """Convert numpy types to Python native types for JSON"""
+        if isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(i) for i in obj]
+        return obj
+
     results_path = os.path.join(args.output_dir, 'svd_analysis.json')
     with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(convert_to_serializable(results), f, indent=2)
     print(f"\nResults saved: {results_path}")
 
     # Visualize
