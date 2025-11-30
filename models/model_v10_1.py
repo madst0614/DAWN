@@ -109,8 +109,8 @@ class Compressor(nn.Module):
         neurons = self.shared_neurons.compress_neurons  # [N, D, R]
         x_flat = x.view(B * S, D)  # [B*S, D]
 
-        # 출력 버퍼
-        output = torch.zeros(B * S, k, R, device=x.device, dtype=x.dtype)
+        # 출력 버퍼 (AMP 호환: neurons dtype 사용)
+        output = torch.zeros(B * S, k, R, device=x.device, dtype=neurons.dtype)
 
         # 각 top-k 슬롯별로 처리
         for slot in range(k):
@@ -197,7 +197,8 @@ class Expander(nn.Module):
         neurons = self.shared_neurons.expand_neurons  # [N, R, D]
         x_flat = x.view(B * S, R)  # [B*S, R]
 
-        output = torch.zeros(B * S, k, D, device=x.device, dtype=x.dtype)
+        # 출력 버퍼 (AMP 호환: neurons dtype 사용)
+        output = torch.zeros(B * S, k, D, device=x.device, dtype=neurons.dtype)
 
         for slot in range(k):
             slot_idx = topk_idx[:, :, slot].reshape(-1)  # [B*S]
