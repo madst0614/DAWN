@@ -28,7 +28,8 @@ except ImportError:
     TRITON_AVAILABLE = False
 
 # Global flag to control backend
-USE_TRITON = True  # Use Triton kernels by default (faster)
+# NOTE: PyTorch fallback is currently faster because Triton backward has Python loops
+USE_TRITON = False
 
 
 class SharedNeurons(nn.Module):
