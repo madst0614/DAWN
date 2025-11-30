@@ -674,8 +674,8 @@ class TritonCompressFunction(torch.autograd.Function):
 class TritonExpandFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, neurons, topk_idx, weights):
-        B, S, R = x.shape
-        N, _, D = neurons.shape
+        B, S, R = x.shape  # R is compressed dim (64)
+        N, D, R_check = neurons.shape  # [N, D, R] = [224, 320, 64]
         k = topk_idx.shape[-1]
         BS = B * S
 
