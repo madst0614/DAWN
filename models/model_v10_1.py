@@ -126,21 +126,17 @@ class Compressor(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. Gather selected neurons
+        # 3. 선택된 뉴런만 가져오기 (메모리 효율적 - 직접 인덱싱)
         neurons = self.shared_neurons.compress_neurons  # [n_compress, d_model, rank]
 
-        # topk_idx: [B, S, k] → expand for gather
-        # neurons shape: [n_compress, d_model, rank]
-        # We need to select k neurons per position
-        idx_expanded = topk_idx.unsqueeze(-1).unsqueeze(-1).expand(B, S, self.top_k, D, self.rank)
-        neurons_expanded = neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)
-        selected_neurons = neurons_expanded.gather(2, idx_expanded)  # [B, S, k, d_model, rank]
+        # Flatten indices for efficient gather
+        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
+        selected_neurons = neurons[flat_idx]  # [B*S*k, d_model, rank]
+        selected_neurons = selected_neurons.view(B, S, self.top_k, D, self.rank)  # [B, S, k, d_model, rank]
 
-        # 4. Project with selected neurons only
-        # x: [B, S, d_model] → [B, S, 1, d_model]
-        x_expanded = x.unsqueeze(2)  # [B, S, 1, d_model]
-        proj = torch.einsum('bskd,bskdr->bskr', x_expanded.expand(-1, -1, self.top_k, -1), selected_neurons)
-        # proj: [B, S, k, rank]
+        # 4. Batched projection
+        # x: [B, S, d_model], selected_neurons: [B, S, k, d_model, rank]
+        proj = torch.einsum('bsd,bskdr->bskr', x, selected_neurons)  # [B, S, k, rank]
 
         # 5. Weighted sum
         output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, rank]
@@ -148,7 +144,6 @@ class Compressor(nn.Module):
         routing_info = {
             'weights': weights,
             'indices': topk_idx,
-            'scores': scores,  # For load balance loss
         }
         return output, routing_info
 
@@ -209,17 +204,17 @@ class Expander(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. Gather selected neurons
+        # 3. 선택된 뉴런만 가져오기 (메모리 효율적 - 직접 인덱싱)
         neurons = self.shared_neurons.expand_neurons  # [n_expand, rank, d_model]
 
-        # topk_idx: [B, S, k] → expand for gather
-        idx_expanded = topk_idx.unsqueeze(-1).unsqueeze(-1).expand(B, S, self.top_k, R, self.d_model)
-        neurons_expanded = neurons.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)
-        selected_neurons = neurons_expanded.gather(2, idx_expanded)  # [B, S, k, rank, d_model]
+        # Flatten indices for efficient gather
+        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
+        selected_neurons = neurons[flat_idx]  # [B*S*k, rank, d_model]
+        selected_neurons = selected_neurons.view(B, S, self.top_k, R, self.d_model)  # [B, S, k, rank, d_model]
 
-        # 4. Project with selected neurons only
-        x_expanded = x.unsqueeze(2)  # [B, S, 1, rank]
-        proj = torch.einsum('bskr,bskrd->bskd', x_expanded.expand(-1, -1, self.top_k, -1), selected_neurons)
+        # 4. Batched projection
+        # x: [B, S, rank], selected_neurons: [B, S, k, rank, d_model]
+        proj = torch.einsum('bsr,bskrd->bskd', x, selected_neurons)  # [B, S, k, d_model]
         # proj: [B, S, k, d_model]
 
         # 5. Weighted sum
@@ -364,10 +359,10 @@ class NeuronMemory(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.knowledge_k, dim=-1)
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # Gather selected V
-        idx_expanded = topk_idx.unsqueeze(-1).expand(B, S, self.knowledge_k, self.d_model)
-        V_expanded = V.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
-        selected_V = V_expanded.gather(2, idx_expanded)  # [B, S, k, d_model]
+        # 선택된 V 가져오기 (메모리 효율적 - 직접 인덱싱)
+        flat_idx = topk_idx.reshape(-1)  # [B*S*k]
+        selected_V = V[flat_idx]  # [B*S*k, d_model]
+        selected_V = selected_V.view(B, S, self.knowledge_k, self.d_model)  # [B, S, k, d_model]
 
         # Weighted sum
         output = (selected_V * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, d_model]
