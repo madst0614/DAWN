@@ -41,7 +41,8 @@ class CheckpointManager:
         scheduler=None,
         scaler=None,
         model_config: dict = None,
-        filename: str = None
+        filename: str = None,
+        epoch_completed: bool = True
     ) -> str:
         """
         Save checkpoint.
@@ -57,6 +58,7 @@ class CheckpointManager:
             scaler: Optional AMP scaler state
             model_config: Optional model configuration dict
             filename: Optional custom filename (default: checkpoint_epoch{epoch}.pt)
+            epoch_completed: Whether the epoch was fully completed (False for mid-epoch saves)
 
         Returns:
             Path to saved checkpoint
@@ -84,7 +86,9 @@ class CheckpointManager:
             'loss': loss,
             'metrics': metrics,
             'timestamp': timestamp,
-            'model_version': model_version  # 버전 저장
+            'model_version': model_version,
+            'epoch_completed': epoch_completed,
+            'step': metrics.get('step', 0)  # Save step for mid-epoch resume
         }
 
         # Save model config if provided
