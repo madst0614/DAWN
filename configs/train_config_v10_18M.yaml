@@ -27,9 +27,9 @@ model:
 
 # Training
 training:
-  batch_size: 512           # 256 → 512 (A100 80GB 활용)
-  num_epochs: 3             # 30 → 3 (데이터 많으니까)
-  lr: 0.0006                # 0.0003 → 0.0006 (batch 커지면 lr도)
+  batch_size: 384
+  num_epochs: 3
+  lr: 0.00045               # 0.0003 × √1.5 (batch 256→384)
   weight_decay: 0.1
   warmup_ratio: 0.05
 
