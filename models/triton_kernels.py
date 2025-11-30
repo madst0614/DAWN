@@ -603,16 +603,21 @@ class TritonCompressFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         x_flat, neurons, topk_flat, weights_flat, sorted_idx, neuron_offsets = ctx.saved_tensors
         B, S, D, R, N, k, BS = ctx.shape
+        original_dtype = grad_output.dtype
 
-        grad_out_flat = grad_output.view(BS, R).contiguous()
+        # Convert to float32 for computation
+        grad_out_flat = grad_output.view(BS, R).float().contiguous()
+        x_flat = x_flat.float()
+        neurons = neurons.float()
+        weights_flat = weights_flat.float()
 
         # grad_out을 permuted order로 확장 (각 슬롯별로 복제)
-        grad_out_permuted = torch.zeros(BS * k, R, device=grad_out_flat.device, dtype=grad_out_flat.dtype)
+        grad_out_permuted = torch.zeros(BS * k, R, device=grad_out_flat.device, dtype=torch.float32)
         for s in range(k):
             grad_out_permuted[s::k] = grad_out_flat
 
         # grad_x
-        grad_x = torch.zeros(BS, D, device=x_flat.device, dtype=x_flat.dtype)
+        grad_x = torch.zeros(BS, D, device=x_flat.device, dtype=torch.float32)
         num_d_blocks = triton.cdiv(D, 64)
         grid = (BS, num_d_blocks)
 
@@ -629,7 +634,7 @@ class TritonCompressFunction(torch.autograd.Function):
         )
 
         # grad_neurons
-        grad_neurons = torch.zeros_like(neurons)
+        grad_neurons = torch.zeros_like(neurons, dtype=torch.float32)
         num_d_blocks = triton.cdiv(D, 32)
         num_r_blocks = triton.cdiv(R, 32)
         grid = (N, num_d_blocks, num_r_blocks)
@@ -647,7 +652,7 @@ class TritonCompressFunction(torch.autograd.Function):
         )
 
         # grad_weights
-        grad_weights = torch.zeros(BS, k, device=x_flat.device, dtype=x_flat.dtype)
+        grad_weights = torch.zeros(BS, k, device=x_flat.device, dtype=torch.float32)
         grid = (BS, k)
 
         grouped_compress_bwd_weights_kernel[grid](
@@ -662,7 +667,8 @@ class TritonCompressFunction(torch.autograd.Function):
             BLOCK_K=32,
         )
 
-        return grad_x.view(B, S, D), grad_neurons, None, grad_weights.view(B, S, k)
+        # Cast back to original dtype
+        return grad_x.view(B, S, D).to(original_dtype), grad_neurons.to(original_dtype), None, grad_weights.view(B, S, k).to(original_dtype)
 
 
 class TritonExpandFunction(torch.autograd.Function):
@@ -719,14 +725,17 @@ class TritonExpandFunction(torch.autograd.Function):
         # Similar structure to compress backward, with R and D swapped
         x_flat, neurons, topk_flat, weights_flat, sorted_idx, neuron_offsets = ctx.saved_tensors
         B, S, R, D, N, k, BS = ctx.shape
+        original_dtype = grad_output.dtype
 
-        # For now, use PyTorch fallback for backward
-        # TODO: Implement Triton backward kernels for expand
-        grad_out_flat = grad_output.view(BS, D)
+        # Convert to float32 for computation
+        grad_out_flat = grad_output.view(BS, D).float()
+        x_flat = x_flat.float()
+        neurons = neurons.float()
+        weights_flat = weights_flat.float()
 
-        grad_x = torch.zeros(BS, R, device=x_flat.device, dtype=x_flat.dtype)
-        grad_neurons = torch.zeros_like(neurons)
-        grad_weights = torch.zeros(BS, k, device=x_flat.device, dtype=x_flat.dtype)
+        grad_x = torch.zeros(BS, R, device=x_flat.device, dtype=torch.float32)
+        grad_neurons = torch.zeros_like(neurons, dtype=torch.float32)
+        grad_weights = torch.zeros(BS, k, device=x_flat.device, dtype=torch.float32)
 
         # PyTorch fallback
         for b in range(BS):
@@ -740,7 +749,8 @@ class TritonExpandFunction(torch.autograd.Function):
                 proj = x_flat[b] @ neurons[n_idx]
                 grad_weights[b, s] = (grad_out_flat[b] * proj).sum()
 
-        return grad_x.view(B, S, R), grad_neurons, None, grad_weights.view(B, S, k)
+        # Cast back to original dtype
+        return grad_x.view(B, S, R).to(original_dtype), grad_neurons.to(original_dtype), None, grad_weights.view(B, S, k).to(original_dtype)
 
 
 # ============================================================
