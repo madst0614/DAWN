@@ -1335,11 +1335,13 @@ class DAWNDeepAnalysis:
             print(f"\n  Analyzing: '{sentence[:40]}...'")
             analysis = visualizer.analyze_sentence(sentence)
 
-            # Token-wise visualization
+            # Token-wise visualization (auto-detect layer count)
+            n_layers = len(analysis['layer_data'])
+            show_layers = [0, n_layers//2, n_layers-1] if n_layers > 2 else list(range(n_layers))
             visualizer.visualize_sentence(
                 analysis,
                 os.path.join(self.dirs['sentence'], f'sentence_{i+1:02d}_tokenwise.png'),
-                show_layers=[0, 3, 7]
+                show_layers=show_layers
             )
 
             # Layer progression
@@ -1353,27 +1355,38 @@ class DAWNDeepAnalysis:
         print("2. ABLATION EXPERIMENTS")
         print("="*60)
 
-        ablation = AblationExperiment(self.model, self.tokenizer, self.device)
+        # Clear CUDA cache before ablation
+        torch.cuda.empty_cache()
 
-        ablation_targets = {
-            'DET_neurons': [168, 200, 215],
-            'ADP_neurons': [223, 165, 100],
-            'AUX_neurons': [202, 154, 181],
-            'PUNCT_neurons': [65, 74, 66],
-        }
+        ablation_results = {}
+        try:
+            ablation = AblationExperiment(self.model, self.tokenizer, self.device)
 
-        ablation_results = ablation.run_ablation_study(self.dataloader, ablation_targets, max_batches=30)
-        all_results['ablation'] = ablation_results
+            ablation_targets = {
+                'DET_neurons': [168, 200, 215],
+                'ADP_neurons': [223, 165, 100],
+                'AUX_neurons': [202, 154, 181],
+                'PUNCT_neurons': [65, 74, 66],
+            }
 
-        # Save ablation results
-        with open(os.path.join(self.dirs['ablation'], 'ablation_results.json'), 'w') as f:
-            json.dump(ablation_results, f, indent=2, default=str)
+            ablation_results = ablation.run_ablation_study(self.dataloader, ablation_targets, max_batches=30)
+            all_results['ablation'] = ablation_results
 
-        # Visualize causality matrix
-        ablation.visualize_causality_matrix(
-            ablation_results,
-            os.path.join(self.dirs['ablation'], 'causality_matrix.png')
-        )
+            # Save ablation results
+            with open(os.path.join(self.dirs['ablation'], 'ablation_results.json'), 'w') as f:
+                json.dump(ablation_results, f, indent=2, default=str)
+
+            # Visualize causality matrix
+            ablation.visualize_causality_matrix(
+                ablation_results,
+                os.path.join(self.dirs['ablation'], 'causality_matrix.png')
+            )
+        except Exception as e:
+            print(f"  WARNING: Ablation failed with error: {e}")
+            print("  Skipping ablation experiments...")
+            all_results['ablation'] = {'error': str(e)}
+
+        torch.cuda.empty_cache()
 
         # 3. Semantic Analysis
         print("\n" + "="*60)
