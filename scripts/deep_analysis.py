@@ -1228,31 +1228,31 @@ class DAWNDeepAnalysis:
         """Load DAWN model from checkpoint"""
         print(f"Loading model from: {self.checkpoint_path}")
 
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
 
-        # Detect model version
+        # Detect model version and get config
         config = checkpoint.get('config', {})
 
         # Try v10.1 first, then v10.0
         try:
-            from models.model_v10_1 import DAWNModel, DAWNConfig
+            from models.model_v10_1 import DAWN
             print("Using model_v10_1")
         except ImportError:
             try:
-                from models.model_v10 import DAWNModel, DAWNConfig
+                from models.model_v10 import DAWN
                 print("Using model_v10")
             except ImportError:
-                from models.model import DAWNModel, DAWNConfig
+                from models.model import DAWN
                 print("Using base model")
 
-        # Create config
+        # Create model with config kwargs
         if isinstance(config, dict):
-            model_config = DAWNConfig(**config)
+            self.model = DAWN(**config)
         else:
-            model_config = config
+            # Config might be stored as object with attributes
+            config_dict = {k: v for k, v in vars(config).items() if not k.startswith('_')}
+            self.model = DAWN(**config_dict)
 
-        # Create and load model
-        self.model = DAWNModel(model_config)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.to(self.device)
         self.model.eval()
