@@ -1,0 +1,61 @@
+# DAWN v10.0 Training Config - 22M Scale
+# 8 layers for hierarchical neuron reuse
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+
+# Model Architecture (v10.0 - 22M target)
+model:
+  model_version: "10.0"
+  d_model: 320
+  n_layers: 8
+  n_heads: 4
+  rank: 64
+
+  # CompressNeurons / ExpandNeurons
+  n_compress: 224         # 224/8 = 28 per layer
+  n_expand: 56            # 56/8 = 7 per layer (4:1 유지)
+
+  # KnowledgeNeurons
+  n_knowledge: 256
+  knowledge_k: 12
+
+  # Architecture
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+
+  # Regularization
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10_22M
+log_dir: /content/drive/MyDrive/dawn/logs_v10_22M
+
+# 파라미터 계산:
+#   embeddings: 9.81M
+#   compress: 224 × 320 × 64 = 4.59M
+#   expand: 56 × 64 × 320 = 1.15M
+#   knowledge: 256×64 + 256×320 = 98K
+#   per-layer × 8: ~2.1M
+#   Total: ~21-22M
+#
+# 11M 대비:
+#   layers: 4 → 8 (2배)
+#   compress/layer: 12 → 28 (2.3배)
+#   expand/layer: 3 → 7 (2.3배)
