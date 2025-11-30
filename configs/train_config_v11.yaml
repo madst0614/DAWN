@@ -6,11 +6,9 @@
 data:
   base_dir: /content/drive/MyDrive/data
   train_files:
-    - train/c4/c4_raw_000.pt
+    - train/wikitext_5to1_texts.pkl
   val_files:
-    - val/c4/c4_val_50M.pt
-  max_train_tokens: 100000000  # 100M tokens
-  max_val_tokens: 5000000      # 5M tokens
+    - validation/wikitext_5to1_texts.pkl
 
 # Model Architecture
 model:
