@@ -275,7 +275,7 @@ def load_optimizer_state(
     scheduler=None,
     scaler=None,
     verbose: bool = True
-) -> Tuple[int, float]:
+) -> Tuple[int, float, int]:
     """
     Load optimizer, scheduler, and scaler states from checkpoint.
 
@@ -287,7 +287,10 @@ def load_optimizer_state(
         verbose: Print loading information
 
     Returns:
-        Tuple of (start_epoch, best_val_loss)
+        Tuple of (start_epoch, best_val_loss, start_step)
+        - start_epoch: epoch to resume from
+        - best_val_loss: best validation loss so far
+        - start_step: step within the epoch to resume from (0 if starting new epoch)
     """
     try:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -298,24 +301,50 @@ def load_optimizer_state(
         if scaler is not None and 'scaler_state_dict' in checkpoint:
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
-        start_epoch = checkpoint.get('epoch', 0) + 1
+        # Check if this is an intermediate checkpoint (has 'step' but epoch not completed)
+        saved_epoch = checkpoint.get('epoch', 0)
+        saved_step = checkpoint.get('step', 0)
+        epoch_completed = checkpoint.get('epoch_completed', True)  # Default True for backward compat
+
+        if epoch_completed:
+            # Epoch was completed, start next epoch from step 0
+            start_epoch = saved_epoch + 1
+            start_step = 0
+        else:
+            # Epoch was not completed, resume same epoch from next step
+            start_epoch = saved_epoch
+            start_step = saved_step + 1
+
         best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
 
         if verbose:
             print(f"✅ Optimizer/scheduler loaded successfully")
-            print(f"✅ Resuming from epoch {start_epoch} (best val loss: {best_val_loss:.4f})")
+            if start_step > 0:
+                print(f"✅ Resuming from epoch {start_epoch}, step {start_step} (best val loss: {best_val_loss:.4f})")
+            else:
+                print(f"✅ Resuming from epoch {start_epoch} (best val loss: {best_val_loss:.4f})")
 
-        return start_epoch, best_val_loss
+        return start_epoch, best_val_loss, start_step
 
     except Exception as e:
         if verbose:
             print(f"\n⚠️  Could not load optimizer state: {str(e)[:100]}")
             print(f"   Starting with fresh optimizer (model weights preserved)")
 
-        start_epoch = checkpoint.get('epoch', 0) + 1
+        saved_epoch = checkpoint.get('epoch', 0)
+        saved_step = checkpoint.get('step', 0)
+        epoch_completed = checkpoint.get('epoch_completed', True)
+
+        if epoch_completed:
+            start_epoch = saved_epoch + 1
+            start_step = 0
+        else:
+            start_epoch = saved_epoch
+            start_step = saved_step + 1
+
         best_val_loss = checkpoint.get('best_val_loss', checkpoint.get('val_loss', float('inf')))
 
         if verbose:
-            print(f"   Epoch count: {start_epoch}, Best val loss: {best_val_loss:.4f}")
+            print(f"   Epoch: {start_epoch}, Step: {start_step}, Best val loss: {best_val_loss:.4f}")
 
-        return start_epoch, best_val_loss
+        return start_epoch, best_val_loss, start_step

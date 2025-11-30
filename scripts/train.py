@@ -572,8 +572,12 @@ def is_v75_or_v76_model(model):
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
                 orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, process_norm_weight=0.0,
-                debug_logger=None, ckpt_manager=None, model_config=None):
-    """Train for one epoch"""
+                debug_logger=None, ckpt_manager=None, model_config=None, start_step=0):
+    """Train for one epoch
+
+    Args:
+        start_step: Step to resume from within this epoch (default 0, start from beginning)
+    """
     model.train()
 
     # Debug: Log at start of key epochs
@@ -595,8 +599,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     # Last neuron metrics (for epoch summary)
     last_neuron_metrics = None
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
+    # Skip steps if resuming from middle of epoch
+    if start_step > 0:
+        print(f"  Skipping to step {start_step}...")
+
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]", initial=start_step, total=len(dataloader))
     for step, batch in enumerate(pbar):
+        # Skip already completed steps
+        if step < start_step:
+            continue
         input_ids = batch["input_ids"].to(device)
 
         # Apply MLM masking
@@ -781,7 +792,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             ckpt_manager.save_checkpoint(
                 model, optimizer, epoch, avg_loss, step_metrics, is_best=False,
                 scheduler=scheduler, scaler=scaler, model_config=model_config,
-                filename=f'checkpoint_epoch{epoch}_step{step+1}.pt'
+                filename=f'checkpoint_epoch{epoch}_step{step+1}.pt',
+                epoch_completed=False  # Mid-epoch checkpoint
             )
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
@@ -1089,6 +1101,11 @@ def main():
     args.n_reflect_d = cfg['model'].get('n_reflect_d', cfg['model'].get('n_reflect', 64))
     args.n_reflect_r = cfg['model'].get('n_reflect_r', cfg['model'].get('n_reflect', 64))
 
+    # v10.1: Top-K sparse routing parameters
+    args.compress_top_k = cfg['model'].get('compress_top_k', 8)
+    args.expand_top_k = cfg['model'].get('expand_top_k', 4)
+    args.router_noise = cfg['model'].get('router_noise', 0.1)
+
     # Training
     args.batch_size = cfg['training']['batch_size']
     args.num_epochs = cfg['training']['num_epochs']
@@ -1152,7 +1169,7 @@ def main():
                 print(f"\n⚠️  Warning: Checkpoint file not found at {resume_path}")
                 print(f"    Starting from scratch instead.")
         else:
-            # Folder path - look for best_model.pt inside
+            # Folder path - look for best_model.pt or latest checkpoint inside
             resume_folder = resume_path
             if not resume_folder.is_absolute():
                 resume_folder = Path(args.checkpoint_dir) / resume_folder.name
@@ -1164,8 +1181,21 @@ def main():
                 print(f"\n✓ Resuming from: {latest_best_checkpoint}")
                 print(f"✓ Continuing in same folder: {checkpoint_dir}")
             else:
-                print(f"\n⚠️  Warning: Checkpoint not found at {best_ckpt}")
-                print(f"    Starting from scratch instead.")
+                # best_model.pt doesn't exist, look for checkpoint_epoch*_step*.pt
+                checkpoint_files = sorted(
+                    resume_folder.glob('checkpoint_epoch*_step*.pt'),
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True
+                )
+                if checkpoint_files:
+                    latest_best_checkpoint = checkpoint_files[0]
+                    checkpoint_dir = resume_folder
+                    print(f"\n✓ No best_model.pt found, using latest intermediate checkpoint:")
+                    print(f"  {latest_best_checkpoint}")
+                    print(f"✓ Continuing in same folder: {checkpoint_dir}")
+                else:
+                    print(f"\n⚠️  Warning: No checkpoints found in {resume_folder}")
+                    print(f"    Starting from scratch instead.")
 
     elif not cli_args.from_scratch:
         # Auto-resume: find latest checkpoint and use its folder
@@ -1286,8 +1316,10 @@ def main():
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
-        if args.model_version == '10.0':
-            print(f"   → v10.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.rank}, n_knowledge={args.n_knowledge}")
+        if args.model_version == '10.1':
+            print(f"   → v10.1 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}, compress_top_k={args.compress_top_k}, expand_top_k={args.expand_top_k}")
+        elif args.model_version == '10.0':
+            print(f"   → v10.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}, n_knowledge={args.n_knowledge}")
         elif args.model_version in ['8.0', '8.1', '8.2', '8.3']:
             print(f"   → v8.0+ params: n_knowledge={args.n_knowledge}, knowledge_k={args.knowledge_k}, rank={args.rank}")
 
@@ -1305,7 +1337,20 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "10.0":
+        if model_version == "10.1":
+            # v10.1: Top-K Sparse Compress/Expand
+            rank = args.basis_rank
+            print(f"SharedNeurons (v{model_version} Top-K): rank={rank}")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (Q/K/V/M shared)")
+            print(f"    → Top-K: {args.compress_top_k} selected per token")
+            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model} (O shared)")
+            print(f"    → Top-K: {args.expand_top_k} selected per token")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
+            print(f"  Router Noise: {args.router_noise}")
+        elif model_version == "10.0":
             # v10.0: Simplified Compress/Expand
             rank = args.basis_rank
             print(f"SharedNeurons (v{model_version}): rank={rank} - No Householder!")
@@ -1412,7 +1457,19 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '10.0':
+    if model_version == '10.1':
+        # v10.1: Top-K Sparse Compress/Expand (Memory efficient)
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'rank': args.basis_rank,
+            'compress_top_k': args.compress_top_k,
+            'expand_top_k': args.expand_top_k,
+            'router_noise': args.router_noise,
+        })
+    elif model_version == '10.0':
         # v10.0: Simplified Compress/Expand (No Householder)
         model_kwargs.update({
             'n_compress': args.n_compress,
@@ -1520,6 +1577,7 @@ def main():
     # Resume from checkpoint (weights loading)
     start_epoch = 1
     best_val_loss = float('inf')
+    start_step = 0  # Step within epoch to resume from
 
     if resume_checkpoint and resume_checkpoint.exists():
         print(f"\n{'='*60}")
@@ -1534,7 +1592,7 @@ def main():
         )
 
         # Load optimizer, scheduler, and scaler states
-        start_epoch, best_val_loss = load_optimizer_state(
+        start_epoch, best_val_loss, start_step = load_optimizer_state(
             optimizer, checkpoint, scheduler=scheduler, scaler=scaler, verbose=True
         )
     else:
@@ -1597,6 +1655,9 @@ def main():
 
         epoch_start = time.time()
 
+        # Determine start_step for this epoch (only non-zero for first epoch when resuming)
+        epoch_start_step = start_step if epoch == start_epoch else 0
+
         # Train
         train_loss, train_acc, neuron_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args,
@@ -1607,7 +1668,8 @@ def main():
             process_norm_weight=args.process_norm_weight,
             debug_logger=debug_logger,
             ckpt_manager=ckpt_manager,
-            model_config=model_kwargs
+            model_config=model_kwargs,
+            start_step=epoch_start_step
         )
 
         # Evaluate

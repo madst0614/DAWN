@@ -2,12 +2,47 @@
 DAWN Model Version Registry
 
 v10.0: Simplified Compress/Expand Architecture
+v10.1: Top-K Sparse Compress/Expand (Memory efficient)
+
+To add a new version:
+1. Add entry to VERSION_REGISTRY below
+2. Create model file in models/model_vX_Y.py
+3. Import and register in models/__init__.py
+4. Add version handling in scripts/train.py (around line 1415)
+5. Create config in configs/train_config_vX_Y.yaml
 """
 
 from typing import Dict, Any, List
 
 
 VERSION_REGISTRY = {
+    "10.1": {
+        "description": "Top-K Sparse Compress/Expand (Memory efficient, ~3x faster)",
+        "aliases": ["101"],
+        "module": "model_v10_1",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "compress_top_k": 8,
+            "expand_top_k": 4,
+            "router_noise": 0.1,
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v10.1 Top-K): rank={args.get('rank', args.get('basis_rank'))}",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (Q/K/V/M shared)",
+            f"    → Top-K: {args.get('compress_top_k', 8)} selected per token",
+            f"  ExpandNeurons: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (O shared)",
+            f"    → Top-K: {args.get('expand_top_k', 4)} selected per token",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('rank', args.get('basis_rank'))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+            f"  Router Noise: {args.get('router_noise', 0.1)}",
+        ],
+    },
     "10.0": {
         "description": "Simplified Compress/Expand (No Householder, Q/K/V/M 통합)",
         "aliases": ["10", "100"],
@@ -43,7 +78,7 @@ def normalize_version(version: str) -> str:
         if version in info.get('aliases', []):
             return canonical
 
-    raise ValueError(f"Unknown version: {version}. Supported: 10.0")
+    raise ValueError(f"Unknown version: {version}. Supported: {', '.join(VERSION_REGISTRY.keys())}")
 
 
 def get_version_info(version: str) -> Dict[str, Any]:

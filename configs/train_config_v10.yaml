@@ -1,62 +1,60 @@
-# DAWN v10.0 Training Config
-# Simplified architecture: Compress + Expand (no Householder)
-# Unified neuron pools for all Q/K/V/O/M
+# DAWN v10.0 Training Config - 18M Scale (A100 80GB)
+# 8 layers for hierarchical neuron reuse
 
 # Data
 data:
   base_dir: /content/drive/MyDrive/data
   train_files:
-    - train/wikitext_5to1_texts.pkl
+    - train/c4/c4_raw_000.pt
   val_files:
-    - validation/wikitext_5to1_texts.pkl
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 360000000  # 360M tokens
+  max_val_tokens: 10000000     # 10M tokens
 
-# Model Architecture (v10.0 - 11M target)
+# Model Architecture
 model:
   model_version: "10.0"
   d_model: 320
-  n_layers: 4
+  n_layers: 8
   n_heads: 4
   rank: 64
-
-  # CompressNeurons / ExpandNeurons (통합 풀)
-  n_compress: 48          # Q/K/V/M 공유 (줄임)
-  n_expand: 12            # O 공유 (4:1 비율)
-
-  # KnowledgeNeurons
-  n_knowledge: 80
-  knowledge_k: 10
-
-  # Architecture
+  n_compress: 224
+  n_expand: 56
+  n_knowledge: 256
+  knowledge_k: 12
   max_seq_len: 128
   dropout: 0.1
 
 # Training
 training:
-  batch_size: 128
-  num_epochs: 30
-  lr: 0.0003
+  batch_size: 256
+  num_epochs: 5
+  lr: 0.0004
   weight_decay: 0.1
   warmup_ratio: 0.05
 
   # Regularization
-  orthogonality_weight: 0.01    # compress/expand 직교성
-  diversity_weight: 0.1         # knowledge diversity
-  load_balance_weight: 0.01     # routing 균등 분포
-  process_norm_weight: 0.0      # v10 미지원 (process neurons 없음)
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
 
 use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10
 log_dir: /content/drive/MyDrive/dawn/logs_v10
 
+# =============================================================================
 # 파라미터 계산:
-#   compress: 48 × 320 × 80 = 1,228,800 (1.23M)
-#   expand: 12 × 80 × 320 = 307,200 (0.31M)
-#   knowledge: 80×80 + 80×320 = 32,000 (32K)
-#   SharedNeurons 총: ~1.57M
+# =============================================================================
+#   compress: 224 × 320 × 64 = 4,587,520 (4.59M)
+#   expand: 56 × 64 × 320 = 1,146,880 (1.15M)
+#   knowledge: 256×64 + 256×320 = 98,304 (98K)
+#   SharedNeurons 총: ~5.83M
 #
 #   embeddings: 30522 × 320 = 9.77M
 #   pos_emb: 128 × 320 = 41K
-#   routers: ~300K
-#   layernorms: ~10K
+#   routers: ~2.2M (8 layers)
+#   layernorms: ~20K
 #
-#   Total: ~11.6M
+#   Total: ~18M
+# =============================================================================
