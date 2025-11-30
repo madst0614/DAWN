@@ -91,47 +91,23 @@ class Compressor(nn.Module):
             routing_info: dict
         """
         B, S, D = x.shape
-        k = self.top_k
-        R = self.rank
-        N = self.n_compress
 
-        # 1. 라우터 + top-k
+        # 1. Router + top-k selection
         scores = self.router(x)  # [B, S, N]
         if add_noise and self.training and self.router_noise > 0:
             scores = scores + torch.randn_like(scores) * self.router_noise
-        topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
+        topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 2. 뉴런 단위 배치 처리
+        # 2. Gather selected neurons (vectorized, no loop)
         neurons = self.shared_neurons.compress_neurons  # [N, D, R]
-        x_flat = x.view(B * S, D)  # [B*S, D]
-        topk_flat = topk_idx.view(B * S, k)  # [B*S, k]
+        selected = neurons[topk_idx]  # [B, S, k, D, R]
 
-        # 출력 버퍼
-        output = torch.zeros(B * S, k, R, device=x.device, dtype=x.dtype)
+        # 3. Batched matmul: [B, S, k, 1, D] @ [B, S, k, D, R] → [B, S, k, 1, R]
+        proj = torch.matmul(x.unsqueeze(2).unsqueeze(3), selected).squeeze(3)  # [B, S, k, R]
 
-        # 3. 각 뉴런별로: 해당 뉴런 선택한 토큰들만 matmul
-        for i in range(N):
-            # 이 뉴런을 선택한 (토큰, 슬롯) 쌍 찾기
-            mask = (topk_flat == i)  # [B*S, k]
-            if not mask.any():
-                continue
-
-            # 해당 토큰들 추출
-            token_idx = mask.any(dim=1)  # [B*S] - 이 뉴런 선택한 토큰
-            tokens = x_flat[token_idx]  # [num_tokens, D]
-
-            # 단일 matmul
-            proj = tokens @ neurons[i]  # [num_tokens, D] @ [D, R] → [num_tokens, R]
-            proj = proj.to(x.dtype)  # AMP: Float→Half
-
-            # 결과를 해당 위치에 scatter
-            slots = mask[token_idx]  # [num_tokens, k] - 어느 슬롯에 넣을지
-            output[token_idx][slots] = proj.unsqueeze(1).expand(-1, k, -1)[slots]
-
-        # 4. weighted sum
-        output = output.view(B, S, k, R)
-        output = (output * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
+        # 4. Weighted sum
+        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
 
         routing_info = {
             'weights': weights,
@@ -174,47 +150,23 @@ class Expander(nn.Module):
             routing_info: dict
         """
         B, S, R = x.shape
-        k = self.top_k
-        D = self.d_model
-        N = self.n_expand
 
-        # 1. 라우터 + top-k
+        # 1. Router + top-k selection
         scores = self.router(x)  # [B, S, N]
         if add_noise and self.training and self.router_noise > 0:
             scores = scores + torch.randn_like(scores) * self.router_noise
-        topk_scores, topk_idx = torch.topk(scores, k, dim=-1)  # [B, S, k]
+        topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 2. 뉴런 단위 배치 처리
+        # 2. Gather selected neurons (vectorized, no loop)
         neurons = self.shared_neurons.expand_neurons  # [N, R, D]
-        x_flat = x.view(B * S, R)  # [B*S, R]
-        topk_flat = topk_idx.view(B * S, k)  # [B*S, k]
+        selected = neurons[topk_idx]  # [B, S, k, R, D]
 
-        # 출력 버퍼
-        output = torch.zeros(B * S, k, D, device=x.device, dtype=x.dtype)
+        # 3. Batched matmul: [B, S, k, 1, R] @ [B, S, k, R, D] → [B, S, k, 1, D]
+        proj = torch.matmul(x.unsqueeze(2).unsqueeze(3), selected).squeeze(3)  # [B, S, k, D]
 
-        # 3. 각 뉴런별로: 해당 뉴런 선택한 토큰들만 matmul
-        for i in range(N):
-            # 이 뉴런을 선택한 (토큰, 슬롯) 쌍 찾기
-            mask = (topk_flat == i)  # [B*S, k]
-            if not mask.any():
-                continue
-
-            # 해당 토큰들 추출
-            token_idx = mask.any(dim=1)  # [B*S] - 이 뉴런 선택한 토큰
-            tokens = x_flat[token_idx]  # [num_tokens, R]
-
-            # 단일 matmul
-            proj = tokens @ neurons[i]  # [num_tokens, R] @ [R, D] → [num_tokens, D]
-            proj = proj.to(x.dtype)  # AMP: Float→Half
-
-            # 결과를 해당 위치에 scatter
-            slots = mask[token_idx]  # [num_tokens, k] - 어느 슬롯에 넣을지
-            output[token_idx][slots] = proj.unsqueeze(1).expand(-1, k, -1)[slots]
-
-        # 4. weighted sum
-        output = output.view(B, S, k, D)
-        output = (output * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
+        # 4. Weighted sum
+        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         routing_info = {
             'weights': weights,
