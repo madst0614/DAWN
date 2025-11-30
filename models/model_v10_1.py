@@ -123,6 +123,7 @@ class Compressor(nn.Module):
 
             # 단일 matmul
             proj = tokens @ neurons[i]  # [num_tokens, D] @ [D, R] → [num_tokens, R]
+            proj = proj.to(x.dtype)  # AMP: Float→Half
 
             # 결과를 해당 위치에 scatter
             slots = mask[token_idx]  # [num_tokens, k] - 어느 슬롯에 넣을지
@@ -205,6 +206,7 @@ class Expander(nn.Module):
 
             # 단일 matmul
             proj = tokens @ neurons[i]  # [num_tokens, R] @ [R, D] → [num_tokens, D]
+            proj = proj.to(x.dtype)  # AMP: Float→Half
 
             # 결과를 해당 위치에 scatter
             slots = mask[token_idx]  # [num_tokens, k] - 어느 슬롯에 넣을지
