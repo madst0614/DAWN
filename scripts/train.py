@@ -1101,11 +1101,6 @@ def main():
     args.n_reflect_d = cfg['model'].get('n_reflect_d', cfg['model'].get('n_reflect', 64))
     args.n_reflect_r = cfg['model'].get('n_reflect_r', cfg['model'].get('n_reflect', 64))
 
-    # v10.1: Top-K sparse routing parameters
-    args.compress_top_k = cfg['model'].get('compress_top_k', 8)
-    args.expand_top_k = cfg['model'].get('expand_top_k', 4)
-    args.router_noise = cfg['model'].get('router_noise', 0.1)
-
     # Training
     args.batch_size = cfg['training']['batch_size']
     args.num_epochs = cfg['training']['num_epochs']
@@ -1316,9 +1311,7 @@ def main():
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
-        if args.model_version == '10.1':
-            print(f"   → v10.1 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}, compress_top_k={args.compress_top_k}, expand_top_k={args.expand_top_k}")
-        elif args.model_version == '10.0':
+        if args.model_version == '10.0':
             print(f"   → v10.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}, n_knowledge={args.n_knowledge}")
         elif args.model_version in ['8.0', '8.1', '8.2', '8.3']:
             print(f"   → v8.0+ params: n_knowledge={args.n_knowledge}, knowledge_k={args.knowledge_k}, rank={args.rank}")
@@ -1337,20 +1330,7 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "10.1":
-            # v10.1: Top-K Sparse Compress/Expand
-            rank = args.basis_rank
-            print(f"SharedNeurons (v{model_version} Top-K): rank={rank}")
-            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (Q/K/V/M shared)")
-            print(f"    → Top-K: {args.compress_top_k} selected per token")
-            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model} (O shared)")
-            print(f"    → Top-K: {args.expand_top_k} selected per token")
-            print(f"  KnowledgeNeurons:")
-            print(f"    - K: {args.n_knowledge} × {rank}")
-            print(f"    - V: {args.n_knowledge} × {args.d_model}")
-            print(f"    - Knowledge top-k: {args.knowledge_k}")
-            print(f"  Router Noise: {args.router_noise}")
-        elif model_version == "10.0":
+        if model_version == "10.0":
             # v10.0: Simplified Compress/Expand
             rank = args.basis_rank
             print(f"SharedNeurons (v{model_version}): rank={rank} - No Householder!")
@@ -1457,19 +1437,7 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '10.1':
-        # v10.1: Top-K Sparse Compress/Expand (Memory efficient)
-        model_kwargs.update({
-            'n_compress': args.n_compress,
-            'n_expand': args.n_expand,
-            'n_knowledge': args.n_knowledge,
-            'knowledge_k': args.knowledge_k,
-            'rank': args.basis_rank,
-            'compress_top_k': args.compress_top_k,
-            'expand_top_k': args.expand_top_k,
-            'router_noise': args.router_noise,
-        })
-    elif model_version == '10.0':
+    if model_version == '10.0':
         # v10.0: Simplified Compress/Expand (No Householder)
         model_kwargs.update({
             'n_compress': args.n_compress,

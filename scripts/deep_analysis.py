@@ -1235,20 +1235,15 @@ class DAWNDeepAnalysis:
         state_keys = list(state_dict.keys())
 
         # v10.0 has per-layer shared_neurons: layers.0.attn.shared_neurons.*
-        # v10.1 has global shared_neurons: shared_neurons.*
         has_per_layer_neurons = any('layers.0.attn.shared_neurons' in k for k in state_keys)
         has_global_neurons = any(k.startswith('shared_neurons.') for k in state_keys)
 
         config = checkpoint.get('config', {})
 
-        if has_per_layer_neurons:
+        if has_per_layer_neurons or has_global_neurons:
             # v10.0 checkpoint
             from models.model_v10 import DAWN
-            print("Using model_v10 (detected per-layer shared_neurons)")
-        elif has_global_neurons:
-            # v10.1 checkpoint
-            from models.model_v10_1 import DAWN
-            print("Using model_v10_1 (detected global shared_neurons)")
+            print("Using model_v10 (detected shared_neurons)")
         else:
             # Fallback
             try:
