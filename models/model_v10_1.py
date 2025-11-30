@@ -126,19 +126,29 @@ class Compressor(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 효율적 처리: repeat_interleave + einsum (루프 없이, 5D 텐서 없이)
-        # [N, D, R] → [B*S*k, D, R]
-        selected = neurons[topk_idx.view(-1)]
+        # 3. 배치 합치기
+        x_flat = x.view(B * S, D)  # [B*S, D]
+        idx_flat = topk_idx.view(B * S, self.top_k)  # [B*S, k]
+        weights_flat = weights.view(B * S, self.top_k)  # [B*S, k]
 
-        # [B, S, D] → [B*S, D] → [B*S*k, D]
-        x_rep = x.view(B * S, D).repeat_interleave(self.top_k, dim=0)
+        # 4. k개씩 루프 처리 (메모리 효율: [B*S, D, R] vs [B*S*k, D, R])
+        # Before: 5.4B elements = 10GB → OOM
+        # After: 671M elements = 1.3GB × k (순차 재사용)
+        output = x.new_zeros(B * S, self.rank)
 
-        # [B*S*k, D] @ [B*S*k, D, R] → [B*S*k, R]
-        proj = torch.einsum('nd,ndr->nr', x_rep, selected)
-        proj = proj.view(B, S, self.top_k, self.rank)
+        for i in range(self.top_k):
+            idx_i = idx_flat[:, i]  # [B*S]
+            w_i = weights_flat[:, i:i+1]  # [B*S, 1]
 
-        # 4. Weighted sum
-        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
+            # 선택된 뉴런: [B*S, D, R]
+            sel = neurons[idx_i]
+
+            # [B*S, D] × [B*S, D, R] → [B*S, R]
+            proj = torch.einsum('bd,bdr->br', x_flat, sel)
+
+            output = output + w_i * proj
+
+        output = output.view(B, S, self.rank)
 
         routing_info = {
             'weights': weights,
@@ -203,19 +213,27 @@ class Expander(nn.Module):
         topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
-        # 3. 효율적 처리: repeat_interleave + einsum (루프 없이, 5D 텐서 없이)
-        # [N, R, D] → [B*S*k, R, D]
-        selected = neurons[topk_idx.view(-1)]
+        # 3. 배치 합치기
+        x_flat = x.view(B * S, R)  # [B*S, R]
+        idx_flat = topk_idx.view(B * S, self.top_k)  # [B*S, k]
+        weights_flat = weights.view(B * S, self.top_k)  # [B*S, k]
 
-        # [B, S, R] → [B*S, R] → [B*S*k, R]
-        x_rep = x.view(B * S, R).repeat_interleave(self.top_k, dim=0)
+        # 4. k개씩 루프 처리 (메모리 효율: [B*S, R, D] vs [B*S*k, R, D])
+        output = x.new_zeros(B * S, self.d_model)
 
-        # [B*S*k, R] @ [B*S*k, R, D] → [B*S*k, D]
-        proj = torch.einsum('nr,nrd->nd', x_rep, selected)
-        proj = proj.view(B, S, self.top_k, self.d_model)
+        for i in range(self.top_k):
+            idx_i = idx_flat[:, i]  # [B*S]
+            w_i = weights_flat[:, i:i+1]  # [B*S, 1]
 
-        # 4. Weighted sum
-        output = (proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
+            # 선택된 뉴런: [B*S, R, D]
+            sel = neurons[idx_i]
+
+            # [B*S, R] × [B*S, R, D] → [B*S, D]
+            proj = torch.einsum('br,brd->bd', x_flat, sel)
+
+            output = output + w_i * proj
+
+        output = output.view(B, S, self.d_model)
 
         routing_info = {
             'weights': weights,
