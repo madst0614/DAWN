@@ -417,6 +417,9 @@ def apply_mlm_masking(input_ids, tokenizer, config=None):
     if config is None:
         config = MLM_CONFIG
 
+    # Ensure int64 dtype (pt files may have int32)
+    input_ids = input_ids.long()
+
     labels = input_ids.clone()
     mask_prob = config.get("mask_prob", 0.15)
     device = input_ids.device
