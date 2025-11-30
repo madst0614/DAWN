@@ -151,11 +151,11 @@ if TRITON_AVAILABLE:
 
                 # x[token_idx, d_offs] 로드: [BLOCK_M, BLOCK_K]
                 x_ptrs = x_ptr + token_idx[:, None] * stride_x_bs + d_offs[None, :] * stride_x_d
-                x_block = tl.load(x_ptrs, mask=perm_mask[:, None] & d_mask[None, :], other=0.0)
+                x_block = tl.load(x_ptrs, mask=perm_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
 
                 # neurons[pid_n, d_offs, r_offs] 로드: [BLOCK_K, BLOCK_N]
                 n_ptrs = neurons_ptr + pid_n * stride_n_n + d_offs[:, None] * stride_n_d + r_offs[None, :] * stride_n_r
-                n_block = tl.load(n_ptrs, mask=d_mask[:, None] & r_mask[None, :], other=0.0)
+                n_block = tl.load(n_ptrs, mask=d_mask[:, None] & r_mask[None, :], other=0.0).to(tl.float32)
 
                 # GEMM: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] -> [BLOCK_M, BLOCK_N]
                 acc += tl.dot(x_block, n_block)
@@ -522,10 +522,10 @@ if TRITON_AVAILABLE:
                 r_mask_inner = r_offs < R
 
                 x_ptrs = x_ptr + token_idx[:, None] * stride_x_bs + r_offs[None, :] * stride_x_r
-                x_block = tl.load(x_ptrs, mask=perm_mask[:, None] & r_mask_inner[None, :], other=0.0)
+                x_block = tl.load(x_ptrs, mask=perm_mask[:, None] & r_mask_inner[None, :], other=0.0).to(tl.float32)
 
                 n_ptrs = neurons_ptr + pid_n * stride_n_n + r_offs[:, None] * stride_n_r + d_offs[None, :] * stride_n_d
-                n_block = tl.load(n_ptrs, mask=r_mask_inner[:, None] & d_mask[None, :], other=0.0)
+                n_block = tl.load(n_ptrs, mask=r_mask_inner[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
 
                 acc += tl.dot(x_block, n_block)
 
