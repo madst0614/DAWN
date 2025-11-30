@@ -1003,36 +1003,10 @@ class NeuronAnalyzer:
             plt.close()
             print(f"  Saved: qkvm_correlation.png")
 
-        # 7.4 t-SNE of neurons (if sklearn available)
-        if HAS_SKLEARN:
-            compress_neurons = self.model.shared_neurons.compress_neurons.data.cpu().numpy()
-            N, D, R = compress_neurons.shape
-            neurons_flat = compress_neurons.reshape(N, D * R)
-
-            # PCA first for speed
-            pca = PCA(n_components=50)
-            neurons_pca = pca.fit_transform(neurons_flat)
-
-            # t-SNE
-            tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, N-1))
-            neurons_tsne = tsne.fit_transform(neurons_pca)
-
-            fig, ax = plt.subplots(figsize=(10, 10))
-            scatter = ax.scatter(neurons_tsne[:, 0], neurons_tsne[:, 1],
-                               c=range(N), cmap='viridis', alpha=0.7)
-            ax.set_title('Compress Neurons t-SNE')
-            ax.set_xlabel('t-SNE 1')
-            ax.set_ylabel('t-SNE 2')
-            plt.colorbar(scatter, ax=ax, label='Neuron ID')
-
-            # Annotate some neurons
-            for i in range(0, N, max(1, N // 20)):
-                ax.annotate(str(i), (neurons_tsne[i, 0], neurons_tsne[i, 1]), fontsize=8)
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, 'neuron_tsne.png'), dpi=150)
-            plt.close()
-            print(f"  Saved: neuron_tsne.png")
+        # 7.4 t-SNE of neurons (if sklearn available) - SKIP for speed
+        # t-SNE is very slow with high-dimensional neuron data
+        # Uncomment below if you want t-SNE visualization
+        print("  Skipping t-SNE (slow). Use analyze_neuron_svd.py for PCA visualization.")
 
         print(f"\nAll visualizations saved to: {output_dir}")
 
