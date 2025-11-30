@@ -120,46 +120,64 @@ class NeuronAnalyzer:
         print(f"n_layers: {self.n_layers}")
 
     # ============================================================
-    # 1. 뉴런 활성화 분석
+    # 1. 뉴런 활성화 분석 (GPU 최적화)
     # ============================================================
 
     @torch.no_grad()
     def analyze_neuron_activations(self, dataloader, max_batches: int = 100) -> Dict:
         """
-        1.1 뉴런별 Top 토큰
-        1.2 토큰별 뉴런 프로파일
-        1.3 품사별 뉴런 특화
+        GPU 최적화된 뉴런 활성화 분석
+        - 벡터화 연산으로 Python 루프 제거
+        - GPU에서 직접 카운트
         """
         print(f"\n{'='*60}")
-        print("1. NEURON ACTIVATION ANALYSIS")
+        print("1. NEURON ACTIVATION ANALYSIS (GPU Optimized)")
         print(f"{'='*60}")
 
         self.model.eval()
+        vocab_size = self.tokenizer.vocab_size
 
-        # Storage
-        # neuron_token_counts[comp][layer][neuron_id] = Counter({token_id: count})
-        neuron_token_counts = {
-            comp: {l: {n: Counter() for n in range(self.n_compress)}
-                   for l in range(self.n_layers)}
-            for comp in ['Q', 'K', 'V', 'M']
-        }
-        neuron_token_weights = {
-            comp: {l: {n: defaultdict(float) for n in range(self.n_compress)}
-                   for l in range(self.n_layers)}
+        # GPU 텐서로 카운트 (Layer 0만 저장 - 메모리 절약)
+        # [comp][neuron_id, token_id] = count
+        neuron_token_matrix = {
+            comp: torch.zeros(self.n_compress, vocab_size, device=self.device, dtype=torch.float32)
             for comp in ['Q', 'K', 'V', 'M']
         }
 
-        # token_neuron_profile[token_id] = {comp: Counter({neuron_id: count})}
-        token_neuron_profile = defaultdict(lambda: {comp: Counter() for comp in ['Q', 'K', 'V', 'M']})
+        # 레이어별 뉴런 사용 빈도 [comp][layer, neuron] = count
+        layer_neuron_counts = {
+            comp: torch.zeros(self.n_layers, self.n_compress, device=self.device, dtype=torch.float32)
+            for comp in ['Q', 'K', 'V', 'M']
+        }
 
-        # pos_neuron_counts[pos][comp] = Counter({neuron_id: count})
-        pos_neuron_counts = defaultdict(lambda: {comp: Counter() for comp in ['Q', 'K', 'V', 'M']})
+        # POS별 뉴런 카운트를 위한 token→POS 매핑 (배치로 처리)
+        # 미리 전체 vocab에 대해 POS 계산
+        print("  Building POS mapping for vocabulary...")
+        token_to_pos = {}
+        pos_to_idx = {}
+        pos_list = ['DET', 'AUX', 'PRON', 'ADP', 'CONJ', 'NUM', 'VERB_ING', 'VERB_ED', 'ADV', 'NOUN_SUFFIX', 'ADJ_SUFFIX', 'OTHER']
+        for i, pos in enumerate(pos_list):
+            pos_to_idx[pos] = i
 
+        # Vocab의 각 토큰에 대해 POS 태그 미리 계산
+        pos_indices = torch.zeros(vocab_size, dtype=torch.long, device=self.device)
+        for tid in range(min(vocab_size, 50000)):  # 상위 50K만
+            token_str = self.tokenizer.decode([tid]).strip()
+            pos = simple_pos_tag(token_str)
+            pos_indices[tid] = pos_to_idx.get(pos, pos_to_idx['OTHER'])
+
+        # POS별 뉴런 카운트 [pos, neuron]
+        pos_neuron_matrix = {
+            comp: torch.zeros(len(pos_list), self.n_compress, device=self.device, dtype=torch.float32)
+            for comp in ['Q', 'K', 'V', 'M']
+        }
+
+        print("  Processing batches...")
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Activation Analysis", total=max_batches)):
             if batch_idx >= max_batches:
                 break
 
-            input_ids = batch["input_ids"].to(self.device)
+            input_ids = batch["input_ids"].to(self.device)  # [B, S]
             B, S = input_ids.shape
 
             _, routing_infos = self.model(input_ids, return_routing_info=True)
@@ -176,31 +194,79 @@ class NeuronAnalyzer:
                 }
 
                 for comp, data in comp_data.items():
-                    weights = data['weights'].cpu()  # [B, S, n_compress]
+                    # indices: [B, S, k] - 선택된 뉴런
+                    indices = data['indices']  # [B, S, k]
+                    k = indices.shape[-1]
 
-                    # Top-k indices from weights
-                    topk_weights, topk_idx = torch.topk(weights, k=8, dim=-1)  # [B, S, 8]
+                    # 뉴런 사용 빈도 업데이트 (GPU에서 bincount)
+                    flat_indices = indices.view(-1)  # [B*S*k]
+                    counts = torch.bincount(flat_indices, minlength=self.n_compress).float()
+                    layer_neuron_counts[comp][layer_idx] += counts
 
-                    for b in range(B):
-                        for s in range(S):
-                            token_id = input_ids[b, s].item()
-                            token_str = self.tokenizer.decode([token_id]).strip()
-                            pos = simple_pos_tag(token_str)
+                    # Layer 0에서만 토큰-뉴런 매핑 (메모리 절약)
+                    if layer_idx == 0:
+                        # [B, S] -> [B, S, k] (브로드캐스트용)
+                        token_ids_exp = input_ids.unsqueeze(-1).expand(-1, -1, k)  # [B, S, k]
 
-                            for k_i in range(8):
-                                neuron_id = topk_idx[b, s, k_i].item()
-                                weight = topk_weights[b, s, k_i].item()
+                        # Flatten
+                        flat_tokens = token_ids_exp.reshape(-1)  # [B*S*k]
+                        flat_neurons = indices.reshape(-1)  # [B*S*k]
 
-                                # 뉴런별 토큰 카운트
-                                neuron_token_counts[comp][layer_idx][neuron_id][token_id] += 1
-                                neuron_token_weights[comp][layer_idx][neuron_id][token_id] += weight
+                        # 2D index로 scatter_add
+                        # neuron_token_matrix[comp][neuron, token] += 1
+                        idx_2d = flat_neurons * vocab_size + flat_tokens
+                        ones = torch.ones_like(idx_2d, dtype=torch.float32)
+                        neuron_token_matrix[comp].view(-1).scatter_add_(0, idx_2d, ones)
 
-                                # 토큰별 뉴런 프로파일 (layer 0만)
-                                if layer_idx == 0:
-                                    token_neuron_profile[token_id][comp][neuron_id] += 1
+                        # POS별 뉴런 카운트
+                        token_pos = pos_indices[flat_tokens]  # [B*S*k]
+                        idx_pos = token_pos * self.n_compress + flat_neurons
+                        pos_neuron_matrix[comp].view(-1).scatter_add_(0, idx_pos, ones)
 
-                                # 품사별 뉴런 카운트
-                                pos_neuron_counts[pos][comp][neuron_id] += 1
+        # CPU로 이동 및 Counter 형식으로 변환 (호환성)
+        print("  Converting to analysis format...")
+        neuron_token_counts = {
+            comp: {0: {n: Counter() for n in range(self.n_compress)}}
+            for comp in ['Q', 'K', 'V', 'M']
+        }
+        neuron_token_weights = {
+            comp: {0: {n: defaultdict(float) for n in range(self.n_compress)}}
+            for comp in ['Q', 'K', 'V', 'M']
+        }
+
+        # 각 뉴런의 Top 토큰만 추출 (메모리 절약)
+        for comp in ['Q', 'K', 'V', 'M']:
+            matrix = neuron_token_matrix[comp]  # [n_compress, vocab_size]
+            for neuron_id in range(self.n_compress):
+                row = matrix[neuron_id]
+                topk_counts, topk_tokens = torch.topk(row, k=min(100, (row > 0).sum().item() or 1))
+                for cnt, tid in zip(topk_counts.cpu().tolist(), topk_tokens.cpu().tolist()):
+                    if cnt > 0:
+                        neuron_token_counts[comp][0][neuron_id][tid] = int(cnt)
+
+        # POS 카운트 변환
+        pos_neuron_counts = defaultdict(lambda: {comp: Counter() for comp in ['Q', 'K', 'V', 'M']})
+        for comp in ['Q', 'K', 'V', 'M']:
+            matrix = pos_neuron_matrix[comp].cpu()  # [n_pos, n_compress]
+            for pos_idx, pos in enumerate(pos_list):
+                row = matrix[pos_idx]
+                for neuron_id in range(self.n_compress):
+                    cnt = int(row[neuron_id].item())
+                    if cnt > 0:
+                        pos_neuron_counts[pos][comp][neuron_id] = cnt
+
+        # 토큰별 뉴런 프로파일 (Q, Layer 0 기준)
+        token_neuron_profile = defaultdict(lambda: {comp: Counter() for comp in ['Q', 'K', 'V', 'M']})
+        matrix = neuron_token_matrix['Q'].T  # [vocab_size, n_compress]
+        # Top 활성화 토큰만
+        token_totals = matrix.sum(dim=1)  # [vocab_size]
+        top_tokens = torch.topk(token_totals, k=min(1000, (token_totals > 0).sum().item() or 1))[1]
+        for tid in top_tokens.cpu().tolist():
+            row = matrix[tid].cpu()
+            for neuron_id in range(self.n_compress):
+                cnt = int(row[neuron_id].item())
+                if cnt > 0:
+                    token_neuron_profile[tid]['Q'][neuron_id] = cnt
 
         results = {
             'neuron_top_tokens': {},
