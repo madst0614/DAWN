@@ -738,15 +738,18 @@ class TritonExpandFunction(torch.autograd.Function):
         grad_weights = torch.zeros(BS, k, device=x_flat.device, dtype=torch.float32)
 
         # PyTorch fallback
+        # Expand forward: y = x @ neuron.T where x:[R], neuron:[D,R], y:[D]
+        # grad_x = grad_y @ neuron = [D] @ [D,R] -> [R]
+        # grad_neuron = outer(grad_y, x) = [D] outer [R] -> [D,R]
         for b in range(BS):
             for s in range(k):
                 n_idx = topk_flat[b, s]
                 w = weights_flat[b, s]
 
-                grad_x[b] += w * (grad_out_flat[b] @ neurons[n_idx].T)
-                grad_neurons[n_idx] += w * torch.outer(x_flat[b], grad_out_flat[b])
+                grad_x[b] += w * (grad_out_flat[b] @ neurons[n_idx])  # [D] @ [D,R] -> [R]
+                grad_neurons[n_idx] += w * torch.outer(grad_out_flat[b], x_flat[b])  # [D] outer [R] -> [D,R]
 
-                proj = x_flat[b] @ neurons[n_idx]
+                proj = x_flat[b] @ neurons[n_idx].T  # [R] @ [R,D] -> [D]
                 grad_weights[b, s] = (grad_out_flat[b] * proj).sum()
 
         # Cast back to original dtype
