@@ -176,7 +176,7 @@ class VanillaTransformer(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, return_activations=False):
+    def forward(self, input_ids, labels=None, return_routing_info=False):
         B, S = input_ids.shape
 
         # Embeddings
@@ -196,25 +196,32 @@ class VanillaTransformer(nn.Module):
         x = self.norm(x)
         logits = self.head(x)
 
-        if return_activations:
-            # Compatibility with DAWN training script
-            # Return empty list for neuron indices
+        # Loss calculation (compatible with DAWN train.py)
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, self.vocab_size),
+                labels.view(-1),
+                ignore_index=-100
+            )
+            if return_routing_info:
+                return loss, logits, []  # Empty routing info
+            return loss, logits
+
+        if return_routing_info:
             return logits, []
         return logits
 
-    def get_loss(self, input_ids, labels, **kwargs):
-        """Compute loss (compatible with DAWN training script)"""
-        logits = self.forward(input_ids)
+    def get_config(self):
+        """Return model configuration (train.py compatible)"""
+        return self.config
 
-        ce_loss = F.cross_entropy(
-            logits.view(-1, self.vocab_size),
-            labels.view(-1),
-            ignore_index=-100
-        )
+    def count_parameters(self):
+        """Count trainable parameters (train.py compatible)"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-        loss_dict = {'ce': ce_loss.item(), 'total': ce_loss.item()}
-
-        return ce_loss, loss_dict, logits
+    def get_auxiliary_losses(self):
+        """Return auxiliary losses (train.py compatible) - none for baseline"""
+        return {}
 
     def get_num_params(self):
         """Count parameters"""

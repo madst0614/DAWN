@@ -1,0 +1,44 @@
+# DAWN v10.0 Training Config - 18M Scale (A100 80GB)
+# 8 layers for hierarchical neuron reuse
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 360000000  # 360M tokens
+  max_val_tokens: 10000000     # 10M tokens
+
+# Model Architecture
+model:
+  model_version: "10.0"
+  d_model: 320
+  n_layers: 8
+  n_heads: 4
+  rank: 64
+  n_compress: 224
+  n_expand: 56
+  n_knowledge: 256
+  knowledge_k: 12
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 256
+  num_epochs: 5
+  lr: 0.0004                # batch 256에 맞춤
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+
+  # Regularization
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10_18M
+log_dir: /content/drive/MyDrive/dawn/logs_v10_18M

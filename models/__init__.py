@@ -6,10 +6,18 @@ v10.0: Simplified Compress/Expand Architecture
 - ExpandNeurons: O 통합 [n_expand, rank, d_model]
 - KnowledgeNeurons: [n_knowledge, rank] + [n_knowledge, d_model]
 - Soft routing (no Householder)
+
+baseline: Vanilla Transformer for fair comparison
 """
 
 # v10.0 - current stable version
 from .model_v10 import DAWN
+
+# Baseline for comparison
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from baseline_transformer import VanillaTransformer
 
 # Version registry
 from .version_registry import (
@@ -27,6 +35,7 @@ from .version_registry import (
 __all__ = [
     # Models
     'DAWN',
+    'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
     'normalize_version',
@@ -47,16 +56,19 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "10.0" or "10"
+        version: "10.0", "10", or "baseline"
         config: Model configuration dict
 
     Returns:
-        DAWN model instance
+        Model instance (DAWN or VanillaTransformer)
     """
+    if version == "baseline":
+        return VanillaTransformer(**config)
+
     version = normalize_version(version)
 
     if version == "10.0":
         return DAWN(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported version: 10.0")
+                        f"Supported versions: 10.0, baseline")

@@ -1060,7 +1060,8 @@ def main():
     # v6.0: Basis FFN parameters
     args.neuron_rank = cfg['model'].get('neuron_rank', None)  # v6.0: not used anymore (backward compat)
     args.n_basis = cfg['model'].get('n_basis', 8)
-    args.basis_rank = cfg['model'].get('basis_rank', 64)
+    # v10+ uses 'rank' key, older versions use 'basis_rank'
+    args.basis_rank = cfg['model'].get('basis_rank', cfg['model'].get('rank', 64))
     args.mod_rank = cfg['model'].get('mod_rank', None)  # v5.0 compatibility (ignored)
     args.router_temperature = cfg['model'].get('router_temperature', None)  # v6.0 only (v7.0 ignores)
 
@@ -1251,15 +1252,21 @@ def main():
         args.max_seq_len = checkpoint_config.get('max_seq_len', args.max_seq_len)
         args.dropout = checkpoint_config.get('dropout', args.dropout)
 
-        # v8.0+ parameters
+        # v8.0+ / v10+ shared parameters
         args.rank = checkpoint_config.get('rank', getattr(args, 'rank', 64))
         args.basis_rank = args.rank  # Sync basis_rank with rank for model creation
+        args.n_knowledge = checkpoint_config.get('n_knowledge', getattr(args, 'n_knowledge', 64))
+        args.knowledge_k = checkpoint_config.get('knowledge_k', getattr(args, 'knowledge_k', 8))
+
+        # v8.x specific parameters
         args.n_input = checkpoint_config.get('n_input', getattr(args, 'n_input', 8))
         args.n_process = checkpoint_config.get('n_process', getattr(args, 'n_process', 32))
         args.n_output = checkpoint_config.get('n_output', getattr(args, 'n_output', 8))
         args.process_k = checkpoint_config.get('process_k', getattr(args, 'process_k', 3))
-        args.n_knowledge = checkpoint_config.get('n_knowledge', getattr(args, 'n_knowledge', 64))
-        args.knowledge_k = checkpoint_config.get('knowledge_k', getattr(args, 'knowledge_k', 8))
+
+        # v10.0 specific parameters
+        args.n_compress = checkpoint_config.get('n_compress', getattr(args, 'n_compress', 4))
+        args.n_expand = checkpoint_config.get('n_expand', getattr(args, 'n_expand', 4))
 
         if checkpoint_training_config:
             # Training hyperparameters (only if not overridden by CLI)
@@ -1279,7 +1286,9 @@ def main():
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
-        if args.model_version in ['8.0', '8.1', '8.2', '8.3']:
+        if args.model_version == '10.0':
+            print(f"   → v10.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.rank}, n_knowledge={args.n_knowledge}")
+        elif args.model_version in ['8.0', '8.1', '8.2', '8.3']:
             print(f"   → v8.0+ params: n_knowledge={args.n_knowledge}, knowledge_k={args.knowledge_k}, rank={args.rank}")
 
     # ============================================================

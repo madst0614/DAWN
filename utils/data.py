@@ -417,6 +417,9 @@ def apply_mlm_masking(input_ids, tokenizer, config=None):
     if config is None:
         config = MLM_CONFIG
 
+    # Ensure int64 dtype (pt files may have int32)
+    input_ids = input_ids.long()
+
     labels = input_ids.clone()
     mask_prob = config.get("mask_prob", 0.15)
     device = input_ids.device
@@ -496,6 +499,48 @@ class TextDataset(Dataset):
         }
 
 
+class TokenDataset(Dataset):
+    """Dataset for pre-tokenized data (from .pt files)"""
+    def __init__(self, tokens, max_length=128):
+        """
+        Args:
+            tokens: Tensor of shape [N, seq_len] containing token IDs
+            max_length: Maximum sequence length (truncate if longer)
+        """
+        self.tokens = tokens
+        self.max_length = max_length
+
+        # Debug: print shape info
+        if hasattr(tokens, 'shape'):
+            print(f"  TokenDataset: tokens shape = {tokens.shape}")
+
+    def __len__(self):
+        return self.tokens.shape[0]
+
+    def __getitem__(self, idx):
+        input_ids = self.tokens[idx]
+
+        # Handle different tensor shapes
+        if input_ids.dim() == 0:
+            # 0-d tensor (scalar) - shouldn't happen, but wrap in 1D
+            input_ids = input_ids.unsqueeze(0)
+
+        seq_len = input_ids.shape[0]
+
+        # Truncate if needed
+        if seq_len > self.max_length:
+            input_ids = input_ids[:self.max_length]
+            seq_len = self.max_length
+
+        # Create attention mask (1 for real tokens, will handle padding in collate)
+        attention_mask = torch.ones(seq_len, dtype=torch.long)
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
+        }
+
+
 def collate_fn_dynamic_padding(batch, tokenizer, max_seq_len=None):
     """
     Collate function with padding.
@@ -548,12 +593,59 @@ def collate_fn_dynamic_padding(batch, tokenizer, max_seq_len=None):
     }
 
 
+def load_single_file(filepath, max_length=128):
+    """
+    Load data from a single file (.pkl or .pt format).
+
+    Args:
+        filepath: Path to the data file
+        max_length: Sequence length for reshaping flat token tensors
+
+    Returns:
+        Tuple of (data, is_pretokenized)
+        - For .pkl: (list of texts, False)
+        - For .pt: (tensor of tokens [N, seq_len], True)
+    """
+    if filepath.endswith('.pt'):
+        # Pre-tokenized data
+        data = torch.load(filepath)
+        if isinstance(data, dict) and 'tokens' in data:
+            tokens = data['tokens']
+        elif isinstance(data, torch.Tensor):
+            tokens = data
+        else:
+            raise ValueError(f"Unknown .pt format. Expected dict with 'tokens' or tensor, got {type(data)}")
+
+        # Reshape flat 1D tokens to [N, seq_len]
+        if tokens.dim() == 1:
+            total_tokens = tokens.shape[0]
+            num_sequences = total_tokens // max_length
+            tokens = tokens[:num_sequences * max_length]  # Trim to fit
+            tokens = tokens.view(num_sequences, max_length)
+            print(f"  Reshaped flat tokens to {tokens.shape[0]:,} sequences of length {max_length}")
+
+        return tokens, True
+    else:
+        # Text data (.pkl)
+        with open(filepath, 'rb') as f:
+            texts = pickle.load(f)
+        return texts, False
+
+
 def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
     """Load data from config paths with FIXED padding to max_length
 
     Supports both single file and multiple files:
     - Single file: data_config['train_file'], data_config['val_file']
     - Multiple files: data_config['train_files'], data_config['val_files'] (list)
+
+    Supports both formats:
+    - .pkl: List of text strings (will be tokenized)
+    - .pt: Pre-tokenized tensor with 'tokens' key
+
+    Optional config options:
+    - max_train_tokens: Limit training data (e.g., 360000000 for 360M)
+    - max_val_tokens: Limit validation data (default: 10M)
     """
     from transformers import AutoTokenizer
     from functools import partial
@@ -562,6 +654,10 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
     if tokenizer_path is None:
         tokenizer_path = "bert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    # Get optional token limits from config
+    max_train_tokens = data_config.get('max_train_tokens', None)
+    max_val_tokens = data_config.get('max_val_tokens', 10_000_000)  # Default 10M
 
     # Load data from config paths
     base_dir = data_config['base_dir']
@@ -578,33 +674,80 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
 
     print(f"Loading data from: {base_dir}")
 
-    # Load train texts from all files
-    train_texts = []
+    # Load train data from all files
+    train_data = []
+    train_is_pretokenized = None
     for train_file in train_files:
         train_path = os.path.join(base_dir, train_file)
         if not os.path.exists(train_path):
             raise FileNotFoundError(f"Train data not found: {train_path}")
-        with open(train_path, 'rb') as f:
-            texts = pickle.load(f)
-            train_texts.extend(texts)
-            print(f"  Loaded {len(texts):,} texts from {train_file}")
 
-    # Load validation texts from all files
-    val_texts = []
+        data, is_pretokenized = load_single_file(train_path, max_length)
+
+        # Check consistency
+        if train_is_pretokenized is None:
+            train_is_pretokenized = is_pretokenized
+        elif train_is_pretokenized != is_pretokenized:
+            raise ValueError("Cannot mix .pkl and .pt files in the same split")
+
+        if is_pretokenized:
+            train_data.append(data)
+            print(f"  Loaded {len(data):,} sequences from {train_file} (pre-tokenized)")
+        else:
+            train_data.extend(data)
+            print(f"  Loaded {len(data):,} texts from {train_file}")
+
+    # Load validation data from all files
+    val_data = []
+    val_is_pretokenized = None
     for val_file in val_files:
         val_path = os.path.join(base_dir, val_file)
         if not os.path.exists(val_path):
             raise FileNotFoundError(f"Validation data not found: {val_path}")
-        with open(val_path, 'rb') as f:
-            texts = pickle.load(f)
-            val_texts.extend(texts)
-            print(f"  Loaded {len(texts):,} texts from {val_file}")
 
-    print(f"Total: {len(train_texts):,} train texts, {len(val_texts):,} val texts")
+        data, is_pretokenized = load_single_file(val_path, max_length)
 
-    # Create datasets
-    train_dataset = TextDataset(train_texts, tokenizer, max_length)
-    val_dataset = TextDataset(val_texts, tokenizer, max_length)
+        # Check consistency
+        if val_is_pretokenized is None:
+            val_is_pretokenized = is_pretokenized
+        elif val_is_pretokenized != is_pretokenized:
+            raise ValueError("Cannot mix .pkl and .pt files in the same split")
+
+        if is_pretokenized:
+            val_data.append(data)
+            print(f"  Loaded {len(data):,} sequences from {val_file} (pre-tokenized)")
+        else:
+            val_data.extend(data)
+            print(f"  Loaded {len(data):,} texts from {val_file}")
+
+    # Create datasets based on data type
+    if train_is_pretokenized:
+        # Concatenate all token tensors
+        train_tokens = torch.cat(train_data, dim=0) if len(train_data) > 1 else train_data[0]
+        # Limit training data if specified
+        if max_train_tokens is not None:
+            max_train_seqs = max_train_tokens // max_length
+            if len(train_tokens) > max_train_seqs:
+                train_tokens = train_tokens[:max_train_seqs]
+                print(f"  Limited training to {max_train_seqs:,} sequences ({max_train_tokens/1e6:.0f}M tokens)")
+        train_dataset = TokenDataset(train_tokens, max_length)
+        print(f"Total: {len(train_tokens):,} train sequences (pre-tokenized)")
+    else:
+        train_dataset = TextDataset(train_data, tokenizer, max_length)
+        print(f"Total: {len(train_data):,} train texts")
+
+    if val_is_pretokenized:
+        val_tokens = torch.cat(val_data, dim=0) if len(val_data) > 1 else val_data[0]
+        # Limit validation data
+        max_val_seqs = max_val_tokens // max_length
+        if len(val_tokens) > max_val_seqs:
+            val_tokens = val_tokens[:max_val_seqs]
+            print(f"  Limited validation to {max_val_seqs:,} sequences ({max_val_tokens/1e6:.0f}M tokens)")
+        val_dataset = TokenDataset(val_tokens, max_length)
+        print(f"Total: {len(val_tokens):,} val sequences (pre-tokenized)")
+    else:
+        val_dataset = TextDataset(val_data, tokenizer, max_length)
+        print(f"Total: {len(val_data):,} val texts")
 
     # Create collate function with tokenizer and fixed max_length
     collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer, max_seq_len=max_length)
