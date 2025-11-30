@@ -1,0 +1,53 @@
+# Vanilla Transformer Baseline - 18M Scale
+# Fair comparison with DAWN v10.0 18M
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 360000000  # 360M tokens
+  max_val_tokens: 10000000     # 10M tokens
+
+# Model Architecture
+model:
+  model_version: "baseline"
+  d_model: 320
+  n_layers: 6
+  n_heads: 4
+  d_ff: 1280              # 4 * d_model
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training (same as DAWN 18M)
+training:
+  batch_size: 256
+  num_epochs: 5
+  lr: 0.0004
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+
+  # Regularization (ignored for baseline)
+  orthogonality_weight: 0.0
+  diversity_weight: 0.0
+  load_balance_weight: 0.0
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_baseline_18M
+log_dir: /content/drive/MyDrive/dawn/logs_baseline_18M
+
+# 파라미터 계산:
+#   Embedding: 30000 × 320 = 9,600,000
+#   Pos Embedding: 128 × 320 = 40,960
+#   Per Layer:
+#     - Attention (Q,K,V,O): 4 × 320² = 409,600
+#     - FFN: 320×1280 + 1280×320 = 819,200
+#     - LayerNorm: 2 × 320 × 2 = 1,280
+#     - Total: ~1,230,080
+#   6 Layers: ~7,380,480
+#   Final LayerNorm: 640
+#
+#   Total: ~17M (weight tying 적용)
