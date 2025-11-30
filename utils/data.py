@@ -507,18 +507,30 @@ class TokenDataset(Dataset):
         self.tokens = tokens
         self.max_length = max_length
 
+        # Debug: print shape info
+        if hasattr(tokens, 'shape'):
+            print(f"  TokenDataset: tokens shape = {tokens.shape}")
+
     def __len__(self):
-        return len(self.tokens)
+        return self.tokens.shape[0]
 
     def __getitem__(self, idx):
         input_ids = self.tokens[idx]
 
+        # Handle different tensor shapes
+        if input_ids.dim() == 0:
+            # 0-d tensor (scalar) - shouldn't happen, but wrap in 1D
+            input_ids = input_ids.unsqueeze(0)
+
+        seq_len = input_ids.shape[0]
+
         # Truncate if needed
-        if len(input_ids) > self.max_length:
+        if seq_len > self.max_length:
             input_ids = input_ids[:self.max_length]
+            seq_len = self.max_length
 
         # Create attention mask (1 for real tokens, will handle padding in collate)
-        attention_mask = torch.ones(len(input_ids), dtype=torch.long)
+        attention_mask = torch.ones(seq_len, dtype=torch.long)
 
         return {
             'input_ids': input_ids,
