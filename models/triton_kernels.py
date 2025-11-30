@@ -606,7 +606,7 @@ class TritonCompressFunction(torch.autograd.Function):
         original_dtype = grad_output.dtype
 
         # Convert to float32 for computation
-        grad_out_flat = grad_output.view(BS, R).float().contiguous()
+        grad_out_flat = grad_output.reshape(BS, R).float().contiguous()
         x_flat = x_flat.float()
         neurons = neurons.float()
         weights_flat = weights_flat.float()
@@ -668,7 +668,7 @@ class TritonCompressFunction(torch.autograd.Function):
         )
 
         # Cast back to original dtype
-        return grad_x.view(B, S, D).to(original_dtype), grad_neurons.to(original_dtype), None, grad_weights.view(B, S, k).to(original_dtype)
+        return grad_x.reshape(B, S, D).to(original_dtype), grad_neurons.to(original_dtype), None, grad_weights.reshape(B, S, k).to(original_dtype)
 
 
 class TritonExpandFunction(torch.autograd.Function):
@@ -728,7 +728,7 @@ class TritonExpandFunction(torch.autograd.Function):
         original_dtype = grad_output.dtype
 
         # Convert to float32 for computation
-        grad_out_flat = grad_output.view(BS, D).float()
+        grad_out_flat = grad_output.reshape(BS, D).float().contiguous()
         x_flat = x_flat.float()
         neurons = neurons.float()
         weights_flat = weights_flat.float()
@@ -750,7 +750,7 @@ class TritonExpandFunction(torch.autograd.Function):
                 grad_weights[b, s] = (grad_out_flat[b] * proj).sum()
 
         # Cast back to original dtype
-        return grad_x.view(B, S, R).to(original_dtype), grad_neurons.to(original_dtype), None, grad_weights.view(B, S, k).to(original_dtype)
+        return grad_x.reshape(B, S, R).to(original_dtype), grad_neurons.to(original_dtype), None, grad_weights.reshape(B, S, k).to(original_dtype)
 
 
 # ============================================================
