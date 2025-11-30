@@ -36,10 +36,10 @@ model:
 # Training
 training:
   batch_size: 128
-  num_epochs: 3
+  num_epochs: 30
   lr: 0.0003
   weight_decay: 0.1
-  warmup_ratio: 0.05
+  warmup_epochs: 2
 
   # Regularization
   orthogonality_weight: 0.01
