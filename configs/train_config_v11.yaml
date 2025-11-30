@@ -14,7 +14,7 @@ data:
 
 # Model Architecture
 model:
-  model_version: "11.0"
+  model_version: "10.0"  # v10 모델 사용, 설정만 다름 (rank=16 실험)
   d_model: 256
   n_layers: 4
   n_heads: 4
