@@ -590,14 +590,18 @@ def collate_fn_dynamic_padding(batch, tokenizer, max_seq_len=None):
     }
 
 
-def load_single_file(filepath):
+def load_single_file(filepath, max_length=128):
     """
     Load data from a single file (.pkl or .pt format).
+
+    Args:
+        filepath: Path to the data file
+        max_length: Sequence length for reshaping flat token tensors
 
     Returns:
         Tuple of (data, is_pretokenized)
         - For .pkl: (list of texts, False)
-        - For .pt: (tensor of tokens, True)
+        - For .pt: (tensor of tokens [N, seq_len], True)
     """
     if filepath.endswith('.pt'):
         # Pre-tokenized data
@@ -608,6 +612,15 @@ def load_single_file(filepath):
             tokens = data
         else:
             raise ValueError(f"Unknown .pt format. Expected dict with 'tokens' or tensor, got {type(data)}")
+
+        # Reshape flat 1D tokens to [N, seq_len]
+        if tokens.dim() == 1:
+            total_tokens = tokens.shape[0]
+            num_sequences = total_tokens // max_length
+            tokens = tokens[:num_sequences * max_length]  # Trim to fit
+            tokens = tokens.view(num_sequences, max_length)
+            print(f"  Reshaped flat tokens to {tokens.shape[0]:,} sequences of length {max_length}")
+
         return tokens, True
     else:
         # Text data (.pkl)
@@ -658,7 +671,7 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
         if not os.path.exists(train_path):
             raise FileNotFoundError(f"Train data not found: {train_path}")
 
-        data, is_pretokenized = load_single_file(train_path)
+        data, is_pretokenized = load_single_file(train_path, max_length)
 
         # Check consistency
         if train_is_pretokenized is None:
@@ -681,7 +694,7 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
         if not os.path.exists(val_path):
             raise FileNotFoundError(f"Validation data not found: {val_path}")
 
-        data, is_pretokenized = load_single_file(val_path)
+        data, is_pretokenized = load_single_file(val_path, max_length)
 
         # Check consistency
         if val_is_pretokenized is None:
