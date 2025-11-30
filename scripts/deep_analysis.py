@@ -1264,11 +1264,16 @@ class DAWNDeepAnalysis:
         self.model.to(self.device)
         self.model.eval()
 
-        # Load tokenizer
+        # Load tokenizer (matching model vocab_size)
         from transformers import AutoTokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Check if model was trained with BERT vocab (30522) or GPT-2 vocab (50257)
+        model_vocab_size = self.model.vocab_size if hasattr(self.model, 'vocab_size') else config.get('vocab_size', 30522)
+        if model_vocab_size <= 32000:
+            self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
 
         print(f"Model loaded: {sum(p.numel() for p in self.model.parameters())/1e6:.1f}M params")
 
