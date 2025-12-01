@@ -603,9 +603,9 @@ def main():
     parser.add_argument('--task', type=str, required=True,
                         help='GLUE task name or "all" for all tasks')
     parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to DAWN pretrained checkpoint')
+                        help='Path to checkpoint directory or best_model.pt file')
     parser.add_argument('--output_dir', type=str, default=None,
-                        help='Output directory for results')
+                        help='Output directory (default: {checkpoint_dir}/glue)')
     parser.add_argument('--model_version', type=str, default='12.0',
                         help='DAWN model version')
     parser.add_argument('--collect_neurons', action='store_true',
@@ -617,10 +617,32 @@ def main():
 
     args = parser.parse_args()
 
+    # Handle checkpoint path: directory or file
+    checkpoint_path = args.checkpoint
+    if os.path.isdir(checkpoint_path):
+        # Directory provided - look for best_model.pt
+        checkpoint_dir = checkpoint_path
+        checkpoint_file = os.path.join(checkpoint_path, 'best_model.pt')
+        if not os.path.exists(checkpoint_file):
+            # Try other common names
+            for name in ['best_model.pt', 'model.pt', 'checkpoint.pt']:
+                candidate = os.path.join(checkpoint_path, name)
+                if os.path.exists(candidate):
+                    checkpoint_file = candidate
+                    break
+            else:
+                raise FileNotFoundError(f"No checkpoint file found in {checkpoint_path}")
+        checkpoint_path = checkpoint_file
+    else:
+        # File provided
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+
+    print(f"Checkpoint file: {checkpoint_path}")
+    print(f"Checkpoint dir: {checkpoint_dir}")
+
     # Setup output directory
     if args.output_dir is None:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        args.output_dir = f'glue_results_{timestamp}'
+        args.output_dir = os.path.join(checkpoint_dir, 'glue')
 
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"Output directory: {args.output_dir}")
@@ -644,7 +666,7 @@ def main():
 
         result = train_glue_task(
             task_name=task,
-            checkpoint_path=args.checkpoint,
+            checkpoint_path=checkpoint_path,
             output_dir=args.output_dir,
             model_version=args.model_version,
             collect_neurons=args.collect_neurons,
