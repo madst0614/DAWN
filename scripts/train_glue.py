@@ -441,13 +441,13 @@ def train_glue_task(
         train_dataset,
         batch_size=task_config['batch_size'],
         shuffle=True,
-        num_workers=2,
+        num_workers=0,
     )
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=task_config['batch_size'],
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
     )
 
     # Load DAWN checkpoint
