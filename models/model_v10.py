@@ -27,7 +27,7 @@ class SharedNeurons(nn.Module):
 
     - CompressNeurons: [n_compress, d_model, rank] - Q/K/V/M 공유
     - ExpandNeurons: [n_expand, rank, d_model] - O 공유
-    - KnowledgeNeurons: [n_knowledge, rank] + [n_knowledge, d_model]
+    - KnowledgeNeurons: [n_knowledge, knowledge_rank] + [n_knowledge, d_model]
     """
     def __init__(
         self,
@@ -36,10 +36,12 @@ class SharedNeurons(nn.Module):
         n_compress: int,
         n_expand: int,
         n_knowledge: int,
+        knowledge_rank: int = None,  # 별도 rank, None이면 rank 사용
     ):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
         self.n_compress = n_compress
         self.n_expand = n_expand
         self.n_knowledge = n_knowledge
@@ -50,8 +52,8 @@ class SharedNeurons(nn.Module):
         # ExpandNeurons: rank → d_model (O 공유)
         self.expand_neurons = nn.Parameter(torch.zeros(n_expand, rank, d_model))
 
-        # KnowledgeNeurons
-        self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, rank))
+        # KnowledgeNeurons (별도 knowledge_rank 사용)
+        self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, self.knowledge_rank))
         self.knowledge_V = nn.Parameter(torch.zeros(n_knowledge, d_model))
 
         self._init_parameters()
@@ -240,6 +242,7 @@ class NeuronCircuit(nn.Module):
             'K': k_info,
             'V': v_info,
             'O': o_info,
+            'attn_weights': attn.detach(),  # [B, H, S, S] attention weights
         }
         return output, routing_info
 
@@ -257,15 +260,23 @@ class NeuronMemory(nn.Module):
         rank: int,
         n_compress: int,
         knowledge_k: int = 8,
+        knowledge_rank: int = None,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.rank = rank
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
         self.knowledge_k = knowledge_k
 
         # Query Compressor
         self.query_compressor = Compressor(shared_neurons, d_model, rank, n_compress)
+
+        # Query projection if knowledge_rank differs from rank
+        if self.knowledge_rank != rank:
+            self.query_proj = nn.Linear(rank, self.knowledge_rank, bias=False)
+        else:
+            self.query_proj = None
 
     def forward(self, x):
         """
@@ -280,11 +291,15 @@ class NeuronMemory(nn.Module):
         # Query compression
         Q, q_info = self.query_compressor(x)  # [B, S, rank]
 
+        # Project to knowledge_rank if needed
+        if self.query_proj is not None:
+            Q = self.query_proj(Q)  # [B, S, knowledge_rank]
+
         # Knowledge lookup
-        K = self.shared_neurons.knowledge_K  # [n_knowledge, rank]
+        K = self.shared_neurons.knowledge_K  # [n_knowledge, knowledge_rank]
         V = self.shared_neurons.knowledge_V  # [n_knowledge, d_model]
 
-        scores = Q @ K.T / math.sqrt(self.rank)  # [B, S, n_knowledge]
+        scores = Q @ K.T / math.sqrt(self.knowledge_rank)  # [B, S, n_knowledge]
         topk_scores, topk_idx = torch.topk(scores, self.knowledge_k, dim=-1)
         weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
 
@@ -315,6 +330,7 @@ class DAWNBlock(nn.Module):
         n_compress: int,
         n_expand: int,
         knowledge_k: int,
+        knowledge_rank: int = None,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -323,7 +339,7 @@ class DAWNBlock(nn.Module):
             shared_neurons, d_model, n_heads, rank, n_compress, n_expand, dropout
         )
         self.memory = NeuronMemory(
-            shared_neurons, d_model, rank, n_compress, knowledge_k
+            shared_neurons, d_model, rank, n_compress, knowledge_k, knowledge_rank
         )
 
         self.norm1 = nn.LayerNorm(d_model)
@@ -373,6 +389,7 @@ class DAWN(nn.Module):
         n_expand: int = 64,
         n_knowledge: int = 80,
         knowledge_k: int = 10,
+        knowledge_rank: int = None,  # 별도 rank, None이면 rank 사용
         dropout: float = 0.1,
         **kwargs
     ):
@@ -383,6 +400,7 @@ class DAWN(nn.Module):
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.rank = rank
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
         self.max_seq_len = max_seq_len
 
         # Config 저장
@@ -406,6 +424,7 @@ class DAWN(nn.Module):
             n_compress=n_compress,
             n_expand=n_expand,
             n_knowledge=n_knowledge,
+            knowledge_rank=self.knowledge_rank,
         )
 
         # Layers
@@ -418,6 +437,7 @@ class DAWN(nn.Module):
                 n_compress=n_compress,
                 n_expand=n_expand,
                 knowledge_k=knowledge_k,
+                knowledge_rank=self.knowledge_rank,
                 dropout=dropout,
             )
             for _ in range(n_layers)
@@ -607,6 +627,7 @@ class DAWN(nn.Module):
             'n_layers': self.n_layers,
             'n_heads': self.n_heads,
             'rank': self.rank,
+            'knowledge_rank': self.knowledge_rank,
             'max_seq_len': self.max_seq_len,
             'n_compress': self.n_compress,
             'n_expand': self.n_expand,

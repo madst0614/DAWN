@@ -1,5 +1,5 @@
-# DAWN v10.0 Training Config
-# 실험: d=320, rank=64 (baseline)
+# DAWN v10.3 Training Config
+# 실험: d=320, rank=128 vs rank=64 vs rank=32 비교
 
 # Data
 data:
@@ -15,14 +15,15 @@ model:
   d_model: 320
   n_layers: 4
   n_heads: 4
-  rank: 64
+  rank: 128               # 64 → 128 (2배)
 
-  n_compress: 48
-  n_expand: 12
+  # 뉴런 수 절반 (파라미터 동일 유지)
+  n_compress: 24          # 48 → 24 (절반)
+  n_expand: 6             # 12 → 6 (절반)
 
   # Top-K Selection
-  compress_top_k: 8
-  expand_top_k: 6
+  compress_top_k: 6       # 비율 유지
+  expand_top_k: 4
   router_noise: 0.1
 
   n_knowledge: 80
@@ -44,14 +45,14 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10_0
-log_dir: /content/drive/MyDrive/dawn/logs_v10_0
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10_3
+log_dir: /content/drive/MyDrive/dawn/logs_v10_3
 
 # =============================================================================
 # Rank Ablation 비교 (d=320, 4L, 동일 파라미터 ~0.98M compress)
 # =============================================================================
 #
-# | 항목              | v10.3             | v10.0 (this)      | v10.2              |
+# | 항목              | v10.3 (this)      | v10.0 (baseline)  | v10.2              |
 # |-------------------|-------------------|-------------------|--------------------|
 # | rank              | 128               | 64                | 32                 |
 # | n_compress        | 24                | 48                | 96                 |

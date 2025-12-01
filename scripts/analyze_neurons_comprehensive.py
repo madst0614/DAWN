@@ -194,15 +194,15 @@ class NeuronAnalyzer:
                 }
 
                 for comp, data in comp_data.items():
-                    # v10.0: weights only [B, S, N], v10.1: weights + indices
+                    # v10.0: weights [B, S, N], may have indices for top-k
                     weights = data['weights']  # [B, S, N] or [B, S, k]
 
                     if 'indices' in data:
-                        # v10.1: Top-K selected
+                        # Top-K selected
                         indices = data['indices']  # [B, S, k]
                         k = indices.shape[-1]
                     else:
-                        # v10.0: All neurons, get top-k from weights
+                        # All neurons, get top-k from weights
                         k = min(8, weights.shape[-1])
                         _, indices = torch.topk(weights, k, dim=-1)  # [B, S, k]
 

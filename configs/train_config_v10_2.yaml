@@ -1,0 +1,67 @@
+# DAWN v10.2 Training Config
+# 실험: d=320, rank=32 vs rank=64 비교
+# 가설: rank=32가 sweet spot일 수 있음
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - val/wikitext_5to1_texts.pkl
+
+# Model Architecture
+model:
+  model_version: "10.0"
+  d_model: 320            # 320 유지
+  n_layers: 4
+  n_heads: 4
+  rank: 32                # 64 → 32
+
+  # 뉴런 수 2배 증가 (파라미터 동일 유지)
+  n_compress: 96          # 48 → 96 (2배)
+  n_expand: 24            # 12 → 24 (2배)
+
+  # Top-K Selection
+  compress_top_k: 12
+  expand_top_k: 8
+  router_noise: 0.1
+
+  n_knowledge: 80         # 기존과 동일
+  knowledge_k: 10
+  knowledge_rank: 64
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v10_2
+log_dir: /content/drive/MyDrive/dawn/logs_v10_2
+
+# =============================================================================
+# Rank Ablation 비교 (d=320, 4L, 동일 파라미터)
+# =============================================================================
+#
+# | 항목              | v10.0 (baseline)  | v10.2 (this)       |
+# |-------------------|-------------------|--------------------|
+# | d_model           | 320               | 320                |
+# | rank              | 64                | 32                 |
+# | n_compress        | 48                | 96                 |
+# | n_expand          | 12                | 24                 |
+# | compress params   | 48×320×64=0.98M   | 96×320×32=0.98M    |
+# | expand params     | 12×64×320=0.25M   | 24×32×320=0.25M    |
+# | 표현력 (k×rank)   | 8×64=512          | 12×32=384          |
+# | 뉴런 granularity  | 큰 덩어리         | 중간               |
+#
+# =============================================================================

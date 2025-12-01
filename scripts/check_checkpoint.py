@@ -33,8 +33,8 @@ print(f"  ... total {len(keys)} keys")
 print("\n=== Model Structure Detection ===")
 has_per_layer = any('layers.0.attn.shared_neurons' in k for k in keys)
 has_global = any(k.startswith('shared_neurons.') for k in keys)
-print(f"  Per-layer shared_neurons (v10.0): {has_per_layer}")
-print(f"  Global shared_neurons (v10.1): {has_global}")
+print(f"  Per-layer shared_neurons: {has_per_layer}")
+print(f"  Global shared_neurons: {has_global}")
 
 # Check compress/expand neuron shapes
 for k in keys:

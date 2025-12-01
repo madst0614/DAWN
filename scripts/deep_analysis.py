@@ -649,14 +649,20 @@ class SemanticAnalyzer:
             _, routing_infos = self.model(input_ids, return_routing_info=True)
 
             # Only use first layer for simplicity
-            routing_info = routing_infos[0]
+            layer_info = routing_infos[0]
+            attn_routing = layer_info.get('attention', layer_info)
+            mem_routing = layer_info.get('memory', {})
 
-            for comp_key in ['compress_Q', 'compress_K', 'compress_V', 'compress_M']:
-                if comp_key not in routing_info:
-                    continue
+            # Collect routing data from attention Q/K/V and memory M
+            comp_data = {}
+            for key in ['Q', 'K', 'V']:
+                if key in attn_routing:
+                    comp_data[key] = attn_routing[key]
+            if 'M' in mem_routing:
+                comp_data['M'] = mem_routing['M']
 
-                data = routing_info[comp_key]
-                weights = data['weights']  # [B, S, k]
+            for comp_key, data in comp_data.items():
+                weights = data['weights']  # [B, S, N] or [B, S, k]
 
                 if 'indices' in data:
                     indices = data['indices']  # [B, S, k]
@@ -697,16 +703,16 @@ class SemanticAnalyzer:
                             positions = (input_ids[b] == token_id).nonzero(as_tuple=True)[0]
                             for pos in positions:
                                 if pos < S:
-                                    for comp_key in ['compress_Q']:
-                                        if comp_key in routing_info:
-                                            data = routing_info[comp_key]
-                                            if 'indices' in data:
-                                                indices = data['indices'][b, pos].cpu().numpy()
-                                            else:
-                                                _, idx = torch.topk(data['weights'][b, pos], 8)
-                                                indices = idx.cpu().numpy()
-                                            for ni in indices:
-                                                ner_neuron_counts[label][ni] += 1
+                                    # Use Q routing from attention
+                                    if 'Q' in attn_routing:
+                                        data = attn_routing['Q']
+                                        if 'indices' in data:
+                                            indices = data['indices'][b, pos].cpu().numpy()
+                                        else:
+                                            _, idx = torch.topk(data['weights'][b, pos], 8)
+                                            indices = idx.cpu().numpy()
+                                        for ni in indices:
+                                            ner_neuron_counts[label][ni] += 1
 
         # Find top neurons for each category
         results = {
@@ -1133,8 +1139,8 @@ class AdvancedVisualizer:
         input_ids = torch.tensor([tokens], device=self.device)
         token_strs = [self.tokenizer.decode([t]).strip() for t in tokens]
 
-        # Get outputs with attention
-        outputs = self.model(input_ids, return_routing_info=True, output_attentions=True)
+        # Get outputs with routing info
+        outputs = self.model(input_ids, return_routing_info=True)
 
         # This depends on model architecture - adjust as needed
         if len(outputs) >= 2:
@@ -1156,39 +1162,56 @@ class AdvancedVisualizer:
         for layer_idx in range(min(4, len(routing_infos))):
             ax = axes[0, layer_idx]
 
-            routing_info = routing_infos[layer_idx]
-            if 'compress_Q' in routing_info:
-                data = routing_info['compress_Q']
-                if 'indices' in data:
-                    indices = data['indices'][0].cpu().numpy()
-                else:
-                    _, indices = torch.topk(data['weights'][0], 8, dim=-1)
-                    indices = indices.cpu().numpy()
+            layer_info = routing_infos[layer_idx]
+            attn_routing = layer_info.get('attention', layer_info)
 
-                weights = data['weights'][0].cpu().numpy()
+            if 'Q' in attn_routing:
+                data = attn_routing['Q']
+                weights = data['weights'][0].cpu().numpy()  # [S, N] or [S, k]
+
+                if 'indices' in data:
+                    indices = data['indices'][0].cpu().numpy()  # [S, k]
+                else:
+                    k = min(8, weights.shape[-1])
+                    _, idx = torch.topk(torch.tensor(weights), k, dim=-1)
+                    indices = idx.numpy()
 
                 # Heatmap of top-k neurons
                 unique_neurons = sorted(set(indices.flatten()))[:30]
                 neuron_to_idx = {n: i for i, n in enumerate(unique_neurons)}
 
                 heatmap = np.zeros((n_tokens, len(unique_neurons)))
-                for t in range(n_tokens):
+                for t in range(min(n_tokens, indices.shape[0])):
                     for ki in range(indices.shape[1]):
                         n_idx = indices[t, ki]
                         if n_idx in neuron_to_idx:
-                            heatmap[t, neuron_to_idx[n_idx]] += weights[t, ki]
+                            w_idx = ki if weights.shape[-1] == indices.shape[-1] else n_idx
+                            heatmap[t, neuron_to_idx[n_idx]] += weights[t, w_idx] if w_idx < weights.shape[-1] else 0
 
                 ax.imshow(heatmap.T, aspect='auto', cmap='Blues')
                 ax.set_xticks(range(n_tokens))
                 ax.set_xticklabels(token_strs, rotation=45, ha='right', fontsize=7)
-                ax.set_title(f'Layer {layer_idx} Neurons')
+                ax.set_title(f'Layer {layer_idx} Q Neurons')
 
-        # Bottom row: Could show attention patterns if available
-        for i in range(4):
-            ax = axes[1, i]
-            ax.text(0.5, 0.5, f'Attention L{i}\n(if available)',
-                   ha='center', va='center', fontsize=12)
-            ax.axis('off')
+        # Bottom row: Show attention patterns
+        for layer_idx in range(min(4, len(routing_infos))):
+            ax = axes[1, layer_idx]
+            layer_info = routing_infos[layer_idx]
+            attn_routing = layer_info.get('attention', layer_info)
+
+            if 'attn_weights' in attn_routing:
+                # attn_weights: [B, H, S, S]
+                attn = attn_routing['attn_weights'][0].mean(dim=0).cpu().numpy()  # [S, S] average over heads
+                ax.imshow(attn[:n_tokens, :n_tokens], aspect='auto', cmap='Blues')
+                ax.set_xticks(range(n_tokens))
+                ax.set_xticklabels(token_strs, rotation=45, ha='right', fontsize=7)
+                ax.set_yticks(range(n_tokens))
+                ax.set_yticklabels(token_strs, fontsize=7)
+                ax.set_title(f'Layer {layer_idx} Attention')
+            else:
+                ax.text(0.5, 0.5, f'Attention L{layer_idx}\n(not available)',
+                       ha='center', va='center', fontsize=12)
+                ax.axis('off')
 
         plt.suptitle(f'Attention + Neuron: "{text[:50]}..."')
         plt.tight_layout()
@@ -1212,7 +1235,6 @@ class DAWNDeepAnalysis:
 
         # Create output directories
         self.dirs = {
-            'sentence': os.path.join(output_dir, 'sentence_visualizations'),
             'ablation': os.path.join(output_dir, 'ablation'),
             'semantic': os.path.join(output_dir, 'semantic'),
             'catalog': os.path.join(output_dir, 'catalog'),
@@ -1235,20 +1257,15 @@ class DAWNDeepAnalysis:
         state_keys = list(state_dict.keys())
 
         # v10.0 has per-layer shared_neurons: layers.0.attn.shared_neurons.*
-        # v10.1 has global shared_neurons: shared_neurons.*
         has_per_layer_neurons = any('layers.0.attn.shared_neurons' in k for k in state_keys)
         has_global_neurons = any(k.startswith('shared_neurons.') for k in state_keys)
 
         config = checkpoint.get('config', {})
 
-        if has_per_layer_neurons:
+        if has_per_layer_neurons or has_global_neurons:
             # v10.0 checkpoint
             from models.model_v10 import DAWN
-            print("Using model_v10 (detected per-layer shared_neurons)")
-        elif has_global_neurons:
-            # v10.1 checkpoint
-            from models.model_v10_1 import DAWN
-            print("Using model_v10_1 (detected global shared_neurons)")
+            print("Using model_v10 (detected shared_neurons)")
         else:
             # Fallback
             try:
@@ -1270,11 +1287,16 @@ class DAWNDeepAnalysis:
         self.model.to(self.device)
         self.model.eval()
 
-        # Load tokenizer
+        # Load tokenizer (matching model vocab_size)
         from transformers import AutoTokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Check if model was trained with BERT vocab (30522) or GPT-2 vocab (50257)
+        model_vocab_size = self.model.vocab_size if hasattr(self.model, 'vocab_size') else config.get('vocab_size', 30522)
+        if model_vocab_size <= 32000:
+            self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
 
         print(f"Model loaded: {sum(p.numel() for p in self.model.parameters())/1e6:.1f}M params")
 
@@ -1311,48 +1333,9 @@ class DAWNDeepAnalysis:
         """Run all analyses"""
         all_results = {}
 
-        # 1. Sentence Visualization
+        # 1. Ablation Experiments
         print("\n" + "="*60)
-        print("1. SENTENCE VISUALIZATION")
-        print("="*60)
-
-        visualizer = SentenceVisualizer(self.model, self.tokenizer, self.device)
-
-        test_sentences = [
-            "The cat sat on the mat.",
-            "She quickly ran to the store and bought milk.",
-            "In 1990, the president signed the bill.",
-            "The quick brown fox jumps over the lazy dog.",
-            "Scientists discovered a new species in the Amazon.",
-            "He said that she would come tomorrow.",
-            "The book on the table is mine.",
-            "They have been working here since 2010.",
-            "If it rains, we will stay home.",
-            "The company announced record profits yesterday.",
-        ]
-
-        for i, sentence in enumerate(test_sentences):
-            print(f"\n  Analyzing: '{sentence[:40]}...'")
-            analysis = visualizer.analyze_sentence(sentence)
-
-            # Token-wise visualization (auto-detect layer count)
-            n_layers = len(analysis['layer_data'])
-            show_layers = [0, n_layers//2, n_layers-1] if n_layers > 2 else list(range(n_layers))
-            visualizer.visualize_sentence(
-                analysis,
-                os.path.join(self.dirs['sentence'], f'sentence_{i+1:02d}_tokenwise.png'),
-                show_layers=show_layers
-            )
-
-            # Layer progression
-            visualizer.visualize_layer_progression(
-                analysis,
-                os.path.join(self.dirs['sentence'], f'sentence_{i+1:02d}_layerwise.png')
-            )
-
-        # 2. Ablation Experiments
-        print("\n" + "="*60)
-        print("2. ABLATION EXPERIMENTS")
+        print("1. ABLATION EXPERIMENTS")
         print("="*60)
 
         # Clear CUDA cache before ablation
@@ -1388,9 +1371,9 @@ class DAWNDeepAnalysis:
 
         torch.cuda.empty_cache()
 
-        # 3. Semantic Analysis
+        # 2. Semantic Analysis
         print("\n" + "="*60)
-        print("3. SEMANTIC ANALYSIS")
+        print("2. SEMANTIC ANALYSIS")
         print("="*60)
 
         semantic = SemanticAnalyzer(self.model, self.tokenizer, self.device)
@@ -1407,9 +1390,9 @@ class DAWNDeepAnalysis:
             os.path.join(self.dirs['semantic'], 'category_heatmap.png')
         )
 
-        # 4. Neuron Catalog
+        # 3. Neuron Catalog
         print("\n" + "="*60)
-        print("4. NEURON CATALOG")
+        print("3. NEURON CATALOG")
         print("="*60)
 
         catalog_builder = NeuronCatalog(self.model, self.tokenizer, self.device)
@@ -1427,9 +1410,9 @@ class DAWNDeepAnalysis:
             os.path.join(self.dirs['catalog'], 'neuron_roles_summary.png')
         )
 
-        # 5. Advanced Visualizations
+        # 4. Advanced Visualizations
         print("\n" + "="*60)
-        print("5. ADVANCED VISUALIZATIONS")
+        print("4. ADVANCED VISUALIZATIONS")
         print("="*60)
 
         adv_viz = AdvancedVisualizer(self.model, self.tokenizer, self.device)
@@ -1444,7 +1427,7 @@ class DAWNDeepAnalysis:
         # Attention + Neuron combined
         adv_viz.visualize_attention_neuron(
             "The president signed the new economic bill yesterday.",
-            os.path.join(self.dirs['sentence'], 'attention_neuron_combined.png')
+            os.path.join(self.dirs['catalog'], 'attention_neuron_combined.png')
         )
 
         # Generate report
