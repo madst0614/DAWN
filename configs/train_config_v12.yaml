@@ -1,0 +1,44 @@
+# DAWN v12.0 Training Config
+# SSM-guided Shared QKV Architecture
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - val/wikitext_5to1_texts.pkl
+
+# Model Architecture
+model:
+  model_version: "12.0"
+  d_model: 320
+  n_layers: 4
+  n_heads: 4
+  rank: 64
+  # Neurons
+  n_compress: 48
+  n_expand: 12
+  n_knowledge: 80
+  knowledge_k: 10
+  knowledge_rank: 64
+  max_seq_len: 128
+  dropout: 0.1
+  state_dim: 64  # SSM state dimension
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+  # Regularization
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v12
+log_dir: /content/drive/MyDrive/dawn/logs_v12

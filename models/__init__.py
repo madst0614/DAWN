@@ -6,15 +6,60 @@ v10.0: Simplified Compress/Expand Architecture
 - ExpandNeurons: O 통합 [n_expand, rank, d_model]
 - KnowledgeNeurons: [n_knowledge, rank] + [n_knowledge, d_model]
 - Soft routing (no Householder)
+- 3 compressors for Q/K/V
+
+v11.0: Unified Compression Architecture
+- 1 compressor + expand_Q/K/V (instead of 3 compressors)
+- Attention in d_model space (not rank space)
+- d_head = d_model // n_heads
+- 라우팅 연산 3배 감소
+
+v12.0: SSM-guided Shared QKV Architecture
+- SSM으로 토큰 중요도 계산
+- 중요도 × 토큰별 뉴런 선호 → 레이어별 뉴런 가중치
+- 공유 compress → Q/K/V
+- d_model Attention
+
+v12.1: SSM-guided Shared Neurons (v10 based)
+- SSM으로 토큰 중요도 계산
+- compress/expand 둘 다 뉴런 라우팅
+- rank Attention (v10 style)
+
+v12.2: SSM-guided Dynamic Compress/Expand
+- SSM으로 토큰 중요도 계산
+- 공유 neuron_weights로 compress & expand_Q/K/V 동적 생성
+- expand_neurons_Q/K/V as nn.Parameter (n_compress개)
+- d_model Attention
+
+v12.3: SSM-guided Shared Expand Pool
+- expand_neurons_pool 1개 (공용 풀)
+- expand_router_Q/K/V 3개로 분리 (다른 가중치, 같은 풀)
+- 파라미터 절약: 3 pools → 1 pool (~0.48M)
+- d_model Attention
 
 baseline: Vanilla Transformer for fair comparison
 """
 
-# v10.0 - stable version
+# v10.0 - soft routing
 from .model_v10 import DAWN as DAWN_v10
 
+# v11.0 - d_model attention
+from .model_v11 import DAWN as DAWN_v11
+
+# v12.0 - SSM-guided shared QKV (d_model attention)
+from .model_v12 import DAWN as DAWN_v12
+
+# v12.1 - SSM-guided shared neurons (v10 based, rank attention)
+from .model_v12_1 import DAWN as DAWN_v12_1
+
+# v12.2 - SSM-guided dynamic compress/expand (shared neuron_weights, d_model attention)
+from .model_v12_2 import DAWN as DAWN_v12_2
+
+# v12.3 - SSM-guided shared expand pool (n_expand for Q/K/V, separate routers)
+from .model_v12_3 import DAWN as DAWN_v12_3
+
 # Default DAWN is the latest version
-DAWN = DAWN_v10
+DAWN = DAWN_v12_3
 
 # Baseline for comparison
 import sys
@@ -39,6 +84,11 @@ __all__ = [
     # Models
     'DAWN',
     'DAWN_v10',
+    'DAWN_v11',
+    'DAWN_v12',
+    'DAWN_v12_1',
+    'DAWN_v12_2',
+    'DAWN_v12_3',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -53,14 +103,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "10.0"
+__version__ = "12.3"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "10.0", "10", or "baseline"
+        version: "10.0", "11.0", "12.0", "12.1", "12.2", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -73,6 +123,16 @@ def create_model_by_version(version, config):
 
     if version == "10.0":
         return DAWN_v10(**config)
+    elif version == "11.0":
+        return DAWN_v11(**config)
+    elif version == "12.0":
+        return DAWN_v12(**config)
+    elif version == "12.1":
+        return DAWN_v12_1(**config)
+    elif version == "12.2":
+        return DAWN_v12_2(**config)
+    elif version == "12.3":
+        return DAWN_v12_3(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, baseline")
