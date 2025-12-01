@@ -18,7 +18,7 @@ model:
   rank: 64
   # Neurons
   n_compress: 48
-  n_expand: 48  # v10 style - same as compress
+  n_expand: 12  # fewer expand neurons
   n_knowledge: 80
   knowledge_k: 10
   knowledge_rank: 64
