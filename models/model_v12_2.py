@@ -45,10 +45,10 @@ class SharedNeurons(nn.Module):
         self.compress_neurons = nn.Parameter(torch.zeros(n_compress, d_model, rank))
         self.expand_neurons = nn.Parameter(torch.zeros(n_expand, rank, d_model))
 
-        # Q/K/V용 expand 뉴런 풀 (공유)
-        self.expand_neurons_Q = nn.Parameter(torch.zeros(n_compress, rank, d_model))
-        self.expand_neurons_K = nn.Parameter(torch.zeros(n_compress, rank, d_model))
-        self.expand_neurons_V = nn.Parameter(torch.zeros(n_compress, rank, d_model))
+        # Q/K/V용 expand 뉴런 풀 (n_expand개로 축소)
+        self.expand_neurons_Q = nn.Parameter(torch.zeros(n_expand, rank, d_model))
+        self.expand_neurons_K = nn.Parameter(torch.zeros(n_expand, rank, d_model))
+        self.expand_neurons_V = nn.Parameter(torch.zeros(n_expand, rank, d_model))
 
         self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, self.knowledge_rank))
         self.knowledge_V = nn.Parameter(torch.zeros(n_knowledge, d_model))
@@ -58,11 +58,11 @@ class SharedNeurons(nn.Module):
     def _init_parameters(self):
         for i in range(self.n_compress):
             nn.init.orthogonal_(self.compress_neurons.data[i])
+        for i in range(self.n_expand):
+            nn.init.orthogonal_(self.expand_neurons.data[i])
             nn.init.orthogonal_(self.expand_neurons_Q.data[i])
             nn.init.orthogonal_(self.expand_neurons_K.data[i])
             nn.init.orthogonal_(self.expand_neurons_V.data[i])
-        for i in range(self.n_expand):
-            nn.init.orthogonal_(self.expand_neurons.data[i])
         nn.init.normal_(self.knowledge_K, std=0.02)
         nn.init.normal_(self.knowledge_V, std=0.02)
 
@@ -135,10 +135,11 @@ class NeuronCircuit(nn.Module):
         # SSM
         self.ssm = SSM(d_model, state_dim)
 
-        # Router: 토큰별 뉴런 선호도 (하나로 공유)
-        self.router = nn.Linear(d_model, n_compress, bias=False)
+        # Router: compress용
+        self.compress_router = nn.Linear(d_model, n_compress, bias=False)
 
-        # expand_neurons_Q/K/V는 SharedNeurons에서 가져옴
+        # Router: expand용 (Q/K/V)
+        self.expand_router = nn.Linear(d_model, n_expand, bias=False)
 
         # Output projection
         self.expand_O = nn.Linear(d_model, d_model, bias=False)
@@ -160,26 +161,29 @@ class NeuronCircuit(nn.Module):
         # 1. SSM → 토큰 중요도
         importance, ssm_state = self.ssm(x)  # [B, S], [B, state_dim]
 
-        # 2. 토큰별 뉴런 선호도
-        token_neuron_pref = F.softmax(self.router(x), dim=-1)  # [B, S, n_compress]
+        # 2. Compress 라우팅
+        compress_pref = F.softmax(self.compress_router(x), dim=-1)  # [B, S, n_compress]
+        compress_weights = torch.einsum('bs,bsn->bn', importance, compress_pref)
+        compress_weights = compress_weights / (compress_weights.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # 3. 중요도 × 뉴런선호 → 뉴런 가중치 (공유)
-        neuron_weights = torch.einsum('bs,bsn->bn', importance, token_neuron_pref)
-        neuron_weights = neuron_weights / (neuron_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # 3. Expand 라우팅
+        expand_pref = F.softmax(self.expand_router(x), dim=-1)  # [B, S, n_expand]
+        expand_weights = torch.einsum('bs,bsn->bn', importance, expand_pref)
+        expand_weights = expand_weights / (expand_weights.sum(dim=-1, keepdim=True) + 1e-8)
 
         # 4. 공유 compress 행렬 생성
-        shared_compress = torch.einsum('bn,ndr->bdr', neuron_weights,
+        shared_compress = torch.einsum('bn,ndr->bdr', compress_weights,
                                         self.shared_neurons.compress_neurons)
 
         # 5. 압축
         h = torch.einsum('bsd,bdr->bsr', x, shared_compress)  # [B, S, rank]
 
-        # 6. 동적 expand 행렬 생성 (SharedNeurons에서 가져옴)
-        shared_expand_Q = torch.einsum('bn,nrd->brd', neuron_weights,
+        # 6. 동적 expand 행렬 생성 (expand_weights 사용)
+        shared_expand_Q = torch.einsum('bn,nrd->brd', expand_weights,
                                         self.shared_neurons.expand_neurons_Q)
-        shared_expand_K = torch.einsum('bn,nrd->brd', neuron_weights,
+        shared_expand_K = torch.einsum('bn,nrd->brd', expand_weights,
                                         self.shared_neurons.expand_neurons_K)
-        shared_expand_V = torch.einsum('bn,nrd->brd', neuron_weights,
+        shared_expand_V = torch.einsum('bn,nrd->brd', expand_weights,
                                         self.shared_neurons.expand_neurons_V)
 
         # 7. Q/K/V 복원 (같은 뉴런 관점으로)
@@ -207,7 +211,9 @@ class NeuronCircuit(nn.Module):
 
         routing_info = {
             'importance': importance.detach(),
-            'neuron_weights': neuron_weights.detach(),
+            'neuron_weights': compress_weights.detach(),  # for compatibility
+            'compress_weights': compress_weights.detach(),
+            'expand_weights': expand_weights.detach(),
             'ssm_state': ssm_state.detach(),
             'attn_weights': attn.detach(),
         }
@@ -481,17 +487,17 @@ class DAWN(nn.Module):
             I = torch.eye(self.rank, device=W.device)
             loss += ((WWt - I) ** 2).mean()
 
-        # expand_neurons_Q/K/V (공유)
+        # expand_neurons_Q/K/V (n_expand개)
         for neurons in [self.shared_neurons.expand_neurons_Q,
                         self.shared_neurons.expand_neurons_K,
                         self.shared_neurons.expand_neurons_V]:
-            for i in range(self.n_compress):
+            for i in range(self.n_expand):
                 W = neurons[i]
                 WWt = W @ W.T
                 I = torch.eye(self.rank, device=W.device)
                 loss += ((WWt - I) ** 2).mean()
 
-        total_count = self.n_compress + self.n_expand + 3 * self.n_compress
+        total_count = self.n_compress + self.n_expand + 3 * self.n_expand
         return loss / total_count
 
     def routing_entropy_loss(self):
@@ -557,7 +563,8 @@ class DAWN(nn.Module):
         ssm_total = ssm_per_layer * self.n_layers
 
         router_per_layer = (
-            self.layers[0].attn.router.weight.numel() +
+            self.layers[0].attn.compress_router.weight.numel() +
+            self.layers[0].attn.expand_router.weight.numel() +
             self.layers[0].memory.router.weight.numel()
         )
         routers = router_per_layer * self.n_layers
@@ -569,9 +576,9 @@ class DAWN(nn.Module):
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
         print(f"=== DAWN v12.2 Parameter Breakdown ===")
-        print(f"CompressNeurons: {compress:,} ({compress/1e6:.2f}M) [shared]")
-        print(f"ExpandNeurons:   {expand:,} ({expand/1e6:.2f}M) [shared, unused in attn]")
-        print(f"expand_Q/K/V:    {expand_qkv:,} ({expand_qkv/1e6:.2f}M) [shared]")
+        print(f"CompressNeurons: {compress:,} ({compress/1e6:.2f}M) [{self.n_compress} neurons, shared]")
+        print(f"ExpandNeurons:   {expand:,} ({expand/1e6:.2f}M) [{self.n_expand} neurons, shared]")
+        print(f"expand_Q/K/V:    {expand_qkv:,} ({expand_qkv/1e6:.2f}M) [{self.n_expand}×3 neurons, shared]")
         print(f"expand_O:        {expand_o:,} ({expand_o/1e3:.1f}K) [per-layer]")
         print(f"KnowledgeNeurons: {knowledge:,} ({knowledge/1e3:.1f}K)")
         print(f"Embeddings:      {embed:,} ({embed/1e6:.2f}M)")
