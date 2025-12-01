@@ -140,7 +140,7 @@ VERSION_REGISTRY = {
         ],
     },
     "12.3": {
-        "description": "SSM-guided Shared Expand Pool (n_expand for Q/K/V, separate routers)",
+        "description": "SSM-guided Shared Expand Pool (1 pool, 3 routers for Q/K/V)",
         "aliases": ["123"],
         "module": "model_v12_3",
         "required_params": [
@@ -154,11 +154,12 @@ VERSION_REGISTRY = {
         "display_info": lambda args: [
             f"SharedNeurons (v12.3): rank={args.get('rank', args.get('basis_rank'))} (shared expand pool)",
             f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (SSM shared)",
-            f"  ExpandNeurons_Q/K/V: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (shared pool)",
+            f"  expand_neurons_pool: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (1 shared pool for Q/K/V)",
             f"  SSM: state_dim={args.get('state_dim', 64)}",
-            f"  Architecture: SSM → compress_router/expand_router → compress & expand_Q/K/V",
+            f"  Architecture: SSM → compress_router + expand_router_Q/K/V → shared pool",
+            f"  Key: 다른 가중치, 같은 풀 → Q/K/V 생성",
             f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
-            f"  Parameter savings: n_expand({args.get('n_expand')}) vs n_compress({args.get('n_compress')}) for Q/K/V",
+            f"  Parameter savings: 1 pool vs 3 pools (~0.48M saved)",
             f"  KnowledgeNeurons:",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",

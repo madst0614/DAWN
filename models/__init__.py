@@ -32,9 +32,9 @@ v12.2: SSM-guided Dynamic Compress/Expand
 - d_model Attention
 
 v12.3: SSM-guided Shared Expand Pool
-- expand_neurons_Q/K/V를 n_expand (12)개로 축소 (vs n_compress 48)
-- compress_router와 expand_router 분리
-- 파라미터 2.21M 절약 (2.95M → 0.74M)
+- expand_neurons_pool 1개 (공용 풀)
+- expand_router_Q/K/V 3개로 분리 (다른 가중치, 같은 풀)
+- 파라미터 절약: 3 pools → 1 pool (~0.48M)
 - d_model Attention
 
 baseline: Vanilla Transformer for fair comparison
