@@ -1,0 +1,93 @@
+# DAWN GLUE Benchmark Configuration
+# Fine-tuning settings for each GLUE task
+
+# Pretrained model
+model:
+  checkpoint: /content/drive/MyDrive/dawn/checkpoints_v12/run_v12.0_20251201_134229_2973/best_model.pt
+  version: "12.0"
+
+# Default settings (can be overridden per task)
+defaults:
+  max_seq_len: 128
+  dropout: 0.1
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_clip: 1.0
+
+# Task-specific settings
+tasks:
+  sst2:
+    num_labels: 2
+    metric: accuracy
+    lr: 2e-5
+    epochs: 3
+    batch_size: 32
+    description: "Sentiment Analysis"
+
+  mnli:
+    num_labels: 3
+    metric: accuracy
+    lr: 2e-5
+    epochs: 3
+    batch_size: 32
+    description: "Natural Language Inference"
+
+  qqp:
+    num_labels: 2
+    metric: f1
+    lr: 2e-5
+    epochs: 3
+    batch_size: 32
+    description: "Quora Question Pairs"
+
+  qnli:
+    num_labels: 2
+    metric: accuracy
+    lr: 2e-5
+    epochs: 3
+    batch_size: 32
+    description: "Question NLI"
+
+  rte:
+    num_labels: 2
+    metric: accuracy
+    lr: 2e-5
+    epochs: 5
+    batch_size: 16
+    description: "Recognizing Textual Entailment"
+
+  mrpc:
+    num_labels: 2
+    metric: f1
+    lr: 2e-5
+    epochs: 5
+    batch_size: 16
+    description: "Microsoft Research Paraphrase Corpus"
+
+  cola:
+    num_labels: 2
+    metric: matthews
+    lr: 2e-5
+    epochs: 5
+    batch_size: 16
+    description: "Corpus of Linguistic Acceptability"
+
+  stsb:
+    num_labels: 1  # regression
+    metric: pearson
+    lr: 2e-5
+    epochs: 5
+    batch_size: 16
+    description: "Semantic Textual Similarity"
+
+# Neuron analysis settings
+analysis:
+  collect_neurons: true
+  save_per_epoch: false  # Only save on final epoch
+  top_k_neurons: 10
+
+# Output
+output:
+  base_dir: /content/drive/MyDrive/dawn/glue_results
+  save_best_only: true
+  save_predictions: false
