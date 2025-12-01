@@ -1346,7 +1346,24 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "12.2":
+        if model_version == "12.3":
+            # v12.3: SSM-guided Shared Expand Pool (1 pool, 3 routers)
+            rank = args.basis_rank
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
+            state_dim = getattr(args, 'state_dim', 64)
+            d_head = args.d_model // args.n_heads
+            print(f"SharedNeurons (v{model_version}): rank={rank} - Shared Expand Pool!")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (SSM shared)")
+            print(f"  expand_neurons_pool: {args.n_expand} × {rank} × {args.d_model} (1 shared pool for Q/K/V)")
+            print(f"  expand_router_Q/K/V: 3 separate routers → different weights, same pool")
+            print(f"  SSM: state_dim={state_dim}")
+            print(f"  Architecture: SSM → compress_router + expand_router_Q/K/V → shared pool")
+            print(f"  Attention: d_model space (d_head={d_head})")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "12.2":
             # v12.2: SSM-guided Dynamic Compress/Expand (shared neuron_weights)
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
