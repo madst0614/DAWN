@@ -28,7 +28,13 @@ v12.1: SSM-guided Shared Neurons (v10 based)
 v12.2: SSM-guided Dynamic Compress/Expand
 - SSM으로 토큰 중요도 계산
 - 공유 neuron_weights로 compress & expand_Q/K/V 동적 생성
-- expand_neurons_Q/K/V as nn.Parameter (per-layer)
+- expand_neurons_Q/K/V as nn.Parameter (n_compress개)
+- d_model Attention
+
+v12.3: SSM-guided Shared Expand Pool
+- expand_neurons_Q/K/V를 n_expand (12)개로 축소 (vs n_compress 48)
+- compress_router와 expand_router 분리
+- 파라미터 2.21M 절약 (2.95M → 0.74M)
 - d_model Attention
 
 baseline: Vanilla Transformer for fair comparison
@@ -49,8 +55,11 @@ from .model_v12_1 import DAWN as DAWN_v12_1
 # v12.2 - SSM-guided dynamic compress/expand (shared neuron_weights, d_model attention)
 from .model_v12_2 import DAWN as DAWN_v12_2
 
+# v12.3 - SSM-guided shared expand pool (n_expand for Q/K/V, separate routers)
+from .model_v12_3 import DAWN as DAWN_v12_3
+
 # Default DAWN is the latest version
-DAWN = DAWN_v12_2
+DAWN = DAWN_v12_3
 
 # Baseline for comparison
 import sys
@@ -79,6 +88,7 @@ __all__ = [
     'DAWN_v12',
     'DAWN_v12_1',
     'DAWN_v12_2',
+    'DAWN_v12_3',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -93,7 +103,7 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "12.2"
+__version__ = "12.3"
 
 
 def create_model_by_version(version, config):
@@ -121,6 +131,8 @@ def create_model_by_version(version, config):
         return DAWN_v12_1(**config)
     elif version == "12.2":
         return DAWN_v12_2(**config)
+    elif version == "12.3":
+        return DAWN_v12_3(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, baseline")
