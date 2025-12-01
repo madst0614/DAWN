@@ -171,23 +171,17 @@ class DAWNForSequenceClassification(nn.Module):
         B, S = input_ids.shape
         device = input_ids.device
 
-        # Get DAWN output with routing info
-        if return_routing_info or self.collect_neurons:
-            logits_lm, routing_infos = self.dawn(input_ids, return_routing_info=True)
-        else:
-            logits_lm = self.dawn(input_ids)
-            routing_infos = None
-
-        # Use [CLS] token (first token) representation
-        # Get hidden states before lm_head
+        # Single forward pass through DAWN layers (without lm_head)
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
         x = self.dawn.token_emb(input_ids) + self.dawn.pos_emb(positions)
 
         mask = torch.triu(torch.ones(S, S, device=device), diagonal=1).bool()
         mask = ~mask.unsqueeze(0).unsqueeze(0)
 
+        routing_infos = []
         for layer in self.dawn.layers:
-            x, _ = layer(x, mask)
+            x, routing_info = layer(x, mask)
+            routing_infos.append(routing_info)
 
         x = self.dawn.norm(x)
 
@@ -199,7 +193,7 @@ class DAWNForSequenceClassification(nn.Module):
         logits = self.classifier(cls_output)  # [B, num_labels]
 
         # Collect neuron activations if enabled
-        if self.collect_neurons and routing_infos is not None:
+        if self.collect_neurons:
             self._collect_neuron_activations(routing_infos)
 
         # Compute loss
