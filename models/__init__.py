@@ -6,11 +6,13 @@ v10.0: Simplified Compress/Expand Architecture
 - ExpandNeurons: O 통합 [n_expand, rank, d_model]
 - KnowledgeNeurons: [n_knowledge, rank] + [n_knowledge, d_model]
 - Soft routing (no Householder)
+- 3 compressors for Q/K/V
 
-v11.0: Hard Top-K Routing
-- Same architecture as v10.0
-- Hard top-k selection instead of soft routing
-- Significant compute savings (e.g., 48 → 2 = 24x)
+v11.0: Unified Compression Architecture
+- 1 compressor + expand_Q/K/V (instead of 3 compressors)
+- Attention in d_model space (not rank space)
+- d_head = d_model // n_heads
+- 라우팅 연산 3배 감소
 
 baseline: Vanilla Transformer for fair comparison
 """

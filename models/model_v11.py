@@ -1,17 +1,21 @@
 """
-DAWN v11.0: Hard Top-K Routing Architecture
+DAWN v11.0: Unified Compression Architecture
 
 Key changes from v10:
-- Soft routing → Hard Top-K selection
-- Compressor/Expander: only top-k neurons computed (24x savings with k=2 vs n=48)
-- Same architecture otherwise (SharedNeurons, Q/K/V/M compress, O expand)
+- NeuronCircuit: 3 compressors (Q/K/V) → 1 compressor + expand_Q/K/V
+- Attention: rank space → d_model space
+- d_head: rank // n_heads → d_model // n_heads
 
 Architecture:
     x (d_model)
-    → Compressor: router → top-k → softmax(top-k) → weighted selected neurons → (rank)
-    → Expander: router → top-k → softmax(top-k) → weighted selected neurons → (d_model)
+    → Compressor: router → softmax → weighted compress_neurons → h (rank)
+    → expand_Q/K/V: h (rank) → Q/K/V (d_model)
+    → Attention in d_model space
+    → expand_O: attn_out (d_model) → output (d_model)
 
-Computational savings: n_compress → top_k (e.g., 48 → 2 = 24x)
+이점:
+- 압축 한 번만 (3→1), 라우팅 연산 감소
+- d_model에서 Attention → 더 풍부한 표현력
 """
 
 import math
@@ -24,7 +28,7 @@ class SharedNeurons(nn.Module):
     """
     v11.0: SharedNeurons (same as v10.0)
 
-    - CompressNeurons: [n_compress, d_model, rank] - Q/K/V/M shared
+    - CompressNeurons: [n_compress, d_model, rank] - unified compression
     - ExpandNeurons: [n_expand, rank, d_model] - O shared
     - KnowledgeNeurons: [n_knowledge, knowledge_rank] + [n_knowledge, d_model]
     """
@@ -45,10 +49,10 @@ class SharedNeurons(nn.Module):
         self.n_expand = n_expand
         self.n_knowledge = n_knowledge
 
-        # CompressNeurons: d_model → rank (Q/K/V/M shared)
+        # CompressNeurons: d_model → rank
         self.compress_neurons = nn.Parameter(torch.zeros(n_compress, d_model, rank))
 
-        # ExpandNeurons: rank → d_model (O shared)
+        # ExpandNeurons: rank → d_model
         self.expand_neurons = nn.Parameter(torch.zeros(n_expand, rank, d_model))
 
         # KnowledgeNeurons
@@ -73,13 +77,12 @@ class SharedNeurons(nn.Module):
 
 class Compressor(nn.Module):
     """
-    d_model → rank compression with Hard Top-K routing
+    d_model → rank compression with Soft Routing
 
     Flow:
     1. Router → scores
-    2. Top-K selection
-    3. Softmax over top-k scores
-    4. Weighted projection with selected neurons only
+    2. Softmax over all neurons
+    3. Weighted sum of all projections
     """
     def __init__(
         self,
@@ -87,14 +90,12 @@ class Compressor(nn.Module):
         d_model: int,
         rank: int,
         n_compress: int,
-        top_k: int = 2,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.rank = rank
         self.n_compress = n_compress
-        self.top_k = top_k
 
         # Independent router
         self.router = nn.Linear(d_model, n_compress, bias=False)
@@ -105,48 +106,31 @@ class Compressor(nn.Module):
             x: [B, S, d_model]
         Returns:
             output: [B, S, rank]
-            routing_info: dict with topk_idx and topk_weights
+            routing_info: dict with weights
         """
-        B, S, D = x.shape
-
-        # 1. Router scores
+        # 1. Router → weights
         scores = self.router(x)  # [B, S, n_compress]
+        weights = F.softmax(scores, dim=-1)  # [B, S, n_compress]
 
-        # 2. Top-K selection
-        topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
-        topk_weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
-
-        # 3. Project with selected neurons only
+        # 2. Project with all neurons
         neurons = self.shared_neurons.compress_neurons  # [n_compress, d_model, rank]
+        all_proj = torch.einsum('bsd,ndr->bsnr', x, neurons)  # [B, S, n_compress, rank]
 
-        # Gather and project for each top-k neuron
-        output = torch.zeros(B, S, self.rank, device=x.device, dtype=x.dtype)
+        # 3. Weighted sum
+        output = (all_proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, rank]
 
-        for i in range(self.top_k):
-            idx = topk_idx[:, :, i]  # [B, S]
-            weight = topk_weights[:, :, i:i+1]  # [B, S, 1]
-
-            # Select neurons and project
-            selected_neurons = neurons[idx]  # [B, S, d_model, rank]
-            proj = torch.einsum('bsd,bsdr->bsr', x, selected_neurons)  # [B, S, rank]
-            output = output + weight * proj
-
-        routing_info = {
-            'topk_idx': topk_idx,
-            'topk_weights': topk_weights,
-        }
+        routing_info = {'weights': weights}
         return output, routing_info
 
 
 class Expander(nn.Module):
     """
-    rank → d_model expansion with Hard Top-K routing
+    rank → d_model expansion with Soft Routing
 
     Flow:
     1. Router → scores
-    2. Top-K selection
-    3. Softmax over top-k scores
-    4. Weighted projection with selected neurons only
+    2. Softmax over all neurons
+    3. Weighted sum of all projections
     """
     def __init__(
         self,
@@ -154,14 +138,12 @@ class Expander(nn.Module):
         d_model: int,
         rank: int,
         n_expand: int,
-        top_k: int = 2,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.rank = rank
         self.n_expand = n_expand
-        self.top_k = top_k
 
         # Independent router
         self.router = nn.Linear(rank, n_expand, bias=False)
@@ -172,45 +154,32 @@ class Expander(nn.Module):
             x: [B, S, rank]
         Returns:
             output: [B, S, d_model]
-            routing_info: dict with topk_idx and topk_weights
+            routing_info: dict with weights
         """
-        B, S, R = x.shape
-
-        # 1. Router scores
+        # 1. Router → weights
         scores = self.router(x)  # [B, S, n_expand]
+        weights = F.softmax(scores, dim=-1)  # [B, S, n_expand]
 
-        # 2. Top-K selection
-        topk_scores, topk_idx = torch.topk(scores, self.top_k, dim=-1)  # [B, S, k]
-        topk_weights = F.softmax(topk_scores, dim=-1)  # [B, S, k]
-
-        # 3. Project with selected neurons only
+        # 2. Project with all neurons
         neurons = self.shared_neurons.expand_neurons  # [n_expand, rank, d_model]
+        all_proj = torch.einsum('bsr,nrd->bsnd', x, neurons)  # [B, S, n_expand, d_model]
 
-        # Gather and project for each top-k neuron
-        output = torch.zeros(B, S, self.d_model, device=x.device, dtype=x.dtype)
+        # 3. Weighted sum
+        output = (all_proj * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, d_model]
 
-        for i in range(self.top_k):
-            idx = topk_idx[:, :, i]  # [B, S]
-            weight = topk_weights[:, :, i:i+1]  # [B, S, 1]
-
-            # Select neurons and project
-            selected_neurons = neurons[idx]  # [B, S, rank, d_model]
-            proj = torch.einsum('bsr,bsrd->bsd', x, selected_neurons)  # [B, S, d_model]
-            output = output + weight * proj
-
-        routing_info = {
-            'topk_idx': topk_idx,
-            'topk_weights': topk_weights,
-        }
+        routing_info = {'weights': weights}
         return output, routing_info
 
 
 class NeuronCircuit(nn.Module):
     """
-    v11.0 Attention Layer with Hard Top-K Routing
+    v11.0 Attention Layer with Unified Compression
 
-    Q/K/V: independent Compressors (shared compress_neurons)
-    O: Expander
+    Architecture:
+    1. x → Compressor → h (rank)
+    2. h → expand_Q/K/V → Q/K/V (d_model)
+    3. Attention in d_model space
+    4. attn_out → expand_O (or Expander) → output
     """
     def __init__(
         self,
@@ -220,24 +189,25 @@ class NeuronCircuit(nn.Module):
         rank: int,
         n_compress: int,
         n_expand: int,
-        compress_top_k: int = 2,
-        expand_top_k: int = 2,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.n_heads = n_heads
-        self.d_head = rank // n_heads
+        self.d_head = d_model // n_heads  # Changed: d_model based
         self.rank = rank
 
-        # Q/K/V: independent Compressors with top-k
-        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k)
-        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k)
-        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k)
+        # Single compressor (unified for Q/K/V)
+        self.compressor = Compressor(shared_neurons, d_model, rank, n_compress)
 
-        # O: Expander with top-k
-        self.expander_O = Expander(shared_neurons, d_model, rank, n_expand, expand_top_k)
+        # Expand from rank to d_model for Q/K/V
+        self.expand_Q = nn.Linear(rank, d_model, bias=False)
+        self.expand_K = nn.Linear(rank, d_model, bias=False)
+        self.expand_V = nn.Linear(rank, d_model, bias=False)
+
+        # Output projection (d_model → d_model)
+        self.expand_O = nn.Linear(d_model, d_model, bias=False)
 
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
@@ -249,40 +219,40 @@ class NeuronCircuit(nn.Module):
             mask: [B, 1, S, S] causal mask
         Returns:
             output: [B, S, d_model]
-            routing_info: dict with Q/K/V/O routing
+            routing_info: dict with routing info
         """
         B, S, D = x.shape
 
-        # Q/K/V compression
-        Q, q_info = self.compressor_Q(x)  # [B, S, rank]
-        K, k_info = self.compressor_K(x)  # [B, S, rank]
-        V, v_info = self.compressor_V(x)  # [B, S, rank]
+        # 1. Compress (unified)
+        h, compress_info = self.compressor(x)  # [B, S, rank]
 
-        # Reshape for multi-head attention
+        # 2. Expand to Q/K/V
+        Q = self.expand_Q(h)  # [B, S, d_model]
+        K = self.expand_K(h)  # [B, S, d_model]
+        V = self.expand_V(h)  # [B, S, d_model]
+
+        # 3. Reshape for multi-head attention (in d_model space)
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)  # [B, H, S, d_head]
         K = K.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Attention
+        # 4. Attention
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float('-inf'))
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
 
-        # Apply attention to V
+        # 5. Apply attention to V
         attn_out = torch.matmul(attn, V)  # [B, H, S, d_head]
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.rank)  # [B, S, rank]
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.d_model)  # [B, S, d_model]
 
-        # Output expansion
-        output, o_info = self.expander_O(attn_out)  # [B, S, d_model]
+        # 6. Output projection
+        output = self.expand_O(attn_out)  # [B, S, d_model]
         output = self.out_dropout(output)
 
         routing_info = {
-            'Q': q_info,
-            'K': k_info,
-            'V': v_info,
-            'O': o_info,
+            'compress': compress_info,
             'attn_weights': attn.detach(),  # [B, H, S, S]
         }
         return output, routing_info
@@ -290,7 +260,7 @@ class NeuronCircuit(nn.Module):
 
 class NeuronMemory(nn.Module):
     """
-    v11.0 Knowledge Retrieval with Hard Top-K Routing
+    v11.0 Knowledge Retrieval
 
     Query compression → Knowledge lookup → Output
     """
@@ -302,7 +272,6 @@ class NeuronMemory(nn.Module):
         n_compress: int,
         knowledge_k: int = 8,
         knowledge_rank: int = None,
-        compress_top_k: int = 2,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
@@ -311,8 +280,8 @@ class NeuronMemory(nn.Module):
         self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
         self.knowledge_k = knowledge_k
 
-        # Query Compressor with top-k
-        self.query_compressor = Compressor(shared_neurons, d_model, rank, n_compress, compress_top_k)
+        # Query Compressor
+        self.query_compressor = Compressor(shared_neurons, d_model, rank, n_compress)
 
         # Query projection if knowledge_rank differs from rank
         if self.knowledge_rank != rank:
@@ -373,19 +342,15 @@ class DAWNBlock(nn.Module):
         n_expand: int,
         knowledge_k: int,
         knowledge_rank: int = None,
-        compress_top_k: int = 2,
-        expand_top_k: int = 2,
         dropout: float = 0.1,
     ):
         super().__init__()
 
         self.attn = NeuronCircuit(
-            shared_neurons, d_model, n_heads, rank, n_compress, n_expand,
-            compress_top_k, expand_top_k, dropout
+            shared_neurons, d_model, n_heads, rank, n_compress, n_expand, dropout
         )
         self.memory = NeuronMemory(
-            shared_neurons, d_model, rank, n_compress, knowledge_k, knowledge_rank,
-            compress_top_k
+            shared_neurons, d_model, rank, n_compress, knowledge_k, knowledge_rank
         )
 
         self.norm1 = nn.LayerNorm(d_model)
@@ -415,13 +380,16 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v11.0: Hard Top-K Routing Architecture
+    DAWN v11.0: Unified Compression Architecture
 
-    - CompressNeurons: Q/K/V/M shared
-    - ExpandNeurons: O shared
-    - Hard top-k routing (not soft)
+    Key changes from v10:
+    - NeuronCircuit: 1 compressor + expand_Q/K/V (instead of 3 compressors)
+    - Attention in d_model space (not rank space)
+    - d_head = d_model // n_heads
 
-    Computational savings: n_compress → top_k (e.g., 48 → 2 = 24x)
+    이점:
+    - 압축 1번 (3번 → 1번) → 라우팅 연산 감소
+    - d_model에서 Attention → 더 풍부한 표현력
     """
     __version__ = "11.0"
 
@@ -438,8 +406,6 @@ class DAWN(nn.Module):
         n_knowledge: int = 80,
         knowledge_k: int = 10,
         knowledge_rank: int = None,
-        compress_top_k: int = 2,
-        expand_top_k: int = 2,
         dropout: float = 0.1,
         **kwargs
     ):
@@ -458,8 +424,6 @@ class DAWN(nn.Module):
         self.n_expand = n_expand
         self.n_knowledge = n_knowledge
         self.knowledge_k = knowledge_k
-        self.compress_top_k = compress_top_k
-        self.expand_top_k = expand_top_k
 
         # train.py compatibility
         self.n_neurons = n_compress  # For load balance loss
@@ -490,8 +454,6 @@ class DAWN(nn.Module):
                 n_expand=n_expand,
                 knowledge_k=knowledge_k,
                 knowledge_rank=self.knowledge_rank,
-                compress_top_k=compress_top_k,
-                expand_top_k=expand_top_k,
                 dropout=dropout,
             )
             for _ in range(n_layers)
@@ -571,7 +533,7 @@ class DAWN(nn.Module):
         return loss / (self.n_compress + self.n_expand)
 
     def routing_entropy_loss(self):
-        """Placeholder for routing entropy (not used in hard top-k)"""
+        """Placeholder for routing entropy"""
         return torch.tensor(0.0, device=next(self.parameters()).device)
 
     def knowledge_diversity_loss(self):
@@ -584,61 +546,27 @@ class DAWN(nn.Module):
 
     def load_balance_loss(self, routing_infos):
         """
-        Load balance loss for hard top-k routing
-
-        Counts how often each neuron is selected and penalizes imbalance.
+        Load balance loss for soft routing
 
         Args:
             routing_infos: forward에서 반환된 layer별 routing 정보
         Returns:
             load balance loss (lower = more balanced)
         """
-        device = next(self.parameters()).device
         loss = 0.0
         count = 0
 
         for layer_info in routing_infos:
-            # Attention Q/K/V compressors
-            for comp in ['Q', 'K', 'V']:
-                topk_idx = layer_info['attention'][comp]['topk_idx']  # [B, S, k]
-                B, S, k = topk_idx.shape
-
-                # Count neuron usage
-                usage = torch.zeros(self.n_compress, device=device)
-                for i in range(k):
-                    idx = topk_idx[:, :, i].flatten()  # [B*S]
-                    usage.scatter_add_(0, idx, torch.ones_like(idx, dtype=usage.dtype))
-                usage = usage / (B * S * k)  # normalize
-
-                target = 1.0 / self.n_compress
-                loss += ((usage - target) ** 2).sum() * self.n_compress
-                count += 1
-
-            # O expander
-            o_topk_idx = layer_info['attention']['O']['topk_idx']  # [B, S, k]
-            B, S, k = o_topk_idx.shape
-
-            o_usage = torch.zeros(self.n_expand, device=device)
-            for i in range(k):
-                idx = o_topk_idx[:, :, i].flatten()
-                o_usage.scatter_add_(0, idx, torch.ones_like(idx, dtype=o_usage.dtype))
-            o_usage = o_usage / (B * S * k)
-
-            target_o = 1.0 / self.n_expand
-            loss += ((o_usage - target_o) ** 2).sum() * self.n_expand
+            # Attention compressor (unified)
+            weights = layer_info['attention']['compress']['weights']  # [B, S, n_compress]
+            usage = weights.mean(dim=(0, 1))  # [n_compress]
+            target = 1.0 / self.n_compress
+            loss += ((usage - target) ** 2).sum() * self.n_compress
             count += 1
 
             # Memory M compressor
-            m_topk_idx = layer_info['memory']['M']['topk_idx']  # [B, S, k]
-            B, S, k = m_topk_idx.shape
-
-            m_usage = torch.zeros(self.n_compress, device=device)
-            for i in range(k):
-                idx = m_topk_idx[:, :, i].flatten()
-                m_usage.scatter_add_(0, idx, torch.ones_like(idx, dtype=m_usage.dtype))
-            m_usage = m_usage / (B * S * k)
-
-            target = 1.0 / self.n_compress
+            m_weights = layer_info['memory']['M']['weights']  # [B, S, n_compress]
+            m_usage = m_weights.mean(dim=(0, 1))
             loss += ((m_usage - target) ** 2).sum() * self.n_compress
             count += 1
 
@@ -663,15 +591,21 @@ class DAWN(nn.Module):
 
         embed = self.token_emb.weight.numel() + self.pos_emb.weight.numel()
 
-        # Routers: per layer
+        # Routers: per layer (1 compressor + 1 memory compressor)
         router_per_layer = (
-            self.layers[0].attn.compressor_Q.router.weight.numel() +
-            self.layers[0].attn.compressor_K.router.weight.numel() +
-            self.layers[0].attn.compressor_V.router.weight.numel() +
-            self.layers[0].attn.expander_O.router.weight.numel() +
+            self.layers[0].attn.compressor.router.weight.numel() +
             self.layers[0].memory.query_compressor.router.weight.numel()
         )
         routers = router_per_layer * self.n_layers
+
+        # expand_Q/K/V/O per layer
+        expand_qkvo_per_layer = (
+            self.layers[0].attn.expand_Q.weight.numel() +
+            self.layers[0].attn.expand_K.weight.numel() +
+            self.layers[0].attn.expand_V.weight.numel() +
+            self.layers[0].attn.expand_O.weight.numel()
+        )
+        expand_qkvo = expand_qkvo_per_layer * self.n_layers
 
         # LayerNorms
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
@@ -682,10 +616,11 @@ class DAWN(nn.Module):
         print(f"KnowledgeNeurons: {knowledge:,} ({knowledge/1e3:.1f}K)")
         print(f"Embeddings:      {embed:,} ({embed/1e6:.2f}M)")
         print(f"Routers:         {routers:,} ({routers/1e3:.1f}K)")
+        print(f"Expand Q/K/V/O:  {expand_qkvo:,} ({expand_qkvo/1e6:.2f}M)")
         print(f"LayerNorms:      {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
-        print(f"Hard Top-K: compress_top_k={self.compress_top_k}, expand_top_k={self.expand_top_k}")
-        print(f"Compute savings: {self.n_compress}/{self.compress_top_k}x compress, {self.n_expand}/{self.expand_top_k}x expand")
+        print(f"Architecture: 1 compressor + expand_Q/K/V/O")
+        print(f"Attention in d_model space (d_head={self.d_model // self.n_heads})")
         print(f"---")
         print(f"Total:           {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 
@@ -695,6 +630,7 @@ class DAWN(nn.Module):
             'knowledge': knowledge,
             'embeddings': embed,
             'routers': routers,
+            'expand_qkvo': expand_qkvo,
             'norms': norms,
         }
 
@@ -712,6 +648,4 @@ class DAWN(nn.Module):
             'n_expand': self.n_expand,
             'n_knowledge': self.n_knowledge,
             'knowledge_k': self.knowledge_k,
-            'compress_top_k': self.compress_top_k,
-            'expand_top_k': self.expand_top_k,
         }
