@@ -3,7 +3,8 @@ DAWN Model Version Registry
 
 v10.0: Simplified Compress/Expand Architecture (Soft Routing, 3 compressors for Q/K/V)
 v11.0: Unified Compression (1 compressor + expand_Q/K/V, d_model attention)
-v12.0: SSM-guided Shared QKV (SSM → importance → shared compress → Q/K/V)
+v12.0: SSM-guided Shared QKV (SSM → importance → shared compress → Q/K/V, d_model attention)
+v12.1: SSM-guided Shared Neurons (v10 based, rank attention, neuron compress/expand)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below
@@ -80,6 +81,31 @@ VERSION_REGISTRY = {
             f"  SSM: state_dim={args.get('state_dim', 64)}",
             f"  Architecture: SSM → importance × neuron_pref → shared compress → Q/K/V",
             f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
+    "12.1": {
+        "description": "SSM-guided Shared Neurons (v10 based, rank attention, neuron compress/expand)",
+        "aliases": ["121"],
+        "module": "model_v12_1",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v12.1): rank={args.get('rank', args.get('basis_rank'))} (v10 based)",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (SSM shared)",
+            f"  ExpandNeurons: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (SSM shared)",
+            f"  SSM: state_dim={args.get('state_dim', 64)}",
+            f"  Architecture: SSM → importance × pref → shared compress/expand",
+            f"  Attention: rank space (d_head={args.get('rank', args.get('basis_rank'))}//{args.get('n_heads')})",
             f"  KnowledgeNeurons:",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",

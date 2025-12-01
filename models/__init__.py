@@ -18,7 +18,12 @@ v12.0: SSM-guided Shared QKV Architecture
 - SSM으로 토큰 중요도 계산
 - 중요도 × 토큰별 뉴런 선호 → 레이어별 뉴런 가중치
 - 공유 compress → Q/K/V
-- 토큰별 라우팅 → 레이어별 1회 라우팅
+- d_model Attention
+
+v12.1: SSM-guided Shared Neurons (v10 based)
+- SSM으로 토큰 중요도 계산
+- compress/expand 둘 다 뉴런 라우팅
+- rank Attention (v10 style)
 
 baseline: Vanilla Transformer for fair comparison
 """
@@ -29,11 +34,14 @@ from .model_v10 import DAWN as DAWN_v10
 # v11.0 - d_model attention
 from .model_v11 import DAWN as DAWN_v11
 
-# v12.0 - SSM-guided shared QKV
+# v12.0 - SSM-guided shared QKV (d_model attention)
 from .model_v12 import DAWN as DAWN_v12
 
+# v12.1 - SSM-guided shared neurons (v10 based, rank attention)
+from .model_v12_1 import DAWN as DAWN_v12_1
+
 # Default DAWN is the latest version
-DAWN = DAWN_v12
+DAWN = DAWN_v12_1
 
 # Baseline for comparison
 import sys
@@ -60,6 +68,7 @@ __all__ = [
     'DAWN_v10',
     'DAWN_v11',
     'DAWN_v12',
+    'DAWN_v12_1',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -74,14 +83,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "12.0"
+__version__ = "12.1"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "10.0", "11.0", "12.0", "10", "11", "12", or "baseline"
+        version: "10.0", "11.0", "12.0", "12.1", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -98,6 +107,8 @@ def create_model_by_version(version, config):
         return DAWN_v11(**config)
     elif version == "12.0":
         return DAWN_v12(**config)
+    elif version == "12.1":
+        return DAWN_v12_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, 12.0, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, baseline")
