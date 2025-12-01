@@ -1,6 +1,6 @@
 # DAWN v11.0 Training Config
-# 실험: rank=16, 뉴런 4배 (v10 대비 동일 파라미터)
-# 가설: 작은 뉴런 많이 조합 > 큰 뉴런 적게 조합
+# Hard Top-K Routing: 선택된 k개 뉴런만 계산 (연산량 대폭 절감)
+# v10 대비 변경: Soft routing → Hard Top-K selection
 
 # Data
 data:
@@ -12,24 +12,23 @@ data:
 
 # Model Architecture
 model:
-  model_version: "10.0"  # v10 모델 사용, 설정만 다름 (rank=16 실험)
-  d_model: 256
+  model_version: "11.0"  # Hard Top-K Routing!
+  d_model: 320
   n_layers: 4
   n_heads: 4
-  rank: 16                # 64 → 16 (4배 압축)
+  rank: 64
 
-  # 뉴런 수 4배 증가 (파라미터 동일 유지)
-  n_compress: 256         # 64 → 256
-  n_expand: 64            # 16 → 64
+  # Neurons (v10과 동일한 구조)
+  n_compress: 48
+  n_expand: 12
 
-  # Top-K Selection (v11 핵심)
-  compress_top_k: 16      # 256개 중 16개 선택 (6.25%)
-  expand_top_k: 8         # 64개 중 8개 선택 (12.5%)
-  router_noise: 0.1       # 학습 시 탐색용 noise
+  # Hard Top-K Selection (v11 핵심!)
+  compress_top_k: 2       # 48개 중 2개 선택 → 24배 절약
+  expand_top_k: 2         # 12개 중 2개 선택 → 6배 절약
 
-  n_knowledge: 64
-  knowledge_k: 8
-  knowledge_rank: 32         # knowledge 전용 rank (rank와 별도)
+  n_knowledge: 80
+  knowledge_k: 10
+  knowledge_rank: 64
   max_seq_len: 128
   dropout: 0.1
 
@@ -44,7 +43,7 @@ training:
   # Regularization
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.01   # top-k에서 중요
+  load_balance_weight: 0.01   # top-k에서 중요 (균등 분배)
   process_norm_weight: 0.0
 
 use_amp: true
@@ -52,17 +51,21 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v11
 log_dir: /content/drive/MyDrive/dawn/logs_v11
 
 # =============================================================================
-# v10 vs v11 비교 (동일 파라미터)
+# v10 vs v11 비교 (Hard Top-K의 효과)
 # =============================================================================
 #
-# | 항목              | v10.0             | v11.0              |
+# | 항목              | v10.0 (Soft)      | v11.0 (Hard Top-K)  |
 # |-------------------|-------------------|---------------------|
-# | rank              | 64                | 16                  |
-# | n_compress        | 64                | 256                 |
-# | n_expand          | 16                | 64                  |
-# | Routing           | Soft (all)        | Hard (top-k)        |
-# | compress params   | 64×256×64=1.05M   | 256×256×16=1.05M    |
-# | expand params     | 16×64×256=0.26M   | 64×16×256=0.26M     |
-# | 표현력 (top-k×rank)| 8×64=512         | 16×16=256           |
+# | Routing           | 48개 전부 softmax | 2개만 선택          |
+# | Compress 연산     | 48회 projection   | 2회 projection      |
+# | Expand 연산       | 12회 projection   | 2회 projection      |
+# | 연산량 절약       | -                 | ~24x (compress)     |
+# | 파라미터          | 동일              | 동일                |
+# | Sparsity          | Dense (100%)      | Sparse (4.2%)       |
+#
+# Hard Top-K 장점:
+# 1. 연산량 대폭 절감 (MoE처럼 sparse activation)
+# 2. 뉴런별 특화 학습 유도 (expert specialization)
+# 3. 추론 속도 향상
 #
 # =============================================================================

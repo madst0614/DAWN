@@ -550,14 +550,14 @@ def get_underlying_model(model):
 
 
 def is_modern_dawn_model(model):
-    """Check if model is DAWN v10.0"""
+    """Check if model is DAWN v10.0 or v11.0"""
     base_model = get_underlying_model(model)
 
-    # Check for v10 structure
-    if hasattr(base_model, '__version__') and base_model.__version__ == "10.0":
+    # Check for v10/v11 structure
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["10.0", "11.0"]:
         return True
 
-    # Structure check: v10 has layers with .attn and .memory
+    # Structure check: v10/v11 has layers with .attn and .memory
     if hasattr(base_model, 'layers') and len(base_model.layers) > 0:
         if hasattr(base_model.layers[0], 'attn') and hasattr(base_model.layers[0], 'memory'):
             return True
@@ -1312,7 +1312,12 @@ def main():
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
-        if args.model_version == '10.0':
+        if args.model_version == '11.0':
+            compress_top_k = getattr(args, 'compress_top_k', 2)
+            expand_top_k = getattr(args, 'expand_top_k', 2)
+            print(f"   → v11.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}")
+            print(f"   → Hard Top-K: compress_top_k={compress_top_k}, expand_top_k={expand_top_k}")
+        elif args.model_version == '10.0':
             print(f"   → v10.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}, n_knowledge={args.n_knowledge}")
         elif args.model_version in ['8.0', '8.1', '8.2', '8.3']:
             print(f"   → v8.0+ params: n_knowledge={args.n_knowledge}, knowledge_k={args.knowledge_k}, rank={args.rank}")
@@ -1331,7 +1336,22 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "10.0":
+        if model_version == "11.0":
+            # v11.0: Hard Top-K Routing
+            rank = args.basis_rank
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
+            compress_top_k = getattr(args, 'compress_top_k', 2)
+            expand_top_k = getattr(args, 'expand_top_k', 2)
+            print(f"SharedNeurons (v{model_version}): rank={rank} - Hard Top-K Routing!")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (Q/K/V/M shared)")
+            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model} (O shared)")
+            print(f"  Hard Top-K: compress={compress_top_k}, expand={expand_top_k}")
+            print(f"  Compute savings: {args.n_compress}/{compress_top_k}x compress, {args.n_expand}/{expand_top_k}x expand")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "10.0":
             # v10.0: Simplified Compress/Expand
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
@@ -1439,7 +1459,19 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '10.0':
+    if model_version == '11.0':
+        # v11.0: Hard Top-K Routing
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'knowledge_rank': args.knowledge_rank,  # None = use rank
+            'rank': args.basis_rank,
+            'compress_top_k': getattr(args, 'compress_top_k', 2),
+            'expand_top_k': getattr(args, 'expand_top_k', 2),
+        })
+    elif model_version == '10.0':
         # v10.0: Simplified Compress/Expand (No Householder)
         model_kwargs.update({
             'n_compress': args.n_compress,
