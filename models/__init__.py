@@ -14,17 +14,26 @@ v11.0: Unified Compression Architecture
 - d_head = d_model // n_heads
 - 라우팅 연산 3배 감소
 
+v12.0: SSM-guided Shared QKV Architecture
+- SSM으로 토큰 중요도 계산
+- 중요도 × 토큰별 뉴런 선호 → 레이어별 뉴런 가중치
+- 공유 compress → Q/K/V
+- 토큰별 라우팅 → 레이어별 1회 라우팅
+
 baseline: Vanilla Transformer for fair comparison
 """
 
 # v10.0 - soft routing
 from .model_v10 import DAWN as DAWN_v10
 
-# v11.0 - hard top-k routing
+# v11.0 - d_model attention
 from .model_v11 import DAWN as DAWN_v11
 
+# v12.0 - SSM-guided shared QKV
+from .model_v12 import DAWN as DAWN_v12
+
 # Default DAWN is the latest version
-DAWN = DAWN_v11
+DAWN = DAWN_v12
 
 # Baseline for comparison
 import sys
@@ -50,6 +59,7 @@ __all__ = [
     'DAWN',
     'DAWN_v10',
     'DAWN_v11',
+    'DAWN_v12',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -64,14 +74,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "11.0"
+__version__ = "12.0"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "10.0", "11.0", "10", "11", or "baseline"
+        version: "10.0", "11.0", "12.0", "10", "11", "12", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -86,6 +96,8 @@ def create_model_by_version(version, config):
         return DAWN_v10(**config)
     elif version == "11.0":
         return DAWN_v11(**config)
+    elif version == "12.0":
+        return DAWN_v12(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, baseline")

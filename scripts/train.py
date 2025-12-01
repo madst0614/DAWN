@@ -550,11 +550,11 @@ def get_underlying_model(model):
 
 
 def is_modern_dawn_model(model):
-    """Check if model is DAWN v10.0 or v11.0"""
+    """Check if model is DAWN v10.0, v11.0, or v12.0"""
     base_model = get_underlying_model(model)
 
-    # Check for v10/v11 structure
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["10.0", "11.0"]:
+    # Check for v10/v11/v12 structure
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["10.0", "11.0", "12.0"]:
         return True
 
     # Structure check: v10/v11 has layers with .attn and .memory
@@ -1089,6 +1089,9 @@ def main():
     args.knowledge_k = cfg['model'].get('knowledge_k', 8)
     args.knowledge_rank = cfg['model'].get('knowledge_rank', None)  # None = use rank
 
+    # v12.0 SSM parameters
+    args.state_dim = cfg['model'].get('state_dim', 64)
+
     # v8.0 Ablation: skip Householder (from config or CLI)
     args.skip_householder = cfg['model'].get('skip_householder', False)
     args.compress_gelu = cfg['model'].get('compress_gelu', False)
@@ -1312,7 +1315,10 @@ def main():
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
-        if args.model_version == '11.0':
+        if args.model_version == '12.0':
+            print(f"   → v12.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}, state_dim={getattr(args, 'state_dim', 64)}")
+            print(f"   → Architecture: SSM → importance → shared compress → Q/K/V")
+        elif args.model_version == '11.0':
             print(f"   → v11.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}")
             print(f"   → Architecture: compressor_Q/K/V → expand_Q/K/V → d_model attention")
         elif args.model_version == '10.0':
@@ -1334,7 +1340,23 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "11.0":
+        if model_version == "12.0":
+            # v12.0: SSM-guided Shared QKV
+            rank = args.basis_rank
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
+            state_dim = getattr(args, 'state_dim', 64)
+            d_head = args.d_model // args.n_heads
+            print(f"SharedNeurons (v{model_version}): rank={rank} - SSM-guided Shared QKV!")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (shared via SSM)")
+            print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model}")
+            print(f"  SSM: state_dim={state_dim}")
+            print(f"  Architecture: SSM → importance × neuron_pref → shared compress → Q/K/V")
+            print(f"  Attention: d_model space (d_head={d_head})")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "11.0":
             # v11.0: d_model Attention (compress → expand → d_model attention)
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
@@ -1456,7 +1478,18 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '11.0':
+    if model_version == '12.0':
+        # v12.0: SSM-guided Shared QKV
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'knowledge_rank': args.knowledge_rank,  # None = use rank
+            'rank': args.basis_rank,
+            'state_dim': getattr(args, 'state_dim', 64),
+        })
+    elif model_version == '11.0':
         # v11.0: Unified Compression (1 compressor + expand_Q/K/V)
         model_kwargs.update({
             'n_compress': args.n_compress,
