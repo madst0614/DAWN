@@ -1,7 +1,8 @@
 """
 DAWN Model Version Registry
 
-v10.0: Simplified Compress/Expand Architecture
+v10.0: Simplified Compress/Expand Architecture (Soft Routing)
+v11.0: Hard Top-K Routing (Sparse Activation)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below
@@ -30,6 +31,31 @@ VERSION_REGISTRY = {
             f"SharedNeurons (v10.0): rank={args.get('rank', args.get('basis_rank'))}",
             f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (Q/K/V/M shared)",
             f"  ExpandNeurons: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (O shared)",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('rank', args.get('basis_rank'))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
+    "11.0": {
+        "description": "Hard Top-K Routing (v10 + sparse activation)",
+        "aliases": ["11", "110"],
+        "module": "model_v11",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "compress_top_k": 2,
+            "expand_top_k": 2,
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v11.0): rank={args.get('rank', args.get('basis_rank'))}",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (Q/K/V/M shared)",
+            f"  ExpandNeurons: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (O shared)",
+            f"  Hard Top-K: compress={args.get('compress_top_k', 2)}, expand={args.get('expand_top_k', 2)}",
+            f"  Compute savings: {args.get('n_compress')}/{args.get('compress_top_k', 2)}x compress, {args.get('n_expand')}/{args.get('expand_top_k', 2)}x expand",
             f"  KnowledgeNeurons:",
             f"    - K: {args.get('n_knowledge')} × {args.get('rank', args.get('basis_rank'))}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",

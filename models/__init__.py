@@ -7,14 +7,22 @@ v10.0: Simplified Compress/Expand Architecture
 - KnowledgeNeurons: [n_knowledge, rank] + [n_knowledge, d_model]
 - Soft routing (no Householder)
 
+v11.0: Hard Top-K Routing
+- Same architecture as v10.0
+- Hard top-k selection instead of soft routing
+- Significant compute savings (e.g., 48 → 2 = 24x)
+
 baseline: Vanilla Transformer for fair comparison
 """
 
-# v10.0 - stable version
+# v10.0 - soft routing
 from .model_v10 import DAWN as DAWN_v10
 
+# v11.0 - hard top-k routing
+from .model_v11 import DAWN as DAWN_v11
+
 # Default DAWN is the latest version
-DAWN = DAWN_v10
+DAWN = DAWN_v11
 
 # Baseline for comparison
 import sys
@@ -39,6 +47,7 @@ __all__ = [
     # Models
     'DAWN',
     'DAWN_v10',
+    'DAWN_v11',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -53,14 +62,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "10.0"
+__version__ = "11.0"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "10.0", "10", or "baseline"
+        version: "10.0", "11.0", "10", "11", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -73,6 +82,8 @@ def create_model_by_version(version, config):
 
     if version == "10.0":
         return DAWN_v10(**config)
+    elif version == "11.0":
+        return DAWN_v11(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, baseline")
+                        f"Supported versions: 10.0, 11.0, baseline")
