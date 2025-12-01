@@ -1,21 +1,21 @@
 """
-DAWN v11.0: Unified Compression Architecture
+DAWN v11.0: d_model Attention Architecture
 
 Key changes from v10:
-- NeuronCircuit: 3 compressors (Q/K/V) → 1 compressor + expand_Q/K/V
 - Attention: rank space → d_model space
 - d_head: rank // n_heads → d_model // n_heads
+- Q/K/V: compress → expand to d_model
 
 Architecture:
     x (d_model)
-    → Compressor: router → softmax → weighted compress_neurons → h (rank)
+    → compressor_Q/K/V: router → softmax → weighted compress_neurons → h (rank)
     → expand_Q/K/V: h (rank) → Q/K/V (d_model)
-    → Attention in d_model space
+    → Attention in d_model space (d_head = d_model // n_heads)
     → expand_O: attn_out (d_model) → output (d_model)
 
-이점:
-- 압축 한 번만 (3→1), 라우팅 연산 감소
-- d_model에서 Attention → 더 풍부한 표현력
+v10 vs v11:
+- v10: Attention in rank space (d_head = rank // n_heads)
+- v11: Attention in d_model space (d_head = d_model // n_heads)
 """
 
 import math
@@ -173,13 +173,13 @@ class Expander(nn.Module):
 
 class NeuronCircuit(nn.Module):
     """
-    v11.0 Attention Layer with Unified Compression
+    v11.0 Attention Layer
 
     Architecture:
-    1. x → Compressor → h (rank)
-    2. h → expand_Q/K/V → Q/K/V (d_model)
+    1. x → compressor_Q/K/V → h_Q/K/V (rank) - 각각 다른 압축!
+    2. h_Q/K/V → expand_Q/K/V → Q/K/V (d_model)
     3. Attention in d_model space
-    4. attn_out → expand_O (or Expander) → output
+    4. attn_out → expand_O → output
     """
     def __init__(
         self,
@@ -195,11 +195,13 @@ class NeuronCircuit(nn.Module):
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.n_heads = n_heads
-        self.d_head = d_model // n_heads  # Changed: d_model based
+        self.d_head = d_model // n_heads  # d_model based
         self.rank = rank
 
-        # Single compressor (unified for Q/K/V)
-        self.compressor = Compressor(shared_neurons, d_model, rank, n_compress)
+        # Separate compressors for Q/K/V (각각 다른 라우팅)
+        self.compressor_Q = Compressor(shared_neurons, d_model, rank, n_compress)
+        self.compressor_K = Compressor(shared_neurons, d_model, rank, n_compress)
+        self.compressor_V = Compressor(shared_neurons, d_model, rank, n_compress)
 
         # Expand from rank to d_model for Q/K/V
         self.expand_Q = nn.Linear(rank, d_model, bias=False)
@@ -223,13 +225,15 @@ class NeuronCircuit(nn.Module):
         """
         B, S, D = x.shape
 
-        # 1. Compress (unified)
-        h, compress_info = self.compressor(x)  # [B, S, rank]
+        # 1. Compress Q/K/V separately (각각 다른 뉴런 조합)
+        h_Q, q_info = self.compressor_Q(x)  # [B, S, rank]
+        h_K, k_info = self.compressor_K(x)  # [B, S, rank]
+        h_V, v_info = self.compressor_V(x)  # [B, S, rank]
 
-        # 2. Expand to Q/K/V
-        Q = self.expand_Q(h)  # [B, S, d_model]
-        K = self.expand_K(h)  # [B, S, d_model]
-        V = self.expand_V(h)  # [B, S, d_model]
+        # 2. Expand to d_model
+        Q = self.expand_Q(h_Q)  # [B, S, d_model]
+        K = self.expand_K(h_K)  # [B, S, d_model]
+        V = self.expand_V(h_V)  # [B, S, d_model]
 
         # 3. Reshape for multi-head attention (in d_model space)
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)  # [B, H, S, d_head]
@@ -252,7 +256,9 @@ class NeuronCircuit(nn.Module):
         output = self.out_dropout(output)
 
         routing_info = {
-            'compress': compress_info,
+            'Q': q_info,
+            'K': k_info,
+            'V': v_info,
             'attn_weights': attn.detach(),  # [B, H, S, S]
         }
         return output, routing_info
@@ -380,16 +386,16 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v11.0: Unified Compression Architecture
+    DAWN v11.0: d_model Attention Architecture
 
     Key changes from v10:
-    - NeuronCircuit: 1 compressor + expand_Q/K/V (instead of 3 compressors)
     - Attention in d_model space (not rank space)
-    - d_head = d_model // n_heads
+    - d_head = d_model // n_heads (not rank // n_heads)
+    - Q/K/V: compress → expand to d_model
 
-    이점:
-    - 압축 1번 (3번 → 1번) → 라우팅 연산 감소
-    - d_model에서 Attention → 더 풍부한 표현력
+    v10 vs v11:
+    - v10: Attention in rank space (d_head = rank // n_heads)
+    - v11: Attention in d_model space (d_head = d_model // n_heads)
     """
     __version__ = "11.0"
 
@@ -557,16 +563,18 @@ class DAWN(nn.Module):
         count = 0
 
         for layer_info in routing_infos:
-            # Attention compressor (unified)
-            weights = layer_info['attention']['compress']['weights']  # [B, S, n_compress]
-            usage = weights.mean(dim=(0, 1))  # [n_compress]
-            target = 1.0 / self.n_compress
-            loss += ((usage - target) ** 2).sum() * self.n_compress
-            count += 1
+            # Attention Q/K/V compressors
+            for comp in ['Q', 'K', 'V']:
+                weights = layer_info['attention'][comp]['weights']  # [B, S, n_compress]
+                usage = weights.mean(dim=(0, 1))  # [n_compress]
+                target = 1.0 / self.n_compress
+                loss += ((usage - target) ** 2).sum() * self.n_compress
+                count += 1
 
             # Memory M compressor
             m_weights = layer_info['memory']['M']['weights']  # [B, S, n_compress]
             m_usage = m_weights.mean(dim=(0, 1))
+            target = 1.0 / self.n_compress
             loss += ((m_usage - target) ** 2).sum() * self.n_compress
             count += 1
 
@@ -591,9 +599,11 @@ class DAWN(nn.Module):
 
         embed = self.token_emb.weight.numel() + self.pos_emb.weight.numel()
 
-        # Routers: per layer (1 compressor + 1 memory compressor)
+        # Routers: per layer (3 compressors Q/K/V + 1 memory compressor)
         router_per_layer = (
-            self.layers[0].attn.compressor.router.weight.numel() +
+            self.layers[0].attn.compressor_Q.router.weight.numel() +
+            self.layers[0].attn.compressor_K.router.weight.numel() +
+            self.layers[0].attn.compressor_V.router.weight.numel() +
             self.layers[0].memory.query_compressor.router.weight.numel()
         )
         routers = router_per_layer * self.n_layers
@@ -619,7 +629,7 @@ class DAWN(nn.Module):
         print(f"Expand Q/K/V/O:  {expand_qkvo:,} ({expand_qkvo/1e6:.2f}M)")
         print(f"LayerNorms:      {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
-        print(f"Architecture: 1 compressor + expand_Q/K/V/O")
+        print(f"Architecture: compressor_Q/K/V + expand_Q/K/V/O")
         print(f"Attention in d_model space (d_head={self.d_model // self.n_heads})")
         print(f"---")
         print(f"Total:           {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")

@@ -1,6 +1,5 @@
 # DAWN v11.0 Training Config
-# Unified Compression: 1 compressor + expand_Q/K/V
-# Attention in d_model space (not rank space)
+# d_model Attention: compress → expand → d_model attention
 
 # Data
 data:
@@ -20,7 +19,7 @@ model:
 
   # Neurons (v10과 동일)
   n_compress: 48
-  n_expand: 48
+  n_expand: 12
 
   n_knowledge: 80
   knowledge_k: 10
@@ -47,20 +46,17 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v11
 log_dir: /content/drive/MyDrive/dawn/logs_v11
 
 # =============================================================================
-# v10 vs v11 비교 (Unified Compression)
+# v10 vs v11 비교
 # =============================================================================
 #
 # | 항목              | v10.0              | v11.0                  |
 # |-------------------|--------------------|-----------------------|
-# | Compressors       | 3개 (Q/K/V 별도)   | 1개 (unified)          |
-# | Q/K/V 생성        | 각각 compress_neurons| expand_Q/K/V Linear   |
 # | Attention space   | rank               | d_model               |
 # | d_head            | rank // n_heads    | d_model // n_heads    |
-# | Routing 연산      | 3회/layer          | 1회/layer (Attn)      |
+# | Q/K/V 생성        | compress only      | compress → expand      |
 #
-# v11 이점:
-# 1. 라우팅 연산 3배 감소 (Attention 부분)
-# 2. d_model에서 Attention → 더 풍부한 표현력
-# 3. 단일 압축 표현에서 Q/K/V 분화 → 정보 효율성
+# v11 차이점:
+# - Attention을 d_model space에서 수행 (더 풍부한 표현력)
+# - expand_Q/K/V/O Linear 추가됨
 #
 # =============================================================================

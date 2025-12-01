@@ -1314,7 +1314,7 @@ def main():
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
         if args.model_version == '11.0':
             print(f"   → v11.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}")
-            print(f"   → Architecture: 1 compressor + expand_Q/K/V/O, d_model attention")
+            print(f"   → Architecture: compressor_Q/K/V → expand_Q/K/V → d_model attention")
         elif args.model_version == '10.0':
             print(f"   → v10.0 params: n_compress={args.n_compress}, n_expand={args.n_expand}, rank={args.basis_rank}, n_knowledge={args.n_knowledge}")
         elif args.model_version in ['8.0', '8.1', '8.2', '8.3']:
@@ -1335,14 +1335,14 @@ def main():
 
     if model_version != 'baseline':
         if model_version == "11.0":
-            # v11.0: Unified Compression (1 compressor + expand_Q/K/V)
+            # v11.0: d_model Attention (compress → expand → d_model attention)
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
             d_head = args.d_model // args.n_heads
-            print(f"SharedNeurons (v{model_version}): rank={rank} - Unified Compression!")
-            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (unified)")
+            print(f"SharedNeurons (v{model_version}): rank={rank} - d_model Attention!")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (Q/K/V shared)")
             print(f"  ExpandNeurons: {args.n_expand} × {rank} × {args.d_model}")
-            print(f"  Architecture: 1 compressor + expand_Q/K/V/O")
+            print(f"  Architecture: compressor_Q/K/V → expand_Q/K/V → d_model attention")
             print(f"  Attention: d_model space (d_head={d_head})")
             print(f"  KnowledgeNeurons:")
             print(f"    - K: {args.n_knowledge} × {knowledge_rank}")

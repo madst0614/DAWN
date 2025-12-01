@@ -38,7 +38,7 @@ VERSION_REGISTRY = {
         ],
     },
     "11.0": {
-        "description": "Unified Compression (1 compressor + expand_Q/K/V, d_model attention)",
+        "description": "d_model Attention (compress→expand→d_model attention)",
         "aliases": ["11", "110"],
         "module": "model_v11",
         "required_params": [
@@ -50,12 +50,12 @@ VERSION_REGISTRY = {
         },
         "display_info": lambda args: [
             f"SharedNeurons (v11.0): rank={args.get('rank', args.get('basis_rank'))}",
-            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (unified)",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (Q/K/V shared)",
             f"  ExpandNeurons: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')}",
-            f"  Architecture: 1 compressor + expand_Q/K/V/O",
+            f"  Architecture: compressor_Q/K/V → expand_Q/K/V → d_model attention",
             f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
             f"  KnowledgeNeurons:",
-            f"    - K: {args.get('n_knowledge')} × {args.get('rank', args.get('basis_rank'))}",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
             f"    - top-k: {args.get('knowledge_k')}",
         ],
