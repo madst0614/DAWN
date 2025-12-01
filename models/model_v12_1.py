@@ -118,8 +118,10 @@ class NeuronCircuit(nn.Module):
         # SSM
         self.ssm = SSM(d_model, state_dim)
 
-        # Router: 토큰별 뉴런 선호도 (compress/expand 각각)
-        self.compress_router = nn.Linear(d_model, n_compress, bias=False)
+        # Router: Q/K/V 각각 독립 라우터 (SSM 중요도는 공유)
+        self.compress_router_Q = nn.Linear(d_model, n_compress, bias=False)
+        self.compress_router_K = nn.Linear(d_model, n_compress, bias=False)
+        self.compress_router_V = nn.Linear(d_model, n_compress, bias=False)
         self.expand_router = nn.Linear(rank, n_expand, bias=False)
 
         self.attn_dropout = nn.Dropout(dropout)
@@ -139,23 +141,30 @@ class NeuronCircuit(nn.Module):
         # 1. SSM → 토큰 중요도
         importance, ssm_state = self.ssm(x)  # [B, S], [B, state_dim]
 
-        # 2. 토큰별 compress 뉴런 선호도
-        token_compress_pref = F.softmax(self.compress_router(x), dim=-1)  # [B, S, n_compress]
+        # 2. Q/K/V 각각 토큰별 뉴런 선호도
+        token_Q_pref = F.softmax(self.compress_router_Q(x), dim=-1)  # [B, S, n_compress]
+        token_K_pref = F.softmax(self.compress_router_K(x), dim=-1)
+        token_V_pref = F.softmax(self.compress_router_V(x), dim=-1)
 
-        # 3. 중요도 × 뉴런선호 → compress 뉴런 가중치
-        compress_weights = torch.einsum('bs,bsn->bn', importance, token_compress_pref)
-        compress_weights = compress_weights / (compress_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # 3. 중요도 × 뉴런선호 → Q/K/V별 compress 뉴런 가중치
+        compress_weights_Q = torch.einsum('bs,bsn->bn', importance, token_Q_pref)
+        compress_weights_K = torch.einsum('bs,bsn->bn', importance, token_K_pref)
+        compress_weights_V = torch.einsum('bs,bsn->bn', importance, token_V_pref)
 
-        # 4. 공유 compress 행렬 생성
-        # [B, n_compress] @ [n_compress, d_model, rank] → [B, d_model, rank]
-        shared_compress = torch.einsum('bn,ndr->bdr', compress_weights,
-                                        self.shared_neurons.compress_neurons)
+        compress_weights_Q = compress_weights_Q / (compress_weights_Q.sum(dim=-1, keepdim=True) + 1e-8)
+        compress_weights_K = compress_weights_K / (compress_weights_K.sum(dim=-1, keepdim=True) + 1e-8)
+        compress_weights_V = compress_weights_V / (compress_weights_V.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # 5. 모든 토큰에 공유 compress 적용 → Q/K/V
-        # [B, S, d_model] @ [B, d_model, rank] → [B, S, rank]
-        Q = torch.einsum('bsd,bdr->bsr', x, shared_compress)
-        K = torch.einsum('bsd,bdr->bsr', x, shared_compress)
-        V = torch.einsum('bsd,bdr->bsr', x, shared_compress)
+        # 4. Q/K/V별 공유 compress 행렬 생성
+        neurons = self.shared_neurons.compress_neurons
+        shared_compress_Q = torch.einsum('bn,ndr->bdr', compress_weights_Q, neurons)
+        shared_compress_K = torch.einsum('bn,ndr->bdr', compress_weights_K, neurons)
+        shared_compress_V = torch.einsum('bn,ndr->bdr', compress_weights_V, neurons)
+
+        # 5. 각각 다른 투영
+        Q = torch.einsum('bsd,bdr->bsr', x, shared_compress_Q)
+        K = torch.einsum('bsd,bdr->bsr', x, shared_compress_K)
+        V = torch.einsum('bsd,bdr->bsr', x, shared_compress_V)
 
         # 6. Multi-head Attention in rank space
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)  # [B, H, S, d_head]
@@ -190,7 +199,9 @@ class NeuronCircuit(nn.Module):
 
         routing_info = {
             'importance': importance.detach(),
-            'compress_weights': compress_weights.detach(),
+            'compress_weights_Q': compress_weights_Q.detach(),
+            'compress_weights_K': compress_weights_K.detach(),
+            'compress_weights_V': compress_weights_V.detach(),
             'expand_weights': expand_weights.detach(),
             'ssm_state': ssm_state.detach(),
             'attn_weights': attn.detach(),
@@ -479,11 +490,12 @@ class DAWN(nn.Module):
         count = 0
 
         for layer_info in routing_infos:
-            # Attention compress 뉴런 가중치
-            compress_w = layer_info['attention']['compress_weights']  # [B, n_compress]
+            # Attention compress 뉴런 가중치 (Q/K/V 각각)
             target_c = 1.0 / self.n_compress
-            loss += ((compress_w.mean(dim=0) - target_c) ** 2).sum() * self.n_compress
-            count += 1
+            for key in ['compress_weights_Q', 'compress_weights_K', 'compress_weights_V']:
+                compress_w = layer_info['attention'][key]  # [B, n_compress]
+                loss += ((compress_w.mean(dim=0) - target_c) ** 2).sum() * self.n_compress
+                count += 1
 
             # Attention expand 뉴런 가중치
             expand_w = layer_info['attention']['expand_weights']  # [B, n_expand]
@@ -526,7 +538,9 @@ class DAWN(nn.Module):
         ssm_total = ssm_per_layer * self.n_layers
 
         router_per_layer = (
-            self.layers[0].attn.compress_router.weight.numel() +
+            self.layers[0].attn.compress_router_Q.weight.numel() +
+            self.layers[0].attn.compress_router_K.weight.numel() +
+            self.layers[0].attn.compress_router_V.weight.numel() +
             self.layers[0].attn.expand_router.weight.numel() +
             self.layers[0].memory.compress_router.weight.numel()
         )
