@@ -28,6 +28,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torch.cuda.amp import autocast, GradScaler
 
@@ -318,7 +319,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, use_a
     total_loss = 0
     num_batches = 0
 
-    for batch in train_loader:
+    pbar = tqdm(train_loader, desc="Training", leave=False)
+    for batch in pbar:
         input_ids = batch['input_ids'].to(device)
         labels = batch['label'].to(device)
 
@@ -341,6 +343,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, use_a
         scheduler.step()
         total_loss += loss.item()
         num_batches += 1
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
     return total_loss / num_batches
 
@@ -359,7 +362,7 @@ def evaluate(model, eval_loader, task_name, device, collect_neurons=False):
     num_batches = 0
 
     with torch.no_grad():
-        for batch in eval_loader:
+        for batch in tqdm(eval_loader, desc="Evaluating", leave=False):
             input_ids = batch['input_ids'].to(device)
             labels = batch['label'].to(device)
 
