@@ -793,7 +793,44 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
-    version = config.get('model_version', '10.0')
+    version = config.get('model_version', 'auto')
+
+    # Auto-detect version
+    if version == 'auto':
+        # 1. Try checkpoint path
+        path_str = str(checkpoint_path).lower()
+        if 'v12_4' in path_str or 'v12.4' in path_str:
+            version = '12.4'
+        elif 'v12_3' in path_str or 'v12.3' in path_str:
+            version = '12.3'
+        elif 'v12_2' in path_str or 'v12.2' in path_str:
+            version = '12.2'
+        elif 'v12_1' in path_str or 'v12.1' in path_str:
+            version = '12.1'
+        elif 'v12_0' in path_str or 'v12.0' in path_str or 'v12' in path_str:
+            version = '12.0'
+        elif 'v11' in path_str:
+            version = '11.0'
+        elif 'v10' in path_str:
+            version = '10.0'
+        else:
+            # 2. Detect from state_dict keys
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            keys = list(state_dict.keys())
+            keys_str = ' '.join(keys)
+
+            if 'O_compress_pool' in keys_str or 'O_expand_pool' in keys_str:
+                version = '12.4'
+            elif 'O_pool' in keys_str:
+                version = '12.4'
+            elif 'expand_neurons_pool' in keys_str:
+                version = '12.3'
+            elif 'ssm' in keys_str or 'SSM' in keys_str:
+                version = '12.0'
+            else:
+                version = '10.0'
+
+        print(f"Auto-detected version: {version}")
 
     print(f"Model version: {version}")
 
