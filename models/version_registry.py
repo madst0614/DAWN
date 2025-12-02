@@ -7,6 +7,7 @@ v12.0: SSM-guided Shared QKV (SSM → importance → shared compress → Q/K/V, 
 v12.1: SSM-guided Shared Neurons (v10 based, rank attention, neuron compress/expand)
 v12.2: SSM-guided Dynamic Compress/Expand (shared neuron_weights, d_model attention)
 v12.3: SSM-guided Shared Expand Pool (n_expand for Q/K/V, separate routers)
+v12.5: Global SSM + Global Router (24→1 SSM, 60→5 routers, context enhancement)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below
