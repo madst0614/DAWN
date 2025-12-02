@@ -1385,6 +1385,26 @@ def main():
             print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
             print(f"    - V: {args.n_knowledge} × {args.d_model}")
             print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "12.5":
+            # v12.5: Global SSM + Global Router
+            rank = args.basis_rank
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
+            state_dim = getattr(args, 'state_dim', 64)
+            d_head = args.d_model // args.n_heads
+            print(f"SharedNeurons (v{model_version}): rank={rank} - Global SSM + Router!")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (shared)")
+            print(f"  expand_neurons_pool: {args.n_expand} × {rank} × {args.d_model} (1 shared pool for Q/K/V)")
+            print(f"  Global SSM: 1 (model level) → importance + context")
+            print(f"  Global Routers: 5 (compress, expand_Q/K/V, memory)")
+            print(f"  Context Enhancement: SSM context added to x")
+            print(f"  SSM: state_dim={state_dim}")
+            print(f"  Architecture: Global SSM → importance + context → Global Routers")
+            print(f"  Attention: d_model space (d_head={d_head})")
+            print(f"  Parameter savings: SSM 24→1, Routers 60→5")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
         elif model_version == "12.3":
             # v12.3: SSM-guided Shared Expand Pool (1 pool, 3 routers)
             rank = args.basis_rank
@@ -1586,6 +1606,17 @@ def main():
             'n_O_expand': getattr(args, 'n_O_expand', 12),
             'low_rank_O': getattr(args, 'low_rank_O', False),
             'O_rank': getattr(args, 'O_rank', 64),
+        })
+    elif model_version == '12.5':
+        # v12.5: Global SSM + Global Router
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'knowledge_rank': args.knowledge_rank,  # None = use rank
+            'rank': args.basis_rank,
+            'state_dim': getattr(args, 'state_dim', 64),
         })
     elif model_version == '12.3':
         # v12.3: SSM-guided Shared Expand Pool (1 pool, 3 routers)
