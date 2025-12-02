@@ -853,7 +853,215 @@ class DAWNAnalyzer:
         return results
 
     # ============================================================
-    # 7. VISUALIZATION
+    # 7. ROUTING DIVERSITY ANALYSIS (Collapse 진단)
+    # ============================================================
+
+    @torch.no_grad()
+    def analyze_routing_diversity(self, dataloader, max_batches: int = 50) -> Dict:
+        """
+        Analyze expand/compress router diversity to diagnose collapse.
+
+        Checks:
+        1. compress_pref vs expand_pref entropy (router 자체 문제?)
+        2. Token-level variance (토큰마다 다른가?)
+        3. Before/after importance weighting (SSM이 diversity 죽이나?)
+        """
+        print(f"\n{'='*60}")
+        print("7. ROUTING DIVERSITY ANALYSIS (Collapse 진단)")
+        print(f"{'='*60}")
+
+        self.model.eval()
+
+        # Accumulators
+        stats = {
+            'compress_pref': {'entropy': [], 'token_var': [], 'neuron_var': []},
+            'expand_pref_Q': {'entropy': [], 'token_var': [], 'neuron_var': []},
+            'expand_pref_K': {'entropy': [], 'token_var': [], 'neuron_var': []},
+            'expand_pref_V': {'entropy': [], 'token_var': [], 'neuron_var': []},
+            'compress_weights': {'entropy': []},
+            'expand_weights_Q': {'entropy': []},
+            'expand_weights_K': {'entropy': []},
+            'expand_weights_V': {'entropy': []},
+            'importance': {'entropy': [], 'concentration': []},
+        }
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Diversity Analysis", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            # Use layer 0 for analysis
+            routing_info = routing_infos[0]
+            attn = routing_info.get('attention', routing_info)
+
+            # Skip if not v12.3 format
+            if 'compress_pref' not in attn:
+                print("\n[SKIP] compress_pref not found in routing_info")
+                print("This analysis requires v12.3 format with token-level preferences.")
+                return {}
+
+            # Get token-level preferences
+            compress_pref = attn['compress_pref']  # [B, S, n_compress]
+            expand_pref_Q = attn.get('expand_pref_Q')  # [B, S, n_expand]
+            expand_pref_K = attn.get('expand_pref_K')
+            expand_pref_V = attn.get('expand_pref_V')
+
+            # Get batch-level weights
+            compress_weights = attn['compress_weights']  # [B, n_compress]
+            expand_weights_Q = attn.get('expand_weights_Q')  # [B, n_expand]
+            expand_weights_K = attn.get('expand_weights_K')
+            expand_weights_V = attn.get('expand_weights_V')
+
+            # Get importance
+            importance = attn.get('importance')  # [B, S]
+
+            def compute_entropy(p, dim=-1):
+                """Compute entropy along dimension"""
+                return -(p * torch.log(p + 1e-10)).sum(dim).mean().item()
+
+            def compute_token_var(p):
+                """Variance across tokens (dim=1)"""
+                return p.var(dim=1).mean().item()
+
+            def compute_neuron_var(p):
+                """Variance across neurons (dim=-1)"""
+                return p.var(dim=-1).mean().item()
+
+            # Analyze compress_pref [B, S, n_compress]
+            stats['compress_pref']['entropy'].append(compute_entropy(compress_pref))
+            stats['compress_pref']['token_var'].append(compute_token_var(compress_pref))
+            stats['compress_pref']['neuron_var'].append(compute_neuron_var(compress_pref))
+
+            # Analyze expand_pref_Q/K/V [B, S, n_expand]
+            for name, pref in [('expand_pref_Q', expand_pref_Q),
+                               ('expand_pref_K', expand_pref_K),
+                               ('expand_pref_V', expand_pref_V)]:
+                if pref is not None:
+                    stats[name]['entropy'].append(compute_entropy(pref))
+                    stats[name]['token_var'].append(compute_token_var(pref))
+                    stats[name]['neuron_var'].append(compute_neuron_var(pref))
+
+            # Analyze batch-level weights [B, n]
+            stats['compress_weights']['entropy'].append(compute_entropy(compress_weights))
+            for name, weights in [('expand_weights_Q', expand_weights_Q),
+                                  ('expand_weights_K', expand_weights_K),
+                                  ('expand_weights_V', expand_weights_V)]:
+                if weights is not None:
+                    stats[name]['entropy'].append(compute_entropy(weights))
+
+            # Analyze importance [B, S]
+            if importance is not None:
+                stats['importance']['entropy'].append(compute_entropy(importance))
+                # Concentration: how much does top token dominate?
+                top_importance = importance.max(dim=1).values / (importance.sum(dim=1) + 1e-10)
+                stats['importance']['concentration'].append(top_importance.mean().item())
+
+        # Compute averages and build results
+        results = {}
+
+        # Max entropies for reference
+        max_entropy_compress = math.log(self.n_compress)
+        max_entropy_expand = math.log(self.n_expand)
+
+        print(f"\n--- Token-Level Preferences (Before SSM) ---")
+        print(f"{'Metric':<20} {'Entropy':<12} {'Max':<8} {'Ratio':<8} {'Token Var':<12} {'Neuron Var':<12}")
+        print("-" * 72)
+
+        for name in ['compress_pref', 'expand_pref_Q', 'expand_pref_K', 'expand_pref_V']:
+            if stats[name]['entropy']:
+                entropy = np.mean(stats[name]['entropy'])
+                token_var = np.mean(stats[name]['token_var'])
+                neuron_var = np.mean(stats[name]['neuron_var'])
+                max_ent = max_entropy_compress if 'compress' in name else max_entropy_expand
+                ratio = entropy / max_ent
+
+                results[name] = {
+                    'entropy': entropy,
+                    'max_entropy': max_ent,
+                    'entropy_ratio': ratio,
+                    'token_variance': token_var,
+                    'neuron_variance': neuron_var,
+                }
+
+                print(f"{name:<20} {entropy:<12.4f} {max_ent:<8.2f} {ratio:<8.2%} {token_var:<12.6f} {neuron_var:<12.6f}")
+
+        print(f"\n--- Batch-Level Weights (After SSM) ---")
+        print(f"{'Metric':<20} {'Entropy':<12} {'Max':<8} {'Ratio':<8}")
+        print("-" * 40)
+
+        for name in ['compress_weights', 'expand_weights_Q', 'expand_weights_K', 'expand_weights_V']:
+            if stats[name]['entropy']:
+                entropy = np.mean(stats[name]['entropy'])
+                max_ent = max_entropy_compress if 'compress' in name else max_entropy_expand
+                ratio = entropy / max_ent
+
+                results[name] = {
+                    'entropy': entropy,
+                    'max_entropy': max_ent,
+                    'entropy_ratio': ratio,
+                }
+
+                print(f"{name:<20} {entropy:<12.4f} {max_ent:<8.2f} {ratio:<8.2%}")
+
+        # SSM importance analysis
+        if stats['importance']['entropy']:
+            imp_entropy = np.mean(stats['importance']['entropy'])
+            imp_concentration = np.mean(stats['importance']['concentration'])
+
+            print(f"\n--- SSM Importance ---")
+            print(f"Importance entropy: {imp_entropy:.4f}")
+            print(f"Top token concentration: {imp_concentration:.2%}")
+
+            results['importance'] = {
+                'entropy': imp_entropy,
+                'concentration': imp_concentration,
+            }
+
+        # Diagnosis
+        print(f"\n--- Diagnosis ---")
+
+        # Compare compress vs expand
+        if 'compress_pref' in results and 'expand_pref_Q' in results:
+            c_ratio = results['compress_pref']['entropy_ratio']
+            e_ratio = results['expand_pref_Q']['entropy_ratio']
+
+            print(f"compress_pref entropy ratio: {c_ratio:.2%}")
+            print(f"expand_pref_Q entropy ratio: {e_ratio:.2%}")
+
+            if e_ratio < 0.3:
+                print("  → expand_pref collapsed! Router 자체 문제")
+            elif c_ratio > 0.5 and e_ratio > 0.5:
+                print("  → Both diverse! 좋은 상태")
+
+        # Compare before/after SSM
+        if 'expand_pref_Q' in results and 'expand_weights_Q' in results:
+            before = results['expand_pref_Q']['entropy_ratio']
+            after = results['expand_weights_Q']['entropy_ratio']
+            drop = before - after
+
+            print(f"\nExpand entropy drop (pref→weights): {before:.2%} → {after:.2%} (Δ={drop:.2%})")
+
+            if drop > 0.2:
+                print("  → SSM importance가 diversity 죽임!")
+            elif drop < 0.05:
+                print("  → SSM 영향 적음, pref 자체가 문제")
+
+        # Token variance check
+        if 'expand_pref_Q' in results:
+            token_var = results['expand_pref_Q']['token_variance']
+            if token_var < 0.001:
+                print(f"\nToken variance 매우 낮음 ({token_var:.6f})")
+                print("  → 모든 토큰이 같은 뉴런 선호. Router가 토큰 구분 못함")
+            elif token_var > 0.01:
+                print(f"\nToken variance 양호 ({token_var:.6f})")
+                print("  → 토큰별 분화 있음")
+
+        return results
+
+    # ============================================================
+    # 8. VISUALIZATION
     # ============================================================
 
     def visualize(self, all_results: Dict, output_path: str):
@@ -997,7 +1205,10 @@ class DAWNAnalyzer:
         # 6. Attn-Mem balance
         all_results['attn_mem'] = self.analyze_attn_mem_balance(dataloader, min(max_batches, 30))
 
-        # 7. Visualization
+        # 7. Routing diversity (collapse diagnosis)
+        all_results['routing_diversity'] = self.analyze_routing_diversity(dataloader, max_batches)
+
+        # 8. Visualization
         os.makedirs(output_dir, exist_ok=True)
         viz_path = os.path.join(output_dir, 'analysis_summary.png')
         self.visualize(all_results, viz_path)
