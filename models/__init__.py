@@ -58,7 +58,10 @@ from .model_v12_2 import DAWN as DAWN_v12_2
 # v12.3 - SSM-guided shared expand pool (n_expand for Q/K/V, separate routers)
 from .model_v12_3 import DAWN as DAWN_v12_3
 
-# Default DAWN is the latest version
+# v12.4 - config-based dynamic O experiments (experimental)
+from .model_v12_4 import DAWN as DAWN_v12_4
+
+# Default DAWN is v12.3 (stable)
 DAWN = DAWN_v12_3
 
 # Baseline for comparison
@@ -89,6 +92,7 @@ __all__ = [
     'DAWN_v12_1',
     'DAWN_v12_2',
     'DAWN_v12_3',
+    'DAWN_v12_4',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -133,6 +137,8 @@ def create_model_by_version(version, config):
         return DAWN_v12_2(**config)
     elif version == "12.3":
         return DAWN_v12_3(**config)
+    elif version == "12.4":
+        return DAWN_v12_4(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, baseline")

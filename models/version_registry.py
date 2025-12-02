@@ -166,6 +166,38 @@ VERSION_REGISTRY = {
             f"    - top-k: {args.get('knowledge_k')}",
         ],
     },
+    "12.4": {
+        "description": "Config-based Dynamic O Experiments (dynamic_O, low_rank_O options)",
+        "aliases": ["124"],
+        "module": "model_v12_4",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "dynamic_O": False,
+            "n_O_expand": 12,
+            "low_rank_O": False,
+            "O_rank": 64,
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v12.4): rank={args.get('rank', args.get('basis_rank'))} (configurable O)",
+            f"  Config: dynamic_O={args.get('dynamic_O', False)}, low_rank_O={args.get('low_rank_O', False)}, n_heads={args.get('n_heads')}",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (SSM shared)",
+            f"  expand_neurons_pool: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (QKV pool)",
+            f"  O_compress_pool: {args.get('n_O_expand', 12)} × {args.get('d_model')} × {args.get('O_rank', 64)}" if args.get('dynamic_O', False) and args.get('low_rank_O', False) else (f"  O_pool: {args.get('n_O_expand', 12)} × {args.get('d_model')} × {args.get('d_model')}" if args.get('dynamic_O', False) else "  O projection: None (direct output)"),
+            f"  O_expand_pool: {args.get('n_O_expand', 12)} × {args.get('O_rank', 64)} × {args.get('d_model')}" if args.get('dynamic_O', False) and args.get('low_rank_O', False) else "",
+            f"  SSM: state_dim={args.get('state_dim', 64)}",
+            f"  Architecture: SSM → Q/K/V expand → {'low-rank O' if args.get('low_rank_O', False) else ('full-rank O' if args.get('dynamic_O', False) else 'no O proj')}",
+            f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
 }
 
 

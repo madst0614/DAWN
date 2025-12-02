@@ -1,0 +1,55 @@
+# DAWN v12.3 Training Config - 20M Scale, 12 Layers
+# Deep architecture experiment
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - val/wikitext_5to1_texts.pkl
+
+# Model Architecture
+model:
+  model_version: "12.3"
+  d_model: 320
+  n_layers: 12
+  n_heads: 4
+  rank: 64
+  state_dim: 64
+  n_compress: 288
+  n_expand: 72
+  n_knowledge: 320
+  knowledge_k: 14
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_ratio: 0.1
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v12_3_20M_12L
+log_dir: /content/drive/MyDrive/dawn/logs_v12_3_20M_12L
+
+# 파라미터 계산:
+#   Embedding: 30522 × 320 = 9.77M (weight tying)
+#
+#   Shared Neurons:
+#     Compress: 288 × 320 × 64 = 5.90M
+#     Expand Pool (QKV): 72 × 64 × 320 = 1.47M
+#     Knowledge K: 320 × 64 = 0.02M
+#     Knowledge V: 320 × 320 = 0.10M
+#
+#   Per Layer × 12:
+#     SSM + Routers + LN + expand_O: ~0.14M × 12 = 1.68M
+#
+#   Total: ~18.9M
