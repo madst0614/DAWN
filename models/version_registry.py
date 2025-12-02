@@ -8,6 +8,7 @@ v12.1: SSM-guided Shared Neurons (v10 based, rank attention, neuron compress/exp
 v12.2: SSM-guided Dynamic Compress/Expand (shared neuron_weights, d_model attention)
 v12.3: SSM-guided Shared Expand Pool (n_expand for Q/K/V, separate routers)
 v12.5: Global SSM + Global Router (24→1 SSM, 60→5 routers, context enhancement)
+v12.6: No SSM Ablation (simple projection for importance, no context enhancement)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -228,6 +229,34 @@ VERSION_REGISTRY = {
             f"  Architecture: Global SSM → importance + context → Global Routers (per-layer x)",
             f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
             f"  Parameter savings: SSM 24→1, Routers 60→5",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
+    "12.6": {
+        "description": "No SSM Ablation (simple projection, no context enhancement)",
+        "aliases": ["126"],
+        "module": "model_v12_6",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,  # kept for config compatibility
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v12.6): rank={args.get('rank', args.get('basis_rank'))} (no SSM ablation)",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (shared)",
+            f"  expand_neurons_pool: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (QKV pool)",
+            f"  Global Importance: simple projection (no SSM)",
+            f"  Global Routers: 5 (compress, expand_Q/K/V, memory)",
+            f"  Context Enhancement: REMOVED (ablation)",
+            f"  Architecture: Simple Importance → Global Routers (per-layer x)",
+            f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
+            f"  Ablation: SSM removed, context removed",
             f"  KnowledgeNeurons:",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",

@@ -43,6 +43,11 @@ v12.5: Global SSM + Global Router
 - SSM 문맥 강화: importance + context 출력
 - context는 x에 더해서 문맥 강화
 
+v12.6: No SSM Ablation
+- SSM 제거, 단순 projection으로 importance 계산
+- context 강화 제거
+- Global Router만 유지 (ablation study)
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -70,7 +75,10 @@ from .model_v12_4 import DAWN as DAWN_v12_4
 # v12.5 - Global SSM + Global Router
 from .model_v12_5 import DAWN as DAWN_v12_5
 
-# Default DAWN is v12.5 (latest stable)
+# v12.6 - No SSM Ablation (simple projection for importance)
+from .model_v12_6 import DAWN as DAWN_v12_6
+
+# Default DAWN is v12.3 (stable)
 DAWN = DAWN_v12_3
 
 # Baseline for comparison
@@ -103,6 +111,7 @@ __all__ = [
     'DAWN_v12_3',
     'DAWN_v12_4',
     'DAWN_v12_5',
+    'DAWN_v12_6',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -151,6 +160,8 @@ def create_model_by_version(version, config):
         return DAWN_v12_4(**config)
     elif version == "12.5":
         return DAWN_v12_5(**config)
+    elif version == "12.6":
+        return DAWN_v12_6(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, baseline")
