@@ -261,6 +261,7 @@ class RoutingInfoParser:
 
         elif version == 'v12':
             attn = routing_info['attention']
+            mem = routing_info.get('memory', {})
 
             if comp == 'compress':
                 # compress_pref [B, S, n_compress]
@@ -269,8 +270,9 @@ class RoutingInfoParser:
                 # expand_pref_Q/K/V [B, S, n_expand]
                 return attn.get(f'expand_pref_{comp}')
             elif comp == 'M':
-                # Memory uses compress routing
-                return attn.get('compress_pref')
+                # Memory's token_neuron_pref (if saved in routing_info)
+                # Note: NeuronMemory needs to save 'compress_pref' for this to work
+                return mem.get('compress_pref')
 
         return None
 
@@ -620,9 +622,15 @@ class DAWNAnalyzer:
 
         self.model.eval()
 
+        # Compress usage (Q=K=V in v12.3, separate in v10)
         layer_comp_usage = {l: {comp: torch.zeros(self.n_compress, device=self.device)
                                for comp in ['Q', 'K', 'V', 'M']}
                           for l in range(self.n_layers)}
+
+        # Expand usage (Q/K/V different in v12.3)
+        layer_expand_usage = {l: {comp: torch.zeros(self.n_expand, device=self.device)
+                                  for comp in ['Q', 'K', 'V']}
+                             for l in range(self.n_layers)}
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Layer Analysis", total=max_batches)):
             if batch_idx >= max_batches:
@@ -632,20 +640,32 @@ class DAWNAnalyzer:
             _, routing_infos = self.model(input_ids, return_routing_info=True)
 
             for layer_idx, routing_info in enumerate(routing_infos):
+                # Compress routing
                 for comp in ['Q', 'K', 'V', 'M']:
                     weights, _ = self.parser.get_compress_weights(routing_info, comp)
                     if weights is not None:
-                        # Handle different shapes:
-                        # v10.x: [B, S, N] -> sum over (B, S)
-                        # v12.3: [B, N] -> sum over (B)
                         if len(weights.shape) == 3:
                             layer_comp_usage[layer_idx][comp] += weights.sum(dim=(0, 1))
                         else:
                             layer_comp_usage[layer_idx][comp] += weights.sum(dim=0)
 
-        results = {'layer_correlation': {}}
+                # Expand routing (v12.3 has different expand_weights for Q/K/V)
+                for comp in ['Q', 'K', 'V']:
+                    weights, _ = self.parser.get_expand_weights(routing_info, comp)
+                    if weights is not None:
+                        if len(weights.shape) == 3:
+                            layer_expand_usage[layer_idx][comp] += weights.sum(dim=(0, 1))
+                        else:
+                            layer_expand_usage[layer_idx][comp] += weights.sum(dim=0)
 
-        print(f"\n--- Q/K/V/M Correlation by Layer ---")
+        results = {'layer_correlation': {}, 'expand_correlation': {}}
+
+        # Check if v12.3 (Q=K=V for compress)
+        is_v12 = self.version.startswith('12')
+
+        print(f"\n--- Compress Routing: Q/K/V/M Correlation by Layer ---")
+        if is_v12:
+            print("(Note: v12.3 uses shared compress_weights for Q/K/V, so Q-K, Q-V = 1.0)")
 
         for layer_idx in range(self.n_layers):
             q_usage = layer_comp_usage[layer_idx]['Q']
@@ -668,6 +688,30 @@ class DAWNAnalyzer:
 
             if layer_idx == 0:
                 print(f"  L{layer_idx}: Q-K={qk:.3f}, Q-V={qv:.3f}, Q-M={qm:.3f}")
+
+        # Expand correlation (more meaningful for v12.3)
+        if is_v12:
+            print(f"\n--- Expand Routing: Q/K/V Differentiation by Layer ---")
+            print("(v12.3 uses different expand_weights for Q/K/V)")
+
+            for layer_idx in range(self.n_layers):
+                q_exp = layer_expand_usage[layer_idx]['Q']
+                k_exp = layer_expand_usage[layer_idx]['K']
+                v_exp = layer_expand_usage[layer_idx]['V']
+
+                q_norm = F.normalize(q_exp.unsqueeze(0), dim=-1)
+                k_norm = F.normalize(k_exp.unsqueeze(0), dim=-1)
+                v_norm = F.normalize(v_exp.unsqueeze(0), dim=-1)
+
+                qk = F.cosine_similarity(q_norm, k_norm).item()
+                qv = F.cosine_similarity(q_norm, v_norm).item()
+                kv = F.cosine_similarity(k_norm, v_norm).item()
+
+                results['expand_correlation'][f'L{layer_idx}'] = {
+                    'Q-K': qk, 'Q-V': qv, 'K-V': kv
+                }
+
+                print(f"  L{layer_idx}: Q-K={qk:.3f}, Q-V={qv:.3f}, K-V={kv:.3f}")
 
         return results
 

@@ -301,6 +301,7 @@ class NeuronMemory(nn.Module):
         routing_info = {
             'importance': importance.detach(),
             'neuron_weights': neuron_weights.detach(),
+            'compress_pref': token_neuron_pref.detach(),  # [B, S, n_compress] - token-level
             'knowledge_indices': topk_idx,
             'knowledge_weights': weights,
         }
