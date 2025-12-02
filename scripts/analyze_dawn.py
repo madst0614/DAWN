@@ -143,13 +143,19 @@ class RoutingInfoParser:
         routing_info['memory']['knowledge_indices']
         routing_info['memory']['knowledge_weights']
 
-    v12.3 format (BATCH-LEVEL routing via SSM importance weighting):
-        # SSM collapses token dimension: einsum('bs,bsn->bn', importance, pref)
-        routing_info['attention']['compress_weights']  # [B, n_compress] - BATCH-LEVEL!
-        routing_info['attention']['expand_weights_Q']  # [B, n_expand] - BATCH-LEVEL!
-        routing_info['attention']['expand_weights_K']  # [B, n_expand]
-        routing_info['attention']['expand_weights_V']  # [B, n_expand]
-        routing_info['memory']['neuron_weights']  # [B, n_compress] - BATCH-LEVEL!
+    v12.3 format:
+        # Token-level preferences (before SSM weighting):
+        routing_info['attention']['compress_pref']    # [B, S, n_compress] - TOKEN-LEVEL!
+        routing_info['attention']['expand_pref_Q']    # [B, S, n_expand] - TOKEN-LEVEL!
+        routing_info['attention']['expand_pref_K/V']  # [B, S, n_expand]
+
+        # Batch-level weights (after SSM importance weighting):
+        # einsum('bs,bsn->bn', importance, pref)
+        routing_info['attention']['compress_weights']  # [B, n_compress] - BATCH-LEVEL
+        routing_info['attention']['expand_weights_Q']  # [B, n_expand] - BATCH-LEVEL
+        routing_info['attention']['expand_weights_K/V']
+
+        routing_info['memory']['neuron_weights']  # [B, n_compress]
         routing_info['memory']['knowledge_indices']
         routing_info['memory']['knowledge_weights']
     """
@@ -235,6 +241,38 @@ class RoutingInfoParser:
         """
         mem = routing_info.get('memory', {})
         return mem.get('knowledge_indices'), mem.get('knowledge_weights')
+
+    def get_token_level_pref(self, routing_info: Dict, comp: str = 'Q') -> Optional[torch.Tensor]:
+        """
+        Get token-level routing preferences (before SSM importance weighting).
+
+        v10.x: same as get_compress_weights (already token-level)
+        v12.3: compress_pref [B, S, n_compress] or expand_pref_Q/K/V [B, S, n_expand]
+
+        Returns:
+            pref: [B, S, N] - token-level preferences
+        """
+        version = self.detect_version(routing_info)
+
+        if version == 'v10':
+            # v10 is already token-level
+            weights, _ = self.get_compress_weights(routing_info, comp)
+            return weights
+
+        elif version == 'v12':
+            attn = routing_info['attention']
+
+            if comp == 'compress':
+                # compress_pref [B, S, n_compress]
+                return attn.get('compress_pref')
+            elif comp in ['Q', 'K', 'V']:
+                # expand_pref_Q/K/V [B, S, n_expand]
+                return attn.get(f'expand_pref_{comp}')
+            elif comp == 'M':
+                # Memory uses compress routing
+                return attn.get('compress_pref')
+
+        return None
 
 
 # ============================================================
@@ -648,7 +686,7 @@ class DAWNAnalyzer:
 
         pos_neuron_weights = defaultdict(lambda: torch.zeros(self.n_compress, device=self.device))
         pos_counts = defaultdict(float)
-        is_batch_level = None  # Will detect from first routing info
+        use_token_pref = False  # Whether we're using token-level compress_pref
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Specialization", total=max_batches)):
             if batch_idx >= max_batches:
@@ -659,55 +697,61 @@ class DAWNAnalyzer:
 
             _, routing_infos = self.model(input_ids, return_routing_info=True)
 
-            # Layer 0, Q routing
-            q_weights, _ = self.parser.get_compress_weights(routing_infos[0], 'Q')
+            # Try to get token-level compress_pref first (v12.3)
+            token_pref = self.parser.get_token_level_pref(routing_infos[0], 'compress')
 
-            if q_weights is None:
-                continue
+            if token_pref is not None and len(token_pref.shape) == 3:
+                # v12.3: Use compress_pref [B, S, n_compress] for true token-level analysis
+                use_token_pref = True
+                _, seq_len, n_neurons = token_pref.shape
 
-            # Detect routing type
-            if is_batch_level is None:
-                is_batch_level = (len(q_weights.shape) == 2)
-                if is_batch_level:
-                    print("\n[NOTE] v12.3 batch-level routing detected.")
-                    print("  Routing weights are [B, N] not [B, S, N].")
-                    print("  All tokens in a batch share the same routing weights.")
-                    print("  POS analysis shows batch-averaged patterns, not per-token specialization.\n")
-
-            # Handle different tensor shapes
-            # v10.x: [B, S, N] (token-level weights)
-            # v12.3: [B, N] (batch-level weights - all tokens share same weight)
-            if len(q_weights.shape) == 3:
-                _, seq_len, n_neurons = q_weights.shape
                 for b in range(B):
                     for s in range(min(S, seq_len)):
                         tid = input_ids[b, s].item()
                         token = self.tokenizer.decode([tid]).strip()
                         pos = simple_pos_tag(token)
 
-                        weights = q_weights[b, s]
+                        weights = token_pref[b, s]
                         if weights.shape[0] == self.n_compress:
                             pos_neuron_weights[pos] += weights
                             pos_counts[pos] += 1
-            elif len(q_weights.shape) == 2:
-                # Batch-level weights [B, n_compress]
-                # Each batch has one routing vector shared by all tokens
-                for b in range(B):
-                    batch_weights = q_weights[b]  # [n_compress]
-                    for s in range(S):
-                        tid = input_ids[b, s].item()
-                        token = self.tokenizer.decode([tid]).strip()
-                        pos = simple_pos_tag(token)
+            else:
+                # v10.x or fallback: Use compress_weights
+                q_weights, _ = self.parser.get_compress_weights(routing_infos[0], 'Q')
 
-                        if batch_weights.shape[0] == self.n_compress:
-                            pos_neuron_weights[pos] += batch_weights
-                            pos_counts[pos] += 1
+                if q_weights is None:
+                    continue
 
-        results = {'pos': {}, 'is_batch_level': is_batch_level}
+                if len(q_weights.shape) == 3:
+                    _, seq_len, n_neurons = q_weights.shape
+                    for b in range(B):
+                        for s in range(min(S, seq_len)):
+                            tid = input_ids[b, s].item()
+                            token = self.tokenizer.decode([tid]).strip()
+                            pos = simple_pos_tag(token)
 
-        print(f"\n--- POS -> Preferred Neurons (L0 Q) ---")
-        if is_batch_level:
-            print("(Batch-averaged; all POS may show similar patterns due to shared batch weights)")
+                            weights = q_weights[b, s]
+                            if weights.shape[0] == self.n_compress:
+                                pos_neuron_weights[pos] += weights
+                                pos_counts[pos] += 1
+                elif len(q_weights.shape) == 2:
+                    # Batch-level fallback (shouldn't happen if compress_pref exists)
+                    for b in range(B):
+                        batch_weights = q_weights[b]
+                        for s in range(S):
+                            tid = input_ids[b, s].item()
+                            token = self.tokenizer.decode([tid]).strip()
+                            pos = simple_pos_tag(token)
+
+                            if batch_weights.shape[0] == self.n_compress:
+                                pos_neuron_weights[pos] += batch_weights
+                                pos_counts[pos] += 1
+
+        results = {'pos': {}, 'use_token_pref': use_token_pref}
+
+        print(f"\n--- POS -> Preferred Neurons (L0 compress_pref) ---")
+        if use_token_pref:
+            print("(Using token-level compress_pref [B,S,N] for true per-token analysis)")
 
         # Calculate POS discriminability (cosine sim between POS weight vectors)
         pos_vectors = {}
@@ -740,8 +784,12 @@ class DAWNAnalyzer:
             results['pos_discriminability'] = pos_disc
 
             print(f"\n  POS Discriminability: {pos_disc:.4f}")
-            if is_batch_level and pos_disc < 0.1:
-                print(f"  (Low discriminability expected for batch-level routing)")
+            if pos_disc > 0.3:
+                print(f"  (Good differentiation! Neurons specialize for different POS)")
+            elif pos_disc > 0.1:
+                print(f"  (Moderate differentiation)")
+            else:
+                print(f"  (Low differentiation - neurons may be general-purpose)")
 
         return results
 

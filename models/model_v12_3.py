@@ -219,10 +219,14 @@ class NeuronCircuit(nn.Module):
         routing_info = {
             'importance': importance.detach(),
             'neuron_weights': compress_weights.detach(),  # for compatibility
-            'compress_weights': compress_weights.detach(),
+            'compress_weights': compress_weights.detach(),  # [B, n_compress] - batch-level
+            'compress_pref': compress_pref.detach(),  # [B, S, n_compress] - token-level
             'expand_weights_Q': expand_weights_Q.detach(),
             'expand_weights_K': expand_weights_K.detach(),
             'expand_weights_V': expand_weights_V.detach(),
+            'expand_pref_Q': expand_pref_Q.detach(),  # [B, S, n_expand] - token-level
+            'expand_pref_K': expand_pref_K.detach(),
+            'expand_pref_V': expand_pref_V.detach(),
             'ssm_state': ssm_state.detach(),
             'attn_weights': attn.detach(),
         }
