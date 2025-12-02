@@ -1095,6 +1095,8 @@ def main():
     # v12.4 dynamic O parameters
     args.dynamic_O = cfg['model'].get('dynamic_O', False)
     args.n_O_expand = cfg['model'].get('n_O_expand', 12)
+    args.low_rank_O = cfg['model'].get('low_rank_O', False)
+    args.O_rank = cfg['model'].get('O_rank', 64)
 
     # v8.0 Ablation: skip Householder (from config or CLI)
     args.skip_householder = cfg['model'].get('skip_householder', False)
@@ -1357,17 +1359,27 @@ def main():
             state_dim = getattr(args, 'state_dim', 64)
             dynamic_O = getattr(args, 'dynamic_O', False)
             n_O_expand = getattr(args, 'n_O_expand', 12)
+            low_rank_O = getattr(args, 'low_rank_O', False)
+            O_rank = getattr(args, 'O_rank', 64)
             d_head = args.d_model // args.n_heads
             print(f"SharedNeurons (v{model_version}): rank={rank} - Config-based O!")
-            print(f"  Config: dynamic_O={dynamic_O}, n_heads={args.n_heads}")
+            print(f"  Config: dynamic_O={dynamic_O}, low_rank_O={low_rank_O}, n_heads={args.n_heads}")
             print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (SSM shared)")
             print(f"  expand_neurons_pool: {args.n_expand} × {rank} × {args.d_model} (1 shared pool for Q/K/V)")
             if dynamic_O:
-                print(f"  O_pool: {n_O_expand} × {args.d_model} × {args.d_model} (dynamic O)")
+                if low_rank_O:
+                    print(f"  O_compress_pool: {n_O_expand} × {args.d_model} × {O_rank} (low-rank O)")
+                    print(f"  O_expand_pool: {n_O_expand} × {O_rank} × {args.d_model}")
+                else:
+                    print(f"  O_pool: {n_O_expand} × {args.d_model} × {args.d_model} (full-rank O)")
             else:
                 print(f"  O projection: None (direct output)")
             print(f"  SSM: state_dim={state_dim}")
-            print(f"  Architecture: SSM → Q/K/V expand → {'dynamic O' if dynamic_O else 'no O proj'}")
+            if dynamic_O:
+                o_type = 'low-rank O' if low_rank_O else 'full-rank O'
+            else:
+                o_type = 'no O proj'
+            print(f"  Architecture: SSM → Q/K/V expand → {o_type}")
             print(f"  Attention: d_model space (d_head={d_head})")
             print(f"  KnowledgeNeurons:")
             print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
@@ -1572,6 +1584,8 @@ def main():
             'state_dim': getattr(args, 'state_dim', 64),
             'dynamic_O': getattr(args, 'dynamic_O', False),
             'n_O_expand': getattr(args, 'n_O_expand', 12),
+            'low_rank_O': getattr(args, 'low_rank_O', False),
+            'O_rank': getattr(args, 'O_rank', 64),
         })
     elif model_version == '12.3':
         # v12.3: SSM-guided Shared Expand Pool (1 pool, 3 routers)

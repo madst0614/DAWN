@@ -1,7 +1,7 @@
 """
 DAWN v12.4: Config-based Dynamic O Experiments
 
-v12.4a: dynamic_O=True
+v12.4a: dynamic_O=True, low_rank_O=False
 - O_pool: [n_O_expand, d_model, d_model]
 - expand_router_O로 동적 O 행렬 생성
 - n_heads=4
@@ -9,6 +9,12 @@ v12.4a: dynamic_O=True
 v12.4b: dynamic_O=False
 - expand_O 제거 (attention output 직접 사용)
 - n_heads=1
+
+v12.4c: dynamic_O=True, low_rank_O=True
+- O_compress_pool: [n_O_expand, d_model, O_rank]
+- O_expand_pool: [n_O_expand, O_rank, d_model]
+- 하나의 expand_router_O로 두 풀 공유
+- n_heads=4
 
 Base: v12.3 (SSM-guided Shared Expand Pool)
 """
@@ -31,6 +37,8 @@ class SharedNeurons(nn.Module):
         knowledge_rank: int = None,
         dynamic_O: bool = False,
         n_O_expand: int = 12,
+        low_rank_O: bool = False,
+        O_rank: int = 64,
     ):
         super().__init__()
         self.d_model = d_model
@@ -41,6 +49,8 @@ class SharedNeurons(nn.Module):
         self.n_knowledge = n_knowledge
         self.dynamic_O = dynamic_O
         self.n_O_expand = n_O_expand
+        self.low_rank_O = low_rank_O
+        self.O_rank = O_rank
 
         # Compress pool: [n_compress, d_model, rank]
         self.compress_neurons = nn.Parameter(torch.zeros(n_compress, d_model, rank))
@@ -53,9 +63,22 @@ class SharedNeurons(nn.Module):
 
         # O pool (only if dynamic_O)
         if dynamic_O:
-            self.O_pool = nn.Parameter(torch.zeros(n_O_expand, d_model, d_model))
+            if low_rank_O:
+                # Low-rank O: compress then expand
+                # O_compress_pool: [n_O_expand, d_model, O_rank]
+                # O_expand_pool: [n_O_expand, O_rank, d_model]
+                self.O_compress_pool = nn.Parameter(torch.zeros(n_O_expand, d_model, O_rank))
+                self.O_expand_pool = nn.Parameter(torch.zeros(n_O_expand, O_rank, d_model))
+                self.register_parameter('O_pool', None)
+            else:
+                # Full-rank O: [n_O_expand, d_model, d_model]
+                self.O_pool = nn.Parameter(torch.zeros(n_O_expand, d_model, d_model))
+                self.register_parameter('O_compress_pool', None)
+                self.register_parameter('O_expand_pool', None)
         else:
             self.register_parameter('O_pool', None)
+            self.register_parameter('O_compress_pool', None)
+            self.register_parameter('O_expand_pool', None)
 
         self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, self.knowledge_rank))
         self.knowledge_V = nn.Parameter(torch.zeros(n_knowledge, d_model))
@@ -68,9 +91,14 @@ class SharedNeurons(nn.Module):
         for i in range(self.n_expand):
             nn.init.orthogonal_(self.expand_neurons.data[i])
             nn.init.orthogonal_(self.expand_neurons_pool.data[i])
-        if self.dynamic_O and self.O_pool is not None:
-            for i in range(self.n_O_expand):
-                nn.init.orthogonal_(self.O_pool.data[i])
+        if self.dynamic_O:
+            if self.low_rank_O:
+                for i in range(self.n_O_expand):
+                    nn.init.orthogonal_(self.O_compress_pool.data[i])
+                    nn.init.orthogonal_(self.O_expand_pool.data[i])
+            elif self.O_pool is not None:
+                for i in range(self.n_O_expand):
+                    nn.init.orthogonal_(self.O_pool.data[i])
         nn.init.normal_(self.knowledge_K, std=0.02)
         nn.init.normal_(self.knowledge_V, std=0.02)
 
@@ -115,7 +143,8 @@ class NeuronCircuit(nn.Module):
     v12.4: SSM-guided with configurable O projection
 
     Options:
-    - dynamic_O=True: O dynamically composed from O_pool
+    - dynamic_O=True, low_rank_O=False: O from O_pool [n_O_expand, d_model, d_model]
+    - dynamic_O=True, low_rank_O=True: O from O_compress_pool & O_expand_pool (low-rank)
     - dynamic_O=False: no O projection (direct output)
     """
     def __init__(
@@ -130,6 +159,8 @@ class NeuronCircuit(nn.Module):
         dropout: float = 0.1,
         dynamic_O: bool = False,
         n_O_expand: int = 12,
+        low_rank_O: bool = False,
+        O_rank: int = 64,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
@@ -141,6 +172,8 @@ class NeuronCircuit(nn.Module):
         self.n_expand = n_expand
         self.dynamic_O = dynamic_O
         self.n_O_expand = n_O_expand
+        self.low_rank_O = low_rank_O
+        self.O_rank = O_rank
 
         # SSM
         self.ssm = SSM(d_model, state_dim)
@@ -154,6 +187,7 @@ class NeuronCircuit(nn.Module):
         self.expand_router_V = nn.Linear(d_model, n_expand, bias=False)
 
         # Router: expand O (only if dynamic_O)
+        # Same router for both full-rank and low-rank O
         if dynamic_O:
             self.expand_router_O = nn.Linear(d_model, n_O_expand, bias=False)
         else:
@@ -229,14 +263,26 @@ class NeuronCircuit(nn.Module):
 
         # 9. Output projection (configurable)
         if self.dynamic_O:
-            # Dynamic O from O_pool
+            # Dynamic O routing (same for both full-rank and low-rank)
             expand_pref_O = F.softmax(self.expand_router_O(x), dim=-1)
             expand_weights_O = torch.einsum('bs,bsn->bn', importance, expand_pref_O)
             expand_weights_O = expand_weights_O / (expand_weights_O.sum(dim=-1, keepdim=True) + 1e-8)
 
-            # O_pool: [n_O_expand, d_model, d_model]
-            shared_O = torch.einsum('bn,nde->bde', expand_weights_O, self.shared_neurons.O_pool)
-            output = torch.einsum('bsd,bde->bse', attn_out, shared_O)
+            if self.low_rank_O:
+                # Low-rank O: (attn_out @ O_compress) @ O_expand
+                # O_compress_pool: [n_O_expand, d_model, O_rank]
+                # O_expand_pool: [n_O_expand, O_rank, d_model]
+                shared_O_compress = torch.einsum('bn,ndr->bdr', expand_weights_O,
+                                                  self.shared_neurons.O_compress_pool)
+                shared_O_expand = torch.einsum('bn,nrd->brd', expand_weights_O,
+                                                self.shared_neurons.O_expand_pool)
+                # attn_out: [B, S, d_model] -> [B, S, O_rank] -> [B, S, d_model]
+                h_o = torch.einsum('bsd,bdr->bsr', attn_out, shared_O_compress)
+                output = torch.einsum('bsr,brd->bsd', h_o, shared_O_expand)
+            else:
+                # Full-rank O: O_pool [n_O_expand, d_model, d_model]
+                shared_O = torch.einsum('bn,nde->bde', expand_weights_O, self.shared_neurons.O_pool)
+                output = torch.einsum('bsd,bde->bse', attn_out, shared_O)
         else:
             # No O projection - direct output
             output = attn_out
@@ -341,12 +387,14 @@ class DAWNBlock(nn.Module):
         dropout: float = 0.1,
         dynamic_O: bool = False,
         n_O_expand: int = 12,
+        low_rank_O: bool = False,
+        O_rank: int = 64,
     ):
         super().__init__()
 
         self.attn = NeuronCircuit(
             shared_neurons, d_model, n_heads, rank, n_compress, n_expand,
-            state_dim, dropout, dynamic_O, n_O_expand
+            state_dim, dropout, dynamic_O, n_O_expand, low_rank_O, O_rank
         )
         self.memory = NeuronMemory(
             shared_neurons, d_model, rank, n_compress, knowledge_k, knowledge_rank, state_dim
@@ -374,12 +422,17 @@ class DAWN(nn.Module):
     """
     DAWN v12.4: Config-based Dynamic O Experiments
 
-    v12.4a: dynamic_O=True, n_heads=4
+    v12.4a: dynamic_O=True, low_rank_O=False, n_heads=4
     - O_pool: [n_O_expand, d_model, d_model]
     - expand_router_O로 동적 O 행렬 생성
 
     v12.4b: dynamic_O=False, n_heads=1
     - expand_O 제거 (attention output 직접 사용)
+
+    v12.4c: dynamic_O=True, low_rank_O=True, n_heads=4
+    - O_compress_pool: [n_O_expand, d_model, O_rank]
+    - O_expand_pool: [n_O_expand, O_rank, d_model]
+    - 하나의 router로 저랭크 O 동적 생성
     """
     __version__ = "12.4"
 
@@ -401,6 +454,8 @@ class DAWN(nn.Module):
         # v12.4 specific
         dynamic_O: bool = False,
         n_O_expand: int = 12,
+        low_rank_O: bool = False,
+        O_rank: int = 64,
         **kwargs
     ):
         super().__init__()
@@ -422,6 +477,8 @@ class DAWN(nn.Module):
         # v12.4 specific
         self.dynamic_O = dynamic_O
         self.n_O_expand = n_O_expand
+        self.low_rank_O = low_rank_O
+        self.O_rank = O_rank
 
         self.n_neurons = n_compress
         self.basis_rank = rank
@@ -440,6 +497,8 @@ class DAWN(nn.Module):
             knowledge_rank=self.knowledge_rank,
             dynamic_O=dynamic_O,
             n_O_expand=n_O_expand,
+            low_rank_O=low_rank_O,
+            O_rank=O_rank,
         )
 
         # Layers
@@ -457,6 +516,8 @@ class DAWN(nn.Module):
                 dropout=dropout,
                 dynamic_O=dynamic_O,
                 n_O_expand=n_O_expand,
+                low_rank_O=low_rank_O,
+                O_rank=O_rank,
             )
             for _ in range(n_layers)
         ])
@@ -533,13 +594,29 @@ class DAWN(nn.Module):
             loss += ((WWt - I) ** 2).mean()
 
         # O_pool (if dynamic_O)
-        if self.dynamic_O and self.shared_neurons.O_pool is not None:
-            for i in range(self.n_O_expand):
-                W = self.shared_neurons.O_pool[i]
-                WtW = W.T @ W
-                I = torch.eye(self.d_model, device=W.device)
-                loss += ((WtW - I) ** 2).mean()
-            total_count = self.n_compress + self.n_expand + self.n_expand + self.n_O_expand
+        if self.dynamic_O:
+            if self.low_rank_O:
+                # Low-rank O: O_compress_pool and O_expand_pool
+                for i in range(self.n_O_expand):
+                    W_c = self.shared_neurons.O_compress_pool[i]
+                    WtW = W_c.T @ W_c
+                    I = torch.eye(self.O_rank, device=W_c.device)
+                    loss += ((WtW - I) ** 2).mean()
+
+                    W_e = self.shared_neurons.O_expand_pool[i]
+                    WWt = W_e @ W_e.T
+                    I = torch.eye(self.O_rank, device=W_e.device)
+                    loss += ((WWt - I) ** 2).mean()
+                total_count = self.n_compress + self.n_expand + self.n_expand + self.n_O_expand * 2
+            elif self.shared_neurons.O_pool is not None:
+                for i in range(self.n_O_expand):
+                    W = self.shared_neurons.O_pool[i]
+                    WtW = W.T @ W
+                    I = torch.eye(self.d_model, device=W.device)
+                    loss += ((WtW - I) ** 2).mean()
+                total_count = self.n_compress + self.n_expand + self.n_expand + self.n_O_expand
+            else:
+                total_count = self.n_compress + self.n_expand + self.n_expand
         else:
             total_count = self.n_compress + self.n_expand + self.n_expand
 
@@ -602,8 +679,15 @@ class DAWN(nn.Module):
         expand = self.shared_neurons.expand_neurons.numel()
         expand_pool = self.shared_neurons.expand_neurons_pool.numel()
 
-        if self.dynamic_O and self.shared_neurons.O_pool is not None:
-            o_pool = self.shared_neurons.O_pool.numel()
+        if self.dynamic_O:
+            if self.low_rank_O:
+                o_compress_pool = self.shared_neurons.O_compress_pool.numel()
+                o_expand_pool = self.shared_neurons.O_expand_pool.numel()
+                o_pool = o_compress_pool + o_expand_pool
+            elif self.shared_neurons.O_pool is not None:
+                o_pool = self.shared_neurons.O_pool.numel()
+            else:
+                o_pool = 0
         else:
             o_pool = 0
 
@@ -635,15 +719,25 @@ class DAWN(nn.Module):
 
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        o_type = "dynamic O_pool" if self.dynamic_O else "no O projection"
+        if self.dynamic_O:
+            if self.low_rank_O:
+                o_type = f"low-rank O (rank={self.O_rank})"
+            else:
+                o_type = "full-rank O_pool"
+        else:
+            o_type = "no O projection"
 
         print(f"=== DAWN v12.4 Parameter Breakdown ===")
-        print(f"Config: dynamic_O={self.dynamic_O}, n_heads={self.n_heads}")
+        print(f"Config: dynamic_O={self.dynamic_O}, low_rank_O={self.low_rank_O}, n_heads={self.n_heads}")
         print(f"CompressNeurons:   {compress:,} ({compress/1e6:.2f}M) [{self.n_compress} neurons, shared]")
         print(f"ExpandNeurons:     {expand:,} ({expand/1e6:.2f}M) [{self.n_expand} neurons, shared]")
         print(f"expand_pool (QKV): {expand_pool:,} ({expand_pool/1e6:.2f}M) [{self.n_expand} neurons, 1 shared pool]")
         if self.dynamic_O:
-            print(f"O_pool:            {o_pool:,} ({o_pool/1e6:.2f}M) [{self.n_O_expand} neurons, {o_type}]")
+            if self.low_rank_O:
+                print(f"O_compress_pool:   {o_compress_pool:,} ({o_compress_pool/1e6:.2f}M) [{self.n_O_expand} × {self.d_model} × {self.O_rank}]")
+                print(f"O_expand_pool:     {o_expand_pool:,} ({o_expand_pool/1e6:.2f}M) [{self.n_O_expand} × {self.O_rank} × {self.d_model}]")
+            else:
+                print(f"O_pool:            {o_pool:,} ({o_pool/1e6:.2f}M) [{self.n_O_expand} × {self.d_model} × {self.d_model}]")
         else:
             print(f"O projection:      None ({o_type})")
         print(f"KnowledgeNeurons:  {knowledge:,} ({knowledge/1e3:.1f}K)")
@@ -686,4 +780,6 @@ class DAWN(nn.Module):
             'state_dim': self.state_dim,
             'dynamic_O': self.dynamic_O,
             'n_O_expand': self.n_O_expand,
+            'low_rank_O': self.low_rank_O,
+            'O_rank': self.O_rank,
         }
