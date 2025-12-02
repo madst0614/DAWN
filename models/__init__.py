@@ -58,11 +58,11 @@ from .model_v12_2 import DAWN as DAWN_v12_2
 # v12.3 - SSM-guided shared expand pool (n_expand for Q/K/V, separate routers)
 from .model_v12_3 import DAWN as DAWN_v12_3
 
-# v12.4 - config-based dynamic O experiments
+# v12.4 - config-based dynamic O experiments (experimental)
 from .model_v12_4 import DAWN as DAWN_v12_4
 
-# Default DAWN is the latest version
-DAWN = DAWN_v12_4
+# Default DAWN is v12.3 (stable)
+DAWN = DAWN_v12_3
 
 # Baseline for comparison
 import sys
@@ -107,7 +107,7 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "12.4"
+__version__ = "12.3"
 
 
 def create_model_by_version(version, config):
