@@ -198,6 +198,35 @@ VERSION_REGISTRY = {
             f"    - top-k: {args.get('knowledge_k')}",
         ],
     },
+    "12.5": {
+        "description": "Global SSM + Global Router (24→1 SSM, 60→5 routers)",
+        "aliases": ["125"],
+        "module": "model_v12_5",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v12.5): rank={args.get('rank', args.get('basis_rank'))} (global SSM + routers)",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (shared)",
+            f"  expand_neurons_pool: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (QKV pool)",
+            f"  Global SSM: 1 (model level) → importance + context",
+            f"  Global Routers: 5 (compress, expand_Q/K/V, memory)",
+            f"  Context Enhancement: SSM context added to x",
+            f"  SSM: state_dim={args.get('state_dim', 64)}",
+            f"  Architecture: Global SSM → importance + context → Global Routers (per-layer x)",
+            f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
+            f"  Parameter savings: SSM 24→1, Routers 60→5",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
 }
 
 

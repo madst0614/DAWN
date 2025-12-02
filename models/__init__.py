@@ -37,6 +37,12 @@ v12.3: SSM-guided Shared Expand Pool
 - 파라미터 절약: 3 pools → 1 pool (~0.48M)
 - d_model Attention
 
+v12.5: Global SSM + Global Router
+- Global SSM: 24 -> 1 (모델 레벨에서 한 번 계산)
+- Global Router: 60 -> 5 (compress, expand_Q/K/V, memory)
+- SSM 문맥 강화: importance + context 출력
+- context는 x에 더해서 문맥 강화
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -61,7 +67,10 @@ from .model_v12_3 import DAWN as DAWN_v12_3
 # v12.4 - config-based dynamic O experiments (experimental)
 from .model_v12_4 import DAWN as DAWN_v12_4
 
-# Default DAWN is v12.3 (stable)
+# v12.5 - Global SSM + Global Router
+from .model_v12_5 import DAWN as DAWN_v12_5
+
+# Default DAWN is v12.5 (latest stable)
 DAWN = DAWN_v12_3
 
 # Baseline for comparison
@@ -93,6 +102,7 @@ __all__ = [
     'DAWN_v12_2',
     'DAWN_v12_3',
     'DAWN_v12_4',
+    'DAWN_v12_5',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -139,6 +149,8 @@ def create_model_by_version(version, config):
         return DAWN_v12_3(**config)
     elif version == "12.4":
         return DAWN_v12_4(**config)
+    elif version == "12.5":
+        return DAWN_v12_5(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, baseline")
