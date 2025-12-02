@@ -422,7 +422,17 @@ class SentenceVisualizer:
 
             elif 'compress_weights' in attn:
                 # v12 format
-                weights = attn['compress_weights'][0].cpu().numpy()
+                raw_weights = attn['compress_weights'][0].cpu()  # First batch
+
+                # v12.3: [n_compress] (batch-level) -> expand to [S, n_compress]
+                # v12.x: [S, n_compress] (token-level) -> keep as is
+                if len(raw_weights.shape) == 1:
+                    # Batch-level routing: expand to all tokens
+                    n_tokens = len(tokens)
+                    weights = raw_weights.unsqueeze(0).expand(n_tokens, -1).numpy()
+                else:
+                    weights = raw_weights.numpy()
+
                 k = min(8, weights.shape[-1])
                 _, idx = torch.topk(torch.tensor(weights), k, dim=-1)
                 indices = idx.numpy()
@@ -563,9 +573,12 @@ class SemanticAnalyzer:
             if 'Q' in attn and isinstance(attn['Q'], dict):
                 weights = attn['Q']['weights']
                 indices = attn['Q'].get('indices')
+                is_batch_level = False
             elif 'compress_weights' in attn:
                 weights = attn['compress_weights']
                 indices = None
+                # v12.3: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
+                is_batch_level = (len(weights.shape) == 2)
             else:
                 continue
 
@@ -574,17 +587,32 @@ class SemanticAnalyzer:
                 _, indices = torch.topk(weights, k, dim=-1)
 
             for b in range(B):
-                for s in range(S):
-                    token_id = input_ids[b, s].item()
-                    top_neurons = indices[b, s].cpu().numpy()
-                    top_weights = weights[b, s].cpu().numpy()
+                if is_batch_level:
+                    # Batch-level routing: same weights for all tokens in batch
+                    batch_neurons = indices[b].cpu().numpy()
+                    batch_weights = weights[b].cpu().numpy()
 
-                    for ni, w in zip(top_neurons, top_weights[:len(top_neurons)]):
-                        total_counts[ni] += w
+                    for s in range(S):
+                        token_id = input_ids[b, s].item()
+                        for ni, w in zip(batch_neurons, batch_weights[:len(batch_neurons)]):
+                            total_counts[ni] += w
 
-                        for category, token_ids in self.category_token_ids.items():
-                            if token_id in token_ids:
-                                category_counts[category][ni] += w
+                            for category, token_ids in self.category_token_ids.items():
+                                if token_id in token_ids:
+                                    category_counts[category][ni] += w
+                else:
+                    # Token-level routing: different weights per token
+                    for s in range(S):
+                        token_id = input_ids[b, s].item()
+                        top_neurons = indices[b, s].cpu().numpy()
+                        top_weights = weights[b, s].cpu().numpy()
+
+                        for ni, w in zip(top_neurons, top_weights[:len(top_neurons)]):
+                            total_counts[ni] += w
+
+                            for category, token_ids in self.category_token_ids.items():
+                                if token_id in token_ids:
+                                    category_counts[category][ni] += w
 
         results = {}
         print("\n--- Semantic Category Neurons ---")
@@ -689,9 +717,12 @@ class NeuronCatalog:
             if 'Q' in attn and isinstance(attn['Q'], dict):
                 weights = attn['Q']['weights']
                 indices = attn['Q'].get('indices')
+                is_batch_level = False
             elif 'compress_weights' in attn:
                 weights = attn['compress_weights']
                 indices = None
+                # v12.3: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
+                is_batch_level = (len(weights.shape) == 2)
             else:
                 continue
 
@@ -700,18 +731,34 @@ class NeuronCatalog:
                 _, indices = torch.topk(weights, k, dim=-1)
 
             for b in range(B):
-                for s in range(S):
-                    token_id = input_ids[b, s].item()
-                    token_str = self.tokenizer.decode([token_id]).strip()
-                    pos = simple_pos_tag(token_str)
+                if is_batch_level:
+                    # Batch-level routing: same weights for all tokens in batch
+                    batch_neurons = indices[b].cpu().numpy()
+                    batch_weights = weights[b].cpu().numpy()
 
-                    top_neurons = indices[b, s].cpu().numpy()
-                    top_weights = weights[b, s].cpu().numpy()
+                    for s in range(S):
+                        token_id = input_ids[b, s].item()
+                        token_str = self.tokenizer.decode([token_id]).strip()
+                        pos = simple_pos_tag(token_str)
 
-                    for ni, w in zip(top_neurons, top_weights[:len(top_neurons)]):
-                        neuron_token_counts[ni][token_str] += 1
-                        neuron_pos_counts[ni][pos] += 1
-                        neuron_total_usage[ni] += w
+                        for ni, w in zip(batch_neurons, batch_weights[:len(batch_neurons)]):
+                            neuron_token_counts[ni][token_str] += 1
+                            neuron_pos_counts[ni][pos] += 1
+                            neuron_total_usage[ni] += w
+                else:
+                    # Token-level routing: different weights per token
+                    for s in range(S):
+                        token_id = input_ids[b, s].item()
+                        token_str = self.tokenizer.decode([token_id]).strip()
+                        pos = simple_pos_tag(token_str)
+
+                        top_neurons = indices[b, s].cpu().numpy()
+                        top_weights = weights[b, s].cpu().numpy()
+
+                        for ni, w in zip(top_neurons, top_weights[:len(top_neurons)]):
+                            neuron_token_counts[ni][token_str] += 1
+                            neuron_pos_counts[ni][pos] += 1
+                            neuron_total_usage[ni] += w
 
         # Build catalog
         catalog = {}

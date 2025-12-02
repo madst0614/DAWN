@@ -133,8 +133,8 @@ class RoutingInfoParser:
     """
     Version-aware routing info parser.
 
-    v10.x format:
-        routing_info['attention']['Q']['weights']  # [B, S, N]
+    v10.x format (TOKEN-LEVEL routing):
+        routing_info['attention']['Q']['weights']  # [B, S, N] - per-token weights
         routing_info['attention']['Q']['indices']  # optional [B, S, k]
         routing_info['attention']['K']['weights']
         routing_info['attention']['V']['weights']
@@ -143,12 +143,13 @@ class RoutingInfoParser:
         routing_info['memory']['knowledge_indices']
         routing_info['memory']['knowledge_weights']
 
-    v12.3 format:
-        routing_info['attention']['compress_weights']  # [B, S, n_compress]
-        routing_info['attention']['expand_weights_Q']  # [B, S, n_expand]
-        routing_info['attention']['expand_weights_K']
-        routing_info['attention']['expand_weights_V']
-        routing_info['memory']['neuron_weights']  # [B, S, n_compress]
+    v12.3 format (BATCH-LEVEL routing via SSM importance weighting):
+        # SSM collapses token dimension: einsum('bs,bsn->bn', importance, pref)
+        routing_info['attention']['compress_weights']  # [B, n_compress] - BATCH-LEVEL!
+        routing_info['attention']['expand_weights_Q']  # [B, n_expand] - BATCH-LEVEL!
+        routing_info['attention']['expand_weights_K']  # [B, n_expand]
+        routing_info['attention']['expand_weights_V']  # [B, n_expand]
+        routing_info['memory']['neuron_weights']  # [B, n_compress] - BATCH-LEVEL!
         routing_info['memory']['knowledge_indices']
         routing_info['memory']['knowledge_weights']
     """
@@ -173,7 +174,7 @@ class RoutingInfoParser:
         Get compress weights for a component.
 
         Returns:
-            weights: [B, S, N] or [B, S, k]
+            weights: [B, S, N] for v10.x (token-level) or [B, N] for v12.3 (batch-level)
             indices: [B, S, k] or None
         """
         version = self.detect_version(routing_info)
@@ -207,7 +208,7 @@ class RoutingInfoParser:
         Get expand weights for a component.
 
         Returns:
-            weights: [B, S, n_expand]
+            weights: [B, S, n_expand] for v10.x (token-level) or [B, n_expand] for v12.3 (batch-level)
             indices: [B, S, k] or None
         """
         version = self.detect_version(routing_info)
@@ -331,12 +332,21 @@ class DAWNAnalyzer:
                     if weights is None:
                         continue
 
-                    # Flatten and normalize
-                    weights_flat = weights.reshape(-1, weights.shape[-1])  # [B*S, N]
+                    # Handle different shapes:
+                    # v10.x: [B, S, N] (token-level) -> flatten to [B*S, N]
+                    # v12.3: [B, N] (batch-level) -> keep as [B, N]
+                    if len(weights.shape) == 3:
+                        weights_flat = weights.reshape(-1, weights.shape[-1])  # [B*S, N]
+                    else:
+                        weights_flat = weights  # [B, N]
+
                     weights_norm = F.normalize(weights_flat, dim=-1)
 
                     # Sample for efficiency
                     n_samples = min(256, weights_flat.shape[0])
+                    if n_samples < 2:
+                        continue  # Need at least 2 samples for pairwise comparison
+
                     idx = torch.randperm(weights_flat.shape[0])[:n_samples]
                     sampled = weights_norm[idx]
 
@@ -587,7 +597,13 @@ class DAWNAnalyzer:
                 for comp in ['Q', 'K', 'V', 'M']:
                     weights, _ = self.parser.get_compress_weights(routing_info, comp)
                     if weights is not None:
-                        layer_comp_usage[layer_idx][comp] += weights.sum(dim=(0, 1))
+                        # Handle different shapes:
+                        # v10.x: [B, S, N] -> sum over (B, S)
+                        # v12.3: [B, N] -> sum over (B)
+                        if len(weights.shape) == 3:
+                            layer_comp_usage[layer_idx][comp] += weights.sum(dim=(0, 1))
+                        else:
+                            layer_comp_usage[layer_idx][comp] += weights.sum(dim=0)
 
         results = {'layer_correlation': {}}
 
@@ -632,6 +648,7 @@ class DAWNAnalyzer:
 
         pos_neuron_weights = defaultdict(lambda: torch.zeros(self.n_compress, device=self.device))
         pos_counts = defaultdict(float)
+        is_batch_level = None  # Will detect from first routing info
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Specialization", total=max_batches)):
             if batch_idx >= max_batches:
@@ -648,9 +665,18 @@ class DAWNAnalyzer:
             if q_weights is None:
                 continue
 
+            # Detect routing type
+            if is_batch_level is None:
+                is_batch_level = (len(q_weights.shape) == 2)
+                if is_batch_level:
+                    print("\n[NOTE] v12.3 batch-level routing detected.")
+                    print("  Routing weights are [B, N] not [B, S, N].")
+                    print("  All tokens in a batch share the same routing weights.")
+                    print("  POS analysis shows batch-averaged patterns, not per-token specialization.\n")
+
             # Handle different tensor shapes
-            # v10: [B, S, N] or [B, S, k] (per-token weights)
-            # v12: [B, S, n_compress] (per-token weights)
+            # v10.x: [B, S, N] (token-level weights)
+            # v12.3: [B, N] (batch-level weights - all tokens share same weight)
             if len(q_weights.shape) == 3:
                 _, seq_len, n_neurons = q_weights.shape
                 for b in range(B):
@@ -664,28 +690,34 @@ class DAWNAnalyzer:
                             pos_neuron_weights[pos] += weights
                             pos_counts[pos] += 1
             elif len(q_weights.shape) == 2:
-                # Batch-level weights [B, n_compress] - use for all tokens
+                # Batch-level weights [B, n_compress]
+                # Each batch has one routing vector shared by all tokens
                 for b in range(B):
+                    batch_weights = q_weights[b]  # [n_compress]
                     for s in range(S):
                         tid = input_ids[b, s].item()
                         token = self.tokenizer.decode([tid]).strip()
                         pos = simple_pos_tag(token)
 
-                        weights = q_weights[b]
-                        if weights.shape[0] == self.n_compress:
-                            pos_neuron_weights[pos] += weights
+                        if batch_weights.shape[0] == self.n_compress:
+                            pos_neuron_weights[pos] += batch_weights
                             pos_counts[pos] += 1
 
-        results = {'pos': {}}
+        results = {'pos': {}, 'is_batch_level': is_batch_level}
 
         print(f"\n--- POS -> Preferred Neurons (L0 Q) ---")
+        if is_batch_level:
+            print("(Batch-averaged; all POS may show similar patterns due to shared batch weights)")
+
+        # Calculate POS discriminability (cosine sim between POS weight vectors)
+        pos_vectors = {}
         for pos in sorted(pos_counts.keys()):
             if pos_counts[pos] < 100 or pos == 'OTHER':
                 continue
-
             avg_weights = pos_neuron_weights[pos] / pos_counts[pos]
-            top_neurons = torch.topk(avg_weights, 5)
+            pos_vectors[pos] = F.normalize(avg_weights.unsqueeze(0), dim=-1)
 
+            top_neurons = torch.topk(avg_weights, 5)
             results['pos'][pos] = {
                 'count': int(pos_counts[pos]),
                 'top_neurons': top_neurons.indices.tolist(),
@@ -693,6 +725,23 @@ class DAWNAnalyzer:
 
             neurons_str = ', '.join([f'{n}' for n in top_neurons.indices.tolist()[:3]])
             print(f"  {pos:12s} (n={int(pos_counts[pos]):5d}): [{neurons_str}]")
+
+        # Compute POS discriminability (average pairwise distance)
+        if len(pos_vectors) >= 2:
+            pos_list = list(pos_vectors.keys())
+            similarities = []
+            for i in range(len(pos_list)):
+                for j in range(i+1, len(pos_list)):
+                    sim = F.cosine_similarity(pos_vectors[pos_list[i]], pos_vectors[pos_list[j]]).item()
+                    similarities.append(sim)
+
+            avg_sim = np.mean(similarities)
+            pos_disc = 1.0 - avg_sim
+            results['pos_discriminability'] = pos_disc
+
+            print(f"\n  POS Discriminability: {pos_disc:.4f}")
+            if is_batch_level and pos_disc < 0.1:
+                print(f"  (Low discriminability expected for batch-level routing)")
 
         return results
 
