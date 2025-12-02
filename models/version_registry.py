@@ -166,6 +166,35 @@ VERSION_REGISTRY = {
             f"    - top-k: {args.get('knowledge_k')}",
         ],
     },
+    "12.4": {
+        "description": "Config-based Dynamic O Experiments (dynamic_O option)",
+        "aliases": ["124"],
+        "module": "model_v12_4",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "dynamic_O": False,
+            "n_O_expand": 12,
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v12.4): rank={args.get('rank', args.get('basis_rank'))} (configurable O)",
+            f"  Config: dynamic_O={args.get('dynamic_O', False)}, n_heads={args.get('n_heads')}",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (SSM shared)",
+            f"  expand_neurons_pool: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (QKV pool)",
+            f"  O_pool: {args.get('n_O_expand', 12)} × {args.get('d_model')} × {args.get('d_model')}" if args.get('dynamic_O', False) else "  O projection: None (direct output)",
+            f"  SSM: state_dim={args.get('state_dim', 64)}",
+            f"  Architecture: SSM → Q/K/V expand → {'dynamic O' if args.get('dynamic_O', False) else 'no O proj'}",
+            f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
 }
 
 
