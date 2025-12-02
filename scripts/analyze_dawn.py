@@ -414,12 +414,20 @@ class DAWNAnalyzer:
                 for comp in ['Q', 'K', 'V', 'M']:
                     weights, _ = self.parser.get_compress_weights(routing_info, comp)
                     if weights is not None:
-                        compress_usage[comp][layer_idx] += weights.sum(dim=(0, 1))
+                        # Handle different shapes: [B, S, N] or [B, N]
+                        if len(weights.shape) == 3:
+                            compress_usage[comp][layer_idx] += weights.sum(dim=(0, 1))
+                        elif len(weights.shape) == 2:
+                            compress_usage[comp][layer_idx] += weights.sum(dim=0)
 
                 for comp in ['Q', 'K', 'V']:
                     weights, _ = self.parser.get_expand_weights(routing_info, comp)
                     if weights is not None:
-                        expand_usage[comp][layer_idx] += weights.sum(dim=(0, 1))
+                        # Handle different shapes: [B, S, N] or [B, N]
+                        if len(weights.shape) == 3:
+                            expand_usage[comp][layer_idx] += weights.sum(dim=(0, 1))
+                        elif len(weights.shape) == 2:
+                            expand_usage[comp][layer_idx] += weights.sum(dim=0)
 
         # Normalize
         for comp in compress_usage:
@@ -640,15 +648,33 @@ class DAWNAnalyzer:
             if q_weights is None:
                 continue
 
-            for b in range(B):
-                for s in range(S):
-                    tid = input_ids[b, s].item()
-                    token = self.tokenizer.decode([tid]).strip()
-                    pos = simple_pos_tag(token)
+            # Handle different tensor shapes
+            # v10: [B, S, N] or [B, S, k] (per-token weights)
+            # v12: [B, S, n_compress] (per-token weights)
+            if len(q_weights.shape) == 3:
+                _, seq_len, n_neurons = q_weights.shape
+                for b in range(B):
+                    for s in range(min(S, seq_len)):
+                        tid = input_ids[b, s].item()
+                        token = self.tokenizer.decode([tid]).strip()
+                        pos = simple_pos_tag(token)
 
-                    weights = q_weights[b, s]
-                    pos_neuron_weights[pos] += weights
-                    pos_counts[pos] += 1
+                        weights = q_weights[b, s]
+                        if weights.shape[0] == self.n_compress:
+                            pos_neuron_weights[pos] += weights
+                            pos_counts[pos] += 1
+            elif len(q_weights.shape) == 2:
+                # Batch-level weights [B, n_compress] - use for all tokens
+                for b in range(B):
+                    for s in range(S):
+                        tid = input_ids[b, s].item()
+                        token = self.tokenizer.decode([tid]).strip()
+                        pos = simple_pos_tag(token)
+
+                        weights = q_weights[b]
+                        if weights.shape[0] == self.n_compress:
+                            pos_neuron_weights[pos] += weights
+                            pos_counts[pos] += 1
 
         results = {'pos': {}}
 
