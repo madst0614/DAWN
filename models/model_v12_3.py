@@ -46,9 +46,6 @@ class SharedNeurons(nn.Module):
         # Compress pool: [n_compress, d_model, rank]
         self.compress_neurons = nn.Parameter(torch.zeros(n_compress, d_model, rank))
 
-        # Expand pool: [n_expand, rank, d_model] - 일반 expand용
-        self.expand_neurons = nn.Parameter(torch.zeros(n_expand, rank, d_model))
-
         # Q/K/V 공용 expand 풀 (하나의 풀, 다른 가중치로 조합)
         self.expand_neurons_pool = nn.Parameter(torch.zeros(n_expand, rank, d_model))
 
@@ -61,7 +58,6 @@ class SharedNeurons(nn.Module):
         for i in range(self.n_compress):
             nn.init.orthogonal_(self.compress_neurons.data[i])
         for i in range(self.n_expand):
-            nn.init.orthogonal_(self.expand_neurons.data[i])
             nn.init.orthogonal_(self.expand_neurons_pool.data[i])
         nn.init.normal_(self.knowledge_K, std=0.02)
         nn.init.normal_(self.knowledge_V, std=0.02)
@@ -489,21 +485,14 @@ class DAWN(nn.Module):
             I = torch.eye(self.rank, device=W.device)
             loss += ((WtW - I) ** 2).mean()
 
-        # SharedNeurons expand
-        for i in range(self.n_expand):
-            W = self.shared_neurons.expand_neurons[i]
-            WWt = W @ W.T
-            I = torch.eye(self.rank, device=W.device)
-            loss += ((WWt - I) ** 2).mean()
-
-        # expand_neurons_pool (공용 풀)
+        # expand_neurons_pool (Q/K/V 공용 풀)
         for i in range(self.n_expand):
             W = self.shared_neurons.expand_neurons_pool[i]
             WWt = W @ W.T
             I = torch.eye(self.rank, device=W.device)
             loss += ((WWt - I) ** 2).mean()
 
-        total_count = self.n_compress + self.n_expand + self.n_expand
+        total_count = self.n_compress + self.n_expand
         return loss / total_count
 
     def routing_entropy_loss(self):
@@ -553,9 +542,6 @@ class DAWN(nn.Module):
 
     def count_by_component(self):
         compress = self.shared_neurons.compress_neurons.numel()
-        expand = self.shared_neurons.expand_neurons.numel()
-
-        # expand_neurons_pool (공용 풀 1개)
         expand_pool = self.shared_neurons.expand_neurons_pool.numel()
 
         knowledge = (self.shared_neurons.knowledge_K.numel() +
@@ -590,8 +576,7 @@ class DAWN(nn.Module):
 
         print(f"=== DAWN v12.3 Parameter Breakdown ===")
         print(f"CompressNeurons:   {compress:,} ({compress/1e6:.2f}M) [{self.n_compress} neurons, shared]")
-        print(f"ExpandNeurons:     {expand:,} ({expand/1e6:.2f}M) [{self.n_expand} neurons, shared]")
-        print(f"expand_pool (QKV): {expand_pool:,} ({expand_pool/1e6:.2f}M) [{self.n_expand} neurons, 1 shared pool]")
+        print(f"ExpandPool (QKV):  {expand_pool:,} ({expand_pool/1e6:.2f}M) [{self.n_expand} neurons, 1 shared pool]")
         print(f"expand_O:          {expand_o:,} ({expand_o/1e3:.1f}K) [per-layer]")
         print(f"KnowledgeNeurons:  {knowledge:,} ({knowledge/1e3:.1f}K)")
         print(f"Embeddings:        {embed:,} ({embed/1e6:.2f}M)")
@@ -606,7 +591,6 @@ class DAWN(nn.Module):
 
         return {
             'compress': compress,
-            'expand': expand,
             'expand_pool': expand_pool,
             'expand_o': expand_o,
             'knowledge': knowledge,
