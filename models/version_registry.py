@@ -10,11 +10,17 @@ v12.3: SSM-guided Shared Expand Pool (n_expand for Q/K/V, separate routers)
 v12.5: Global SSM + Global Router (24→1 SSM, 60→5 routers, context enhancement)
 
 To add a new version:
-1. Add entry to VERSION_REGISTRY below
+1. Add entry to VERSION_REGISTRY below (with display_info lambda)
 2. Create model file in models/model_vX_Y.py
-3. Import and register in models/__init__.py
-4. Add version handling in scripts/train.py (around line 1415)
+3. Update models/__init__.py:
+   - Add import statement
+   - Add to __all__ list
+   - Add elif in create_model_by_version()
+4. Update scripts/train.py:
+   - Add model info print section (~line 1388)
+   - Add model_kwargs section (~line 1610)
 5. Create config in configs/train_config_vX_Y.yaml
+6. Add version description to this docstring
 """
 
 from typing import Dict, Any, List
