@@ -45,12 +45,11 @@ log_dir: /content/drive/MyDrive/dawn/logs_v12_3_20M_12L
 #
 #   Shared Neurons:
 #     Compress: 288 × 320 × 64 = 5.90M
-#     Expand: 72 × 64 × 320 = 1.47M
-#     Expand Pool: 72 × 64 × 320 = 1.47M
+#     Expand Pool (QKV): 72 × 64 × 320 = 1.47M
 #     Knowledge K: 320 × 64 = 0.02M
 #     Knowledge V: 320 × 320 = 0.10M
 #
 #   Per Layer × 12:
-#     SSM + Routers + LN: ~0.14M × 12 = 1.68M
+#     SSM + Routers + LN + expand_O: ~0.14M × 12 = 1.68M
 #
-#   Total: ~20.4M
+#   Total: ~18.9M
