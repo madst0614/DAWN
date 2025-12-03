@@ -812,20 +812,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Token variance (Q만 대표로)
                     var_Q = calc_token_var(pref_Q)
 
-                    # Memory ratio (attn_out_norm vs mem_out_norm per layer)
-                    mem_ratios = []
+                    # Attention ratio (attn_out_norm vs mem_out_norm per layer)
+                    attn_ratios = []
                     for layer_info in routing_infos:
                         attn_norm = layer_info.get('attn_out_norm')
                         mem_norm = layer_info.get('mem_out_norm')
                         if attn_norm is not None and mem_norm is not None:
-                            ratio = (mem_norm / (attn_norm + mem_norm + 1e-8) * 100).item()
-                            mem_ratios.append(f"{ratio:.0f}")
+                            ratio = (attn_norm / (attn_norm + mem_norm + 1e-8) * 100).item()
+                            attn_ratios.append(f"{ratio:.0f}")
                         else:
-                            mem_ratios.append("-")
-                    mem_str = "/".join(mem_ratios)
+                            attn_ratios.append("-")
+                    attn_str = "/".join(attn_ratios)
 
                     # Compact output
-                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Mem:{mem_str}")
+                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Attn:{attn_str}")
 
                     # Warning if collapse detected
                     if min(ent_Q, ent_K, ent_V) < 30:
