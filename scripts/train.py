@@ -571,7 +571,7 @@ def is_v75_or_v76_model(model):
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, process_norm_weight=0.0,
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0, process_norm_weight=0.0,
                 debug_logger=None, ckpt_manager=None, model_config=None, start_step=0):
     """Train for one epoch
 
@@ -625,7 +625,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 base_model = get_underlying_model(model)
 
                 # v10: DAWN model forward
-                if load_balance_weight > 0:
+                if load_balance_weight > 0 or entropy_weight > 0:
                     ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                 else:
                     ce_loss, logits = model(input_ids, labels)
@@ -647,8 +647,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     if hasattr(base_model, 'load_balance_loss'):
                         lb_loss = base_model.load_balance_loss(routing_infos)
 
+                # Entropy loss (for v12.7/v13 with router dropout)
+                ent_loss = 0.0
+                if entropy_weight > 0 and routing_infos is not None:
+                    if hasattr(base_model, 'routing_entropy_loss'):
+                        # Check if it accepts routing_infos (v12.7/v13) or not (older versions)
+                        import inspect
+                        sig = inspect.signature(base_model.routing_entropy_loss)
+                        if len(sig.parameters) > 0:
+                            ent_loss = base_model.routing_entropy_loss(routing_infos)
+                        else:
+                            ent_loss = base_model.routing_entropy_loss()
+
                 # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
 
             scaler.scale(loss).backward()
 
@@ -667,7 +679,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             base_model = get_underlying_model(model)
 
             # v10: DAWN model forward
-            if load_balance_weight > 0:
+            if load_balance_weight > 0 or entropy_weight > 0:
                 ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
             else:
                 ce_loss, logits = model(input_ids, labels)
@@ -689,8 +701,19 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 if hasattr(base_model, 'load_balance_loss'):
                     lb_loss = base_model.load_balance_loss(routing_infos)
 
+            # Entropy loss (for v12.7/v13 with router dropout)
+            ent_loss = 0.0
+            if entropy_weight > 0 and routing_infos is not None:
+                if hasattr(base_model, 'routing_entropy_loss'):
+                    import inspect
+                    sig = inspect.signature(base_model.routing_entropy_loss)
+                    if len(sig.parameters) > 0:
+                        ent_loss = base_model.routing_entropy_loss(routing_infos)
+                    else:
+                        ent_loss = base_model.routing_entropy_loss()
+
             # Total loss
-            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
 
             loss.backward()
 
@@ -1147,6 +1170,7 @@ def main():
     args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.0)  # v6.0 compat
     args.diversity_weight = cfg['training'].get('diversity_weight', 0.0)  # v7.0: recipe diversity
     args.load_balance_weight = cfg['training'].get('load_balance_weight', 0.0)  # v7.0: load balance
+    args.entropy_weight = cfg['training'].get('entropy_weight', 0.0)  # v13: router entropy loss
     args.process_norm_weight = cfg['training'].get('process_norm_weight', 0.0)  # v8.0: process neuron norm
 
     # Other
@@ -1324,6 +1348,7 @@ def main():
             args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
             args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
             args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
+            args.entropy_weight = checkpoint_training_config.get('entropy_weight', args.entropy_weight)
             args.process_norm_weight = checkpoint_training_config.get('process_norm_weight', args.process_norm_weight)
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
@@ -1654,6 +1679,8 @@ def main():
         reg_parts.append(f"div={args.diversity_weight}")
     if args.load_balance_weight > 0:
         reg_parts.append(f"lb={args.load_balance_weight}")
+    if args.entropy_weight > 0:
+        reg_parts.append(f"ent={args.entropy_weight}")
     if reg_parts:
         print(f"Regularization: {', '.join(reg_parts)}")
 
@@ -2026,6 +2053,7 @@ def main():
             orthogonality_weight=args.orthogonality_weight,
             diversity_weight=args.diversity_weight,
             load_balance_weight=args.load_balance_weight,
+            entropy_weight=args.entropy_weight,
             process_norm_weight=args.process_norm_weight,
             debug_logger=debug_logger,
             ckpt_manager=ckpt_manager,
