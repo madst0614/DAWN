@@ -30,9 +30,9 @@ model:
   max_seq_len: 512
   dropout: 0.1
   gradient_checkpointing: true
-  # Top-k sparse mixing
-  top_k_compress: 8
-  top_k_expand: 4
+  # Top-k sparse mixing (16.7% compress, 33.3% expand - same ratio as 11M)
+  top_k_compress: 48
+  top_k_expand: 24
   router_dropout: 0.1
 
 # Training
