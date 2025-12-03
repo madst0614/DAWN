@@ -1,7 +1,9 @@
 """
-DAWN v12.7: Global SSM without Context Enhancement
+DAWN v12.7: Selective SSM for Context-aware Importance
 
-Ablation study: SSM 유지, context 강화만 제거
+Selective SSM mechanism:
+- 기존: 고정 A, B → 모든 토큰 동일하게 decay
+- 변경: 토큰별 delta, B_t → 중요 토큰은 오래 남고, 불필요한 토큰은 빨리 사라짐
 
 vs v12.5:
 - SSM 유지 (importance 계산)
@@ -10,11 +12,11 @@ vs v12.5:
 
 vs v12.6:
 - v12.6: SSM 완전 제거
-- v12.7: SSM 유지, context만 제거
+- v12.7: Selective SSM 유지, context만 제거
 
 Ablation hierarchy:
 - v12.5: SSM + context
-- v12.7: SSM only (no context)
+- v12.7: Selective SSM only (no context)
 - v12.6: no SSM (simple projection)
 """
 
@@ -66,45 +68,61 @@ class SharedNeurons(nn.Module):
 
 class GlobalSSM(nn.Module):
     """
-    v12.7: Global SSM without context enhancement
+    Global SSM with Selective mechanism
 
-    vs v12.5: context_proj 제거, importance만 반환
+    기존: 고정 A, B → 모든 토큰 동일하게 decay
+    변경: 토큰별 delta, B_t → 중요 토큰은 오래 남고, 불필요한 토큰은 빨리 사라짐
+
+    "The cat sat on the mat"
+    → "the", "on" 높은 delta → 빨리 잊음
+    → "cat", "sat", "mat" 낮은 delta → h_final에 남음
+    → importance = 각 토큰이 h_final과 얼마나 유사한가
     """
     def __init__(self, d_model: int, state_dim: int):
         super().__init__()
         self.d_model = d_model
         self.state_dim = state_dim
 
-        self.A = nn.Parameter(torch.randn(state_dim, state_dim) * 0.01)
-        self.B = nn.Parameter(torch.randn(d_model, state_dim) * 0.01)
+        # Base decay (learnable)
+        self.A = nn.Parameter(torch.ones(state_dim) * 0.5)
 
-        # importance projection: final state -> importance
+        # Selective projections (토큰마다 다르게)
+        self.W_delta = nn.Linear(d_model, state_dim, bias=False)  # decay 강도
+        self.W_B = nn.Linear(d_model, state_dim, bias=False)      # 저장 방식
+
+        # Importance projection
         self.importance_proj = nn.Linear(state_dim, d_model, bias=False)
 
-        # context_proj 제거 (v12.7)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.W_delta.weight, std=0.02)
+        nn.init.normal_(self.W_B.weight, std=0.02)
+        nn.init.normal_(self.importance_proj.weight, std=0.02)
 
     def forward(self, x):
         """
         Args:
             x: [B, S, d_model]
         Returns:
-            importance: [B, S] token importance (no context)
+            importance: [B, S] token importance
         """
         B, S, D = x.shape
-        device = x.device
-
-        # Only need final state (no need to store all states)
-        h = torch.zeros(B, self.state_dim, device=device)
+        h = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
 
         for t in range(S):
-            h = h @ self.A + x[:, t] @ self.B
+            delta = F.softplus(self.W_delta(x[:, t]))  # [B, state_dim], 양수
+            B_t = self.W_B(x[:, t])                     # [B, state_dim]
 
-        # Importance from final state
+            # Selective decay: 토큰마다 다른 망각률
+            decay = torch.exp(-delta * F.softplus(self.A))
+            h = h * decay + B_t
+
+        # Final state로 importance 계산
         h_proj = self.importance_proj(h)  # [B, d_model]
-        importance = torch.einsum('bsd,bd->bs', x, h_proj)  # [B, S]
+        importance = torch.einsum('bsd,bd->bs', x, h_proj)
         importance = F.softmax(importance, dim=-1)
 
-        # No context (removed in v12.7)
         return importance
 
 
@@ -508,10 +526,11 @@ class DAWN(nn.Module):
         knowledge = self.shared_neurons.knowledge_K.numel() + self.shared_neurons.knowledge_V.numel()
         embed = self.token_emb.weight.numel() + self.pos_emb.weight.numel()
 
-        # Global SSM (v12.7: no context_proj)
+        # Global SSM (v12.7: Selective mechanism)
         ssm_total = (
             self.global_ssm.A.numel() +
-            self.global_ssm.B.numel() +
+            self.global_ssm.W_delta.weight.numel() +
+            self.global_ssm.W_B.weight.numel() +
             self.global_ssm.importance_proj.weight.numel()
         )
 
@@ -526,18 +545,18 @@ class DAWN(nn.Module):
         expand_o = self.layers[0].attn.expand_O.weight.numel() * self.n_layers
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        print(f"=== DAWN v12.7 Parameter Breakdown (SSM, no context) ===")
+        print(f"=== DAWN v12.7 Parameter Breakdown (Selective SSM) ===")
         print(f"CompressNeurons:   {compress:,} ({compress/1e6:.2f}M)")
         print(f"ExpandPool (QKV):  {expand_pool:,} ({expand_pool/1e6:.2f}M)")
         print(f"expand_O:          {expand_o:,} ({expand_o/1e3:.1f}K)")
         print(f"KnowledgeNeurons:  {knowledge:,} ({knowledge/1e3:.1f}K)")
         print(f"Embeddings:        {embed:,} ({embed/1e6:.2f}M)")
-        print(f"Global SSM:        {ssm_total:,} ({ssm_total/1e3:.1f}K) [no context_proj]")
+        print(f"Global SSM:        {ssm_total:,} ({ssm_total/1e3:.1f}K) [Selective: A + W_delta + W_B]")
         print(f"Global Routers:    {routers:,} ({routers/1e3:.1f}K)")
         print(f"LayerNorms:        {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
-        print(f"Architecture: Global SSM (importance only) → Global Routers")
-        print(f"Ablation: SSM preserved, context removed")
+        print(f"Architecture: Selective SSM (importance) → Global Routers → FlashAttn")
+        print(f"Selective: 토큰별 delta, B_t → 중요 토큰 오래 유지")
         print(f"---")
         print(f"Total:             {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 
