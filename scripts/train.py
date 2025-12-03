@@ -1431,24 +1431,27 @@ def main():
             print(f"    - V: {args.n_knowledge} × {args.d_model}")
             print(f"    - Knowledge top-k: {args.knowledge_k}")
         elif model_version == "12.7":
-            # v12.7: SSM without Context + FlashAttention
+            # v12.7: SSM without Context + Top-k + FlashAttention
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
             state_dim = getattr(args, 'state_dim', 64)
             d_head = args.d_model // args.n_heads
+            top_k_compress = getattr(args, 'top_k_compress', 8)
+            top_k_expand = getattr(args, 'top_k_expand', 4)
             grad_ckpt = getattr(args, 'gradient_checkpointing', False)
-            print(f"SharedNeurons (v{model_version}): rank={rank} - SSM without Context + FlashAttention!")
+            print(f"SharedNeurons (v{model_version}): rank={rank} - SSM + Top-k (no Context)!")
             print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (shared)")
             print(f"  expand_neurons_pool: {args.n_expand} × {rank} × {args.d_model} (1 shared pool for Q/K/V)")
             print(f"  Global SSM: 1 (model level) → importance only")
-            print(f"  Global Routers: 5 (compress, expand_Q/K/V, memory)")
-            print(f"  Context Enhancement: REMOVED (ablation)")
+            print(f"  Global Routers: 5 (compress, expand_Q/K/V, memory) + Top-k")
+            print(f"  Top-k Compress: {top_k_compress}/{args.n_compress}")
+            print(f"  Top-k Expand: {top_k_expand}/{args.n_expand}")
+            print(f"  Context Enhancement: ❌ (ablation)")
             print(f"  SSM: state_dim={state_dim}")
             print(f"  FlashAttention: enabled (scaled_dot_product_attention)")
             print(f"  Gradient Checkpointing: {grad_ckpt}")
-            print(f"  Architecture: Global SSM (importance) → Global Routers → FlashAttn")
+            print(f"  Architecture: Selective SSM → Top-k Routers → FlashAttn")
             print(f"  Attention: d_model space (d_head={d_head})")
-            print(f"  Ablation: SSM preserved, context removed")
             print(f"  KnowledgeNeurons:")
             print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
             print(f"    - V: {args.n_knowledge} × {args.d_model}")
@@ -1731,7 +1734,7 @@ def main():
             'state_dim': getattr(args, 'state_dim', 64),  # kept for compatibility
         })
     elif model_version == '12.7':
-        # v12.7: SSM without Context
+        # v12.7: SSM without Context + Top-k
         model_kwargs.update({
             'n_compress': args.n_compress,
             'n_expand': args.n_expand,
@@ -1740,6 +1743,8 @@ def main():
             'knowledge_rank': args.knowledge_rank,  # None = use rank
             'rank': args.basis_rank,
             'state_dim': getattr(args, 'state_dim', 64),
+            'top_k_compress': getattr(args, 'top_k_compress', 8),
+            'top_k_expand': getattr(args, 'top_k_expand', 4),
             'gradient_checkpointing': args.gradient_checkpointing,
         })
     elif model_version == '12.8':

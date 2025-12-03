@@ -127,12 +127,15 @@ class GlobalSSM(nn.Module):
 
 
 class GlobalRouters(nn.Module):
-    """v12.7: Global routers (same as v12.5)"""
-    def __init__(self, d_model: int, n_compress: int, n_expand: int):
+    """v12.7: Global routers with Top-k sparse selection"""
+    def __init__(self, d_model: int, n_compress: int, n_expand: int,
+                 top_k_compress: int = 8, top_k_expand: int = 4):
         super().__init__()
         self.d_model = d_model
         self.n_compress = n_compress
         self.n_expand = n_expand
+        self.top_k_compress = top_k_compress
+        self.top_k_expand = top_k_expand
 
         # Attention routers
         self.compress_router = nn.Linear(d_model, n_compress, bias=False)
@@ -143,46 +146,64 @@ class GlobalRouters(nn.Module):
         # Memory router
         self.memory_router = nn.Linear(d_model, n_compress, bias=False)
 
+    def _topk_sparsify(self, weights, k):
+        """Apply top-k sparsification and renormalize"""
+        topk_vals, topk_idx = torch.topk(weights, k, dim=-1)
+        sparse_weights = torch.zeros_like(weights)
+        sparse_weights.scatter_(-1, topk_idx, topk_vals)
+        sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        return sparse_weights, topk_idx
+
     def get_attention_weights(self, x, importance):
         # Compress routing
         compress_pref = F.softmax(self.compress_router(x), dim=-1)
-        compress_weights = torch.einsum('bs,bsn->bn', importance, compress_pref)
-        compress_weights = compress_weights / (compress_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        compress_weights_dense = torch.einsum('bs,bsn->bn', importance, compress_pref)
 
-        # Expand routing - Q/K/V each
+        # Top-k sparsification
+        compress_weights, compress_topk_idx = self._topk_sparsify(compress_weights_dense, self.top_k_compress)
+
+        # Expand routing
         expand_pref_Q = F.softmax(self.expand_router_Q(x), dim=-1)
         expand_pref_K = F.softmax(self.expand_router_K(x), dim=-1)
         expand_pref_V = F.softmax(self.expand_router_V(x), dim=-1)
 
-        expand_weights_Q = torch.einsum('bs,bsn->bn', importance, expand_pref_Q)
-        expand_weights_K = torch.einsum('bs,bsn->bn', importance, expand_pref_K)
-        expand_weights_V = torch.einsum('bs,bsn->bn', importance, expand_pref_V)
+        expand_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_Q)
+        expand_weights_K_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_K)
+        expand_weights_V_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_V)
 
-        expand_weights_Q = expand_weights_Q / (expand_weights_Q.sum(dim=-1, keepdim=True) + 1e-8)
-        expand_weights_K = expand_weights_K / (expand_weights_K.sum(dim=-1, keepdim=True) + 1e-8)
-        expand_weights_V = expand_weights_V / (expand_weights_V.sum(dim=-1, keepdim=True) + 1e-8)
+        expand_weights_Q, expand_topk_idx_Q = self._topk_sparsify(expand_weights_Q_dense, self.top_k_expand)
+        expand_weights_K, expand_topk_idx_K = self._topk_sparsify(expand_weights_K_dense, self.top_k_expand)
+        expand_weights_V, expand_topk_idx_V = self._topk_sparsify(expand_weights_V_dense, self.top_k_expand)
 
         routing_info = {
+            # Sparse weights (for forward)
             'compress_weights': compress_weights.detach(),
-            'compress_pref': compress_pref.detach(),
             'expand_weights_Q': expand_weights_Q.detach(),
             'expand_weights_K': expand_weights_K.detach(),
             'expand_weights_V': expand_weights_V.detach(),
-            'expand_pref_Q': expand_pref_Q.detach(),
-            'expand_pref_K': expand_pref_K.detach(),
-            'expand_pref_V': expand_pref_V.detach(),
+            # Dense weights (for load balance loss)
+            'compress_weights_dense': compress_weights_dense.detach(),
+            'expand_weights_Q_dense': expand_weights_Q_dense.detach(),
+            'expand_weights_K_dense': expand_weights_K_dense.detach(),
+            'expand_weights_V_dense': expand_weights_V_dense.detach(),
+            # Top-k indices
+            'compress_topk_idx': compress_topk_idx.detach(),
+            'expand_topk_idx_Q': expand_topk_idx_Q.detach(),
+            'expand_topk_idx_K': expand_topk_idx_K.detach(),
+            'expand_topk_idx_V': expand_topk_idx_V.detach(),
         }
 
         return compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, routing_info
 
     def get_memory_weights(self, x, importance):
         memory_pref = F.softmax(self.memory_router(x), dim=-1)
-        memory_weights = torch.einsum('bs,bsn->bn', importance, memory_pref)
-        memory_weights = memory_weights / (memory_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        memory_weights_dense = torch.einsum('bs,bsn->bn', importance, memory_pref)
+        memory_weights, memory_topk_idx = self._topk_sparsify(memory_weights_dense, self.top_k_compress)
 
         routing_info = {
             'memory_weights': memory_weights.detach(),
-            'memory_pref': memory_pref.detach(),
+            'memory_weights_dense': memory_weights_dense.detach(),
+            'memory_topk_idx': memory_topk_idx.detach(),
         }
 
         return memory_weights, routing_info
@@ -361,6 +382,8 @@ class DAWN(nn.Module):
         knowledge_k: int = 10,
         knowledge_rank: int = None,
         state_dim: int = 64,
+        top_k_compress: int = 8,
+        top_k_expand: int = 4,
         dropout: float = 0.1,
         gradient_checkpointing: bool = False,
         **kwargs
@@ -375,6 +398,8 @@ class DAWN(nn.Module):
         self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
         self.max_seq_len = max_seq_len
         self.state_dim = state_dim
+        self.top_k_compress = top_k_compress
+        self.top_k_expand = top_k_expand
         self.gradient_checkpointing = gradient_checkpointing
 
         self.n_compress = n_compress
@@ -396,8 +421,10 @@ class DAWN(nn.Module):
         # Global SSM (v12.7: no context_proj)
         self.global_ssm = GlobalSSM(d_model, state_dim)
 
-        # Global Routers
-        self.global_routers = GlobalRouters(d_model, n_compress, n_expand)
+        # Top-k Global Routers
+        self.global_routers = GlobalRouters(
+            d_model, n_compress, n_expand, top_k_compress, top_k_expand
+        )
 
         self.layers = nn.ModuleList([
             DAWNBlock(
@@ -490,23 +517,25 @@ class DAWN(nn.Module):
         return sim[mask].abs().mean()
 
     def load_balance_loss(self, routing_infos):
+        """Load balance on dense (pre-top-k) weights to prevent dead neurons"""
         loss = 0.0
         count = 0
 
         for layer_info in routing_infos:
-            compress_w = layer_info['attention']['compress_weights']
+            # Use dense weights (before top-k)
+            compress_w = layer_info['attention']['compress_weights_dense']
             target_compress = 1.0 / self.n_compress
             loss += ((compress_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
             count += 1
 
             target_expand = 1.0 / self.n_expand
-            for key in ['expand_weights_Q', 'expand_weights_K', 'expand_weights_V']:
+            for key in ['expand_weights_Q_dense', 'expand_weights_K_dense', 'expand_weights_V_dense']:
                 expand_w = layer_info['attention'][key]
                 loss += ((expand_w.mean(dim=0) - target_expand) ** 2).sum() * self.n_expand
                 count += 1
 
-            mem_neuron_w = layer_info['memory']['neuron_weights']
-            loss += ((mem_neuron_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
+            mem_w = layer_info['memory']['memory_weights_dense']
+            loss += ((mem_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
             count += 1
 
         return loss / (count + 1e-10)
@@ -545,7 +574,7 @@ class DAWN(nn.Module):
         expand_o = self.layers[0].attn.expand_O.weight.numel() * self.n_layers
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        print(f"=== DAWN v12.7 Parameter Breakdown (Selective SSM) ===")
+        print(f"=== DAWN v12.7 Parameter Breakdown (Selective SSM + Top-k) ===")
         print(f"CompressNeurons:   {compress:,} ({compress/1e6:.2f}M)")
         print(f"ExpandPool (QKV):  {expand_pool:,} ({expand_pool/1e6:.2f}M)")
         print(f"expand_O:          {expand_o:,} ({expand_o/1e3:.1f}K)")
@@ -555,8 +584,10 @@ class DAWN(nn.Module):
         print(f"Global Routers:    {routers:,} ({routers/1e3:.1f}K)")
         print(f"LayerNorms:        {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
-        print(f"Architecture: Selective SSM (importance) → Global Routers → FlashAttn")
-        print(f"Selective: 토큰별 delta, B_t → 중요 토큰 오래 유지")
+        print(f"Top-k Compress: {self.top_k_compress}/{self.n_compress}")
+        print(f"Top-k Expand:   {self.top_k_expand}/{self.n_expand}")
+        print(f"Architecture: Selective SSM → Top-k Routers → FlashAttn")
+        print(f"Context: ❌ (ablation)")
         print(f"---")
         print(f"Total:             {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 
@@ -575,5 +606,6 @@ class DAWN(nn.Module):
             'max_seq_len': self.max_seq_len, 'n_compress': self.n_compress,
             'n_expand': self.n_expand, 'n_knowledge': self.n_knowledge,
             'knowledge_k': self.knowledge_k, 'state_dim': self.state_dim,
+            'top_k_compress': self.top_k_compress, 'top_k_expand': self.top_k_expand,
             'gradient_checkpointing': self.gradient_checkpointing,
         }
