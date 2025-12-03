@@ -789,21 +789,42 @@ class DAWN(nn.Module):
         count = 0
 
         for layer_info in routing_infos:
-            # Use dense weights (before top-k)
-            compress_w = layer_info['attention']['compress_weights_dense']
-            target_compress = 1.0 / self.n_compress
-            loss += ((compress_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
-            count += 1
+            attn_info = layer_info['attention']
 
-            target_expand = 1.0 / self.n_expand
-            for key in ['expand_weights_Q_dense', 'expand_weights_K_dense', 'expand_weights_V_dense']:
-                expand_w = layer_info['attention'][key]
-                loss += ((expand_w.mean(dim=0) - target_expand) ** 2).sum() * self.n_expand
+            # token_routing=True: use compress_weights directly [B,S,N] -> mean over B,S
+            # token_routing=False: use _dense weights [B,N] -> mean over B
+            if 'compress_weights_dense' in attn_info:
+                compress_w = attn_info['compress_weights_dense']  # [B, N]
+                target_compress = 1.0 / self.n_compress
+                loss += ((compress_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
                 count += 1
 
-            mem_w = layer_info['memory']['memory_weights_dense']
-            loss += ((mem_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
-            count += 1
+                target_expand = 1.0 / self.n_expand
+                for key in ['expand_weights_Q_dense', 'expand_weights_K_dense', 'expand_weights_V_dense']:
+                    expand_w = attn_info[key]  # [B, N]
+                    loss += ((expand_w.mean(dim=0) - target_expand) ** 2).sum() * self.n_expand
+                    count += 1
+
+                mem_w = layer_info['memory']['memory_weights_dense']  # [B, N]
+                loss += ((mem_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
+                count += 1
+            else:
+                # token_routing=True: weights are [B, S, N]
+                compress_w = attn_info['compress_weights']  # [B, S, N]
+                target_compress = 1.0 / self.n_compress
+                # Mean over batch and sequence -> [N]
+                loss += ((compress_w.mean(dim=(0, 1)) - target_compress) ** 2).sum() * self.n_compress
+                count += 1
+
+                target_expand = 1.0 / self.n_expand
+                for key in ['expand_weights_Q', 'expand_weights_K', 'expand_weights_V']:
+                    expand_w = attn_info[key]  # [B, S, N]
+                    loss += ((expand_w.mean(dim=(0, 1)) - target_expand) ** 2).sum() * self.n_expand
+                    count += 1
+
+                mem_w = layer_info['memory']['memory_weights']  # [B, S, N]
+                loss += ((mem_w.mean(dim=(0, 1)) - target_compress) ** 2).sum() * self.n_compress
+                count += 1
 
         return loss / (count + 1e-10)
 
@@ -878,4 +899,6 @@ class DAWN(nn.Module):
             'top_k_compress': self.top_k_compress, 'top_k_expand': self.top_k_expand,
             'router_dropout': self.router_dropout,
             'gradient_checkpointing': self.gradient_checkpointing,
+            'ssm_checkpointing': self.ssm_checkpointing,
+            'token_routing': self.token_routing,
         }
