@@ -421,10 +421,14 @@ class SentenceVisualizer:
                         layer_result[comp] = {'weights': weights, 'indices': indices}
 
             elif 'compress_weights' in attn:
-                # v12 format
-                raw_weights = attn['compress_weights'][0].cpu()  # First batch
+                # v12 format (including v12.7/v13 with top-k)
+                # Try dense weights first for better visualization
+                if 'compress_weights_dense' in attn:
+                    raw_weights = attn['compress_weights_dense'][0].cpu()  # v12.7/v13
+                else:
+                    raw_weights = attn['compress_weights'][0].cpu()  # First batch
 
-                # v12.3: [n_compress] (batch-level) -> expand to [S, n_compress]
+                # v12.3+: [n_compress] (batch-level) -> expand to [S, n_compress]
                 # v12.x: [S, n_compress] (token-level) -> keep as is
                 if len(raw_weights.shape) == 1:
                     # Batch-level routing: expand to all tokens
@@ -575,9 +579,13 @@ class SemanticAnalyzer:
                 indices = attn['Q'].get('indices')
                 is_batch_level = False
             elif 'compress_weights' in attn:
-                weights = attn['compress_weights']
-                indices = None
-                # v12.3: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
+                # v12.7/v13: prefer dense weights for analysis
+                if 'compress_weights_dense' in attn:
+                    weights = attn['compress_weights_dense']
+                else:
+                    weights = attn['compress_weights']
+                indices = attn.get('compress_topk_idx')
+                # v12.3+: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
                 is_batch_level = (len(weights.shape) == 2)
             else:
                 continue
@@ -719,9 +727,13 @@ class NeuronCatalog:
                 indices = attn['Q'].get('indices')
                 is_batch_level = False
             elif 'compress_weights' in attn:
-                weights = attn['compress_weights']
-                indices = None
-                # v12.3: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
+                # v12.7/v13: prefer dense weights for catalog building
+                if 'compress_weights_dense' in attn:
+                    weights = attn['compress_weights_dense']
+                else:
+                    weights = attn['compress_weights']
+                indices = attn.get('compress_topk_idx')
+                # v12.3+: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
                 is_batch_level = (len(weights.shape) == 2)
             else:
                 continue
@@ -846,7 +858,17 @@ def main():
     if version == 'auto':
         # 1. Try checkpoint path
         path_str = str(checkpoint_path).lower()
-        if 'v12_4' in path_str or 'v12.4' in path_str:
+        if 'v13' in path_str:
+            version = '13.0'
+        elif 'v12_8' in path_str or 'v12.8' in path_str:
+            version = '12.8'
+        elif 'v12_7' in path_str or 'v12.7' in path_str:
+            version = '12.7'
+        elif 'v12_6' in path_str or 'v12.6' in path_str:
+            version = '12.6'
+        elif 'v12_5' in path_str or 'v12.5' in path_str:
+            version = '12.5'
+        elif 'v12_4' in path_str or 'v12.4' in path_str:
             version = '12.4'
         elif 'v12_3' in path_str or 'v12.3' in path_str:
             version = '12.3'
@@ -866,7 +888,11 @@ def main():
             keys = list(state_dict.keys())
             keys_str = ' '.join(keys)
 
-            if 'O_compress_pool' in keys_str or 'O_expand_pool' in keys_str:
+            if 'context_proj' in keys_str:
+                version = '13.0'  # v13 has context_proj in SSM
+            elif 'A_log' in keys_str:
+                version = '12.7'  # v12.7 has Mamba-style SSM
+            elif 'O_compress_pool' in keys_str or 'O_expand_pool' in keys_str:
                 version = '12.4'
             elif 'O_pool' in keys_str:
                 version = '12.4'
@@ -898,8 +924,15 @@ def main():
         'dropout': config.get('dropout', 0.1),
     }
 
-    if version.startswith('12'):
+    if version.startswith('12') or version.startswith('13'):
         model_kwargs['state_dim'] = config.get('state_dim', 64)
+        if 'knowledge_rank' in config:
+            model_kwargs['knowledge_rank'] = config['knowledge_rank']
+
+    # v12.7, v12.8, v13 have top-k sparse routing
+    if version in ['12.7', '12.8', '13.0'] or version.startswith('13'):
+        model_kwargs['top_k_compress'] = config.get('top_k_compress', 8)
+        model_kwargs['top_k_expand'] = config.get('top_k_expand', 4)
 
     model = create_model_by_version(version, model_kwargs)
 
