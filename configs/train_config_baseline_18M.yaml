@@ -15,7 +15,7 @@ data:
 model:
   model_version: "baseline"
   d_model: 320
-  n_layers: 6
+  n_layers: 8
   n_heads: 4
   d_ff: 1280              # 4 * d_model
   max_seq_len: 512
@@ -51,7 +51,7 @@ log_dir: /content/drive/MyDrive/dawn/logs_baseline_18M
 #     - FFN: 320×1280 + 1280×320 = 819,200
 #     - LayerNorm: 2 × 320 × 2 = 1,280
 #     - Total: ~1,230,080
-#   6 Layers: ~7,380,480
+#   8 Layers: ~9,840,640
 #   Final LayerNorm: 640
 #
-#   Total: ~17M (weight tying 적용)
+#   Total: ~19M (weight tying 적용)
