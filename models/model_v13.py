@@ -131,15 +131,20 @@ class GlobalSSM(nn.Module):
         A = -torch.exp(self.A_log)  # [d_model, state_dim]
 
         if MAMBA_AVAILABLE:
-            # Mamba parallel scan
-            # Reshape for mamba: [B, d_model, S]
+            # Mamba expects: x [B, D, S], delta [B, D, S], A [D, N], B [B, N, S], C [B, N, S]
+            # 모든 텐서를 같은 dtype으로 맞춤
+            dtype = x.dtype
+
             x_mamba = x.transpose(1, 2).contiguous()  # [B, D, S]
             delta_mamba = delta.transpose(1, 2).contiguous()  # [B, D, S]
-            B_mamba = B_sel.transpose(1, 2).contiguous()  # [B, state_dim, S]
-            C_mamba = C_sel.transpose(1, 2).contiguous()  # [B, state_dim, S]
 
-            # selective_scan_fn expects specific shapes
-            # x: [B, D, S], delta: [B, D, S], A: [D, N], B: [B, N, S], C: [B, N, S]
+            # B, C shape: [B, N, S] (not [B, S, N])
+            B_mamba = B_sel.transpose(1, 2).contiguous()  # [B, N, S]
+            C_mamba = C_sel.transpose(1, 2).contiguous()  # [B, N, S]
+
+            # dtype 통일
+            A = A.to(dtype)
+
             y = selective_scan_fn(
                 x_mamba,
                 delta_mamba,
@@ -149,10 +154,9 @@ class GlobalSSM(nn.Module):
                 D=None,
                 z=None,
                 delta_bias=None,
-                delta_softplus=False,  # 이미 softplus 적용함
+                delta_softplus=False,
                 return_last_state=False
             )
-            # y: [B, D, S]
             ssm_out = y.transpose(1, 2).contiguous()  # [B, S, D]
         else:
             # Fallback: slow for-loop
