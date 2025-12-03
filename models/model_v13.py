@@ -327,11 +327,16 @@ class GlobalRouters(nn.Module):
                 'expand_weights_Q': expand_weights_Q.detach(),
                 'expand_weights_K': expand_weights_K.detach(),
                 'expand_weights_V': expand_weights_V.detach(),
-                # Dense weights (for load balance loss)
+                # Dense weights (for monitoring - detached)
                 'compress_weights_dense': compress_weights_dense.detach(),
                 'expand_weights_Q_dense': expand_weights_Q_dense.detach(),
                 'expand_weights_K_dense': expand_weights_K_dense.detach(),
                 'expand_weights_V_dense': expand_weights_V_dense.detach(),
+                # Dense weights (for load balance loss - with gradient)
+                'compress_weights_dense_grad': compress_weights_dense,
+                'expand_weights_Q_dense_grad': expand_weights_Q_dense,
+                'expand_weights_K_dense_grad': expand_weights_K_dense,
+                'expand_weights_V_dense_grad': expand_weights_V_dense,
                 # Top-k indices
                 'compress_topk_idx': compress_topk_idx.detach(),
                 'expand_topk_idx_Q': expand_topk_idx_Q.detach(),
@@ -373,6 +378,7 @@ class GlobalRouters(nn.Module):
             routing_info = {
                 'memory_weights': memory_weights.detach(),
                 'memory_weights_dense': memory_weights_dense.detach(),
+                'memory_weights_dense_grad': memory_weights_dense,  # for load balance loss
                 'memory_topk_idx': memory_topk_idx.detach(),
                 'token_routing': False,
             }
@@ -790,20 +796,20 @@ class DAWN(nn.Module):
             attn_info = layer_info['attention']
 
             # token_routing=True: use compress_weights directly [B,S,N] -> mean over B,S
-            # token_routing=False: use _dense weights [B,N] -> mean over B
-            if 'compress_weights_dense' in attn_info:
-                compress_w = attn_info['compress_weights_dense']  # [B, N]
+            # token_routing=False: use _dense_grad weights [B,N] -> mean over B (with gradient)
+            if 'compress_weights_dense_grad' in attn_info:
+                compress_w = attn_info['compress_weights_dense_grad']  # [B, N] with gradient
                 target_compress = 1.0 / self.n_compress
                 loss += ((compress_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
                 count += 1
 
                 target_expand = 1.0 / self.n_expand
-                for key in ['expand_weights_Q_dense', 'expand_weights_K_dense', 'expand_weights_V_dense']:
-                    expand_w = attn_info[key]  # [B, N]
+                for key in ['expand_weights_Q_dense_grad', 'expand_weights_K_dense_grad', 'expand_weights_V_dense_grad']:
+                    expand_w = attn_info[key]  # [B, N] with gradient
                     loss += ((expand_w.mean(dim=0) - target_expand) ** 2).sum() * self.n_expand
                     count += 1
 
-                mem_w = layer_info['memory']['memory_weights_dense']  # [B, N]
+                mem_w = layer_info['memory']['memory_weights_dense_grad']  # [B, N] with gradient
                 loss += ((mem_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
                 count += 1
             else:
