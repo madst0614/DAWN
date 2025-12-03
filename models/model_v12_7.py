@@ -200,17 +200,40 @@ class GlobalRouters(nn.Module):
         self.top_k_compress = top_k_compress
         self.top_k_expand = top_k_expand
 
-        # Attention routers
-        self.compress_router = nn.Linear(d_model, n_compress, bias=False)
-        self.expand_router_Q = nn.Linear(d_model, n_expand, bias=False)
-        self.expand_router_K = nn.Linear(d_model, n_expand, bias=False)
-        self.expand_router_V = nn.Linear(d_model, n_expand, bias=False)
+        # Attention routers (2-layer MLP for better representation)
+        hidden_dim = d_model // 4
+        self.compress_router = nn.Sequential(
+            nn.Linear(d_model, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Dropout(router_dropout),
+            nn.Linear(hidden_dim, n_compress, bias=False)
+        )
+        self.expand_router_Q = nn.Sequential(
+            nn.Linear(d_model, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Dropout(router_dropout),
+            nn.Linear(hidden_dim, n_expand, bias=False)
+        )
+        self.expand_router_K = nn.Sequential(
+            nn.Linear(d_model, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Dropout(router_dropout),
+            nn.Linear(hidden_dim, n_expand, bias=False)
+        )
+        self.expand_router_V = nn.Sequential(
+            nn.Linear(d_model, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Dropout(router_dropout),
+            nn.Linear(hidden_dim, n_expand, bias=False)
+        )
 
-        # Memory router
-        self.memory_router = nn.Linear(d_model, n_compress, bias=False)
-
-        # Router dropout for exploration
-        self.router_dropout = nn.Dropout(router_dropout)
+        # Memory router (2-layer MLP)
+        self.memory_router = nn.Sequential(
+            nn.Linear(d_model, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Dropout(router_dropout),
+            nn.Linear(hidden_dim, n_compress, bias=False)
+        )
 
     def _topk_sparsify(self, weights, k):
         """Apply top-k sparsification and renormalize"""
@@ -221,24 +244,18 @@ class GlobalRouters(nn.Module):
         return sparse_weights, topk_idx
 
     def get_attention_weights(self, x, importance):
-        # Compress routing (with dropout on logits)
+        # Compress routing (dropout is inside the MLP)
         compress_logits = self.compress_router(x)
-        if self.training:
-            compress_logits = self.router_dropout(compress_logits)
         compress_pref = F.softmax(compress_logits, dim=-1)
         compress_weights_dense = torch.einsum('bs,bsn->bn', importance, compress_pref)
 
         # Top-k sparsification
         compress_weights, compress_topk_idx = self._topk_sparsify(compress_weights_dense, self.top_k_compress)
 
-        # Expand routing (with dropout on logits)
+        # Expand routing (dropout is inside the MLP)
         expand_logits_Q = self.expand_router_Q(x)
         expand_logits_K = self.expand_router_K(x)
         expand_logits_V = self.expand_router_V(x)
-        if self.training:
-            expand_logits_Q = self.router_dropout(expand_logits_Q)
-            expand_logits_K = self.router_dropout(expand_logits_K)
-            expand_logits_V = self.router_dropout(expand_logits_V)
         expand_pref_Q = F.softmax(expand_logits_Q, dim=-1)
         expand_pref_K = F.softmax(expand_logits_K, dim=-1)
         expand_pref_V = F.softmax(expand_logits_V, dim=-1)
@@ -282,9 +299,8 @@ class GlobalRouters(nn.Module):
         return compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, routing_info
 
     def get_memory_weights(self, x, importance):
+        # Dropout is inside the MLP
         memory_logits = self.memory_router(x)
-        if self.training:
-            memory_logits = self.router_dropout(memory_logits)
         memory_pref = F.softmax(memory_logits, dim=-1)
         memory_weights_dense = torch.einsum('bs,bsn->bn', importance, memory_pref)
         memory_weights, memory_topk_idx = self._topk_sparsify(memory_weights_dense, self.top_k_compress)
@@ -595,12 +611,16 @@ class DAWN(nn.Module):
 
         return loss / (self.n_compress + self.n_expand)
 
-    def routing_entropy_loss(self, routing_infos):
+    def routing_entropy_loss(self, routing_infos, target_ratio=0.6):
         """
-        Entropy loss to encourage diverse routing (prevent router collapse).
-        Penalizes low entropy (concentrated) routing preferences.
+        Target entropy loss - entropy가 target_ratio 근처 유지되도록.
+        너무 낮으면 (collapse) 올리고, 너무 높으면 (uniform) 낮춤.
 
         Uses '_grad' versions of preferences to maintain gradient flow.
+
+        Args:
+            routing_infos: List of routing info dicts per layer
+            target_ratio: Target entropy ratio (0.6 = 60% of max entropy)
         """
         loss = 0.0
         count = 0
@@ -615,15 +635,17 @@ class DAWN(nn.Module):
                 if key in attn:
                     pref = attn[key]  # [B, S, n_expand]
                     entropy = -(pref * (pref + 1e-8).log()).sum(dim=-1).mean()
-                    # Penalize low entropy (want high entropy = diverse routing)
-                    loss += (max_entropy_expand - entropy) / max_entropy_expand
+                    current_ratio = entropy / max_entropy_expand
+                    # Penalize deviation from target ratio
+                    loss += (current_ratio - target_ratio).abs()
                     count += 1
 
             # Compress router entropy - use _grad version for backprop
             if 'compress_pref_grad' in attn:
                 pref = attn['compress_pref_grad']  # [B, S, n_compress]
                 entropy = -(pref * (pref + 1e-8).log()).sum(dim=-1).mean()
-                loss += (max_entropy_compress - entropy) / max_entropy_compress
+                current_ratio = entropy / max_entropy_compress
+                loss += (current_ratio - target_ratio).abs()
                 count += 1
 
         return loss / (count + 1e-10)
