@@ -26,6 +26,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+# Mamba selective scan import (fallback 포함)
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    MAMBA_AVAILABLE = True
+except ImportError:
+    MAMBA_AVAILABLE = False
+    print("Warning: mamba-ssm not installed, using slow for-loop SSM")
+
 
 class SharedNeurons(nn.Module):
     """v13: Shared neurons"""
@@ -68,37 +76,39 @@ class SharedNeurons(nn.Module):
 
 class GlobalSSM(nn.Module):
     """
-    Selective SSM + Context Enhancement
+    Selective SSM + Context Enhancement with Parallel Scan
+
+    Mamba 라이브러리 사용 시 O(S) → O(log S) 병렬화
 
     - Selective: 토큰별 delta, B_t로 중요 정보만 h_final에 남김
     - Context: states를 x에 더해서 병목 보완
-
-    "The cat sat on the mat"
-    → "the", "on" 높은 delta → 빨리 잊음
-    → "cat", "sat", "mat" 낮은 delta → h_final에 남음
-    → importance = 각 토큰이 h_final과 얼마나 유사한가
     """
     def __init__(self, d_model: int, state_dim: int):
         super().__init__()
         self.d_model = d_model
         self.state_dim = state_dim
 
-        # Selective parameters
-        self.A = nn.Parameter(torch.ones(state_dim) * 0.5)
-        self.W_delta = nn.Linear(d_model, state_dim, bias=False)
-        self.W_B = nn.Linear(d_model, state_dim, bias=False)
+        # Mamba-style parameters
+        # A: [d_model, state_dim] - 채널별 decay
+        self.A_log = nn.Parameter(torch.randn(d_model, state_dim) * 0.1)
 
-        # Context projection (병목 보완)
-        self.context_proj = nn.Linear(state_dim, d_model, bias=False)
+        # Input projections
+        self.W_delta = nn.Linear(d_model, d_model, bias=False)  # delta per channel
+        self.W_B = nn.Linear(d_model, state_dim, bias=False)
+        self.W_C = nn.Linear(d_model, state_dim, bias=False)  # output projection from state
+
+        # Context projection
+        self.context_proj = nn.Linear(d_model, d_model, bias=False)
 
         # Importance projection
-        self.importance_proj = nn.Linear(state_dim, d_model, bias=False)
+        self.importance_proj = nn.Linear(d_model, d_model, bias=False)
 
         self._init_weights()
 
     def _init_weights(self):
         nn.init.normal_(self.W_delta.weight, std=0.02)
         nn.init.normal_(self.W_B.weight, std=0.02)
+        nn.init.normal_(self.W_C.weight, std=0.02)
         nn.init.normal_(self.context_proj.weight, std=0.02)
         nn.init.normal_(self.importance_proj.weight, std=0.02)
 
@@ -107,31 +117,83 @@ class GlobalSSM(nn.Module):
         Args:
             x: [B, S, d_model]
         Returns:
-            importance: [B, S] token importance
-            context: [B, S, d_model] context enhancement
+            importance: [B, S]
+            context: [B, S, d_model]
         """
         B, S, D = x.shape
-        h = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
-        states = torch.zeros(B, S, self.state_dim, device=x.device, dtype=x.dtype)
 
-        for t in range(S):
-            delta = F.softplus(self.W_delta(x[:, t]))  # [B, state_dim], 양수
-            B_t = self.W_B(x[:, t])                     # [B, state_dim]
+        # Compute selective parameters
+        delta = F.softplus(self.W_delta(x))  # [B, S, d_model]
+        B_sel = self.W_B(x)  # [B, S, state_dim]
+        C_sel = self.W_C(x)  # [B, S, state_dim]
 
-            # Selective decay: 토큰마다 다른 망각률
-            decay = torch.exp(-delta * F.softplus(self.A))
-            h = h * decay + B_t
-            states[:, t] = h
+        # A: negative for decay
+        A = -torch.exp(self.A_log)  # [d_model, state_dim]
 
-        # Context enhancement (병목 보완)
-        context = self.context_proj(states)  # [B, S, d_model]
+        if MAMBA_AVAILABLE:
+            # Mamba parallel scan
+            # Reshape for mamba: [B, d_model, S]
+            x_mamba = x.transpose(1, 2).contiguous()  # [B, D, S]
+            delta_mamba = delta.transpose(1, 2).contiguous()  # [B, D, S]
+            B_mamba = B_sel.transpose(1, 2).contiguous()  # [B, state_dim, S]
+            C_mamba = C_sel.transpose(1, 2).contiguous()  # [B, state_dim, S]
 
-        # Importance from final state
-        h_proj = self.importance_proj(h)  # [B, d_model]
+            # selective_scan_fn expects specific shapes
+            # x: [B, D, S], delta: [B, D, S], A: [D, N], B: [B, N, S], C: [B, N, S]
+            y = selective_scan_fn(
+                x_mamba,
+                delta_mamba,
+                A,
+                B_mamba,
+                C_mamba,
+                D=None,
+                z=None,
+                delta_bias=None,
+                delta_softplus=False,  # 이미 softplus 적용함
+                return_last_state=False
+            )
+            # y: [B, D, S]
+            ssm_out = y.transpose(1, 2).contiguous()  # [B, S, D]
+        else:
+            # Fallback: slow for-loop
+            ssm_out = self._slow_forward(x, delta, A, B_sel, C_sel)
+
+        # Context enhancement
+        context = self.context_proj(ssm_out)  # [B, S, d_model]
+
+        # Importance from final state (mean pool as approximation)
+        h_final = ssm_out[:, -1, :]  # [B, d_model]
+        h_proj = self.importance_proj(h_final)  # [B, d_model]
         importance = torch.einsum('bsd,bd->bs', x, h_proj)
         importance = F.softmax(importance, dim=-1)
 
         return importance, context
+
+    def _slow_forward(self, x, delta, A, B_sel, C_sel):
+        """Fallback slow implementation"""
+        B, S, D = x.shape
+        N = self.state_dim
+
+        h = torch.zeros(B, D, N, device=x.device, dtype=x.dtype)
+        outputs = []
+
+        for t in range(S):
+            # h = h * exp(delta * A) + delta * B * x
+            delta_t = delta[:, t, :, None]  # [B, D, 1]
+            A_exp = A[None, :, :]  # [1, D, N]
+            decay = torch.exp(delta_t * A_exp)  # [B, D, N]
+
+            B_t = B_sel[:, t, None, :]  # [B, 1, N]
+            x_t = x[:, t, :, None]  # [B, D, 1]
+
+            h = h * decay + (delta_t * x_t) * B_t  # [B, D, N]
+
+            # Output: y = h @ C
+            C_t = C_sel[:, t, :]  # [B, N]
+            y_t = torch.einsum('bdn,bn->bd', h, C_t)  # [B, D]
+            outputs.append(y_t)
+
+        return torch.stack(outputs, dim=1)  # [B, S, D]
 
 
 class GlobalRouters(nn.Module):
@@ -576,11 +638,12 @@ class DAWN(nn.Module):
         knowledge = self.shared_neurons.knowledge_K.numel() + self.shared_neurons.knowledge_V.numel()
         embed = self.token_emb.weight.numel() + self.pos_emb.weight.numel()
 
-        # Selective SSM parameters
+        # Mamba-style SSM parameters
         ssm_total = (
-            self.global_ssm.A.numel() +
+            self.global_ssm.A_log.numel() +
             self.global_ssm.W_delta.weight.numel() +
             self.global_ssm.W_B.weight.numel() +
+            self.global_ssm.W_C.weight.numel() +
             self.global_ssm.context_proj.weight.numel() +
             self.global_ssm.importance_proj.weight.numel()
         )
@@ -602,13 +665,14 @@ class DAWN(nn.Module):
         print(f"expand_O:          {expand_o:,} ({expand_o/1e3:.1f}K)")
         print(f"KnowledgeNeurons:  {knowledge:,} ({knowledge/1e3:.1f}K)")
         print(f"Embeddings:        {embed:,} ({embed/1e6:.2f}M)")
-        print(f"Selective SSM:     {ssm_total:,} ({ssm_total/1e3:.1f}K) [A + W_delta + W_B + context + importance]")
+        print(f"Mamba SSM:         {ssm_total:,} ({ssm_total/1e3:.1f}K) [A_log + W_delta + W_B + W_C + context + importance]")
         print(f"Global Routers:    {routers:,} ({routers/1e3:.1f}K)")
         print(f"LayerNorms:        {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
         print(f"Top-k Compress: {self.top_k_compress}/{self.n_compress}")
         print(f"Top-k Expand:   {self.top_k_expand}/{self.n_expand}")
-        print(f"Architecture: Selective SSM → Context → Top-k Routers → FlashAttn")
+        print(f"Mamba Available: {MAMBA_AVAILABLE}")
+        print(f"Architecture: Mamba SSM (parallel scan) → Context → Top-k Routers → FlashAttn")
         print(f"---")
         print(f"Total:             {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 
