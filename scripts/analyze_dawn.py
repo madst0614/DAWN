@@ -980,7 +980,10 @@ class DAWNAnalyzer:
             if hasattr(self.model, 'global_ssm'):
                 ssm_result = self.model.global_ssm(x)
                 if isinstance(ssm_result, tuple):
-                    importance, context = ssm_result
+                    if len(ssm_result) == 3:
+                        importance, context, _ = ssm_result  # v13: (importance, context, raw_importance)
+                    else:
+                        importance, context = ssm_result
                 else:
                     importance = ssm_result
                     context = None
