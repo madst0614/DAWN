@@ -902,6 +902,11 @@ class DAWNAnalyzer:
         print("6. ATTENTION VS MEMORY BALANCE")
         print(f"{'='*60}")
 
+        # v12.7/v13 require routing weights for forward pass
+        # Use full model forward to get layer outputs
+        if self.version in ['12.7', '12.8', '13.0'] or self.version.startswith('13'):
+            return self._analyze_attn_mem_balance_v12_topk(dataloader, max_batches)
+
         self.model.eval()
 
         layer_stats = {l: {'attn_norm': [], 'mem_norm': []} for l in range(self.n_layers)}
@@ -924,6 +929,85 @@ class DAWNAnalyzer:
                 x = x + attn_out
 
                 mem_out, _ = layer.memory(layer.norm2(x))
+                x = x + mem_out
+
+                layer_stats[layer_idx]['attn_norm'].append(attn_out.norm(dim=-1).mean().item())
+                layer_stats[layer_idx]['mem_norm'].append(mem_out.norm(dim=-1).mean().item())
+
+        results = {'layers': {}}
+
+        print(f"\n--- Layer-wise Contribution ---")
+        print(f"{'Layer':<8} {'Attn Norm':<12} {'Mem Norm':<12} {'Attn%':<10}")
+        print("-" * 42)
+
+        for layer_idx in range(self.n_layers):
+            avg_attn = np.mean(layer_stats[layer_idx]['attn_norm'])
+            avg_mem = np.mean(layer_stats[layer_idx]['mem_norm'])
+            contrib = avg_attn / (avg_attn + avg_mem + 1e-10)
+
+            results['layers'][f'L{layer_idx}'] = {
+                'attn_norm': avg_attn,
+                'mem_norm': avg_mem,
+                'attn_contribution': contrib
+            }
+
+            print(f"L{layer_idx:<7} {avg_attn:<12.3f} {avg_mem:<12.3f} {contrib:<10.1%}")
+
+        return results
+
+    @torch.no_grad()
+    def _analyze_attn_mem_balance_v12_topk(self, dataloader, max_batches: int = 30) -> Dict:
+        """Analyze attention vs memory contribution for v12.7/v13 (requires routing weights)"""
+        self.model.eval()
+
+        layer_stats = {l: {'attn_norm': [], 'mem_norm': []} for l in range(self.n_layers)}
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Attn-Mem Balance", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+            B, S = input_ids.shape
+
+            # Full forward pass with hooks to capture intermediate outputs
+            pos = torch.arange(S, device=self.device).unsqueeze(0).expand(B, S)
+            x = self.model.token_emb(input_ids) + self.model.pos_emb(pos)
+
+            mask = torch.triu(torch.ones(S, S, device=self.device), diagonal=1).bool()
+            mask = ~mask.unsqueeze(0).unsqueeze(0)
+
+            # Get importance and routing weights from SSM
+            if hasattr(self.model, 'global_ssm'):
+                ssm_result = self.model.global_ssm(x)
+                if isinstance(ssm_result, tuple):
+                    importance, context = ssm_result
+                else:
+                    importance = ssm_result
+                    context = None
+            else:
+                importance = torch.ones(B, S, device=self.device) / S
+                context = None
+
+            # Get routing weights
+            compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, _ = \
+                self.model.global_routers.get_attention_weights(x, importance)
+            memory_weights, _ = self.model.global_routers.get_memory_weights(x, importance)
+
+            # Process through layers
+            for layer_idx, layer in enumerate(self.model.layers):
+                x_norm = layer.norm1(x)
+
+                # Add context if available (v13)
+                if context is not None and hasattr(layer, 'attn'):
+                    x_for_attn = x_norm + context
+                else:
+                    x_for_attn = x_norm
+
+                attn_out, _ = layer.attn(x_for_attn, compress_weights, expand_weights_Q,
+                                         expand_weights_K, expand_weights_V, mask)
+                x = x + attn_out
+
+                mem_out, _ = layer.memory(layer.norm2(x), memory_weights)
                 x = x + mem_out
 
                 layer_stats[layer_idx]['attn_norm'].append(attn_out.norm(dim=-1).mean().item())

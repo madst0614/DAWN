@@ -253,6 +253,11 @@ class GlobalRouters(nn.Module):
             'expand_topk_idx_Q': expand_topk_idx_Q.detach(),
             'expand_topk_idx_K': expand_topk_idx_K.detach(),
             'expand_topk_idx_V': expand_topk_idx_V.detach(),
+            # Token-level preferences (for analysis)
+            'compress_pref': compress_pref.detach(),
+            'expand_pref_Q': expand_pref_Q.detach(),
+            'expand_pref_K': expand_pref_K.detach(),
+            'expand_pref_V': expand_pref_V.detach(),
         }
 
         return compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, routing_info
