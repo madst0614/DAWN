@@ -679,11 +679,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 for layer_info in routing_infos:
                     attn = layer_info.get('attention', {})
                     for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad',
-                                'compress_weights_dense_grad', 'expand_weights_Q_dense_grad',
-                                'expand_weights_K_dense_grad', 'expand_weights_V_dense_grad']:
+                                'compress_logits', 'expand_logits_Q', 'expand_logits_K', 'expand_logits_V']:
                         attn.pop(key, None)
                     mem = layer_info.get('memory', {})
-                    mem.pop('memory_weights_dense_grad', None)
+                    mem.pop('memory_logits', None)
 
             # Gradient clipping
             scaler.unscale_(optimizer)
@@ -753,11 +752,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 for layer_info in routing_infos:
                     attn = layer_info.get('attention', {})
                     for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad',
-                                'compress_weights_dense_grad', 'expand_weights_Q_dense_grad',
-                                'expand_weights_K_dense_grad', 'expand_weights_V_dense_grad']:
+                                'compress_logits', 'expand_logits_Q', 'expand_logits_K', 'expand_logits_V']:
                         attn.pop(key, None)
                     mem = layer_info.get('memory', {})
-                    mem.pop('memory_weights_dense_grad', None)
+                    mem.pop('memory_logits', None)
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

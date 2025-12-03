@@ -307,6 +307,11 @@ class GlobalRouters(nn.Module):
                 'expand_pref_Q_grad': expand_pref_Q,
                 'expand_pref_K_grad': expand_pref_K,
                 'expand_pref_V_grad': expand_pref_V,
+                # Logits (for load balance loss - with gradient)
+                'compress_logits': compress_logits,
+                'expand_logits_Q': expand_logits_Q,
+                'expand_logits_K': expand_logits_K,
+                'expand_logits_V': expand_logits_V,
             }
         else:
             # Batch-level routing: aggregate by importance [B, N]
@@ -332,11 +337,6 @@ class GlobalRouters(nn.Module):
                 'expand_weights_Q_dense': expand_weights_Q_dense.detach(),
                 'expand_weights_K_dense': expand_weights_K_dense.detach(),
                 'expand_weights_V_dense': expand_weights_V_dense.detach(),
-                # Dense weights (for load balance loss - with gradient)
-                'compress_weights_dense_grad': compress_weights_dense,
-                'expand_weights_Q_dense_grad': expand_weights_Q_dense,
-                'expand_weights_K_dense_grad': expand_weights_K_dense,
-                'expand_weights_V_dense_grad': expand_weights_V_dense,
                 # Top-k indices
                 'compress_topk_idx': compress_topk_idx.detach(),
                 'expand_topk_idx_Q': expand_topk_idx_Q.detach(),
@@ -347,6 +347,11 @@ class GlobalRouters(nn.Module):
                 'expand_pref_Q': expand_pref_Q.detach(),
                 'expand_pref_K': expand_pref_K.detach(),
                 'expand_pref_V': expand_pref_V.detach(),
+                # Logits (for load balance loss - with gradient)
+                'compress_logits': compress_logits,
+                'expand_logits_Q': expand_logits_Q,
+                'expand_logits_K': expand_logits_K,
+                'expand_logits_V': expand_logits_V,
                 # Token-level preferences (for entropy loss - with gradient)
                 'compress_pref_grad': compress_pref,
                 'expand_pref_Q_grad': expand_pref_Q,
@@ -368,6 +373,7 @@ class GlobalRouters(nn.Module):
             memory_weights = memory_pref
             routing_info = {
                 'memory_weights': memory_weights.detach(),
+                'memory_logits': memory_logits,  # for load balance loss
                 'token_routing': True,
             }
         else:
@@ -378,7 +384,7 @@ class GlobalRouters(nn.Module):
             routing_info = {
                 'memory_weights': memory_weights.detach(),
                 'memory_weights_dense': memory_weights_dense.detach(),
-                'memory_weights_dense_grad': memory_weights_dense,  # for load balance loss
+                'memory_logits': memory_logits,  # for load balance loss
                 'memory_topk_idx': memory_topk_idx.detach(),
                 'token_routing': False,
             }
@@ -407,7 +413,7 @@ class NeuronCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, mask=None):
+    def forward(self, x, compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V):
         B, S, D = x.shape
         token_routing = compress_weights.dim() == 3  # [B, S, N] vs [B, N]
 
@@ -545,12 +551,12 @@ class DAWNBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, importance, global_routers: GlobalRouters, mask=None):
+    def forward(self, x, importance, global_routers: GlobalRouters):
         normed_x = self.norm1(x)
         compress_w, expand_Q, expand_K, expand_V, attn_routing = \
             global_routers.get_attention_weights(normed_x, importance)
 
-        attn_out, _ = self.attn(normed_x, compress_w, expand_Q, expand_K, expand_V, mask)
+        attn_out, _ = self.attn(normed_x, compress_w, expand_Q, expand_K, expand_V)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
@@ -682,9 +688,6 @@ class DAWN(nn.Module):
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
         x = self.token_emb(input_ids) + self.pos_emb(positions)
 
-        mask = torch.triu(torch.ones(S, S, device=device), diagonal=1).bool()
-        mask = ~mask.unsqueeze(0).unsqueeze(0)
-
         routing_infos = []
         for layer in self.layers:
             # Selective SSM: importance + context (recalculated per layer)
@@ -698,11 +701,11 @@ class DAWN(nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 x, routing_info = checkpoint(
-                    layer, x, importance, self.global_routers, mask,
+                    layer, x, importance, self.global_routers,
                     use_reentrant=False
                 )
             else:
-                x, routing_info = layer(x, importance, self.global_routers, mask)
+                x, routing_info = layer(x, importance, self.global_routers)
             if return_routing_info:
                 routing_info['importance'] = importance.detach()
                 routing_info['raw_importance'] = raw_importance.detach()
@@ -722,20 +725,18 @@ class DAWN(nn.Module):
         return logits
 
     def orthogonality_loss(self):
-        loss = 0.0
-        for i in range(self.n_compress):
-            W = self.shared_neurons.compress_neurons[i]
-            WtW = W.T @ W
-            I = torch.eye(self.rank, device=W.device)
-            loss += ((WtW - I) ** 2).mean()
+        # Compress: [n_compress, d_model, rank] -> W^T @ W = [n_compress, rank, rank]
+        W_c = self.shared_neurons.compress_neurons
+        WtW = torch.bmm(W_c.transpose(1, 2), W_c)  # [n_compress, rank, rank]
+        I = torch.eye(self.rank, device=W_c.device).unsqueeze(0)
+        loss_c = ((WtW - I) ** 2).mean()
 
-        for i in range(self.n_expand):
-            W = self.shared_neurons.expand_neurons_pool[i]
-            WWt = W @ W.T
-            I = torch.eye(self.rank, device=W.device)
-            loss += ((WWt - I) ** 2).mean()
+        # Expand: [n_expand, rank, d_model] -> W @ W^T = [n_expand, rank, rank]
+        W_e = self.shared_neurons.expand_neurons_pool
+        WWt = torch.bmm(W_e, W_e.transpose(1, 2))  # [n_expand, rank, rank]
+        loss_e = ((WWt - I) ** 2).mean()
 
-        return loss / (self.n_compress + self.n_expand)
+        return (loss_c + loss_e) / 2
 
     def routing_entropy_loss(self, routing_infos, target_ratio=0.6):
         """
@@ -788,49 +789,43 @@ class DAWN(nn.Module):
         return sim[mask].abs().mean()
 
     def load_balance_loss(self, routing_infos):
-        """Load balance on dense (pre-top-k) weights to prevent dead neurons"""
+        """Load balance on logits (pre-softmax) for gradient flow to routers"""
         loss = 0.0
         count = 0
 
         for layer_info in routing_infos:
-            attn_info = layer_info['attention']
+            attn = layer_info['attention']
 
-            # token_routing=True: use compress_weights directly [B,S,N] -> mean over B,S
-            # token_routing=False: use _dense_grad weights [B,N] -> mean over B (with gradient)
-            if 'compress_weights_dense_grad' in attn_info:
-                compress_w = attn_info['compress_weights_dense_grad']  # [B, N] with gradient
-                target_compress = 1.0 / self.n_compress
-                loss += ((compress_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
+            # Compress router
+            if 'compress_logits' in attn:
+                logits = attn['compress_logits']  # [B, S, n_compress]
+                probs = F.softmax(logits, dim=-1)
+                usage = probs.mean(dim=(0, 1))  # [n_compress]
+                target = 1.0 / self.n_compress
+                loss += ((usage - target) ** 2).sum() * self.n_compress
                 count += 1
 
-                target_expand = 1.0 / self.n_expand
-                for key in ['expand_weights_Q_dense_grad', 'expand_weights_K_dense_grad', 'expand_weights_V_dense_grad']:
-                    expand_w = attn_info[key]  # [B, N] with gradient
-                    loss += ((expand_w.mean(dim=0) - target_expand) ** 2).sum() * self.n_expand
+            # Expand routers
+            for key in ['expand_logits_Q', 'expand_logits_K', 'expand_logits_V']:
+                if key in attn:
+                    logits = attn[key]  # [B, S, n_expand]
+                    probs = F.softmax(logits, dim=-1)
+                    usage = probs.mean(dim=(0, 1))  # [n_expand]
+                    target = 1.0 / self.n_expand
+                    loss += ((usage - target) ** 2).sum() * self.n_expand
                     count += 1
 
-                mem_w = layer_info['memory']['memory_weights_dense_grad']  # [B, N] with gradient
-                loss += ((mem_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
-                count += 1
-            else:
-                # token_routing=True: weights are [B, S, N]
-                compress_w = attn_info['compress_weights']  # [B, S, N]
-                target_compress = 1.0 / self.n_compress
-                # Mean over batch and sequence -> [N]
-                loss += ((compress_w.mean(dim=(0, 1)) - target_compress) ** 2).sum() * self.n_compress
-                count += 1
-
-                target_expand = 1.0 / self.n_expand
-                for key in ['expand_weights_Q', 'expand_weights_K', 'expand_weights_V']:
-                    expand_w = attn_info[key]  # [B, S, N]
-                    loss += ((expand_w.mean(dim=(0, 1)) - target_expand) ** 2).sum() * self.n_expand
-                    count += 1
-
-                mem_w = layer_info['memory']['memory_weights']  # [B, S, N]
-                loss += ((mem_w.mean(dim=(0, 1)) - target_compress) ** 2).sum() * self.n_compress
+            # Memory router
+            mem = layer_info['memory']
+            if 'memory_logits' in mem:
+                logits = mem['memory_logits']  # [B, S, n_compress]
+                probs = F.softmax(logits, dim=-1)
+                usage = probs.mean(dim=(0, 1))
+                target = 1.0 / self.n_compress
+                loss += ((usage - target) ** 2).sum() * self.n_compress
                 count += 1
 
-        return loss / (count + 1e-10)
+        return loss / max(count, 1)
 
     def get_auxiliary_losses(self):
         return {
@@ -857,13 +852,16 @@ class DAWN(nn.Module):
             self.global_ssm.importance_proj.weight.numel()
         )
 
-        routers = (
-            self.global_routers.compress_router.weight.numel() +
-            self.global_routers.expand_router_Q.weight.numel() +
-            self.global_routers.expand_router_K.weight.numel() +
-            self.global_routers.expand_router_V.weight.numel() +
-            self.global_routers.memory_router.weight.numel()
-        )
+        def _count_seq_params(seq):
+            return sum(p.numel() for p in seq.parameters())
+
+        routers = sum(_count_seq_params(r) for r in [
+            self.global_routers.compress_router,
+            self.global_routers.expand_router_Q,
+            self.global_routers.expand_router_K,
+            self.global_routers.expand_router_V,
+            self.global_routers.memory_router,
+        ])
 
         expand_o = self.layers[0].attn.expand_O.weight.numel() * self.n_layers
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
