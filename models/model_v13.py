@@ -169,10 +169,10 @@ class GlobalSSM(nn.Module):
         # Importance from final state (mean pool as approximation)
         h_final = ssm_out[:, -1, :]  # [B, d_model]
         h_proj = self.importance_proj(h_final)  # [B, d_model]
-        importance = torch.einsum('bsd,bd->bs', x, h_proj)
-        importance = F.softmax(importance, dim=-1)
+        raw_importance = torch.einsum('bsd,bd->bs', x, h_proj)  # [B, S] - before softmax
+        importance = F.softmax(raw_importance, dim=-1)
 
-        return importance, context
+        return importance, context, raw_importance
 
     def _slow_forward(self, x, delta, A, B_sel, C_sel):
         """Fallback slow implementation"""
@@ -613,7 +613,7 @@ class DAWN(nn.Module):
         routing_infos = []
         for layer in self.layers:
             # Selective SSM: importance + context (recalculated per layer)
-            importance, context = self.global_ssm(x)
+            importance, context, raw_importance = self.global_ssm(x)
             x = x + context
 
             if self.gradient_checkpointing and self.training:
@@ -625,6 +625,7 @@ class DAWN(nn.Module):
                 x, routing_info = layer(x, importance, self.global_routers, mask)
             if return_routing_info:
                 routing_info['importance'] = importance.detach()
+                routing_info['raw_importance'] = raw_importance.detach()
                 routing_infos.append(routing_info)
 
         x = self.norm(x)

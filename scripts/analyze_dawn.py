@@ -1276,6 +1276,11 @@ class DAWNAnalyzer:
             'max_importance': [],
             'min_importance': [],
             'std_importance': [],
+            # Raw importance (before softmax) stats
+            'raw_std': [],
+            'raw_min': [],
+            'raw_max': [],
+            'raw_range': [],
         }
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Importance Analysis", total=max_batches)):
@@ -1291,10 +1296,14 @@ class DAWNAnalyzer:
 
             # Get importance from SSM
             ssm_result = self.model.global_ssm(x)
-            if isinstance(ssm_result, tuple):
+            if len(ssm_result) == 3:
+                importance, _, raw_importance = ssm_result
+            elif len(ssm_result) == 2:
                 importance, _ = ssm_result
+                raw_importance = None
             else:
                 importance = ssm_result
+                raw_importance = None
 
             # importance: [B, S] - normalized probability over tokens
 
@@ -1329,6 +1338,14 @@ class DAWNAnalyzer:
             stats['min_importance'].append(importance.min(dim=-1).values.mean().item())
             stats['std_importance'].append(importance.std(dim=-1).mean().item())
 
+            # 5. Raw importance statistics (before softmax)
+            if raw_importance is not None:
+                stats['raw_std'].append(raw_importance.std(dim=-1).mean().item())
+                stats['raw_min'].append(raw_importance.min(dim=-1).values.mean().item())
+                stats['raw_max'].append(raw_importance.max(dim=-1).values.mean().item())
+                raw_range = raw_importance.max(dim=-1).values - raw_importance.min(dim=-1).values
+                stats['raw_range'].append(raw_range.mean().item())
+
         # Aggregate results
         results = {}
         for key in stats:
@@ -1339,7 +1356,7 @@ class DAWNAnalyzer:
                 }
 
         # Print summary
-        print(f"\n--- Importance Distribution Statistics ---")
+        print(f"\n--- Importance Distribution Statistics (after softmax) ---")
         print(f"{'Metric':<25} {'Mean':<12} {'Std':<12}")
         print("-" * 49)
 
@@ -1349,6 +1366,17 @@ class DAWNAnalyzer:
                 mean = results[key]['mean']
                 std = results[key]['std']
                 print(f"{key:<25} {mean:<12.4f} {std:<12.4f}")
+
+        # Raw importance stats (before softmax)
+        if 'raw_std' in results:
+            print(f"\n--- Raw Importance Statistics (before softmax) ---")
+            print(f"{'Metric':<25} {'Mean':<12} {'Std':<12}")
+            print("-" * 49)
+            for key in ['raw_std', 'raw_min', 'raw_max', 'raw_range']:
+                if key in results:
+                    mean = results[key]['mean']
+                    std = results[key]['std']
+                    print(f"{key:<25} {mean:<12.4f} {std:<12.4f}")
 
         # Diagnosis
         print(f"\n--- Diagnosis ---")
@@ -1381,6 +1409,22 @@ class DAWNAnalyzer:
                 print("  → Moderate concentration")
             else:
                 print("  → Low concentration, fairly distributed")
+
+        # Raw importance diagnosis
+        if 'raw_std' in results and 'raw_range' in results:
+            raw_std = results['raw_std']['mean']
+            raw_range = results['raw_range']['mean']
+            print(f"\n--- Raw Score Analysis ---")
+            print(f"Raw std: {raw_std:.4f}, Raw range: {raw_range:.4f}")
+            if raw_std < 0.1:
+                print("  ⚠ Raw scores very similar (std < 0.1)")
+                print("  → Problem is in SSM output, not softmax temperature")
+            elif raw_range < 1.0:
+                print("  ⚠ Raw score range small (< 1.0)")
+                print("  → Softmax will produce near-uniform distribution")
+            else:
+                print("  ✓ Raw scores have reasonable variance")
+                print("  → SSM is differentiating tokens")
 
         return results
 
