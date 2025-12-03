@@ -617,12 +617,14 @@ class DAWN(nn.Module):
         너무 낮으면 (collapse) 올리고, 너무 높으면 (uniform) 낮춤.
 
         Uses '_grad' versions of preferences to maintain gradient flow.
+        Uses fp32 to avoid AMP underflow issues.
 
         Args:
             routing_infos: List of routing info dicts per layer
             target_ratio: Target entropy ratio (0.6 = 60% of max entropy)
         """
-        loss = 0.0
+        device = next(self.parameters()).device
+        loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         count = 0
         max_entropy_expand = math.log(self.n_expand)
         max_entropy_compress = math.log(self.n_compress)
@@ -633,22 +635,24 @@ class DAWN(nn.Module):
             # Expand router entropy (Q, K, V) - use _grad versions for backprop
             for key in ['expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad']:
                 if key in attn:
-                    pref = attn[key]  # [B, S, n_expand]
-                    entropy = -(pref * (pref + 1e-8).log()).sum(dim=-1).mean()
+                    pref = attn[key].float()  # fp32 강제
+                    pref = pref.clamp(min=1e-6)  # 안전한 범위로 clamp
+                    entropy = -(pref * pref.log()).sum(dim=-1).mean()
                     current_ratio = entropy / max_entropy_expand
                     # Penalize deviation from target ratio
-                    loss += (current_ratio - target_ratio).abs()
+                    loss = loss + (current_ratio - target_ratio).abs()
                     count += 1
 
             # Compress router entropy - use _grad version for backprop
             if 'compress_pref_grad' in attn:
-                pref = attn['compress_pref_grad']  # [B, S, n_compress]
-                entropy = -(pref * (pref + 1e-8).log()).sum(dim=-1).mean()
+                pref = attn['compress_pref_grad'].float()  # fp32 강제
+                pref = pref.clamp(min=1e-6)
+                entropy = -(pref * pref.log()).sum(dim=-1).mean()
                 current_ratio = entropy / max_entropy_compress
-                loss += (current_ratio - target_ratio).abs()
+                loss = loss + (current_ratio - target_ratio).abs()
                 count += 1
 
-        return loss / (count + 1e-10)
+        return loss / max(count, 1)
 
     def knowledge_diversity_loss(self):
         K = self.shared_neurons.knowledge_K
