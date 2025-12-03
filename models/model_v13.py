@@ -284,11 +284,16 @@ class GlobalRouters(nn.Module):
             'expand_topk_idx_Q': expand_topk_idx_Q.detach(),
             'expand_topk_idx_K': expand_topk_idx_K.detach(),
             'expand_topk_idx_V': expand_topk_idx_V.detach(),
-            # Token-level preferences (for analysis)
+            # Token-level preferences (for analysis - detached)
             'compress_pref': compress_pref.detach(),
             'expand_pref_Q': expand_pref_Q.detach(),
             'expand_pref_K': expand_pref_K.detach(),
             'expand_pref_V': expand_pref_V.detach(),
+            # Token-level preferences (for entropy loss - with gradient)
+            'compress_pref_grad': compress_pref,
+            'expand_pref_Q_grad': expand_pref_Q,
+            'expand_pref_K_grad': expand_pref_K,
+            'expand_pref_V_grad': expand_pref_V,
         }
 
         return compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, routing_info
@@ -624,6 +629,8 @@ class DAWN(nn.Module):
         """
         Entropy loss to encourage diverse routing (prevent router collapse).
         Penalizes low entropy (concentrated) routing preferences.
+
+        Uses '_grad' versions of preferences to maintain gradient flow.
         """
         loss = 0.0
         count = 0
@@ -633,8 +640,8 @@ class DAWN(nn.Module):
         for layer_info in routing_infos:
             attn = layer_info['attention']
 
-            # Expand router entropy (Q, K, V)
-            for key in ['expand_pref_Q', 'expand_pref_K', 'expand_pref_V']:
+            # Expand router entropy (Q, K, V) - use _grad versions for backprop
+            for key in ['expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad']:
                 if key in attn:
                     pref = attn[key]  # [B, S, n_expand]
                     entropy = -(pref * (pref + 1e-8).log()).sum(dim=-1).mean()
@@ -642,9 +649,9 @@ class DAWN(nn.Module):
                     loss += (max_entropy_expand - entropy) / max_entropy_expand
                     count += 1
 
-            # Compress router entropy
-            if 'compress_pref' in attn:
-                pref = attn['compress_pref']  # [B, S, n_compress]
+            # Compress router entropy - use _grad version for backprop
+            if 'compress_pref_grad' in attn:
+                pref = attn['compress_pref_grad']  # [B, S, n_compress]
                 entropy = -(pref * (pref + 1e-8).log()).sum(dim=-1).mean()
                 loss += (max_entropy_compress - entropy) / max_entropy_compress
                 count += 1
