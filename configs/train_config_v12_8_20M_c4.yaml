@@ -1,0 +1,73 @@
+# DAWN v12.8 Training Config - 20M Scale, 12 Layers
+# C4 dataset, Top-k Sparse Mixing
+
+# Top-k Sparse Mixing:
+# - Soft mixing → Top-k sparse mixing
+# - Switch Transformer style load balance loss
+# - compress: 288 → top_k_compress (16)
+# - expand: 72 → top_k_expand (8)
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 100000000   # 100M tokens
+  max_val_tokens: 2000000        # 2M tokens
+
+# Model Architecture
+model:
+  model_version: "12.8"
+  d_model: 320
+  n_layers: 12
+  n_heads: 4
+  rank: 64
+  state_dim: 64
+  n_compress: 288
+  n_expand: 72
+  n_knowledge: 320
+  knowledge_k: 14
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+  top_k_compress: 16
+  top_k_expand: 8
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 4
+  lr: 0.0006
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v12_8_20M_c4
+log_dir: /content/drive/MyDrive/dawn/logs_v12_8_20M_c4
+
+# Summary:
+#   Train: 100M × 4 epochs = 400M tokens (Chinchilla optimal)
+#   Seq length: 512 (with gradient checkpointing + FlashAttention)
+#   Batch size: 128, lr: 0.0006, warmup: 6%
+#
+# v12.8 Top-k Sparse Mixing:
+#   - Soft mixing → Top-k sparse selection
+#   - compress: 288 neurons → top 16 selected
+#   - expand: 72 neurons → top 8 selected
+#   - Switch Transformer style load balance loss
+#   - FlashAttention enabled
+#
+# vs v12.7:
+#   - v12.7: soft mixing (all neurons weighted sum)
+#   - v12.8: sparse mixing (top-k neurons gather + weighted sum)
+#
+# Expected benefits:
+#   - Computational sparsity
+#   - Better neuron specialization
+#   - Improved load balancing

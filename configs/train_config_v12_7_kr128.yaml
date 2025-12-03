@@ -1,0 +1,48 @@
+# DAWN v12.7 Training Config
+# SSM without Context (SSM preserved, context removed)
+# knowledge_rank 128 (2x baseline)
+
+# Ablation study: knowledge_rank 효과 측정
+# vs v12.7 baseline (kr=64): knowledge rank 2배
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - val/wikitext_5to1_texts.pkl
+
+# Model Architecture
+model:
+  model_version: "12.7"
+  d_model: 320
+  n_layers: 4
+  n_heads: 4
+  rank: 64
+  # Neurons
+  n_compress: 48
+  n_expand: 12
+  n_knowledge: 80
+  knowledge_k: 10
+  knowledge_rank: 128            # 2x baseline (64 -> 128)
+  max_seq_len: 128
+  dropout: 0.1
+  state_dim: 64
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+  # Regularization
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v12_7_kr128
+log_dir: /content/drive/MyDrive/dawn/logs_v12_7_kr128
