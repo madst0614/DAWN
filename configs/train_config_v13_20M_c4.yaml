@@ -34,8 +34,7 @@ model:
   top_k_compress: 48
   top_k_expand: 24
   router_dropout: 0.1
-  # Optional features (disabled by default)
-  ssm_checkpointing: false
+  # Optional: per-token routing instead of batch-level
   token_routing: false
 
 # Training

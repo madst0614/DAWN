@@ -603,7 +603,6 @@ class DAWN(nn.Module):
         dropout: float = 0.1,
         router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
-        ssm_checkpointing: bool = False,
         token_routing: bool = False,
         **kwargs
     ):
@@ -619,7 +618,6 @@ class DAWN(nn.Module):
         self.state_dim = state_dim
         self.top_k_compress = top_k_compress
         self.top_k_expand = top_k_expand
-        self.ssm_checkpointing = ssm_checkpointing
         self.token_routing = token_routing
         self.router_dropout = router_dropout
         self.gradient_checkpointing = gradient_checkpointing
@@ -684,7 +682,7 @@ class DAWN(nn.Module):
         routing_infos = []
         for layer in self.layers:
             # Selective SSM: importance + context (recalculated per layer)
-            if self.ssm_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training:
                 importance, context, raw_importance = checkpoint(
                     self.global_ssm, x, use_reentrant=False
                 )
@@ -899,6 +897,5 @@ class DAWN(nn.Module):
             'top_k_compress': self.top_k_compress, 'top_k_expand': self.top_k_expand,
             'router_dropout': self.router_dropout,
             'gradient_checkpointing': self.gradient_checkpointing,
-            'ssm_checkpointing': self.ssm_checkpointing,
             'token_routing': self.token_routing,
         }
