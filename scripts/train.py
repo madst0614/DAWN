@@ -783,29 +783,59 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         if (step + 1) % 200 == 0 and routing_infos is not None:
             with torch.no_grad():
                 try:
+                    # Layer 0 for routing analysis
                     attn = routing_infos[0].get('attention', routing_infos[0])
-                    expand_pref_Q = attn.get('expand_pref_Q')
-                    compress_pref = attn.get('compress_pref')
 
-                    if expand_pref_Q is not None:
-                        # Entropy ratio for expand router
-                        ent_Q = -(expand_pref_Q * (expand_pref_Q + 1e-8).log()).sum(-1).mean()
-                        n_expand = expand_pref_Q.shape[-1]
-                        ent_Q_ratio = ent_Q / math.log(n_expand) * 100
+                    # Get all expand prefs
+                    pref_Q = attn.get('expand_pref_Q')
+                    pref_K = attn.get('expand_pref_K')
+                    pref_V = attn.get('expand_pref_V')
+                    pref_C = attn.get('compress_pref')
 
-                        # Token variance (are different tokens routed differently?)
-                        token_var_Q = expand_pref_Q.var(dim=1).mean().item()
+                    def calc_entropy_ratio(pref):
+                        if pref is None:
+                            return 0.0
+                        ent = -(pref * (pref + 1e-8).log()).sum(-1).mean()
+                        return (ent / math.log(pref.shape[-1]) * 100).item()
 
-                        print(f"[Step {step+1}] expand_Q: entropy={ent_Q_ratio:.1f}%, token_var={token_var_Q:.6f}")
+                    def calc_token_var(pref):
+                        if pref is None:
+                            return 0.0
+                        return pref.var(dim=1).mean().item()
 
-                        if ent_Q_ratio < 30:
-                            print(f"  ⚠ WARNING: Router may be collapsing!")
+                    # Entropy ratios
+                    ent_Q = calc_entropy_ratio(pref_Q)
+                    ent_K = calc_entropy_ratio(pref_K)
+                    ent_V = calc_entropy_ratio(pref_V)
+                    ent_C = calc_entropy_ratio(pref_C)
 
-                    if compress_pref is not None:
-                        ent_C = -(compress_pref * (compress_pref + 1e-8).log()).sum(-1).mean()
-                        n_compress = compress_pref.shape[-1]
-                        ent_C_ratio = ent_C / math.log(n_compress) * 100
-                        print(f"[Step {step+1}] compress: entropy={ent_C_ratio:.1f}%")
+                    # Token variance (Q만 대표로)
+                    var_Q = calc_token_var(pref_Q)
+
+                    # Memory ratio (L0 vs L3)
+                    mem_L0, mem_L3 = 0.0, 0.0
+                    if len(routing_infos) > 0:
+                        l0 = routing_infos[0]
+                        attn_w = l0['attention'].get('compress_weights_dense')
+                        mem_w = l0.get('memory', {}).get('memory_weights_dense')
+                        if attn_w is not None and mem_w is not None:
+                            mem_L0 = (mem_w.mean() / (attn_w.mean() + mem_w.mean() + 1e-8) * 100).item()
+                    if len(routing_infos) > 3:
+                        l3 = routing_infos[3]
+                        attn_w = l3['attention'].get('compress_weights_dense')
+                        mem_w = l3.get('memory', {}).get('memory_weights_dense')
+                        if attn_w is not None and mem_w is not None:
+                            mem_L3 = (mem_w.mean() / (attn_w.mean() + mem_w.mean() + 1e-8) * 100).item()
+
+                    # Compact output
+                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Mem L0/L3:{mem_L0:.0f}/{mem_L3:.0f}%")
+
+                    # Warning if collapse detected
+                    if min(ent_Q, ent_K, ent_V) < 30:
+                        print(f"  ⚠ WARNING: Router may be collapsing! (target: 60%)")
+                    elif min(ent_Q, ent_K, ent_V) > 80:
+                        print(f"  ⚠ WARNING: Router too uniform! (target: 60%)")
+
                 except Exception:
                     pass  # Skip if routing_infos format is different
 
