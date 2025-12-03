@@ -13,7 +13,7 @@ data:
   val_files:
     - val/c4/c4_val_50M.pt
   max_train_tokens: 100000000   # 100M tokens
-  max_val_tokens: 1638400       # ~1.6M tokens (50 batches)
+  max_val_tokens: 2000000        # 2M tokens
 
 # Model Architecture
 model:
