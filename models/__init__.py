@@ -53,6 +53,12 @@ v12.7: SSM without Context
 - context 강화만 제거
 - Ablation: v12.5 vs v12.7 = context 효과
 
+v12.8: Top-k Sparse Mixing
+- Soft mixing → Top-k sparse mixing
+- Switch Transformer style load balance loss
+- compress: top_k_compress (16), expand: top_k_expand (8)
+- FlashAttention maintained
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -85,6 +91,9 @@ from .model_v12_6 import DAWN as DAWN_v12_6
 
 # v12.7 - SSM without Context (SSM preserved, context removed)
 from .model_v12_7 import DAWN as DAWN_v12_7
+
+# v12.8 - Top-k Sparse Mixing with Switch-style load balance
+from .model_v12_8 import DAWN as DAWN_v12_8
 
 # Default DAWN is v12.3 (stable)
 DAWN = DAWN_v12_3
@@ -121,6 +130,7 @@ __all__ = [
     'DAWN_v12_5',
     'DAWN_v12_6',
     'DAWN_v12_7',
+    'DAWN_v12_8',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -173,6 +183,8 @@ def create_model_by_version(version, config):
         return DAWN_v12_6(**config)
     elif version == "12.7":
         return DAWN_v12_7(**config)
+    elif version == "12.8":
+        return DAWN_v12_8(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8, baseline")
