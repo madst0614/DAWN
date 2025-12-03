@@ -662,6 +662,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Total loss
                 loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
 
+                # NaN/INF detection
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"\n[WARNING] NaN/INF detected at step {step}!")
+                    print(f"  ce_loss: {ce_loss.item() if torch.is_tensor(ce_loss) else ce_loss}")
+                    print(f"  orth_loss: {orth_loss.item() if torch.is_tensor(orth_loss) else orth_loss}")
+                    print(f"  diversity_loss: {diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss}")
+                    print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
+                    print(f"  ent_loss: {ent_loss.item() if torch.is_tensor(ent_loss) else ent_loss}")
+                    raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
+
             scaler.scale(loss).backward()
 
             # Gradient clipping
@@ -714,6 +724,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             # Total loss
             loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
+
+            # NaN/INF detection
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n[WARNING] NaN/INF detected at step {step}!")
+                print(f"  ce_loss: {ce_loss.item() if torch.is_tensor(ce_loss) else ce_loss}")
+                print(f"  orth_loss: {orth_loss.item() if torch.is_tensor(orth_loss) else orth_loss}")
+                print(f"  diversity_loss: {diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss}")
+                print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
+                print(f"  ent_loss: {ent_loss.item() if torch.is_tensor(ent_loss) else ent_loss}")
+                raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
             loss.backward()
 
