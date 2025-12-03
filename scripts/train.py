@@ -1479,6 +1479,33 @@ def main():
             print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
             print(f"    - V: {args.n_knowledge} × {args.d_model}")
             print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "13.0":
+            # v13.0: Final Architecture - Selective SSM + Context + Top-k
+            rank = args.basis_rank
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
+            state_dim = getattr(args, 'state_dim', 64)
+            d_head = args.d_model // args.n_heads
+            top_k_compress = getattr(args, 'top_k_compress', 8)
+            top_k_expand = getattr(args, 'top_k_expand', 4)
+            grad_ckpt = getattr(args, 'gradient_checkpointing', False)
+            print(f"SharedNeurons (v{model_version}): rank={rank} - FINAL ARCHITECTURE!")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (shared)")
+            print(f"  expand_neurons_pool: {args.n_expand} × {rank} × {args.d_model} (1 shared pool for Q/K/V)")
+            print(f"  Global SSM: Selective mechanism (token-dependent delta, B_t)")
+            print(f"  Global Routers: 5 (compress, expand_Q/K/V, memory) + Top-k")
+            print(f"  Context Enhancement: SSM context added to x")
+            print(f"  Top-k Compress: {top_k_compress}/{args.n_compress}")
+            print(f"  Top-k Expand: {top_k_expand}/{args.n_expand}")
+            print(f"  SSM: state_dim={state_dim}")
+            print(f"  FlashAttention: enabled (scaled_dot_product_attention)")
+            print(f"  Gradient Checkpointing: {grad_ckpt}")
+            print(f"  Load Balance: Switch Transformer style")
+            print(f"  Architecture: Selective SSM → Context + Top-k Routers → FlashAttn")
+            print(f"  Attention: d_model space (d_head={d_head})")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
         elif model_version == "12.3":
             # v12.3: SSM-guided Shared Expand Pool (1 pool, 3 routers)
             rank = args.basis_rank
@@ -1727,6 +1754,20 @@ def main():
             'state_dim': getattr(args, 'state_dim', 64),
             'top_k_compress': getattr(args, 'top_k_compress', 16),
             'top_k_expand': getattr(args, 'top_k_expand', 8),
+            'gradient_checkpointing': args.gradient_checkpointing,
+        })
+    elif model_version == '13.0':
+        # v13.0: Final Architecture - Selective SSM + Context + Top-k
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand': args.n_expand,
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'knowledge_rank': args.knowledge_rank,  # None = use rank
+            'rank': args.basis_rank,
+            'state_dim': getattr(args, 'state_dim', 64),
+            'top_k_compress': getattr(args, 'top_k_compress', 8),
+            'top_k_expand': getattr(args, 'top_k_expand', 4),
             'gradient_checkpointing': args.gradient_checkpointing,
         })
     elif model_version == '12.3':

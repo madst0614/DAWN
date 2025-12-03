@@ -1,0 +1,50 @@
+# DAWN v13.0 20M Training Config (C4 dataset)
+# Final Architecture: Selective SSM + Context + Top-k Sparse Routing
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4_train_100M.pkl
+  val_files:
+    - val/c4_val.pkl
+
+# Model Architecture
+model:
+  model_version: "13.0"
+  d_model: 512
+  n_layers: 6
+  n_heads: 8
+  rank: 64
+  # Neurons
+  n_compress: 64
+  n_expand: 16
+  n_knowledge: 128
+  knowledge_k: 12
+  knowledge_rank: 64
+  max_seq_len: 512
+  dropout: 0.1
+  state_dim: 64
+  # Top-k sparse mixing
+  top_k_compress: 8
+  top_k_expand: 4
+  gradient_checkpointing: true
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 10
+  lr: 0.0006
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  # Regularization
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
+  max_train_tokens: 100_000_000
+  max_val_tokens: 2_000_000
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v13_20M
+log_dir: /content/drive/MyDrive/dawn/logs_v13_20M

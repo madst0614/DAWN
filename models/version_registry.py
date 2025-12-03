@@ -11,6 +11,7 @@ v12.5: Global SSM + Global Router (24→1 SSM, 60→5 routers, context enhanceme
 v12.6: No SSM Ablation (simple projection for importance, no context enhancement)
 v12.7: SSM without Context (SSM preserved, context removed)
 v12.8: Top-k Sparse Mixing (soft mixing → top-k sparse, Switch-style load balance)
+v13.0: Final Architecture (Selective SSM + Context + Top-k + FlashAttention)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -321,6 +322,39 @@ VERSION_REGISTRY = {
             f"  FlashAttention: enabled",
             f"  Load Balance: Switch Transformer style",
             f"  Architecture: Global SSM → Top-k Routers → FlashAttn",
+            f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
+    "13.0": {
+        "description": "Final Architecture (Selective SSM + Context + Top-k + FlashAttention)",
+        "aliases": ["13", "130"],
+        "module": "model_v13",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_compress": 8,
+            "top_k_expand": 4,
+            "gradient_checkpointing": False,
+        },
+        "display_info": lambda args: [
+            f"DAWN v13.0 Final: rank={args.get('rank', args.get('basis_rank'))}",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))}",
+            f"  expand_neurons_pool: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')}",
+            f"  Selective SSM: state_dim={args.get('state_dim', 64)} [A + W_delta + W_B + context + importance]",
+            f"  Top-k Compress: {args.get('top_k_compress', 8)}/{args.get('n_compress')}",
+            f"  Top-k Expand: {args.get('top_k_expand', 4)}/{args.get('n_expand')}",
+            f"  Context Enhancement: enabled",
+            f"  FlashAttention: enabled",
+            f"  Gradient Checkpointing: {args.get('gradient_checkpointing', False)}",
+            f"  Architecture: Selective SSM → Context → Top-k Routers → FlashAttn",
             f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
             f"  KnowledgeNeurons:",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",

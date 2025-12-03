@@ -59,6 +59,11 @@ v12.8: Top-k Sparse Mixing
 - compress: top_k_compress (16), expand: top_k_expand (8)
 - FlashAttention maintained
 
+v13.0: Final Architecture
+- Selective SSM + Context Enhancement
+- Top-k Sparse Routing
+- FlashAttention + Gradient Checkpointing
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -94,6 +99,9 @@ from .model_v12_7 import DAWN as DAWN_v12_7
 
 # v12.8 - Top-k Sparse Mixing with Switch-style load balance
 from .model_v12_8 import DAWN as DAWN_v12_8
+
+# v13.0 - Final Architecture (Selective SSM + Context + Top-k)
+from .model_v13 import DAWN as DAWN_v13
 
 # Default DAWN is v12.3 (stable)
 DAWN = DAWN_v12_3
@@ -131,6 +139,7 @@ __all__ = [
     'DAWN_v12_6',
     'DAWN_v12_7',
     'DAWN_v12_8',
+    'DAWN_v13',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -185,6 +194,8 @@ def create_model_by_version(version, config):
         return DAWN_v12_7(**config)
     elif version == "12.8":
         return DAWN_v12_8(**config)
+    elif version == "13.0":
+        return DAWN_v13(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8, 13.0, baseline")
