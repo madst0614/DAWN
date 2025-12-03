@@ -234,30 +234,39 @@ class GlobalRouters(nn.Module):
         """
         Compute attention routing weights with Top-k sparsification
         """
-        # Compress routing with top-k
+        # Compress routing
         compress_pref = F.softmax(self.compress_router(x), dim=-1)  # [B, S, n_compress]
-        compress_weights = torch.einsum('bs,bsn->bn', importance, compress_pref)
-        compress_weights, compress_topk_idx = self._topk_sparsify(compress_weights, self.top_k_compress)
+        compress_weights_dense = torch.einsum('bs,bsn->bn', importance, compress_pref)
 
-        # Expand routing with top-k (each Q/K/V)
+        # Top-k sparsification
+        compress_weights, compress_topk_idx = self._topk_sparsify(compress_weights_dense, self.top_k_compress)
+
+        # Expand routing
         expand_pref_Q = F.softmax(self.expand_router_Q(x), dim=-1)
         expand_pref_K = F.softmax(self.expand_router_K(x), dim=-1)
         expand_pref_V = F.softmax(self.expand_router_V(x), dim=-1)
 
-        expand_weights_Q = torch.einsum('bs,bsn->bn', importance, expand_pref_Q)
-        expand_weights_K = torch.einsum('bs,bsn->bn', importance, expand_pref_K)
-        expand_weights_V = torch.einsum('bs,bsn->bn', importance, expand_pref_V)
+        expand_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_Q)
+        expand_weights_K_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_K)
+        expand_weights_V_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_V)
 
-        expand_weights_Q, expand_topk_idx_Q = self._topk_sparsify(expand_weights_Q, self.top_k_expand)
-        expand_weights_K, expand_topk_idx_K = self._topk_sparsify(expand_weights_K, self.top_k_expand)
-        expand_weights_V, expand_topk_idx_V = self._topk_sparsify(expand_weights_V, self.top_k_expand)
+        expand_weights_Q, expand_topk_idx_Q = self._topk_sparsify(expand_weights_Q_dense, self.top_k_expand)
+        expand_weights_K, expand_topk_idx_K = self._topk_sparsify(expand_weights_K_dense, self.top_k_expand)
+        expand_weights_V, expand_topk_idx_V = self._topk_sparsify(expand_weights_V_dense, self.top_k_expand)
 
         routing_info = {
+            # Sparse weights (for forward)
             'compress_weights': compress_weights.detach(),
-            'compress_topk_idx': compress_topk_idx.detach(),
             'expand_weights_Q': expand_weights_Q.detach(),
             'expand_weights_K': expand_weights_K.detach(),
             'expand_weights_V': expand_weights_V.detach(),
+            # Dense weights (for load balance loss)
+            'compress_weights_dense': compress_weights_dense.detach(),
+            'expand_weights_Q_dense': expand_weights_Q_dense.detach(),
+            'expand_weights_K_dense': expand_weights_K_dense.detach(),
+            'expand_weights_V_dense': expand_weights_V_dense.detach(),
+            # Top-k indices
+            'compress_topk_idx': compress_topk_idx.detach(),
             'expand_topk_idx_Q': expand_topk_idx_Q.detach(),
             'expand_topk_idx_K': expand_topk_idx_K.detach(),
             'expand_topk_idx_V': expand_topk_idx_V.detach(),
@@ -268,11 +277,12 @@ class GlobalRouters(nn.Module):
     def get_memory_weights(self, x, importance):
         """Compute memory routing weights with Top-k sparsification"""
         memory_pref = F.softmax(self.memory_router(x), dim=-1)
-        memory_weights = torch.einsum('bs,bsn->bn', importance, memory_pref)
-        memory_weights, memory_topk_idx = self._topk_sparsify(memory_weights, self.top_k_compress)
+        memory_weights_dense = torch.einsum('bs,bsn->bn', importance, memory_pref)
+        memory_weights, memory_topk_idx = self._topk_sparsify(memory_weights_dense, self.top_k_compress)
 
         routing_info = {
             'memory_weights': memory_weights.detach(),
+            'memory_weights_dense': memory_weights_dense.detach(),
             'memory_topk_idx': memory_topk_idx.detach(),
         }
 
@@ -599,25 +609,25 @@ class DAWN(nn.Module):
         return sim[mask].abs().mean()
 
     def load_balance_loss(self, routing_infos):
-        """Top-k load balance loss"""
+        """Load balance on dense (pre-top-k) weights to prevent dead neurons"""
         loss = 0.0
         count = 0
 
         for layer_info in routing_infos:
-            # Compress weights (already sparse from top-k)
-            compress_w = layer_info['attention']['compress_weights']
+            # Use dense weights (before top-k)
+            compress_w = layer_info['attention']['compress_weights_dense']
             target_compress = 1.0 / self.n_compress
             loss += ((compress_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
             count += 1
 
             target_expand = 1.0 / self.n_expand
-            for key in ['expand_weights_Q', 'expand_weights_K', 'expand_weights_V']:
+            for key in ['expand_weights_Q_dense', 'expand_weights_K_dense', 'expand_weights_V_dense']:
                 expand_w = layer_info['attention'][key]
                 loss += ((expand_w.mean(dim=0) - target_expand) ** 2).sum() * self.n_expand
                 count += 1
 
-            mem_neuron_w = layer_info['memory']['neuron_weights']
-            loss += ((mem_neuron_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
+            mem_w = layer_info['memory']['memory_weights_dense']
+            loss += ((mem_w.mean(dim=0) - target_compress) ** 2).sum() * self.n_compress
             count += 1
 
         return loss / (count + 1e-10)
