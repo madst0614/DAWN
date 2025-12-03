@@ -1102,6 +1102,9 @@ def main():
     args.skip_householder = cfg['model'].get('skip_householder', False)
     args.compress_gelu = cfg['model'].get('compress_gelu', False)
 
+    # Gradient checkpointing (v12.7+)
+    args.gradient_checkpointing = cfg['model'].get('gradient_checkpointing', False)
+
     # v9.0 Compress/Expand/Reflection parameters
     args.n_compress = cfg['model'].get('n_compress', 4)
     args.n_expand = cfg['model'].get('n_expand', 4)
@@ -1677,6 +1680,7 @@ def main():
             'knowledge_rank': args.knowledge_rank,  # None = use rank
             'rank': args.basis_rank,
             'state_dim': getattr(args, 'state_dim', 64),
+            'gradient_checkpointing': args.gradient_checkpointing,
         })
     elif model_version == '12.3':
         # v12.3: SSM-guided Shared Expand Pool (1 pool, 3 routers)

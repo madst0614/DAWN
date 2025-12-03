@@ -27,12 +27,13 @@ model:
   n_expand: 72
   n_knowledge: 320
   knowledge_k: 14
-  max_seq_len: 128
+  max_seq_len: 512
   dropout: 0.1
+  gradient_checkpointing: true
 
 # Training
 training:
-  batch_size: 256
+  batch_size: 64
   num_epochs: 4
   lr: 0.0004
   weight_decay: 0.1
@@ -48,10 +49,13 @@ log_dir: /content/drive/MyDrive/dawn/logs_v12_7_20M_c4
 
 # Summary:
 #   Train: 100M × 4 epochs = 400M tokens (Chinchilla optimal)
+#   Seq length: 512 (with gradient checkpointing)
+#   Batch size: 64 (reduced for longer seq)
 #
 # v12.7 ablation (vs v12.5):
 #   - SSM 유지 (importance 계산)
 #   - context 강화만 제거
+#   - gradient_checkpointing: 메모리 절약 (seq 512 지원)
 #
 # Ablation hierarchy:
 #   v12.5: SSM + context

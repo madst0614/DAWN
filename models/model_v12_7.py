@@ -22,6 +22,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class SharedNeurons(nn.Module):
@@ -343,6 +344,7 @@ class DAWN(nn.Module):
         knowledge_rank: int = None,
         state_dim: int = 64,
         dropout: float = 0.1,
+        gradient_checkpointing: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -355,6 +357,7 @@ class DAWN(nn.Module):
         self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
         self.max_seq_len = max_seq_len
         self.state_dim = state_dim
+        self.gradient_checkpointing = gradient_checkpointing
 
         self.n_compress = n_compress
         self.n_expand = n_expand
@@ -418,7 +421,13 @@ class DAWN(nn.Module):
 
         routing_infos = []
         for layer in self.layers:
-            x, routing_info = layer(x, importance, self.global_routers, mask)
+            if self.gradient_checkpointing and self.training:
+                x, routing_info = checkpoint(
+                    layer, x, importance, self.global_routers, mask,
+                    use_reentrant=False
+                )
+            else:
+                x, routing_info = layer(x, importance, self.global_routers, mask)
             if return_routing_info:
                 routing_info['importance'] = importance.detach()
                 routing_infos.append(routing_info)
@@ -547,4 +556,5 @@ class DAWN(nn.Module):
             'max_seq_len': self.max_seq_len, 'n_compress': self.n_compress,
             'n_expand': self.n_expand, 'n_knowledge': self.n_knowledge,
             'knowledge_k': self.knowledge_k, 'state_dim': self.state_dim,
+            'gradient_checkpointing': self.gradient_checkpointing,
         }
