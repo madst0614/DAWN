@@ -552,17 +552,15 @@ class DAWN(nn.Module):
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
         x = self.token_emb(input_ids) + self.pos_emb(positions)
 
-        # Selective SSM: importance + context
-        importance, context = self.global_ssm(x)
-
-        # Context enhancement
-        x = x + context
-
         mask = torch.triu(torch.ones(S, S, device=device), diagonal=1).bool()
         mask = ~mask.unsqueeze(0).unsqueeze(0)
 
         routing_infos = []
         for layer in self.layers:
+            # Selective SSM: importance + context (recalculated per layer)
+            importance, context = self.global_ssm(x)
+            x = x + context
+
             if self.gradient_checkpointing and self.training:
                 x, routing_info = checkpoint(
                     layer, x, importance, self.global_routers, mask,
