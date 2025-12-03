@@ -131,18 +131,13 @@ class GlobalSSM(nn.Module):
         A = -torch.exp(self.A_log)  # [d_model, state_dim]
 
         if MAMBA_AVAILABLE:
-            # Mamba expects: x [B, D, S], delta [B, D, S], A [D, N], B [B, N, S], C [B, N, S]
-            # 모든 텐서를 같은 dtype으로 맞춤
+            # 모든 텐서를 x와 같은 dtype으로
             dtype = x.dtype
 
             x_mamba = x.transpose(1, 2).contiguous()  # [B, D, S]
             delta_mamba = delta.transpose(1, 2).contiguous()  # [B, D, S]
-
-            # B, C shape: [B, N, S] (not [B, S, N])
-            B_mamba = B_sel.transpose(1, 2).contiguous()  # [B, N, S]
-            C_mamba = C_sel.transpose(1, 2).contiguous()  # [B, N, S]
-
-            # dtype 통일
+            B_mamba = B_sel.transpose(1, 2).contiguous().to(dtype)  # [B, N, S]
+            C_mamba = C_sel.transpose(1, 2).contiguous().to(dtype)  # [B, N, S]
             A = A.to(dtype)
 
             y = selective_scan_fn(
