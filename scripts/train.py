@@ -812,23 +812,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Token variance (Q만 대표로)
                     var_Q = calc_token_var(pref_Q)
 
-                    # Effective rank (how many neurons are actually used)
-                    def calc_eff_rank(pref):
-                        if pref is None:
-                            return 0.0
-                        # Effective rank = exp(entropy)
-                        p = pref.mean(dim=(0, 1))  # [n_neurons]
-                        p = p / (p.sum() + 1e-8)
-                        ent = -(p * (p + 1e-8).log()).sum()
-                        return torch.exp(ent).item()
-
-                    eff_Q = calc_eff_rank(pref_Q)
-                    eff_C = calc_eff_rank(pref_C)
-                    n_expand = pref_Q.shape[-1] if pref_Q is not None else 12
-                    n_compress = pref_C.shape[-1] if pref_C is not None else 48
+                    # Memory ratio (attn_out_norm vs mem_out_norm per layer)
+                    mem_ratios = []
+                    for layer_info in routing_infos:
+                        attn_norm = layer_info.get('attn_out_norm')
+                        mem_norm = layer_info.get('mem_out_norm')
+                        if attn_norm is not None and mem_norm is not None:
+                            ratio = (mem_norm / (attn_norm + mem_norm + 1e-8) * 100).item()
+                            mem_ratios.append(f"{ratio:.0f}")
+                        else:
+                            mem_ratios.append("-")
+                    mem_str = "/".join(mem_ratios)
 
                     # Compact output
-                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | EffRank Q:{eff_Q:.1f}/{n_expand} C:{eff_C:.1f}/{n_compress}")
+                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Mem:{mem_str}")
 
                     # Warning if collapse detected
                     if min(ent_Q, ent_K, ent_V) < 30:

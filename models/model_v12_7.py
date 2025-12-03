@@ -455,9 +455,15 @@ class DAWNBlock(nn.Module):
         mem_out, knowledge_info = self.memory(normed_x2, memory_w)
         x = x + self.dropout(mem_out)
 
+        # Output norms for attn/mem balance monitoring
+        attn_out_norm = attn_out.norm(dim=-1).mean().detach()
+        mem_out_norm = mem_out.norm(dim=-1).mean().detach()
+
         routing_info = {
             'attention': {**attn_routing, 'neuron_weights': compress_w.detach()},  # FlashAttn: no attn_weights
             'memory': {**mem_routing, **knowledge_info, 'neuron_weights': memory_w.detach()},
+            'attn_out_norm': attn_out_norm,
+            'mem_out_norm': mem_out_norm,
         }
         return x, routing_info
 

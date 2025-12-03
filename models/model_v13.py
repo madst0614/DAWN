@@ -97,6 +97,9 @@ class GlobalSSM(nn.Module):
         self.W_B = nn.Linear(d_model, state_dim, bias=False)
         self.W_C = nn.Linear(d_model, state_dim, bias=False)  # output projection from state
 
+        # SSM output normalization (값 폭발 방지)
+        self.ssm_norm = nn.LayerNorm(d_model)
+
         # Context projection
         self.context_proj = nn.Linear(d_model, d_model, bias=False)
 
@@ -156,6 +159,9 @@ class GlobalSSM(nn.Module):
         else:
             # Fallback: slow for-loop
             ssm_out = self._slow_forward(x, delta, A, B_sel, C_sel)
+
+        # Normalize SSM output (값 폭발 방지)
+        ssm_out = self.ssm_norm(ssm_out)
 
         # Context enhancement
         context = self.context_proj(ssm_out)  # [B, S, d_model]
@@ -480,9 +486,15 @@ class DAWNBlock(nn.Module):
         mem_out, knowledge_info = self.memory(normed_x2, memory_w)
         x = x + self.dropout(mem_out)
 
+        # Output norms for attn/mem balance monitoring
+        attn_out_norm = attn_out.norm(dim=-1).mean().detach()
+        mem_out_norm = mem_out.norm(dim=-1).mean().detach()
+
         routing_info = {
             'attention': {**attn_routing, 'neuron_weights': compress_w.detach()},
             'memory': {**mem_routing, **knowledge_info, 'neuron_weights': memory_w.detach()},
+            'attn_out_norm': attn_out_norm,
+            'mem_out_norm': mem_out_norm,
         }
         return x, routing_info
 
