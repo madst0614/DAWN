@@ -191,7 +191,8 @@ class GlobalSSM(nn.Module):
 class GlobalRouters(nn.Module):
     """v12.7: Global routers with Top-k sparse selection"""
     def __init__(self, d_model: int, n_compress: int, n_expand: int,
-                 top_k_compress: int = 8, top_k_expand: int = 4):
+                 top_k_compress: int = 8, top_k_expand: int = 4,
+                 router_dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.n_compress = n_compress
@@ -208,6 +209,9 @@ class GlobalRouters(nn.Module):
         # Memory router
         self.memory_router = nn.Linear(d_model, n_compress, bias=False)
 
+        # Router dropout for exploration
+        self.router_dropout = nn.Dropout(router_dropout)
+
     def _topk_sparsify(self, weights, k):
         """Apply top-k sparsification and renormalize"""
         topk_vals, topk_idx = torch.topk(weights, k, dim=-1)
@@ -217,17 +221,27 @@ class GlobalRouters(nn.Module):
         return sparse_weights, topk_idx
 
     def get_attention_weights(self, x, importance):
-        # Compress routing
-        compress_pref = F.softmax(self.compress_router(x), dim=-1)
+        # Compress routing (with dropout on logits)
+        compress_logits = self.compress_router(x)
+        if self.training:
+            compress_logits = self.router_dropout(compress_logits)
+        compress_pref = F.softmax(compress_logits, dim=-1)
         compress_weights_dense = torch.einsum('bs,bsn->bn', importance, compress_pref)
 
         # Top-k sparsification
         compress_weights, compress_topk_idx = self._topk_sparsify(compress_weights_dense, self.top_k_compress)
 
-        # Expand routing
-        expand_pref_Q = F.softmax(self.expand_router_Q(x), dim=-1)
-        expand_pref_K = F.softmax(self.expand_router_K(x), dim=-1)
-        expand_pref_V = F.softmax(self.expand_router_V(x), dim=-1)
+        # Expand routing (with dropout on logits)
+        expand_logits_Q = self.expand_router_Q(x)
+        expand_logits_K = self.expand_router_K(x)
+        expand_logits_V = self.expand_router_V(x)
+        if self.training:
+            expand_logits_Q = self.router_dropout(expand_logits_Q)
+            expand_logits_K = self.router_dropout(expand_logits_K)
+            expand_logits_V = self.router_dropout(expand_logits_V)
+        expand_pref_Q = F.softmax(expand_logits_Q, dim=-1)
+        expand_pref_K = F.softmax(expand_logits_K, dim=-1)
+        expand_pref_V = F.softmax(expand_logits_V, dim=-1)
 
         expand_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_Q)
         expand_weights_K_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_K)
@@ -263,7 +277,10 @@ class GlobalRouters(nn.Module):
         return compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, routing_info
 
     def get_memory_weights(self, x, importance):
-        memory_pref = F.softmax(self.memory_router(x), dim=-1)
+        memory_logits = self.memory_router(x)
+        if self.training:
+            memory_logits = self.router_dropout(memory_logits)
+        memory_pref = F.softmax(memory_logits, dim=-1)
         memory_weights_dense = torch.einsum('bs,bsn->bn', importance, memory_pref)
         memory_weights, memory_topk_idx = self._topk_sparsify(memory_weights_dense, self.top_k_compress)
 
@@ -452,6 +469,7 @@ class DAWN(nn.Module):
         top_k_compress: int = 8,
         top_k_expand: int = 4,
         dropout: float = 0.1,
+        router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
         **kwargs
     ):
@@ -467,6 +485,7 @@ class DAWN(nn.Module):
         self.state_dim = state_dim
         self.top_k_compress = top_k_compress
         self.top_k_expand = top_k_expand
+        self.router_dropout = router_dropout
         self.gradient_checkpointing = gradient_checkpointing
 
         self.n_compress = n_compress
@@ -490,7 +509,7 @@ class DAWN(nn.Module):
 
         # Top-k Global Routers
         self.global_routers = GlobalRouters(
-            d_model, n_compress, n_expand, top_k_compress, top_k_expand
+            d_model, n_compress, n_expand, top_k_compress, top_k_expand, router_dropout
         )
 
         self.layers = nn.ModuleList([
@@ -571,8 +590,36 @@ class DAWN(nn.Module):
 
         return loss / (self.n_compress + self.n_expand)
 
-    def routing_entropy_loss(self):
-        return torch.tensor(0.0, device=next(self.parameters()).device)
+    def routing_entropy_loss(self, routing_infos):
+        """
+        Entropy loss to encourage diverse routing (prevent router collapse).
+        Penalizes low entropy (concentrated) routing preferences.
+        """
+        loss = 0.0
+        count = 0
+        max_entropy_expand = math.log(self.n_expand)
+        max_entropy_compress = math.log(self.n_compress)
+
+        for layer_info in routing_infos:
+            attn = layer_info['attention']
+
+            # Expand router entropy (Q, K, V)
+            for key in ['expand_pref_Q', 'expand_pref_K', 'expand_pref_V']:
+                if key in attn:
+                    pref = attn[key]  # [B, S, n_expand]
+                    entropy = -(pref * (pref + 1e-8).log()).sum(dim=-1).mean()
+                    # Penalize low entropy (want high entropy = diverse routing)
+                    loss += (max_entropy_expand - entropy) / max_entropy_expand
+                    count += 1
+
+            # Compress router entropy
+            if 'compress_pref' in attn:
+                pref = attn['compress_pref']  # [B, S, n_compress]
+                entropy = -(pref * (pref + 1e-8).log()).sum(dim=-1).mean()
+                loss += (max_entropy_compress - entropy) / max_entropy_compress
+                count += 1
+
+        return loss / (count + 1e-10)
 
     def knowledge_diversity_loss(self):
         K = self.shared_neurons.knowledge_K
@@ -674,5 +721,6 @@ class DAWN(nn.Module):
             'n_expand': self.n_expand, 'n_knowledge': self.n_knowledge,
             'knowledge_k': self.knowledge_k, 'state_dim': self.state_dim,
             'top_k_compress': self.top_k_compress, 'top_k_expand': self.top_k_expand,
+            'router_dropout': self.router_dropout,
             'gradient_checkpointing': self.gradient_checkpointing,
         }
