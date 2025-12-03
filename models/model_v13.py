@@ -106,6 +106,9 @@ class GlobalSSM(nn.Module):
         # Importance projection
         self.importance_proj = nn.Linear(d_model, d_model, bias=False)
 
+        # Temperature for importance softmax (lower = sharper distribution)
+        self.importance_temperature = 0.5
+
         self._init_weights()
 
     def _init_weights(self):
@@ -170,7 +173,7 @@ class GlobalSSM(nn.Module):
         h_final = ssm_out[:, -1, :]  # [B, d_model]
         h_proj = self.importance_proj(h_final)  # [B, d_model]
         raw_importance = torch.einsum('bsd,bd->bs', x, h_proj)  # [B, S] - before softmax
-        importance = F.softmax(raw_importance, dim=-1)
+        importance = F.softmax(raw_importance / self.importance_temperature, dim=-1)
 
         return importance, context, raw_importance
 
