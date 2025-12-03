@@ -9,6 +9,7 @@ v12.2: SSM-guided Dynamic Compress/Expand (shared neuron_weights, d_model attent
 v12.3: SSM-guided Shared Expand Pool (n_expand for Q/K/V, separate routers)
 v12.5: Global SSM + Global Router (24→1 SSM, 60→5 routers, context enhancement)
 v12.6: No SSM Ablation (simple projection for importance, no context enhancement)
+v12.7: SSM without Context (SSM preserved, context removed)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -257,6 +258,35 @@ VERSION_REGISTRY = {
             f"  Architecture: Simple Importance → Global Routers (per-layer x)",
             f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
             f"  Ablation: SSM removed, context removed",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
+    "12.7": {
+        "description": "SSM without Context (SSM preserved, context removed)",
+        "aliases": ["127"],
+        "module": "model_v12_7",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+        },
+        "display_info": lambda args: [
+            f"SharedNeurons (v12.7): rank={args.get('rank', args.get('basis_rank'))} (SSM, no context)",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (shared)",
+            f"  expand_neurons_pool: {args.get('n_expand')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (QKV pool)",
+            f"  Global SSM: 1 (model level) → importance only",
+            f"  Global Routers: 5 (compress, expand_Q/K/V, memory)",
+            f"  Context Enhancement: REMOVED (ablation)",
+            f"  SSM: state_dim={args.get('state_dim', 64)}",
+            f"  Architecture: Global SSM (importance) → Global Routers (per-layer x)",
+            f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
+            f"  Ablation: SSM preserved, context removed",
             f"  KnowledgeNeurons:",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",

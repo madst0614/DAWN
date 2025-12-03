@@ -1,0 +1,63 @@
+# DAWN v12.7 Training Config - 20M Scale, 12 Layers
+# C4 dataset, SSM without Context
+
+# Ablation study: SSM 유지, context 강화만 제거
+# vs v12.5: context 제거
+# vs v12.6: SSM 유지 (v12.6은 SSM 완전 제거)
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 100000000   # 100M tokens
+  max_val_tokens: 1638400       # ~1.6M tokens (50 batches)
+
+# Model Architecture
+model:
+  model_version: "12.7"
+  d_model: 320
+  n_layers: 12
+  n_heads: 4
+  rank: 64
+  state_dim: 64
+  n_compress: 288
+  n_expand: 72
+  n_knowledge: 320
+  knowledge_k: 14
+  max_seq_len: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 256
+  num_epochs: 4
+  lr: 0.0004
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.01
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v12_7_20M_c4
+log_dir: /content/drive/MyDrive/dawn/logs_v12_7_20M_c4
+
+# Summary:
+#   Train: 100M × 4 epochs = 400M tokens (Chinchilla optimal)
+#
+# v12.7 ablation (vs v12.5):
+#   - SSM 유지 (importance 계산)
+#   - context 강화만 제거
+#
+# Ablation hierarchy:
+#   v12.5: SSM + context
+#   v12.7: SSM only (no context) <- this
+#   v12.6: no SSM (simple projection)
+#
+# 예상 비교:
+#   v12.5 vs v12.7: context 효과 측정
+#   v12.7 vs v12.6: SSM importance 효과 측정

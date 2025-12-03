@@ -48,6 +48,11 @@ v12.6: No SSM Ablation
 - context 강화 제거
 - Global Router만 유지 (ablation study)
 
+v12.7: SSM without Context
+- SSM 유지 (importance 계산)
+- context 강화만 제거
+- Ablation: v12.5 vs v12.7 = context 효과
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -77,6 +82,9 @@ from .model_v12_5 import DAWN as DAWN_v12_5
 
 # v12.6 - No SSM Ablation (simple projection for importance)
 from .model_v12_6 import DAWN as DAWN_v12_6
+
+# v12.7 - SSM without Context (SSM preserved, context removed)
+from .model_v12_7 import DAWN as DAWN_v12_7
 
 # Default DAWN is v12.3 (stable)
 DAWN = DAWN_v12_3
@@ -112,6 +120,7 @@ __all__ = [
     'DAWN_v12_4',
     'DAWN_v12_5',
     'DAWN_v12_6',
+    'DAWN_v12_7',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -162,6 +171,8 @@ def create_model_by_version(version, config):
         return DAWN_v12_5(**config)
     elif version == "12.6":
         return DAWN_v12_6(**config)
+    elif version == "12.7":
+        return DAWN_v12_7(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, baseline")
