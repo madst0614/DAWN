@@ -35,9 +35,9 @@ model:
 training:
   batch_size: 256
   num_epochs: 4
-  lr: 0.0016
+  lr: 0.001
   weight_decay: 0.1
-  warmup_ratio: 0.05
+  warmup_ratio: 0.08
   orthogonality_weight: 0.01
   diversity_weight: 0.1
   load_balance_weight: 0.01
@@ -50,7 +50,7 @@ log_dir: /content/drive/MyDrive/dawn/logs_v12_7_20M_c4
 # Summary:
 #   Train: 100M × 4 epochs = 400M tokens (Chinchilla optimal)
 #   Seq length: 512 (with gradient checkpointing)
-#   Batch size: 256, lr: 0.0016 (linear scaling)
+#   Batch size: 256, lr: 0.001, warmup: 8%
 #
 # v12.7 ablation (vs v12.5):
 #   - SSM 유지 (importance 계산)
