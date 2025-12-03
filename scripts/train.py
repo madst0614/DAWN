@@ -812,23 +812,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Token variance (Q만 대표로)
                     var_Q = calc_token_var(pref_Q)
 
-                    # Memory ratio (L0 vs L3)
-                    mem_L0, mem_L3 = 0.0, 0.0
-                    if len(routing_infos) > 0:
-                        l0 = routing_infos[0]
-                        attn_w = l0['attention'].get('compress_weights_dense')
-                        mem_w = l0.get('memory', {}).get('memory_weights_dense')
+                    # Memory ratio (all layers)
+                    mem_ratios = []
+                    for layer_info in routing_infos:
+                        attn_w = layer_info['attention'].get('compress_weights_dense')
+                        mem_w = layer_info.get('memory', {}).get('memory_weights_dense')
                         if attn_w is not None and mem_w is not None:
-                            mem_L0 = (mem_w.mean() / (attn_w.mean() + mem_w.mean() + 1e-8) * 100).item()
-                    if len(routing_infos) > 3:
-                        l3 = routing_infos[3]
-                        attn_w = l3['attention'].get('compress_weights_dense')
-                        mem_w = l3.get('memory', {}).get('memory_weights_dense')
-                        if attn_w is not None and mem_w is not None:
-                            mem_L3 = (mem_w.mean() / (attn_w.mean() + mem_w.mean() + 1e-8) * 100).item()
+                            ratio = (mem_w.mean() / (attn_w.mean() + mem_w.mean() + 1e-8) * 100).item()
+                            mem_ratios.append(f"{ratio:.0f}")
+                        else:
+                            mem_ratios.append("-")
+                    mem_str = "/".join(mem_ratios)
 
                     # Compact output
-                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Mem L0/L3:{mem_L0:.0f}/{mem_L3:.0f}%")
+                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Mem:{mem_str}")
 
                     # Warning if collapse detected
                     if min(ent_Q, ent_K, ent_V) < 30:
