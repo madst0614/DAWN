@@ -812,20 +812,23 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Token variance (Q만 대표로)
                     var_Q = calc_token_var(pref_Q)
 
-                    # Memory ratio (all layers)
-                    mem_ratios = []
-                    for layer_info in routing_infos:
-                        attn_w = layer_info['attention'].get('compress_weights_dense')
-                        mem_w = layer_info.get('memory', {}).get('memory_weights_dense')
-                        if attn_w is not None and mem_w is not None:
-                            ratio = (mem_w.mean() / (attn_w.mean() + mem_w.mean() + 1e-8) * 100).item()
-                            mem_ratios.append(f"{ratio:.0f}")
-                        else:
-                            mem_ratios.append("-")
-                    mem_str = "/".join(mem_ratios)
+                    # Effective rank (how many neurons are actually used)
+                    def calc_eff_rank(pref):
+                        if pref is None:
+                            return 0.0
+                        # Effective rank = exp(entropy)
+                        p = pref.mean(dim=(0, 1))  # [n_neurons]
+                        p = p / (p.sum() + 1e-8)
+                        ent = -(p * (p + 1e-8).log()).sum()
+                        return torch.exp(ent).item()
+
+                    eff_Q = calc_eff_rank(pref_Q)
+                    eff_C = calc_eff_rank(pref_C)
+                    n_expand = pref_Q.shape[-1] if pref_Q is not None else 12
+                    n_compress = pref_C.shape[-1] if pref_C is not None else 48
 
                     # Compact output
-                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Mem:{mem_str}")
+                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | EffRank Q:{eff_Q:.1f}/{n_expand} C:{eff_C:.1f}/{n_compress}")
 
                     # Warning if collapse detected
                     if min(ent_Q, ent_K, ent_V) < 30:
