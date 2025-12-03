@@ -674,6 +674,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             scaler.scale(loss).backward()
 
+            # Free computation graph references from routing_infos
+            if routing_infos is not None:
+                for layer_info in routing_infos:
+                    attn = layer_info.get('attention', {})
+                    for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad']:
+                        attn.pop(key, None)
+
             # Gradient clipping
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -736,6 +743,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
             loss.backward()
+
+            # Free computation graph references from routing_infos
+            if routing_infos is not None:
+                for layer_info in routing_infos:
+                    attn = layer_info.get('attention', {})
+                    for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad']:
+                        attn.pop(key, None)
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
