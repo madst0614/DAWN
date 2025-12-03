@@ -32,6 +32,7 @@ model:
   # Top-k sparse mixing
   top_k_compress: 8
   top_k_expand: 4
+  router_dropout: 0.1
 
 # Training
 training:
@@ -44,6 +45,7 @@ training:
   orthogonality_weight: 0.01
   diversity_weight: 0.1
   load_balance_weight: 0.01
+  entropy_weight: 0.001
   process_norm_weight: 0.0
 
 use_amp: true
