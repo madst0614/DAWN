@@ -306,7 +306,7 @@ class RoutingInfoParser:
             weights, _ = self.get_compress_weights(routing_info, comp)
             return weights
 
-        elif version == 'v12':
+        elif version in ['v12', 'v12_topk']:
             attn = routing_info['attention']
             mem = routing_info.get('memory', {})
 
