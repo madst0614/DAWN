@@ -211,19 +211,19 @@ class NeuronCircuit(nn.Module):
         K = K.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-        attn = F.softmax(scores, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        attn_out = torch.matmul(attn, V)
+        # FlashAttention via PyTorch 2.0+ scaled_dot_product_attention
+        attn_out = F.scaled_dot_product_attention(
+            Q, K, V,
+            is_causal=True,
+            dropout_p=self.attn_dropout.p if self.training else 0.0
+        )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.d_model)
 
         output = self.expand_O(attn_out)
         output = self.out_dropout(output)
 
-        return output, attn.detach()
+        # FlashAttention doesn't return attention weights
+        return output, None
 
 
 class NeuronMemory(nn.Module):
@@ -312,7 +312,7 @@ class DAWNBlock(nn.Module):
         x = x + self.dropout(mem_out)
 
         routing_info = {
-            'attention': {**attn_routing, 'attn_weights': attn_weights, 'neuron_weights': compress_w.detach()},
+            'attention': {**attn_routing, 'neuron_weights': compress_w.detach()},  # FlashAttn: no attn_weights
             'memory': {**mem_routing, **knowledge_info, 'neuron_weights': memory_w.detach()},
         }
         return x, routing_info
