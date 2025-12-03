@@ -779,6 +779,36 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         window_acc_valid += valid_tokens
         window_count += 1
 
+        # Real-time entropy monitoring (every 200 steps)
+        if (step + 1) % 200 == 0 and routing_infos is not None:
+            with torch.no_grad():
+                try:
+                    attn = routing_infos[0].get('attention', routing_infos[0])
+                    expand_pref_Q = attn.get('expand_pref_Q')
+                    compress_pref = attn.get('compress_pref')
+
+                    if expand_pref_Q is not None:
+                        # Entropy ratio for expand router
+                        ent_Q = -(expand_pref_Q * (expand_pref_Q + 1e-8).log()).sum(-1).mean()
+                        n_expand = expand_pref_Q.shape[-1]
+                        ent_Q_ratio = ent_Q / math.log(n_expand) * 100
+
+                        # Token variance (are different tokens routed differently?)
+                        token_var_Q = expand_pref_Q.var(dim=1).mean().item()
+
+                        print(f"[Step {step+1}] expand_Q: entropy={ent_Q_ratio:.1f}%, token_var={token_var_Q:.6f}")
+
+                        if ent_Q_ratio < 30:
+                            print(f"  ⚠ WARNING: Router may be collapsing!")
+
+                    if compress_pref is not None:
+                        ent_C = -(compress_pref * (compress_pref + 1e-8).log()).sum(-1).mean()
+                        n_compress = compress_pref.shape[-1]
+                        ent_C_ratio = ent_C / math.log(n_compress) * 100
+                        print(f"[Step {step+1}] compress: entropy={ent_C_ratio:.1f}%")
+                except Exception:
+                    pass  # Skip if routing_infos format is different
+
         # Log aggregated metrics every 100 steps
         if log_file and (step + 1) % log_interval == 0:
             avg_window_loss = window_loss / window_count
