@@ -22,7 +22,7 @@ model:
   rank: 64
   state_dim: 64
   n_compress: 48
-  n_expand: 12
+  n_expand: 24
   n_knowledge: 80
   knowledge_k: 10
   knowledge_rank: 64
@@ -30,21 +30,21 @@ model:
   dropout: 0.1
   gradient_checkpointing: false
   top_k_compress: 8
-  top_k_expand: 4
+  top_k_expand: 8
   router_dropout: 0.1
   token_routing: false
 
 # Training
 training:
-  batch_size: 128
+  batch_size: 256
   num_epochs: 10
-  lr: 0.0003
+  lr: 0.0004
   weight_decay: 0.1
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.01
-  entropy_weight: 0.01
+  load_balance_weight: 0.05
+  entropy_weight: 0.0
   process_norm_weight: 0.0
 
 use_amp: true
