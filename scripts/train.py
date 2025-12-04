@@ -2335,7 +2335,20 @@ def main():
         with open(training_log_file, 'a') as f:
             f.write(f"EPOCH,{epoch},{train_loss:.6f},{train_acc:.6f},"
                    f"{val_loss:.6f},{val_acc:.6f},"
-                   f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}\n")
+                   f"{optimizer.param_groups[0]['lr']:.6e},{epoch_time:.2f}")
+
+            # v13.2: Add starvation and usage EMA to epoch summary
+            base_model = get_underlying_model(model)
+            if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+                router = base_model.global_routers.neuron_router
+                if hasattr(router, 'usage_ema_compress'):
+                    starvation_weight = max(0.0, 1.0 - global_step / total_steps)
+                    usage_C = router.usage_ema_compress.mean().item()
+                    usage_QK = router.usage_ema_expand_QK.mean().item()
+                    usage_V = router.usage_ema_expand_V.mean().item()
+                    f.write(f",starv={starvation_weight:.3f},usage_C={usage_C:.3f},"
+                           f"usage_QK={usage_QK:.3f},usage_V={usage_V:.3f}")
+            f.write("\n")
 
         # Debug: Log epoch summary for specific epochs
         if debug_logger and debug_logger.should_log_epoch(epoch):
