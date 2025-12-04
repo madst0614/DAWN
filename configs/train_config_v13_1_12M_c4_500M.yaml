@@ -29,7 +29,7 @@ model:
   knowledge_rank: 64
   max_seq_len: 512
   dropout: 0.1
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   top_k_compress: 12
   top_k_QK: 4        # Top-k for QK router
   top_k_V: 6         # Top-k for V router (can be different)
