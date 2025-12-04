@@ -1235,6 +1235,10 @@ def main():
     args.top_k_QK = cfg['model'].get('top_k_QK', 4)
     args.top_k_V = cfg['model'].get('top_k_V', 6)
 
+    # v13.2 unified router parameters
+    args.d_space = cfg['model'].get('d_space', 64)
+    args.router_dropout = cfg['model'].get('router_dropout', 0.1)
+
     # v9.0 Compress/Expand/Reflection parameters
     args.n_compress = cfg['model'].get('n_compress', 4)
     args.n_expand = cfg['model'].get('n_expand', 4)
@@ -1610,6 +1614,39 @@ def main():
             print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
             print(f"    - V: {args.n_knowledge} × {args.d_model}")
             print(f"    - Knowledge top-k: {args.knowledge_k}")
+        elif model_version == "13.2":
+            # v13.2: Unified Neuron Router
+            rank = args.basis_rank
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
+            state_dim = getattr(args, 'state_dim', 64)
+            d_head = args.d_model // args.n_heads
+            top_k_compress = getattr(args, 'top_k_compress', 8)
+            n_expand_QK = getattr(args, 'n_expand_QK', 12)
+            n_expand_V = getattr(args, 'n_expand_V', 12)
+            top_k_QK = getattr(args, 'top_k_QK', 4)
+            top_k_V = getattr(args, 'top_k_V', 6)
+            d_space = getattr(args, 'd_space', 64)
+            grad_ckpt = getattr(args, 'gradient_checkpointing', False)
+            print(f"SharedNeurons (v{model_version}): rank={rank} - Unified Router!")
+            print(f"  CompressNeurons: {args.n_compress} × {args.d_model} × {rank} (shared)")
+            print(f"  expand_neurons_QK: {n_expand_QK} × {rank} × {args.d_model} (Q/K pool)")
+            print(f"  expand_neurons_V: {n_expand_V} × {rank} × {args.d_model} (V pool)")
+            print(f"  Global SSM: Selective mechanism (token-dependent delta, B_t)")
+            print(f"  Unified Router: d_space={d_space} (all neurons in same space)")
+            print(f"  Context Enhancement: SSM context added to x")
+            print(f"  Top-k Compress: {top_k_compress}/{args.n_compress}")
+            print(f"  Top-k QK: {top_k_QK}/{n_expand_QK}")
+            print(f"  Top-k V: {top_k_V}/{n_expand_V}")
+            print(f"  SSM: state_dim={state_dim}")
+            print(f"  FlashAttention: enabled (scaled_dot_product_attention)")
+            print(f"  Gradient Checkpointing: {grad_ckpt}")
+            print(f"  Load Balance: Switch Transformer style")
+            print(f"  Architecture: Selective SSM → Context + Unified Router → FlashAttn")
+            print(f"  Attention: d_model space (d_head={d_head})")
+            print(f"  KnowledgeNeurons:")
+            print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
+            print(f"    - V: {args.n_knowledge} × {args.d_model}")
+            print(f"    - Knowledge top-k: {args.knowledge_k}")
         elif model_version == "13.1":
             # v13.1: Separate QK/V Expand Pools
             rank = args.basis_rank
@@ -1627,7 +1664,7 @@ def main():
             print(f"  expand_neurons_QK: {n_expand_QK} × {rank} × {args.d_model} (Q/K shared)")
             print(f"  expand_neurons_V: {n_expand_V} × {rank} × {args.d_model} (V separate)")
             print(f"  Global SSM: Selective mechanism (token-dependent delta, B_t)")
-            print(f"  Global Routers: compress + QK + V + memory")
+            print(f"  Global Routers: compress + Q + K + V + memory")
             print(f"  Context Enhancement: SSM context added to x")
             print(f"  Top-k Compress: {top_k_compress}/{args.n_compress}")
             print(f"  Top-k QK: {top_k_QK}/{n_expand_QK}")
@@ -1937,6 +1974,24 @@ def main():
             'top_k_compress': getattr(args, 'top_k_compress', 8),
             'top_k_QK': getattr(args, 'top_k_QK', 4),
             'top_k_V': getattr(args, 'top_k_V', 6),
+            'gradient_checkpointing': args.gradient_checkpointing,
+        })
+    elif model_version == '13.2':
+        # v13.2: Unified Neuron Router
+        model_kwargs.update({
+            'n_compress': args.n_compress,
+            'n_expand_QK': getattr(args, 'n_expand_QK', 12),
+            'n_expand_V': getattr(args, 'n_expand_V', 12),
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'knowledge_rank': args.knowledge_rank,  # None = use rank
+            'rank': args.basis_rank,
+            'state_dim': getattr(args, 'state_dim', 64),
+            'top_k_compress': getattr(args, 'top_k_compress', 8),
+            'top_k_QK': getattr(args, 'top_k_QK', 4),
+            'top_k_V': getattr(args, 'top_k_V', 6),
+            'd_space': getattr(args, 'd_space', 64),
+            'router_dropout': getattr(args, 'router_dropout', 0.1),
             'gradient_checkpointing': args.gradient_checkpointing,
         })
     elif model_version == '13.0':
