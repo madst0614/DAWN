@@ -1007,7 +1007,7 @@ class DAWNAnalyzer:
                     x_for_attn = x_norm
 
                 attn_out, _ = layer.attn(x_for_attn, compress_weights, expand_weights_Q,
-                                         expand_weights_K, expand_weights_V, mask)
+                                         expand_weights_K, expand_weights_V)
                 x = x + attn_out
 
                 mem_out, _ = layer.memory(layer.norm2(x), memory_weights)
