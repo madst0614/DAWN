@@ -30,9 +30,12 @@ model:
   max_seq_len: 512
   dropout: 0.1
   gradient_checkpointing: true
-  # Top-k sparse mixing
-  top_k_compress: 8
-  top_k_expand: 4
+  # Top-k sparse mixing (16.7% compress, 33.3% expand - same ratio as 11M)
+  top_k_compress: 48
+  top_k_expand: 24
+  router_dropout: 0.1
+  # Optional: per-token routing instead of batch-level
+  token_routing: false
 
 # Training
 training:
@@ -43,7 +46,8 @@ training:
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.01
+  load_balance_weight: 0.05
+  entropy_weight: 0.05
   process_norm_weight: 0.0
 
 use_amp: true

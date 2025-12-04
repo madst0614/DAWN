@@ -306,7 +306,7 @@ class RoutingInfoParser:
             weights, _ = self.get_compress_weights(routing_info, comp)
             return weights
 
-        elif version == 'v12':
+        elif version in ['v12', 'v12_topk']:
             attn = routing_info['attention']
             mem = routing_info.get('memory', {})
 
@@ -980,7 +980,10 @@ class DAWNAnalyzer:
             if hasattr(self.model, 'global_ssm'):
                 ssm_result = self.model.global_ssm(x)
                 if isinstance(ssm_result, tuple):
-                    importance, context = ssm_result
+                    if len(ssm_result) == 3:
+                        importance, context, _ = ssm_result  # v13: (importance, context, raw_importance)
+                    else:
+                        importance, context = ssm_result
                 else:
                     importance = ssm_result
                     context = None
@@ -1004,7 +1007,7 @@ class DAWNAnalyzer:
                     x_for_attn = x_norm
 
                 attn_out, _ = layer.attn(x_for_attn, compress_weights, expand_weights_Q,
-                                         expand_weights_K, expand_weights_V, mask)
+                                         expand_weights_K, expand_weights_V)
                 x = x + attn_out
 
                 mem_out, _ = layer.memory(layer.norm2(x), memory_weights)
@@ -1243,7 +1246,193 @@ class DAWNAnalyzer:
         return results
 
     # ============================================================
-    # 8. VISUALIZATION
+    # 8. IMPORTANCE DISTRIBUTION ANALYSIS
+    # ============================================================
+
+    @torch.no_grad()
+    def analyze_importance_distribution(self, dataloader, max_batches: int = 50) -> Dict:
+        """
+        Analyze SSM importance distribution.
+
+        Computes:
+        1. Importance entropy (higher = more uniform)
+        2. Importance sparsity (Gini coefficient)
+        3. Top 10% concentration (how much weight on top tokens)
+        4. Per-layer importance statistics
+        """
+        print(f"\n{'='*60}")
+        print("8. IMPORTANCE DISTRIBUTION ANALYSIS")
+        print(f"{'='*60}")
+
+        self.model.eval()
+
+        # Check if model has SSM
+        if not hasattr(self.model, 'global_ssm'):
+            print("No SSM found in model, skipping importance analysis")
+            return {}
+
+        stats = {
+            'entropy': [],
+            'gini': [],
+            'top_10_concentration': [],
+            'top_20_concentration': [],
+            'max_importance': [],
+            'min_importance': [],
+            'std_importance': [],
+            # Raw importance (before softmax) stats
+            'raw_std': [],
+            'raw_min': [],
+            'raw_max': [],
+            'raw_range': [],
+        }
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Importance Analysis", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+            B, S = input_ids.shape
+
+            # Get embeddings
+            pos = torch.arange(S, device=self.device).unsqueeze(0).expand(B, S)
+            x = self.model.token_emb(input_ids) + self.model.pos_emb(pos)
+
+            # Get importance from SSM
+            ssm_result = self.model.global_ssm(x)
+            if len(ssm_result) == 3:
+                importance, _, raw_importance = ssm_result
+            elif len(ssm_result) == 2:
+                importance, _ = ssm_result
+                raw_importance = None
+            else:
+                importance = ssm_result
+                raw_importance = None
+
+            # importance: [B, S] - normalized probability over tokens
+
+            # 1. Entropy (higher = more uniform)
+            entropy = -(importance * torch.log(importance + 1e-10)).sum(dim=-1)  # [B]
+            max_entropy = math.log(S)
+            normalized_entropy = entropy / max_entropy  # [B]
+            stats['entropy'].append(normalized_entropy.mean().item())
+
+            # 2. Gini coefficient (0 = perfect equality, 1 = max inequality)
+            sorted_imp, _ = torch.sort(importance, dim=-1)  # [B, S]
+            n = S
+            index = torch.arange(1, n + 1, dtype=torch.float32, device=self.device)
+            gini = ((2 * index - n - 1) * sorted_imp).sum(dim=-1) / (n * sorted_imp.sum(dim=-1) + 1e-10)  # [B]
+            stats['gini'].append(gini.mean().item())
+
+            # 3. Top-k concentration
+            k_10 = max(1, S // 10)  # top 10%
+            k_20 = max(1, S // 5)   # top 20%
+
+            top_10_vals = torch.topk(importance, k_10, dim=-1).values  # [B, k_10]
+            top_20_vals = torch.topk(importance, k_20, dim=-1).values  # [B, k_20]
+
+            top_10_conc = top_10_vals.sum(dim=-1) / (importance.sum(dim=-1) + 1e-10)  # [B]
+            top_20_conc = top_20_vals.sum(dim=-1) / (importance.sum(dim=-1) + 1e-10)  # [B]
+
+            stats['top_10_concentration'].append(top_10_conc.mean().item())
+            stats['top_20_concentration'].append(top_20_conc.mean().item())
+
+            # 4. Basic statistics
+            stats['max_importance'].append(importance.max(dim=-1).values.mean().item())
+            stats['min_importance'].append(importance.min(dim=-1).values.mean().item())
+            stats['std_importance'].append(importance.std(dim=-1).mean().item())
+
+            # 5. Raw importance statistics (before softmax)
+            if raw_importance is not None:
+                stats['raw_std'].append(raw_importance.std(dim=-1).mean().item())
+                stats['raw_min'].append(raw_importance.min(dim=-1).values.mean().item())
+                stats['raw_max'].append(raw_importance.max(dim=-1).values.mean().item())
+                raw_range = raw_importance.max(dim=-1).values - raw_importance.min(dim=-1).values
+                stats['raw_range'].append(raw_range.mean().item())
+
+        # Aggregate results
+        results = {}
+        for key in stats:
+            if stats[key]:
+                results[key] = {
+                    'mean': np.mean(stats[key]),
+                    'std': np.std(stats[key]),
+                }
+
+        # Print summary
+        print(f"\n--- Importance Distribution Statistics (after softmax) ---")
+        print(f"{'Metric':<25} {'Mean':<12} {'Std':<12}")
+        print("-" * 49)
+
+        for key in ['entropy', 'gini', 'top_10_concentration', 'top_20_concentration',
+                    'max_importance', 'min_importance', 'std_importance']:
+            if key in results:
+                mean = results[key]['mean']
+                std = results[key]['std']
+                print(f"{key:<25} {mean:<12.4f} {std:<12.4f}")
+
+        # Raw importance stats (before softmax)
+        if 'raw_std' in results:
+            print(f"\n--- Raw Importance Statistics (before softmax) ---")
+            print(f"{'Metric':<25} {'Mean':<12} {'Std':<12}")
+            print("-" * 49)
+            for key in ['raw_std', 'raw_min', 'raw_max', 'raw_range']:
+                if key in results:
+                    mean = results[key]['mean']
+                    std = results[key]['std']
+                    print(f"{key:<25} {mean:<12.4f} {std:<12.4f}")
+
+        # Diagnosis
+        print(f"\n--- Diagnosis ---")
+
+        if 'entropy' in results:
+            entropy = results['entropy']['mean']
+            if entropy < 0.3:
+                print(f"Entropy={entropy:.2%} (LOW): Importance very concentrated")
+                print("  → Few tokens dominate, SSM may be collapsing")
+            elif entropy < 0.6:
+                print(f"Entropy={entropy:.2%} (MODERATE): Some concentration")
+            else:
+                print(f"Entropy={entropy:.2%} (HIGH): Uniform distribution")
+
+        if 'gini' in results:
+            gini = results['gini']['mean']
+            if gini > 0.7:
+                print(f"Gini={gini:.3f} (HIGH): Very unequal distribution")
+            elif gini > 0.4:
+                print(f"Gini={gini:.3f} (MODERATE): Some inequality")
+            else:
+                print(f"Gini={gini:.3f} (LOW): Relatively uniform")
+
+        if 'top_10_concentration' in results:
+            top10 = results['top_10_concentration']['mean']
+            print(f"\nTop 10% tokens hold {top10:.1%} of total importance")
+            if top10 > 0.5:
+                print("  → High concentration! SSM focusing on few tokens")
+            elif top10 > 0.3:
+                print("  → Moderate concentration")
+            else:
+                print("  → Low concentration, fairly distributed")
+
+        # Raw importance diagnosis
+        if 'raw_std' in results and 'raw_range' in results:
+            raw_std = results['raw_std']['mean']
+            raw_range = results['raw_range']['mean']
+            print(f"\n--- Raw Score Analysis ---")
+            print(f"Raw std: {raw_std:.4f}, Raw range: {raw_range:.4f}")
+            if raw_std < 0.1:
+                print("  ⚠ Raw scores very similar (std < 0.1)")
+                print("  → Problem is in SSM output, not softmax temperature")
+            elif raw_range < 1.0:
+                print("  ⚠ Raw score range small (< 1.0)")
+                print("  → Softmax will produce near-uniform distribution")
+            else:
+                print("  ✓ Raw scores have reasonable variance")
+                print("  → SSM is differentiating tokens")
+
+        return results
+
+    # ============================================================
+    # 9. VISUALIZATION
     # ============================================================
 
     def visualize(self, all_results: Dict, output_path: str):
@@ -1390,7 +1579,10 @@ class DAWNAnalyzer:
         # 7. Routing diversity (collapse diagnosis)
         all_results['routing_diversity'] = self.analyze_routing_diversity(dataloader, max_batches)
 
-        # 8. Visualization
+        # 8. Importance distribution analysis
+        all_results['importance_distribution'] = self.analyze_importance_distribution(dataloader, max_batches)
+
+        # 9. Visualization
         os.makedirs(output_dir, exist_ok=True)
         viz_path = os.path.join(output_dir, 'analysis_summary.png')
         self.visualize(all_results, viz_path)
@@ -1399,15 +1591,360 @@ class DAWNAnalyzer:
 
 
 # ============================================================
+# EPOCH TRACKING
+# ============================================================
+
+def analyze_epoch_progression(checkpoint_dir: str, val_data_path: str,
+                               output_dir: str = './epoch_analysis',
+                               epochs: List[int] = None,
+                               max_batches: int = 30,
+                               batch_size: int = 32) -> Dict:
+    """
+    Compare metrics across training epochs.
+
+    Args:
+        checkpoint_dir: Directory containing epoch checkpoints (epoch_1.pt, epoch_2.pt, ...)
+        val_data_path: Path to validation data
+        output_dir: Output directory for results
+        epochs: Specific epochs to analyze (e.g., [1, 3, 5, 10]). If None, find all.
+        max_batches: Max batches per epoch analysis
+        batch_size: Batch size for dataloader
+
+    Returns:
+        Dictionary with metrics per epoch
+    """
+    from pathlib import Path
+    import re
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint_path = Path(checkpoint_dir)
+
+    print(f"\n{'='*60}")
+    print("EPOCH PROGRESSION ANALYSIS")
+    print(f"{'='*60}")
+    print(f"Checkpoint dir: {checkpoint_dir}")
+    print(f"Device: {device}")
+
+    # Find epoch checkpoints
+    if epochs is None:
+        # Auto-detect epoch checkpoints
+        epoch_files = {}
+        for f in checkpoint_path.glob('*.pt'):
+            # Match patterns like: epoch_1.pt, checkpoint_epoch_3.pt, etc.
+            match = re.search(r'epoch[_-]?(\d+)', f.stem, re.IGNORECASE)
+            if match:
+                epoch_num = int(match.group(1))
+                epoch_files[epoch_num] = f
+        epochs = sorted(epoch_files.keys())
+    else:
+        # Find files for specified epochs
+        epoch_files = {}
+        for epoch in epochs:
+            patterns = [
+                f'epoch_{epoch}.pt',
+                f'epoch{epoch}.pt',
+                f'checkpoint_epoch_{epoch}.pt',
+                f'epoch-{epoch}.pt',
+            ]
+            for pattern in patterns:
+                f = checkpoint_path / pattern
+                if f.exists():
+                    epoch_files[epoch] = f
+                    break
+
+    if not epoch_files:
+        print(f"No epoch checkpoints found in {checkpoint_dir}")
+        return {}
+
+    print(f"Found epochs: {sorted(epoch_files.keys())}")
+
+    # Load validation data
+    print(f"\nLoading validation data: {val_data_path}")
+    with open(val_data_path, 'rb') as f:
+        val_texts = pickle.load(f)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+
+    class SimpleDataset(torch.utils.data.Dataset):
+        def __init__(self, texts, tokenizer, max_len=128):
+            self.texts = texts
+            self.tokenizer = tokenizer
+            self.max_len = max_len
+        def __len__(self):
+            return len(self.texts)
+        def __getitem__(self, idx):
+            encoding = self.tokenizer(
+                self.texts[idx],
+                truncation=True,
+                max_length=self.max_len,
+                padding='max_length',
+                return_tensors='pt'
+            )
+            return {'input_ids': encoding['input_ids'].squeeze(0)}
+
+    # Track metrics across epochs
+    epoch_metrics = {}
+    model = None
+    version = None
+
+    for epoch in sorted(epoch_files.keys()):
+        print(f"\n{'='*60}")
+        print(f"EPOCH {epoch}")
+        print(f"{'='*60}")
+
+        checkpoint = torch.load(epoch_files[epoch], map_location=device)
+        config = checkpoint.get('model_config', checkpoint.get('config', {}))
+
+        # Detect version from first checkpoint
+        if version is None:
+            version = config.get('model_version', 'auto')
+            path_str = str(epoch_files[epoch]).lower()
+            if version == 'auto':
+                if 'v13' in path_str:
+                    version = '13.0'
+                elif 'v12_7' in path_str or 'v12.7' in path_str:
+                    version = '12.7'
+                else:
+                    version = '12.3'
+            print(f"Model version: {version}")
+
+            # Create model once
+            from models import create_model_by_version
+            model_kwargs = {
+                'vocab_size': config.get('vocab_size', 30522),
+                'd_model': config.get('d_model', 320),
+                'n_layers': config.get('n_layers', 4),
+                'n_heads': config.get('n_heads', 4),
+                'rank': config.get('rank', 64),
+                'max_seq_len': config.get('max_seq_len', 128),
+                'n_compress': config.get('n_compress', 48),
+                'n_expand': config.get('n_expand', 12),
+                'n_knowledge': config.get('n_knowledge', 80),
+                'knowledge_k': config.get('knowledge_k', 10),
+                'dropout': config.get('dropout', 0.1),
+                'state_dim': config.get('state_dim', 64),
+            }
+            if version in ['12.7', '12.8', '13.0'] or version.startswith('13'):
+                model_kwargs['top_k_compress'] = config.get('top_k_compress', 8)
+                model_kwargs['top_k_expand'] = config.get('top_k_expand', 4)
+
+            model = create_model_by_version(version, model_kwargs)
+            model = model.to(device)
+
+            dataset = SimpleDataset(val_texts, tokenizer, model_kwargs['max_seq_len'])
+            dataloader = torch.utils.data.DataLoader(
+                dataset, batch_size=batch_size, shuffle=False, num_workers=2
+            )
+
+        # Load weights
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+
+        # Get training metrics from checkpoint
+        train_loss = checkpoint.get('train_loss', checkpoint.get('loss'))
+        val_loss = checkpoint.get('val_loss')
+
+        # Run quick analysis
+        analyzer = DAWNAnalyzer(model, tokenizer, device, model_version=version)
+
+        metrics = {
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+        }
+
+        # Quick routing diversity check (key metric for collapse)
+        try:
+            diversity = analyzer.analyze_routing_diversity(dataloader, max_batches=min(max_batches, 20))
+            if diversity:
+                metrics['compress_pref_entropy'] = diversity.get('compress_pref', {}).get('entropy_ratio')
+                metrics['expand_pref_Q_entropy'] = diversity.get('expand_pref_Q', {}).get('entropy_ratio')
+                metrics['compress_weights_entropy'] = diversity.get('compress_weights', {}).get('entropy_ratio')
+                metrics['expand_weights_Q_entropy'] = diversity.get('expand_weights_Q', {}).get('entropy_ratio')
+        except Exception as e:
+            print(f"  Warning: Routing diversity analysis failed: {e}")
+
+        # Quick importance distribution check
+        try:
+            importance = analyzer.analyze_importance_distribution(dataloader, max_batches=min(max_batches, 20))
+            if importance:
+                metrics['importance_entropy'] = importance.get('entropy', {}).get('mean')
+                metrics['importance_gini'] = importance.get('gini', {}).get('mean')
+                metrics['importance_top10_conc'] = importance.get('top_10_concentration', {}).get('mean')
+        except Exception as e:
+            print(f"  Warning: Importance analysis failed: {e}")
+
+        epoch_metrics[epoch] = metrics
+        print(f"\nEpoch {epoch} Summary: train_loss={train_loss}, val_loss={val_loss}")
+
+    # Print comparison table
+    print(f"\n{'='*60}")
+    print("EPOCH COMPARISON")
+    print(f"{'='*60}")
+
+    epochs_sorted = sorted(epoch_metrics.keys())
+
+    # Header
+    header = f"{'Metric':<30}"
+    for e in epochs_sorted:
+        header += f"E{e:<8}"
+    print(header)
+    print("-" * (30 + 9 * len(epochs_sorted)))
+
+    # Rows
+    metric_names = [
+        ('train_loss', 'Train Loss'),
+        ('val_loss', 'Val Loss'),
+        ('compress_pref_entropy', 'Compress Pref Entropy'),
+        ('expand_pref_Q_entropy', 'Expand Pref Q Entropy'),
+        ('compress_weights_entropy', 'Compress Weights Entropy'),
+        ('expand_weights_Q_entropy', 'Expand Weights Q Entropy'),
+        ('importance_entropy', 'Importance Entropy'),
+        ('importance_gini', 'Importance Gini'),
+        ('importance_top10_conc', 'Importance Top10%'),
+    ]
+
+    for key, name in metric_names:
+        row = f"{name:<30}"
+        for e in epochs_sorted:
+            val = epoch_metrics[e].get(key)
+            if val is not None:
+                if isinstance(val, float):
+                    row += f"{val:<9.4f}"
+                else:
+                    row += f"{val:<9}"
+            else:
+                row += f"{'N/A':<9}"
+        print(row)
+
+    # Diagnose trends
+    print(f"\n--- Trend Analysis ---")
+
+    if len(epochs_sorted) >= 2:
+        first_epoch = epochs_sorted[0]
+        last_epoch = epochs_sorted[-1]
+
+        # Check entropy trend
+        e_first = epoch_metrics[first_epoch].get('expand_pref_Q_entropy')
+        e_last = epoch_metrics[last_epoch].get('expand_pref_Q_entropy')
+
+        if e_first is not None and e_last is not None:
+            delta = e_last - e_first
+            if delta < -0.1:
+                print(f"⚠ Expand entropy DECREASING: {e_first:.2%} → {e_last:.2%} (Δ={delta:.2%})")
+                print("  → Router may be collapsing during training!")
+            elif delta > 0.1:
+                print(f"✓ Expand entropy INCREASING: {e_first:.2%} → {e_last:.2%} (Δ={delta:.2%})")
+                print("  → Router becoming more diverse (good!)")
+            else:
+                print(f"  Expand entropy stable: {e_first:.2%} → {e_last:.2%}")
+
+        # Check importance concentration trend
+        c_first = epoch_metrics[first_epoch].get('importance_top10_conc')
+        c_last = epoch_metrics[last_epoch].get('importance_top10_conc')
+
+        if c_first is not None and c_last is not None:
+            delta = c_last - c_first
+            if delta > 0.1:
+                print(f"⚠ Top10% concentration INCREASING: {c_first:.1%} → {c_last:.1%}")
+                print("  → SSM becoming more concentrated")
+            elif delta < -0.1:
+                print(f"✓ Top10% concentration DECREASING: {c_first:.1%} → {c_last:.1%}")
+            else:
+                print(f"  Top10% concentration stable: {c_first:.1%} → {c_last:.1%}")
+
+    # Save results
+    os.makedirs(output_dir, exist_ok=True)
+    results_path = os.path.join(output_dir, 'epoch_progression.json')
+    with open(results_path, 'w') as f:
+        json.dump(convert_to_serializable(epoch_metrics), f, indent=2)
+    print(f"\nResults saved: {results_path}")
+
+    # Visualization
+    if HAS_MATPLOTLIB:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+        # Loss curves
+        ax = axes[0, 0]
+        train_losses = [epoch_metrics[e].get('train_loss') for e in epochs_sorted]
+        val_losses = [epoch_metrics[e].get('val_loss') for e in epochs_sorted]
+        if any(v is not None for v in train_losses):
+            ax.plot(epochs_sorted, train_losses, 'o-', label='Train')
+        if any(v is not None for v in val_losses):
+            ax.plot(epochs_sorted, val_losses, 's-', label='Val')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('Training Progress')
+        ax.legend()
+
+        # Entropy trends
+        ax = axes[0, 1]
+        compress_ent = [epoch_metrics[e].get('compress_pref_entropy') for e in epochs_sorted]
+        expand_ent = [epoch_metrics[e].get('expand_pref_Q_entropy') for e in epochs_sorted]
+        if any(v is not None for v in compress_ent):
+            ax.plot(epochs_sorted, compress_ent, 'o-', label='Compress Pref')
+        if any(v is not None for v in expand_ent):
+            ax.plot(epochs_sorted, expand_ent, 's-', label='Expand Pref Q')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Entropy Ratio')
+        ax.set_title('Router Entropy (higher=diverse)')
+        ax.axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='50% target')
+        ax.legend()
+
+        # Importance distribution
+        ax = axes[1, 0]
+        imp_ent = [epoch_metrics[e].get('importance_entropy') for e in epochs_sorted]
+        imp_gini = [epoch_metrics[e].get('importance_gini') for e in epochs_sorted]
+        if any(v is not None for v in imp_ent):
+            ax.plot(epochs_sorted, imp_ent, 'o-', label='Entropy')
+        if any(v is not None for v in imp_gini):
+            ax.plot(epochs_sorted, imp_gini, 's-', label='Gini')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Value')
+        ax.set_title('Importance Distribution')
+        ax.legend()
+
+        # Top-k concentration
+        ax = axes[1, 1]
+        top10 = [epoch_metrics[e].get('importance_top10_conc') for e in epochs_sorted]
+        if any(v is not None for v in top10):
+            ax.plot(epochs_sorted, top10, 'o-', color='coral')
+            ax.fill_between(epochs_sorted, 0, top10, alpha=0.3, color='coral')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Concentration')
+        ax.set_title('Top 10% Token Concentration')
+        ax.axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='50% threshold')
+
+        plt.tight_layout()
+        viz_path = os.path.join(output_dir, 'epoch_progression.png')
+        plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+        if IN_NOTEBOOK:
+            plt.show()
+        else:
+            plt.close()
+        print(f"Visualization saved: {viz_path}")
+
+    return epoch_metrics
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(description='DAWN Unified Analysis')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to checkpoint')
-    parser.add_argument('--val_data', type=str, required=True,
+    parser.add_argument('--checkpoint', type=str, required=False,
+                        help='Path to checkpoint (or checkpoint dir for --epoch_tracking)')
+    parser.add_argument('--val_data', type=str, required=False,
                         help='Path to validation data (pkl)')
+    parser.add_argument('--epoch_tracking', action='store_true',
+                        help='Run epoch progression analysis instead of single checkpoint')
+    parser.add_argument('--epochs', type=str, default=None,
+                        help='Specific epochs to analyze (comma-separated, e.g., "1,3,5,10")')
     parser.add_argument('--max_batches', type=int, default=50,
                         help='Max batches for analysis')
     parser.add_argument('--batch_size', type=int, default=32,
@@ -1417,6 +1954,34 @@ def main():
     parser.add_argument('--version', type=str, default='auto',
                         help='Model version (auto, 10.0, 12.3, etc.)')
     args = parser.parse_args()
+
+    # Epoch tracking mode
+    if args.epoch_tracking:
+        if not args.checkpoint or not args.val_data:
+            print("Error: --checkpoint (checkpoint dir) and --val_data are required for epoch tracking")
+            return
+
+        epochs = None
+        if args.epochs:
+            epochs = [int(e.strip()) for e in args.epochs.split(',')]
+
+        analyze_epoch_progression(
+            checkpoint_dir=args.checkpoint,
+            val_data_path=args.val_data,
+            output_dir=args.output_dir,
+            epochs=epochs,
+            max_batches=args.max_batches,
+            batch_size=args.batch_size,
+        )
+        return
+
+    # Regular single-checkpoint analysis
+    if not args.checkpoint or not args.val_data:
+        print("Error: --checkpoint and --val_data are required")
+        print("Usage:")
+        print("  Single checkpoint: python analyze_dawn.py --checkpoint <path> --val_data <path>")
+        print("  Epoch tracking:    python analyze_dawn.py --epoch_tracking --checkpoint <dir> --val_data <path>")
+        return
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")

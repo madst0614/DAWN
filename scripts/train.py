@@ -571,7 +571,7 @@ def is_v75_or_v76_model(model):
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, process_norm_weight=0.0,
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0, process_norm_weight=0.0,
                 debug_logger=None, ckpt_manager=None, model_config=None, start_step=0):
     """Train for one epoch
 
@@ -625,7 +625,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 base_model = get_underlying_model(model)
 
                 # v10: DAWN model forward
-                if load_balance_weight > 0:
+                if load_balance_weight > 0 or entropy_weight > 0:
                     ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                 else:
                     ce_loss, logits = model(input_ids, labels)
@@ -647,10 +647,42 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     if hasattr(base_model, 'load_balance_loss'):
                         lb_loss = base_model.load_balance_loss(routing_infos)
 
+                # Entropy loss (for v12.7/v13 with router dropout)
+                ent_loss = 0.0
+                if entropy_weight > 0 and routing_infos is not None:
+                    if hasattr(base_model, 'routing_entropy_loss'):
+                        # Check if it accepts routing_infos (v12.7/v13) or not (older versions)
+                        import inspect
+                        sig = inspect.signature(base_model.routing_entropy_loss)
+                        if len(sig.parameters) > 0:
+                            ent_loss = base_model.routing_entropy_loss(routing_infos)
+                        else:
+                            ent_loss = base_model.routing_entropy_loss()
+
                 # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
+
+                # NaN/INF detection
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"\n[WARNING] NaN/INF detected at step {step}!")
+                    print(f"  ce_loss: {ce_loss.item() if torch.is_tensor(ce_loss) else ce_loss}")
+                    print(f"  orth_loss: {orth_loss.item() if torch.is_tensor(orth_loss) else orth_loss}")
+                    print(f"  diversity_loss: {diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss}")
+                    print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
+                    print(f"  ent_loss: {ent_loss.item() if torch.is_tensor(ent_loss) else ent_loss}")
+                    raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
             scaler.scale(loss).backward()
+
+            # Free computation graph references from routing_infos
+            if routing_infos is not None:
+                for layer_info in routing_infos:
+                    attn = layer_info.get('attention', {})
+                    for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad',
+                                'compress_logits', 'expand_logits_Q', 'expand_logits_K', 'expand_logits_V']:
+                        attn.pop(key, None)
+                    mem = layer_info.get('memory', {})
+                    mem.pop('memory_logits', None)
 
             # Gradient clipping
             scaler.unscale_(optimizer)
@@ -667,7 +699,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             base_model = get_underlying_model(model)
 
             # v10: DAWN model forward
-            if load_balance_weight > 0:
+            if load_balance_weight > 0 or entropy_weight > 0:
                 ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
             else:
                 ce_loss, logits = model(input_ids, labels)
@@ -689,10 +721,41 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 if hasattr(base_model, 'load_balance_loss'):
                     lb_loss = base_model.load_balance_loss(routing_infos)
 
+            # Entropy loss (for v12.7/v13 with router dropout)
+            ent_loss = 0.0
+            if entropy_weight > 0 and routing_infos is not None:
+                if hasattr(base_model, 'routing_entropy_loss'):
+                    import inspect
+                    sig = inspect.signature(base_model.routing_entropy_loss)
+                    if len(sig.parameters) > 0:
+                        ent_loss = base_model.routing_entropy_loss(routing_infos)
+                    else:
+                        ent_loss = base_model.routing_entropy_loss()
+
             # Total loss
-            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
+
+            # NaN/INF detection
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n[WARNING] NaN/INF detected at step {step}!")
+                print(f"  ce_loss: {ce_loss.item() if torch.is_tensor(ce_loss) else ce_loss}")
+                print(f"  orth_loss: {orth_loss.item() if torch.is_tensor(orth_loss) else orth_loss}")
+                print(f"  diversity_loss: {diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss}")
+                print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
+                print(f"  ent_loss: {ent_loss.item() if torch.is_tensor(ent_loss) else ent_loss}")
+                raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
             loss.backward()
+
+            # Free computation graph references from routing_infos
+            if routing_infos is not None:
+                for layer_info in routing_infos:
+                    attn = layer_info.get('attention', {})
+                    for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad',
+                                'compress_logits', 'expand_logits_Q', 'expand_logits_K', 'expand_logits_V']:
+                        attn.pop(key, None)
+                    mem = layer_info.get('memory', {})
+                    mem.pop('memory_logits', None)
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -735,6 +798,63 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         window_acc_correct += correct
         window_acc_valid += valid_tokens
         window_count += 1
+
+        # Real-time entropy monitoring (every 200 steps)
+        if (step + 1) % 200 == 0 and routing_infos is not None:
+            with torch.no_grad():
+                try:
+                    # Layer 0 for routing analysis
+                    attn = routing_infos[0].get('attention', routing_infos[0])
+
+                    # Get all expand prefs
+                    pref_Q = attn.get('expand_pref_Q')
+                    pref_K = attn.get('expand_pref_K')
+                    pref_V = attn.get('expand_pref_V')
+                    pref_C = attn.get('compress_pref')
+
+                    def calc_entropy_ratio(pref):
+                        if pref is None:
+                            return 0.0
+                        ent = -(pref * (pref + 1e-8).log()).sum(-1).mean()
+                        return (ent / math.log(pref.shape[-1]) * 100).item()
+
+                    def calc_token_var(pref):
+                        if pref is None:
+                            return 0.0
+                        return pref.var(dim=1).mean().item()
+
+                    # Entropy ratios
+                    ent_Q = calc_entropy_ratio(pref_Q)
+                    ent_K = calc_entropy_ratio(pref_K)
+                    ent_V = calc_entropy_ratio(pref_V)
+                    ent_C = calc_entropy_ratio(pref_C)
+
+                    # Token variance (Q만 대표로)
+                    var_Q = calc_token_var(pref_Q)
+
+                    # Attention ratio (attn_out_norm vs mem_out_norm per layer)
+                    attn_ratios = []
+                    for layer_info in routing_infos:
+                        attn_norm = layer_info.get('attn_out_norm')
+                        mem_norm = layer_info.get('mem_out_norm')
+                        if attn_norm is not None and mem_norm is not None:
+                            ratio = (attn_norm / (attn_norm + mem_norm + 1e-8) * 100).item()
+                            attn_ratios.append(f"{ratio:.0f}")
+                        else:
+                            attn_ratios.append("-")
+                    attn_str = "/".join(attn_ratios)
+
+                    # Compact output
+                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Attn:{attn_str}")
+
+                    # Warning if collapse detected
+                    if min(ent_Q, ent_K, ent_V) < 30:
+                        print(f"  ⚠ WARNING: Router may be collapsing! (target: 60%)")
+                    elif min(ent_Q, ent_K, ent_V) > 80:
+                        print(f"  ⚠ WARNING: Router too uniform! (target: 60%)")
+
+                except Exception:
+                    pass  # Skip if routing_infos format is different
 
         # Log aggregated metrics every 100 steps
         if log_file and (step + 1) % log_interval == 0:
@@ -1147,6 +1267,7 @@ def main():
     args.orthogonality_weight = cfg['training'].get('orthogonality_weight', 0.0)  # v6.0 compat
     args.diversity_weight = cfg['training'].get('diversity_weight', 0.0)  # v7.0: recipe diversity
     args.load_balance_weight = cfg['training'].get('load_balance_weight', 0.0)  # v7.0: load balance
+    args.entropy_weight = cfg['training'].get('entropy_weight', 0.0)  # v13: router entropy loss
     args.process_norm_weight = cfg['training'].get('process_norm_weight', 0.0)  # v8.0: process neuron norm
 
     # Other
@@ -1324,6 +1445,7 @@ def main():
             args.orthogonality_weight = checkpoint_training_config.get('orthogonality_weight', args.orthogonality_weight)
             args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
             args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
+            args.entropy_weight = checkpoint_training_config.get('entropy_weight', args.entropy_weight)
             args.process_norm_weight = checkpoint_training_config.get('process_norm_weight', args.process_norm_weight)
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
@@ -1654,6 +1776,8 @@ def main():
         reg_parts.append(f"div={args.diversity_weight}")
     if args.load_balance_weight > 0:
         reg_parts.append(f"lb={args.load_balance_weight}")
+    if args.entropy_weight > 0:
+        reg_parts.append(f"ent={args.entropy_weight}")
     if reg_parts:
         print(f"Regularization: {', '.join(reg_parts)}")
 
@@ -2026,6 +2150,7 @@ def main():
             orthogonality_weight=args.orthogonality_weight,
             diversity_weight=args.diversity_weight,
             load_balance_weight=args.load_balance_weight,
+            entropy_weight=args.entropy_weight,
             process_norm_weight=args.process_norm_weight,
             debug_logger=debug_logger,
             ckpt_manager=ckpt_manager,
