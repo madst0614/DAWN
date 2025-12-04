@@ -738,46 +738,31 @@ class DAWN(nn.Module):
 
         return (loss_c + loss_e) / 2
 
-    def routing_entropy_loss(self, routing_infos, target_ratio=0.6):
+    def routing_entropy_loss(self, routing_infos, target_ratio=0.5):
         """
-        Target entropy loss - entropy가 target_ratio 근처 유지되도록.
-        너무 낮으면 (collapse) 올리고, 너무 높으면 (uniform) 낮춤.
-
-        Uses '_grad' versions of preferences to maintain gradient flow.
-        Uses fp32 to avoid AMP underflow issues.
-
-        Args:
-            routing_infos: List of routing info dicts per layer
-            target_ratio: Target entropy ratio (0.6 = 60% of max entropy)
+        Q/K expand router만 대상, collapse 방지만 (entropy < target일 때만 penalty)
+        V/C는 건드리지 않음
         """
         device = next(self.parameters()).device
         loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         count = 0
         max_entropy_expand = math.log(self.n_expand)
-        max_entropy_compress = math.log(self.n_compress)
 
         for layer_info in routing_infos:
             attn = layer_info['attention']
 
-            # Expand router entropy (Q, K, V) - use _grad versions for backprop
-            for key in ['expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad']:
+            # Q/K만 - V는 제외
+            for key in ['expand_pref_Q_grad', 'expand_pref_K_grad']:
                 if key in attn:
-                    pref = attn[key].float()  # fp32 강제
-                    pref = pref.clamp(min=1e-6)  # 안전한 범위로 clamp
+                    pref = attn[key].float().clamp(min=1e-6)
                     entropy = -(pref * pref.log()).sum(dim=-1).mean()
-                    current_ratio = entropy / max_entropy_expand
-                    # Penalize deviation from target ratio
-                    loss = loss + (current_ratio - target_ratio).abs()
-                    count += 1
+                    ratio = entropy / max_entropy_expand
 
-            # Compress router entropy - use _grad version for backprop
-            if 'compress_pref_grad' in attn:
-                pref = attn['compress_pref_grad'].float()  # fp32 강제
-                pref = pref.clamp(min=1e-6)
-                entropy = -(pref * pref.log()).sum(dim=-1).mean()
-                current_ratio = entropy / max_entropy_compress
-                loss = loss + (current_ratio - target_ratio).abs()
-                count += 1
+                    # collapse 방지만 (아래로 떨어질 때만 penalty)
+                    if ratio < target_ratio:
+                        loss = loss + (target_ratio - ratio)
+
+                    count += 1
 
         return loss / max(count, 1)
 
