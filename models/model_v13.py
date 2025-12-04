@@ -102,6 +102,7 @@ class GlobalSSM(nn.Module):
 
         # Context projection
         self.context_proj = nn.Linear(d_model, d_model, bias=False)
+        self.context_scale = nn.Parameter(torch.tensor(0.1))
 
         # Importance projection
         self.importance_proj = nn.Linear(d_model, d_model, bias=False)
@@ -166,8 +167,8 @@ class GlobalSSM(nn.Module):
         # Normalize SSM output (값 폭발 방지)
         ssm_out = self.ssm_norm(ssm_out)
 
-        # Context enhancement
-        context = self.context_proj(ssm_out)  # [B, S, d_model]
+        # Context enhancement (scaled for stability)
+        context = self.context_proj(ssm_out) * self.context_scale  # [B, S, d_model]
 
         # Importance from final state (mean pool as approximation)
         h_final = ssm_out[:, -1, :]  # [B, d_model]
