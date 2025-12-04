@@ -1,9 +1,10 @@
-# DAWN v13.0 Training Config
-# Final Architecture: Selective SSM + Context + Top-k Sparse Routing
+# DAWN v13.2 Training Config
+# UnifiedNeuronRouter: 5 routers → 1 unified router with shared projection
+# All neurons in same d_space embedding space
+# Starvation bonus with decay for early exploration
 
-# vs v12.5: Selective SSM (token-dependent) + Top-k routing
-# vs v12.7: Context Enhancement 복구
-# vs v12.8: Selective SSM 적용
+# vs v13.1: Separate Q/K/V routers
+# vs v13.2: UnifiedNeuronRouter (~25K params vs ~42K)
 
 # Data
 data:
@@ -15,14 +16,15 @@ data:
 
 # Model Architecture
 model:
-  model_version: "13.0"
+  model_version: "13.2"
   d_model: 320
   n_layers: 4
   n_heads: 4
   rank: 64
   # Neurons
   n_compress: 48
-  n_expand: 12
+  n_expand_QK: 12
+  n_expand_V: 12
   n_knowledge: 80
   knowledge_k: 10
   knowledge_rank: 64
@@ -31,7 +33,10 @@ model:
   state_dim: 64
   # Top-k sparse mixing
   top_k_compress: 8
-  top_k_expand: 4
+  top_k_QK: 4
+  top_k_V: 6
+  # Unified router
+  d_space: 64
   router_dropout: 0.1
 
 # Training
@@ -49,5 +54,5 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v13
-log_dir: /content/drive/MyDrive/dawn/logs_v13
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v13_2
+log_dir: /content/drive/MyDrive/dawn/logs_v13_2
