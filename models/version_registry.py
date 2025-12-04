@@ -362,6 +362,39 @@ VERSION_REGISTRY = {
             f"    - top-k: {args.get('knowledge_k')}",
         ],
     },
+    "13.1": {
+        "description": "Separate QK/V Expand Pools (Q/K share, V separate)",
+        "aliases": ["131"],
+        "module": "model_v13_1",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_compress", "n_expand_QK", "n_expand_V", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_compress": 8,
+            "top_k_QK": 4,
+            "top_k_V": 6,
+            "gradient_checkpointing": False,
+        },
+        "display_info": lambda args: [
+            f"DAWN v13.1: rank={args.get('rank', args.get('basis_rank'))} (QK/V separated)",
+            f"  CompressNeurons: {args.get('n_compress')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))}",
+            f"  expand_neurons_QK: {args.get('n_expand_QK')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K shared)",
+            f"  expand_neurons_V: {args.get('n_expand_V')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V separate)",
+            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
+            f"  Top-k Compress: {args.get('top_k_compress', 8)}/{args.get('n_compress')}",
+            f"  Top-k QK: {args.get('top_k_QK', 4)}/{args.get('n_expand_QK')}",
+            f"  Top-k V: {args.get('top_k_V', 6)}/{args.get('n_expand_V')}",
+            f"  Architecture: Selective SSM → Context → QK/V Routers → FlashAttn",
+            f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
+            f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
 }
 
 
