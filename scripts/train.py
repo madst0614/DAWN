@@ -626,8 +626,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
+                # Check if v13.2 (needs routing_info for starvation logging)
+                is_v13_2 = (hasattr(base_model, 'global_routers') and
+                           hasattr(base_model.global_routers, 'neuron_router') and
+                           hasattr(base_model.global_routers.neuron_router, 'usage_ema_compress'))
+
                 # v10: DAWN model forward
-                if load_balance_weight > 0 or entropy_weight > 0:
+                if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2:
                     ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True,
                                                            step=global_step, total_steps=total_steps)
                 else:
@@ -701,8 +706,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Non-AMP training (CPU or no CUDA)
             base_model = get_underlying_model(model)
 
+            # Check if v13.2 (needs routing_info for starvation logging)
+            is_v13_2 = (hasattr(base_model, 'global_routers') and
+                       hasattr(base_model.global_routers, 'neuron_router') and
+                       hasattr(base_model.global_routers.neuron_router, 'usage_ema_compress'))
+
             # v10: DAWN model forward
-            if load_balance_weight > 0 or entropy_weight > 0:
+            if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2:
                 ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True,
                                                        step=global_step, total_steps=total_steps)
             else:
