@@ -806,9 +806,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Layer 0 for routing analysis
                     attn = routing_infos[0].get('attention', routing_infos[0])
 
-                    # Get all expand prefs
-                    pref_Q = attn.get('expand_pref_Q')
-                    pref_K = attn.get('expand_pref_K')
+                    # Get all expand prefs (handle both v13.0 and v13.1 formats)
+                    pref_QK = attn.get('expand_pref_QK')  # v13.1: shared QK
+                    pref_Q = attn.get('expand_pref_Q') if pref_QK is None else pref_QK
+                    pref_K = attn.get('expand_pref_K') if pref_QK is None else pref_QK
                     pref_V = attn.get('expand_pref_V')
                     pref_C = attn.get('compress_pref')
 
