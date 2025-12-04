@@ -859,10 +859,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         router = base_model.global_routers.neuron_router
                         if hasattr(router, 'usage_ema_compress'):
                             starvation_weight = max(0.0, 1.0 - global_step / total_steps)
+                            # Mean (expected: k/n ratio)
                             usage_C = router.usage_ema_compress.mean().item()
                             usage_QK = router.usage_ema_expand_QK.mean().item()
                             usage_V = router.usage_ema_expand_V.mean().item()
-                            print(f"         Starv:{starvation_weight:.3f} | Usage C/QK/V:{usage_C:.3f}/{usage_QK:.3f}/{usage_V:.3f}")
+                            # Std (diversity: low=good, high=bad)
+                            std_C = router.usage_ema_compress.std().item()
+                            std_QK = router.usage_ema_expand_QK.std().item()
+                            std_V = router.usage_ema_expand_V.std().item()
+                            print(f"         Starv:{starvation_weight:.3f} | Usage C/QK/V:{usage_C:.3f}/{usage_QK:.3f}/{usage_V:.3f} | Std:{std_C:.3f}/{std_QK:.3f}/{std_V:.3f}")
 
                     # Warning if collapse detected
                     if min(ent_Q, ent_K, ent_V) < 30:
@@ -2346,8 +2351,12 @@ def main():
                     usage_C = router.usage_ema_compress.mean().item()
                     usage_QK = router.usage_ema_expand_QK.mean().item()
                     usage_V = router.usage_ema_expand_V.mean().item()
+                    std_C = router.usage_ema_compress.std().item()
+                    std_QK = router.usage_ema_expand_QK.std().item()
+                    std_V = router.usage_ema_expand_V.std().item()
                     f.write(f",starv={starvation_weight:.3f},usage_C={usage_C:.3f},"
-                           f"usage_QK={usage_QK:.3f},usage_V={usage_V:.3f}")
+                           f"usage_QK={usage_QK:.3f},usage_V={usage_V:.3f},"
+                           f"std_C={std_C:.3f},std_QK={std_QK:.3f},std_V={std_V:.3f}")
             f.write("\n")
 
         # Debug: Log epoch summary for specific epochs
