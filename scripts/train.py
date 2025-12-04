@@ -572,11 +572,13 @@ def is_v75_or_v76_model(model):
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
                 orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0, process_norm_weight=0.0,
-                debug_logger=None, ckpt_manager=None, model_config=None, start_step=0):
+                debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1):
     """Train for one epoch
 
     Args:
         start_step: Step to resume from within this epoch (default 0, start from beginning)
+        global_step: Global training step counter (for v13.2 starvation decay)
+        total_steps: Total training steps (for v13.2 starvation decay)
     """
     model.train()
 
@@ -626,9 +628,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # v10: DAWN model forward
                 if load_balance_weight > 0 or entropy_weight > 0:
-                    ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                    ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True,
+                                                           step=global_step, total_steps=total_steps)
                 else:
-                    ce_loss, logits = model(input_ids, labels)
+                    ce_loss, logits = model(input_ids, labels, step=global_step, total_steps=total_steps)
                     routing_infos = None
 
                 # Orthogonality loss
@@ -700,9 +703,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             # v10: DAWN model forward
             if load_balance_weight > 0 or entropy_weight > 0:
-                ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True,
+                                                       step=global_step, total_steps=total_steps)
             else:
-                ce_loss, logits = model(input_ids, labels)
+                ce_loss, logits = model(input_ids, labels, step=global_step, total_steps=total_steps)
                 routing_infos = None
 
             # Orthogonality loss
@@ -768,6 +772,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         if scheduler is not None:
             scheduler.step()
+
+        # Increment global step counter (for v13.2 starvation decay)
+        global_step += 1
 
         # Accuracy calculation (only valid tokens)
         predictions = logits.argmax(dim=-1)
@@ -846,6 +853,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                     # Compact output
                     print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Attn:{attn_str}")
+
+                    # v13.2: Starvation weight and usage EMA logging
+                    if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+                        router = base_model.global_routers.neuron_router
+                        if hasattr(router, 'usage_ema_compress'):
+                            starvation_weight = max(0.0, 1.0 - global_step / total_steps)
+                            usage_C = router.usage_ema_compress.mean().item()
+                            usage_QK = router.usage_ema_expand_QK.mean().item()
+                            usage_V = router.usage_ema_expand_V.mean().item()
+                            print(f"         Starv:{starvation_weight:.3f} | Usage C/QK/V:{usage_C:.3f}/{usage_QK:.3f}/{usage_V:.3f}")
 
                     # Warning if collapse detected
                     if min(ent_Q, ent_K, ent_V) < 30:
@@ -933,7 +950,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
 
-    return avg_loss, avg_acc, last_neuron_metrics
+    return avg_loss, avg_acc, last_neuron_metrics, global_step
 
 
 def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
@@ -2241,6 +2258,11 @@ def main():
         debug_logger.log_section(f"Initial State (Before Training)")
         debug_logger.log_epoch_summary(model, sample_batch_for_debug, epoch=0)
 
+    # v13.2: Calculate total_steps for starvation decay
+    steps_per_epoch = len(train_loader)
+    total_steps = args.num_epochs * steps_per_epoch
+    global_step = (start_epoch - 1) * steps_per_epoch + start_step  # Resume from correct step
+
     for epoch in range(start_epoch, args.num_epochs + 1):
         # Clear CUDA cache at start of each epoch (helps with torch.compile memory)
         if torch.cuda.is_available():
@@ -2253,7 +2275,7 @@ def main():
         epoch_start_step = start_step if epoch == start_epoch else 0
 
         # Train
-        train_loss, train_acc, neuron_metrics = train_epoch(
+        train_loss, train_acc, neuron_metrics, global_step = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch, args,
             scaler, tokenizer, log_file=str(training_log_file),
             orthogonality_weight=args.orthogonality_weight,
@@ -2264,7 +2286,9 @@ def main():
             debug_logger=debug_logger,
             ckpt_manager=ckpt_manager,
             model_config=model_kwargs,
-            start_step=epoch_start_step
+            start_step=epoch_start_step,
+            global_step=global_step,
+            total_steps=total_steps
         )
 
         # Evaluate

@@ -671,7 +671,8 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, input_ids, labels=None, return_routing_info=False):
+    def forward(self, input_ids, labels=None, return_routing_info=False, **kwargs):
+        # kwargs: step, total_steps (for v13.2 compatibility, ignored here)
         B, S = input_ids.shape
         device = input_ids.device
 
