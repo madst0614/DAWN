@@ -1,0 +1,51 @@
+# Vanilla Transformer Baseline - 12M Scale
+# Fair comparison with DAWN v13 12M + 500M tokens
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+    - train/c4/c4_raw_001.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 500000000  # 500M tokens
+  max_val_tokens: 2000000      # 2M tokens
+
+# Model Architecture
+model:
+  model_version: "baseline"
+  d_model: 320
+  n_layers: 5
+  n_heads: 4
+  d_ff: 1280
+  max_seq_len: 512
+  dropout: 0.1
+
+# Training (same as DAWN 12M)
+training:
+  batch_size: 256
+  num_epochs: 10
+  lr: 0.0004
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.0
+  diversity_weight: 0.0
+  load_balance_weight: 0.0
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_baseline_12M_c4_500M
+log_dir: /content/drive/MyDrive/dawn/logs_baseline_12M_c4_500M
+
+# 파라미터 계산:
+#   Embedding: 30522 × 320 = 9,767,040
+#   Pos Embedding: 512 × 320 = 163,840
+#   Per Layer: ~1,230,080
+#   5 Layers: ~6,150,400
+#   Total: ~12.2M (weight tying)
+#
+# 비교:
+#   DAWN: 12.3M params, 4 layers
+#   Baseline: 12.2M params, 5 layers
+#   → 거의 동일 파라미터, DAWN이 layer 적음
