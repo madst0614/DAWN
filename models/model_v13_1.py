@@ -713,12 +713,17 @@ class DAWN(nn.Module):
         I = torch.eye(self.rank, device=W_c.device).unsqueeze(0)
         loss_c = ((WtW - I) ** 2).mean()
 
-        # Expand: [n_expand, rank, d_model] -> W @ W^T = [n_expand, rank, rank]
-        W_e = self.shared_neurons.expand_neurons_pool
-        WWt = torch.bmm(W_e, W_e.transpose(1, 2))  # [n_expand, rank, rank]
-        loss_e = ((WWt - I) ** 2).mean()
+        # Expand QK: [n_expand_QK, rank, d_model] -> W @ W^T
+        W_e_QK = self.shared_neurons.expand_neurons_QK
+        WWt_QK = torch.bmm(W_e_QK, W_e_QK.transpose(1, 2))
+        loss_e_QK = ((WWt_QK - I) ** 2).mean()
 
-        return (loss_c + loss_e) / 2
+        # Expand V: [n_expand_V, rank, d_model] -> W @ W^T
+        W_e_V = self.shared_neurons.expand_neurons_V
+        WWt_V = torch.bmm(W_e_V, W_e_V.transpose(1, 2))
+        loss_e_V = ((WWt_V - I) ** 2).mean()
+
+        return (loss_c + loss_e_QK + loss_e_V) / 3
 
     def routing_entropy_loss(self, routing_infos, target_ratio=0.5):
         """
@@ -841,25 +846,28 @@ class DAWN(nn.Module):
         expand_o = self.layers[0].attn.expand_O.weight.numel() * self.n_layers
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        print(f"=== DAWN v13.0 Parameter Breakdown (Final) ===")
+        print(f"=== DAWN v13.1 Parameter Breakdown (QK/V Separated) ===")
         print(f"CompressNeurons:   {compress:,} ({compress/1e6:.2f}M)")
-        print(f"ExpandPool (QKV):  {expand_pool:,} ({expand_pool/1e6:.2f}M)")
+        print(f"ExpandPool QK:     {expand_QK:,} ({expand_QK/1e6:.2f}M)")
+        print(f"ExpandPool V:      {expand_V:,} ({expand_V/1e6:.2f}M)")
         print(f"expand_O:          {expand_o:,} ({expand_o/1e3:.1f}K)")
         print(f"KnowledgeNeurons:  {knowledge:,} ({knowledge/1e3:.1f}K)")
         print(f"Embeddings:        {embed:,} ({embed/1e6:.2f}M)")
-        print(f"Mamba SSM:         {ssm_total:,} ({ssm_total/1e3:.1f}K) [A_log + W_delta + W_B + W_C + context + importance]")
+        print(f"Mamba SSM:         {ssm_total:,} ({ssm_total/1e3:.1f}K)")
         print(f"Global Routers:    {routers:,} ({routers/1e3:.1f}K)")
         print(f"LayerNorms:        {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
         print(f"Top-k Compress: {self.top_k_compress}/{self.n_compress}")
-        print(f"Top-k Expand:   {self.top_k_expand}/{self.n_expand}")
+        print(f"Top-k QK:       {self.top_k_QK}/{self.n_expand_QK}")
+        print(f"Top-k V:        {self.top_k_V}/{self.n_expand_V}")
         print(f"Mamba Available: {MAMBA_AVAILABLE}")
-        print(f"Architecture: Mamba SSM (parallel scan) → Context → Top-k Routers → FlashAttn")
+        print(f"Architecture: Mamba SSM → Context → QK/V Routers → FlashAttn")
         print(f"---")
         print(f"Total:             {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 
         return {
-            'compress': compress, 'expand_pool': expand_pool, 'expand_o': expand_o,
+            'compress': compress, 'expand_QK': expand_QK, 'expand_V': expand_V,
+            'expand_pool': expand_pool, 'expand_o': expand_o,
             'knowledge': knowledge, 'embeddings': embed, 'ssm': ssm_total,
             'routers': routers, 'norms': norms,
         }
@@ -871,9 +879,11 @@ class DAWN(nn.Module):
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'rank': self.rank, 'knowledge_rank': self.knowledge_rank,
             'max_seq_len': self.max_seq_len, 'n_compress': self.n_compress,
-            'n_expand': self.n_expand, 'n_knowledge': self.n_knowledge,
-            'knowledge_k': self.knowledge_k, 'state_dim': self.state_dim,
-            'top_k_compress': self.top_k_compress, 'top_k_expand': self.top_k_expand,
+            'n_expand_QK': self.n_expand_QK, 'n_expand_V': self.n_expand_V,
+            'n_knowledge': self.n_knowledge, 'knowledge_k': self.knowledge_k,
+            'state_dim': self.state_dim,
+            'top_k_compress': self.top_k_compress,
+            'top_k_QK': self.top_k_QK, 'top_k_V': self.top_k_V,
             'router_dropout': self.router_dropout,
             'gradient_checkpointing': self.gradient_checkpointing,
             'token_routing': self.token_routing,
