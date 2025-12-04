@@ -224,39 +224,28 @@ class GlobalRouters(nn.Module):
         self.top_k_expand = top_k_expand
         self.token_routing = token_routing
 
-        # Attention routers (2-layer MLP for better representation)
-        hidden_dim = d_model // 4
+        # Attention routers (1-layer linear)
         self.compress_router = nn.Sequential(
-            nn.Linear(d_model, hidden_dim, bias=False),
-            nn.GELU(),
-            nn.Dropout(router_dropout),
-            nn.Linear(hidden_dim, n_compress, bias=False)
+            nn.Linear(d_model, n_compress, bias=False),
+            nn.Dropout(router_dropout)
         )
         self.expand_router_Q = nn.Sequential(
-            nn.Linear(d_model, hidden_dim, bias=False),
-            nn.GELU(),
-            nn.Dropout(router_dropout),
-            nn.Linear(hidden_dim, n_expand, bias=False)
+            nn.Linear(d_model, n_expand, bias=False),
+            nn.Dropout(router_dropout)
         )
         self.expand_router_K = nn.Sequential(
-            nn.Linear(d_model, hidden_dim, bias=False),
-            nn.GELU(),
-            nn.Dropout(router_dropout),
-            nn.Linear(hidden_dim, n_expand, bias=False)
+            nn.Linear(d_model, n_expand, bias=False),
+            nn.Dropout(router_dropout)
         )
         self.expand_router_V = nn.Sequential(
-            nn.Linear(d_model, hidden_dim, bias=False),
-            nn.GELU(),
-            nn.Dropout(router_dropout),
-            nn.Linear(hidden_dim, n_expand, bias=False)
+            nn.Linear(d_model, n_expand, bias=False),
+            nn.Dropout(router_dropout)
         )
 
-        # Memory router (2-layer MLP)
+        # Memory router (1-layer linear)
         self.memory_router = nn.Sequential(
-            nn.Linear(d_model, hidden_dim, bias=False),
-            nn.GELU(),
-            nn.Dropout(router_dropout),
-            nn.Linear(hidden_dim, n_compress, bias=False)
+            nn.Linear(d_model, n_compress, bias=False),
+            nn.Dropout(router_dropout)
         )
 
         # Additional dropout for logits (optional, can be disabled)
