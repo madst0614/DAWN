@@ -49,8 +49,8 @@ training:
   # Regularization
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.01
-  entropy_weight: 0.01
+  load_balance_weight: 0.0    # starvation이 대체
+  entropy_weight: 0.0         # starvation이 대체
   process_norm_weight: 0.0
 
 use_amp: true
