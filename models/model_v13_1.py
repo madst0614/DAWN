@@ -205,12 +205,13 @@ class GlobalSSM(nn.Module):
 
 class GlobalRouters(nn.Module):
     """
-    v13.1: Global routers with separate QK/V routing
+    v13.1: Global routers with separate Q/K/V routing
 
-    4 routers + Top-k sparsification:
+    5 routers + Top-k sparsification:
     - compress_router → top_k_compress
-    - expand_router_QK → top_k_QK (Q and K share)
-    - expand_router_V → top_k_V
+    - expand_router_Q → top_k_QK (uses QK pool)
+    - expand_router_K → top_k_QK (uses QK pool)
+    - expand_router_V → top_k_V (uses V pool)
     - memory_router → top_k_compress
     """
     def __init__(self, d_model: int, n_compress: int, n_expand_QK: int, n_expand_V: int,
@@ -231,12 +232,17 @@ class GlobalRouters(nn.Module):
             nn.Linear(d_model, n_compress, bias=False),
             nn.Dropout(router_dropout)
         )
-        # QK shared router
-        self.expand_router_QK = nn.Sequential(
+        # Q router (uses QK pool)
+        self.expand_router_Q = nn.Sequential(
             nn.Linear(d_model, n_expand_QK, bias=False),
             nn.Dropout(router_dropout)
         )
-        # V separate router
+        # K router (uses QK pool)
+        self.expand_router_K = nn.Sequential(
+            nn.Linear(d_model, n_expand_QK, bias=False),
+            nn.Dropout(router_dropout)
+        )
+        # V router (uses V pool)
         self.expand_router_V = nn.Sequential(
             nn.Linear(d_model, n_expand_V, bias=False),
             nn.Dropout(router_dropout)
@@ -260,78 +266,92 @@ class GlobalRouters(nn.Module):
         """
         Compute attention routing weights with Top-k sparsification
 
-        Returns: compress_weights, expand_weights_QK, expand_weights_V, routing_info
+        Returns: compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, routing_info
         """
         # Compress routing
         compress_logits = self.compress_router(x)
         compress_pref = F.softmax(compress_logits, dim=-1)  # [B, S, n_compress]
 
-        # Expand routing: QK shared, V separate
-        expand_logits_QK = self.expand_router_QK(x)
+        # Expand routing: Q, K, V separate routers
+        expand_logits_Q = self.expand_router_Q(x)
+        expand_logits_K = self.expand_router_K(x)
         expand_logits_V = self.expand_router_V(x)
-        expand_pref_QK = F.softmax(expand_logits_QK, dim=-1)
+        expand_pref_Q = F.softmax(expand_logits_Q, dim=-1)
+        expand_pref_K = F.softmax(expand_logits_K, dim=-1)
         expand_pref_V = F.softmax(expand_logits_V, dim=-1)
 
         if self.token_routing:
             # Token-level routing: use per-token weights directly [B, S, N]
             compress_weights = compress_pref
-            expand_weights_QK = expand_pref_QK
+            expand_weights_Q = expand_pref_Q
+            expand_weights_K = expand_pref_K
             expand_weights_V = expand_pref_V
 
             routing_info = {
                 'compress_weights': compress_weights.detach(),
-                'expand_weights_QK': expand_weights_QK.detach(),
+                'expand_weights_Q': expand_weights_Q.detach(),
+                'expand_weights_K': expand_weights_K.detach(),
                 'expand_weights_V': expand_weights_V.detach(),
                 'token_routing': True,
                 # For entropy loss (with gradient)
                 'compress_pref_grad': compress_pref,
-                'expand_pref_QK_grad': expand_pref_QK,
+                'expand_pref_Q_grad': expand_pref_Q,
+                'expand_pref_K_grad': expand_pref_K,
                 'expand_pref_V_grad': expand_pref_V,
                 # For load balance loss (with gradient)
                 'compress_logits': compress_logits,
-                'expand_logits_QK': expand_logits_QK,
+                'expand_logits_Q': expand_logits_Q,
+                'expand_logits_K': expand_logits_K,
                 'expand_logits_V': expand_logits_V,
             }
         else:
             # Batch-level routing: aggregate by importance [B, N]
             compress_weights_dense = torch.einsum('bs,bsn->bn', importance, compress_pref)
-            expand_weights_QK_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_QK)
+            expand_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_Q)
+            expand_weights_K_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_K)
             expand_weights_V_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_V)
 
             # Top-k sparsification
             compress_weights, compress_topk_idx = self._topk_sparsify(compress_weights_dense, self.top_k_compress)
-            expand_weights_QK, expand_topk_idx_QK = self._topk_sparsify(expand_weights_QK_dense, self.top_k_QK)
+            expand_weights_Q, expand_topk_idx_Q = self._topk_sparsify(expand_weights_Q_dense, self.top_k_QK)
+            expand_weights_K, expand_topk_idx_K = self._topk_sparsify(expand_weights_K_dense, self.top_k_QK)
             expand_weights_V, expand_topk_idx_V = self._topk_sparsify(expand_weights_V_dense, self.top_k_V)
 
             routing_info = {
                 # Sparse weights (for forward)
                 'compress_weights': compress_weights.detach(),
-                'expand_weights_QK': expand_weights_QK.detach(),
+                'expand_weights_Q': expand_weights_Q.detach(),
+                'expand_weights_K': expand_weights_K.detach(),
                 'expand_weights_V': expand_weights_V.detach(),
                 # Dense weights (for monitoring)
                 'compress_weights_dense': compress_weights_dense.detach(),
-                'expand_weights_QK_dense': expand_weights_QK_dense.detach(),
+                'expand_weights_Q_dense': expand_weights_Q_dense.detach(),
+                'expand_weights_K_dense': expand_weights_K_dense.detach(),
                 'expand_weights_V_dense': expand_weights_V_dense.detach(),
                 # Top-k indices
                 'compress_topk_idx': compress_topk_idx.detach(),
-                'expand_topk_idx_QK': expand_topk_idx_QK.detach(),
+                'expand_topk_idx_Q': expand_topk_idx_Q.detach(),
+                'expand_topk_idx_K': expand_topk_idx_K.detach(),
                 'expand_topk_idx_V': expand_topk_idx_V.detach(),
                 # Token-level preferences (for analysis)
                 'compress_pref': compress_pref.detach(),
-                'expand_pref_QK': expand_pref_QK.detach(),
+                'expand_pref_Q': expand_pref_Q.detach(),
+                'expand_pref_K': expand_pref_K.detach(),
                 'expand_pref_V': expand_pref_V.detach(),
                 # For load balance loss (with gradient)
                 'compress_logits': compress_logits,
-                'expand_logits_QK': expand_logits_QK,
+                'expand_logits_Q': expand_logits_Q,
+                'expand_logits_K': expand_logits_K,
                 'expand_logits_V': expand_logits_V,
                 # For entropy loss (with gradient)
                 'compress_pref_grad': compress_pref,
-                'expand_pref_QK_grad': expand_pref_QK,
+                'expand_pref_Q_grad': expand_pref_Q,
+                'expand_pref_K_grad': expand_pref_K,
                 'expand_pref_V_grad': expand_pref_V,
                 'token_routing': False,
             }
 
-        return compress_weights, expand_weights_QK, expand_weights_V, routing_info
+        return compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, routing_info
 
     def get_memory_weights(self, x, importance):
         """Compute memory routing weights with Top-k sparsification"""
@@ -384,13 +404,14 @@ class NeuronCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, compress_weights, expand_weights_QK, expand_weights_V):
+    def forward(self, x, compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V):
         """
         Args:
             x: [B, S, D]
             compress_weights: [B, N] or [B, S, N]
-            expand_weights_QK: [B, N_QK] or [B, S, N_QK] - shared for Q and K
-            expand_weights_V: [B, N_V] or [B, S, N_V] - separate for V
+            expand_weights_Q: [B, N_QK] or [B, S, N_QK] - Q router weights (uses QK pool)
+            expand_weights_K: [B, N_QK] or [B, S, N_QK] - K router weights (uses QK pool)
+            expand_weights_V: [B, N_V] or [B, S, N_V] - V router weights (uses V pool)
         """
         B, S, D = x.shape
         token_routing = compress_weights.dim() == 3  # [B, S, N] vs [B, N]
@@ -403,15 +424,16 @@ class NeuronCircuit(nn.Module):
             # 2. Compress: [B, S, D] @ [B, S, D, R] -> [B, S, R]
             h = torch.einsum('bsd,bsdr->bsr', x, shared_compress)
 
-            # 3. Per-token expand matrices - QK shared pool, V separate pool
+            # 3. Per-token expand matrices - Q/K use QK pool, V uses V pool
             pool_QK = self.shared_neurons.expand_neurons_QK
             pool_V = self.shared_neurons.expand_neurons_V
-            shared_expand_QK = torch.einsum('bsn,nrd->bsrd', expand_weights_QK, pool_QK)
+            shared_expand_Q = torch.einsum('bsn,nrd->bsrd', expand_weights_Q, pool_QK)
+            shared_expand_K = torch.einsum('bsn,nrd->bsrd', expand_weights_K, pool_QK)
             shared_expand_V = torch.einsum('bsn,nrd->bsrd', expand_weights_V, pool_V)
 
-            # 4. Generate Q/K/V: Q and K from same weights, V from different
-            Q = torch.einsum('bsr,bsrd->bsd', h, shared_expand_QK)
-            K = torch.einsum('bsr,bsrd->bsd', h, shared_expand_QK)  # Same as Q
+            # 4. Generate Q/K/V: Q and K use different weights, V from V pool
+            Q = torch.einsum('bsr,bsrd->bsd', h, shared_expand_Q)
+            K = torch.einsum('bsr,bsrd->bsd', h, shared_expand_K)
             V = torch.einsum('bsr,bsrd->bsd', h, shared_expand_V)
         else:
             # Batch-level routing: same matrix for all tokens
@@ -421,15 +443,16 @@ class NeuronCircuit(nn.Module):
             # 2. Compress: [B, S, D] @ [B, D, R] -> [B, S, R]
             h = torch.einsum('bsd,bdr->bsr', x, shared_compress)
 
-            # 3. Dynamic expand matrices - QK shared, V separate
+            # 3. Dynamic expand matrices - Q/K use QK pool, V uses V pool
             pool_QK = self.shared_neurons.expand_neurons_QK
             pool_V = self.shared_neurons.expand_neurons_V
-            shared_expand_QK = torch.einsum('bn,nrd->brd', expand_weights_QK, pool_QK)
+            shared_expand_Q = torch.einsum('bn,nrd->brd', expand_weights_Q, pool_QK)
+            shared_expand_K = torch.einsum('bn,nrd->brd', expand_weights_K, pool_QK)
             shared_expand_V = torch.einsum('bn,nrd->brd', expand_weights_V, pool_V)
 
-            # 4. Generate Q/K/V: Q and K from same weights, V from different
-            Q = torch.einsum('bsr,brd->bsd', h, shared_expand_QK)
-            K = torch.einsum('bsr,brd->bsd', h, shared_expand_QK)  # Same as Q
+            # 4. Generate Q/K/V: Q and K use different weights, V from V pool
+            Q = torch.einsum('bsr,brd->bsd', h, shared_expand_Q)
+            K = torch.einsum('bsr,brd->bsd', h, shared_expand_K)
             V = torch.einsum('bsr,brd->bsd', h, shared_expand_V)
 
         # 5. Multi-head Attention with FlashAttention
@@ -531,10 +554,10 @@ class DAWNBlock(nn.Module):
 
     def forward(self, x, importance, global_routers: GlobalRouters):
         normed_x = self.norm1(x)
-        compress_w, expand_QK, expand_V, attn_routing = \
+        compress_w, expand_Q, expand_K, expand_V, attn_routing = \
             global_routers.get_attention_weights(normed_x, importance)
 
-        attn_out, _ = self.attn(normed_x, compress_w, expand_QK, expand_V)
+        attn_out, _ = self.attn(normed_x, compress_w, expand_Q, expand_K, expand_V)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
@@ -727,7 +750,7 @@ class DAWN(nn.Module):
 
     def routing_entropy_loss(self, routing_infos, target_ratio=0.5):
         """
-        QK expand router만 대상, collapse 방지만 (entropy < target일 때만 penalty)
+        Q/K expand router 대상, collapse 방지만 (entropy < target일 때만 penalty)
         V/C는 건드리지 않음
         """
         device = next(self.parameters()).device
@@ -738,16 +761,26 @@ class DAWN(nn.Module):
         for layer_info in routing_infos:
             attn = layer_info['attention']
 
-            # QK만 - V는 제외
-            if 'expand_pref_QK_grad' in attn:
-                pref = attn['expand_pref_QK_grad'].float().clamp(min=1e-6)
+            # Q router
+            if 'expand_pref_Q_grad' in attn:
+                pref = attn['expand_pref_Q_grad'].float().clamp(min=1e-6)
                 entropy = -(pref * pref.log()).sum(dim=-1).mean()
                 ratio = entropy / max_entropy_QK
 
                 # collapse 방지만 (아래로 떨어질 때만 penalty)
                 if ratio < target_ratio:
                     loss = loss + (target_ratio - ratio)
+                count += 1
 
+            # K router
+            if 'expand_pref_K_grad' in attn:
+                pref = attn['expand_pref_K_grad'].float().clamp(min=1e-6)
+                entropy = -(pref * pref.log()).sum(dim=-1).mean()
+                ratio = entropy / max_entropy_QK
+
+                # collapse 방지만 (아래로 떨어질 때만 penalty)
+                if ratio < target_ratio:
+                    loss = loss + (target_ratio - ratio)
                 count += 1
 
         return loss / max(count, 1)
@@ -776,16 +809,25 @@ class DAWN(nn.Module):
                 loss += ((usage - target) ** 2).sum() * self.n_compress
                 count += 1
 
-            # QK expand router (shared)
-            if 'expand_logits_QK' in attn:
-                logits = attn['expand_logits_QK']  # [B, S, n_expand_QK]
+            # Q expand router
+            if 'expand_logits_Q' in attn:
+                logits = attn['expand_logits_Q']  # [B, S, n_expand_QK]
                 probs = F.softmax(logits, dim=-1)
                 usage = probs.mean(dim=(0, 1))
                 target = 1.0 / self.n_expand_QK
                 loss += ((usage - target) ** 2).sum() * self.n_expand_QK
                 count += 1
 
-            # V expand router (separate)
+            # K expand router
+            if 'expand_logits_K' in attn:
+                logits = attn['expand_logits_K']  # [B, S, n_expand_QK]
+                probs = F.softmax(logits, dim=-1)
+                usage = probs.mean(dim=(0, 1))
+                target = 1.0 / self.n_expand_QK
+                loss += ((usage - target) ** 2).sum() * self.n_expand_QK
+                count += 1
+
+            # V expand router
             if 'expand_logits_V' in attn:
                 logits = attn['expand_logits_V']  # [B, S, n_expand_V]
                 probs = F.softmax(logits, dim=-1)
@@ -838,7 +880,8 @@ class DAWN(nn.Module):
 
         routers = sum(_count_seq_params(r) for r in [
             self.global_routers.compress_router,
-            self.global_routers.expand_router_QK,
+            self.global_routers.expand_router_Q,
+            self.global_routers.expand_router_K,
             self.global_routers.expand_router_V,
             self.global_routers.memory_router,
         ])
