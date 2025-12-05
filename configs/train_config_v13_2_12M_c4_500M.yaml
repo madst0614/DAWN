@@ -23,7 +23,7 @@ model:
   state_dim: 64
   n_compress: 48
   n_expand_QK: 12    # Q/K shared pool
-  n_expand_V: 12     # V separate pool
+  n_expand_V: 24     # V separate pool (expanded)
   n_knowledge: 80
   knowledge_k: 10
   knowledge_rank: 64
@@ -32,7 +32,7 @@ model:
   gradient_checkpointing: true
   top_k_compress: 12
   top_k_QK: 4        # Top-k for QK router
-  top_k_V: 6         # Top-k for V router
+  top_k_V: 8         # Top-k for V router
   d_space: 64        # Unified neuron embedding space
   router_dropout: 0.1
   token_routing: false
