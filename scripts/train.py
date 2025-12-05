@@ -2301,6 +2301,30 @@ def main():
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
 
+        # v13.2: Print router metrics
+        base_model = get_underlying_model(model)
+        if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+            router = base_model.global_routers.neuron_router
+            if hasattr(router, 'usage_ema_compress'):
+                starvation_weight = max(0.05, math.exp(-3.0 * global_step / total_steps))
+                # Active count
+                active_C = (router.usage_ema_compress > 0.01).sum().item()
+                active_QK = (router.usage_ema_expand_QK > 0.01).sum().item()
+                active_V = (router.usage_ema_expand_V > 0.01).sum().item()
+                n_C = router.usage_ema_compress.numel()
+                n_QK = router.usage_ema_expand_QK.numel()
+                n_V = router.usage_ema_expand_V.numel()
+                # Gini coefficient
+                def gini(x):
+                    x_sorted = torch.sort(x)[0]
+                    n = x.numel()
+                    idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+                    return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
+                gini_C = gini(router.usage_ema_compress)
+                gini_QK = gini(router.usage_ema_expand_QK)
+                gini_V = gini(router.usage_ema_expand_V)
+                print(f"  Router: Starv={starvation_weight:.3f} | Active C/QK/V: {int(active_C)}/{n_C}, {int(active_QK)}/{n_QK}, {int(active_V)}/{n_V} | Gini: {gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}")
+
         # Print neuron metrics if available
         if neuron_metrics is not None:
             print(f"  Neuron Metrics:")
