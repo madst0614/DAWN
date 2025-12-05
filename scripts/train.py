@@ -840,14 +840,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # Entropy ratios (C/QK/V)
+                    # Entropy ratios (C/Q/K/V)
                     ent_C = calc_entropy_ratio(pref_C)
-                    ent_QK = (calc_entropy_ratio(pref_Q) + calc_entropy_ratio(pref_K)) / 2
+                    ent_Q = calc_entropy_ratio(pref_Q)
+                    ent_K = calc_entropy_ratio(pref_K)
                     ent_V = calc_entropy_ratio(pref_V)
 
-                    # Token variance (C/QK/V)
+                    # Token variance (C/Q/K/V)
                     var_C = calc_token_var(pref_C)
-                    var_QK = (calc_token_var(pref_Q) + calc_token_var(pref_K)) / 2
+                    var_Q = calc_token_var(pref_Q)
+                    var_K = calc_token_var(pref_K)
                     var_V = calc_token_var(pref_V)
 
                     # Attention ratio (attn_out_norm vs mem_out_norm per layer)
@@ -863,7 +865,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     attn_str = "/".join(attn_ratios)
 
                     # Compact output
-                    print(f"[{step+1}] Ent C/QK/V:{ent_C:.0f}/{ent_QK:.0f}/{ent_V:.0f} | TokVar:{var_C:.4f}/{var_QK:.4f}/{var_V:.4f} | Attn:{attn_str}")
+                    print(f"[{step+1}] Ent C/Q/K/V:{ent_C:.0f}/{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f} | TokVar:{var_C:.4f}/{var_Q:.4f}/{var_K:.4f}/{var_V:.4f} | Attn:{attn_str}")
 
                     # v13.2: Starvation weight and usage EMA logging
                     if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
@@ -893,9 +895,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             print(f"         Starv:{starvation_weight:.3f} | Active C/QK/V:{int(active_C)}/{n_C},{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} | Gini:{gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}")
 
                     # Warning if collapse detected
-                    if min(ent_C, ent_QK, ent_V) < 30:
+                    if min(ent_C, ent_Q, ent_K, ent_V) < 30:
                         print(f"  ⚠ WARNING: Router may be collapsing! (target: 60%)")
-                    elif min(ent_C, ent_QK, ent_V) > 80:
+                    elif min(ent_C, ent_Q, ent_K, ent_V) > 80:
                         print(f"  ⚠ WARNING: Router too uniform! (target: 60%)")
 
                 except Exception:
