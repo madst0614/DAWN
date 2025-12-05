@@ -905,8 +905,27 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
 
             with open(log_file, 'a') as f:
-                f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
-                       f"acc={avg_window_acc:.6f}\n")
+                f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},acc={avg_window_acc:.6f}")
+
+                # v13.2: Add router metrics
+                if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+                    router = base_model.global_routers.neuron_router
+                    if hasattr(router, 'usage_ema_compress'):
+                        active_C = (router.usage_ema_compress > 0.01).sum().item()
+                        active_QK = (router.usage_ema_expand_QK > 0.01).sum().item()
+                        active_V = (router.usage_ema_expand_V > 0.01).sum().item()
+                        def gini(x):
+                            x_sorted = torch.sort(x)[0]
+                            n = x.numel()
+                            idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+                            return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
+                        gini_C = gini(router.usage_ema_compress)
+                        gini_QK = gini(router.usage_ema_expand_QK)
+                        gini_V = gini(router.usage_ema_expand_V)
+                        f.write(f",active_C={int(active_C)},active_QK={int(active_QK)},active_V={int(active_V)}")
+                        f.write(f",gini_C={gini_C:.3f},gini_QK={gini_QK:.3f},gini_V={gini_V:.3f}")
+
+                f.write("\n")
 
             # Collect neuron metrics
             model.eval()
