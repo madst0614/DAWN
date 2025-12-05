@@ -1,8 +1,6 @@
 # DAWN v13.2 Training Config - 20M Scale, 500M tokens
-# Composition over Depth: 4 layers with large QK pool
-# Based on train_config_v13_2_12M_c4_500M.yaml
+# 12L Depth Test: 깊이가 늘면 QK가 압축되는가?
 
-# Data
 data:
   base_dir: /content/drive/MyDrive/data
   train_files:
@@ -10,46 +8,39 @@ data:
     - train/c4/c4_raw_001.pt
   val_files:
     - val/c4/c4_val_50M.pt
-  max_train_tokens: 500000000   # 500M tokens
-  max_val_tokens: 2000000        # 2M tokens
+  max_train_tokens: 500000000
+  max_val_tokens: 2000000
 
-# Model Architecture
 model:
   model_version: "13.2"
   d_model: 384
-  n_layers: 8
+  n_layers: 12                   # 8 → 12
   n_heads: 4
   rank: 64
   state_dim: 64
 
-  # QK 중심 뉴런 배분
-  n_compress: 30
+  n_compress: 36                 # 30 → 36
   n_expand_QK: 200
   n_expand_V: 16
-
   n_knowledge: 300
-  knowledge_k: 16
+  knowledge_k: 20                # 16 → 20
   knowledge_rank: 64
-
   max_seq_len: 512
   dropout: 0.1
   gradient_checkpointing: true
 
-  # Top-k
   top_k_compress: 8
   top_k_QK: 20
   top_k_V: 4
-
   d_space: 64
   router_dropout: 0.1
   token_routing: false
   use_ssm_context: true
 
-# Training
 training:
-  batch_size: 128                # 256 → 128 (메모리)
-  num_epochs: 10
-  lr: 0.0006                     # 배치 작아져서 lr 약간 증가
+  batch_size: 64                 # 128 → 64 (12L 메모리)
+  num_epochs: 3                  # 빠른 검증
+  lr: 0.0005                     # 약간 낮춤
   weight_decay: 0.1
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
@@ -62,16 +53,12 @@ use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v13_2_20M_c4_500M
 log_dir: /content/drive/MyDrive/dawn/logs_v13_2_20M_c4_500M
 
-# 20M Changes (vs 12M):
-#   - d_model: 320 → 384
-#   - n_compress: 24 → 96
-#   - n_expand_QK: 48 → 200 (핵심)
-#   - n_expand_V: 12 → 48
-#   - n_knowledge: 80 → 160
-#   - top_k: 8/10/4 → 12/20/8
-#   - batch_size: 256 → 128
-#   - lr: 0.0004 → 0.0006
+# 12L 실험:
+#   - n_layers: 8 → 12
+#   - batch_size: 128 → 64
+#   - num_epochs: 10 → 3
 #
-# 핵심 가설:
-#   "Depth 대신 Composition"
-#   "4 layers + QK 200 vs 12 layers + QK 72"
+# 예측:
+#   - QK: 200 → 100~130 압축
+#   - V: 4개 유지
+#   - 레이어별 Attn/Know gradient 명확
