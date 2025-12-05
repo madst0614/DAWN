@@ -23,22 +23,22 @@ model:
   state_dim: 64
 
   # QK 중심 뉴런 배분
-  n_compress: 96
+  n_compress: 30
   n_expand_QK: 200
-  n_expand_V: 48
+  n_expand_V: 16
 
-  n_knowledge: 160
-  knowledge_k: 14
+  n_knowledge: 300
+  knowledge_k: 16
   knowledge_rank: 64
 
   max_seq_len: 512
   dropout: 0.1
-  gradient_checkpointing: true
+  gradient_checkpointing: false
 
   # Top-k
-  top_k_compress: 12
+  top_k_compress: 8
   top_k_QK: 20
-  top_k_V: 8
+  top_k_V: 4
 
   d_space: 64
   router_dropout: 0.1
