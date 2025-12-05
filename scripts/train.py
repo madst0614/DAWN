@@ -649,26 +649,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
                     diversity_loss = base_model.knowledge_diversity_loss()
 
-                # Load balance loss
+                # Load balance loss (from model.aux_loss for v13.2+, fallback to old method)
                 lb_loss = 0.0
-                if load_balance_weight > 0 and routing_infos is not None:
-                    if hasattr(base_model, 'load_balance_loss'):
+                if load_balance_weight > 0:
+                    if hasattr(base_model, 'aux_loss') and base_model.aux_loss != 0.0:
+                        lb_loss = base_model.aux_loss
+                    elif routing_infos is not None and hasattr(base_model, 'load_balance_loss'):
                         lb_loss = base_model.load_balance_loss(routing_infos)
 
-                # Entropy loss (for v12.7/v13 with router dropout)
-                ent_loss = 0.0
-                if entropy_weight > 0 and routing_infos is not None:
-                    if hasattr(base_model, 'routing_entropy_loss'):
-                        # Check if it accepts routing_infos (v12.7/v13) or not (older versions)
-                        import inspect
-                        sig = inspect.signature(base_model.routing_entropy_loss)
-                        if len(sig.parameters) > 0:
-                            ent_loss = base_model.routing_entropy_loss(routing_infos)
-                        else:
-                            ent_loss = base_model.routing_entropy_loss()
-
                 # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
                 # NaN/INF detection
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -677,20 +667,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     print(f"  orth_loss: {orth_loss.item() if torch.is_tensor(orth_loss) else orth_loss}")
                     print(f"  diversity_loss: {diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss}")
                     print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
-                    print(f"  ent_loss: {ent_loss.item() if torch.is_tensor(ent_loss) else ent_loss}")
                     raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
             scaler.scale(loss).backward()
-
-            # Free computation graph references from routing_infos
-            if routing_infos is not None:
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', {})
-                    for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad',
-                                'compress_logits', 'expand_logits_Q', 'expand_logits_K', 'expand_logits_V']:
-                        attn.pop(key, None)
-                    mem = layer_info.get('memory', {})
-                    mem.pop('memory_logits', None)
 
             # Gradient clipping
             scaler.unscale_(optimizer)
@@ -729,25 +708,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
                 diversity_loss = base_model.knowledge_diversity_loss()
 
-            # Load balance loss
+            # Load balance loss (from model.aux_loss for v13.2+, fallback to old method)
             lb_loss = 0.0
-            if load_balance_weight > 0 and routing_infos is not None:
-                if hasattr(base_model, 'load_balance_loss'):
+            if load_balance_weight > 0:
+                if hasattr(base_model, 'aux_loss') and base_model.aux_loss != 0.0:
+                    lb_loss = base_model.aux_loss
+                elif routing_infos is not None and hasattr(base_model, 'load_balance_loss'):
                     lb_loss = base_model.load_balance_loss(routing_infos)
 
-            # Entropy loss (for v12.7/v13 with router dropout)
-            ent_loss = 0.0
-            if entropy_weight > 0 and routing_infos is not None:
-                if hasattr(base_model, 'routing_entropy_loss'):
-                    import inspect
-                    sig = inspect.signature(base_model.routing_entropy_loss)
-                    if len(sig.parameters) > 0:
-                        ent_loss = base_model.routing_entropy_loss(routing_infos)
-                    else:
-                        ent_loss = base_model.routing_entropy_loss()
-
             # Total loss
-            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
+            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             # NaN/INF detection
             if torch.isnan(loss) or torch.isinf(loss):
@@ -756,20 +726,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 print(f"  orth_loss: {orth_loss.item() if torch.is_tensor(orth_loss) else orth_loss}")
                 print(f"  diversity_loss: {diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss}")
                 print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
-                print(f"  ent_loss: {ent_loss.item() if torch.is_tensor(ent_loss) else ent_loss}")
                 raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
             loss.backward()
-
-            # Free computation graph references from routing_infos
-            if routing_infos is not None:
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', {})
-                    for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad',
-                                'compress_logits', 'expand_logits_Q', 'expand_logits_K', 'expand_logits_V']:
-                        attn.pop(key, None)
-                    mem = layer_info.get('memory', {})
-                    mem.pop('memory_logits', None)
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
