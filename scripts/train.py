@@ -846,8 +846,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ent_V = calc_entropy_ratio(pref_V)
                     ent_C = calc_entropy_ratio(pref_C)
 
-                    # Token variance (Q만 대표로)
-                    var_Q = calc_token_var(pref_Q)
+                    # Token variance (C/QK/V)
+                    var_C = calc_token_var(pref_C)
+                    var_QK = (calc_token_var(pref_Q) + calc_token_var(pref_K)) / 2
+                    var_V = calc_token_var(pref_V)
 
                     # Attention ratio (attn_out_norm vs mem_out_norm per layer)
                     attn_ratios = []
@@ -862,7 +864,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     attn_str = "/".join(attn_ratios)
 
                     # Compact output
-                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Attn:{attn_str}")
+                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar C/QK/V:{var_C:.4f}/{var_QK:.4f}/{var_V:.4f} | Attn:{attn_str}")
 
                     # v13.2: Starvation weight and usage EMA logging
                     if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
