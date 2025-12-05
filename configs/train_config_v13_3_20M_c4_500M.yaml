@@ -16,29 +16,29 @@ data:
 # Model Architecture
 model:
   model_version: "13.3"
-  d_model: 384                   # 320 → 384
+  d_model: 384
   n_layers: 4
   n_heads: 4
   rank: 64
   state_dim: 64
 
-  # QK 중심 뉴런 배분 (12M 대비 ~4배)
-  n_compress: 96                 # 24 → 96
-  n_expand_QK: 200               # 48 → 200 (핵심!)
-  n_expand_V: 48                 # 12 → 48
+  # QK 중심 뉴런 배분
+  n_compress: 96
+  n_expand_QK: 200
+  n_expand_V: 48
 
-  n_knowledge: 160               # 80 → 160
-  knowledge_k: 14                # 10 → 14
+  n_knowledge: 160
+  knowledge_k: 14
   knowledge_rank: 64
 
   max_seq_len: 512
   dropout: 0.1
   gradient_checkpointing: true
 
-  # Top-k (조합력 증가)
-  top_k_compress: 12             # 8 → 12
-  top_k_QK: 20                   # 10 → 20
-  top_k_V: 8                     # 4 → 8
+  # Top-k
+  top_k_compress: 12
+  top_k_QK: 20
+  top_k_V: 8
 
   d_space: 64
   router_dropout: 0.1
@@ -47,9 +47,9 @@ model:
 
 # Training
 training:
-  batch_size: 256
+  batch_size: 128                # 256 → 128 (메모리)
   num_epochs: 10
-  lr: 0.0004
+  lr: 0.0006                     # 배치 작아져서 lr 약간 증가
   weight_decay: 0.1
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
@@ -65,14 +65,13 @@ log_dir: /content/drive/MyDrive/dawn/logs_v13_3_20M_c4_500M
 # v13.3 Changes (vs 12M):
 #   - d_model: 320 → 384
 #   - n_compress: 24 → 96
-#   - n_expand_QK: 48 → 200 (4배, 핵심)
+#   - n_expand_QK: 48 → 200 (핵심)
 #   - n_expand_V: 12 → 48
 #   - n_knowledge: 80 → 160
 #   - top_k: 8/10/4 → 12/20/8
+#   - batch_size: 256 → 128
+#   - lr: 0.0004 → 0.0006
 #
 # 핵심 가설:
-#   "QK 뉴런 조합으로 관계 표현"
-#   "Layer 수 유지, 뉴런 풀 확장"
 #   "Depth 대신 Composition"
-#
-# 예상 파라미터: ~20M
+#   "4 layers + QK 200 vs 12 layers + QK 72"
