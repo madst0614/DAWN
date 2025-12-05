@@ -1,0 +1,63 @@
+# DAWN v13.2 Training Config - 12L 깊이 실험
+# 가설: 깊이가 늘면 QK가 압축된다
+
+# Data - 동일
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+    - train/c4/c4_raw_001.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 500000000
+  max_val_tokens: 2000000
+
+# Model Architecture
+model:
+  model_version: "13.2"
+  d_model: 384
+  n_layers: 12              # 4 → 12 (핵심 변경)
+  n_heads: 4
+  rank: 64
+  state_dim: 64
+
+  n_compress: 36            # 30 → 36 (4L 실험과 동일하게)
+  n_expand_QK: 200          # 유지
+  n_expand_V: 16            # 유지
+  n_knowledge: 300          # 유지
+  knowledge_k: 20           # 16 → 20 (4L 실험과 동일)
+  knowledge_rank: 64
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true  # 메모리 위해 필수
+
+  top_k_compress: 8
+  top_k_QK: 20
+  top_k_V: 4
+  d_space: 64
+  router_dropout: 0.1
+  token_routing: false
+  use_ssm_context: true
+
+# Training
+training:
+  batch_size: 64            # 128 → 64 (12L 메모리)
+  num_epochs: 3             # 10 → 3 (빠른 확인)
+  lr: 0.0005                # 약간 낮춤
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v13_2_12L_depth_test
+log_dir: /content/drive/MyDrive/dawn/logs_v13_2_12L_depth_test
+
+# 12L 실험 목표:
+#   1. QK가 200 → 100~130으로 압축되는가?
+#   2. V는 4개 유지되는가?
+#   3. 레이어별 Know/Attn 비율 gradient 보이는가?
+#   4. C는 유지되는가?
