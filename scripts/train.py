@@ -857,6 +857,39 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                             print(f"         Starv:{starvation_weight:.3f} | Active C/QK/V:{int(active_C)}/{n_C},{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} | Gini:{gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}")
 
+                    # Knowledge neuron usage stats
+                    try:
+                        # Collect knowledge indices from all layers
+                        all_knowledge_idx = []
+                        for layer_info in routing_infos:
+                            mem = layer_info.get('memory', {})
+                            k_idx = mem.get('knowledge_indices')
+                            if k_idx is not None:
+                                all_knowledge_idx.append(k_idx.flatten())
+
+                        if all_knowledge_idx:
+                            all_idx = torch.cat(all_knowledge_idx)
+                            n_knowledge = base_model.n_knowledge if hasattr(base_model, 'n_knowledge') else 80
+
+                            # Count usage per knowledge neuron
+                            usage_counts = torch.bincount(all_idx.long(), minlength=n_knowledge).float()
+                            usage_freq = usage_counts / (usage_counts.sum() + 1e-8)
+
+                            # Active: neurons used at least once
+                            active_K = (usage_counts > 0).sum().item()
+
+                            # Entropy (normalized)
+                            ent_K = -(usage_freq * (usage_freq + 1e-8).log()).sum()
+                            max_ent = math.log(n_knowledge)
+                            ent_ratio_K = (ent_K / max_ent * 100).item()
+
+                            # Gini
+                            gini_K = gini(usage_freq)
+
+                            print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f}")
+                    except Exception:
+                        pass
+
                     # Warning if collapse detected
                     if min(ent_C, ent_Q, ent_K, ent_V) < 30:
                         print(f"  ⚠ WARNING: Router may be collapsing! (target: 60%)")
