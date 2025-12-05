@@ -72,8 +72,11 @@ class UnifiedNeuronRouter(nn.Module):
         h_proj = self.proj(x)  # [B, S, d_space]
         h_proj = self.dropout(h_proj)
 
+        # Normalize neuron embeddings only (preserve token magnitude for routing signal)
+        neuron_emb_norm = F.normalize(self.neuron_emb, dim=-1)
+
         # 전체 뉴런과 내적
-        all_logits = torch.einsum('bsd,nd->bsn', h_proj, self.neuron_emb)
+        all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
 
         # 타입별 슬라이싱 + starvation
         if neuron_type in ['compress', 'memory']:
@@ -775,9 +778,9 @@ class DAWN(nn.Module):
         B, S = input_ids.shape
         device = input_ids.device
 
-        # Calculate starvation weight (decays from 1.0 to 0.0 over training)
+        # Calculate starvation weight (exponential decay with floor for continued exploration)
         if step is not None and total_steps is not None and total_steps > 0:
-            starvation_weight = max(0.0, 1.0 - step / total_steps)
+            starvation_weight = max(0.05, math.exp(-3.0 * step / total_steps))
         else:
             starvation_weight = 0.0  # default (inference or not provided)
 
