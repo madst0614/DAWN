@@ -17,7 +17,7 @@ data:
 model:
   model_version: "13.2"
   d_model: 384
-  n_layers: 4
+  n_layers: 8
   n_heads: 4
   rank: 64
   state_dim: 64
