@@ -27,7 +27,7 @@ model:
   knowledge_rank: 64
   max_seq_len: 512
   dropout: 0.1
-  gradient_checkpointing: true
+  gradient_checkpointing: false
 
   top_k_compress: 8
   top_k_QK: 20
