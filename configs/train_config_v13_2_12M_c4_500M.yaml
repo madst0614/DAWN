@@ -36,6 +36,7 @@ model:
   d_space: 64        # Unified neuron embedding space
   router_dropout: 0.1
   token_routing: false
+  use_ssm_context: false
 
 # Training
 training:
