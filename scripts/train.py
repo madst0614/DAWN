@@ -823,8 +823,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             attn_ratios.append("-")
                     attn_str = "/".join(attn_ratios)
 
-                    # Compact output
-                    print(f"[{step+1}] Ent C/Q/K/V:{ent_C:.0f}/{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f} | TokVar:{var_C:.4f}/{var_Q:.4f}/{var_K:.4f}/{var_V:.4f} | Attn:{attn_str}")
+                    # Compute window average for display
+                    avg_loss = window_loss / window_count if window_count > 0 else 0.0
+                    avg_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
+
+                    # Compact output with loss/acc
+                    print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | Ent C/Q/K/V:{ent_C:.0f}/{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f} | TokVar:{var_C:.4f}/{var_Q:.4f}/{var_K:.4f}/{var_V:.4f} | Attn:{attn_str}")
 
                     # v13.2: Starvation weight and usage EMA logging
                     if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
