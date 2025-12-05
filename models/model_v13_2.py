@@ -168,12 +168,16 @@ class GlobalSSM(nn.Module):
     Mamba 라이브러리 사용 시 O(S) → O(log S) 병렬화
 
     - Selective: 토큰별 delta, B_t로 중요 정보만 h_final에 남김
-    - Context: states를 x에 더해서 병목 보완
+    - Context: states를 x에 더해서 병목 보완 (optional)
+
+    Args:
+        return_context: if False, skips context computation for memory savings
     """
-    def __init__(self, d_model: int, state_dim: int):
+    def __init__(self, d_model: int, state_dim: int, return_context: bool = True):
         super().__init__()
         self.d_model = d_model
         self.state_dim = state_dim
+        self.return_context = return_context
 
         # Mamba-style parameters
         # A: [d_model, state_dim] - 채널별 decay
@@ -254,14 +258,17 @@ class GlobalSSM(nn.Module):
         # Normalize SSM output (값 폭발 방지)
         ssm_out = self.ssm_norm(ssm_out)
 
-        # Context enhancement (scaled for stability)
-        context = self.context_proj(ssm_out) * self.context_scale  # [B, S, d_model]
-
-        # Importance from final state (mean pool as approximation)
+        # Importance from final state
         h_final = ssm_out[:, -1, :]  # [B, d_model]
         h_proj = self.importance_proj(h_final)  # [B, d_model]
         raw_importance = torch.einsum('bsd,bd->bs', x, h_proj)  # [B, S] - before softmax
         importance = F.softmax(raw_importance / self.importance_temperature, dim=-1)
+
+        # Context enhancement (optional, for memory savings)
+        if self.return_context:
+            context = self.context_proj(ssm_out) * self.context_scale  # [B, S, d_model]
+        else:
+            context = None
 
         return importance, context, raw_importance
 
@@ -694,6 +701,7 @@ class DAWN(nn.Module):
         router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
         token_routing: bool = False,
+        use_ssm_context: bool = True,
         **kwargs
     ):
         super().__init__()
@@ -713,6 +721,7 @@ class DAWN(nn.Module):
         self.token_routing = token_routing
         self.router_dropout = router_dropout
         self.gradient_checkpointing = gradient_checkpointing
+        self.use_ssm_context = use_ssm_context
 
         self.n_compress = n_compress
         self.n_expand_QK = n_expand_QK
@@ -732,8 +741,8 @@ class DAWN(nn.Module):
             n_knowledge=n_knowledge, knowledge_rank=self.knowledge_rank,
         )
 
-        # Selective SSM with context
-        self.global_ssm = GlobalSSM(d_model, state_dim)
+        # Selective SSM with context (optional for memory savings)
+        self.global_ssm = GlobalSSM(d_model, state_dim, return_context=use_ssm_context)
 
         # Unified Neuron Router (replaces 5 separate routers)
         self.global_routers = GlobalRouters(
@@ -802,7 +811,8 @@ class DAWN(nn.Module):
                 )
             else:
                 importance, context, raw_importance = self.global_ssm(x)
-            x = x + context
+            if context is not None:
+                x = x + context
 
             if self.gradient_checkpointing and self.training:
                 x, routing_info, layer_aux_loss = checkpoint(
