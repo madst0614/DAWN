@@ -1,0 +1,58 @@
+# DAWN v13.2 Training Config
+# UnifiedNeuronRouter: 5 routers → 1 unified router with shared projection
+# All neurons in same d_space embedding space
+# Starvation bonus with decay for early exploration
+
+# vs v13.1: Separate Q/K/V routers
+# vs v13.2: UnifiedNeuronRouter (~25K params vs ~42K)
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - val/wikitext_5to1_texts.pkl
+
+# Model Architecture
+model:
+  model_version: "13.2"
+  d_model: 320
+  n_layers: 4
+  n_heads: 4
+  rank: 64
+  # Neurons
+  n_compress: 48
+  n_expand_QK: 12
+  n_expand_V: 12
+  n_knowledge: 80
+  knowledge_k: 10
+  knowledge_rank: 64
+  max_seq_len: 128
+  dropout: 0.1
+  state_dim: 64
+  # Top-k sparse mixing
+  top_k_compress: 8
+  top_k_QK: 4
+  top_k_V: 6
+  # Unified router
+  d_space: 64
+  router_dropout: 0.1
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+  # Regularization
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0    # starvation이 대체
+  entropy_weight: 0.0         # starvation이 대체
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v13_2
+log_dir: /content/drive/MyDrive/dawn/logs_v13_2
