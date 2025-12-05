@@ -1,4 +1,4 @@
-# DAWN v13.3 Training Config - 20M Scale, 500M tokens
+# DAWN v13.2 Training Config - 20M Scale, 500M tokens
 # Composition over Depth: 4 layers with large QK pool
 # Based on train_config_v13_2_12M_c4_500M.yaml
 
@@ -59,10 +59,10 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v13_3_20M_c4_500M
-log_dir: /content/drive/MyDrive/dawn/logs_v13_3_20M_c4_500M
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v13_2_20M_c4_500M
+log_dir: /content/drive/MyDrive/dawn/logs_v13_2_20M_c4_500M
 
-# v13.3 Changes (vs 12M):
+# 20M Changes (vs 12M):
 #   - d_model: 320 → 384
 #   - n_compress: 24 → 96
 #   - n_expand_QK: 48 → 200 (핵심)
