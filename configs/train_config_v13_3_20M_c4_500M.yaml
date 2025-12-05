@@ -15,7 +15,7 @@ data:
 
 # Model Architecture
 model:
-  model_version: "13.3"
+  model_version: "13.2"
   d_model: 384
   n_layers: 4
   n_heads: 4
