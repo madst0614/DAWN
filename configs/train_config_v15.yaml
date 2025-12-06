@@ -1,0 +1,67 @@
+# DAWN v15 Training Config
+# Direct Knowledge Projection (NeuronMemory bypasses Feature neurons)
+# F(eature), R(elational), T(ransfer), K(nowledge) neurons
+
+# vs v14: Memory uses direct proj_k instead of Feature-weighted query
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - val/wikitext_5to1_texts.pkl
+
+# Model Architecture
+model:
+  model_version: "15.0"
+  d_model: 320
+  n_layers: 4
+  n_heads: 4
+  rank: 64
+  state_dim: 64
+
+  # FRTK Neurons
+  n_feature: 12
+  n_relational: 48
+  n_transfer: 12
+  n_knowledge: 80
+  knowledge_k: 10
+  knowledge_rank: 128            # v15: 64 → 128 (larger matching space)
+  max_seq_len: 128
+  dropout: 0.1
+
+  # Top-k sparse mixing
+  top_k_feature: 3
+  top_k_relational: 12
+  top_k_transfer: 3
+
+  # Router settings
+  d_space: 64
+  router_dropout: 0.1
+  token_routing: false
+  use_ssm_context: true
+  gradient_checkpointing: false
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+  # Regularization
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v15
+log_dir: /content/drive/MyDrive/dawn/logs_v15
+
+# v15 Changes from v14:
+#   - NeuronMemory: x → proj_k → Q (bypass Feature neurons)
+#   - knowledge_rank: 64 → 128 (larger matching space)
+#   - No memory routing (memory_weights removed)
