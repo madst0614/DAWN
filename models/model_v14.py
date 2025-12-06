@@ -1,17 +1,23 @@
 """
-DAWN v13.2: Unified Neuron Router
+DAWN v14: Feature-Relational-Transfer-Knowledge (FRTK) Architecture
 
-Changes from v13.1:
-- 5 separate routers → 1 UnifiedNeuronRouter
-- All neurons (compress, expand_QK, expand_V) in same d_space embedding
-- Token projection → dot product with neuron embeddings
-- Starvation bonus with decay for early exploration
-- Usage EMA tracking per neuron type
+Changes from v13.2:
+- Renamed neuron types for clarity:
+  * compress → feature (F)
+  * expand_QK → relational (R)
+  * expand_V → transfer (T)
+  * knowledge → knowledge (K)
+- Starvation weight → Excitability (refractory-inspired)
+  * usage_ema ≈ 0 → excitability = 1.0 (ready to fire)
+  * usage_ema ≈ tau → excitability ≈ 0.0 (refractory)
+  * Provides opportunity, gradient decides the rest
 
-Architecture:
-- Pool: QK shared, V separate (same as v13.1)
-- Router: 1 unified router with shared projection
-- Routing: token → proj → dot product → type-specific slicing
+Architecture (FRTK):
+- Feature Neurons (F): x → low-rank projection (compress)
+- Relational Neurons (R): Q/K generation for attention patterns
+- Transfer Neurons (T): V generation for value transfer
+- Knowledge Neurons (K): factual memory retrieval
+- Unified router with Excitability for balanced usage
 """
 
 import math
@@ -33,24 +39,25 @@ class UnifiedNeuronRouter(nn.Module):
     """
     통합 뉴런 임베딩 공간에서 토큰-뉴런 매칭
 
-    모든 뉴런(compress, expand_QK, expand_V)이 같은 공간에 존재.
+    모든 뉴런(feature, relational, transfer)이 같은 공간에 존재.
     토큰이 투영되어 가까운 뉴런 선택.
+    Excitability (refractory-inspired)로 균형 잡힌 사용 유도.
     """
-    def __init__(self, d_model, n_compress, n_expand_QK, n_expand_V,
+    def __init__(self, d_model, n_feature, n_relational, n_transfer,
                  d_space=64, dropout=0.1):
         super().__init__()
-        self.n_compress = n_compress
-        self.n_expand_QK = n_expand_QK
-        self.n_expand_V = n_expand_V
+        self.n_feature = n_feature
+        self.n_relational = n_relational
+        self.n_transfer = n_transfer
         self.d_space = d_space
 
-        total_neurons = n_compress + n_expand_QK + n_expand_V
+        total_neurons = n_feature + n_relational + n_transfer
         self.total_neurons = total_neurons
 
         # 인덱스 경계
-        self.compress_end = n_compress
-        self.expand_QK_end = n_compress + n_expand_QK
-        # expand_V는 expand_QK_end ~ total_neurons
+        self.feature_end = n_feature
+        self.relational_end = n_feature + n_relational
+        # transfer는 relational_end ~ total_neurons
 
         # 공유 projection
         self.proj = nn.Linear(d_model, d_space)
@@ -60,14 +67,35 @@ class UnifiedNeuronRouter(nn.Module):
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
         # 타입별 usage 추적
-        self.register_buffer('usage_ema_compress', torch.zeros(n_compress))
-        self.register_buffer('usage_ema_expand_QK', torch.zeros(n_expand_QK))
-        self.register_buffer('usage_ema_expand_V', torch.zeros(n_expand_V))
+        self.register_buffer('usage_ema_feature', torch.zeros(n_feature))
+        self.register_buffer('usage_ema_relational', torch.zeros(n_relational))
+        self.register_buffer('usage_ema_transfer', torch.zeros(n_transfer))
 
-    def get_logits(self, x, neuron_type, starvation_weight=0.0):
+        # Excitability: tau (recovery time constant) + decaying weight
+        self.tau = 1.0
+        self.excitability_weight = 1.0  # Decays over training (like starvation)
+
+    def decay_excitability(self, decay_rate=0.9995):
+        """Decay excitability_weight each step. Call from training loop."""
+        self.excitability_weight *= decay_rate
+
+    def get_excitability(self, usage_ema):
+        """
+        Neuronal excitability based on usage.
+        Mirrors biological refractory dynamics.
+
+        - usage_ema ≈ 0 → excitability = 1.0 (fully ready)
+        - usage_ema ≈ tau → excitability ≈ 0.0 (refractory)
+
+        Unlike floor/ceiling approaches, this just provides opportunity -
+        gradient decides the rest.
+        """
+        return torch.clamp(1.0 - usage_ema / self.tau, min=0.0, max=1.0)
+
+    def get_logits(self, x, neuron_type):
         """
         x: [B, S, d_model]
-        neuron_type: 'compress', 'expand_Q', 'expand_K', 'expand_V', 'memory'
+        neuron_type: 'feature', 'relational_Q', 'relational_K', 'transfer', 'memory'
         """
         h_proj = self.proj(x)  # [B, S, d_space]
         h_proj = self.dropout(h_proj)
@@ -78,24 +106,24 @@ class UnifiedNeuronRouter(nn.Module):
         # 전체 뉴런과 내적
         all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
 
-        # 타입별 슬라이싱 + starvation
-        if neuron_type in ['compress', 'memory']:
-            logits = all_logits[..., :self.compress_end]
-            if self.training and starvation_weight > 0:
-                bonus = (1 - self.usage_ema_compress) * starvation_weight
-                logits = logits + bonus
+        # 타입별 슬라이싱 + Excitability (refractory-inspired)
+        if neuron_type in ['feature', 'memory']:
+            logits = all_logits[..., :self.feature_end]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_feature)
+                logits = logits + excitability * self.excitability_weight
 
-        elif neuron_type in ['expand_Q', 'expand_K']:
-            logits = all_logits[..., self.compress_end:self.expand_QK_end]
-            if self.training and starvation_weight > 0:
-                bonus = (1 - self.usage_ema_expand_QK) * starvation_weight
-                logits = logits + bonus
+        elif neuron_type in ['relational_Q', 'relational_K']:
+            logits = all_logits[..., self.feature_end:self.relational_end]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_relational)
+                logits = logits + excitability * self.excitability_weight
 
-        elif neuron_type == 'expand_V':
-            logits = all_logits[..., self.expand_QK_end:]
-            if self.training and starvation_weight > 0:
-                bonus = (1 - self.usage_ema_expand_V) * starvation_weight
-                logits = logits + bonus
+        elif neuron_type == 'transfer':
+            logits = all_logits[..., self.relational_end:]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_transfer)
+                logits = logits + excitability * self.excitability_weight
 
         return logits
 
@@ -110,22 +138,22 @@ class UnifiedNeuronRouter(nn.Module):
         else:
             usage = (weights > 0).float().mean(dim=0)
 
-        if neuron_type in ['compress', 'memory']:
-            self.usage_ema_compress = 0.99 * self.usage_ema_compress + 0.01 * usage
-        elif neuron_type in ['expand_Q', 'expand_K']:
-            self.usage_ema_expand_QK = 0.99 * self.usage_ema_expand_QK + 0.01 * usage
-        elif neuron_type == 'expand_V':
-            self.usage_ema_expand_V = 0.99 * self.usage_ema_expand_V + 0.01 * usage
+        if neuron_type in ['feature', 'memory']:
+            self.usage_ema_feature = 0.99 * self.usage_ema_feature + 0.01 * usage
+        elif neuron_type == 'relational':
+            self.usage_ema_relational = 0.99 * self.usage_ema_relational + 0.01 * usage
+        elif neuron_type == 'transfer':
+            self.usage_ema_transfer = 0.99 * self.usage_ema_transfer + 0.01 * usage
 
 class SharedNeurons(nn.Module):
-    """v13.1: Shared neurons with separate QK/V expand pools"""
+    """v14: Shared neurons with FRTK naming"""
     def __init__(
         self,
         d_model: int,
         rank: int,
-        n_compress: int,
-        n_expand_QK: int,
-        n_expand_V: int,
+        n_feature: int,
+        n_relational: int,
+        n_transfer: int,
         n_knowledge: int,
         knowledge_rank: int = None,
     ):
@@ -133,32 +161,32 @@ class SharedNeurons(nn.Module):
         self.d_model = d_model
         self.rank = rank
         self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
-        self.n_compress = n_compress
-        self.n_expand_QK = n_expand_QK
-        self.n_expand_V = n_expand_V
+        self.n_feature = n_feature
+        self.n_relational = n_relational
+        self.n_transfer = n_transfer
         self.n_knowledge = n_knowledge
 
-        # Compress pool: [n_compress, d_model, rank]
-        self.compress_neurons = nn.Parameter(torch.zeros(n_compress, d_model, rank))
+        # Feature pool: [n_feature, d_model, rank]
+        self.feature_neurons = nn.Parameter(torch.zeros(n_feature, d_model, rank))
 
-        # Separate expand pools: QK shared, V separate
-        self.expand_neurons_QK = nn.Parameter(torch.zeros(n_expand_QK, rank, d_model))
-        self.expand_neurons_V = nn.Parameter(torch.zeros(n_expand_V, rank, d_model))
+        # Separate expand pools: Relational shared, Transfer separate
+        self.relational_neurons = nn.Parameter(torch.zeros(n_relational, rank, d_model))
+        self.transfer_neurons = nn.Parameter(torch.zeros(n_transfer, rank, d_model))
 
-        self.knowledge_K = nn.Parameter(torch.zeros(n_knowledge, self.knowledge_rank))
-        self.knowledge_V = nn.Parameter(torch.zeros(n_knowledge, d_model))
+        self.knowledge_neurons_K = nn.Parameter(torch.zeros(n_knowledge, self.knowledge_rank))
+        self.knowledge_neurons_V = nn.Parameter(torch.zeros(n_knowledge, d_model))
 
         self._init_parameters()
 
     def _init_parameters(self):
-        for i in range(self.n_compress):
-            nn.init.orthogonal_(self.compress_neurons.data[i])
-        for i in range(self.n_expand_QK):
-            nn.init.orthogonal_(self.expand_neurons_QK.data[i])
-        for i in range(self.n_expand_V):
-            nn.init.orthogonal_(self.expand_neurons_V.data[i])
-        nn.init.normal_(self.knowledge_K, std=0.02)
-        nn.init.normal_(self.knowledge_V, std=0.02)
+        for i in range(self.n_feature):
+            nn.init.orthogonal_(self.feature_neurons.data[i])
+        for i in range(self.n_relational):
+            nn.init.orthogonal_(self.relational_neurons.data[i])
+        for i in range(self.n_transfer):
+            nn.init.orthogonal_(self.transfer_neurons.data[i])
+        nn.init.normal_(self.knowledge_neurons_K, std=0.02)
+        nn.init.normal_(self.knowledge_neurons_V, std=0.02)
 
 
 class GlobalSSM(nn.Module):
@@ -301,29 +329,29 @@ class GlobalSSM(nn.Module):
 
 class GlobalRouters(nn.Module):
     """
-    v13.2: Unified neuron space routing
+    v14: Unified neuron space routing with FRTK naming
 
     1 UnifiedNeuronRouter for all neuron types:
     - All neurons in same d_space embedding
-    - Type-specific slicing for compress/expand_QK/expand_V
-    - Starvation bonus with decay
+    - Type-specific slicing for feature/relational/transfer
+    - Excitability (refractory-inspired) for balanced usage
     """
-    def __init__(self, d_model: int, n_compress: int, n_expand_QK: int, n_expand_V: int,
-                 top_k_compress: int = 8, top_k_QK: int = 4, top_k_V: int = 6,
+    def __init__(self, d_model: int, n_feature: int, n_relational: int, n_transfer: int,
+                 top_k_feature: int = 8, top_k_relational: int = 4, top_k_transfer: int = 6,
                  d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False):
         super().__init__()
         self.d_model = d_model
-        self.n_compress = n_compress
-        self.n_expand_QK = n_expand_QK
-        self.n_expand_V = n_expand_V
-        self.top_k_compress = top_k_compress
-        self.top_k_QK = top_k_QK
-        self.top_k_V = top_k_V
+        self.n_feature = n_feature
+        self.n_relational = n_relational
+        self.n_transfer = n_transfer
+        self.top_k_feature = top_k_feature
+        self.top_k_relational = top_k_relational
+        self.top_k_transfer = top_k_transfer
         self.token_routing = token_routing
 
         # Unified router (replaces 5 separate routers)
         self.neuron_router = UnifiedNeuronRouter(
-            d_model, n_compress, n_expand_QK, n_expand_V,
+            d_model, n_feature, n_relational, n_transfer,
             d_space=d_space, dropout=router_dropout
         )
 
@@ -335,109 +363,111 @@ class GlobalRouters(nn.Module):
         sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-8)
         return sparse_weights, topk_idx
 
-    def get_attention_weights(self, x, importance, starvation_weight=0.0):
+    def get_attention_weights(self, x, importance):
         """
         Compute attention routing weights with Top-k sparsification
 
-        Returns: compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, routing_info, aux_loss
+        Returns: feature_weights, relational_weights_Q, relational_weights_K, transfer_weights, routing_info, aux_loss
         """
-        # Get logits from unified router
-        compress_logits = self.neuron_router.get_logits(x, 'compress', starvation_weight)
-        expand_logits_Q = self.neuron_router.get_logits(x, 'expand_Q', starvation_weight)
-        expand_logits_K = self.neuron_router.get_logits(x, 'expand_K', starvation_weight)
-        expand_logits_V = self.neuron_router.get_logits(x, 'expand_V', starvation_weight)
+        # Get logits from unified router (Excitability applied internally)
+        feature_logits = self.neuron_router.get_logits(x, 'feature')
+        relational_logits_Q = self.neuron_router.get_logits(x, 'relational_Q')
+        relational_logits_K = self.neuron_router.get_logits(x, 'relational_K')
+        transfer_logits = self.neuron_router.get_logits(x, 'transfer')
 
-        compress_pref = F.softmax(compress_logits, dim=-1)
-        expand_pref_Q = F.softmax(expand_logits_Q, dim=-1)
-        expand_pref_K = F.softmax(expand_logits_K, dim=-1)
-        expand_pref_V = F.softmax(expand_logits_V, dim=-1)
+        feature_pref = F.softmax(feature_logits, dim=-1)
+        relational_pref_Q = F.softmax(relational_logits_Q, dim=-1)
+        relational_pref_K = F.softmax(relational_logits_K, dim=-1)
+        transfer_pref = F.softmax(transfer_logits, dim=-1)
 
         # Compute aux_loss (load balance) directly here
         aux_loss = 0.0
         if self.training:
-            # Compress
-            usage_C = compress_pref.mean(dim=(0, 1))
-            target_C = 1.0 / self.n_compress
-            aux_loss = aux_loss + ((usage_C - target_C) ** 2).sum() * self.n_compress
+            # Feature
+            usage_F = feature_pref.mean(dim=(0, 1))
+            target_F = 1.0 / self.n_feature
+            aux_loss = aux_loss + ((usage_F - target_F) ** 2).sum() * self.n_feature
 
-            # Q expand
-            usage_Q = expand_pref_Q.mean(dim=(0, 1))
-            target_QK = 1.0 / self.n_expand_QK
-            aux_loss = aux_loss + ((usage_Q - target_QK) ** 2).sum() * self.n_expand_QK
+            # Relational Q
+            usage_Q = relational_pref_Q.mean(dim=(0, 1))
+            target_R = 1.0 / self.n_relational
+            aux_loss = aux_loss + ((usage_Q - target_R) ** 2).sum() * self.n_relational
 
-            # K expand
-            usage_K = expand_pref_K.mean(dim=(0, 1))
-            aux_loss = aux_loss + ((usage_K - target_QK) ** 2).sum() * self.n_expand_QK
+            # Relational K
+            usage_K = relational_pref_K.mean(dim=(0, 1))
+            aux_loss = aux_loss + ((usage_K - target_R) ** 2).sum() * self.n_relational
 
-            # V expand
-            usage_V = expand_pref_V.mean(dim=(0, 1))
-            target_V = 1.0 / self.n_expand_V
-            aux_loss = aux_loss + ((usage_V - target_V) ** 2).sum() * self.n_expand_V
+            # Transfer
+            usage_T = transfer_pref.mean(dim=(0, 1))
+            target_T = 1.0 / self.n_transfer
+            aux_loss = aux_loss + ((usage_T - target_T) ** 2).sum() * self.n_transfer
 
         if self.token_routing:
             # Token-level routing: use per-token weights directly [B, S, N]
-            compress_weights = compress_pref
-            expand_weights_Q = expand_pref_Q
-            expand_weights_K = expand_pref_K
-            expand_weights_V = expand_pref_V
+            feature_weights = feature_pref
+            relational_weights_Q = relational_pref_Q
+            relational_weights_K = relational_pref_K
+            transfer_weights = transfer_pref
 
             routing_info = {
-                'compress_weights': compress_weights.detach(),
-                'expand_weights_Q': expand_weights_Q.detach(),
-                'expand_weights_K': expand_weights_K.detach(),
-                'expand_weights_V': expand_weights_V.detach(),
+                'feature_weights': feature_weights.detach(),
+                'relational_weights_Q': relational_weights_Q.detach(),
+                'relational_weights_K': relational_weights_K.detach(),
+                'transfer_weights': transfer_weights.detach(),
                 'token_routing': True,
             }
         else:
             # Batch-level routing: aggregate by importance [B, N]
-            compress_weights_dense = torch.einsum('bs,bsn->bn', importance, compress_pref)
-            expand_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_Q)
-            expand_weights_K_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_K)
-            expand_weights_V_dense = torch.einsum('bs,bsn->bn', importance, expand_pref_V)
+            feature_weights_dense = torch.einsum('bs,bsn->bn', importance, feature_pref)
+            relational_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_Q)
+            relational_weights_K_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_K)
+            transfer_weights_dense = torch.einsum('bs,bsn->bn', importance, transfer_pref)
 
             # Top-k sparsification
-            compress_weights, compress_topk_idx = self._topk_sparsify(compress_weights_dense, self.top_k_compress)
-            expand_weights_Q, expand_topk_idx_Q = self._topk_sparsify(expand_weights_Q_dense, self.top_k_QK)
-            expand_weights_K, expand_topk_idx_K = self._topk_sparsify(expand_weights_K_dense, self.top_k_QK)
-            expand_weights_V, expand_topk_idx_V = self._topk_sparsify(expand_weights_V_dense, self.top_k_V)
+            feature_weights, feature_topk_idx = self._topk_sparsify(feature_weights_dense, self.top_k_feature)
+            relational_weights_Q, relational_topk_idx_Q = self._topk_sparsify(relational_weights_Q_dense, self.top_k_relational)
+            relational_weights_K, relational_topk_idx_K = self._topk_sparsify(relational_weights_K_dense, self.top_k_relational)
+            transfer_weights, transfer_topk_idx = self._topk_sparsify(transfer_weights_dense, self.top_k_transfer)
 
             routing_info = {
                 # Sparse weights (for forward)
-                'compress_weights': compress_weights.detach(),
-                'expand_weights_Q': expand_weights_Q.detach(),
-                'expand_weights_K': expand_weights_K.detach(),
-                'expand_weights_V': expand_weights_V.detach(),
+                'feature_weights': feature_weights.detach(),
+                'relational_weights_Q': relational_weights_Q.detach(),
+                'relational_weights_K': relational_weights_K.detach(),
+                'transfer_weights': transfer_weights.detach(),
                 # Token-level preferences (for monitoring)
-                'compress_pref': compress_pref.detach(),
-                'expand_pref_Q': expand_pref_Q.detach(),
-                'expand_pref_K': expand_pref_K.detach(),
-                'expand_pref_V': expand_pref_V.detach(),
+                'feature_pref': feature_pref.detach(),
+                'relational_pref_Q': relational_pref_Q.detach(),
+                'relational_pref_K': relational_pref_K.detach(),
+                'transfer_pref': transfer_pref.detach(),
                 'token_routing': False,
             }
 
         # Update usage statistics
         if self.training:
-            self.neuron_router.update_usage(compress_weights, 'compress')
-            self.neuron_router.update_usage(expand_weights_Q, 'expand_Q')
-            self.neuron_router.update_usage(expand_weights_K, 'expand_K')
-            self.neuron_router.update_usage(expand_weights_V, 'expand_V')
+            self.neuron_router.update_usage(feature_weights, 'feature')
+            self.neuron_router.update_usage(transfer_weights, 'transfer')
 
-        return compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V, routing_info, aux_loss
+            # Relational: Q OR K에서 선택되면 사용된 것으로 카운트
+            relational_used = ((relational_weights_Q > 0) | (relational_weights_K > 0)).float()
+            self.neuron_router.update_usage(relational_used, 'relational')
 
-    def get_memory_weights(self, x, importance, starvation_weight=0.0):
+        return feature_weights, relational_weights_Q, relational_weights_K, transfer_weights, routing_info, aux_loss
+
+    def get_memory_weights(self, x, importance):
         """Compute memory routing weights with Top-k sparsification
 
         Returns: memory_weights, routing_info, aux_loss
         """
-        memory_logits = self.neuron_router.get_logits(x, 'memory', starvation_weight)
+        memory_logits = self.neuron_router.get_logits(x, 'memory')
         memory_pref = F.softmax(memory_logits, dim=-1)
 
         # Compute aux_loss (load balance) directly here
         aux_loss = 0.0
         if self.training:
             usage_M = memory_pref.mean(dim=(0, 1))
-            target_M = 1.0 / self.n_compress
-            aux_loss = ((usage_M - target_M) ** 2).sum() * self.n_compress
+            target_M = 1.0 / self.n_feature
+            aux_loss = ((usage_M - target_M) ** 2).sum() * self.n_feature
 
         if self.token_routing:
             # Token-level routing: use per-token weights directly [B, S, N]
@@ -449,7 +479,7 @@ class GlobalRouters(nn.Module):
         else:
             # Batch-level routing: aggregate by importance [B, N]
             memory_weights_dense = torch.einsum('bs,bsn->bn', importance, memory_pref)
-            memory_weights, memory_topk_idx = self._topk_sparsify(memory_weights_dense, self.top_k_compress)
+            memory_weights, memory_topk_idx = self._topk_sparsify(memory_weights_dense, self.top_k_feature)
 
             routing_info = {
                 'memory_weights': memory_weights.detach(),
@@ -464,7 +494,7 @@ class GlobalRouters(nn.Module):
 
 
 class NeuronCircuit(nn.Module):
-    """v13.1: Attention circuit with separate QK/V expand pools"""
+    """v14: Attention circuit with FRTK naming"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
@@ -484,56 +514,56 @@ class NeuronCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, compress_weights, expand_weights_Q, expand_weights_K, expand_weights_V):
+    def forward(self, x, feature_weights, relational_weights_Q, relational_weights_K, transfer_weights):
         """
         Args:
             x: [B, S, D]
-            compress_weights: [B, N] or [B, S, N]
-            expand_weights_Q: [B, N_QK] or [B, S, N_QK] - Q router weights (uses QK pool)
-            expand_weights_K: [B, N_QK] or [B, S, N_QK] - K router weights (uses QK pool)
-            expand_weights_V: [B, N_V] or [B, S, N_V] - V router weights (uses V pool)
+            feature_weights: [B, N] or [B, S, N]
+            relational_weights_Q: [B, N_R] or [B, S, N_R] - Q router weights (uses Relational pool)
+            relational_weights_K: [B, N_R] or [B, S, N_R] - K router weights (uses Relational pool)
+            transfer_weights: [B, N_T] or [B, S, N_T] - V router weights (uses Transfer pool)
         """
         B, S, D = x.shape
-        token_routing = compress_weights.dim() == 3  # [B, S, N] vs [B, N]
+        token_routing = feature_weights.dim() == 3  # [B, S, N] vs [B, N]
 
         if token_routing:
             # Token-level routing: different matrix per token
-            # 1. Per-token compress matrix [B, S, D, R]
-            shared_compress = torch.einsum('bsn,ndr->bsdr', compress_weights,
-                                            self.shared_neurons.compress_neurons)
-            # 2. Compress: [B, S, D] @ [B, S, D, R] -> [B, S, R]
-            h = torch.einsum('bsd,bsdr->bsr', x, shared_compress)
+            # 1. Per-token feature matrix [B, S, D, R]
+            shared_feature = torch.einsum('bsn,ndr->bsdr', feature_weights,
+                                            self.shared_neurons.feature_neurons)
+            # 2. Feature: [B, S, D] @ [B, S, D, R] -> [B, S, R]
+            h = torch.einsum('bsd,bsdr->bsr', x, shared_feature)
 
-            # 3. Per-token expand matrices - Q/K use QK pool, V uses V pool
-            pool_QK = self.shared_neurons.expand_neurons_QK
-            pool_V = self.shared_neurons.expand_neurons_V
-            shared_expand_Q = torch.einsum('bsn,nrd->bsrd', expand_weights_Q, pool_QK)
-            shared_expand_K = torch.einsum('bsn,nrd->bsrd', expand_weights_K, pool_QK)
-            shared_expand_V = torch.einsum('bsn,nrd->bsrd', expand_weights_V, pool_V)
+            # 3. Per-token expand matrices - Q/K use Relational pool, V uses Transfer pool
+            pool_R = self.shared_neurons.relational_neurons
+            pool_T = self.shared_neurons.transfer_neurons
+            shared_relational_Q = torch.einsum('bsn,nrd->bsrd', relational_weights_Q, pool_R)
+            shared_relational_K = torch.einsum('bsn,nrd->bsrd', relational_weights_K, pool_R)
+            shared_transfer = torch.einsum('bsn,nrd->bsrd', transfer_weights, pool_T)
 
-            # 4. Generate Q/K/V: Q and K use different weights, V from V pool
-            Q = torch.einsum('bsr,bsrd->bsd', h, shared_expand_Q)
-            K = torch.einsum('bsr,bsrd->bsd', h, shared_expand_K)
-            V = torch.einsum('bsr,bsrd->bsd', h, shared_expand_V)
+            # 4. Generate Q/K/V: Q and K use different weights, V from Transfer pool
+            Q = torch.einsum('bsr,bsrd->bsd', h, shared_relational_Q)
+            K = torch.einsum('bsr,bsrd->bsd', h, shared_relational_K)
+            V = torch.einsum('bsr,bsrd->bsd', h, shared_transfer)
         else:
             # Batch-level routing: same matrix for all tokens
-            # 1. Shared compress matrix [B, D, R]
-            shared_compress = torch.einsum('bn,ndr->bdr', compress_weights,
-                                            self.shared_neurons.compress_neurons)
-            # 2. Compress: [B, S, D] @ [B, D, R] -> [B, S, R]
-            h = torch.einsum('bsd,bdr->bsr', x, shared_compress)
+            # 1. Shared feature matrix [B, D, R]
+            shared_feature = torch.einsum('bn,ndr->bdr', feature_weights,
+                                            self.shared_neurons.feature_neurons)
+            # 2. Feature: [B, S, D] @ [B, D, R] -> [B, S, R]
+            h = torch.einsum('bsd,bdr->bsr', x, shared_feature)
 
-            # 3. Dynamic expand matrices - Q/K use QK pool, V uses V pool
-            pool_QK = self.shared_neurons.expand_neurons_QK
-            pool_V = self.shared_neurons.expand_neurons_V
-            shared_expand_Q = torch.einsum('bn,nrd->brd', expand_weights_Q, pool_QK)
-            shared_expand_K = torch.einsum('bn,nrd->brd', expand_weights_K, pool_QK)
-            shared_expand_V = torch.einsum('bn,nrd->brd', expand_weights_V, pool_V)
+            # 3. Dynamic expand matrices - Q/K use Relational pool, V uses Transfer pool
+            pool_R = self.shared_neurons.relational_neurons
+            pool_T = self.shared_neurons.transfer_neurons
+            shared_relational_Q = torch.einsum('bn,nrd->brd', relational_weights_Q, pool_R)
+            shared_relational_K = torch.einsum('bn,nrd->brd', relational_weights_K, pool_R)
+            shared_transfer = torch.einsum('bn,nrd->brd', transfer_weights, pool_T)
 
-            # 4. Generate Q/K/V: Q and K use different weights, V from V pool
-            Q = torch.einsum('bsr,brd->bsd', h, shared_expand_Q)
-            K = torch.einsum('bsr,brd->bsd', h, shared_expand_K)
-            V = torch.einsum('bsr,brd->bsd', h, shared_expand_V)
+            # 4. Generate Q/K/V: Q and K use different weights, V from Transfer pool
+            Q = torch.einsum('bsr,brd->bsd', h, shared_relational_Q)
+            K = torch.einsum('bsr,brd->bsd', h, shared_relational_K)
+            V = torch.einsum('bsr,brd->bsd', h, shared_transfer)
 
         # 5. Multi-head Attention with FlashAttention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -556,7 +586,7 @@ class NeuronCircuit(nn.Module):
 
 
 class NeuronMemory(nn.Module):
-    """v13: Memory using global routing"""
+    """v14: Memory using global routing with FRTK naming"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
@@ -583,20 +613,20 @@ class NeuronMemory(nn.Module):
 
         if token_routing:
             # Token-level routing: different matrix per token
-            shared_compress = torch.einsum('bsn,ndr->bsdr', memory_weights,
-                                            self.shared_neurons.compress_neurons)
-            Q = torch.einsum('bsd,bsdr->bsr', x, shared_compress)
+            shared_feature = torch.einsum('bsn,ndr->bsdr', memory_weights,
+                                            self.shared_neurons.feature_neurons)
+            Q = torch.einsum('bsd,bsdr->bsr', x, shared_feature)
         else:
             # Batch-level routing: same matrix for all tokens
-            shared_compress = torch.einsum('bn,ndr->bdr', memory_weights,
-                                            self.shared_neurons.compress_neurons)
-            Q = torch.einsum('bsd,bdr->bsr', x, shared_compress)
+            shared_feature = torch.einsum('bn,ndr->bdr', memory_weights,
+                                            self.shared_neurons.feature_neurons)
+            Q = torch.einsum('bsd,bdr->bsr', x, shared_feature)
 
         if self.query_proj is not None:
             Q = self.query_proj(Q)
 
-        K = self.shared_neurons.knowledge_K
-        V = self.shared_neurons.knowledge_V
+        K = self.shared_neurons.knowledge_neurons_K
+        V = self.shared_neurons.knowledge_neurons_V
 
         scores = Q @ K.T / math.sqrt(self.knowledge_rank)
         topk_scores, topk_idx = torch.topk(scores, self.knowledge_k, dim=-1)
@@ -612,7 +642,7 @@ class NeuronMemory(nn.Module):
 
 
 class DAWNBlock(nn.Module):
-    """DAWN v13 block"""
+    """DAWN v14 block"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
@@ -632,16 +662,16 @@ class DAWNBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, importance, global_routers: GlobalRouters, starvation_weight=0.0):
+    def forward(self, x, importance, global_routers: GlobalRouters):
         normed_x = self.norm1(x)
-        compress_w, expand_Q, expand_K, expand_V, attn_routing, attn_aux_loss = \
-            global_routers.get_attention_weights(normed_x, importance, starvation_weight)
+        feature_w, relational_Q, relational_K, transfer_w, attn_routing, attn_aux_loss = \
+            global_routers.get_attention_weights(normed_x, importance)
 
-        attn_out, _ = self.attn(normed_x, compress_w, expand_Q, expand_K, expand_V)
+        attn_out, _ = self.attn(normed_x, feature_w, relational_Q, relational_K, transfer_w)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
-        memory_w, mem_routing, mem_aux_loss = global_routers.get_memory_weights(normed_x2, importance, starvation_weight)
+        memory_w, mem_routing, mem_aux_loss = global_routers.get_memory_weights(normed_x2, importance)
 
         mem_out, knowledge_info = self.memory(normed_x2, memory_w)
         x = x + self.dropout(mem_out)
@@ -651,7 +681,7 @@ class DAWNBlock(nn.Module):
         mem_out_norm = mem_out.norm(dim=-1).mean().detach()
 
         routing_info = {
-            'attention': {**attn_routing, 'neuron_weights': compress_w.detach()},
+            'attention': {**attn_routing, 'neuron_weights': feature_w.detach()},
             'memory': {**mem_routing, **knowledge_info, 'neuron_weights': memory_w.detach()},
             'attn_out_norm': attn_out_norm,
             'mem_out_norm': mem_out_norm,
@@ -663,20 +693,20 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v13.2: Unified Neuron Router
+    DAWN v14: Feature-Relational-Transfer-Knowledge (FRTK) Architecture
 
-    Changes from v13.1:
-    - 5 separate routers → 1 UnifiedNeuronRouter
-    - All neurons in same d_space embedding
-    - Starvation bonus with decay for exploration
-    - Usage EMA tracking per neuron type
+    Changes from v13.2:
+    - Renamed neuron types: compress→feature, expand_QK→relational, expand_V→transfer
+    - Starvation weight → Excitability (refractory-inspired)
+    - Simple: excitability = 1 - usage_ema / tau
 
-    Architecture:
-    - Pool: QK shared, V separate (same as v13.1)
-    - Router: 1 unified with shared projection
-    - Routing: token → proj → dot product → type-specific slicing
+    Architecture (FRTK):
+    - Feature Neurons (F): input compression
+    - Relational Neurons (R): Q/K generation
+    - Transfer Neurons (T): V generation
+    - Knowledge Neurons (K): factual memory
     """
-    __version__ = "13.2"
+    __version__ = "14.0"
 
     def __init__(
         self,
@@ -686,16 +716,16 @@ class DAWN(nn.Module):
         n_heads: int = 4,
         rank: int = 64,
         max_seq_len: int = 128,
-        n_compress: int = 48,
-        n_expand_QK: int = 12,
-        n_expand_V: int = 12,
+        n_feature: int = 48,
+        n_relational: int = 12,
+        n_transfer: int = 12,
         n_knowledge: int = 80,
         knowledge_k: int = 10,
         knowledge_rank: int = None,
         state_dim: int = 64,
-        top_k_compress: int = 8,
-        top_k_QK: int = 4,
-        top_k_V: int = 6,
+        top_k_feature: int = 8,
+        top_k_relational: int = 4,
+        top_k_transfer: int = 6,
         d_space: int = 64,
         dropout: float = 0.1,
         router_dropout: float = 0.1,
@@ -714,30 +744,30 @@ class DAWN(nn.Module):
         self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
         self.max_seq_len = max_seq_len
         self.state_dim = state_dim
-        self.top_k_compress = top_k_compress
-        self.top_k_QK = top_k_QK
-        self.top_k_V = top_k_V
+        self.top_k_feature = top_k_feature
+        self.top_k_relational = top_k_relational
+        self.top_k_transfer = top_k_transfer
         self.d_space = d_space
         self.token_routing = token_routing
         self.router_dropout = router_dropout
         self.gradient_checkpointing = gradient_checkpointing
         self.use_ssm_context = use_ssm_context
 
-        self.n_compress = n_compress
-        self.n_expand_QK = n_expand_QK
-        self.n_expand_V = n_expand_V
+        self.n_feature = n_feature
+        self.n_relational = n_relational
+        self.n_transfer = n_transfer
         self.n_knowledge = n_knowledge
         self.knowledge_k = knowledge_k
 
-        self.n_neurons = n_compress
+        self.n_neurons = n_feature
         self.basis_rank = rank
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
 
         self.shared_neurons = SharedNeurons(
-            d_model=d_model, rank=rank, n_compress=n_compress,
-            n_expand_QK=n_expand_QK, n_expand_V=n_expand_V,
+            d_model=d_model, rank=rank, n_feature=n_feature,
+            n_relational=n_relational, n_transfer=n_transfer,
             n_knowledge=n_knowledge, knowledge_rank=self.knowledge_rank,
         )
 
@@ -746,8 +776,8 @@ class DAWN(nn.Module):
 
         # Unified Neuron Router (replaces 5 separate routers)
         self.global_routers = GlobalRouters(
-            d_model, n_compress, n_expand_QK, n_expand_V,
-            top_k_compress, top_k_QK, top_k_V,
+            d_model, n_feature, n_relational, n_transfer,
+            top_k_feature, top_k_relational, top_k_transfer,
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing
         )
 
@@ -777,27 +807,18 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, input_ids, labels=None, return_routing_info=False,
-                step=None, total_steps=None):
+    def forward(self, input_ids, labels=None, return_routing_info=False):
         """
         Args:
             input_ids: [B, S] token ids
             labels: [B, S] labels for loss calculation
             return_routing_info: whether to return routing info
-            step: current training step (for starvation decay)
-            total_steps: total training steps (for starvation decay)
         """
         B, S = input_ids.shape
         device = input_ids.device
 
         # Reset aux_loss accumulator
         self.aux_loss = 0.0
-
-        # Calculate starvation weight (exponential decay with floor for continued exploration)
-        if step is not None and total_steps is not None and total_steps > 0:
-            starvation_weight = max(0.05, math.exp(-3.0 * step / total_steps))
-        else:
-            starvation_weight = 0.0  # default (inference or not provided)
 
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
         x = self.token_emb(input_ids) + self.pos_emb(positions)
@@ -816,11 +837,11 @@ class DAWN(nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 x, routing_info, layer_aux_loss = checkpoint(
-                    layer, x, importance, self.global_routers, starvation_weight,
+                    layer, x, importance, self.global_routers,
                     use_reentrant=False
                 )
             else:
-                x, routing_info, layer_aux_loss = layer(x, importance, self.global_routers, starvation_weight)
+                x, routing_info, layer_aux_loss = layer(x, importance, self.global_routers)
 
             # Accumulate aux_loss
             self.aux_loss = self.aux_loss + layer_aux_loss
@@ -846,26 +867,26 @@ class DAWN(nn.Module):
         return logits
 
     def orthogonality_loss(self):
-        # Compress: [n_compress, d_model, rank] -> W^T @ W = [n_compress, rank, rank]
-        W_c = self.shared_neurons.compress_neurons
-        WtW = torch.bmm(W_c.transpose(1, 2), W_c)  # [n_compress, rank, rank]
-        I = torch.eye(self.rank, device=W_c.device).unsqueeze(0)
-        loss_c = ((WtW - I) ** 2).mean()
+        # Feature: [n_feature, d_model, rank] -> W^T @ W = [n_feature, rank, rank]
+        W_f = self.shared_neurons.feature_neurons
+        WtW = torch.bmm(W_f.transpose(1, 2), W_f)  # [n_feature, rank, rank]
+        I = torch.eye(self.rank, device=W_f.device).unsqueeze(0)
+        loss_f = ((WtW - I) ** 2).mean()
 
-        # Expand QK: [n_expand_QK, rank, d_model] -> W @ W^T
-        W_e_QK = self.shared_neurons.expand_neurons_QK
-        WWt_QK = torch.bmm(W_e_QK, W_e_QK.transpose(1, 2))
-        loss_e_QK = ((WWt_QK - I) ** 2).mean()
+        # Relational: [n_relational, rank, d_model] -> W @ W^T
+        W_r = self.shared_neurons.relational_neurons
+        WWt_r = torch.bmm(W_r, W_r.transpose(1, 2))
+        loss_r = ((WWt_r - I) ** 2).mean()
 
-        # Expand V: [n_expand_V, rank, d_model] -> W @ W^T
-        W_e_V = self.shared_neurons.expand_neurons_V
-        WWt_V = torch.bmm(W_e_V, W_e_V.transpose(1, 2))
-        loss_e_V = ((WWt_V - I) ** 2).mean()
+        # Transfer: [n_transfer, rank, d_model] -> W @ W^T
+        W_t = self.shared_neurons.transfer_neurons
+        WWt_t = torch.bmm(W_t, W_t.transpose(1, 2))
+        loss_t = ((WWt_t - I) ** 2).mean()
 
-        return (loss_c + loss_e_QK + loss_e_V) / 3
+        return (loss_f + loss_r + loss_t) / 3
 
     def knowledge_diversity_loss(self):
-        K = self.shared_neurons.knowledge_K
+        K = self.shared_neurons.knowledge_neurons_K
         K_norm = F.normalize(K, dim=-1)
         sim = K_norm @ K_norm.T
         mask = ~torch.eye(self.n_knowledge, dtype=torch.bool, device=K.device)
@@ -881,11 +902,10 @@ class DAWN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def count_by_component(self):
-        compress = self.shared_neurons.compress_neurons.numel()
-        expand_QK = self.shared_neurons.expand_neurons_QK.numel()
-        expand_V = self.shared_neurons.expand_neurons_V.numel()
-        expand_pool = expand_QK + expand_V  # Combined for display
-        knowledge = self.shared_neurons.knowledge_K.numel() + self.shared_neurons.knowledge_V.numel()
+        feature = self.shared_neurons.feature_neurons.numel()
+        relational = self.shared_neurons.relational_neurons.numel()
+        transfer = self.shared_neurons.transfer_neurons.numel()
+        knowledge = self.shared_neurons.knowledge_neurons_K.numel() + self.shared_neurons.knowledge_neurons_V.numel()
         embed = self.token_emb.weight.numel() + self.pos_emb.weight.numel()
 
         # Mamba-style SSM parameters
@@ -904,28 +924,28 @@ class DAWN(nn.Module):
         expand_o = self.layers[0].attn.expand_O.weight.numel() * self.n_layers
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        print(f"=== DAWN v13.2 Parameter Breakdown (Unified Router) ===")
-        print(f"CompressNeurons:   {compress:,} ({compress/1e6:.2f}M)")
-        print(f"ExpandPool QK:     {expand_QK:,} ({expand_QK/1e6:.2f}M)")
-        print(f"ExpandPool V:      {expand_V:,} ({expand_V/1e6:.2f}M)")
-        print(f"expand_O:          {expand_o:,} ({expand_o/1e3:.1f}K)")
-        print(f"KnowledgeNeurons:  {knowledge:,} ({knowledge/1e3:.1f}K)")
-        print(f"Embeddings:        {embed:,} ({embed/1e6:.2f}M)")
-        print(f"Mamba SSM:         {ssm_total:,} ({ssm_total/1e3:.1f}K)")
-        print(f"Unified Router:    {routers:,} ({routers/1e3:.1f}K) [d_space={self.d_space}]")
-        print(f"LayerNorms:        {norms:,} ({norms/1e3:.1f}K)")
+        print(f"=== DAWN v14 Parameter Breakdown (FRTK Architecture) ===")
+        print(f"FeatureNeurons (F):    {feature:,} ({feature/1e6:.2f}M)")
+        print(f"RelationalNeurons (R): {relational:,} ({relational/1e6:.2f}M)")
+        print(f"TransferNeurons (T):   {transfer:,} ({transfer/1e6:.2f}M)")
+        print(f"expand_O:              {expand_o:,} ({expand_o/1e3:.1f}K)")
+        print(f"KnowledgeNeurons (K):  {knowledge:,} ({knowledge/1e3:.1f}K)")
+        print(f"Embeddings:            {embed:,} ({embed/1e6:.2f}M)")
+        print(f"Mamba SSM:             {ssm_total:,} ({ssm_total/1e3:.1f}K)")
+        print(f"Unified Router:        {routers:,} ({routers/1e3:.1f}K) [d_space={self.d_space}]")
+        print(f"LayerNorms:            {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
-        print(f"Top-k Compress: {self.top_k_compress}/{self.n_compress}")
-        print(f"Top-k QK:       {self.top_k_QK}/{self.n_expand_QK}")
-        print(f"Top-k V:        {self.top_k_V}/{self.n_expand_V}")
+        print(f"Top-k Feature:    {self.top_k_feature}/{self.n_feature}")
+        print(f"Top-k Relational: {self.top_k_relational}/{self.n_relational}")
+        print(f"Top-k Transfer:   {self.top_k_transfer}/{self.n_transfer}")
         print(f"Mamba Available: {MAMBA_AVAILABLE}")
-        print(f"Architecture: Mamba SSM → Context → Unified Router → FlashAttn")
+        print(f"Architecture: Mamba SSM → Context → Unified Router (Excitability) → FlashAttn")
         print(f"---")
-        print(f"Total:             {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
+        print(f"Total:                 {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 
         return {
-            'compress': compress, 'expand_QK': expand_QK, 'expand_V': expand_V,
-            'expand_pool': expand_pool, 'expand_o': expand_o,
+            'feature': feature, 'relational': relational, 'transfer': transfer,
+            'expand_o': expand_o,
             'knowledge': knowledge, 'embeddings': embed, 'ssm': ssm_total,
             'routers': routers, 'norms': norms,
         }
@@ -936,12 +956,12 @@ class DAWN(nn.Module):
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'rank': self.rank, 'knowledge_rank': self.knowledge_rank,
-            'max_seq_len': self.max_seq_len, 'n_compress': self.n_compress,
-            'n_expand_QK': self.n_expand_QK, 'n_expand_V': self.n_expand_V,
+            'max_seq_len': self.max_seq_len, 'n_feature': self.n_feature,
+            'n_relational': self.n_relational, 'n_transfer': self.n_transfer,
             'n_knowledge': self.n_knowledge, 'knowledge_k': self.knowledge_k,
             'state_dim': self.state_dim,
-            'top_k_compress': self.top_k_compress,
-            'top_k_QK': self.top_k_QK, 'top_k_V': self.top_k_V,
+            'top_k_feature': self.top_k_feature,
+            'top_k_relational': self.top_k_relational, 'top_k_transfer': self.top_k_transfer,
             'd_space': self.d_space,
             'router_dropout': self.router_dropout,
             'gradient_checkpointing': self.gradient_checkpointing,

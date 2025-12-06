@@ -172,6 +172,23 @@ class RoutingInfoParser:
         routing_info['memory']['memory_weights']       # [B, n_compress] - SPARSE
         routing_info['memory']['memory_weights_dense'] # [B, n_compress] - DENSE
         routing_info['memory']['memory_topk_idx']      # [B, top_k_compress]
+
+    v14 format (FRTK: Feature/Relational/Transfer/Knowledge):
+        # Renamed from v13.2 for clarity:
+        # compress → feature (F)
+        # expand_QK → relational (R)
+        # expand_V → transfer (T)
+        # knowledge → knowledge (K)
+
+        routing_info['attention']['feature_pref']         # [B, S, n_feature]
+        routing_info['attention']['feature_weights']      # [B, n_feature]
+        routing_info['attention']['relational_pref_Q']    # [B, S, n_relational]
+        routing_info['attention']['relational_pref_K']    # [B, S, n_relational]
+        routing_info['attention']['relational_weights_Q'] # [B, n_relational]
+        routing_info['attention']['relational_weights_K'] # [B, n_relational]
+        routing_info['attention']['transfer_pref']        # [B, S, n_transfer]
+        routing_info['attention']['transfer_weights']     # [B, n_transfer]
+
         routing_info['memory']['knowledge_indices']
         routing_info['memory']['knowledge_weights']
     """
@@ -180,14 +197,18 @@ class RoutingInfoParser:
         self.version = model_version
         self.is_v10 = model_version.startswith('10') or model_version in ['10.0', '11.0']
         self.is_v12 = model_version.startswith('12')
-        self.is_v13 = model_version.startswith('13')
-        self.is_topk = model_version in ['12.7', '12.8', '13', '13.0'] or model_version.startswith('13')
+        self.is_v13 = model_version.startswith('13') and not model_version.startswith('14')
+        self.is_v14 = model_version.startswith('14')
+        self.is_topk = model_version in ['12.7', '12.8', '13', '13.0'] or model_version.startswith('13') or model_version.startswith('14')
 
     def detect_version(self, routing_info: Dict) -> str:
         """Auto-detect version from routing_info structure"""
         if 'attention' in routing_info:
             attn = routing_info['attention']
-            if 'Q' in attn and isinstance(attn['Q'], dict):
+            # v14: FRTK naming (feature/relational/transfer)
+            if 'feature_weights' in attn or 'feature_pref' in attn:
+                return 'v14'
+            elif 'Q' in attn and isinstance(attn['Q'], dict):
                 return 'v10'
             elif 'compress_weights_dense' in attn:
                 # v12.7, v12.8, v13 have dense weights for load balance loss
@@ -198,16 +219,16 @@ class RoutingInfoParser:
 
     def get_compress_weights(self, routing_info: Dict, comp: str = 'Q', use_dense: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Get compress weights for a component.
+        Get compress/feature weights for a component.
 
         Args:
             routing_info: The routing info dict
-            comp: Component name ('Q', 'K', 'V', 'M')
+            comp: Component name ('Q', 'K', 'V', 'M') or v14 ('F', 'feature')
             use_dense: If True and available, return dense weights (pre-top-k) instead of sparse
 
         Returns:
-            weights: [B, S, N] for v10.x (token-level) or [B, N] for v12.x (batch-level)
-            indices: [B, S, k] or None (top-k indices for v12.7/v13)
+            weights: [B, S, N] for v10.x (token-level) or [B, N] for v12.x+ (batch-level)
+            indices: [B, S, k] or None (top-k indices for v12.7+)
         """
         version = self.detect_version(routing_info)
 
@@ -219,6 +240,13 @@ class RoutingInfoParser:
 
             weights = data.get('weights')
             indices = data.get('indices')
+            return weights, indices
+
+        elif version == 'v14':
+            attn = routing_info['attention']
+            # v14: compress → feature
+            weights = attn.get('feature_weights')
+            indices = None  # v14 doesn't expose top-k indices separately
             return weights, indices
 
         elif version in ['v12', 'v12_topk']:
@@ -245,22 +273,35 @@ class RoutingInfoParser:
 
     def get_expand_weights(self, routing_info: Dict, comp: str = 'Q', use_dense: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Get expand weights for a component.
+        Get expand/relational/transfer weights for a component.
 
         Args:
             routing_info: The routing info dict
-            comp: Component name ('Q', 'K', 'V')
+            comp: Component name ('Q', 'K', 'V') or v14 ('R_Q', 'R_K', 'T')
             use_dense: If True and available, return dense weights (pre-top-k) instead of sparse
 
         Returns:
-            weights: [B, S, n_expand] for v10.x (token-level) or [B, n_expand] for v12.x (batch-level)
-            indices: [B, S, k] or None (top-k indices for v12.7/v13)
+            weights: [B, S, n_expand] for v10.x (token-level) or [B, n_expand] for v12.x+ (batch-level)
+            indices: [B, S, k] or None (top-k indices for v12.7+)
         """
         version = self.detect_version(routing_info)
 
         if version == 'v10':
             data = routing_info['attention'].get('O', {})
             return data.get('weights'), data.get('indices')
+
+        elif version == 'v14':
+            attn = routing_info['attention']
+            # v14: expand_Q/K → relational_Q/K, expand_V → transfer
+            if comp in ['Q', 'R_Q']:
+                weights = attn.get('relational_weights_Q')
+            elif comp in ['K', 'R_K']:
+                weights = attn.get('relational_weights_K')
+            elif comp in ['V', 'T']:
+                weights = attn.get('transfer_weights')
+            else:
+                weights = None
+            return weights, None
 
         elif version in ['v12', 'v12_topk']:
             attn = routing_info['attention']
@@ -295,6 +336,7 @@ class RoutingInfoParser:
 
         v10.x: same as get_compress_weights (already token-level)
         v12.3: compress_pref [B, S, n_compress] or expand_pref_Q/K/V [B, S, n_expand]
+        v14: feature_pref, relational_pref_Q/K, transfer_pref
 
         Returns:
             pref: [B, S, N] - token-level preferences
@@ -305,6 +347,19 @@ class RoutingInfoParser:
             # v10 is already token-level
             weights, _ = self.get_compress_weights(routing_info, comp)
             return weights
+
+        elif version == 'v14':
+            attn = routing_info['attention']
+            # v14: FRTK naming
+            if comp in ['compress', 'F', 'feature']:
+                return attn.get('feature_pref')
+            elif comp in ['Q', 'R_Q']:
+                return attn.get('relational_pref_Q')
+            elif comp in ['K', 'R_K']:
+                return attn.get('relational_pref_K')
+            elif comp in ['V', 'T', 'transfer']:
+                return attn.get('transfer_pref')
+            return None
 
         elif version in ['v12', 'v12_topk']:
             attn = routing_info['attention']
@@ -338,7 +393,14 @@ class DAWNAnalyzer:
 
         # Detect version
         if model_version == 'auto':
-            if hasattr(self.model, 'shared_neurons'):
+            # v14: has global_routers with neuron_router (FRTK)
+            if hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
+                router = self.model.global_routers.neuron_router
+                if hasattr(router, 'usage_ema_feature'):
+                    model_version = '14.0'
+                else:
+                    model_version = '13.2'
+            elif hasattr(self.model, 'shared_neurons'):
                 shared = self.model.shared_neurons
 
                 # Check for v13 (has context in SSM)
@@ -362,11 +424,21 @@ class DAWNAnalyzer:
         # Model config
         self.n_layers = self.model.n_layers
         self.d_model = self.model.d_model
-        self.rank = self.model.rank
+        self.rank = getattr(self.model, 'rank', self.d_model // 4)
         self.n_heads = self.model.n_heads
 
-        # Neuron counts
-        if hasattr(self.model, 'shared_neurons'):
+        # Neuron counts - v14 (FRTK) vs legacy
+        if hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
+            router = self.model.global_routers.neuron_router
+            # v14: feature/relational/transfer
+            self.n_feature = getattr(router, 'n_feature', 0)
+            self.n_relational = getattr(router, 'n_relational', 0)
+            self.n_transfer = getattr(router, 'n_transfer', 0)
+            # Map to legacy names for compatibility
+            self.n_compress = self.n_feature
+            self.n_expand = self.n_relational
+            self.n_knowledge = getattr(self.model, 'n_knowledge', 80)
+        elif hasattr(self.model, 'shared_neurons'):
             shared = self.model.shared_neurons
             self.n_compress = shared.compress_neurons.shape[0]
             if hasattr(shared, 'expand_neurons_pool'):
@@ -380,10 +452,17 @@ class DAWNAnalyzer:
                 self.n_knowledge = shared.knowledge_K.shape[0]
             else:
                 self.n_knowledge = 0
+            # v14 aliases
+            self.n_feature = self.n_compress
+            self.n_relational = self.n_expand
+            self.n_transfer = self.n_expand
         else:
             self.n_compress = getattr(self.model, 'n_compress', 48)
             self.n_expand = getattr(self.model, 'n_expand', 12)
             self.n_knowledge = getattr(self.model, 'n_knowledge', 80)
+            self.n_feature = self.n_compress
+            self.n_relational = self.n_expand
+            self.n_transfer = self.n_expand
 
         self.knowledge_k = getattr(self.model, 'knowledge_k', 10)
 
@@ -391,7 +470,12 @@ class DAWNAnalyzer:
         print(f"DAWN Analyzer (v{self.version})")
         print(f"{'='*60}")
         print(f"d_model: {self.d_model}, rank: {self.rank}")
-        print(f"n_compress: {self.n_compress}, n_expand: {self.n_expand}")
+        if self.version.startswith('14'):
+            # v14: FRTK naming
+            print(f"n_feature: {self.n_feature}, n_relational: {self.n_relational}, n_transfer: {self.n_transfer}")
+        else:
+            # Legacy naming
+            print(f"n_compress: {self.n_compress}, n_expand: {self.n_expand}")
         print(f"n_knowledge: {self.n_knowledge}, n_layers: {self.n_layers}")
 
     # ============================================================
@@ -562,7 +646,11 @@ class DAWNAnalyzer:
 
         results = {'compress': {}, 'expand': {}, 'summary': {}}
 
-        print(f"\n--- Compress Neuron Usage ---")
+        # v14: use FRTK naming
+        compress_label = "Feature" if self.version.startswith('14') else "Compress"
+        expand_label = "Relational/Transfer" if self.version.startswith('14') else "Expand"
+
+        print(f"\n--- {compress_label} Neuron Usage ---")
         print(f"{'Comp':<6} {'Layer':<8} {'Eff.Rank':<12} {'Util%':<10} {'Dead':<8}")
         print("-" * 44)
 
@@ -577,7 +665,7 @@ class DAWNAnalyzer:
                 if comp == 'Q':
                     print(f"{comp:<6} L{layer_idx:<7} {stats['eff_rank']:<12.1f} {stats['utilization']*100:<10.1f} {stats['dead_count']:<8}")
 
-        print(f"\n--- Expand Neuron Usage ---")
+        print(f"\n--- {expand_label} Neuron Usage ---")
         for comp in ['Q', 'K', 'V']:
             results['expand'][comp] = {}
             for layer_idx in range(self.n_layers):
@@ -714,12 +802,17 @@ class DAWNAnalyzer:
 
         results = {'layer_correlation': {}, 'expand_correlation': {}}
 
-        # Check if v12.3 (Q=K=V for compress)
+        # Check if v12.3 (Q=K=V for compress) or v14 (FRTK)
         is_v12 = self.version.startswith('12')
+        is_v14 = self.version.startswith('14')
 
-        print(f"\n--- Compress Routing: Q/K/V/M Correlation by Layer ---")
-        if is_v12:
-            print("(Note: v12.3 uses shared compress_weights for Q/K/V, so Q-K, Q-V = 1.0)")
+        # v14: use FRTK naming
+        compress_label = "Feature" if is_v14 else "Compress"
+        expand_label = "Relational/Transfer" if is_v14 else "Expand"
+
+        print(f"\n--- {compress_label} Routing: Q/K/V/M Correlation by Layer ---")
+        if is_v12 or is_v14:
+            print(f"(Note: v{self.version} uses shared {compress_label.lower()}_weights for Q/K/V, so Q-K, Q-V = 1.0)")
 
         for layer_idx in range(self.n_layers):
             q_usage = layer_comp_usage[layer_idx]['Q']
@@ -743,10 +836,10 @@ class DAWNAnalyzer:
             if layer_idx == 0:
                 print(f"  L{layer_idx}: Q-K={qk:.3f}, Q-V={qv:.3f}, Q-M={qm:.3f}")
 
-        # Expand correlation (more meaningful for v12.3)
-        if is_v12:
-            print(f"\n--- Expand Routing: Q/K/V Differentiation by Layer ---")
-            print("(v12.3 uses different expand_weights for Q/K/V)")
+        # Expand/Relational correlation (more meaningful for v12.3+)
+        if is_v12 or is_v14:
+            print(f"\n--- {expand_label} Routing: Q/K/V Differentiation by Layer ---")
+            print(f"(v{self.version} uses different {expand_label.lower()}_weights for Q/K/V)")
 
             for layer_idx in range(self.n_layers):
                 q_exp = layer_expand_usage[layer_idx]['Q']

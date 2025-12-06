@@ -126,44 +126,102 @@ class NeuronSVDAnalyzer:
     def __init__(self, model, device='cuda'):
         self.model = get_underlying_model(model)
         self.device = device
-
-        self.n_compress = self.model.shared_neurons.compress_neurons.shape[0]
         self.d_model = self.model.d_model
-        self.rank = self.model.rank
+        self.rank = getattr(self.model, 'rank', self.d_model // 4)
 
-        if hasattr(self.model.shared_neurons, 'expand_neurons_pool'):
-            self.n_expand = self.model.shared_neurons.expand_neurons_pool.shape[0]
-        elif hasattr(self.model.shared_neurons, 'expand_neurons'):
-            self.n_expand = self.model.shared_neurons.expand_neurons.shape[0]
+        # Detect version and get neuron counts
+        if hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
+            router = self.model.global_routers.neuron_router
+            if hasattr(router, 'usage_ema_feature'):
+                self.version = '14'
+                self.n_feature = router.n_feature
+                self.n_relational = router.n_relational
+                self.n_transfer = router.n_transfer
+                # Legacy aliases
+                self.n_compress = self.n_feature
+                self.n_expand = self.n_relational
+            else:
+                self.version = '13'
+                self.n_compress = self.model.shared_neurons.compress_neurons.shape[0]
+                self.n_expand = self._get_expand_count()
+                self.n_feature = self.n_compress
+                self.n_relational = self.n_expand
+                self.n_transfer = self.n_expand
+        elif hasattr(self.model, 'shared_neurons'):
+            self.version = 'legacy'
+            self.n_compress = self.model.shared_neurons.compress_neurons.shape[0]
+            self.n_expand = self._get_expand_count()
+            self.n_feature = self.n_compress
+            self.n_relational = self.n_expand
+            self.n_transfer = self.n_expand
         else:
-            self.n_expand = self.n_compress
+            self.version = 'unknown'
+            self.n_compress = getattr(self.model, 'n_compress', 48)
+            self.n_expand = getattr(self.model, 'n_expand', 12)
+            self.n_feature = self.n_compress
+            self.n_relational = self.n_expand
+            self.n_transfer = self.n_expand
 
         print(f"\n{'='*60}")
-        print(f"Neuron SVD/PCA Analyzer")
+        print(f"Neuron SVD/PCA Analyzer (v{self.version})")
         print(f"{'='*60}")
-        print(f"n_compress: {self.n_compress}, n_expand: {self.n_expand}")
+        if self.version == '14':
+            print(f"n_feature: {self.n_feature}, n_relational: {self.n_relational}, n_transfer: {self.n_transfer}")
+        else:
+            print(f"n_compress: {self.n_compress}, n_expand: {self.n_expand}")
         print(f"d_model: {self.d_model}, rank: {self.rank}")
+
+    def _get_expand_count(self):
+        """Get expand neuron count from shared_neurons"""
+        shared = self.model.shared_neurons
+        if hasattr(shared, 'expand_neurons_pool'):
+            return shared.expand_neurons_pool.shape[0]
+        elif hasattr(shared, 'expand_neurons'):
+            return shared.expand_neurons.shape[0]
+        return self.n_compress
 
     def extract_neurons(self) -> Dict[str, np.ndarray]:
         """Extract neuron weights from model"""
-        shared = self.model.shared_neurons
+        neurons = {}
 
-        neurons = {
-            'compress': shared.compress_neurons.data.cpu().numpy(),
-        }
+        if self.version == '14':
+            # v14: neurons stored in shared_neurons with FRTK naming
+            shared = self.model.shared_neurons
+            neurons['feature'] = shared.feature_neurons.data.cpu().numpy()
+            neurons['relational'] = shared.relational_neurons.data.cpu().numpy()
+            neurons['transfer'] = shared.transfer_neurons.data.cpu().numpy()
 
-        if hasattr(shared, 'expand_neurons_pool'):
-            neurons['expand'] = shared.expand_neurons_pool.data.cpu().numpy()
-        elif hasattr(shared, 'expand_neurons'):
-            neurons['expand'] = shared.expand_neurons.data.cpu().numpy()
+            # v14: knowledge_neurons_K/V (not knowledge_K/V)
+            if hasattr(shared, 'knowledge_neurons_K'):
+                neurons['knowledge_K'] = shared.knowledge_neurons_K.data.cpu().numpy()
+                neurons['knowledge_V'] = shared.knowledge_neurons_V.data.cpu().numpy()
 
-        if hasattr(shared, 'knowledge_K'):
-            neurons['knowledge_K'] = shared.knowledge_K.data.cpu().numpy()
-            neurons['knowledge_V'] = shared.knowledge_V.data.cpu().numpy()
+            # Legacy aliases for compatibility
+            neurons['compress'] = neurons['feature']
+            neurons['expand'] = neurons['relational']
+        else:
+            # Legacy versions: use shared_neurons with compress/expand naming
+            shared = self.model.shared_neurons
+            neurons['compress'] = shared.compress_neurons.data.cpu().numpy()
+
+            if hasattr(shared, 'expand_neurons_pool'):
+                neurons['expand'] = shared.expand_neurons_pool.data.cpu().numpy()
+            elif hasattr(shared, 'expand_neurons'):
+                neurons['expand'] = shared.expand_neurons.data.cpu().numpy()
+
+            if hasattr(shared, 'knowledge_K'):
+                neurons['knowledge_K'] = shared.knowledge_K.data.cpu().numpy()
+                neurons['knowledge_V'] = shared.knowledge_V.data.cpu().numpy()
+
+            # v14 aliases for compatibility
+            neurons['feature'] = neurons['compress']
+            neurons['relational'] = neurons.get('expand', neurons['compress'])
+            neurons['transfer'] = neurons.get('expand', neurons['compress'])
 
         print(f"\nExtracted neurons:")
         for name, arr in neurons.items():
-            print(f"  {name}: {arr.shape}")
+            if name not in ['compress', 'expand']:  # Skip legacy aliases for v14
+                print(f"  {name}: {arr.shape}")
 
         return neurons
 
@@ -238,32 +296,58 @@ class NeuronSVDAnalyzer:
         neurons = self.extract_neurons()
         results = {}
 
-        # Compress neurons
-        compress = neurons['compress']
-        N, D, R = compress.shape
-        compress_flat = compress.reshape(N, D * R)
+        # v14: use FRTK naming
+        is_v14 = self.version == '14'
+        feature_name = "FeatureNeurons" if is_v14 else "CompressNeurons"
+        relational_name = "RelationalNeurons" if is_v14 else "ExpandNeurons"
 
-        pca_results, ratio, sv = self.analyze_pca(compress_flat, "CompressNeurons")
-        sim_results, sim_matrix = self.analyze_similarity(compress_flat)
+        # Feature/Compress neurons
+        feature = neurons['feature']
+        N, D, R = feature.shape
+        feature_flat = feature.reshape(N, D * R)
 
-        results['compress'] = {
+        pca_results, ratio, sv = self.analyze_pca(feature_flat, feature_name)
+        sim_results, sim_matrix = self.analyze_similarity(feature_flat)
+
+        results['feature'] = {
             'pca': pca_results,
             'similarity': sim_results
         }
+        # Legacy alias
+        results['compress'] = results['feature']
 
-        # Expand neurons
-        if 'expand' in neurons:
-            expand = neurons['expand']
-            if len(expand.shape) == 3:
-                N, R, D = expand.shape
-                expand_flat = expand.reshape(N, R * D)
+        # Relational/Expand neurons
+        if 'relational' in neurons:
+            relational = neurons['relational']
+            if len(relational.shape) == 3:
+                N, R, D = relational.shape
+                relational_flat = relational.reshape(N, R * D)
             else:
-                expand_flat = expand
+                relational_flat = relational
 
-            pca_results, _, _ = self.analyze_pca(expand_flat, "ExpandNeurons")
-            sim_results, _ = self.analyze_similarity(expand_flat)
+            pca_results, _, _ = self.analyze_pca(relational_flat, relational_name)
+            sim_results, _ = self.analyze_similarity(relational_flat)
 
-            results['expand'] = {
+            results['relational'] = {
+                'pca': pca_results,
+                'similarity': sim_results
+            }
+            # Legacy alias
+            results['expand'] = results['relational']
+
+        # v14: Transfer neurons (separate from relational)
+        if is_v14 and 'transfer' in neurons:
+            transfer = neurons['transfer']
+            if len(transfer.shape) == 3:
+                N, R, D = transfer.shape
+                transfer_flat = transfer.reshape(N, R * D)
+            else:
+                transfer_flat = transfer
+
+            pca_results, _, _ = self.analyze_pca(transfer_flat, "TransferNeurons")
+            sim_results, _ = self.analyze_similarity(transfer_flat)
+
+            results['transfer'] = {
                 'pca': pca_results,
                 'similarity': sim_results
             }
@@ -286,14 +370,37 @@ class NeuronSVDAnalyzer:
         print("SUMMARY")
         print(f"{'='*60}")
 
-        print(f"\n[CompressNeurons]")
-        print(f"  Effective dim: {results['compress']['pca']['effective_dim']:.1f}/{self.n_compress}")
-        print(f"  Similarity: {results['compress']['similarity']['mean']:.4f}")
+        if is_v14:
+            print(f"\n[FeatureNeurons]")
+            print(f"  Effective dim: {results['feature']['pca']['effective_dim']:.1f}/{self.n_feature}")
+            print(f"  Similarity: {results['feature']['similarity']['mean']:.4f}")
 
-        if 'expand' in results:
-            print(f"\n[ExpandNeurons]")
-            print(f"  Effective dim: {results['expand']['pca']['effective_dim']:.1f}/{self.n_expand}")
-            print(f"  Similarity: {results['expand']['similarity']['mean']:.4f}")
+            if 'relational' in results:
+                print(f"\n[RelationalNeurons]")
+                print(f"  Effective dim: {results['relational']['pca']['effective_dim']:.1f}/{self.n_relational}")
+                print(f"  Similarity: {results['relational']['similarity']['mean']:.4f}")
+
+            if 'transfer' in results:
+                print(f"\n[TransferNeurons]")
+                print(f"  Effective dim: {results['transfer']['pca']['effective_dim']:.1f}/{self.n_transfer}")
+                print(f"  Similarity: {results['transfer']['similarity']['mean']:.4f}")
+        else:
+            print(f"\n[CompressNeurons]")
+            print(f"  Effective dim: {results['compress']['pca']['effective_dim']:.1f}/{self.n_compress}")
+            print(f"  Similarity: {results['compress']['similarity']['mean']:.4f}")
+
+            if 'expand' in results:
+                print(f"\n[ExpandNeurons]")
+                print(f"  Effective dim: {results['expand']['pca']['effective_dim']:.1f}/{self.n_expand}")
+                print(f"  Similarity: {results['expand']['similarity']['mean']:.4f}")
+
+        # Knowledge neurons (both v14 and legacy)
+        if 'knowledge' in results:
+            n_knowledge = getattr(self.model, 'n_knowledge',
+                                  getattr(self.model.shared_neurons, 'n_knowledge', 80))
+            print(f"\n[KnowledgeNeurons]")
+            print(f"  K Effective dim: {results['knowledge']['K_pca']['effective_dim']:.1f}/{n_knowledge}")
+            print(f"  V Effective dim: {results['knowledge']['V_pca']['effective_dim']:.1f}/{n_knowledge}")
 
         return results
 
@@ -420,18 +527,38 @@ class SentenceVisualizer:
 
                         layer_result[comp] = {'weights': weights, 'indices': indices}
 
-            elif 'compress_weights' in attn:
-                # v12 format (including v12.7/v13 with top-k)
-                # Try dense weights first for better visualization
-                if 'compress_weights_dense' in attn:
+            elif 'feature_weights' in attn or 'feature_pref' in attn:
+                # v14 FRTK format
+                n_tokens = len(tokens)
+
+                # Feature weights (for Q/K/V compress equivalent)
+                if 'feature_weights' in attn:
+                    raw_weights = attn['feature_weights'][0].cpu()
+                    if len(raw_weights.shape) == 1:
+                        weights = raw_weights.unsqueeze(0).expand(n_tokens, -1).numpy()
+                    else:
+                        weights = raw_weights.numpy()
+
+                    k = min(8, weights.shape[-1])
+                    _, idx = torch.topk(torch.tensor(weights), k, dim=-1)
+                    indices = idx.numpy()
+
+                    # Use feature weights for all components (they share feature neurons)
+                    for comp in ['Q', 'K', 'V']:
+                        layer_result[comp] = {'weights': weights, 'indices': indices}
+
+            elif 'compress_pref' in attn or 'compress_weights_dense' in attn or 'compress_weights' in attn:
+                # v12/v13 - compress_pref 우선 (token-level)
+                if 'compress_pref' in attn:
+                    raw_weights = attn['compress_pref'][0].cpu()  # v13.2 [S, N]
+                elif 'compress_weights_dense' in attn:
                     raw_weights = attn['compress_weights_dense'][0].cpu()  # v12.7/v13
                 else:
-                    raw_weights = attn['compress_weights'][0].cpu()  # First batch
+                    raw_weights = attn['compress_weights'][0].cpu()  # fallback
 
-                # v12.3+: [n_compress] (batch-level) -> expand to [S, n_compress]
-                # v12.x: [S, n_compress] (token-level) -> keep as is
+                # [n_compress] (batch-level) -> expand to [S, n_compress]
+                # [S, n_compress] (token-level) -> keep as is
                 if len(raw_weights.shape) == 1:
-                    # Batch-level routing: expand to all tokens
                     n_tokens = len(tokens)
                     weights = raw_weights.unsqueeze(0).expand(n_tokens, -1).numpy()
                 else:
@@ -537,6 +664,22 @@ class SemanticAnalyzer:
         self.tokenizer = tokenizer
         self.device = device
 
+        # Detect version and get n_neurons
+        if hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
+            router = self.model.global_routers.neuron_router
+            if hasattr(router, 'usage_ema_feature'):
+                self.version = '14'
+                self.n_neurons = router.n_feature
+            else:
+                self.version = '13'
+                self.n_neurons = self.model.shared_neurons.compress_neurons.shape[0]
+        elif hasattr(self.model, 'shared_neurons'):
+            self.version = 'legacy'
+            self.n_neurons = self.model.shared_neurons.compress_neurons.shape[0]
+        else:
+            self.version = 'unknown'
+            self.n_neurons = getattr(self.model, 'n_compress', 48)
+
         # Build token ID sets
         self.category_token_ids = {}
         for category, words in self.SEMANTIC_CATEGORIES.items():
@@ -551,12 +694,12 @@ class SemanticAnalyzer:
     def analyze(self, dataloader, max_batches: int = 50) -> Dict:
         """Find neurons specialized for semantic categories"""
         print(f"\n{'='*60}")
-        print("SEMANTIC NEURON ANALYSIS")
+        print(f"SEMANTIC NEURON ANALYSIS (v{self.version})")
         print(f"{'='*60}")
 
         self.model.eval()
 
-        n_neurons = self.model.shared_neurons.compress_neurons.shape[0]
+        n_neurons = self.n_neurons
         category_counts = {cat: np.zeros(n_neurons) for cat in self.SEMANTIC_CATEGORIES}
         total_counts = np.zeros(n_neurons)
 
@@ -575,17 +718,24 @@ class SemanticAnalyzer:
 
             # Get weights based on version
             if 'Q' in attn and isinstance(attn['Q'], dict):
+                # v10 format
                 weights = attn['Q']['weights']
                 indices = attn['Q'].get('indices')
                 is_batch_level = False
-            elif 'compress_weights' in attn:
-                # v12.7/v13: prefer dense weights for analysis
-                if 'compress_weights_dense' in attn:
+            elif 'feature_weights' in attn:
+                # v14 FRTK format
+                weights = attn['feature_weights']
+                indices = None  # v14 doesn't expose top-k indices separately
+                is_batch_level = (len(weights.shape) == 2)
+            elif 'compress_pref' in attn or 'compress_weights_dense' in attn or 'compress_weights' in attn:
+                # v12/v13 - compress_pref 우선 (token-level)
+                if 'compress_pref' in attn:
+                    weights = attn['compress_pref']  # v13.2 [B, S, N]
+                elif 'compress_weights_dense' in attn:
                     weights = attn['compress_weights_dense']
                 else:
                     weights = attn['compress_weights']
                 indices = attn.get('compress_topk_idx')
-                # v12.3+: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
                 is_batch_level = (len(weights.shape) == 2)
             else:
                 continue
@@ -694,13 +844,28 @@ class NeuronCatalog:
         self.model = get_underlying_model(model)
         self.tokenizer = tokenizer
         self.device = device
-        self.n_neurons = self.model.shared_neurons.compress_neurons.shape[0]
+
+        # Detect version and get n_neurons
+        if hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
+            router = self.model.global_routers.neuron_router
+            if hasattr(router, 'usage_ema_feature'):
+                self.version = '14'
+                self.n_neurons = router.n_feature
+            else:
+                self.version = '13'
+                self.n_neurons = self.model.shared_neurons.compress_neurons.shape[0]
+        elif hasattr(self.model, 'shared_neurons'):
+            self.version = 'legacy'
+            self.n_neurons = self.model.shared_neurons.compress_neurons.shape[0]
+        else:
+            self.version = 'unknown'
+            self.n_neurons = getattr(self.model, 'n_compress', 48)
 
     @torch.no_grad()
     def build(self, dataloader, max_batches: int = 100) -> Dict:
         """Build neuron catalog"""
         print(f"\n{'='*60}")
-        print("BUILDING NEURON CATALOG")
+        print(f"BUILDING NEURON CATALOG (v{self.version})")
         print(f"{'='*60}")
 
         self.model.eval()
@@ -723,17 +888,24 @@ class NeuronCatalog:
             attn = routing_info.get('attention', routing_info)
 
             if 'Q' in attn and isinstance(attn['Q'], dict):
+                # v10 format
                 weights = attn['Q']['weights']
                 indices = attn['Q'].get('indices')
                 is_batch_level = False
-            elif 'compress_weights' in attn:
-                # v12.7/v13: prefer dense weights for catalog building
-                if 'compress_weights_dense' in attn:
+            elif 'feature_weights' in attn:
+                # v14 FRTK format
+                weights = attn['feature_weights']
+                indices = None  # v14 doesn't expose top-k indices separately
+                is_batch_level = (len(weights.shape) == 2)
+            elif 'compress_pref' in attn or 'compress_weights_dense' in attn or 'compress_weights' in attn:
+                # v12/v13 - compress_pref 우선 (token-level)
+                if 'compress_pref' in attn:
+                    weights = attn['compress_pref']  # v13.2 [B, S, N]
+                elif 'compress_weights_dense' in attn:
                     weights = attn['compress_weights_dense']
                 else:
                     weights = attn['compress_weights']
                 indices = attn.get('compress_topk_idx')
-                # v12.3+: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
                 is_batch_level = (len(weights.shape) == 2)
             else:
                 continue
@@ -858,7 +1030,9 @@ def main():
     if version == 'auto':
         # 1. Try checkpoint path
         path_str = str(checkpoint_path).lower()
-        if 'v13' in path_str:
+        if 'v14' in path_str:
+            version = '14.0'
+        elif 'v13' in path_str:
             version = '13.0'
         elif 'v12_8' in path_str or 'v12.8' in path_str:
             version = '12.8'
@@ -888,7 +1062,9 @@ def main():
             keys = list(state_dict.keys())
             keys_str = ' '.join(keys)
 
-            if 'context_proj' in keys_str:
+            if 'feature_neurons' in keys_str or 'usage_ema_feature' in keys_str:
+                version = '14.0'  # v14 has FRTK naming
+            elif 'context_proj' in keys_str:
                 version = '13.0'  # v13 has context_proj in SSM
             elif 'A_log' in keys_str:
                 version = '12.7'  # v12.7 has Mamba-style SSM
@@ -924,7 +1100,7 @@ def main():
         'dropout': config.get('dropout', 0.1),
     }
 
-    if version.startswith('12') or version.startswith('13'):
+    if version.startswith('12') or version.startswith('13') or version.startswith('14'):
         model_kwargs['state_dim'] = config.get('state_dim', 64)
         if 'knowledge_rank' in config:
             model_kwargs['knowledge_rank'] = config['knowledge_rank']
@@ -933,6 +1109,12 @@ def main():
     if version in ['12.7', '12.8', '13.0'] or version.startswith('13'):
         model_kwargs['top_k_compress'] = config.get('top_k_compress', 8)
         model_kwargs['top_k_expand'] = config.get('top_k_expand', 4)
+
+    # v14: FRTK neuron counts
+    if version.startswith('14'):
+        model_kwargs['n_feature'] = config.get('n_feature', config.get('n_compress', 48))
+        model_kwargs['n_relational'] = config.get('n_relational', config.get('n_expand', 12))
+        model_kwargs['n_transfer'] = config.get('n_transfer', config.get('n_expand', 12))
 
     model = create_model_by_version(version, model_kwargs)
 
