@@ -1,0 +1,63 @@
+# DAWN v14 Training Config - 20M Scale, 500M tokens
+# FRTK Architecture with Homeostatic Routing Pressure
+
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+    - train/c4/c4_raw_001.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 500000000
+  max_val_tokens: 2000000
+
+model:
+  model_version: "14.0"
+  d_model: 384
+  n_layers: 12
+  n_heads: 4
+  rank: 64
+  state_dim: 64
+
+  # FRTK Neurons (new naming in v14)
+  n_feature: 36                  # compress → feature
+  n_relational: 200              # expand_QK → relational
+  n_transfer: 16                 # expand_V → transfer
+  n_knowledge: 300
+  knowledge_k: 20
+  knowledge_rank: 64
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: false
+
+  # Top-k settings (FRTK naming)
+  top_k_feature: 8               # top_k_compress → top_k_feature
+  top_k_relational: 20           # top_k_QK → top_k_relational
+  top_k_transfer: 4              # top_k_V → top_k_transfer
+  d_space: 64
+  router_dropout: 0.1
+  token_routing: false
+  use_ssm_context: true
+
+training:
+  batch_size: 96
+  num_epochs: 3
+  lr: 0.00055
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v14_20M_c4_500M
+log_dir: /content/drive/MyDrive/dawn/logs_v14_20M_c4_500M
+
+# v14 Changes:
+#   - compress → feature (F)
+#   - expand_QK → relational (R)
+#   - expand_V → transfer (T)
+#   - starvation_weight → Homeostatic Routing Pressure (HRP)
+#   - HRP: adaptive pressure based on usage imbalance
