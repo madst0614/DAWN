@@ -960,33 +960,77 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 except Exception:
                     pass  # Skip if routing_infos format is different
 
-        # Log aggregated metrics every 100 steps
+        # Log aggregated metrics every 100 steps (same format as console output)
         if log_file and (step + 1) % log_interval == 0:
             avg_window_loss = window_loss / window_count
             avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
 
             with open(log_file, 'a') as f:
-                f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},acc={avg_window_acc:.6f}")
+                # Basic loss/acc line
+                f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
 
-                # v13.2: Add router metrics
+                # v14/v13.2: Add router metrics (same format as console)
                 if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                     router = base_model.global_routers.neuron_router
-                    if hasattr(router, 'usage_ema_compress'):
-                        active_C = (router.usage_ema_compress > 0.01).sum().item()
-                        active_QK = (router.usage_ema_expand_QK > 0.01).sum().item()
-                        active_V = (router.usage_ema_expand_V > 0.01).sum().item()
-                        def gini(x):
-                            x_sorted = torch.sort(x)[0]
-                            n = x.numel()
-                            idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
-                            return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
-                        gini_C = gini(router.usage_ema_compress)
-                        gini_QK = gini(router.usage_ema_expand_QK)
-                        gini_V = gini(router.usage_ema_expand_V)
-                        f.write(f",active_C={int(active_C)},active_QK={int(active_QK)},active_V={int(active_V)}")
-                        f.write(f",gini_C={gini_C:.3f},gini_QK={gini_QK:.3f},gini_V={gini_V:.3f}")
 
-                f.write("\n")
+                    def gini(x):
+                        x_sorted = torch.sort(x)[0]
+                        n = x.numel()
+                        idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+                        return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
+
+                    # v14: FRTK with HRP
+                    if hasattr(router, 'usage_ema_feature'):
+                        ema_F = router.usage_ema_feature
+                        ema_R = router.usage_ema_relational
+                        ema_T = router.usage_ema_transfer
+
+                        active_F = (ema_F > 0.01).sum().item()
+                        active_R = (ema_R > 0.01).sum().item()
+                        active_T = (ema_T > 0.01).sum().item()
+                        n_F, n_R, n_T = ema_F.numel(), ema_R.numel(), ema_T.numel()
+
+                        gini_F, gini_R, gini_T = gini(ema_F), gini(ema_R), gini(ema_T)
+
+                        imb_F = (ema_F.max() - ema_F.min()).item()
+                        imb_R = (ema_R.max() - ema_R.min()).item()
+                        imb_T = (ema_T.max() - ema_T.min()).item()
+                        prs_F, prs_R, prs_T = 0.05 + 1.0 * imb_F, 0.05 + 1.0 * imb_R, 0.05 + 1.0 * imb_T
+
+                        min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
+                        min_R, max_R, mean_R = ema_R.min().item(), ema_R.max().item(), ema_R.mean().item()
+                        min_T, max_T, mean_T = ema_T.min().item(), ema_T.max().item(), ema_T.mean().item()
+
+                        f.write(f"         HRP | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}\n")
+                        f.write(f"             Pressure F/R/T:{prs_F:.3f}/{prs_R:.3f}/{prs_T:.3f} | Imbalance:{imb_F:.3f}/{imb_R:.3f}/{imb_T:.3f}\n")
+                        f.write(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]\n")
+
+                    # v13.2: Compress/QK/V with starvation
+                    elif hasattr(router, 'usage_ema_compress'):
+                        ema_C = router.usage_ema_compress
+                        ema_QK = router.usage_ema_expand_QK
+                        ema_V = router.usage_ema_expand_V
+
+                        starvation_weight = max(0.05, math.exp(-3.0 * global_step / total_steps))
+
+                        active_C = (ema_C > 0.01).sum().item()
+                        active_QK = (ema_QK > 0.01).sum().item()
+                        active_V = (ema_V > 0.01).sum().item()
+                        n_C, n_QK, n_V = ema_C.numel(), ema_QK.numel(), ema_V.numel()
+
+                        gini_C, gini_QK, gini_V = gini(ema_C), gini(ema_QK), gini(ema_V)
+
+                        imb_C = (ema_C.max() - ema_C.min()).item()
+                        imb_QK = (ema_QK.max() - ema_QK.min()).item()
+                        imb_V = (ema_V.max() - ema_V.min()).item()
+
+                        min_C, max_C, mean_C = ema_C.min().item(), ema_C.max().item(), ema_C.mean().item()
+                        min_QK, max_QK, mean_QK = ema_QK.min().item(), ema_QK.max().item(), ema_QK.mean().item()
+                        min_V, max_V, mean_V = ema_V.min().item(), ema_V.max().item(), ema_V.mean().item()
+
+                        f.write(f"         Starv:{starvation_weight:.3f} | Active C/QK/V:{int(active_C)}/{n_C},{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} | Gini:{gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}\n")
+                        f.write(f"             Imbalance C/QK/V:{imb_C:.3f}/{imb_QK:.3f}/{imb_V:.3f}\n")
+                        f.write(f"             EMA C:[{min_C:.3f},{mean_C:.3f},{max_C:.3f}] QK:[{min_QK:.3f},{mean_QK:.3f},{max_QK:.3f}] V:[{min_V:.3f},{mean_V:.3f},{max_V:.3f}]\n")
 
             # Collect neuron metrics
             model.eval()
