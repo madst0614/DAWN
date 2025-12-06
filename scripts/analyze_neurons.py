@@ -191,12 +191,23 @@ class NeuronWordMapper:
         neuron_words = [Counter() for _ in range(self.n_neurons)]
         neuron_total = np.zeros(self.n_neurons)
 
+        # Cache token_id -> word mapping
+        token_cache = {}
+
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Building word map", total=max_batches)):
             if batch_idx >= max_batches:
                 break
 
             input_ids = batch["input_ids"].to(self.device)
             B, S = input_ids.shape
+
+            # Pre-decode tokens with cache
+            input_ids_cpu = input_ids.cpu().numpy()
+            for b in range(B):
+                for s in range(S):
+                    tid = input_ids_cpu[b, s]
+                    if tid not in token_cache:
+                        token_cache[tid] = self.tokenizer.decode([tid]).strip()
 
             _, routing_infos = self.model(input_ids, return_routing_info=True)
 
@@ -212,17 +223,20 @@ class NeuronWordMapper:
                 k = min(8, weights.shape[-1])
                 _, indices = torch.topk(weights, k, dim=-1)
 
+            # Move to CPU once
+            indices_cpu = indices.cpu().numpy()
+            weights_cpu = weights.cpu().numpy()
+
             for b in range(B):
                 for s in range(S):
-                    token_id = input_ids[b, s].item()
-                    word = self.tokenizer.decode([token_id]).strip()
+                    word = token_cache[input_ids_cpu[b, s]]
 
                     if is_batch_level:
-                        top_neurons = indices[b].cpu().numpy()
-                        top_weights = weights[b].cpu().numpy()
+                        top_neurons = indices_cpu[b]
+                        top_weights = weights_cpu[b]
                     else:
-                        top_neurons = indices[b, s].cpu().numpy()
-                        top_weights = weights[b, s].cpu().numpy()
+                        top_neurons = indices_cpu[b, s]
+                        top_weights = weights_cpu[b, s]
 
                     for ni, w in zip(top_neurons, top_weights[:len(top_neurons)]):
                         neuron_words[ni][word] += float(w)
@@ -709,12 +723,24 @@ class NeuronProbe:
         all_activations = []
         all_labels = []
 
+        # Cache token_id -> (word, pos) mapping
+        token_cache = {}
+
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Collecting", total=max_batches)):
             if batch_idx >= max_batches:
                 break
 
             input_ids = batch["input_ids"].to(self.device)
             B, S = input_ids.shape
+
+            # Pre-decode tokens with cache
+            input_ids_cpu = input_ids.cpu().numpy()
+            for b in range(B):
+                for s in range(S):
+                    tid = input_ids_cpu[b, s]
+                    if tid not in token_cache:
+                        word = self.tokenizer.decode([tid]).strip()
+                        token_cache[tid] = (word, simple_pos_tag(word))
 
             _, routing_infos = self.model(input_ids, return_routing_info=True)
 
@@ -723,20 +749,19 @@ class NeuronProbe:
                 continue
 
             is_batch_level = (len(weights.shape) == 2)
+            weights_cpu = weights.cpu().numpy()
 
             for b in range(B):
                 for s in range(S):
-                    token_id = input_ids[b, s].item()
-                    word = self.tokenizer.decode([token_id]).strip()
-                    pos = simple_pos_tag(word)
+                    _, pos = token_cache[input_ids_cpu[b, s]]
 
                     if pos == 'OTHER':
                         continue
 
                     if is_batch_level:
-                        act = weights[b].cpu().numpy()
+                        act = weights_cpu[b]
                     else:
-                        act = weights[b, s].cpu().numpy()
+                        act = weights_cpu[b, s]
 
                     all_activations.append(act)
                     all_labels.append(pos)
@@ -845,12 +870,27 @@ class LayerRoleAnalyzer:
             for l in range(self.n_layers)
         }
 
+        # Cache token_id -> word mapping to avoid repeated decode calls
+        token_cache = {}
+
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Analyzing layers", total=max_batches)):
             if batch_idx >= max_batches:
                 break
 
             input_ids = batch["input_ids"].to(self.device)
             B, S = input_ids.shape
+
+            # Pre-decode all tokens in batch (cache lookup)
+            input_ids_cpu = input_ids.cpu().numpy()
+            words_batch = []
+            for b in range(B):
+                words_seq = []
+                for s in range(S):
+                    tid = input_ids_cpu[b, s]
+                    if tid not in token_cache:
+                        token_cache[tid] = self.tokenizer.decode([tid]).strip()
+                    words_seq.append(token_cache[tid])
+                words_batch.append(words_seq)
 
             _, routing_infos = self.model(input_ids, return_routing_info=True)
 
@@ -865,15 +905,17 @@ class LayerRoleAnalyzer:
                     k = min(8, weights.shape[-1])
                     _, indices = torch.topk(weights, k, dim=-1)
 
+                # Move to CPU once per layer
+                indices_cpu = indices.cpu().numpy()
+
                 for b in range(B):
                     for s in range(S):
-                        token_id = input_ids[b, s].item()
-                        word = self.tokenizer.decode([token_id]).strip()
+                        word = words_batch[b][s]
 
                         if is_batch_level:
-                            top_neurons = indices[b].cpu().numpy()
+                            top_neurons = indices_cpu[b]
                         else:
-                            top_neurons = indices[b, s].cpu().numpy()
+                            top_neurons = indices_cpu[b, s]
 
                         for ni in top_neurons[:4]:  # Top 4 neurons
                             layer_neuron_words[layer_idx][ni][word] += 1
