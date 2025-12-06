@@ -967,3 +967,15 @@ class DAWN(nn.Module):
             'gradient_checkpointing': self.gradient_checkpointing,
             'token_routing': self.token_routing,
         }
+
+    def get_model_info(self):
+        """Return model architecture info for logging (used by train.py)"""
+        return [
+            f"DAWN v{self.__version__}: FRTK Architecture",
+            f"  FeatureNeurons (F): {self.n_feature} × {self.d_model} × {self.rank}",
+            f"  RelationalNeurons (R): {self.n_relational} × {self.rank} × {self.d_model} (Q/K pool)",
+            f"  TransferNeurons (T): {self.n_transfer} × {self.rank} × {self.d_model} (V pool)",
+            f"  Top-k: F={self.top_k_feature}, R={self.top_k_relational}, T={self.top_k_transfer}",
+            f"  KnowledgeNeurons (K): {self.n_knowledge} × {self.knowledge_rank} (top-{self.knowledge_k})",
+            f"  Router: d_space={self.d_space}, Excitability (SAR)",
+        ]

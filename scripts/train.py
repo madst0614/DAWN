@@ -554,7 +554,7 @@ def is_modern_dawn_model(model):
     base_model = get_underlying_model(model)
 
     # Check for v10+ structure
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["10.0", "13.0", "13.1", "13.2", "14.0"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["10.0", "13.0", "13.1", "13.2", "14.0", "15.0"]:
         return True
 
     # Structure check: v10+ has layers with .attn and .memory
@@ -1622,40 +1622,17 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "14.0":
-            # v14.0: FRTK Architecture with SAR
+        if model_version in ["14.0", "15.0"]:
+            # v14.0/v15.0: FRTK Architecture - defer to model.get_model_info()
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
-            state_dim = getattr(args, 'state_dim', 64)
-            d_head = args.d_model // args.n_heads
             n_feature = getattr(args, 'n_feature', 48)
             n_relational = getattr(args, 'n_relational', 12)
             n_transfer = getattr(args, 'n_transfer', 12)
-            top_k_feature = getattr(args, 'top_k_feature', 8)
-            top_k_relational = getattr(args, 'top_k_relational', 4)
-            top_k_transfer = getattr(args, 'top_k_transfer', 6)
-            d_space = getattr(args, 'd_space', 64)
-            grad_ckpt = getattr(args, 'gradient_checkpointing', False)
-            print(f"DAWN v{model_version}: rank={rank} - FRTK Architecture!")
-            print(f"  FeatureNeurons (F): {n_feature} × {args.d_model} × {rank}")
-            print(f"  RelationalNeurons (R): {n_relational} × {rank} × {args.d_model} (Q/K pool)")
-            print(f"  TransferNeurons (T): {n_transfer} × {rank} × {args.d_model} (V pool)")
-            print(f"  Global SSM: Selective mechanism (token-dependent delta, B_t)")
-            print(f"  Unified Router: d_space={d_space} + SAR (Synaptic Activation Regulation)")
-            print(f"  Context Enhancement: SSM context added to x")
-            print(f"  Top-k Feature: {top_k_feature}/{n_feature}")
-            print(f"  Top-k Relational: {top_k_relational}/{n_relational}")
-            print(f"  Top-k Transfer: {top_k_transfer}/{n_transfer}")
-            print(f"  SSM: state_dim={state_dim}")
-            print(f"  FlashAttention: enabled (scaled_dot_product_attention)")
-            print(f"  Gradient Checkpointing: {grad_ckpt}")
-            print(f"  Load Balance: Switch Transformer style + SAR")
-            print(f"  Architecture: Mamba SSM → Context + Unified Router (SAR) → FlashAttn")
-            print(f"  Attention: d_model space (d_head={d_head})")
-            print(f"  KnowledgeNeurons (K):")
-            print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
-            print(f"    - V: {args.n_knowledge} × {args.d_model}")
-            print(f"    - Knowledge top-k: {args.knowledge_k}")
+            print(f"DAWN v{model_version}: FRTK Architecture")
+            print(f"  Feature/Relational/Transfer: {n_feature}/{n_relational}/{n_transfer}")
+            print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
+            print(f"  (detailed info after model creation)")
         elif model_version == "13.2":
             # v13.2: Unified Neuron Router
             rank = args.basis_rank
@@ -1874,15 +1851,15 @@ def main():
             'top_k_V': getattr(args, 'top_k_V', 6),
             'gradient_checkpointing': args.gradient_checkpointing,
         })
-    elif model_version == '14.0':
-        # v14.0: FRTK Architecture with SAR
+    elif model_version in ['14.0', '15.0']:
+        # v14.0/v15.0: FRTK Architecture
         model_kwargs.update({
             'n_feature': getattr(args, 'n_feature', 48),
             'n_relational': getattr(args, 'n_relational', 12),
             'n_transfer': getattr(args, 'n_transfer', 12),
             'n_knowledge': args.n_knowledge,
             'knowledge_k': args.knowledge_k,
-            'knowledge_rank': args.knowledge_rank,  # None = use rank
+            'knowledge_rank': args.knowledge_rank,  # v15: 128 default
             'rank': args.basis_rank,
             'state_dim': getattr(args, 'state_dim', 64),
             'top_k_feature': getattr(args, 'top_k_feature', 8),
@@ -1976,6 +1953,12 @@ def main():
 
     model = model.to(device)
     print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
+
+    # Print detailed model info (v14+)
+    if hasattr(model, 'get_model_info'):
+        print()
+        for line in model.get_model_info():
+            print(line)
 
     # NOTE: torch.compile() is applied AFTER checkpoint loading to avoid _orig_mod. prefix issues
 

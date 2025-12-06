@@ -11,6 +11,7 @@ v15.0: Direct Knowledge Projection (NeuronMemory bypasses Feature neurons)
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
 2. Create model file in models/model_vX_Y.py
+   - Add get_model_info() method returning list of log lines (v14+)
 3. Update models/__init__.py:
    - Add import statement
    - Add to __all__ list
@@ -18,6 +19,7 @@ To add a new version:
 4. Update scripts/train.py (if router/routing_info structure changed):
    - _get_router_log_lines(): Add hasattr() branch for new router attributes
    - Training loop: Update routing_info parsing if keys changed
+   - model_kwargs section: Add version to appropriate branch
    - Example: v14 added usage_ema_feature, v15 removed memory routing
 5. Create config in configs/train_config_vX_Y.yaml
 6. Add version description to this docstring
