@@ -15,9 +15,10 @@ To add a new version:
    - Add import statement
    - Add to __all__ list
    - Add elif in create_model_by_version()
-4. Update scripts/train.py:
-   - Add model info print section
-   - Add model_kwargs section
+4. Update scripts/train.py (if router/routing_info structure changed):
+   - _get_router_log_lines(): Add hasattr() branch for new router attributes
+   - Training loop: Update routing_info parsing if keys changed
+   - Example: v14 added usage_ema_feature, v15 removed memory routing
 5. Create config in configs/train_config_vX_Y.yaml
 6. Add version description to this docstring
 """
