@@ -7,17 +7,17 @@ Changes from v13.2:
   * expand_QK → relational (R)
   * expand_V → transfer (T)
   * knowledge → knowledge (K)
-- Starvation weight → Synaptic Activation Regulation (SAR)
-  * LR determines regulatory range (tight early, loose late)
-  * Usage determines pressure direction
-  * Only corrects extremes, middle determined by gradients
+- Starvation weight → Excitability (refractory-inspired)
+  * usage_ema ≈ 0 → excitability = 1.0 (ready to fire)
+  * usage_ema ≈ tau → excitability ≈ 0.0 (refractory)
+  * Provides opportunity, gradient decides the rest
 
 Architecture (FRTK):
 - Feature Neurons (F): x → low-rank projection (compress)
 - Relational Neurons (R): Q/K generation for attention patterns
 - Transfer Neurons (T): V generation for value transfer
 - Knowledge Neurons (K): factual memory retrieval
-- Unified router with SAR for balanced usage
+- Unified router with Excitability for balanced usage
 """
 
 import math
@@ -41,7 +41,7 @@ class UnifiedNeuronRouter(nn.Module):
 
     모든 뉴런(feature, relational, transfer)이 같은 공간에 존재.
     토큰이 투영되어 가까운 뉴런 선택.
-    Synaptic Activation Regulation (SAR)로 균형 잡힌 사용 유도.
+    Excitability (refractory-inspired)로 균형 잡힌 사용 유도.
     """
     def __init__(self, d_model, n_feature, n_relational, n_transfer,
                  d_space=64, dropout=0.1):
@@ -71,44 +71,27 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('usage_ema_relational', torch.zeros(n_relational))
         self.register_buffer('usage_ema_transfer', torch.zeros(n_transfer))
 
-        # SAR: LR ratio for adaptive regulation (set by set_lr_ratio before forward)
-        self.lr_ratio = 1.0
+        # Excitability: tau (recovery time constant)
+        self.tau = 1.0
+        self.excitability_weight = 1.0
 
-    def set_lr_ratio(self, current_lr, initial_lr):
-        """Set LR ratio for SAR. Call before forward pass."""
-        self.lr_ratio = current_lr / initial_lr if initial_lr > 0 else 1.0
-
-    def get_synaptic_regulation(self, usage_ema):
+    def get_excitability(self, usage_ema):
         """
-        Synaptic Activation Regulation (SAR)
+        Neuronal excitability based on usage.
+        Mirrors biological refractory dynamics.
 
-        Inspired by:
-        - Critical period (adaptive bounds)
-        - Neuromodulation (adaptive strength)
-        - Synaptic homeostasis (extreme correction only)
+        - usage_ema ≈ 0 → excitability = 1.0 (fully ready)
+        - usage_ema ≈ tau → excitability ≈ 0.0 (refractory)
 
-        Uses lr_ratio set by set_lr_ratio() before forward.
+        Unlike floor/ceiling approaches, this just provides opportunity -
+        gradient decides the rest.
         """
-        lr_ratio = self.lr_ratio
+        return torch.clamp(1.0 - usage_ema / self.tau, min=0.0, max=1.0)
 
-        # Developmental: adaptive bounds (tight early, loose late)
-        floor = 0.02 + 0.08 * lr_ratio      # 0.10 → 0.02
-        ceiling = 0.97 - 0.27 * lr_ratio    # 0.70 → 0.97
-
-        # Modulatory: adaptive strength (strong early, weak late)
-        strength = 5 + 15 * lr_ratio        # 20 → 5
-
-        # Homeostatic: correct extremes only
-        floor_pressure = torch.clamp(floor - usage_ema, min=0) * strength
-        ceiling_pressure = torch.clamp(usage_ema - ceiling, min=0) * strength
-
-        return floor_pressure - ceiling_pressure
-
-    def get_logits(self, x, neuron_type, use_sar=True):
+    def get_logits(self, x, neuron_type):
         """
         x: [B, S, d_model]
         neuron_type: 'feature', 'relational_Q', 'relational_K', 'transfer', 'memory'
-        use_sar: whether to apply Synaptic Activation Regulation
         """
         h_proj = self.proj(x)  # [B, S, d_space]
         h_proj = self.dropout(h_proj)
@@ -119,24 +102,24 @@ class UnifiedNeuronRouter(nn.Module):
         # 전체 뉴런과 내적
         all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
 
-        # 타입별 슬라이싱 + SAR (Synaptic Activation Regulation)
+        # 타입별 슬라이싱 + Excitability (refractory-inspired)
         if neuron_type in ['feature', 'memory']:
             logits = all_logits[..., :self.feature_end]
-            if self.training and use_sar:
-                regulation = self.get_synaptic_regulation(self.usage_ema_feature)
-                logits = logits + regulation
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_feature)
+                logits = logits + excitability * self.excitability_weight
 
         elif neuron_type in ['relational_Q', 'relational_K']:
             logits = all_logits[..., self.feature_end:self.relational_end]
-            if self.training and use_sar:
-                regulation = self.get_synaptic_regulation(self.usage_ema_relational)
-                logits = logits + regulation
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_relational)
+                logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'transfer':
             logits = all_logits[..., self.relational_end:]
-            if self.training and use_sar:
-                regulation = self.get_synaptic_regulation(self.usage_ema_transfer)
-                logits = logits + regulation
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_transfer)
+                logits = logits + excitability * self.excitability_weight
 
         return logits
 
@@ -347,7 +330,7 @@ class GlobalRouters(nn.Module):
     1 UnifiedNeuronRouter for all neuron types:
     - All neurons in same d_space embedding
     - Type-specific slicing for feature/relational/transfer
-    - Synaptic Activation Regulation (SAR) for balanced usage
+    - Excitability (refractory-inspired) for balanced usage
     """
     def __init__(self, d_model: int, n_feature: int, n_relational: int, n_transfer: int,
                  top_k_feature: int = 8, top_k_relational: int = 4, top_k_transfer: int = 6,
@@ -382,7 +365,7 @@ class GlobalRouters(nn.Module):
 
         Returns: feature_weights, relational_weights_Q, relational_weights_K, transfer_weights, routing_info, aux_loss
         """
-        # Get logits from unified router (SAR applied internally)
+        # Get logits from unified router (Excitability applied internally)
         feature_logits = self.neuron_router.get_logits(x, 'feature')
         relational_logits_Q = self.neuron_router.get_logits(x, 'relational_Q')
         relational_logits_K = self.neuron_router.get_logits(x, 'relational_K')
@@ -710,8 +693,8 @@ class DAWN(nn.Module):
 
     Changes from v13.2:
     - Renamed neuron types: compress→feature, expand_QK→relational, expand_V→transfer
-    - Starvation weight → Synaptic Activation Regulation (SAR)
-    - LR-based adaptive bounds (tight early, loose late)
+    - Starvation weight → Excitability (refractory-inspired)
+    - Simple: excitability = 1 - usage_ema / tau
 
     Architecture (FRTK):
     - Feature Neurons (F): input compression
@@ -820,22 +803,15 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, input_ids, labels=None, return_routing_info=False,
-                current_lr=None, initial_lr=None):
+    def forward(self, input_ids, labels=None, return_routing_info=False):
         """
         Args:
             input_ids: [B, S] token ids
             labels: [B, S] labels for loss calculation
             return_routing_info: whether to return routing info
-            current_lr: current learning rate (for SAR)
-            initial_lr: initial learning rate (for SAR)
         """
         B, S = input_ids.shape
         device = input_ids.device
-
-        # Set LR ratio for SAR (Synaptic Activation Regulation)
-        if current_lr is not None and initial_lr is not None:
-            self.global_routers.neuron_router.set_lr_ratio(current_lr, initial_lr)
 
         # Reset aux_loss accumulator
         self.aux_loss = 0.0
@@ -957,7 +933,7 @@ class DAWN(nn.Module):
         print(f"Top-k Relational: {self.top_k_relational}/{self.n_relational}")
         print(f"Top-k Transfer:   {self.top_k_transfer}/{self.n_transfer}")
         print(f"Mamba Available: {MAMBA_AVAILABLE}")
-        print(f"Architecture: Mamba SSM → Context → Unified Router (SAR) → FlashAttn")
+        print(f"Architecture: Mamba SSM → Context → Unified Router (Excitability) → FlashAttn")
         print(f"---")
         print(f"Total:                 {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 

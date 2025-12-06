@@ -578,14 +578,14 @@ def _gini(x):
     return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
 
 
-def _get_router_log_lines(router, optimizer, args, global_step, total_steps, warmup_steps=0):
+def _get_router_log_lines(router, global_step, total_steps):
     """Generate router log lines for both console and file output.
 
     Returns list of log lines (without trailing newlines).
     """
     lines = []
 
-    # v14: FRTK with SAR (Synaptic Activation Regulation)
+    # v14: FRTK with Excitability (refractory-inspired)
     if hasattr(router, 'usage_ema_feature'):
         ema_F = router.usage_ema_feature
         ema_R = router.usage_ema_relational
@@ -600,27 +600,19 @@ def _get_router_log_lines(router, optimizer, args, global_step, total_steps, war
         # Gini coefficients
         gini_F, gini_R, gini_T = _gini(ema_F), _gini(ema_R), _gini(ema_T)
 
-        # SAR: LR-based bounds + strength
-        # During warmup: lr_ratio = 1.0 (tight bounds)
-        # After warmup: lr_ratio decays with cosine schedule
-        if global_step < warmup_steps:
-            lr_ratio = 1.0
-        else:
-            current_lr = optimizer.param_groups[0]['lr']
-            initial_lr = args.lr
-            lr_ratio = current_lr / initial_lr if initial_lr > 0 else 1.0
-        floor = 0.02 + 0.08 * lr_ratio
-        ceiling = 0.97 - 0.27 * lr_ratio
-        strength = 5 + 15 * lr_ratio
+        # Excitability: 1 - usage_ema / tau (tau=1.0)
+        tau = router.tau if hasattr(router, 'tau') else 1.0
+        exc_F = torch.clamp(1.0 - ema_F / tau, min=0.0, max=1.0)
+        exc_R = torch.clamp(1.0 - ema_R / tau, min=0.0, max=1.0)
+        exc_T = torch.clamp(1.0 - ema_T / tau, min=0.0, max=1.0)
 
-        # Usage EMA distribution
-        min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
-        min_R, max_R, mean_R = ema_R.min().item(), ema_R.max().item(), ema_R.mean().item()
-        min_T, max_T, mean_T = ema_T.min().item(), ema_T.max().item(), ema_T.mean().item()
+        # Excitability distribution
+        min_exc_F, max_exc_F, mean_exc_F = exc_F.min().item(), exc_F.max().item(), exc_F.mean().item()
+        min_exc_R, max_exc_R, mean_exc_R = exc_R.min().item(), exc_R.max().item(), exc_R.mean().item()
+        min_exc_T, max_exc_T, mean_exc_T = exc_T.min().item(), exc_T.max().item(), exc_T.mean().item()
 
-        lines.append(f"         SAR | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
-        lines.append(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f} Str:{strength:.1f}")
-        lines.append(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]")
+        lines.append(f"         Excitability | τ={tau:.1f} | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
+        lines.append(f"             Exc F:[{min_exc_F:.2f},{mean_exc_F:.2f},{max_exc_F:.2f}] R:[{min_exc_R:.2f},{mean_exc_R:.2f},{max_exc_R:.2f}] T:[{min_exc_T:.2f},{mean_exc_T:.2f},{max_exc_T:.2f}]")
 
     # v13.2: Compress/QK/V with starvation
     elif hasattr(router, 'usage_ema_compress'):
@@ -658,14 +650,13 @@ def _get_router_log_lines(router, optimizer, args, global_step, total_steps, war
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
                 orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0, process_norm_weight=0.0,
-                debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1, warmup_steps=0):
+                debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1):
     """Train for one epoch
 
     Args:
         start_step: Step to resume from within this epoch (default 0, start from beginning)
         global_step: Global training step counter (for v13.2 starvation decay)
         total_steps: Total training steps (for v13.2 starvation decay)
-        warmup_steps: Number of warmup steps (for SAR lr_ratio calculation)
     """
     model.train()
 
@@ -721,19 +712,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))
 
                 # v10: DAWN model forward
-                # Get current LR for SAR (Synaptic Activation Regulation)
-                # During warmup: force lr_ratio = 1.0 (tight bounds)
-                current_lr = optimizer.param_groups[0]['lr']
-                if global_step < warmup_steps:
-                    initial_lr = current_lr  # Forces lr_ratio = 1.0
-                else:
-                    initial_lr = args.lr
-
                 if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2_plus:
-                    ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True,
-                                                           current_lr=current_lr, initial_lr=initial_lr)
+                    ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                 else:
-                    ce_loss, logits = model(input_ids, labels, current_lr=current_lr, initial_lr=initial_lr)
+                    ce_loss, logits = model(input_ids, labels)
                     routing_infos = None
 
                 # Orthogonality loss
@@ -790,19 +772,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))
 
             # v10: DAWN model forward
-            # Get current LR for SAR (Synaptic Activation Regulation)
-            # During warmup: force lr_ratio = 1.0 (tight bounds)
-            current_lr = optimizer.param_groups[0]['lr']
-            if global_step < warmup_steps:
-                initial_lr = current_lr  # Forces lr_ratio = 1.0
-            else:
-                initial_lr = args.lr
-
             if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2_plus:
-                ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True,
-                                                       current_lr=current_lr, initial_lr=initial_lr)
+                ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
             else:
-                ce_loss, logits = model(input_ids, labels, current_lr=current_lr, initial_lr=initial_lr)
+                ce_loss, logits = model(input_ids, labels)
                 routing_infos = None
 
             # Orthogonality loss
@@ -959,10 +932,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Compact output with loss/acc
                     print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
 
-                    # v13.2+: Usage EMA logging (v13.2: C/QK/V, v14: F/R/T with SAR)
+                    # v13.2+: Usage EMA logging (v13.2: C/QK/V starvation, v14: F/R/T excitability)
                     if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                         router = base_model.global_routers.neuron_router
-                        for line in _get_router_log_lines(router, optimizer, args, global_step, total_steps, warmup_steps):
+                        for line in _get_router_log_lines(router, global_step, total_steps):
                             print(line)
 
                     # Knowledge neuron usage stats
@@ -1025,7 +998,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # v14/v13.2: Add router metrics (same format as console)
                 if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                     router = base_model.global_routers.neuron_router
-                    for line in _get_router_log_lines(router, optimizer, args, global_step, total_steps, warmup_steps):
+                    for line in _get_router_log_lines(router, global_step, total_steps):
                         f.write(line + "\n")
 
             # Collect neuron metrics
@@ -2157,8 +2130,7 @@ def main():
             model_config=model_kwargs,
             start_step=epoch_start_step,
             global_step=global_step,
-            total_steps=total_steps,
-            warmup_steps=warmup_steps
+            total_steps=total_steps
         )
 
         # Evaluate
