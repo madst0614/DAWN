@@ -29,6 +29,7 @@ import os
 import pickle
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
@@ -41,6 +42,15 @@ from tqdm import tqdm
 
 # Add project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Mixed precision
+try:
+    from torch.cuda.amp import autocast
+    HAS_AMP = True
+except ImportError:
+    HAS_AMP = False
+    def autocast(enabled=True):
+        return torch.no_grad()
 
 # Optional imports
 try:
@@ -423,56 +433,62 @@ class NeuronSimilarityAnalyzer:
         self.detector = VersionDetector(model)
 
     def compute_similarity(self) -> Dict:
-        """Compute cosine similarity matrix"""
+        """Compute cosine similarity matrix (GPU accelerated)"""
         print(f"\n{'='*60}")
-        print(f"NEURON SIMILARITY ANALYSIS")
+        print(f"NEURON SIMILARITY ANALYSIS (GPU)")
         print(f"{'='*60}")
 
         shared = self.model.shared_neurons
 
+        # Get neurons on GPU
         if self.detector.version == '14':
-            neurons = shared.feature_neurons.data.cpu().numpy()
+            neurons = shared.feature_neurons.data
         else:
-            neurons = shared.compress_neurons.data.cpu().numpy()
+            neurons = shared.compress_neurons.data
 
         N = neurons.shape[0]
         neurons_flat = neurons.reshape(N, -1)
 
-        # Normalize
-        norms = np.linalg.norm(neurons_flat, axis=1, keepdims=True) + 1e-10
-        neurons_norm = neurons_flat / norms
+        # GPU-based normalization and similarity
+        with torch.no_grad():
+            neurons_norm = F.normalize(neurons_flat, p=2, dim=1)
+            sim_matrix_gpu = torch.mm(neurons_norm, neurons_norm.T)
 
-        # Cosine similarity
-        sim_matrix = neurons_norm @ neurons_norm.T
+            # Stats on GPU
+            mask = ~torch.eye(N, dtype=torch.bool, device=sim_matrix_gpu.device)
+            off_diag = sim_matrix_gpu[mask]
 
-        # Stats
-        mask = ~np.eye(N, dtype=bool)
-        off_diag = sim_matrix[mask]
+            stats = {
+                'mean': float(off_diag.mean().cpu()),
+                'std': float(off_diag.std().cpu()),
+                'max': float(off_diag.max().cpu()),
+                'min': float(off_diag.min().cpu()),
+            }
+
+            # Find most similar pairs on GPU
+            sim_for_topk = sim_matrix_gpu.clone()
+            sim_for_topk.fill_diagonal_(-1)
+            flat_sim = sim_for_topk.flatten()
+            topk_vals, topk_idx = torch.topk(flat_sim, 10)
+
+            sim_matrix = sim_matrix_gpu.cpu().numpy()
 
         results = {
             'similarity_matrix': sim_matrix.tolist(),
-            'stats': {
-                'mean': float(np.mean(off_diag)),
-                'std': float(np.std(off_diag)),
-                'max': float(np.max(off_diag)),
-                'min': float(np.min(off_diag)),
-            },
+            'stats': stats,
             'n_neurons': N,
         }
 
         print(f"Similarity stats:")
-        print(f"  Mean: {results['stats']['mean']:.4f}")
-        print(f"  Std:  {results['stats']['std']:.4f}")
-        print(f"  Max:  {results['stats']['max']:.4f}")
-        print(f"  Min:  {results['stats']['min']:.4f}")
+        print(f"  Mean: {stats['mean']:.4f}")
+        print(f"  Std:  {stats['std']:.4f}")
+        print(f"  Max:  {stats['max']:.4f}")
+        print(f"  Min:  {stats['min']:.4f}")
 
-        # Find most similar pairs
-        np.fill_diagonal(sim_matrix, -1)
-        flat_idx = np.argsort(sim_matrix.flatten())[-10:]
         print(f"\n--- Most Similar Pairs ---")
-        for idx in reversed(flat_idx):
-            i, j = idx // N, idx % N
-            print(f"  Neuron {i} - {j}: {sim_matrix[i, j]:.4f}")
+        for val, idx in zip(topk_vals, topk_idx):
+            i, j = idx.item() // N, idx.item() % N
+            print(f"  Neuron {i} - {j}: {val.item():.4f}")
 
         return results
 
@@ -503,20 +519,22 @@ class NeuronSimilarityAnalyzer:
 # ============================================================
 
 class NeuronAblation:
-    """Measure neuron contribution via ablation"""
+    """Measure neuron contribution via ablation (GPU optimized)"""
 
     def __init__(self, model, tokenizer, device='cuda'):
         self.model = get_underlying_model(model)
         self.tokenizer = tokenizer
         self.device = device
         self.detector = VersionDetector(model)
+        self.use_amp = HAS_AMP and device != 'cpu'
 
     @torch.no_grad()
     def run_ablation(self, dataloader, max_batches: int = 20,
-                     neurons_to_test: List[int] = None) -> Dict:
-        """Run ablation study"""
+                     neurons_to_test: List[int] = None,
+                     parallel_batch: int = 4) -> Dict:
+        """Run ablation study with GPU optimization"""
         print(f"\n{'='*60}")
-        print(f"ABLATION STUDY")
+        print(f"ABLATION STUDY (GPU, AMP={self.use_amp})")
         print(f"{'='*60}")
 
         self.model.eval()
@@ -524,8 +542,16 @@ class NeuronAblation:
         if neurons_to_test is None:
             neurons_to_test = list(range(min(10, self.detector.n_neurons)))
 
+        # Cache batches to avoid reloading
+        print("Caching data batches...")
+        cached_batches = []
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+            cached_batches.append(batch["input_ids"].to(self.device))
+
         # Get baseline perplexity
-        baseline_loss = self._compute_loss(dataloader, max_batches)
+        baseline_loss = self._compute_loss_cached(cached_batches)
         baseline_ppl = math.exp(baseline_loss)
         print(f"Baseline perplexity: {baseline_ppl:.2f}")
 
@@ -543,11 +569,12 @@ class NeuronAblation:
 
         original_weights = neurons.data.clone()
 
+        # Process neurons in batches for progress display
         for n in tqdm(neurons_to_test, desc="Ablating neurons"):
             # Zero out neuron n
             neurons.data[n] = 0
 
-            ablated_loss = self._compute_loss(dataloader, max_batches)
+            ablated_loss = self._compute_loss_cached(cached_batches)
             ablated_ppl = math.exp(ablated_loss)
 
             delta_ppl = ablated_ppl - baseline_ppl
@@ -574,8 +601,36 @@ class NeuronAblation:
 
         return results
 
+    def _compute_loss_cached(self, cached_batches: List[torch.Tensor]) -> float:
+        """Compute average loss from cached batches with AMP"""
+        total_loss = 0
+        total_tokens = 0
+
+        for input_ids in cached_batches:
+            with autocast(enabled=self.use_amp):
+                outputs = self.model(input_ids)
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+
+            # Shift for LM loss
+            shift_logits = logits[:, :-1, :].contiguous().float()
+            shift_labels = input_ids[:, 1:].contiguous()
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction='sum'
+            )
+
+            total_loss += loss.item()
+            total_tokens += shift_labels.numel()
+
+        return total_loss / total_tokens if total_tokens > 0 else 0
+
     def _compute_loss(self, dataloader, max_batches: int) -> float:
-        """Compute average loss"""
+        """Compute average loss (legacy, for compatibility)"""
         total_loss = 0
         total_tokens = 0
 
@@ -728,7 +783,7 @@ class NeuronProbe:
         X_test = scaler.transform(X_test)
 
         # Train
-        clf = LogisticRegression(max_iter=1000, multi_class='multinomial')
+        clf = LogisticRegression(max_iter=1000, multi_class='multinomial', n_jobs=-1)
         clf.fit(X_train, y_train)
 
         train_acc = clf.score(X_train, y_train)
@@ -1219,8 +1274,11 @@ def load_model_and_data(args):
                 return {'input_ids': encoding['input_ids'].squeeze(0)}
 
         dataset = SimpleDataset(val_texts, tokenizer)
+        num_workers = getattr(args, 'num_workers', 4)
         dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=False, num_workers=2
+            dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=True,
+            prefetch_factor=2 if num_workers > 0 else None
         )
 
     return model, tokenizer, dataloader, device
@@ -1237,6 +1295,7 @@ def main():
                                 'distribution', 'context'])
     parser.add_argument('--max_batches', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--text', type=str, default="The bank by the river was steep.")
     args = parser.parse_args()
 
