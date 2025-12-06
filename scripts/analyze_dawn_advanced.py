@@ -185,22 +185,21 @@ class NeuronSVDAnalyzer:
         neurons = {}
 
         if self.version == '14':
-            # v14: neurons stored in global_neurons
-            global_neurons = self.model.global_neurons
-            # Use FRTK naming
-            neurons['feature'] = global_neurons.feature_neurons.data.cpu().numpy()
-            neurons['relational'] = global_neurons.relational_neurons.data.cpu().numpy()
-            neurons['transfer'] = global_neurons.transfer_neurons.data.cpu().numpy()
+            # v14: neurons stored in shared_neurons with FRTK naming
+            shared = self.model.shared_neurons
+            neurons['feature'] = shared.feature_neurons.data.cpu().numpy()
+            neurons['relational'] = shared.relational_neurons.data.cpu().numpy()
+            neurons['transfer'] = shared.transfer_neurons.data.cpu().numpy()
 
-            if hasattr(global_neurons, 'knowledge_K'):
-                neurons['knowledge_K'] = global_neurons.knowledge_K.data.cpu().numpy()
-                neurons['knowledge_V'] = global_neurons.knowledge_V.data.cpu().numpy()
+            if hasattr(shared, 'knowledge_K'):
+                neurons['knowledge_K'] = shared.knowledge_K.data.cpu().numpy()
+                neurons['knowledge_V'] = shared.knowledge_V.data.cpu().numpy()
 
             # Legacy aliases for compatibility
             neurons['compress'] = neurons['feature']
             neurons['expand'] = neurons['relational']
         else:
-            # Legacy versions: use shared_neurons
+            # Legacy versions: use shared_neurons with compress/expand naming
             shared = self.model.shared_neurons
             neurons['compress'] = shared.compress_neurons.data.cpu().numpy()
 
