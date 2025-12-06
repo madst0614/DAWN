@@ -1343,7 +1343,11 @@ def main():
     if args.mode in ['all', 'layer'] and dataloader:
         layer_analyzer = LayerRoleAnalyzer(model, tokenizer, device)
         results = layer_analyzer.analyze(dataloader, args.max_batches)
-        all_results['layer'] = {'n_layers': results['n_layers']}
+        all_results['layer'] = {
+            'n_layers': layer_analyzer.n_layers,
+            'layers_analyzed': len(results['layers']),
+            'role_changes': len(results['role_changes'])
+        }
 
     # 7. Trajectory
     if args.mode in ['all', 'trajectory']:
