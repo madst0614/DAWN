@@ -12,6 +12,7 @@ v12.6: No SSM Ablation (simple projection for importance, no context enhancement
 v12.7: SSM without Context (SSM preserved, context removed)
 v12.8: Top-k Sparse Mixing (soft mixing → top-k sparse, Switch-style load balance)
 v13.0: Final Architecture (Selective SSM + Context + Top-k + FlashAttention)
+v14.0: FRTK Architecture (Feature-Relational-Transfer-Knowledge) with Homeostatic Routing
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -425,6 +426,41 @@ VERSION_REGISTRY = {
             f"  Architecture: Selective SSM → Context → Unified Router → FlashAttn",
             f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
             f"  KnowledgeNeurons:",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - top-k: {args.get('knowledge_k')}",
+        ],
+    },
+    "14.0": {
+        "description": "FRTK Architecture (Feature-Relational-Transfer-Knowledge) with Homeostatic Routing",
+        "aliases": ["14", "140"],
+        "module": "model_v14",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature", "n_relational", "n_transfer", "n_knowledge", "knowledge_k", "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature": 8,
+            "top_k_relational": 4,
+            "top_k_transfer": 6,
+            "d_space": 64,
+            "gradient_checkpointing": False,
+        },
+        "display_info": lambda args: [
+            f"DAWN v14: rank={args.get('rank', args.get('basis_rank'))} (FRTK Architecture)",
+            f"  FeatureNeurons (F): {args.get('n_feature')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))}",
+            f"  RelationalNeurons (R): {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K pool)",
+            f"  TransferNeurons (T): {args.get('n_transfer')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V pool)",
+            f"  Unified Router: d_space={args.get('d_space', 64)} + Homeostatic Pressure",
+            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
+            f"  Top-k Feature: {args.get('top_k_feature', 8)}/{args.get('n_feature')}",
+            f"  Top-k Relational: {args.get('top_k_relational', 4)}/{args.get('n_relational')}",
+            f"  Top-k Transfer: {args.get('top_k_transfer', 6)}/{args.get('n_transfer')}",
+            f"  Architecture: Mamba SSM → Context → Unified Router (HRP) → FlashAttn",
+            f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
+            f"  KnowledgeNeurons (K):",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
             f"    - top-k: {args.get('knowledge_k')}",

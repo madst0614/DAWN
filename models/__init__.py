@@ -64,6 +64,11 @@ v13.0: Final Architecture
 - Top-k Sparse Routing
 - FlashAttention + Gradient Checkpointing
 
+v14.0: FRTK Architecture
+- Feature-Relational-Transfer-Knowledge naming
+- Homeostatic Routing Pressure (replaces starvation weight)
+- Adaptive pressure based on usage imbalance
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -109,6 +114,9 @@ from .model_v13_1 import DAWN as DAWN_v13_1
 # v13.2 - Unified Neuron Router
 from .model_v13_2 import DAWN as DAWN_v13_2
 
+# v14.0 - FRTK Architecture with Homeostatic Routing
+from .model_v14 import DAWN as DAWN_v14
+
 # Default DAWN is v12.3 (stable)
 DAWN = DAWN_v12_3
 
@@ -148,6 +156,7 @@ __all__ = [
     'DAWN_v13',
     'DAWN_v13_1',
     'DAWN_v13_2',
+    'DAWN_v14',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -208,6 +217,8 @@ def create_model_by_version(version, config):
         return DAWN_v13_1(**config)
     elif version == "13.2":
         return DAWN_v13_2(**config)
+    elif version == "14.0":
+        return DAWN_v14(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8, 13.0, 13.1, 13.2, baseline")
+                        f"Supported versions: 10.0, 11.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8, 13.0, 13.1, 13.2, 14.0, baseline")
