@@ -870,12 +870,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             gini_R = gini(ema_R)
                             gini_T = gini(ema_T)
 
-                            # SAR: LR-based bounds (same as model_v14.py)
+                            # SAR: LR-based bounds + strength (same as model_v14.py)
                             current_lr = optimizer.param_groups[0]['lr']
                             initial_lr = args.lr
                             lr_ratio = current_lr / initial_lr if initial_lr > 0 else 1.0
-                            floor = 0.01 + 0.09 * lr_ratio      # 0.10 → 0.01
-                            ceiling = 0.99 - 0.29 * lr_ratio    # 0.70 → 0.99
+                            floor = 0.02 + 0.08 * lr_ratio      # 0.10 → 0.02
+                            ceiling = 0.97 - 0.27 * lr_ratio    # 0.70 → 0.97
+                            strength = 5 + 15 * lr_ratio        # 20 → 5
 
                             # Usage EMA distribution: min/max/mean
                             min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
@@ -884,8 +885,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                             # Line 1: Active counts and Gini (same format as v13.2)
                             print(f"         SAR | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
-                            # Line 2: SAR bounds (LR-based floor/ceiling)
-                            print(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f}")
+                            # Line 2: SAR bounds (LR-based floor/ceiling/strength)
+                            print(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f} Str:{strength:.1f}")
                             # Line 3: Usage EMA distribution
                             print(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]")
 
@@ -999,19 +1000,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                         gini_F, gini_R, gini_T = gini(ema_F), gini(ema_R), gini(ema_T)
 
-                        # SAR: LR-based bounds
+                        # SAR: LR-based bounds + strength
                         current_lr = optimizer.param_groups[0]['lr']
                         initial_lr = args.lr
                         lr_ratio = current_lr / initial_lr if initial_lr > 0 else 1.0
-                        floor = 0.01 + 0.09 * lr_ratio
-                        ceiling = 0.99 - 0.29 * lr_ratio
+                        floor = 0.02 + 0.08 * lr_ratio
+                        ceiling = 0.97 - 0.27 * lr_ratio
+                        strength = 5 + 15 * lr_ratio
 
                         min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
                         min_R, max_R, mean_R = ema_R.min().item(), ema_R.max().item(), ema_R.mean().item()
                         min_T, max_T, mean_T = ema_T.min().item(), ema_T.max().item(), ema_T.mean().item()
 
                         f.write(f"         SAR | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}\n")
-                        f.write(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f}\n")
+                        f.write(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f} Str:{strength:.1f}\n")
                         f.write(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]\n")
 
                     # v13.2: Compress/QK/V with starvation

@@ -81,19 +81,26 @@ class UnifiedNeuronRouter(nn.Module):
     def get_synaptic_regulation(self, usage_ema):
         """
         Synaptic Activation Regulation (SAR)
-        - Global: LR determines regulatory range
-        - Local: Usage determines pressure direction
-        - 극단만 교정, 중간은 gradient가 결정
+
+        Inspired by:
+        - Critical period (adaptive bounds)
+        - Neuromodulation (adaptive strength)
+        - Synaptic homeostasis (extreme correction only)
+
+        Uses lr_ratio set by set_lr_ratio() before forward.
         """
         lr_ratio = self.lr_ratio
 
-        # Adaptive bounds (tight early, loose late)
-        floor = 0.01 + 0.09 * lr_ratio      # 0.10 → 0.01
-        ceiling = 0.99 - 0.29 * lr_ratio    # 0.70 → 0.99
+        # Developmental: adaptive bounds (tight early, loose late)
+        floor = 0.02 + 0.08 * lr_ratio      # 0.10 → 0.02
+        ceiling = 0.97 - 0.27 * lr_ratio    # 0.70 → 0.97
 
-        # Pressure only at extremes
-        floor_pressure = torch.clamp(floor - usage_ema, min=0) * 10
-        ceiling_pressure = torch.clamp(usage_ema - ceiling, min=0) * 10
+        # Modulatory: adaptive strength (strong early, weak late)
+        strength = 5 + 15 * lr_ratio        # 20 → 5
+
+        # Homeostatic: correct extremes only
+        floor_pressure = torch.clamp(floor - usage_ema, min=0) * strength
+        ceiling_pressure = torch.clamp(usage_ema - ceiling, min=0) * strength
 
         return floor_pressure - ceiling_pressure
 
