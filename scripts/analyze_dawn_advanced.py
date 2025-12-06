@@ -191,9 +191,10 @@ class NeuronSVDAnalyzer:
             neurons['relational'] = shared.relational_neurons.data.cpu().numpy()
             neurons['transfer'] = shared.transfer_neurons.data.cpu().numpy()
 
-            if hasattr(shared, 'knowledge_K'):
-                neurons['knowledge_K'] = shared.knowledge_K.data.cpu().numpy()
-                neurons['knowledge_V'] = shared.knowledge_V.data.cpu().numpy()
+            # v14: knowledge_neurons_K/V (not knowledge_K/V)
+            if hasattr(shared, 'knowledge_neurons_K'):
+                neurons['knowledge_K'] = shared.knowledge_neurons_K.data.cpu().numpy()
+                neurons['knowledge_V'] = shared.knowledge_neurons_V.data.cpu().numpy()
 
             # Legacy aliases for compatibility
             neurons['compress'] = neurons['feature']
@@ -392,6 +393,14 @@ class NeuronSVDAnalyzer:
                 print(f"\n[ExpandNeurons]")
                 print(f"  Effective dim: {results['expand']['pca']['effective_dim']:.1f}/{self.n_expand}")
                 print(f"  Similarity: {results['expand']['similarity']['mean']:.4f}")
+
+        # Knowledge neurons (both v14 and legacy)
+        if 'knowledge' in results:
+            n_knowledge = getattr(self.model, 'n_knowledge',
+                                  getattr(self.model.shared_neurons, 'n_knowledge', 80))
+            print(f"\n[KnowledgeNeurons]")
+            print(f"  K Effective dim: {results['knowledge']['K_pca']['effective_dim']:.1f}/{n_knowledge}")
+            print(f"  V Effective dim: {results['knowledge']['V_pca']['effective_dim']:.1f}/{n_knowledge}")
 
         return results
 
