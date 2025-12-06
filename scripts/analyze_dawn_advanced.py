@@ -547,11 +547,13 @@ class SentenceVisualizer:
                     for comp in ['Q', 'K', 'V']:
                         layer_result[comp] = {'weights': weights, 'indices': indices}
 
-            elif 'compress_weights' in attn:
-                # v12 format (including v12.7/v13 with top-k)
-                # Try dense weights first for better visualization
+            elif 'compress_weights' in attn or 'compress_pref' in attn:
+                # v12/v13 format (including v12.7/v13 with top-k)
+                # Try dense/token-level weights first for better visualization
                 if 'compress_weights_dense' in attn:
                     raw_weights = attn['compress_weights_dense'][0].cpu()  # v12.7/v13
+                elif 'compress_pref' in attn:
+                    raw_weights = attn['compress_pref'][0].cpu()  # v13.2 token-level
                 else:
                     raw_weights = attn['compress_weights'][0].cpu()  # First batch
 
@@ -727,14 +729,16 @@ class SemanticAnalyzer:
                 weights = attn['feature_weights']
                 indices = None  # v14 doesn't expose top-k indices separately
                 is_batch_level = (len(weights.shape) == 2)
-            elif 'compress_weights' in attn:
-                # v12.7/v13: prefer dense weights for analysis
+            elif 'compress_weights' in attn or 'compress_pref' in attn:
+                # v12.7/v13: prefer dense/token-level weights for analysis
                 if 'compress_weights_dense' in attn:
                     weights = attn['compress_weights_dense']
+                elif 'compress_pref' in attn:
+                    weights = attn['compress_pref']  # v13.2 token-level [B, S, N]
                 else:
                     weights = attn['compress_weights']
                 indices = attn.get('compress_topk_idx')
-                # v12.3+: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
+                # v12.3+: [B, n_compress] (batch-level), v12.x/v13.2: [B, S, n_compress] (token-level)
                 is_batch_level = (len(weights.shape) == 2)
             else:
                 continue
@@ -896,14 +900,16 @@ class NeuronCatalog:
                 weights = attn['feature_weights']
                 indices = None  # v14 doesn't expose top-k indices separately
                 is_batch_level = (len(weights.shape) == 2)
-            elif 'compress_weights' in attn:
-                # v12.7/v13: prefer dense weights for catalog building
+            elif 'compress_weights' in attn or 'compress_pref' in attn:
+                # v12.7/v13: prefer dense/token-level weights for catalog building
                 if 'compress_weights_dense' in attn:
                     weights = attn['compress_weights_dense']
+                elif 'compress_pref' in attn:
+                    weights = attn['compress_pref']  # v13.2 token-level [B, S, N]
                 else:
                     weights = attn['compress_weights']
                 indices = attn.get('compress_topk_idx')
-                # v12.3+: [B, n_compress] (batch-level), v12.x: [B, S, n_compress] (token-level)
+                # v12.3+: [B, n_compress] (batch-level), v12.x/v13.2: [B, S, n_compress] (token-level)
                 is_batch_level = (len(weights.shape) == 2)
             else:
                 continue
