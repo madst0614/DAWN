@@ -600,8 +600,9 @@ def _get_router_log_lines(router, global_step, total_steps):
         # Gini coefficients
         gini_F, gini_R, gini_T = _gini(ema_F), _gini(ema_R), _gini(ema_T)
 
-        # Excitability: 1 - usage_ema / tau (tau=1.0)
+        # Excitability: 1 - usage_ema / tau (tau=1.0), with decaying weight
         tau = router.tau if hasattr(router, 'tau') else 1.0
+        weight = router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0
         exc_F = torch.clamp(1.0 - ema_F / tau, min=0.0, max=1.0)
         exc_R = torch.clamp(1.0 - ema_R / tau, min=0.0, max=1.0)
         exc_T = torch.clamp(1.0 - ema_T / tau, min=0.0, max=1.0)
@@ -611,7 +612,7 @@ def _get_router_log_lines(router, global_step, total_steps):
         min_exc_R, max_exc_R, mean_exc_R = exc_R.min().item(), exc_R.max().item(), exc_R.mean().item()
         min_exc_T, max_exc_T, mean_exc_T = exc_T.min().item(), exc_T.max().item(), exc_T.mean().item()
 
-        lines.append(f"         Excitability | τ={tau:.1f} | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
+        lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
         lines.append(f"             Exc F:[{min_exc_F:.2f},{mean_exc_F:.2f},{max_exc_F:.2f}] R:[{min_exc_R:.2f},{mean_exc_R:.2f},{max_exc_R:.2f}] T:[{min_exc_T:.2f},{mean_exc_T:.2f},{max_exc_T:.2f}]")
 
     # v13.2: Compress/QK/V with starvation
@@ -824,6 +825,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         # Increment global step counter (for v13.2 starvation decay)
         global_step += 1
+
+        # v14: Decay excitability weight (like starvation in v13.2)
+        if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+            router = base_model.global_routers.neuron_router
+            if hasattr(router, 'decay_excitability'):
+                router.decay_excitability(decay_rate=0.9995)
 
         # Accuracy calculation (only valid tokens)
         predictions = logits.argmax(dim=-1)
