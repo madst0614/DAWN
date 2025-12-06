@@ -1,0 +1,69 @@
+# DAWN v14 Training Config
+# FRTK Architecture with Excitability Regulation
+# F(eature), R(elational), T(ransfer), K(nowledge) neurons
+
+# vs v13.2: UnifiedNeuronRouter with starvation
+# vs v14: FRTK naming + Excitability (replaces starvation)
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - val/wikitext_5to1_texts.pkl
+
+# Model Architecture
+model:
+  model_version: "14.0"
+  d_model: 320
+  n_layers: 4
+  n_heads: 4
+  rank: 64
+  state_dim: 64
+
+  # FRTK Neurons (v13 → v14 mapping)
+  n_feature: 48              # n_compress → n_feature
+  n_relational: 12           # n_expand_QK → n_relational
+  n_transfer: 12             # n_expand_V → n_transfer
+  n_knowledge: 80
+  knowledge_k: 10
+  knowledge_rank: 64
+  max_seq_len: 128
+  dropout: 0.1
+
+  # Top-k sparse mixing (FRTK naming)
+  top_k_feature: 8           # top_k_compress → top_k_feature
+  top_k_relational: 4        # top_k_QK → top_k_relational
+  top_k_transfer: 6          # top_k_V → top_k_transfer
+
+  # Router settings
+  d_space: 64
+  router_dropout: 0.1
+  token_routing: false
+  use_ssm_context: true
+  gradient_checkpointing: false
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+  # Regularization
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0    # excitability가 대체
+  entropy_weight: 0.0         # excitability가 대체
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v14
+log_dir: /content/drive/MyDrive/dawn/logs_v14
+
+# v14 Changes from v13.2:
+#   - compress → feature (F): 입력 압축/특징 추출
+#   - expand_QK → relational (R): Q/K 관계 학습
+#   - expand_V → transfer (T): V 값 전달
+#   - starvation_weight → Excitability: 뉴런 사용률 자동 조절
