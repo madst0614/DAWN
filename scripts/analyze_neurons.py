@@ -1,0 +1,1338 @@
+#!/usr/bin/env python3
+"""
+DAWN Neuron Interpretability Analysis
+=====================================
+
+Comprehensive neuron analysis for interpretability research.
+
+Analyses:
+1. Neuron-Word Mapping - 뉴런별 반응 단어
+2. Neuron Clustering (t-SNE/UMAP) - 뉴런 임베딩 시각화
+3. Neuron Similarity Heatmap - 뉴런간 유사도
+4. Ablation Study - 뉴런 기여도 측정
+5. Probing Classifier - 정보 인코딩 분석
+6. Layer-wise Role Change - 레이어별 역할 변화
+7. Token Trajectory - 토큰별 뉴런 경로
+8. Activation Distribution - 활성화 분포
+9. Context Dependency - 문맥 의존성
+
+Usage:
+    python analyze_neurons.py --checkpoint <path> --val_data <path> --mode all
+    python analyze_neurons.py --checkpoint <path> --val_data <path> --mode word_map
+    python analyze_neurons.py --checkpoint <path> --val_data <path> --mode ablation
+"""
+
+import argparse
+import json
+import math
+import os
+import pickle
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Set
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
+
+# Add project root
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Optional imports
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.use('Agg')
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+try:
+    from sklearn.manifold import TSNE
+    from sklearn.cluster import KMeans
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+
+try:
+    import umap
+    HAS_UMAP = True
+except ImportError:
+    HAS_UMAP = False
+
+
+# ============================================================
+# Utilities
+# ============================================================
+
+def get_underlying_model(model):
+    if hasattr(model, '_orig_mod'):
+        return model._orig_mod
+    return model
+
+
+def simple_pos_tag(token: str) -> str:
+    """Simple rule-based POS tagging"""
+    token_lower = token.lower().strip()
+    if not token_lower or token_lower.startswith('[') or token_lower.startswith('##'):
+        return 'OTHER'
+    if token_lower in {'the', 'a', 'an', 'this', 'that', 'these', 'those'}:
+        return 'DET'
+    if token_lower in {'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did'}:
+        return 'AUX'
+    if token_lower in {'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them'}:
+        return 'PRON'
+    if token_lower in {'in', 'on', 'at', 'to', 'for', 'with', 'by', 'from', 'of', 'about'}:
+        return 'ADP'
+    if token_lower in {'and', 'or', 'but', 'if', 'when', 'while', 'because', 'although'}:
+        return 'CONJ'
+    if token_lower.endswith('ing'):
+        return 'VERB_ING'
+    if token_lower.endswith('ed'):
+        return 'VERB_ED'
+    if token_lower.endswith('ly'):
+        return 'ADV'
+    if token_lower.endswith('tion') or token_lower.endswith('ness') or token_lower.endswith('ment'):
+        return 'NOUN'
+    return 'OTHER'
+
+
+class VersionDetector:
+    """Detect model version and get routing info"""
+
+    def __init__(self, model):
+        self.model = get_underlying_model(model)
+        self.version = self._detect_version()
+        self.n_neurons = self._get_neuron_count()
+
+    def _detect_version(self) -> str:
+        if hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
+            router = self.model.global_routers.neuron_router
+            if hasattr(router, 'usage_ema_feature'):
+                return '14'
+        if hasattr(self.model, 'shared_neurons'):
+            if hasattr(self.model, 'global_ssm') and hasattr(self.model.global_ssm, 'context_proj'):
+                return '13'
+            return '12'
+        return '10'
+
+    def _get_neuron_count(self) -> int:
+        if self.version == '14':
+            return self.model.global_routers.neuron_router.n_feature
+        elif hasattr(self.model, 'shared_neurons'):
+            return self.model.shared_neurons.compress_neurons.shape[0]
+        return getattr(self.model, 'n_compress', 48)
+
+    def get_weights_from_routing(self, routing_info: Dict) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Extract weights and indices from routing_info"""
+        attn = routing_info.get('attention', routing_info)
+
+        if 'feature_weights' in attn:
+            # v14
+            weights = attn['feature_weights']
+            indices = None
+        elif 'compress_weights' in attn:
+            # v12/v13
+            if 'compress_weights_dense' in attn:
+                weights = attn['compress_weights_dense']
+            else:
+                weights = attn['compress_weights']
+            indices = attn.get('compress_topk_idx')
+        elif 'Q' in attn and isinstance(attn['Q'], dict):
+            # v10
+            weights = attn['Q']['weights']
+            indices = attn['Q'].get('indices')
+        else:
+            return None, None
+
+        return weights, indices
+
+
+# ============================================================
+# 1. Neuron-Word Mapping
+# ============================================================
+
+class NeuronWordMapper:
+    """Map neurons to their most activated words"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+        self.n_neurons = self.detector.n_neurons
+
+    @torch.no_grad()
+    def build_mapping(self, dataloader, max_batches: int = 100, top_k: int = 20) -> Dict:
+        """Build neuron -> word mapping"""
+        print(f"\n{'='*60}")
+        print(f"NEURON-WORD MAPPING (v{self.detector.version})")
+        print(f"{'='*60}")
+
+        self.model.eval()
+
+        # neuron_id -> {word: activation_sum}
+        neuron_words = [Counter() for _ in range(self.n_neurons)]
+        neuron_total = np.zeros(self.n_neurons)
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Building word map", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+            B, S = input_ids.shape
+
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            # Use layer 0 for word mapping
+            weights, indices = self.detector.get_weights_from_routing(routing_infos[0])
+            if weights is None:
+                continue
+
+            # Handle batch-level vs token-level
+            is_batch_level = (len(weights.shape) == 2)
+
+            if indices is None:
+                k = min(8, weights.shape[-1])
+                _, indices = torch.topk(weights, k, dim=-1)
+
+            for b in range(B):
+                for s in range(S):
+                    token_id = input_ids[b, s].item()
+                    word = self.tokenizer.decode([token_id]).strip()
+
+                    if is_batch_level:
+                        top_neurons = indices[b].cpu().numpy()
+                        top_weights = weights[b].cpu().numpy()
+                    else:
+                        top_neurons = indices[b, s].cpu().numpy()
+                        top_weights = weights[b, s].cpu().numpy()
+
+                    for ni, w in zip(top_neurons, top_weights[:len(top_neurons)]):
+                        neuron_words[ni][word] += float(w)
+                        neuron_total[ni] += float(w)
+
+        # Build result
+        results = {'neurons': {}, 'summary': {}}
+
+        pos_distribution = Counter()
+
+        for n in range(self.n_neurons):
+            top_words = neuron_words[n].most_common(top_k)
+
+            # Get POS of top words
+            pos_counts = Counter()
+            for word, _ in top_words[:10]:
+                pos = simple_pos_tag(word)
+                pos_counts[pos] += 1
+
+            primary_pos = pos_counts.most_common(1)[0][0] if pos_counts else 'UNK'
+            pos_distribution[primary_pos] += 1
+
+            results['neurons'][n] = {
+                'top_words': top_words,
+                'total_activation': float(neuron_total[n]),
+                'primary_pos': primary_pos,
+            }
+
+        results['summary'] = {
+            'pos_distribution': dict(pos_distribution),
+            'total_neurons': self.n_neurons,
+        }
+
+        # Print summary
+        print(f"\n--- POS Distribution ---")
+        for pos, count in pos_distribution.most_common():
+            print(f"  {pos}: {count} neurons ({100*count/self.n_neurons:.1f}%)")
+
+        # Print example neurons
+        print(f"\n--- Example Neurons ---")
+        for n in [0, self.n_neurons//2, self.n_neurons-1]:
+            words = [w for w, _ in results['neurons'][n]['top_words'][:5]]
+            print(f"  Neuron {n}: {words}")
+
+        return results
+
+    def visualize(self, results: Dict, output_dir: str):
+        """Create word clouds for top neurons"""
+        if not HAS_MATPLOTLIB:
+            return
+
+        try:
+            from wordcloud import WordCloud
+            has_wordcloud = True
+        except ImportError:
+            has_wordcloud = False
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Sort neurons by total activation
+        sorted_neurons = sorted(
+            results['neurons'].items(),
+            key=lambda x: x[1]['total_activation'],
+            reverse=True
+        )
+
+        # Plot top 9 neurons
+        fig, axes = plt.subplots(3, 3, figsize=(15, 15))
+        axes = axes.flatten()
+
+        for idx, (neuron_id, data) in enumerate(sorted_neurons[:9]):
+            ax = axes[idx]
+
+            if has_wordcloud and data['top_words']:
+                word_freq = dict(data['top_words'])
+                wc = WordCloud(width=400, height=300, background_color='white')
+                wc.generate_from_frequencies(word_freq)
+                ax.imshow(wc, interpolation='bilinear')
+            else:
+                # Simple bar chart
+                words = [w for w, _ in data['top_words'][:10]]
+                freqs = [f for _, f in data['top_words'][:10]]
+                ax.barh(range(len(words)), freqs)
+                ax.set_yticks(range(len(words)))
+                ax.set_yticklabels(words)
+
+            ax.set_title(f"Neuron {neuron_id} ({data['primary_pos']})")
+            ax.axis('off' if has_wordcloud else 'on')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'neuron_words.png'), dpi=150)
+        plt.close()
+        print(f"Saved: {output_dir}/neuron_words.png")
+
+
+# ============================================================
+# 2. Neuron Clustering (t-SNE/UMAP)
+# ============================================================
+
+class NeuronClusterer:
+    """Cluster neurons based on their embeddings"""
+
+    def __init__(self, model, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.device = device
+        self.detector = VersionDetector(model)
+
+    def extract_neuron_embeddings(self) -> np.ndarray:
+        """Extract neuron weight vectors"""
+        shared = self.model.shared_neurons
+
+        if self.detector.version == '14':
+            neurons = shared.feature_neurons.data.cpu().numpy()
+        else:
+            neurons = shared.compress_neurons.data.cpu().numpy()
+
+        # Flatten: [N, D, R] -> [N, D*R]
+        N = neurons.shape[0]
+        return neurons.reshape(N, -1)
+
+    def cluster(self, n_clusters: int = 8, method: str = 'tsne') -> Dict:
+        """Perform clustering and dimensionality reduction"""
+        print(f"\n{'='*60}")
+        print(f"NEURON CLUSTERING ({method.upper()})")
+        print(f"{'='*60}")
+
+        if not HAS_SKLEARN:
+            print("sklearn not available")
+            return {}
+
+        embeddings = self.extract_neuron_embeddings()
+        print(f"Embeddings shape: {embeddings.shape}")
+
+        # Normalize
+        scaler = StandardScaler()
+        embeddings_norm = scaler.fit_transform(embeddings)
+
+        # Dimensionality reduction
+        if method == 'tsne':
+            reducer = TSNE(n_components=2, perplexity=min(30, len(embeddings)-1), random_state=42)
+            coords_2d = reducer.fit_transform(embeddings_norm)
+        elif method == 'umap' and HAS_UMAP:
+            reducer = umap.UMAP(n_components=2, random_state=42)
+            coords_2d = reducer.fit_transform(embeddings_norm)
+        else:
+            # PCA fallback
+            from sklearn.decomposition import PCA
+            reducer = PCA(n_components=2)
+            coords_2d = reducer.fit_transform(embeddings_norm)
+
+        # K-means clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(embeddings_norm)
+
+        results = {
+            'coords_2d': coords_2d.tolist(),
+            'cluster_labels': cluster_labels.tolist(),
+            'n_clusters': n_clusters,
+            'method': method,
+        }
+
+        # Cluster sizes
+        cluster_sizes = Counter(cluster_labels)
+        print(f"\n--- Cluster Sizes ---")
+        for c, size in sorted(cluster_sizes.items()):
+            print(f"  Cluster {c}: {size} neurons")
+
+        return results
+
+    def visualize(self, results: Dict, output_path: str):
+        """Visualize clustering"""
+        if not HAS_MATPLOTLIB or not results:
+            return
+
+        coords = np.array(results['coords_2d'])
+        labels = np.array(results['cluster_labels'])
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+
+        scatter = ax.scatter(coords[:, 0], coords[:, 1],
+                            c=labels, cmap='tab10', s=100, alpha=0.7)
+
+        # Label each point
+        for i, (x, y) in enumerate(coords):
+            ax.annotate(str(i), (x, y), fontsize=8, alpha=0.7)
+
+        plt.colorbar(scatter, label='Cluster')
+        ax.set_title(f"Neuron Clustering ({results['method'].upper()})")
+        ax.set_xlabel('Dimension 1')
+        ax.set_ylabel('Dimension 2')
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"Saved: {output_path}")
+
+
+# ============================================================
+# 3. Neuron Similarity Heatmap
+# ============================================================
+
+class NeuronSimilarityAnalyzer:
+    """Analyze pairwise neuron similarity"""
+
+    def __init__(self, model, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.device = device
+        self.detector = VersionDetector(model)
+
+    def compute_similarity(self) -> Dict:
+        """Compute cosine similarity matrix"""
+        print(f"\n{'='*60}")
+        print(f"NEURON SIMILARITY ANALYSIS")
+        print(f"{'='*60}")
+
+        shared = self.model.shared_neurons
+
+        if self.detector.version == '14':
+            neurons = shared.feature_neurons.data.cpu().numpy()
+        else:
+            neurons = shared.compress_neurons.data.cpu().numpy()
+
+        N = neurons.shape[0]
+        neurons_flat = neurons.reshape(N, -1)
+
+        # Normalize
+        norms = np.linalg.norm(neurons_flat, axis=1, keepdims=True) + 1e-10
+        neurons_norm = neurons_flat / norms
+
+        # Cosine similarity
+        sim_matrix = neurons_norm @ neurons_norm.T
+
+        # Stats
+        mask = ~np.eye(N, dtype=bool)
+        off_diag = sim_matrix[mask]
+
+        results = {
+            'similarity_matrix': sim_matrix.tolist(),
+            'stats': {
+                'mean': float(np.mean(off_diag)),
+                'std': float(np.std(off_diag)),
+                'max': float(np.max(off_diag)),
+                'min': float(np.min(off_diag)),
+            },
+            'n_neurons': N,
+        }
+
+        print(f"Similarity stats:")
+        print(f"  Mean: {results['stats']['mean']:.4f}")
+        print(f"  Std:  {results['stats']['std']:.4f}")
+        print(f"  Max:  {results['stats']['max']:.4f}")
+        print(f"  Min:  {results['stats']['min']:.4f}")
+
+        # Find most similar pairs
+        np.fill_diagonal(sim_matrix, -1)
+        flat_idx = np.argsort(sim_matrix.flatten())[-10:]
+        print(f"\n--- Most Similar Pairs ---")
+        for idx in reversed(flat_idx):
+            i, j = idx // N, idx % N
+            print(f"  Neuron {i} - {j}: {sim_matrix[i, j]:.4f}")
+
+        return results
+
+    def visualize(self, results: Dict, output_path: str):
+        """Create similarity heatmap"""
+        if not HAS_MATPLOTLIB or not results:
+            return
+
+        sim_matrix = np.array(results['similarity_matrix'])
+
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        im = ax.imshow(sim_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+        plt.colorbar(im, label='Cosine Similarity')
+
+        ax.set_title('Neuron Similarity Matrix')
+        ax.set_xlabel('Neuron ID')
+        ax.set_ylabel('Neuron ID')
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"Saved: {output_path}")
+
+
+# ============================================================
+# 4. Ablation Study
+# ============================================================
+
+class NeuronAblation:
+    """Measure neuron contribution via ablation"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+
+    @torch.no_grad()
+    def run_ablation(self, dataloader, max_batches: int = 20,
+                     neurons_to_test: List[int] = None) -> Dict:
+        """Run ablation study"""
+        print(f"\n{'='*60}")
+        print(f"ABLATION STUDY")
+        print(f"{'='*60}")
+
+        self.model.eval()
+
+        if neurons_to_test is None:
+            neurons_to_test = list(range(min(10, self.detector.n_neurons)))
+
+        # Get baseline perplexity
+        baseline_loss = self._compute_loss(dataloader, max_batches)
+        baseline_ppl = math.exp(baseline_loss)
+        print(f"Baseline perplexity: {baseline_ppl:.2f}")
+
+        results = {
+            'baseline_ppl': baseline_ppl,
+            'ablations': {},
+        }
+
+        # Ablate each neuron
+        shared = self.model.shared_neurons
+        if self.detector.version == '14':
+            neurons = shared.feature_neurons
+        else:
+            neurons = shared.compress_neurons
+
+        original_weights = neurons.data.clone()
+
+        for n in tqdm(neurons_to_test, desc="Ablating neurons"):
+            # Zero out neuron n
+            neurons.data[n] = 0
+
+            ablated_loss = self._compute_loss(dataloader, max_batches)
+            ablated_ppl = math.exp(ablated_loss)
+
+            delta_ppl = ablated_ppl - baseline_ppl
+            results['ablations'][n] = {
+                'ppl': ablated_ppl,
+                'delta_ppl': delta_ppl,
+                'importance': delta_ppl / baseline_ppl,
+            }
+
+            # Restore
+            neurons.data = original_weights.clone()
+
+        # Sort by importance
+        sorted_neurons = sorted(results['ablations'].items(),
+                               key=lambda x: x[1]['importance'], reverse=True)
+
+        print(f"\n--- Most Important Neurons ---")
+        for n, data in sorted_neurons[:5]:
+            print(f"  Neuron {n}: +{data['delta_ppl']:.2f} PPL ({data['importance']*100:.1f}%)")
+
+        print(f"\n--- Least Important Neurons ---")
+        for n, data in sorted_neurons[-5:]:
+            print(f"  Neuron {n}: +{data['delta_ppl']:.2f} PPL ({data['importance']*100:.1f}%)")
+
+        return results
+
+    def _compute_loss(self, dataloader, max_batches: int) -> float:
+        """Compute average loss"""
+        total_loss = 0
+        total_tokens = 0
+
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+
+            outputs = self.model(input_ids)
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
+
+            # Shift for LM loss
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous()
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction='sum'
+            )
+
+            total_loss += loss.item()
+            total_tokens += shift_labels.numel()
+
+        return total_loss / total_tokens if total_tokens > 0 else 0
+
+    def visualize(self, results: Dict, output_path: str):
+        """Visualize ablation results"""
+        if not HAS_MATPLOTLIB or not results.get('ablations'):
+            return
+
+        neurons = list(results['ablations'].keys())
+        importances = [results['ablations'][n]['importance'] for n in neurons]
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        colors = ['red' if imp > 0.05 else 'orange' if imp > 0.01 else 'green'
+                  for imp in importances]
+        ax.bar(range(len(neurons)), importances, color=colors)
+        ax.set_xticks(range(len(neurons)))
+        ax.set_xticklabels([f'N{n}' for n in neurons], rotation=45)
+        ax.set_ylabel('Importance (relative PPL increase)')
+        ax.set_title('Neuron Ablation Study')
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"Saved: {output_path}")
+
+
+# ============================================================
+# 5. Probing Classifier
+# ============================================================
+
+class NeuronProbe:
+    """Probe neuron activations for linguistic features"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+
+    @torch.no_grad()
+    def collect_activations(self, dataloader, max_batches: int = 50) -> Tuple[np.ndarray, np.ndarray]:
+        """Collect neuron activations with POS labels"""
+        print(f"\n--- Collecting activations ---")
+
+        self.model.eval()
+
+        all_activations = []
+        all_labels = []
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Collecting", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+            B, S = input_ids.shape
+
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            weights, indices = self.detector.get_weights_from_routing(routing_infos[0])
+            if weights is None:
+                continue
+
+            is_batch_level = (len(weights.shape) == 2)
+
+            for b in range(B):
+                for s in range(S):
+                    token_id = input_ids[b, s].item()
+                    word = self.tokenizer.decode([token_id]).strip()
+                    pos = simple_pos_tag(word)
+
+                    if pos == 'OTHER':
+                        continue
+
+                    if is_batch_level:
+                        act = weights[b].cpu().numpy()
+                    else:
+                        act = weights[b, s].cpu().numpy()
+
+                    all_activations.append(act)
+                    all_labels.append(pos)
+
+        return np.array(all_activations), np.array(all_labels)
+
+    def train_probe(self, dataloader, max_batches: int = 50) -> Dict:
+        """Train probing classifier"""
+        print(f"\n{'='*60}")
+        print(f"PROBING CLASSIFIER")
+        print(f"{'='*60}")
+
+        if not HAS_SKLEARN:
+            print("sklearn not available")
+            return {}
+
+        X, y = self.collect_activations(dataloader, max_batches)
+
+        if len(X) == 0:
+            print("No data collected")
+            return {}
+
+        print(f"Collected {len(X)} samples")
+
+        # Filter rare classes
+        label_counts = Counter(y)
+        valid_labels = {l for l, c in label_counts.items() if c >= 10}
+        mask = np.array([l in valid_labels for l in y])
+        X, y = X[mask], y[mask]
+
+        print(f"After filtering: {len(X)} samples, {len(set(y))} classes")
+
+        # Train/test split
+        n_train = int(0.8 * len(X))
+        indices = np.random.permutation(len(X))
+        train_idx, test_idx = indices[:n_train], indices[n_train:]
+
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        # Normalize
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
+
+        # Train
+        clf = LogisticRegression(max_iter=1000, multi_class='multinomial')
+        clf.fit(X_train, y_train)
+
+        train_acc = clf.score(X_train, y_train)
+        test_acc = clf.score(X_test, y_test)
+
+        print(f"\n--- Results ---")
+        print(f"Train accuracy: {train_acc*100:.1f}%")
+        print(f"Test accuracy:  {test_acc*100:.1f}%")
+
+        # Per-class accuracy
+        y_pred = clf.predict(X_test)
+        class_acc = {}
+        for label in set(y_test):
+            mask = y_test == label
+            if mask.sum() > 0:
+                class_acc[label] = float((y_pred[mask] == y_test[mask]).mean())
+
+        print(f"\n--- Per-class Accuracy ---")
+        for label, acc in sorted(class_acc.items(), key=lambda x: -x[1]):
+            print(f"  {label}: {acc*100:.1f}%")
+
+        return {
+            'train_accuracy': train_acc,
+            'test_accuracy': test_acc,
+            'class_accuracy': class_acc,
+            'n_samples': len(X),
+            'n_classes': len(set(y)),
+        }
+
+
+# ============================================================
+# 6. Layer-wise Role Change
+# ============================================================
+
+class LayerRoleAnalyzer:
+    """Analyze how neuron roles change across layers"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+        self.n_layers = self.model.n_layers
+
+    @torch.no_grad()
+    def analyze(self, dataloader, max_batches: int = 50) -> Dict:
+        """Analyze layer-wise neuron usage"""
+        print(f"\n{'='*60}")
+        print(f"LAYER-WISE ROLE ANALYSIS")
+        print(f"{'='*60}")
+
+        self.model.eval()
+
+        n_neurons = self.detector.n_neurons
+
+        # layer -> neuron -> {word: count}
+        layer_neuron_words = {
+            l: [Counter() for _ in range(n_neurons)]
+            for l in range(self.n_layers)
+        }
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Analyzing layers", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+            B, S = input_ids.shape
+
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            for layer_idx, routing_info in enumerate(routing_infos):
+                weights, indices = self.detector.get_weights_from_routing(routing_info)
+                if weights is None:
+                    continue
+
+                is_batch_level = (len(weights.shape) == 2)
+
+                if indices is None:
+                    k = min(8, weights.shape[-1])
+                    _, indices = torch.topk(weights, k, dim=-1)
+
+                for b in range(B):
+                    for s in range(S):
+                        token_id = input_ids[b, s].item()
+                        word = self.tokenizer.decode([token_id]).strip()
+
+                        if is_batch_level:
+                            top_neurons = indices[b].cpu().numpy()
+                        else:
+                            top_neurons = indices[b, s].cpu().numpy()
+
+                        for ni in top_neurons[:4]:  # Top 4 neurons
+                            layer_neuron_words[layer_idx][ni][word] += 1
+
+        # Analyze role changes
+        results = {'layers': {}, 'role_changes': []}
+
+        for layer_idx in range(self.n_layers):
+            layer_data = {}
+            for n in range(n_neurons):
+                top_words = layer_neuron_words[layer_idx][n].most_common(5)
+                if top_words:
+                    layer_data[n] = [w for w, _ in top_words]
+            results['layers'][layer_idx] = layer_data
+
+        # Find neurons with changing roles
+        print(f"\n--- Role Changes Across Layers ---")
+        for n in range(min(5, n_neurons)):
+            print(f"\nNeuron {n}:")
+            for l in range(self.n_layers):
+                words = results['layers'][l].get(n, [])[:3]
+                print(f"  L{l}: {words}")
+
+        return results
+
+
+# ============================================================
+# 7. Token Trajectory
+# ============================================================
+
+class TokenTrajectory:
+    """Track which neurons process each token"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+
+    @torch.no_grad()
+    def trace(self, text: str) -> Dict:
+        """Trace token through layers"""
+        print(f"\n{'='*60}")
+        print(f"TOKEN TRAJECTORY")
+        print(f"{'='*60}")
+        print(f"Text: {text}")
+
+        self.model.eval()
+
+        tokens = self.tokenizer.encode(text, add_special_tokens=True)
+        input_ids = torch.tensor([tokens], device=self.device)
+
+        token_strs = [self.tokenizer.decode([t]).strip() for t in tokens]
+
+        _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+        trajectories = {t: [] for t in range(len(tokens))}
+
+        for layer_idx, routing_info in enumerate(routing_infos):
+            weights, indices = self.detector.get_weights_from_routing(routing_info)
+            if weights is None:
+                continue
+
+            is_batch_level = (len(weights.shape) == 2)
+
+            if indices is None:
+                k = min(4, weights.shape[-1])
+                _, indices = torch.topk(weights, k, dim=-1)
+
+            for t in range(len(tokens)):
+                if is_batch_level:
+                    top_neurons = indices[0].cpu().numpy()[:4]
+                else:
+                    top_neurons = indices[0, t].cpu().numpy()[:4]
+
+                trajectories[t].append(top_neurons.tolist())
+
+        results = {
+            'tokens': token_strs,
+            'trajectories': trajectories,
+            'n_layers': len(routing_infos),
+        }
+
+        # Print
+        print(f"\n--- Trajectories ---")
+        for t, token in enumerate(token_strs):
+            traj = trajectories[t]
+            traj_str = ' → '.join([str(neurons[:2]) for neurons in traj])
+            print(f"  '{token}': {traj_str}")
+
+        return results
+
+
+# ============================================================
+# 8. Activation Distribution
+# ============================================================
+
+class ActivationDistribution:
+    """Analyze neuron activation distributions"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+
+    @torch.no_grad()
+    def analyze(self, dataloader, max_batches: int = 50) -> Dict:
+        """Analyze activation distributions"""
+        print(f"\n{'='*60}")
+        print(f"ACTIVATION DISTRIBUTION")
+        print(f"{'='*60}")
+
+        self.model.eval()
+
+        n_neurons = self.detector.n_neurons
+        all_activations = [[] for _ in range(n_neurons)]
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Collecting activations", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            weights, _ = self.detector.get_weights_from_routing(routing_infos[0])
+            if weights is None:
+                continue
+
+            # Flatten batch dimension
+            if len(weights.shape) == 3:
+                weights = weights.reshape(-1, weights.shape[-1])
+
+            weights_np = weights.cpu().numpy()
+
+            for n in range(min(n_neurons, weights_np.shape[-1])):
+                all_activations[n].extend(weights_np[:, n].tolist())
+
+        # Compute stats
+        results = {'neurons': {}, 'summary': {}}
+
+        sparsity_scores = []
+        for n in range(n_neurons):
+            acts = np.array(all_activations[n])
+            if len(acts) == 0:
+                continue
+
+            # Gini coefficient (sparsity measure)
+            sorted_acts = np.sort(acts)
+            index = np.arange(1, len(sorted_acts) + 1)
+            gini = ((2 * index - len(sorted_acts) - 1) * sorted_acts).sum() / (len(sorted_acts) * sorted_acts.sum() + 1e-10)
+
+            results['neurons'][n] = {
+                'mean': float(np.mean(acts)),
+                'std': float(np.std(acts)),
+                'max': float(np.max(acts)),
+                'gini': float(gini),
+                'sparsity': float((acts < 0.01).mean()),
+            }
+            sparsity_scores.append(gini)
+
+        results['summary'] = {
+            'avg_gini': float(np.mean(sparsity_scores)),
+            'avg_sparsity': float(np.mean([r['sparsity'] for r in results['neurons'].values()])),
+        }
+
+        print(f"\n--- Summary ---")
+        print(f"Average Gini (sparsity): {results['summary']['avg_gini']:.4f}")
+        print(f"Average zero-rate: {results['summary']['avg_sparsity']*100:.1f}%")
+
+        # Most/least sparse neurons
+        sorted_neurons = sorted(results['neurons'].items(), key=lambda x: x[1]['gini'], reverse=True)
+
+        print(f"\n--- Most Sparse (selective) ---")
+        for n, data in sorted_neurons[:5]:
+            print(f"  Neuron {n}: Gini={data['gini']:.4f}")
+
+        print(f"\n--- Least Sparse (always active) ---")
+        for n, data in sorted_neurons[-5:]:
+            print(f"  Neuron {n}: Gini={data['gini']:.4f}")
+
+        return results
+
+    def visualize(self, results: Dict, output_path: str):
+        """Visualize activation distributions"""
+        if not HAS_MATPLOTLIB or not results.get('neurons'):
+            return
+
+        neurons = list(results['neurons'].keys())
+        ginis = [results['neurons'][n]['gini'] for n in neurons]
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Gini distribution
+        ax = axes[0]
+        ax.hist(ginis, bins=30, edgecolor='black', alpha=0.7)
+        ax.axvline(np.mean(ginis), color='red', linestyle='--', label=f'Mean: {np.mean(ginis):.3f}')
+        ax.set_xlabel('Gini Coefficient')
+        ax.set_ylabel('Count')
+        ax.set_title('Neuron Sparsity Distribution')
+        ax.legend()
+
+        # Per-neuron bar
+        ax = axes[1]
+        ax.bar(range(len(neurons)), ginis, alpha=0.7)
+        ax.set_xlabel('Neuron ID')
+        ax.set_ylabel('Gini Coefficient')
+        ax.set_title('Sparsity per Neuron')
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"Saved: {output_path}")
+
+
+# ============================================================
+# 9. Context Dependency
+# ============================================================
+
+class ContextDependency:
+    """Analyze context-dependent routing"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+
+    @torch.no_grad()
+    def analyze_word(self, word: str, contexts: List[str]) -> Dict:
+        """Analyze how same word routes differently in contexts"""
+        print(f"\n{'='*60}")
+        print(f"CONTEXT DEPENDENCY: '{word}'")
+        print(f"{'='*60}")
+
+        self.model.eval()
+
+        results = {'word': word, 'contexts': []}
+
+        for ctx in contexts:
+            tokens = self.tokenizer.encode(ctx, add_special_tokens=True)
+            input_ids = torch.tensor([tokens], device=self.device)
+
+            # Find target word position
+            token_strs = [self.tokenizer.decode([t]).strip().lower() for t in tokens]
+            try:
+                word_pos = token_strs.index(word.lower())
+            except ValueError:
+                print(f"  '{word}' not found in: {ctx}")
+                continue
+
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            weights, indices = self.detector.get_weights_from_routing(routing_infos[0])
+            if weights is None:
+                continue
+
+            is_batch_level = (len(weights.shape) == 2)
+
+            if indices is None:
+                k = min(8, weights.shape[-1])
+                _, indices = torch.topk(weights, k, dim=-1)
+
+            if is_batch_level:
+                top_neurons = indices[0].cpu().numpy()[:8]
+                top_weights = weights[0].cpu().numpy()
+            else:
+                top_neurons = indices[0, word_pos].cpu().numpy()[:8]
+                top_weights = weights[0, word_pos].cpu().numpy()
+
+            results['contexts'].append({
+                'text': ctx,
+                'top_neurons': top_neurons.tolist(),
+                'weights': [float(top_weights[i]) for i in range(min(8, len(top_weights)))],
+            })
+
+            print(f"\n  Context: {ctx}")
+            print(f"  Top neurons: {top_neurons[:5]}")
+
+        # Compare across contexts
+        if len(results['contexts']) >= 2:
+            neurons_sets = [set(c['top_neurons'][:4]) for c in results['contexts']]
+            intersection = set.intersection(*neurons_sets) if neurons_sets else set()
+            union = set.union(*neurons_sets) if neurons_sets else set()
+
+            jaccard = len(intersection) / len(union) if union else 0
+
+            results['comparison'] = {
+                'shared_neurons': list(intersection),
+                'jaccard_similarity': jaccard,
+            }
+
+            print(f"\n--- Comparison ---")
+            print(f"  Shared neurons: {list(intersection)}")
+            print(f"  Jaccard similarity: {jaccard:.4f}")
+
+        return results
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def load_model_and_data(args):
+    """Load model, tokenizer, and data"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+
+    # Load checkpoint
+    checkpoint_path = Path(args.checkpoint)
+    if checkpoint_path.is_dir():
+        best = checkpoint_path / 'best_model.pt'
+        checkpoint_path = best if best.exists() else max(checkpoint_path.glob('*.pt'), key=lambda p: p.stat().st_mtime)
+
+    print(f"\nLoading: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    config = checkpoint.get('model_config', checkpoint.get('config', {}))
+
+    # Detect version
+    path_str = str(checkpoint_path).lower()
+    if 'v14' in path_str:
+        version = '14.0'
+    elif 'v13' in path_str:
+        version = '13.0'
+    else:
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        keys_str = ' '.join(state_dict.keys())
+        if 'feature_neurons' in keys_str:
+            version = '14.0'
+        elif 'context_proj' in keys_str:
+            version = '13.0'
+        else:
+            version = '12.0'
+
+    print(f"Model version: {version}")
+
+    # Create model
+    from models import create_model_by_version
+
+    model_kwargs = {
+        'vocab_size': config.get('vocab_size', 30522),
+        'd_model': config.get('d_model', 320),
+        'n_layers': config.get('n_layers', 4),
+        'n_heads': config.get('n_heads', 4),
+        'rank': config.get('rank', 64),
+        'max_seq_len': config.get('max_seq_len', 128),
+        'n_compress': config.get('n_compress', 48),
+        'n_expand': config.get('n_expand', 12),
+        'n_knowledge': config.get('n_knowledge', 80),
+        'dropout': config.get('dropout', 0.1),
+    }
+
+    if version.startswith('12') or version.startswith('13') or version.startswith('14'):
+        model_kwargs['state_dim'] = config.get('state_dim', 64)
+
+    if version.startswith('14'):
+        model_kwargs['n_feature'] = config.get('n_feature', config.get('n_compress', 48))
+        model_kwargs['n_relational'] = config.get('n_relational', config.get('n_expand', 12))
+        model_kwargs['n_transfer'] = config.get('n_transfer', config.get('n_expand', 12))
+
+    model = create_model_by_version(version, model_kwargs)
+
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict, strict=False)
+    model = model.to(device)
+    model.eval()
+
+    print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+
+    # Tokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+
+    # Data
+    dataloader = None
+    if args.val_data:
+        print(f"\nLoading data: {args.val_data}")
+        with open(args.val_data, 'rb') as f:
+            val_texts = pickle.load(f)
+
+        class SimpleDataset(torch.utils.data.Dataset):
+            def __init__(self, texts, tokenizer, max_len=128):
+                self.texts = texts
+                self.tokenizer = tokenizer
+                self.max_len = max_len
+            def __len__(self):
+                return len(self.texts)
+            def __getitem__(self, idx):
+                encoding = self.tokenizer(
+                    self.texts[idx], truncation=True, max_length=self.max_len,
+                    padding='max_length', return_tensors='pt'
+                )
+                return {'input_ids': encoding['input_ids'].squeeze(0)}
+
+        dataset = SimpleDataset(val_texts, tokenizer)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=False, num_workers=2
+        )
+
+    return model, tokenizer, dataloader, device
+
+
+def main():
+    parser = argparse.ArgumentParser(description='DAWN Neuron Analysis')
+    parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument('--val_data', type=str, default=None)
+    parser.add_argument('--output_dir', type=str, default='./neuron_analysis')
+    parser.add_argument('--mode', type=str, default='all',
+                        choices=['all', 'word_map', 'cluster', 'similarity',
+                                'ablation', 'probe', 'layer', 'trajectory',
+                                'distribution', 'context'])
+    parser.add_argument('--max_batches', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--text', type=str, default="The bank by the river was steep.")
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    model, tokenizer, dataloader, device = load_model_and_data(args)
+
+    all_results = {}
+
+    # 1. Word Mapping
+    if args.mode in ['all', 'word_map'] and dataloader:
+        mapper = NeuronWordMapper(model, tokenizer, device)
+        results = mapper.build_mapping(dataloader, args.max_batches)
+        mapper.visualize(results, args.output_dir)
+        all_results['word_map'] = {'summary': results['summary']}
+
+    # 2. Clustering
+    if args.mode in ['all', 'cluster']:
+        clusterer = NeuronClusterer(model, device)
+        results = clusterer.cluster(n_clusters=8, method='tsne')
+        clusterer.visualize(results, os.path.join(args.output_dir, 'clustering.png'))
+        all_results['cluster'] = results
+
+    # 3. Similarity
+    if args.mode in ['all', 'similarity']:
+        sim_analyzer = NeuronSimilarityAnalyzer(model, device)
+        results = sim_analyzer.compute_similarity()
+        sim_analyzer.visualize(results, os.path.join(args.output_dir, 'similarity.png'))
+        all_results['similarity'] = {'stats': results['stats']}
+
+    # 4. Ablation
+    if args.mode in ['all', 'ablation'] and dataloader:
+        ablation = NeuronAblation(model, tokenizer, device)
+        results = ablation.run_ablation(dataloader, max_batches=20)
+        ablation.visualize(results, os.path.join(args.output_dir, 'ablation.png'))
+        all_results['ablation'] = results
+
+    # 5. Probing
+    if args.mode in ['all', 'probe'] and dataloader:
+        probe = NeuronProbe(model, tokenizer, device)
+        results = probe.train_probe(dataloader, args.max_batches)
+        all_results['probe'] = results
+
+    # 6. Layer-wise
+    if args.mode in ['all', 'layer'] and dataloader:
+        layer_analyzer = LayerRoleAnalyzer(model, tokenizer, device)
+        results = layer_analyzer.analyze(dataloader, args.max_batches)
+        all_results['layer'] = {'n_layers': results['n_layers']}
+
+    # 7. Trajectory
+    if args.mode in ['all', 'trajectory']:
+        trajectory = TokenTrajectory(model, tokenizer, device)
+        results = trajectory.trace(args.text)
+        all_results['trajectory'] = results
+
+    # 8. Distribution
+    if args.mode in ['all', 'distribution'] and dataloader:
+        dist_analyzer = ActivationDistribution(model, tokenizer, device)
+        results = dist_analyzer.analyze(dataloader, args.max_batches)
+        dist_analyzer.visualize(results, os.path.join(args.output_dir, 'distribution.png'))
+        all_results['distribution'] = {'summary': results['summary']}
+
+    # 9. Context
+    if args.mode in ['all', 'context']:
+        ctx_analyzer = ContextDependency(model, tokenizer, device)
+        contexts = [
+            "The bank by the river was steep.",
+            "I went to the bank to deposit money.",
+        ]
+        results = ctx_analyzer.analyze_word("bank", contexts)
+        all_results['context'] = results
+
+    # Save results
+    results_path = os.path.join(args.output_dir, 'neuron_analysis.json')
+
+    def convert_to_serializable(obj):
+        if isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {str(k): convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(i) for i in obj]
+        return obj
+
+    with open(results_path, 'w') as f:
+        json.dump(convert_to_serializable(all_results), f, indent=2)
+
+    print(f"\n{'='*60}")
+    print(f"ANALYSIS COMPLETE")
+    print(f"Results saved: {results_path}")
+    print(f"{'='*60}")
+
+
+if __name__ == '__main__':
+    main()
