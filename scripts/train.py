@@ -570,6 +570,87 @@ def is_v75_or_v76_model(model):
     return is_modern_dawn_model(model)
 
 
+def _gini(x):
+    """Gini coefficient (0=equal, 1=one neuron dominates)"""
+    x_sorted = torch.sort(x)[0]
+    n = x.numel()
+    idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+    return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
+
+
+def _get_router_log_lines(router, optimizer, args, global_step, total_steps):
+    """Generate router log lines for both console and file output.
+
+    Returns list of log lines (without trailing newlines).
+    """
+    lines = []
+
+    # v14: FRTK with SAR (Synaptic Activation Regulation)
+    if hasattr(router, 'usage_ema_feature'):
+        ema_F = router.usage_ema_feature
+        ema_R = router.usage_ema_relational
+        ema_T = router.usage_ema_transfer
+
+        # Active neuron counts
+        active_F = (ema_F > 0.01).sum().item()
+        active_R = (ema_R > 0.01).sum().item()
+        active_T = (ema_T > 0.01).sum().item()
+        n_F, n_R, n_T = ema_F.numel(), ema_R.numel(), ema_T.numel()
+
+        # Gini coefficients
+        gini_F, gini_R, gini_T = _gini(ema_F), _gini(ema_R), _gini(ema_T)
+
+        # SAR: LR-based bounds + strength
+        current_lr = optimizer.param_groups[0]['lr']
+        initial_lr = args.lr
+        lr_ratio = current_lr / initial_lr if initial_lr > 0 else 1.0
+        floor = 0.02 + 0.08 * lr_ratio
+        ceiling = 0.97 - 0.27 * lr_ratio
+        strength = 5 + 15 * lr_ratio
+
+        # Usage EMA distribution
+        min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
+        min_R, max_R, mean_R = ema_R.min().item(), ema_R.max().item(), ema_R.mean().item()
+        min_T, max_T, mean_T = ema_T.min().item(), ema_T.max().item(), ema_T.mean().item()
+
+        lines.append(f"         SAR | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
+        lines.append(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f} Str:{strength:.1f}")
+        lines.append(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]")
+
+    # v13.2: Compress/QK/V with starvation
+    elif hasattr(router, 'usage_ema_compress'):
+        ema_C = router.usage_ema_compress
+        ema_QK = router.usage_ema_expand_QK
+        ema_V = router.usage_ema_expand_V
+
+        starvation_weight = max(0.05, math.exp(-3.0 * global_step / total_steps))
+
+        # Active neuron counts
+        active_C = (ema_C > 0.01).sum().item()
+        active_QK = (ema_QK > 0.01).sum().item()
+        active_V = (ema_V > 0.01).sum().item()
+        n_C, n_QK, n_V = ema_C.numel(), ema_QK.numel(), ema_V.numel()
+
+        # Gini coefficients
+        gini_C, gini_QK, gini_V = _gini(ema_C), _gini(ema_QK), _gini(ema_V)
+
+        # Imbalance
+        imb_C = (ema_C.max() - ema_C.min()).item()
+        imb_QK = (ema_QK.max() - ema_QK.min()).item()
+        imb_V = (ema_V.max() - ema_V.min()).item()
+
+        # Usage EMA distribution
+        min_C, max_C, mean_C = ema_C.min().item(), ema_C.max().item(), ema_C.mean().item()
+        min_QK, max_QK, mean_QK = ema_QK.min().item(), ema_QK.max().item(), ema_QK.mean().item()
+        min_V, max_V, mean_V = ema_V.min().item(), ema_V.max().item(), ema_V.mean().item()
+
+        lines.append(f"         Starv:{starvation_weight:.3f} | Active C/QK/V:{int(active_C)}/{n_C},{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} | Gini:{gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}")
+        lines.append(f"             Imbalance C/QK/V:{imb_C:.3f}/{imb_QK:.3f}/{imb_V:.3f}")
+        lines.append(f"             EMA C:[{min_C:.3f},{mean_C:.3f},{max_C:.3f}] QK:[{min_QK:.3f},{mean_QK:.3f},{max_QK:.3f}] V:[{min_V:.3f},{mean_V:.3f},{max_V:.3f}]")
+
+    return lines
+
+
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
                 orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0, process_norm_weight=0.0,
                 debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1):
@@ -845,86 +926,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # v13.2+: Usage EMA logging (v13.2: C/QK/V, v14: F/R/T with SAR)
                     if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                         router = base_model.global_routers.neuron_router
-
-                        # Gini coefficient (0=equal, 1=one neuron dominates)
-                        def gini(x):
-                            x_sorted = torch.sort(x)[0]
-                            n = x.numel()
-                            idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
-                            return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
-
-                        # v14: FRTK naming with SAR (Synaptic Activation Regulation)
-                        if hasattr(router, 'usage_ema_feature'):
-                            ema_F = router.usage_ema_feature
-                            ema_R = router.usage_ema_relational
-                            ema_T = router.usage_ema_transfer
-
-                            # Active neuron counts
-                            active_F = (ema_F > 0.01).sum().item()
-                            active_R = (ema_R > 0.01).sum().item()
-                            active_T = (ema_T > 0.01).sum().item()
-                            n_F, n_R, n_T = ema_F.numel(), ema_R.numel(), ema_T.numel()
-
-                            # Gini coefficients
-                            gini_F = gini(ema_F)
-                            gini_R = gini(ema_R)
-                            gini_T = gini(ema_T)
-
-                            # SAR: LR-based bounds + strength (same as model_v14.py)
-                            current_lr = optimizer.param_groups[0]['lr']
-                            initial_lr = args.lr
-                            lr_ratio = current_lr / initial_lr if initial_lr > 0 else 1.0
-                            floor = 0.02 + 0.08 * lr_ratio      # 0.10 → 0.02
-                            ceiling = 0.97 - 0.27 * lr_ratio    # 0.70 → 0.97
-                            strength = 5 + 15 * lr_ratio        # 20 → 5
-
-                            # Usage EMA distribution: min/max/mean
-                            min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
-                            min_R, max_R, mean_R = ema_R.min().item(), ema_R.max().item(), ema_R.mean().item()
-                            min_T, max_T, mean_T = ema_T.min().item(), ema_T.max().item(), ema_T.mean().item()
-
-                            # Line 1: Active counts and Gini (same format as v13.2)
-                            print(f"         SAR | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
-                            # Line 2: SAR bounds (LR-based floor/ceiling/strength)
-                            print(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f} Str:{strength:.1f}")
-                            # Line 3: Usage EMA distribution
-                            print(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]")
-
-                        # v13.2: Compress/QK/V naming with starvation weight
-                        elif hasattr(router, 'usage_ema_compress'):
-                            ema_C = router.usage_ema_compress
-                            ema_QK = router.usage_ema_expand_QK
-                            ema_V = router.usage_ema_expand_V
-
-                            starvation_weight = max(0.05, math.exp(-3.0 * global_step / total_steps))
-
-                            # Active neuron counts
-                            active_C = (ema_C > 0.01).sum().item()
-                            active_QK = (ema_QK > 0.01).sum().item()
-                            active_V = (ema_V > 0.01).sum().item()
-                            n_C, n_QK, n_V = ema_C.numel(), ema_QK.numel(), ema_V.numel()
-
-                            # Gini coefficients
-                            gini_C = gini(ema_C)
-                            gini_QK = gini(ema_QK)
-                            gini_V = gini(ema_V)
-
-                            # Imbalance (for comparison with v14 SAR)
-                            imb_C = (ema_C.max() - ema_C.min()).item()
-                            imb_QK = (ema_QK.max() - ema_QK.min()).item()
-                            imb_V = (ema_V.max() - ema_V.min()).item()
-
-                            # Usage EMA distribution: min/max/mean
-                            min_C, max_C, mean_C = ema_C.min().item(), ema_C.max().item(), ema_C.mean().item()
-                            min_QK, max_QK, mean_QK = ema_QK.min().item(), ema_QK.max().item(), ema_QK.mean().item()
-                            min_V, max_V, mean_V = ema_V.min().item(), ema_V.max().item(), ema_V.mean().item()
-
-                            # Line 1: Active counts and Gini
-                            print(f"         Starv:{starvation_weight:.3f} | Active C/QK/V:{int(active_C)}/{n_C},{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} | Gini:{gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}")
-                            # Line 2: Imbalance (comparable to v14)
-                            print(f"             Imbalance C/QK/V:{imb_C:.3f}/{imb_QK:.3f}/{imb_V:.3f}")
-                            # Line 3: Usage EMA distribution
-                            print(f"             EMA C:[{min_C:.3f},{mean_C:.3f},{max_C:.3f}] QK:[{min_QK:.3f},{mean_QK:.3f},{max_QK:.3f}] V:[{min_V:.3f},{mean_V:.3f},{max_V:.3f}]")
+                        for line in _get_router_log_lines(router, optimizer, args, global_step, total_steps):
+                            print(line)
 
                     # Knowledge neuron usage stats
                     try:
@@ -953,7 +956,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             ent_ratio_K = (ent_K / max_ent * 100).item()
 
                             # Gini
-                            gini_K = gini(usage_freq)
+                            gini_K = _gini(usage_freq)
 
                             print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f}")
                     except Exception:
@@ -980,68 +983,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # v14/v13.2: Add router metrics (same format as console)
                 if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                     router = base_model.global_routers.neuron_router
-
-                    def gini(x):
-                        x_sorted = torch.sort(x)[0]
-                        n = x.numel()
-                        idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
-                        return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
-
-                    # v14: FRTK with SAR (Synaptic Activation Regulation)
-                    if hasattr(router, 'usage_ema_feature'):
-                        ema_F = router.usage_ema_feature
-                        ema_R = router.usage_ema_relational
-                        ema_T = router.usage_ema_transfer
-
-                        active_F = (ema_F > 0.01).sum().item()
-                        active_R = (ema_R > 0.01).sum().item()
-                        active_T = (ema_T > 0.01).sum().item()
-                        n_F, n_R, n_T = ema_F.numel(), ema_R.numel(), ema_T.numel()
-
-                        gini_F, gini_R, gini_T = gini(ema_F), gini(ema_R), gini(ema_T)
-
-                        # SAR: LR-based bounds + strength
-                        current_lr = optimizer.param_groups[0]['lr']
-                        initial_lr = args.lr
-                        lr_ratio = current_lr / initial_lr if initial_lr > 0 else 1.0
-                        floor = 0.02 + 0.08 * lr_ratio
-                        ceiling = 0.97 - 0.27 * lr_ratio
-                        strength = 5 + 15 * lr_ratio
-
-                        min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
-                        min_R, max_R, mean_R = ema_R.min().item(), ema_R.max().item(), ema_R.mean().item()
-                        min_T, max_T, mean_T = ema_T.min().item(), ema_T.max().item(), ema_T.mean().item()
-
-                        f.write(f"         SAR | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}\n")
-                        f.write(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f} Str:{strength:.1f}\n")
-                        f.write(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]\n")
-
-                    # v13.2: Compress/QK/V with starvation
-                    elif hasattr(router, 'usage_ema_compress'):
-                        ema_C = router.usage_ema_compress
-                        ema_QK = router.usage_ema_expand_QK
-                        ema_V = router.usage_ema_expand_V
-
-                        starvation_weight = max(0.05, math.exp(-3.0 * global_step / total_steps))
-
-                        active_C = (ema_C > 0.01).sum().item()
-                        active_QK = (ema_QK > 0.01).sum().item()
-                        active_V = (ema_V > 0.01).sum().item()
-                        n_C, n_QK, n_V = ema_C.numel(), ema_QK.numel(), ema_V.numel()
-
-                        gini_C, gini_QK, gini_V = gini(ema_C), gini(ema_QK), gini(ema_V)
-
-                        imb_C = (ema_C.max() - ema_C.min()).item()
-                        imb_QK = (ema_QK.max() - ema_QK.min()).item()
-                        imb_V = (ema_V.max() - ema_V.min()).item()
-
-                        min_C, max_C, mean_C = ema_C.min().item(), ema_C.max().item(), ema_C.mean().item()
-                        min_QK, max_QK, mean_QK = ema_QK.min().item(), ema_QK.max().item(), ema_QK.mean().item()
-                        min_V, max_V, mean_V = ema_V.min().item(), ema_V.max().item(), ema_V.mean().item()
-
-                        f.write(f"         Starv:{starvation_weight:.3f} | Active C/QK/V:{int(active_C)}/{n_C},{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} | Gini:{gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}\n")
-                        f.write(f"             Imbalance C/QK/V:{imb_C:.3f}/{imb_QK:.3f}/{imb_V:.3f}\n")
-                        f.write(f"             EMA C:[{min_C:.3f},{mean_C:.3f},{max_C:.3f}] QK:[{min_QK:.3f},{mean_QK:.3f},{max_QK:.3f}] V:[{min_V:.3f},{mean_V:.3f},{max_V:.3f}]\n")
+                    for line in _get_router_log_lines(router, optimizer, args, global_step, total_steps):
+                        f.write(line + "\n")
 
             # Collect neuron metrics
             model.eval()
@@ -2209,15 +2152,9 @@ def main():
                 n_C = router.usage_ema_compress.numel()
                 n_QK = router.usage_ema_expand_QK.numel()
                 n_V = router.usage_ema_expand_V.numel()
-                # Gini coefficient
-                def gini(x):
-                    x_sorted = torch.sort(x)[0]
-                    n = x.numel()
-                    idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
-                    return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
-                gini_C = gini(router.usage_ema_compress)
-                gini_QK = gini(router.usage_ema_expand_QK)
-                gini_V = gini(router.usage_ema_expand_V)
+                gini_C = _gini(router.usage_ema_compress)
+                gini_QK = _gini(router.usage_ema_expand_QK)
+                gini_V = _gini(router.usage_ema_expand_V)
                 print(f"  Router: Starv={starvation_weight:.3f} | Active C/QK/V: {int(active_C)}/{n_C}, {int(active_QK)}/{n_QK}, {int(active_V)}/{n_V} | Gini: {gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}")
 
         # Print neuron metrics if available
@@ -2255,15 +2192,9 @@ def main():
                     active_C = (router.usage_ema_compress > 0.01).sum().item()
                     active_QK = (router.usage_ema_expand_QK > 0.01).sum().item()
                     active_V = (router.usage_ema_expand_V > 0.01).sum().item()
-                    # Gini coefficient
-                    def gini(x):
-                        x_sorted = torch.sort(x)[0]
-                        n = x.numel()
-                        idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
-                        return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
-                    gini_C = gini(router.usage_ema_compress)
-                    gini_QK = gini(router.usage_ema_expand_QK)
-                    gini_V = gini(router.usage_ema_expand_V)
+                    gini_C = _gini(router.usage_ema_compress)
+                    gini_QK = _gini(router.usage_ema_expand_QK)
+                    gini_V = _gini(router.usage_ema_expand_V)
                     f.write(f",starv={starvation_weight:.3f},active_C={int(active_C)},"
                            f"active_QK={int(active_QK)},active_V={int(active_V)},"
                            f"gini_C={gini_C:.3f},gini_QK={gini_QK:.3f},gini_V={gini_V:.3f}")
