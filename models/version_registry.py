@@ -5,7 +5,7 @@ v10.0: Simplified Compress/Expand Architecture (Soft Routing, 3 compressors for 
 v13.0: Final Architecture (Selective SSM + Context + Top-k + FlashAttention)
 v13.1: Separate QK/V Expand Pools (Q/K share, V separate)
 v13.2: Unified Neuron Router (all neurons in same embedding space)
-v14.0: FRTK Architecture (Feature-Relational-Transfer-Knowledge) with Homeostatic Routing
+v14.0: FRTK Architecture (Feature-Relational-Transfer-Knowledge) with SAR
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -148,7 +148,7 @@ VERSION_REGISTRY = {
         ],
     },
     "14.0": {
-        "description": "FRTK Architecture (Feature-Relational-Transfer-Knowledge) with Homeostatic Routing",
+        "description": "FRTK Architecture (Feature-Relational-Transfer-Knowledge) with SAR",
         "aliases": ["14", "140"],
         "module": "model_v14",
         "required_params": [
@@ -169,12 +169,12 @@ VERSION_REGISTRY = {
             f"  FeatureNeurons (F): {args.get('n_feature')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))}",
             f"  RelationalNeurons (R): {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K pool)",
             f"  TransferNeurons (T): {args.get('n_transfer')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V pool)",
-            f"  Unified Router: d_space={args.get('d_space', 64)} + Homeostatic Pressure",
+            f"  Unified Router: d_space={args.get('d_space', 64)} + SAR (Synaptic Activation Regulation)",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
             f"  Top-k Feature: {args.get('top_k_feature', 8)}/{args.get('n_feature')}",
             f"  Top-k Relational: {args.get('top_k_relational', 4)}/{args.get('n_relational')}",
             f"  Top-k Transfer: {args.get('top_k_transfer', 6)}/{args.get('n_transfer')}",
-            f"  Architecture: Mamba SSM → Context → Unified Router (HRP) → FlashAttn",
+            f"  Architecture: Mamba SSM → Context → Unified Router (SAR) → FlashAttn",
             f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
             f"  KnowledgeNeurons (K):",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', args.get('rank', args.get('basis_rank')))}",

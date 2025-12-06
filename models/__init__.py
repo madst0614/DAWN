@@ -24,8 +24,8 @@ v13.2: Unified Neuron Router
 
 v14.0: FRTK Architecture
 - Feature-Relational-Transfer-Knowledge naming
-- Homeostatic Routing Pressure (replaces starvation weight)
-- Adaptive pressure based on usage imbalance
+- Synaptic Activation Regulation (SAR) replaces starvation weight
+- LR-based adaptive bounds (tight early, loose late)
 
 baseline: Vanilla Transformer for fair comparison
 """
@@ -42,7 +42,7 @@ from .model_v13_1 import DAWN as DAWN_v13_1
 # v13.2 - Unified Neuron Router
 from .model_v13_2 import DAWN as DAWN_v13_2
 
-# v14.0 - FRTK Architecture with Homeostatic Routing
+# v14.0 - FRTK Architecture with SAR
 from .model_v14 import DAWN as DAWN_v14
 
 # Default DAWN is v14 (latest)

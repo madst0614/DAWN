@@ -634,11 +634,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))
 
                 # v10: DAWN model forward
+                # Get current LR for SAR (Synaptic Activation Regulation)
+                current_lr = optimizer.param_groups[0]['lr']
+                initial_lr = args.lr
+
                 if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2_plus:
                     ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True,
-                                                           step=global_step, total_steps=total_steps)
+                                                           current_lr=current_lr, initial_lr=initial_lr)
                 else:
-                    ce_loss, logits = model(input_ids, labels, step=global_step, total_steps=total_steps)
+                    ce_loss, logits = model(input_ids, labels, current_lr=current_lr, initial_lr=initial_lr)
                     routing_infos = None
 
                 # Orthogonality loss
@@ -695,11 +699,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))
 
             # v10: DAWN model forward
+            # Get current LR for SAR (Synaptic Activation Regulation)
+            current_lr = optimizer.param_groups[0]['lr']
+            initial_lr = args.lr
+
             if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2_plus:
                 ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True,
-                                                       step=global_step, total_steps=total_steps)
+                                                       current_lr=current_lr, initial_lr=initial_lr)
             else:
-                ce_loss, logits = model(input_ids, labels, step=global_step, total_steps=total_steps)
+                ce_loss, logits = model(input_ids, labels, current_lr=current_lr, initial_lr=initial_lr)
                 routing_infos = None
 
             # Orthogonality loss
@@ -834,7 +842,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Compact output with loss/acc
                     print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | Ent C/Q/K/V:{ent_C:.0f}/{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f} | TokVar:{var_C:.4f}/{var_Q:.4f}/{var_K:.4f}/{var_V:.4f} | Attn:{attn_str}")
 
-                    # v13.2+: Usage EMA logging (v13.2: C/QK/V, v14: F/R/T with HRP)
+                    # v13.2+: Usage EMA logging (v13.2: C/QK/V, v14: F/R/T with SAR)
                     if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                         router = base_model.global_routers.neuron_router
 
@@ -845,7 +853,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
                             return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
 
-                        # v14: FRTK naming with Homeostatic Routing Pressure
+                        # v14: FRTK naming with SAR (Synaptic Activation Regulation)
                         if hasattr(router, 'usage_ema_feature'):
                             ema_F = router.usage_ema_feature
                             ema_R = router.usage_ema_relational
@@ -862,13 +870,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             gini_R = gini(ema_R)
                             gini_T = gini(ema_T)
 
-                            # HRP: imbalance and pressure_strength (same as model_v14.py)
-                            imb_F = (ema_F.max() - ema_F.min()).item()
-                            imb_R = (ema_R.max() - ema_R.min()).item()
-                            imb_T = (ema_T.max() - ema_T.min()).item()
-                            prs_F = 0.05 + 1.0 * imb_F  # base_floor=0.05, k=1.0
-                            prs_R = 0.05 + 1.0 * imb_R
-                            prs_T = 0.05 + 1.0 * imb_T
+                            # SAR: LR-based bounds (same as model_v14.py)
+                            current_lr = optimizer.param_groups[0]['lr']
+                            initial_lr = args.lr
+                            lr_ratio = current_lr / initial_lr if initial_lr > 0 else 1.0
+                            floor = 0.01 + 0.09 * lr_ratio      # 0.10 → 0.01
+                            ceiling = 0.99 - 0.29 * lr_ratio    # 0.70 → 0.99
 
                             # Usage EMA distribution: min/max/mean
                             min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
@@ -876,9 +883,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             min_T, max_T, mean_T = ema_T.min().item(), ema_T.max().item(), ema_T.mean().item()
 
                             # Line 1: Active counts and Gini (same format as v13.2)
-                            print(f"         HRP | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
-                            # Line 2: HRP pressure strength and imbalance
-                            print(f"             Pressure F/R/T:{prs_F:.3f}/{prs_R:.3f}/{prs_T:.3f} | Imbalance:{imb_F:.3f}/{imb_R:.3f}/{imb_T:.3f}")
+                            print(f"         SAR | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
+                            # Line 2: SAR bounds (LR-based floor/ceiling)
+                            print(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f}")
                             # Line 3: Usage EMA distribution
                             print(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]")
 
@@ -901,7 +908,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             gini_QK = gini(ema_QK)
                             gini_V = gini(ema_V)
 
-                            # Imbalance (for comparison with v14 HRP)
+                            # Imbalance (for comparison with v14 SAR)
                             imb_C = (ema_C.max() - ema_C.min()).item()
                             imb_QK = (ema_QK.max() - ema_QK.min()).item()
                             imb_V = (ema_V.max() - ema_V.min()).item()
@@ -979,7 +986,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
                         return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
 
-                    # v14: FRTK with HRP
+                    # v14: FRTK with SAR (Synaptic Activation Regulation)
                     if hasattr(router, 'usage_ema_feature'):
                         ema_F = router.usage_ema_feature
                         ema_R = router.usage_ema_relational
@@ -992,17 +999,19 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                         gini_F, gini_R, gini_T = gini(ema_F), gini(ema_R), gini(ema_T)
 
-                        imb_F = (ema_F.max() - ema_F.min()).item()
-                        imb_R = (ema_R.max() - ema_R.min()).item()
-                        imb_T = (ema_T.max() - ema_T.min()).item()
-                        prs_F, prs_R, prs_T = 0.05 + 1.0 * imb_F, 0.05 + 1.0 * imb_R, 0.05 + 1.0 * imb_T
+                        # SAR: LR-based bounds
+                        current_lr = optimizer.param_groups[0]['lr']
+                        initial_lr = args.lr
+                        lr_ratio = current_lr / initial_lr if initial_lr > 0 else 1.0
+                        floor = 0.01 + 0.09 * lr_ratio
+                        ceiling = 0.99 - 0.29 * lr_ratio
 
                         min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
                         min_R, max_R, mean_R = ema_R.min().item(), ema_R.max().item(), ema_R.mean().item()
                         min_T, max_T, mean_T = ema_T.min().item(), ema_T.max().item(), ema_T.mean().item()
 
-                        f.write(f"         HRP | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}\n")
-                        f.write(f"             Pressure F/R/T:{prs_F:.3f}/{prs_R:.3f}/{prs_T:.3f} | Imbalance:{imb_F:.3f}/{imb_R:.3f}/{imb_T:.3f}\n")
+                        f.write(f"         SAR | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}\n")
+                        f.write(f"             LR:{lr_ratio:.3f} Floor:{floor:.3f} Ceil:{ceiling:.3f}\n")
                         f.write(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]\n")
 
                     # v13.2: Compress/QK/V with starvation
@@ -1651,7 +1660,7 @@ def main():
 
     if model_version != 'baseline':
         if model_version == "14.0":
-            # v14.0: FRTK Architecture with Homeostatic Routing
+            # v14.0: FRTK Architecture with SAR
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
             state_dim = getattr(args, 'state_dim', 64)
@@ -1669,7 +1678,7 @@ def main():
             print(f"  RelationalNeurons (R): {n_relational} × {rank} × {args.d_model} (Q/K pool)")
             print(f"  TransferNeurons (T): {n_transfer} × {rank} × {args.d_model} (V pool)")
             print(f"  Global SSM: Selective mechanism (token-dependent delta, B_t)")
-            print(f"  Unified Router: d_space={d_space} + Homeostatic Routing Pressure")
+            print(f"  Unified Router: d_space={d_space} + SAR (Synaptic Activation Regulation)")
             print(f"  Context Enhancement: SSM context added to x")
             print(f"  Top-k Feature: {top_k_feature}/{n_feature}")
             print(f"  Top-k Relational: {top_k_relational}/{n_relational}")
@@ -1677,8 +1686,8 @@ def main():
             print(f"  SSM: state_dim={state_dim}")
             print(f"  FlashAttention: enabled (scaled_dot_product_attention)")
             print(f"  Gradient Checkpointing: {grad_ckpt}")
-            print(f"  Load Balance: Switch Transformer style + HRP")
-            print(f"  Architecture: Mamba SSM → Context + Unified Router (HRP) → FlashAttn")
+            print(f"  Load Balance: Switch Transformer style + SAR")
+            print(f"  Architecture: Mamba SSM → Context + Unified Router (SAR) → FlashAttn")
             print(f"  Attention: d_model space (d_head={d_head})")
             print(f"  KnowledgeNeurons (K):")
             print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
@@ -1903,7 +1912,7 @@ def main():
             'gradient_checkpointing': args.gradient_checkpointing,
         })
     elif model_version == '14.0':
-        # v14.0: FRTK Architecture with Homeostatic Routing
+        # v14.0: FRTK Architecture with SAR
         model_kwargs.update({
             'n_feature': getattr(args, 'n_feature', 48),
             'n_relational': getattr(args, 'n_relational', 12),
