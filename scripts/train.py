@@ -829,10 +829,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             if hasattr(router, 'decay_excitability'):
                 router.decay_excitability(decay_rate=0.9995)
 
-        # Accuracy calculation (only valid tokens)
-        predictions = logits.argmax(dim=-1)
-        valid_mask = (labels != -100)
-        correct_predictions = (predictions == labels) & valid_mask
+        # Accuracy calculation (CLM: shifted)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        predictions = shift_logits.argmax(dim=-1)
+        valid_mask = (shift_labels != -100)
+        correct_predictions = (predictions == shift_labels) & valid_mask
 
         correct = correct_predictions.sum().item()
         valid_tokens = valid_mask.sum().item()
