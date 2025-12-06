@@ -856,7 +856,7 @@ class DAWN(nn.Module):
 
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
+            shift_labels = labels[:, 1:].contiguous().long()
             loss = F.cross_entropy(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1), ignore_index=-100)
             if return_routing_info:
                 return loss, logits, routing_infos
