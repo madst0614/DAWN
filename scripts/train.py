@@ -889,12 +889,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Layer 0 for routing analysis
                     attn = routing_infos[0].get('attention', routing_infos[0])
 
-                    # Get all expand prefs
-                    pref_Q = attn.get('expand_pref_Q')
-                    pref_K = attn.get('expand_pref_K')
-                    pref_V = attn.get('expand_pref_V')
-                    pref_C = attn.get('compress_pref')
-
                     def calc_entropy_ratio(pref):
                         if pref is None:
                             return 0.0
@@ -906,17 +900,45 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # Entropy ratios (C/Q/K/V)
-                    ent_C = calc_entropy_ratio(pref_C)
-                    ent_Q = calc_entropy_ratio(pref_Q)
-                    ent_K = calc_entropy_ratio(pref_K)
-                    ent_V = calc_entropy_ratio(pref_V)
+                    # v14: FRTK (Feature/Relational/Transfer/Knowledge)
+                    if attn.get('feature_pref') is not None:
+                        pref_F = attn.get('feature_pref')
+                        pref_RQ = attn.get('relational_pref_Q')
+                        pref_RK = attn.get('relational_pref_K')
+                        pref_T = attn.get('transfer_pref')
 
-                    # Token variance (C/Q/K/V)
-                    var_C = calc_token_var(pref_C)
-                    var_Q = calc_token_var(pref_Q)
-                    var_K = calc_token_var(pref_K)
-                    var_V = calc_token_var(pref_V)
+                        ent_F = calc_entropy_ratio(pref_F)
+                        ent_RQ = calc_entropy_ratio(pref_RQ)
+                        ent_RK = calc_entropy_ratio(pref_RK)
+                        ent_T = calc_entropy_ratio(pref_T)
+
+                        var_F = calc_token_var(pref_F)
+                        var_RQ = calc_token_var(pref_RQ)
+                        var_RK = calc_token_var(pref_RK)
+                        var_T = calc_token_var(pref_T)
+
+                        ent_str = f"Ent F/RQ/RK/T:{ent_F:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_T:.0f}"
+                        var_str = f"TokVar:{var_F:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_T:.4f}"
+
+                    # v13.2: C/Q/K/V (Compress/Query/Key/Value)
+                    else:
+                        pref_Q = attn.get('expand_pref_Q')
+                        pref_K = attn.get('expand_pref_K')
+                        pref_V = attn.get('expand_pref_V')
+                        pref_C = attn.get('compress_pref')
+
+                        ent_C = calc_entropy_ratio(pref_C)
+                        ent_Q = calc_entropy_ratio(pref_Q)
+                        ent_K = calc_entropy_ratio(pref_K)
+                        ent_V = calc_entropy_ratio(pref_V)
+
+                        var_C = calc_token_var(pref_C)
+                        var_Q = calc_token_var(pref_Q)
+                        var_K = calc_token_var(pref_K)
+                        var_V = calc_token_var(pref_V)
+
+                        ent_str = f"Ent C/Q/K/V:{ent_C:.0f}/{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}"
+                        var_str = f"TokVar:{var_C:.4f}/{var_Q:.4f}/{var_K:.4f}/{var_V:.4f}"
 
                     # Attention ratio (attn_out_norm vs mem_out_norm per layer)
                     attn_ratios = []
@@ -935,7 +957,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     avg_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
 
                     # Compact output with loss/acc
-                    print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | Ent C/Q/K/V:{ent_C:.0f}/{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f} | TokVar:{var_C:.4f}/{var_Q:.4f}/{var_K:.4f}/{var_V:.4f} | Attn:{attn_str}")
+                    print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
 
                     # v13.2+: Usage EMA logging (v13.2: C/QK/V, v14: F/R/T with SAR)
                     if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
@@ -976,10 +998,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     except Exception:
                         pass
 
-                    # Warning if collapse detected
-                    if min(ent_C, ent_Q, ent_K, ent_V) < 30:
+                    # Warning if collapse detected (check min entropy across router types)
+                    # v14: F/RQ/RK/T, v13: C/Q/K/V
+                    if attn.get('feature_pref') is not None:
+                        min_ent = min(ent_F, ent_RQ, ent_RK, ent_T)
+                    else:
+                        min_ent = min(ent_C, ent_Q, ent_K, ent_V)
+
+                    if min_ent < 30:
                         print(f"  ⚠ WARNING: Router may be collapsing! (target: 60%)")
-                    elif min(ent_C, ent_Q, ent_K, ent_V) > 80:
+                    elif min_ent > 80:
                         print(f"  ⚠ WARNING: Router too uniform! (target: 60%)")
 
                 except Exception:
