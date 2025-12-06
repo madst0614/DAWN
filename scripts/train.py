@@ -847,35 +847,76 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                         # v14: FRTK naming with Homeostatic Routing Pressure
                         if hasattr(router, 'usage_ema_feature'):
-                            active_F = (router.usage_ema_feature > 0.01).sum().item()
-                            active_R = (router.usage_ema_relational > 0.01).sum().item()
-                            active_T = (router.usage_ema_transfer > 0.01).sum().item()
-                            n_F = router.usage_ema_feature.numel()
-                            n_R = router.usage_ema_relational.numel()
-                            n_T = router.usage_ema_transfer.numel()
+                            ema_F = router.usage_ema_feature
+                            ema_R = router.usage_ema_relational
+                            ema_T = router.usage_ema_transfer
 
-                            gini_F = gini(router.usage_ema_feature)
-                            gini_R = gini(router.usage_ema_relational)
-                            gini_T = gini(router.usage_ema_transfer)
+                            # Active neuron counts
+                            active_F = (ema_F > 0.01).sum().item()
+                            active_R = (ema_R > 0.01).sum().item()
+                            active_T = (ema_T > 0.01).sum().item()
+                            n_F, n_R, n_T = ema_F.numel(), ema_R.numel(), ema_T.numel()
 
+                            # Gini coefficients
+                            gini_F = gini(ema_F)
+                            gini_R = gini(ema_R)
+                            gini_T = gini(ema_T)
+
+                            # HRP: imbalance and pressure_strength (same as model_v14.py)
+                            imb_F = (ema_F.max() - ema_F.min()).item()
+                            imb_R = (ema_R.max() - ema_R.min()).item()
+                            imb_T = (ema_T.max() - ema_T.min()).item()
+                            prs_F = 0.05 + 1.0 * imb_F  # base_floor=0.05, k=1.0
+                            prs_R = 0.05 + 1.0 * imb_R
+                            prs_T = 0.05 + 1.0 * imb_T
+
+                            # Usage EMA distribution: min/max/mean
+                            min_F, max_F, mean_F = ema_F.min().item(), ema_F.max().item(), ema_F.mean().item()
+                            min_R, max_R, mean_R = ema_R.min().item(), ema_R.max().item(), ema_R.mean().item()
+                            min_T, max_T, mean_T = ema_T.min().item(), ema_T.max().item(), ema_T.mean().item()
+
+                            # Line 1: Active counts and Gini (same format as v13.2)
                             print(f"         HRP | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
+                            # Line 2: HRP pressure strength and imbalance
+                            print(f"             Pressure F/R/T:{prs_F:.3f}/{prs_R:.3f}/{prs_T:.3f} | Imbalance:{imb_F:.3f}/{imb_R:.3f}/{imb_T:.3f}")
+                            # Line 3: Usage EMA distribution
+                            print(f"             EMA F:[{min_F:.3f},{mean_F:.3f},{max_F:.3f}] R:[{min_R:.3f},{mean_R:.3f},{max_R:.3f}] T:[{min_T:.3f},{mean_T:.3f},{max_T:.3f}]")
 
                         # v13.2: Compress/QK/V naming with starvation weight
                         elif hasattr(router, 'usage_ema_compress'):
+                            ema_C = router.usage_ema_compress
+                            ema_QK = router.usage_ema_expand_QK
+                            ema_V = router.usage_ema_expand_V
+
                             starvation_weight = max(0.05, math.exp(-3.0 * global_step / total_steps))
 
-                            active_C = (router.usage_ema_compress > 0.01).sum().item()
-                            active_QK = (router.usage_ema_expand_QK > 0.01).sum().item()
-                            active_V = (router.usage_ema_expand_V > 0.01).sum().item()
-                            n_C = router.usage_ema_compress.numel()
-                            n_QK = router.usage_ema_expand_QK.numel()
-                            n_V = router.usage_ema_expand_V.numel()
+                            # Active neuron counts
+                            active_C = (ema_C > 0.01).sum().item()
+                            active_QK = (ema_QK > 0.01).sum().item()
+                            active_V = (ema_V > 0.01).sum().item()
+                            n_C, n_QK, n_V = ema_C.numel(), ema_QK.numel(), ema_V.numel()
 
-                            gini_C = gini(router.usage_ema_compress)
-                            gini_QK = gini(router.usage_ema_expand_QK)
-                            gini_V = gini(router.usage_ema_expand_V)
+                            # Gini coefficients
+                            gini_C = gini(ema_C)
+                            gini_QK = gini(ema_QK)
+                            gini_V = gini(ema_V)
 
+                            # Imbalance (for comparison with v14 HRP)
+                            imb_C = (ema_C.max() - ema_C.min()).item()
+                            imb_QK = (ema_QK.max() - ema_QK.min()).item()
+                            imb_V = (ema_V.max() - ema_V.min()).item()
+
+                            # Usage EMA distribution: min/max/mean
+                            min_C, max_C, mean_C = ema_C.min().item(), ema_C.max().item(), ema_C.mean().item()
+                            min_QK, max_QK, mean_QK = ema_QK.min().item(), ema_QK.max().item(), ema_QK.mean().item()
+                            min_V, max_V, mean_V = ema_V.min().item(), ema_V.max().item(), ema_V.mean().item()
+
+                            # Line 1: Active counts and Gini
                             print(f"         Starv:{starvation_weight:.3f} | Active C/QK/V:{int(active_C)}/{n_C},{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} | Gini:{gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}")
+                            # Line 2: Imbalance (comparable to v14)
+                            print(f"             Imbalance C/QK/V:{imb_C:.3f}/{imb_QK:.3f}/{imb_V:.3f}")
+                            # Line 3: Usage EMA distribution
+                            print(f"             EMA C:[{min_C:.3f},{mean_C:.3f},{max_C:.3f}] QK:[{min_QK:.3f},{mean_QK:.3f},{max_QK:.3f}] V:[{min_V:.3f},{mean_V:.3f},{max_V:.3f}]")
 
                     # Knowledge neuron usage stats
                     try:
