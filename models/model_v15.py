@@ -966,11 +966,12 @@ class DAWN(nn.Module):
         """Return model architecture info for logging (used by train.py)"""
         return [
             f"DAWN v{self.__version__}: Direct Knowledge Projection",
+            f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
             f"  FeatureNeurons (F): {self.n_feature} × {self.d_model} × {self.rank} [Attn only]",
             f"  RelationalNeurons (R): {self.n_relational} × {self.rank} × {self.d_model} (Q/K pool)",
             f"  TransferNeurons (T): {self.n_transfer} × {self.rank} × {self.d_model} (V pool)",
             f"  Top-k: F={self.top_k_feature}, R={self.top_k_relational}, T={self.top_k_transfer}",
-            f"  KnowledgeNeurons (K): {self.n_knowledge} × {self.knowledge_rank} (top-{self.knowledge_k})",
-            f"  Memory: x → proj_k → Q (direct, bypass Feature)",
+            f"  KnowledgeNeurons (K): {self.n_knowledge} (top-{self.knowledge_k})",
+            f"  Memory: x → proj_k({self.d_model}→{self.knowledge_rank}) → Q (bypass Feature)",
             f"  Router: d_space={self.d_space}, Excitability (SAR)",
         ]
