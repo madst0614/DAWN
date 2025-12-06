@@ -531,21 +531,24 @@ class SentenceVisualizer:
                 # v14 FRTK format
                 n_tokens = len(tokens)
 
-                # Feature weights (for Q/K/V compress equivalent)
-                if 'feature_weights' in attn:
-                    raw_weights = attn['feature_weights'][0].cpu()
-                    if len(raw_weights.shape) == 1:
-                        weights = raw_weights.unsqueeze(0).expand(n_tokens, -1).numpy()
-                    else:
-                        weights = raw_weights.numpy()
+                # Feature: feature_pref 우선 (token-level [S, N]), fallback to feature_weights
+                if 'feature_pref' in attn:
+                    raw_weights = attn['feature_pref'][0].cpu()  # [S, 48] token-level
+                elif 'feature_weights' in attn:
+                    raw_weights = attn['feature_weights'][0].cpu()  # [48] batch-level
 
-                    k = min(8, weights.shape[-1])
-                    _, idx = torch.topk(torch.tensor(weights), k, dim=-1)
-                    indices = idx.numpy()
+                if len(raw_weights.shape) == 1:
+                    weights = raw_weights.unsqueeze(0).expand(n_tokens, -1).numpy()
+                else:
+                    weights = raw_weights.numpy()
 
-                    # Use feature weights for all components (they share feature neurons)
-                    for comp in ['Q', 'K', 'V']:
-                        layer_result[comp] = {'weights': weights, 'indices': indices}
+                k = min(8, weights.shape[-1])
+                _, idx = torch.topk(torch.tensor(weights), k, dim=-1)
+                indices = idx.numpy()
+
+                # Use feature weights for all components (they share feature neurons)
+                for comp in ['Q', 'K', 'V']:
+                    layer_result[comp] = {'weights': weights, 'indices': indices}
 
             elif 'compress_pref' in attn or 'compress_weights_dense' in attn or 'compress_weights' in attn:
                 # v12/v13 - compress_pref 우선 (token-level)
@@ -722,10 +725,13 @@ class SemanticAnalyzer:
                 weights = attn['Q']['weights']
                 indices = attn['Q'].get('indices')
                 is_batch_level = False
-            elif 'feature_weights' in attn:
-                # v14 FRTK format
-                weights = attn['feature_weights']
-                indices = None  # v14 doesn't expose top-k indices separately
+            elif 'feature_weights' in attn or 'feature_pref' in attn:
+                # v14 FRTK format - feature_pref 우선 (token-level)
+                if 'feature_pref' in attn:
+                    weights = attn['feature_pref']  # [B, S, 48] token-level
+                else:
+                    weights = attn['feature_weights']  # [B, 48] batch-level
+                indices = None
                 is_batch_level = (len(weights.shape) == 2)
             elif 'compress_pref' in attn or 'compress_weights_dense' in attn or 'compress_weights' in attn:
                 # v12/v13 - compress_pref 우선 (token-level)
@@ -892,10 +898,13 @@ class NeuronCatalog:
                 weights = attn['Q']['weights']
                 indices = attn['Q'].get('indices')
                 is_batch_level = False
-            elif 'feature_weights' in attn:
-                # v14 FRTK format
-                weights = attn['feature_weights']
-                indices = None  # v14 doesn't expose top-k indices separately
+            elif 'feature_weights' in attn or 'feature_pref' in attn:
+                # v14 FRTK format - feature_pref 우선 (token-level)
+                if 'feature_pref' in attn:
+                    weights = attn['feature_pref']  # [B, S, 48] token-level
+                else:
+                    weights = attn['feature_weights']  # [B, 48] batch-level
+                indices = None
                 is_batch_level = (len(weights.shape) == 2)
             elif 'compress_pref' in attn or 'compress_weights_dense' in attn or 'compress_weights' in attn:
                 # v12/v13 - compress_pref 우선 (token-level)

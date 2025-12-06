@@ -244,9 +244,12 @@ class RoutingInfoParser:
 
         elif version == 'v14':
             attn = routing_info['attention']
-            # v14: compress → feature
-            weights = attn.get('feature_weights')
-            indices = None  # v14 doesn't expose top-k indices separately
+            # v14: feature_pref 우선 (token-level), fallback to feature_weights
+            if 'feature_pref' in attn:
+                weights = attn.get('feature_pref')  # [B, S, N] token-level
+            else:
+                weights = attn.get('feature_weights')  # [B, N] batch-level
+            indices = None
             return weights, indices
 
         elif version in ['v12', 'v12_topk']:

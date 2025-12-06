@@ -143,8 +143,12 @@ class VersionDetector:
         """Extract weights and indices from routing_info"""
         attn = routing_info.get('attention', routing_info)
 
-        if 'feature_weights' in attn:
-            # v14 FRTK
+        if 'feature_pref' in attn:
+            # v14 FRTK: token-level preferences [B, S, N] - 우선 사용!
+            weights = attn['feature_pref']
+            indices = None
+        elif 'feature_weights' in attn:
+            # v14 FRTK: batch-level fallback
             weights = attn['feature_weights']
             indices = None
         elif 'compress_pref' in attn:
