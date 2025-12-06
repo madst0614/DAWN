@@ -691,11 +691,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             continue
         input_ids = batch["input_ids"].to(device)
 
-        # Apply MLM masking
-        if tokenizer is not None:
-            input_ids, labels = apply_mlm_masking(input_ids, tokenizer, MLM_CONFIG)
-        else:
-            labels = input_ids.clone()
+        # CLM: labels = input_ids (model does shift internally)
+        labels = input_ids.clone()
 
         optimizer.zero_grad()
 
@@ -1104,26 +1101,23 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
                 break
             input_ids = batch["input_ids"].to(device)
 
-            # Apply same MLM masking as training
-            if tokenizer is not None:
-                masked_input_ids, labels = apply_mlm_masking(input_ids, tokenizer)
-            else:
-                masked_input_ids = input_ids
-                labels = input_ids.clone()
+            # CLM evaluation
+            logits = eval_model(input_ids)
 
-            logits = eval_model(masked_input_ids)
-
+            # Shift for autoregressive loss
             B, S, V = logits.shape
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous()
             loss = F.cross_entropy(
-                logits.view(B * S, V),
-                labels.view(B * S),
+                shift_logits.view(-1, V),
+                shift_labels.view(-1),
                 ignore_index=-100
             )
 
             # Accuracy calculation
-            predictions = logits.argmax(dim=-1)
-            valid_mask = (labels != -100)
-            correct_predictions = (predictions == labels) & valid_mask
+            predictions = shift_logits.argmax(dim=-1)
+            valid_mask = (shift_labels != -100)
+            correct_predictions = (predictions == shift_labels) & valid_mask
 
             correct = correct_predictions.sum().item()
             valid_tokens = valid_mask.sum().item()
