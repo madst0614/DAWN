@@ -132,7 +132,7 @@ class UnifiedNeuronRouter(nn.Module):
 
         if neuron_type in ['feature', 'memory']:
             self.usage_ema_feature = 0.99 * self.usage_ema_feature + 0.01 * usage
-        elif neuron_type in ['relational_Q', 'relational_K']:
+        elif neuron_type == 'relational':
             self.usage_ema_relational = 0.99 * self.usage_ema_relational + 0.01 * usage
         elif neuron_type == 'transfer':
             self.usage_ema_transfer = 0.99 * self.usage_ema_transfer + 0.01 * usage
@@ -438,9 +438,11 @@ class GlobalRouters(nn.Module):
         # Update usage statistics
         if self.training:
             self.neuron_router.update_usage(feature_weights, 'feature')
-            self.neuron_router.update_usage(relational_weights_Q, 'relational_Q')
-            self.neuron_router.update_usage(relational_weights_K, 'relational_K')
             self.neuron_router.update_usage(transfer_weights, 'transfer')
+
+            # Relational: Q OR K에서 선택되면 사용된 것으로 카운트
+            relational_used = ((relational_weights_Q > 0) | (relational_weights_K > 0)).float()
+            self.neuron_router.update_usage(relational_used, 'relational')
 
         return feature_weights, relational_weights_Q, relational_weights_K, transfer_weights, routing_info, aux_loss
 
