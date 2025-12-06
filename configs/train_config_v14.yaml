@@ -23,8 +23,8 @@ model:
   state_dim: 64
 
   # FRTK Neurons (v13 → v14 mapping)
-  n_feature: 48              # n_compress → n_feature
-  n_relational: 12           # n_expand_QK → n_relational
+  n_feature: 12              # n_compress → n_feature
+  n_relational: 48           # n_expand_QK → n_relational
   n_transfer: 12             # n_expand_V → n_transfer
   n_knowledge: 80
   knowledge_k: 10
@@ -33,9 +33,9 @@ model:
   dropout: 0.1
 
   # Top-k sparse mixing (FRTK naming)
-  top_k_feature: 8           # top_k_compress → top_k_feature
-  top_k_relational: 4        # top_k_QK → top_k_relational
-  top_k_transfer: 6          # top_k_V → top_k_transfer
+  top_k_feature: 3           # top_k_compress → top_k_feature
+  top_k_relational: 12       # top_k_QK → top_k_relational
+  top_k_transfer: 3          # top_k_V → top_k_transfer
 
   # Router settings
   d_space: 64
