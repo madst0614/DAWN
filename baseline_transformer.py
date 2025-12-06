@@ -176,7 +176,8 @@ class VanillaTransformer(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, labels=None, return_routing_info=False):
+    def forward(self, input_ids, labels=None, return_routing_info=False,
+                step=None, total_steps=None):
         B, S = input_ids.shape
 
         # Embeddings

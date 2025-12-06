@@ -649,26 +649,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
                     diversity_loss = base_model.knowledge_diversity_loss()
 
-                # Load balance loss
+                # Load balance loss (from model.aux_loss for v13.2+, fallback to old method)
                 lb_loss = 0.0
-                if load_balance_weight > 0 and routing_infos is not None:
-                    if hasattr(base_model, 'load_balance_loss'):
+                if load_balance_weight > 0:
+                    if hasattr(base_model, 'aux_loss') and base_model.aux_loss != 0.0:
+                        lb_loss = base_model.aux_loss
+                    elif routing_infos is not None and hasattr(base_model, 'load_balance_loss'):
                         lb_loss = base_model.load_balance_loss(routing_infos)
 
-                # Entropy loss (for v12.7/v13 with router dropout)
-                ent_loss = 0.0
-                if entropy_weight > 0 and routing_infos is not None:
-                    if hasattr(base_model, 'routing_entropy_loss'):
-                        # Check if it accepts routing_infos (v12.7/v13) or not (older versions)
-                        import inspect
-                        sig = inspect.signature(base_model.routing_entropy_loss)
-                        if len(sig.parameters) > 0:
-                            ent_loss = base_model.routing_entropy_loss(routing_infos)
-                        else:
-                            ent_loss = base_model.routing_entropy_loss()
-
                 # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
                 # NaN/INF detection
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -677,20 +667,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     print(f"  orth_loss: {orth_loss.item() if torch.is_tensor(orth_loss) else orth_loss}")
                     print(f"  diversity_loss: {diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss}")
                     print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
-                    print(f"  ent_loss: {ent_loss.item() if torch.is_tensor(ent_loss) else ent_loss}")
                     raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
             scaler.scale(loss).backward()
-
-            # Free computation graph references from routing_infos
-            if routing_infos is not None:
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', {})
-                    for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad',
-                                'compress_logits', 'expand_logits_Q', 'expand_logits_K', 'expand_logits_V']:
-                        attn.pop(key, None)
-                    mem = layer_info.get('memory', {})
-                    mem.pop('memory_logits', None)
 
             # Gradient clipping
             scaler.unscale_(optimizer)
@@ -729,25 +708,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
                 diversity_loss = base_model.knowledge_diversity_loss()
 
-            # Load balance loss
+            # Load balance loss (from model.aux_loss for v13.2+, fallback to old method)
             lb_loss = 0.0
-            if load_balance_weight > 0 and routing_infos is not None:
-                if hasattr(base_model, 'load_balance_loss'):
+            if load_balance_weight > 0:
+                if hasattr(base_model, 'aux_loss') and base_model.aux_loss != 0.0:
+                    lb_loss = base_model.aux_loss
+                elif routing_infos is not None and hasattr(base_model, 'load_balance_loss'):
                     lb_loss = base_model.load_balance_loss(routing_infos)
 
-            # Entropy loss (for v12.7/v13 with router dropout)
-            ent_loss = 0.0
-            if entropy_weight > 0 and routing_infos is not None:
-                if hasattr(base_model, 'routing_entropy_loss'):
-                    import inspect
-                    sig = inspect.signature(base_model.routing_entropy_loss)
-                    if len(sig.parameters) > 0:
-                        ent_loss = base_model.routing_entropy_loss(routing_infos)
-                    else:
-                        ent_loss = base_model.routing_entropy_loss()
-
             # Total loss
-            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss + entropy_weight * ent_loss
+            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
 
             # NaN/INF detection
             if torch.isnan(loss) or torch.isinf(loss):
@@ -756,20 +726,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 print(f"  orth_loss: {orth_loss.item() if torch.is_tensor(orth_loss) else orth_loss}")
                 print(f"  diversity_loss: {diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss}")
                 print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
-                print(f"  ent_loss: {ent_loss.item() if torch.is_tensor(ent_loss) else ent_loss}")
                 raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
             loss.backward()
-
-            # Free computation graph references from routing_infos
-            if routing_infos is not None:
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', {})
-                    for key in ['compress_pref_grad', 'expand_pref_Q_grad', 'expand_pref_K_grad', 'expand_pref_V_grad',
-                                'compress_logits', 'expand_logits_Q', 'expand_logits_K', 'expand_logits_V']:
-                        attn.pop(key, None)
-                    mem = layer_info.get('memory', {})
-                    mem.pop('memory_logits', None)
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -840,14 +799,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # Entropy ratios
+                    # Entropy ratios (C/Q/K/V)
+                    ent_C = calc_entropy_ratio(pref_C)
                     ent_Q = calc_entropy_ratio(pref_Q)
                     ent_K = calc_entropy_ratio(pref_K)
                     ent_V = calc_entropy_ratio(pref_V)
-                    ent_C = calc_entropy_ratio(pref_C)
 
-                    # Token variance (Q만 대표로)
+                    # Token variance (C/Q/K/V)
+                    var_C = calc_token_var(pref_C)
                     var_Q = calc_token_var(pref_Q)
+                    var_K = calc_token_var(pref_K)
+                    var_V = calc_token_var(pref_V)
 
                     # Attention ratio (attn_out_norm vs mem_out_norm per layer)
                     attn_ratios = []
@@ -861,28 +823,77 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             attn_ratios.append("-")
                     attn_str = "/".join(attn_ratios)
 
-                    # Compact output
-                    print(f"[{step+1}] Ent Q/K/V/C:{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f}/{ent_C:.0f} | TokVar:{var_Q:.5f} | Attn:{attn_str}")
+                    # Compute window average for display
+                    avg_loss = window_loss / window_count if window_count > 0 else 0.0
+                    avg_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
+
+                    # Compact output with loss/acc
+                    print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | Ent C/Q/K/V:{ent_C:.0f}/{ent_Q:.0f}/{ent_K:.0f}/{ent_V:.0f} | TokVar:{var_C:.4f}/{var_Q:.4f}/{var_K:.4f}/{var_V:.4f} | Attn:{attn_str}")
 
                     # v13.2: Starvation weight and usage EMA logging
                     if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                         router = base_model.global_routers.neuron_router
                         if hasattr(router, 'usage_ema_compress'):
-                            starvation_weight = max(0.0, 1.0 - global_step / total_steps)
-                            # Mean (expected: k/n ratio)
-                            usage_C = router.usage_ema_compress.mean().item()
-                            usage_QK = router.usage_ema_expand_QK.mean().item()
-                            usage_V = router.usage_ema_expand_V.mean().item()
-                            # Std (diversity: low=good, high=bad)
-                            std_C = router.usage_ema_compress.std().item()
-                            std_QK = router.usage_ema_expand_QK.std().item()
-                            std_V = router.usage_ema_expand_V.std().item()
-                            print(f"         Starv:{starvation_weight:.3f} | Usage C/QK/V:{usage_C:.3f}/{usage_QK:.3f}/{usage_V:.3f} | Std:{std_C:.3f}/{std_QK:.3f}/{std_V:.3f}")
+                            starvation_weight = max(0.05, math.exp(-3.0 * global_step / total_steps))
+
+                            # Active count: neurons used at least once (usage > 0.01)
+                            active_C = (router.usage_ema_compress > 0.01).sum().item()
+                            active_QK = (router.usage_ema_expand_QK > 0.01).sum().item()
+                            active_V = (router.usage_ema_expand_V > 0.01).sum().item()
+                            n_C = router.usage_ema_compress.numel()
+                            n_QK = router.usage_ema_expand_QK.numel()
+                            n_V = router.usage_ema_expand_V.numel()
+
+                            # Gini coefficient (0=equal, 1=one neuron dominates)
+                            def gini(x):
+                                x_sorted = torch.sort(x)[0]
+                                n = x.numel()
+                                idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+                                return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
+
+                            gini_C = gini(router.usage_ema_compress)
+                            gini_QK = gini(router.usage_ema_expand_QK)
+                            gini_V = gini(router.usage_ema_expand_V)
+
+                            print(f"         Starv:{starvation_weight:.3f} | Active C/QK/V:{int(active_C)}/{n_C},{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} | Gini:{gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}")
+
+                    # Knowledge neuron usage stats
+                    try:
+                        # Collect knowledge indices from all layers
+                        all_knowledge_idx = []
+                        for layer_info in routing_infos:
+                            mem = layer_info.get('memory', {})
+                            k_idx = mem.get('knowledge_indices')
+                            if k_idx is not None:
+                                all_knowledge_idx.append(k_idx.flatten())
+
+                        if all_knowledge_idx:
+                            all_idx = torch.cat(all_knowledge_idx)
+                            n_knowledge = base_model.n_knowledge if hasattr(base_model, 'n_knowledge') else 80
+
+                            # Count usage per knowledge neuron
+                            usage_counts = torch.bincount(all_idx.long(), minlength=n_knowledge).float()
+                            usage_freq = usage_counts / (usage_counts.sum() + 1e-8)
+
+                            # Active: neurons used at least once
+                            active_K = (usage_counts > 0).sum().item()
+
+                            # Entropy (normalized)
+                            ent_K = -(usage_freq * (usage_freq + 1e-8).log()).sum()
+                            max_ent = math.log(n_knowledge)
+                            ent_ratio_K = (ent_K / max_ent * 100).item()
+
+                            # Gini
+                            gini_K = gini(usage_freq)
+
+                            print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f}")
+                    except Exception:
+                        pass
 
                     # Warning if collapse detected
-                    if min(ent_Q, ent_K, ent_V) < 30:
+                    if min(ent_C, ent_Q, ent_K, ent_V) < 30:
                         print(f"  ⚠ WARNING: Router may be collapsing! (target: 60%)")
-                    elif min(ent_Q, ent_K, ent_V) > 80:
+                    elif min(ent_C, ent_Q, ent_K, ent_V) > 80:
                         print(f"  ⚠ WARNING: Router too uniform! (target: 60%)")
 
                 except Exception:
@@ -894,8 +905,27 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
 
             with open(log_file, 'a') as f:
-                f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},"
-                       f"acc={avg_window_acc:.6f}\n")
+                f.write(f"epoch={epoch},step={step+1},loss={avg_window_loss:.6f},acc={avg_window_acc:.6f}")
+
+                # v13.2: Add router metrics
+                if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+                    router = base_model.global_routers.neuron_router
+                    if hasattr(router, 'usage_ema_compress'):
+                        active_C = (router.usage_ema_compress > 0.01).sum().item()
+                        active_QK = (router.usage_ema_expand_QK > 0.01).sum().item()
+                        active_V = (router.usage_ema_expand_V > 0.01).sum().item()
+                        def gini(x):
+                            x_sorted = torch.sort(x)[0]
+                            n = x.numel()
+                            idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+                            return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
+                        gini_C = gini(router.usage_ema_compress)
+                        gini_QK = gini(router.usage_ema_expand_QK)
+                        gini_V = gini(router.usage_ema_expand_V)
+                        f.write(f",active_C={int(active_C)},active_QK={int(active_QK)},active_V={int(active_V)}")
+                        f.write(f",gini_C={gini_C:.3f},gini_QK={gini_QK:.3f},gini_V={gini_V:.3f}")
+
+                f.write("\n")
 
             # Collect neuron metrics
             model.eval()
@@ -2327,6 +2357,30 @@ def main():
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e} | Time: {format_time(epoch_time)}")
 
+        # v13.2: Print router metrics
+        base_model = get_underlying_model(model)
+        if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+            router = base_model.global_routers.neuron_router
+            if hasattr(router, 'usage_ema_compress'):
+                starvation_weight = max(0.05, math.exp(-3.0 * global_step / total_steps))
+                # Active count
+                active_C = (router.usage_ema_compress > 0.01).sum().item()
+                active_QK = (router.usage_ema_expand_QK > 0.01).sum().item()
+                active_V = (router.usage_ema_expand_V > 0.01).sum().item()
+                n_C = router.usage_ema_compress.numel()
+                n_QK = router.usage_ema_expand_QK.numel()
+                n_V = router.usage_ema_expand_V.numel()
+                # Gini coefficient
+                def gini(x):
+                    x_sorted = torch.sort(x)[0]
+                    n = x.numel()
+                    idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+                    return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
+                gini_C = gini(router.usage_ema_compress)
+                gini_QK = gini(router.usage_ema_expand_QK)
+                gini_V = gini(router.usage_ema_expand_V)
+                print(f"  Router: Starv={starvation_weight:.3f} | Active C/QK/V: {int(active_C)}/{n_C}, {int(active_QK)}/{n_QK}, {int(active_V)}/{n_V} | Gini: {gini_C:.2f}/{gini_QK:.2f}/{gini_V:.2f}")
+
         # Print neuron metrics if available
         if neuron_metrics is not None:
             print(f"  Neuron Metrics:")
@@ -2357,16 +2411,23 @@ def main():
             if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                 router = base_model.global_routers.neuron_router
                 if hasattr(router, 'usage_ema_compress'):
-                    starvation_weight = max(0.0, 1.0 - global_step / total_steps)
-                    usage_C = router.usage_ema_compress.mean().item()
-                    usage_QK = router.usage_ema_expand_QK.mean().item()
-                    usage_V = router.usage_ema_expand_V.mean().item()
-                    std_C = router.usage_ema_compress.std().item()
-                    std_QK = router.usage_ema_expand_QK.std().item()
-                    std_V = router.usage_ema_expand_V.std().item()
-                    f.write(f",starv={starvation_weight:.3f},usage_C={usage_C:.3f},"
-                           f"usage_QK={usage_QK:.3f},usage_V={usage_V:.3f},"
-                           f"std_C={std_C:.3f},std_QK={std_QK:.3f},std_V={std_V:.3f}")
+                    starvation_weight = max(0.05, math.exp(-3.0 * global_step / total_steps))
+                    # Active count
+                    active_C = (router.usage_ema_compress > 0.01).sum().item()
+                    active_QK = (router.usage_ema_expand_QK > 0.01).sum().item()
+                    active_V = (router.usage_ema_expand_V > 0.01).sum().item()
+                    # Gini coefficient
+                    def gini(x):
+                        x_sorted = torch.sort(x)[0]
+                        n = x.numel()
+                        idx = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+                        return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
+                    gini_C = gini(router.usage_ema_compress)
+                    gini_QK = gini(router.usage_ema_expand_QK)
+                    gini_V = gini(router.usage_ema_expand_V)
+                    f.write(f",starv={starvation_weight:.3f},active_C={int(active_C)},"
+                           f"active_QK={int(active_QK)},active_V={int(active_V)},"
+                           f"gini_C={gini_C:.3f},gini_QK={gini_QK:.3f},gini_V={gini_V:.3f}")
             f.write("\n")
 
         # Debug: Log epoch summary for specific epochs

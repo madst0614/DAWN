@@ -21,21 +21,22 @@ model:
   n_heads: 4
   rank: 64
   state_dim: 64
-  n_compress: 48
-  n_expand_QK: 12    # Q/K shared pool
-  n_expand_V: 12     # V separate pool
+  n_compress: 24
+  n_expand_QK: 48
+  n_expand_V: 12
   n_knowledge: 80
   knowledge_k: 10
   knowledge_rank: 64
   max_seq_len: 512
   dropout: 0.1
   gradient_checkpointing: true
-  top_k_compress: 12
-  top_k_QK: 4        # Top-k for QK router
-  top_k_V: 6         # Top-k for V router
+  top_k_compress: 8
+  top_k_QK: 10
+  top_k_V: 4
   d_space: 64        # Unified neuron embedding space
   router_dropout: 0.1
   token_routing: false
+  use_ssm_context: true
 
 # Training
 training:
@@ -46,7 +47,7 @@ training:
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.03
+  load_balance_weight: 0.0
   entropy_weight: 0.0
   process_norm_weight: 0.0
 
