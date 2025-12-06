@@ -144,19 +144,20 @@ class VersionDetector:
         attn = routing_info.get('attention', routing_info)
 
         if 'feature_weights' in attn:
-            # v14
+            # v14 FRTK
             weights = attn['feature_weights']
             indices = None
-        elif 'compress_weights' in attn or 'compress_pref' in attn:
-            # v12/v13 - prefer dense/token-level weights for analysis
-            if 'compress_weights_dense' in attn:
-                weights = attn['compress_weights_dense']
-            elif 'compress_pref' in attn:
-                # v13.2: use token-level preferences (dense [B, S, N])
-                # This gives per-token neuron activations for better word mapping
-                weights = attn['compress_pref']
-            else:
-                weights = attn['compress_weights']
+        elif 'compress_pref' in attn:
+            # v13.2: token-level preferences [B, S, N] - 우선 사용!
+            weights = attn['compress_pref']
+            indices = None
+        elif 'compress_weights_dense' in attn:
+            # v12.7/v13: dense batch-level
+            weights = attn['compress_weights_dense']
+            indices = attn.get('compress_topk_idx')
+        elif 'compress_weights' in attn:
+            # v12/v13 fallback
+            weights = attn['compress_weights']
             indices = attn.get('compress_topk_idx')
         elif 'Q' in attn and isinstance(attn['Q'], dict):
             # v10
