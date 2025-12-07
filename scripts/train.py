@@ -837,7 +837,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
             router = base_model.global_routers.neuron_router
             if hasattr(router, 'decay_excitability'):
-                router.decay_excitability(decay_rate=0.9995)
+                router.decay_excitability()  # Use model's default (0.9999)
 
         # Accuracy calculation (CLM: shifted)
         shift_logits = logits[:, :-1, :].contiguous()

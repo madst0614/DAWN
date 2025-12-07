@@ -19,22 +19,22 @@ model:
   rank: 64
   state_dim: 64
 
-  # FRVK Neurons
-  n_feature: 36
-  n_relational: 200
-  n_value: 16
-  n_knowledge: 300
-  coarse_k: 20                    # Stage 1: router → coarse candidates
-  fine_k: 10                      # Stage 2: knowledge_encoder → fine selection
+  # FRVK Neurons (optimized for 20M scale)
+  n_feature: 28
+  n_relational: 160
+  n_value: 12
+  n_knowledge: 256
+  coarse_k: 16                    # Stage 1: router → coarse candidates
+  fine_k: 8                       # Stage 2: knowledge_encoder → fine selection
   knowledge_rank: 128             # v15: 64 → 128 (larger matching space)
   max_seq_len: 512
   dropout: 0.1
   gradient_checkpointing: false
 
-  # Top-k settings
-  top_k_feature: 8
-  top_k_relational: 20
-  top_k_value: 4
+  # Top-k settings (optimized)
+  top_k_feature: 6
+  top_k_relational: 16
+  top_k_value: 3
   d_space: 64
   router_dropout: 0.1
   token_routing: false
