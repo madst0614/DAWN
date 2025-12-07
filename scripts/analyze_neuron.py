@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Specific Neuron Analysis Script (DAWN v15 compatible)
+DAWN v15 Neuron Deep Analysis Script
+
+Analyzes what a specific neuron encodes by:
+1. Weight matrix analysis (cosine similarity with embeddings)
+2. Actual activation patterns during forward pass
+3. POS-based activation statistics
 
 Usage:
     python scripts/analyze_neuron.py --neuron_id 8 --checkpoint path/to/model.pt
-    python scripts/analyze_neuron.py --neuron_id 8 --checkpoint path/to/model.pt --num_batches 50
 """
 
 import argparse
@@ -25,77 +29,47 @@ try:
     HAS_SPACY = True
 except:
     HAS_SPACY = False
-    print("Warning: spaCy not available, skipping POS analysis")
+    print("Warning: spaCy not available, POS analysis will be skipped")
 
 
 def load_model_and_tokenizer(checkpoint_path, device):
     """Load model from checkpoint"""
-    from pathlib import Path
     from transformers import BertTokenizer
     from models import create_model_by_version
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
 
-    # Detect version from path or state_dict
     path_str = str(checkpoint_path).lower()
     if 'v15' in path_str:
         version = '15.0'
     elif 'v14' in path_str:
         version = '14.0'
-    elif 'v13' in path_str:
-        version = '13.0'
-    elif 'baseline' in path_str or 'vbaseline' in path_str:
-        version = 'baseline'
     else:
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        keys_str = ' '.join(state_dict.keys())
-        if 'knowledge_encoder' in keys_str:
-            version = '15.0'
-        elif 'feature_neurons' in keys_str:
-            version = '14.0'
-        elif 'context_proj' in keys_str:
-            version = '13.0'
-        else:
-            version = config.get('model_version', '15.0')
+        version = config.get('model_version', '15.0')
 
     print(f"Model version: {version}")
 
-    # Import appropriate model
-    if version == 'baseline' or version == 'vbaseline':
-        from baseline_transformer import VanillaTransformer
-        model = VanillaTransformer(**config)
-    else:
-        # Build model kwargs
-        model_kwargs = {
-            'vocab_size': config.get('vocab_size', 30522),
-            'd_model': config.get('d_model', 320),
-            'n_layers': config.get('n_layers', 4),
-            'n_heads': config.get('n_heads', 4),
-            'rank': config.get('rank', 64),
-            'max_seq_len': config.get('max_seq_len', 512),
-            'n_compress': config.get('n_compress', 48),
-            'n_expand': config.get('n_expand', 12),
-            'n_knowledge': config.get('n_knowledge', 80),
-            'dropout': config.get('dropout', 0.1),
-            'state_dim': config.get('state_dim', 64),
-        }
+    model_kwargs = {
+        'vocab_size': config.get('vocab_size', 30522),
+        'd_model': config.get('d_model', 320),
+        'n_layers': config.get('n_layers', 4),
+        'n_heads': config.get('n_heads', 4),
+        'rank': config.get('rank', 64),
+        'max_seq_len': config.get('max_seq_len', 512),
+        'n_feature': config.get('n_feature', 48),
+        'n_relational': config.get('n_relational', 12),
+        'n_value': config.get('n_value', 12),
+        'n_knowledge': config.get('n_knowledge', 80),
+        'dropout': config.get('dropout', 0.1),
+        'state_dim': config.get('state_dim', 64),
+        'knowledge_rank': config.get('knowledge_rank', 128),
+        'coarse_k': config.get('coarse_k', 20),
+        'fine_k': config.get('fine_k', 10),
+    }
 
-        if version.startswith('15'):
-            model_kwargs['n_feature'] = config.get('n_feature', 48)
-            model_kwargs['n_relational'] = config.get('n_relational', 12)
-            model_kwargs['n_value'] = config.get('n_value', 12)
-            model_kwargs['knowledge_rank'] = config.get('knowledge_rank', 128)
-            model_kwargs['coarse_k'] = config.get('coarse_k', 20)
-            model_kwargs['fine_k'] = config.get('fine_k', 10)
-        elif version.startswith('14'):
-            model_kwargs['n_feature'] = config.get('n_feature', config.get('n_compress', 48))
-            model_kwargs['n_relational'] = config.get('n_relational', config.get('n_expand', 12))
-            model_kwargs['n_transfer'] = config.get('n_transfer', config.get('n_expand', 12))
+    model = create_model_by_version(version, model_kwargs)
 
-        model = create_model_by_version(version, model_kwargs)
-
-    # Load state dict
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
@@ -106,46 +80,111 @@ def load_model_and_tokenizer(checkpoint_path, device):
 
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
-    return model, tokenizer, config, version
+    return model, tokenizer, config
 
 
 class DAWNNeuronAnalyzer:
-    """Neuron analyzer for DAWN v15 models"""
+    """Deep analysis of DAWN v15 feature neurons"""
 
     def __init__(self, model, tokenizer, device, neuron_id, neuron_type='feature'):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.neuron_id = neuron_id
-        self.neuron_type = neuron_type  # 'feature', 'relational', 'value', 'knowledge'
+        self.neuron_type = neuron_type
 
-        model_config = model.get_config() if hasattr(model, 'get_config') else {}
-        self.n_layers = model_config.get('n_layers', len(model.layers) if hasattr(model, 'layers') else 12)
-        self.n_feature = model_config.get('n_feature', 48)
-        self.n_relational = model_config.get('n_relational', 12)
-        self.n_value = model_config.get('n_value', 12)
-        self.n_knowledge = model_config.get('n_knowledge', 80)
+        config = model.get_config()
+        self.n_layers = config.get('n_layers', 12)
+        self.n_feature = config.get('n_feature', 48)
+        self.d_model = config.get('d_model', 320)
+        self.rank = config.get('rank', 64)
 
-        print(f"DAWN Neuron Analyzer")
-        print(f"  Layers: {self.n_layers}")
+        print(f"\nDAWN Neuron Deep Analyzer")
+        print(f"  Model: d_model={self.d_model}, rank={self.rank}")
         print(f"  Feature neurons: {self.n_feature}")
-        print(f"  Relational neurons: {self.n_relational}")
-        print(f"  Value neurons: {self.n_value}")
-        print(f"  Knowledge neurons: {self.n_knowledge}")
         print(f"  Analyzing: {neuron_type} neuron #{neuron_id}")
 
-    def analyze_routing_weights(self, dataloader, num_batches=50, max_seq_len=128):
-        """Analyze routing weights for specific neuron"""
+    def analyze_weight_matrix(self, top_k=100):
+        """Analyze neuron's weight matrix - what token directions it responds to"""
         print(f"\n{'='*60}")
-        print(f"1. Routing Weight Analysis for {self.neuron_type} Neuron {self.neuron_id}")
+        print(f"1. Weight Matrix Analysis for Neuron {self.neuron_id}")
         print(f"{'='*60}")
 
-        token_weights = defaultdict(list)  # token_id -> list of weights
-        layer_weights = defaultdict(list)  # layer_idx -> list of weights
+        # Get feature neuron weight: [n_feature, d_model, rank]
+        W_feature = self.model.shared_neurons.feature_neurons.data
+        W_n = W_feature[self.neuron_id]  # [d_model, rank]
+
+        # Get token embeddings: [vocab, d_model]
+        embed = self.model.token_emb.weight.data  # [vocab, d_model]
+
+        print(f"\nW_{self.neuron_id} shape: {W_n.shape}")
+        print(f"Embedding shape: {embed.shape}")
+
+        # Compute how much each token activates this neuron
+        # h = x @ W_n → [vocab, rank]
+        # activation_strength = ||h||
+        with torch.no_grad():
+            h = embed @ W_n  # [vocab, rank]
+            activation_strength = h.norm(dim=1)  # [vocab]
+
+            # Also compute direction (mean of h normalized)
+            h_normalized = F.normalize(h, dim=1)
+
+        # Top tokens by activation strength
+        top_indices = activation_strength.topk(top_k).indices
+        bottom_indices = activation_strength.topk(top_k, largest=False).indices
+
+        print(f"\nTop {top_k} tokens that activate neuron {self.neuron_id}:")
+        print("-" * 60)
+        top_results = []
+        for i, idx in enumerate(top_indices):
+            token = self.tokenizer.convert_ids_to_tokens([idx.item()])[0]
+            strength = activation_strength[idx].item()
+            print(f"  {i+1:3d}. '{token:20s}' | strength={strength:.4f}")
+            top_results.append({'rank': i+1, 'token': token, 'token_id': idx.item(), 'strength': strength})
+
+        print(f"\nBottom {20} tokens (lowest activation):")
+        print("-" * 60)
+        for i, idx in enumerate(bottom_indices[:20]):
+            token = self.tokenizer.convert_ids_to_tokens([idx.item()])[0]
+            strength = activation_strength[idx].item()
+            print(f"  {i+1:3d}. '{token:20s}' | strength={strength:.4f}")
+
+        # Analyze W_n characteristics
+        print(f"\nNeuron {self.neuron_id} weight statistics:")
+        print(f"  W norm: {W_n.norm():.4f}")
+        print(f"  W mean: {W_n.mean():.6f}")
+        print(f"  W std: {W_n.std():.4f}")
+
+        # Compare with other neurons
+        print(f"\nComparison with other neurons:")
+        all_norms = W_feature.view(self.n_feature, -1).norm(dim=1)
+        sorted_norms = all_norms.argsort(descending=True)
+        rank_of_n = (sorted_norms == self.neuron_id).nonzero()[0].item() + 1
+        print(f"  Neuron {self.neuron_id} norm rank: {rank_of_n}/{self.n_feature}")
+        print(f"  Top 5 by norm: {sorted_norms[:5].tolist()}")
+
+        return {
+            'top_tokens': top_results,
+            'neuron_norm': W_n.norm().item(),
+            'norm_rank': rank_of_n
+        }
+
+    def analyze_activation_patterns(self, dataloader, num_batches=50, max_seq_len=128):
+        """Capture actual neuron activations during forward pass"""
+        print(f"\n{'='*60}")
+        print(f"2. Activation Pattern Analysis for Neuron {self.neuron_id}")
+        print(f"{'='*60}")
+
+        token_activations = defaultdict(list)  # token_id -> list of activation norms
+        layer_activations = []  # Will store per-layer mean activations
+
+        # Get feature neuron weight
+        W_n = self.model.shared_neurons.feature_neurons[self.neuron_id].data  # [d_model, rank]
 
         self.model.eval()
         with torch.no_grad(), torch.amp.autocast('cuda'):
-            for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Analyzing routing")):
+            for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Capturing activations")):
                 if batch_idx >= num_batches:
                     break
 
@@ -154,115 +193,75 @@ class DAWNNeuronAnalyzer:
                 else:
                     input_ids = batch.to(self.device)
 
-                # Truncate sequence for memory
                 input_ids = input_ids[:, :max_seq_len]
                 B, S = input_ids.shape
 
-                # Forward with routing info
-                try:
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    # Without labels: (logits, routing_infos)
-                    # With labels: (loss, logits, routing_infos)
-                    if isinstance(outputs, tuple):
-                        if len(outputs) == 2:
-                            routing_info_list = outputs[1]  # (logits, routing_infos)
-                        elif len(outputs) >= 3:
-                            routing_info_list = outputs[2]  # (loss, logits, routing_infos)
-                        else:
-                            continue
-                    else:
-                        continue
-                except Exception as e:
-                    print(f"Forward error: {e}")
-                    continue
+                # Get embeddings
+                positions = torch.arange(S, device=self.device).unsqueeze(0).expand(B, S)
+                x = self.model.token_emb(input_ids) + self.model.pos_emb(positions)
 
-                # Extract weights for target neuron
-                for layer_idx, routing_info in enumerate(routing_info_list):
-                    if not isinstance(routing_info, dict):
-                        continue
+                # Compute neuron activation: h = x @ W_n
+                h = torch.einsum('bsd,dr->bsr', x, W_n)  # [B, S, rank]
+                activation_norm = h.norm(dim=-1)  # [B, S]
 
-                    attn_info = routing_info.get('attention', {})
+                # Collect per-token activations
+                for b in range(B):
+                    for s in range(S):
+                        token_id = input_ids[b, s].item()
+                        act = activation_norm[b, s].item()
+                        token_activations[token_id].append(act)
 
-                    # Get appropriate weights based on neuron type
-                    if self.neuron_type == 'feature':
-                        weights = attn_info.get('feature_weights', attn_info.get('neuron_weights'))
-                    elif self.neuron_type == 'relational':
-                        weights = attn_info.get('relational_weights_Q')
-                    elif self.neuron_type == 'value':
-                        weights = attn_info.get('value_weights')
-                    else:
-                        weights = None
-
-                    if weights is None:
-                        continue
-
-                    # weights shape: [B, N] or [B, S, N]
-                    if weights.dim() == 2 and weights.shape[1] > self.neuron_id:
-                        neuron_w = weights[:, self.neuron_id].cpu()  # [B]
-                        layer_weights[layer_idx].extend(neuron_w.tolist())
-                    elif weights.dim() == 3 and weights.shape[2] > self.neuron_id:
-                        neuron_w = weights[:, :, self.neuron_id].cpu()  # [B, S]
-                        layer_weights[layer_idx].extend(neuron_w.mean(dim=1).tolist())
-
-                        # Token-level analysis
-                        for b in range(B):
-                            for s in range(S):
-                                token_id = input_ids[b, s].item()
-                                token_weights[token_id].append(neuron_w[b, s].item())
-
-                # Clear cache
                 torch.cuda.empty_cache()
 
-        # Report layer-wise weights
-        print(f"\nLayer-wise mean weight for {self.neuron_type} neuron {self.neuron_id}:")
-        print("-" * 50)
-        layer_results = []
-        for layer_idx in sorted(layer_weights.keys()):
-            weights = layer_weights[layer_idx]
-            mean_w = sum(weights) / len(weights) if weights else 0
-            std_w = (sum((w - mean_w)**2 for w in weights) / len(weights))**0.5 if weights else 0
-            print(f"  Layer {layer_idx:2d}: mean={mean_w:.6f}, std={std_w:.6f}, n={len(weights)}")
-            layer_results.append({'layer': layer_idx, 'mean': mean_w, 'std': std_w})
+        # Compute statistics
+        token_mean_act = {}
+        for token_id, acts in token_activations.items():
+            if len(acts) >= 5:
+                token_mean_act[token_id] = sum(acts) / len(acts)
 
-        # Report top tokens
-        if token_weights:
-            print(f"\nTop 50 tokens with highest weight for neuron {self.neuron_id}:")
-            print("-" * 50)
-            token_mean = {tid: sum(ws)/len(ws) for tid, ws in token_weights.items() if len(ws) >= 3}
-            sorted_tokens = sorted(token_mean.items(), key=lambda x: x[1], reverse=True)[:50]
+        # Sort by mean activation
+        sorted_tokens = sorted(token_mean_act.items(), key=lambda x: x[1], reverse=True)
 
-            token_results = []
-            for i, (token_id, mean_w) in enumerate(sorted_tokens):
-                token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
-                count = len(token_weights[token_id])
-                print(f"  {i+1:2d}. '{token:15s}' | weight={mean_w:.6f} | count={count}")
-                token_results.append({'token': token, 'token_id': token_id, 'weight': mean_w, 'count': count})
+        print(f"\nTop 50 tokens by actual activation (||x @ W_{self.neuron_id}||):")
+        print("-" * 60)
+        results = []
+        for i, (token_id, mean_act) in enumerate(sorted_tokens[:50]):
+            token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+            count = len(token_activations[token_id])
+            std_act = (sum((a - mean_act)**2 for a in token_activations[token_id]) / count) ** 0.5
+            print(f"  {i+1:3d}. '{token:20s}' | act={mean_act:.4f} +/- {std_act:.4f} | n={count}")
+            results.append({'token': token, 'mean_activation': mean_act, 'std': std_act, 'count': count})
 
-            return {'layer_weights': layer_results, 'top_tokens': token_results}
+        print(f"\nBottom 20 tokens by activation:")
+        for i, (token_id, mean_act) in enumerate(sorted_tokens[-20:]):
+            token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+            print(f"  {i+1:3d}. '{token:20s}' | act={mean_act:.4f}")
 
-        return {'layer_weights': layer_results}
+        # Overall statistics
+        all_acts = [a for acts in token_activations.values() for a in acts]
+        print(f"\nOverall activation statistics:")
+        print(f"  Mean: {sum(all_acts)/len(all_acts):.4f}")
+        print(f"  Max: {max(all_acts):.4f}")
+        print(f"  Min: {min(all_acts):.4f}")
 
-    def analyze_all_neurons_usage(self, dataloader, num_batches=30, max_seq_len=128):
-        """Analyze usage of all neurons (find which are most/least used)"""
+        return {'top_tokens': results}
+
+    def analyze_pos_patterns(self, dataloader, num_batches=30, max_seq_len=128):
+        """Analyze activation by Part-of-Speech"""
+        if not HAS_SPACY:
+            print("\n[Skipping POS analysis - spaCy not available]")
+            return None
+
         print(f"\n{'='*60}")
-        print(f"2. All {self.neuron_type.title()} Neurons Usage Analysis")
+        print(f"3. POS-based Activation Analysis for Neuron {self.neuron_id}")
         print(f"{'='*60}")
 
-        if self.neuron_type == 'feature':
-            n_neurons = self.n_feature
-        elif self.neuron_type == 'relational':
-            n_neurons = self.n_relational
-        elif self.neuron_type == 'value':
-            n_neurons = self.n_value
-        else:
-            n_neurons = self.n_knowledge
-
-        neuron_total_weight = torch.zeros(n_neurons)
-        neuron_count = 0
+        pos_activations = defaultdict(list)
+        W_n = self.model.shared_neurons.feature_neurons[self.neuron_id].data
 
         self.model.eval()
         with torch.no_grad(), torch.amp.autocast('cuda'):
-            for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Usage analysis")):
+            for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="POS analysis")):
                 if batch_idx >= num_batches:
                     break
 
@@ -272,302 +271,162 @@ class DAWNNeuronAnalyzer:
                     input_ids = batch.to(self.device)
 
                 input_ids = input_ids[:, :max_seq_len]
+                B, S = input_ids.shape
 
-                try:
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    if isinstance(outputs, tuple):
-                        if len(outputs) == 2:
-                            routing_info_list = outputs[1]
-                        elif len(outputs) >= 3:
-                            routing_info_list = outputs[2]
-                        else:
-                            continue
-                    else:
+                # Compute activations
+                positions = torch.arange(S, device=self.device).unsqueeze(0).expand(B, S)
+                x = self.model.token_emb(input_ids) + self.model.pos_emb(positions)
+                h = torch.einsum('bsd,dr->bsr', x, W_n)
+                activation_norm = h.norm(dim=-1).cpu()  # [B, S]
+
+                # Get POS tags
+                for b in range(B):
+                    text = self.tokenizer.decode(input_ids[b].cpu().tolist(), skip_special_tokens=True)
+                    tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b].cpu().tolist())
+
+                    try:
+                        doc = nlp(text)
+                        spacy_tokens = [(t.text, t.pos_) for t in doc]
+
+                        # Align (approximate)
+                        for s, bert_token in enumerate(tokens):
+                            if bert_token in ['[CLS]', '[SEP]', '[PAD]', '[UNK]']:
+                                continue
+
+                            # Find closest spaCy token
+                            clean_token = bert_token.replace('##', '')
+                            pos = 'X'
+                            for sp_text, sp_pos in spacy_tokens:
+                                if clean_token.lower() in sp_text.lower() or sp_text.lower() in clean_token.lower():
+                                    pos = sp_pos
+                                    break
+
+                            act = activation_norm[b, s].item()
+                            pos_activations[pos].append(act)
+                    except:
                         continue
-                except:
-                    continue
-
-                for routing_info in routing_info_list:
-                    if not isinstance(routing_info, dict):
-                        continue
-
-                    attn_info = routing_info.get('attention', {})
-
-                    if self.neuron_type == 'feature':
-                        weights = attn_info.get('feature_weights', attn_info.get('neuron_weights'))
-                    elif self.neuron_type == 'relational':
-                        weights = attn_info.get('relational_weights_Q')
-                    elif self.neuron_type == 'value':
-                        weights = attn_info.get('value_weights')
-                    else:
-                        weights = None
-
-                    if weights is None:
-                        continue
-
-                    # Aggregate
-                    if weights.dim() == 2:
-                        neuron_total_weight[:weights.shape[1]] += weights.sum(dim=0).cpu()
-                    elif weights.dim() == 3:
-                        neuron_total_weight[:weights.shape[2]] += weights.sum(dim=(0,1)).cpu()
-                    neuron_count += weights.shape[0]
 
                 torch.cuda.empty_cache()
 
-        # Normalize
-        if neuron_count > 0:
-            neuron_avg = neuron_total_weight / neuron_count
-        else:
-            print("Warning: No routing data collected!")
-            return {'neuron_usage': [], 'target_rank': -1}
-
         # Report
-        sorted_idx = torch.argsort(neuron_avg, descending=True)
-        print(f"\nNeuron usage ranking (avg weight across all tokens):")
-        print("-" * 50)
-        print("Top 10 most used:")
-        for i, idx in enumerate(sorted_idx[:10]):
-            marker = " <-- TARGET" if idx.item() == self.neuron_id else ""
-            print(f"  {i+1:2d}. Neuron {idx.item():3d}: {neuron_avg[idx]:.6f}{marker}")
+        print(f"\nActivation by POS tag:")
+        print("-" * 60)
+        print(f"{'POS':<12} | {'Mean':>10} | {'Std':>10} | {'Count':>8}")
+        print("-" * 60)
 
-        print("\nBottom 10 least used:")
-        for i, idx in enumerate(sorted_idx[-10:]):
-            marker = " <-- TARGET" if idx.item() == self.neuron_id else ""
-            print(f"  {i+1:2d}. Neuron {idx.item():3d}: {neuron_avg[idx]:.6f}{marker}")
+        results = []
+        sorted_pos = sorted(
+            [(pos, acts) for pos, acts in pos_activations.items() if len(acts) >= 20],
+            key=lambda x: sum(x[1])/len(x[1]),
+            reverse=True
+        )
 
-        # Where is our target neuron?
-        target_rank = (sorted_idx == self.neuron_id).nonzero()
-        if len(target_rank) > 0:
-            rank = target_rank[0].item() + 1
-            print(f"\n** Neuron {self.neuron_id} rank: {rank}/{n_neurons} (avg weight: {neuron_avg[self.neuron_id]:.6f})")
+        for pos, acts in sorted_pos:
+            mean_act = sum(acts) / len(acts)
+            std_act = (sum((a - mean_act)**2 for a in acts) / len(acts)) ** 0.5
+            print(f"{pos:<12} | {mean_act:>10.4f} | {std_act:>10.4f} | {len(acts):>8}")
+            results.append({'pos': pos, 'mean': mean_act, 'std': std_act, 'count': len(acts)})
 
-        return {
-            'neuron_usage': neuron_avg.tolist(),
-            'target_rank': rank if len(target_rank) > 0 else -1
-        }
+        # Interpretation
+        print("\n📊 POS Categories:")
+        print("  Function words: DET, ADP, PRON, AUX, CCONJ, SCONJ, PART")
+        print("  Content words: NOUN, VERB, ADJ, ADV, PROPN")
+        print("  Other: PUNCT, NUM, SYM, X")
 
-    def analyze_ablation(self, test_sentences=None, max_seq_len=64):
-        """Compare predictions with vs without this neuron (simplified)"""
+        return results
+
+    def analyze_context_sensitivity(self, test_sentences=None):
+        """Analyze how neuron activates in context"""
         print(f"\n{'='*60}")
-        print(f"3. Simplified Ablation Analysis")
+        print(f"4. Context Sensitivity Analysis")
         print(f"{'='*60}")
-        print("(Note: Full ablation requires model modification, showing routing impact instead)")
 
         if test_sentences is None:
             test_sentences = [
-                "The cat sat on the mat",
-                "She went to the store to buy",
-                "The quick brown fox jumps",
-                "I love to read books",
+                "The cat sat on the mat.",
+                "A dog ran through the park.",
+                "She quickly walked to the store.",
+                "The big red ball bounced high.",
+                "He is reading an interesting book.",
+                "They went to buy some groceries.",
             ]
 
-        self.model.eval()
+        W_n = self.model.shared_neurons.feature_neurons[self.neuron_id].data
         results = []
 
-        with torch.no_grad(), torch.amp.autocast('cuda'):
+        self.model.eval()
+        with torch.no_grad():
             for sentence in test_sentences:
-                tokens = self.tokenizer.encode(sentence, return_tensors='pt', max_length=max_seq_len, truncation=True)
-                tokens = tokens.to(self.device)
+                tokens = self.tokenizer(sentence, return_tensors='pt', padding=True)
+                input_ids = tokens['input_ids'].to(self.device)
 
-                try:
-                    outputs = self.model(tokens, return_routing_info=True)
-                    if isinstance(outputs, tuple):
-                        if len(outputs) == 2:
-                            routing_info_list = outputs[1]
-                        elif len(outputs) >= 3:
-                            routing_info_list = outputs[2]
-                        else:
-                            routing_info_list = []
-                    else:
-                        routing_info_list = []
-                except Exception as e:
-                    print(f"Error: {e}")
-                    continue
+                # Get activations
+                S = input_ids.shape[1]
+                positions = torch.arange(S, device=self.device).unsqueeze(0)
+                x = self.model.token_emb(input_ids) + self.model.pos_emb(positions)
+                h = torch.einsum('bsd,dr->bsr', x, W_n)
+                activation_norm = h.norm(dim=-1)[0].cpu()  # [S]
 
-                # Get weights for target neuron across layers
-                neuron_weights_per_layer = []
-                for layer_idx, routing_info in enumerate(routing_info_list):
-                    if not isinstance(routing_info, dict):
-                        continue
-                    attn_info = routing_info.get('attention', {})
-                    if self.neuron_type == 'feature':
-                        weights = attn_info.get('feature_weights', attn_info.get('neuron_weights'))
-                    else:
-                        weights = attn_info.get(f'{self.neuron_type}_weights')
+                # Display
+                token_strs = self.tokenizer.convert_ids_to_tokens(input_ids[0].cpu().tolist())
+                print(f"\n\"{sentence}\"")
+                print("-" * 50)
 
-                    if weights is not None and weights.shape[-1] > self.neuron_id:
-                        if weights.dim() == 2:
-                            w = weights[0, self.neuron_id].item()
-                        else:
-                            w = weights[0, :, self.neuron_id].mean().item()
-                        neuron_weights_per_layer.append(w)
+                token_acts = []
+                for i, (tok, act) in enumerate(zip(token_strs, activation_norm)):
+                    if tok not in ['[CLS]', '[SEP]', '[PAD]']:
+                        bar = '█' * int(act.item() * 10)
+                        print(f"  {tok:15s} | {act.item():.4f} | {bar}")
+                        token_acts.append({'token': tok, 'activation': act.item()})
 
-                avg_weight = sum(neuron_weights_per_layer) / len(neuron_weights_per_layer) if neuron_weights_per_layer else 0
-
-                print(f"\nInput: '{sentence}'")
-                print(f"  Neuron {self.neuron_id} avg weight: {avg_weight:.6f}")
-                print(f"  Per-layer: {[f'{w:.4f}' for w in neuron_weights_per_layer]}")
-
-                results.append({
-                    'sentence': sentence,
-                    'avg_weight': avg_weight,
-                    'per_layer': neuron_weights_per_layer
-                })
-
-                torch.cuda.empty_cache()
+                results.append({'sentence': sentence, 'tokens': token_acts})
 
         return results
 
     def run_full_analysis(self, dataloader, num_batches=50, max_seq_len=128, save_path=None):
-        """Run all analyses"""
+        """Run complete analysis"""
         results = {
             'neuron_id': self.neuron_id,
             'neuron_type': self.neuron_type,
-            'n_layers': self.n_layers,
+            'd_model': self.d_model,
+            'rank': self.rank,
+            'n_feature': self.n_feature,
         }
 
-        # 1. Routing weights analysis
-        results['routing_analysis'] = self.analyze_routing_weights(
+        # 1. Weight matrix analysis
+        results['weight_analysis'] = self.analyze_weight_matrix()
+
+        # 2. Activation patterns
+        results['activation_patterns'] = self.analyze_activation_patterns(
             dataloader, num_batches=num_batches, max_seq_len=max_seq_len)
 
-        # 2. All neurons usage
-        results['usage_analysis'] = self.analyze_all_neurons_usage(
+        # 3. POS analysis
+        results['pos_analysis'] = self.analyze_pos_patterns(
             dataloader, num_batches=num_batches//2, max_seq_len=max_seq_len)
 
-        # 3. Ablation (simplified)
-        results['ablation'] = self.analyze_ablation(max_seq_len=max_seq_len)
+        # 4. Context sensitivity
+        results['context_analysis'] = self.analyze_context_sensitivity()
 
         if save_path:
             with open(save_path, 'w') as f:
                 json.dump(results, f, indent=2, default=str)
-            print(f"\nResults saved to: {save_path}")
-
-        return results
-
-
-class TransformerNeuronAnalyzer:
-    """Neuron analyzer for standard Transformer (baseline) models"""
-
-    def __init__(self, model, tokenizer, device, neuron_id):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = device
-        self.neuron_id = neuron_id
-
-        model_config = model.get_config() if hasattr(model, 'get_config') else getattr(model, 'config', {})
-        self.n_layers = len(model.layers) if hasattr(model, 'layers') else model_config.get('n_layers', 12)
-        self.d_ff = model_config.get('d_ff', 1024)
-
-        print(f"Transformer Neuron Analyzer")
-        print(f"  Layers: {self.n_layers}, d_ff: {self.d_ff}")
-        print(f"  Analyzing neuron: {neuron_id}")
-
-    def analyze_top_tokens(self, dataloader, num_batches=50, top_k=50, max_seq_len=128):
-        """Find tokens that most strongly activate this neuron"""
-        print(f"\n{'='*60}")
-        print(f"1. Top Activated Tokens for FFN Neuron {self.neuron_id}")
-        print(f"{'='*60}")
-
-        token_activations = defaultdict(list)
-        activations_cache = {}
-        handles = []
-
-        def make_hook(name):
-            def hook(module, input, output):
-                if output.shape[-1] > self.neuron_id:
-                    activations_cache[name] = output[:, :, self.neuron_id].detach()
-            return hook
-
-        # Register hooks on w_up layers
-        if hasattr(self.model, 'layers'):
-            for i, layer in enumerate(self.model.layers):
-                if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'w_up'):
-                    h = layer.ffn.w_up.register_forward_hook(make_hook(f'layer_{i}'))
-                    handles.append(h)
-
-        self.model.eval()
-        try:
-            with torch.no_grad(), torch.amp.autocast('cuda'):
-                for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Scanning")):
-                    if batch_idx >= num_batches:
-                        break
-
-                    if isinstance(batch, (list, tuple)):
-                        input_ids = batch[0].to(self.device)
-                    else:
-                        input_ids = batch.to(self.device)
-
-                    input_ids = input_ids[:, :max_seq_len]
-                    activations_cache.clear()
-
-                    # Forward (hooks capture activations)
-                    _ = self.model(input_ids)
-
-                    if not activations_cache:
-                        continue
-
-                    # Aggregate across layers
-                    all_acts = torch.stack(list(activations_cache.values()), dim=0)
-                    mean_acts = all_acts.mean(dim=0).cpu()  # [batch, seq]
-
-                    for b in range(input_ids.shape[0]):
-                        for s in range(input_ids.shape[1]):
-                            token_id = input_ids[b, s].item()
-                            token_activations[token_id].append(mean_acts[b, s].item())
-
-                    torch.cuda.empty_cache()
-
-        finally:
-            for h in handles:
-                h.remove()
-
-        # Report
-        token_mean = {tid: sum(acts)/len(acts) for tid, acts in token_activations.items() if len(acts) >= 3}
-        sorted_tokens = sorted(token_mean.items(), key=lambda x: x[1], reverse=True)
-
-        print(f"\nTop {top_k} tokens:")
-        print("-" * 50)
-        results = []
-        for i, (token_id, act) in enumerate(sorted_tokens[:top_k]):
-            token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
-            count = len(token_activations[token_id])
-            print(f"  {i+1:2d}. '{token:15s}' | act={act:8.4f} | n={count}")
-            results.append({'token': token, 'activation': act, 'count': count})
-
-        return results
-
-    def run_full_analysis(self, dataloader, num_batches=50, max_seq_len=128, save_path=None):
-        results = {
-            'neuron_id': self.neuron_id,
-            'model_type': 'Transformer',
-            'n_layers': self.n_layers,
-            'd_ff': self.d_ff,
-        }
-
-        results['top_tokens'] = self.analyze_top_tokens(
-            dataloader, num_batches=num_batches, max_seq_len=max_seq_len)
-
-        if save_path:
-            with open(save_path, 'w') as f:
-                json.dump(results, f, indent=2, default=str)
-            print(f"\nResults saved to: {save_path}")
+            print(f"\n✅ Results saved to: {save_path}")
 
         return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze specific neuron behavior')
+    parser = argparse.ArgumentParser(description='Deep analysis of DAWN neuron')
     parser.add_argument('--neuron_id', type=int, required=True, help='Neuron index to analyze')
     parser.add_argument('--neuron_type', type=str, default='feature',
-                       choices=['feature', 'relational', 'value', 'knowledge'],
-                       help='Neuron type for DAWN models')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
-    parser.add_argument('--data_path', type=str, default='/content/drive/MyDrive/data', help='Path to data')
-    parser.add_argument('--num_batches', type=int, default=50, help='Number of batches to analyze')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size (small for memory)')
-    parser.add_argument('--max_seq_len', type=int, default=128, help='Max sequence length')
-    parser.add_argument('--output', type=str, default=None, help='Output JSON path')
-    parser.add_argument('--device', type=str, default='cuda', help='Device')
+                       choices=['feature', 'relational', 'value', 'knowledge'])
+    parser.add_argument('--checkpoint', type=str, required=True, help='Model checkpoint path')
+    parser.add_argument('--data_path', type=str, default='/content/drive/MyDrive/data')
+    parser.add_argument('--num_batches', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--max_seq_len', type=int, default=128)
+    parser.add_argument('--output', type=str, default=None)
+    parser.add_argument('--device', type=str, default='cuda')
 
     args = parser.parse_args()
 
@@ -576,7 +435,7 @@ def main():
 
     # Load model
     print(f"\nLoading model from: {args.checkpoint}")
-    model, tokenizer, config, version = load_model_and_tokenizer(args.checkpoint, device)
+    model, tokenizer, config = load_model_and_tokenizer(args.checkpoint, device)
 
     # Load data
     print(f"\nLoading data from: {args.data_path}")
@@ -585,11 +444,8 @@ def main():
     val_path = os.path.join(args.data_path, 'val', 'c4', 'c4_val_50M.pt')
     if os.path.exists(val_path):
         raw_data = torch.load(val_path, weights_only=False)
-
         if isinstance(raw_data, dict):
-            data = raw_data.get('tokens', raw_data.get('input_ids', None))
-            if data is None:
-                data = list(raw_data.values())[0]
+            data = raw_data.get('tokens', raw_data.get('input_ids', list(raw_data.values())[0]))
         else:
             data = raw_data
 
@@ -598,7 +454,7 @@ def main():
             n_seqs = data.shape[0] // seq_len
             data = data[:n_seqs * seq_len].view(n_seqs, seq_len)
 
-        dataset = TensorDataset(data[:5000])  # Limit for speed
+        dataset = TensorDataset(data[:5000])
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
         print(f"  Loaded {len(dataset)} sequences")
     else:
@@ -608,14 +464,11 @@ def main():
         dataset = TensorDataset(random_data)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
 
-    # Create appropriate analyzer
-    if version.startswith('15') or version.startswith('14'):
-        analyzer = DAWNNeuronAnalyzer(model, tokenizer, device, args.neuron_id, args.neuron_type)
-    else:
-        analyzer = TransformerNeuronAnalyzer(model, tokenizer, device, args.neuron_id)
+    # Create analyzer
+    analyzer = DAWNNeuronAnalyzer(model, tokenizer, device, args.neuron_id, args.neuron_type)
 
     # Run analysis
-    output_path = args.output or f'neuron_{args.neuron_id}_analysis.json'
+    output_path = args.output or f'neuron_{args.neuron_id}_deep_analysis.json'
     results = analyzer.run_full_analysis(
         dataloader,
         num_batches=args.num_batches,
