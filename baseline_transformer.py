@@ -194,14 +194,14 @@ class VanillaTransformer(nn.Module):
         x = self.dropout(x)
 
         # Causal mask + Pad mask
-        causal_mask = torch.tril(torch.ones(S, S, device=input_ids.device))
-
         if attention_mask is not None:
-            # attention_mask: [B, S] -> [B, 1, 1, S]
-            pad_mask = attention_mask.unsqueeze(1).unsqueeze(2).float()
+            # Combine causal mask with pad mask
+            causal_mask = torch.tril(torch.ones(S, S, device=input_ids.device))
+            pad_mask = attention_mask.unsqueeze(1).unsqueeze(2).float()  # [B, 1, 1, S]
             mask = causal_mask.unsqueeze(0) * pad_mask  # [B, 1, S, S]
         else:
-            mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
+            # No pad mask -> let StandardAttention use is_causal=True
+            mask = None
 
         # Layers
         for layer in self.layers:
