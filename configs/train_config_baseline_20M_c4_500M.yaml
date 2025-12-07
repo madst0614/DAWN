@@ -25,9 +25,9 @@ model:
 
 # Training (same as DAWN 11M)
 training:
-  batch_size: 256
-  num_epochs: 10
-  lr: 0.0004
+  batch_size: 96
+  num_epochs: 3
+  lr: 0.00055
   weight_decay: 0.1
   warmup_ratio: 0.06
   orthogonality_weight: 0.0
