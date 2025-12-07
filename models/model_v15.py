@@ -164,7 +164,7 @@ class SharedNeurons(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
-        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
         self.n_feature = n_feature
         self.n_relational = n_relational
         self.n_value = n_value
@@ -753,7 +753,7 @@ class DAWN(nn.Module):
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.rank = rank
-        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
         self.max_seq_len = max_seq_len
         self.state_dim = state_dim
         self.top_k_feature = top_k_feature
