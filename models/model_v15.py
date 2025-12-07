@@ -1,18 +1,15 @@
 """
 DAWN v15: 2-Stage Hierarchical Knowledge Retrieval
 
-Changes from v14:
-- NeuronMemory: 2-stage hierarchical retrieval
-  * Stage 1: Router-based coarse candidate selection (x → router → top-coarse_k)
-  * Stage 2: h-based fine matching within candidates (h → proj_q → similarity)
-- Knowledge neurons integrated into unified router space
-- knowledge_rank: 64 → 128 (larger matching space)
+2-Stage Knowledge Retrieval:
+- Stage 1: x → router → coarse_k candidates (Excitability for exploration)
+- Stage 2: x → proj_q → fine match within candidates → fine_k selection
 
 Architecture (FRVK):
 - Feature Neurons (F): x → low-rank projection (compress) [Attention only]
 - Relational Neurons (R): Q/K generation for attention patterns
 - Value Neurons (V): V generation for value transfer
-- Knowledge Neurons (K): 2-stage retrieval (router coarse → h fine)
+- Knowledge Neurons (K): 2-stage retrieval (router coarse → x fine)
 - Unified router with Excitability for balanced usage
 """
 
@@ -560,16 +557,13 @@ class NeuronMemory(nn.Module):
     """
     v15: 2-stage hierarchical knowledge retrieval
 
-    Stage 1: Router-based coarse candidate selection (x → router → top-coarse_k)
-             Uses unified router's knowledge logits for initial filtering
-    Stage 2: h-based fine matching within candidates (h → proj_q → similarity → top-fine_k)
-             Uses compressed representation for precise selection
+    Stage 1: x → router → coarse_k candidates (Excitability for exploration)
+    Stage 2: x → proj_q → fine match within candidates → fine_k selection
     """
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
-        rank: int,
         n_knowledge: int,
         knowledge_rank: int = None,
         coarse_k: int = 20,
@@ -578,22 +572,20 @@ class NeuronMemory(nn.Module):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
-        self.rank = rank
         self.n_knowledge = n_knowledge
-        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
         self.coarse_k = coarse_k
         self.fine_k = fine_k
 
-        # Stage 2: h → query projection for fine matching
-        self.proj_q = nn.Linear(rank, self.knowledge_rank, bias=False)
+        # Stage 2: x → query projection for fine matching (d_model → knowledge_rank)
+        self.proj_q = nn.Linear(d_model, self.knowledge_rank, bias=False)
 
-    def forward(self, x, h, router):
+    def forward(self, x, router):
         """
-        v15: 2-stage hierarchical knowledge retrieval
+        v15.1: 2-stage hierarchical knowledge retrieval
 
         Args:
-            x: [B, S, D] input embeddings (for Stage 1 coarse selection)
-            h: [B, S, rank] compressed representation (for Stage 2 fine matching)
+            x: [B, S, D] input embeddings (for both stages)
             router: UnifiedNeuronRouter (provides knowledge logits)
 
         Returns:
@@ -615,8 +607,8 @@ class NeuronMemory(nn.Module):
             router.update_usage(coarse_indicator, 'knowledge')
 
         # ===== Stage 2: Fine matching within candidates =====
-        # h → query for fine-grained similarity
-        query = self.proj_q(h)  # [B, S, knowledge_rank]
+        # x → query for fine-grained similarity (direct, no h)
+        query = self.proj_q(x)  # [B, S, knowledge_rank]
 
         # Get candidate keys from shared neurons
         K_all = self.shared_neurons.knowledge_neurons_K  # [n_knowledge, knowledge_rank]
@@ -672,12 +664,10 @@ class DAWNBlock(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.shared_neurons = shared_neurons
-        self.rank = rank
 
         self.attn = NeuronCircuit(shared_neurons, d_model, n_heads, rank, dropout)
         self.memory = NeuronMemory(
-            shared_neurons, d_model, rank, n_knowledge,
+            shared_neurons, d_model, n_knowledge,
             knowledge_rank=knowledge_rank, coarse_k=coarse_k, fine_k=fine_k
         )
 
@@ -695,21 +685,8 @@ class DAWNBlock(nn.Module):
 
         normed_x2 = self.norm2(x)
 
-        # v15: 2-stage knowledge retrieval
-        # Compute h (compressed representation) for Stage 2 fine matching
-        # Reuse feature_w from attention routing for consistency
-        token_routing = feature_w.dim() == 3
-        if token_routing:
-            shared_feature = torch.einsum('bsn,ndr->bsdr', feature_w,
-                                          self.shared_neurons.feature_neurons)
-            h = torch.einsum('bsd,bsdr->bsr', normed_x2, shared_feature)
-        else:
-            shared_feature = torch.einsum('bn,ndr->bdr', feature_w,
-                                          self.shared_neurons.feature_neurons)
-            h = torch.einsum('bsd,bdr->bsr', normed_x2, shared_feature)
-
-        # Memory with 2-stage: x for coarse (router), h for fine (proj_q)
-        mem_out, knowledge_info = self.memory(normed_x2, h, global_routers.neuron_router)
+        # v15.1: 2-stage knowledge retrieval (x only, no h)
+        mem_out, knowledge_info = self.memory(normed_x2, global_routers.neuron_router)
         x = x + self.dropout(mem_out)
 
         # Output norms for attn/mem balance monitoring
@@ -730,18 +707,15 @@ class DAWN(nn.Module):
     """
     DAWN v15: 2-Stage Hierarchical Knowledge Retrieval
 
-    Changes from v14:
-    - NeuronMemory: 2-stage hierarchical retrieval
-      * Stage 1: Router-based coarse candidate selection (x → router → top-coarse_k)
-      * Stage 2: h-based fine matching within candidates (h → proj_q → similarity → top-fine_k)
-    - Knowledge neurons integrated into unified router space
-    - knowledge_rank: 64 → 128 (larger matching space)
+    2-Stage Knowledge Retrieval:
+    - Stage 1: x → router → coarse_k candidates (Excitability)
+    - Stage 2: x → proj_q → fine match → fine_k selection
 
     Architecture (FRVK):
     - Feature Neurons (F): input compression [Attention only]
     - Relational Neurons (R): Q/K generation
     - Value Neurons (V): V generation
-    - Knowledge Neurons (K): 2-stage retrieval (router coarse → h fine)
+    - Knowledge Neurons (K): 2-stage retrieval (router coarse → x fine)
     """
     __version__ = "15.0"
 
@@ -1012,14 +986,14 @@ class DAWN(nn.Module):
     def get_model_info(self):
         """Return model architecture info for logging (used by train.py)"""
         return [
-            f"DAWN v{self.__version__}: 2-Stage Hierarchical Knowledge Retrieval",
+            f"DAWN v{self.__version__}: 2-Stage Knowledge Retrieval",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
             f"  FeatureNeurons (F): {self.n_feature} × {self.d_model} × {self.rank} [Attn only]",
             f"  RelationalNeurons (R): {self.n_relational} × {self.rank} × {self.d_model} (Q/K pool)",
             f"  ValueNeurons (V): {self.n_value} × {self.rank} × {self.d_model} (V pool)",
             f"  Top-k: F={self.top_k_feature}, R={self.top_k_relational}, V={self.top_k_value}",
             f"  KnowledgeNeurons (K): {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
-            f"  Memory: 2-stage (x→router→coarse_k, h→proj_q→fine_k)",
+            f"  Memory: x→router→coarse, x→proj_q→fine",
             f"  Router: d_space={self.d_space}, Excitability (SAR), Knowledge integrated",
         ]
 

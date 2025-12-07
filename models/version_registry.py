@@ -6,7 +6,7 @@ v13.0: Final Architecture (Selective SSM + Context + Top-k + FlashAttention)
 v13.1: Separate QK/V Expand Pools (Q/K share, V separate)
 v13.2: Unified Neuron Router (all neurons in same embedding space)
 v14.0: FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR
-v15.0: 2-Stage Hierarchical Knowledge Retrieval (router coarse → h fine)
+v15.0: 2-Stage Hierarchical Knowledge Retrieval (x→router→coarse, x→proj_q→fine)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -187,7 +187,7 @@ VERSION_REGISTRY = {
         ],
     },
     "15.0": {
-        "description": "2-Stage Hierarchical Knowledge Retrieval (router coarse → h fine)",
+        "description": "2-Stage Hierarchical Knowledge Retrieval (x→router→coarse, x→proj_q→fine)",
         "aliases": ["15", "150"],
         "module": "model_v15",
         "required_params": [
@@ -203,7 +203,7 @@ VERSION_REGISTRY = {
             "d_space": 64,
             "coarse_k": 20,
             "fine_k": 10,
-            "knowledge_rank": 128,  # v15 default: 128 (larger matching space)
+            "knowledge_rank": 128,
             "gradient_checkpointing": False,
         },
         "display_info": lambda args: [
@@ -217,7 +217,7 @@ VERSION_REGISTRY = {
             f"  Top-k Relational: {args.get('top_k_relational', 4)}/{args.get('n_relational')}",
             f"  Top-k Value: {args.get('top_k_value', 6)}/{args.get('n_value')}",
             f"  Architecture: Mamba SSM → Context → Unified Router (SAR) → FlashAttn",
-            f"  Memory: 2-stage (x→router→coarse_k, h→proj_q→fine_k)",
+            f"  Memory: 2-stage (x→router→coarse, x→proj_q→fine)",
             f"  KnowledgeNeurons (K):",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",

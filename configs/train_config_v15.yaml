@@ -2,7 +2,7 @@
 # 2-Stage Hierarchical Knowledge Retrieval
 # F(eature), R(elational), V(alue), K(nowledge) neurons
 
-# vs v14: NeuronMemory uses 2-stage retrieval (router coarse → h fine)
+# vs v14: NeuronMemory uses 2-stage retrieval (x→router→coarse, x→proj_q→fine)
 
 # Data
 data:
@@ -64,7 +64,7 @@ log_dir: /content/drive/MyDrive/dawn/logs_v15
 
 # v15 Changes from v14:
 #   - NeuronMemory: 2-stage hierarchical retrieval
-#     * Stage 1: x → router → top-coarse_k candidates
-#     * Stage 2: h → proj_q → similarity → top-fine_k
+#     * Stage 1: x → router → coarse_k candidates (Excitability)
+#     * Stage 2: x → proj_q → fine match → fine_k selection
 #   - Knowledge neurons integrated into unified router space
 #   - knowledge_rank: 64 → 128 (larger matching space)
