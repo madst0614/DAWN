@@ -3,7 +3,7 @@ DAWN v15: 2-Stage Hierarchical Knowledge Retrieval
 
 2-Stage Knowledge Retrieval:
 - Stage 1: x → router → coarse_k candidates (Excitability for exploration)
-- Stage 2: x → proj_q → fine match within candidates → fine_k selection
+- Stage 2: x → knowledge_encoder (shared) → fine match → fine_k selection
 
 Architecture (FRVK):
 - Feature Neurons (F): x → low-rank projection (compress) [Attention only]
@@ -1037,7 +1037,7 @@ class DAWN(nn.Module):
             f"  ValueNeurons (V): {self.n_value} × {self.rank} × {self.d_model} (V pool)",
             f"  Top-k: F={self.top_k_feature}, R={self.top_k_relational}, V={self.top_k_value}",
             f"  KnowledgeNeurons (K): {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
-            f"  Memory: x→router→coarse, x→proj_q→fine",
+            f"  Memory: x→router→coarse, x→knowledge_encoder→fine",
             f"  Router: d_space={self.d_space}, Excitability (SAR), Knowledge integrated",
         ]
 
@@ -1053,9 +1053,14 @@ class DAWN(nn.Module):
                 new_key = key.replace('n_transfer', 'n_value')
             if 'usage_ema_transfer' in key:
                 new_key = key.replace('usage_ema_transfer', 'usage_ema_value')
-            # proj_k → proj_q rename (old v15 compat)
-            if 'memory.proj_k' in key:
-                new_key = key.replace('memory.proj_k', 'memory.proj_q')
+            # proj_k → knowledge_encoder (old v15 compat)
+            # Old: layers.X.memory.proj_q → New: knowledge_encoder (shared)
+            if 'memory.proj_k' in key or 'memory.proj_q' in key:
+                # Use layer 0's weights for the shared encoder
+                if 'layers.0.memory.proj' in key:
+                    new_key = 'knowledge_encoder.weight'
+                else:
+                    continue  # Skip other layers' proj weights
             remapped[new_key] = value
 
         return super().load_state_dict(remapped, strict=strict)
