@@ -445,12 +445,12 @@ class DAWNNeuronAnalyzer:
                         weights = attn_info.get('feature_weights', attn_info.get('neuron_weights'))
 
                         if weights is not None:
-                            flat_ids = input_ids.view(-1)  # [B*S]
+                            flat_ids = input_ids.reshape(-1)  # [B*S]
 
                             if weights.dim() == 3 and weights.shape[2] > self.neuron_id:
-                                w_n = weights[:, :, self.neuron_id].view(-1).float()  # [B*S]
+                                w_n = weights[:, :, self.neuron_id].reshape(-1).float()  # [B*S]
                             elif weights.dim() == 2 and weights.shape[1] > self.neuron_id:
-                                w_n = weights[:, self.neuron_id].unsqueeze(1).expand(B, S).contiguous().view(-1).float()
+                                w_n = weights[:, self.neuron_id].unsqueeze(1).expand(B, S).reshape(-1).float()
                             else:
                                 continue
 
