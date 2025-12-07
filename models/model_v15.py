@@ -577,16 +577,14 @@ class NeuronMemory(nn.Module):
         self.coarse_k = coarse_k
         self.fine_k = fine_k
 
-        # Stage 2: x → query projection for fine matching (d_model → knowledge_rank)
-        self.proj_q = nn.Linear(d_model, self.knowledge_rank, bias=False)
-
-    def forward(self, x, router):
+    def forward(self, x, router, knowledge_encoder):
         """
-        v15.1: 2-stage hierarchical knowledge retrieval
+        v15: 2-stage hierarchical knowledge retrieval
 
         Args:
             x: [B, S, D] input embeddings (for both stages)
             router: UnifiedNeuronRouter (provides knowledge logits)
+            knowledge_encoder: nn.Linear (shared d_model → knowledge_rank)
 
         Returns:
             output: [B, S, D] memory output
@@ -607,8 +605,8 @@ class NeuronMemory(nn.Module):
             router.update_usage(coarse_indicator, 'knowledge')
 
         # ===== Stage 2: Fine matching within candidates =====
-        # x → query for fine-grained similarity (direct, no h)
-        query = self.proj_q(x)  # [B, S, knowledge_rank]
+        # x → query for fine-grained similarity (shared encoder)
+        query = knowledge_encoder(x)  # [B, S, knowledge_rank]
 
         # Get candidate keys from shared neurons
         K_all = self.shared_neurons.knowledge_neurons_K  # [n_knowledge, knowledge_rank]
@@ -675,7 +673,7 @@ class DAWNBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, importance, global_routers: GlobalRouters):
+    def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder):
         normed_x = self.norm1(x)
         feature_w, relational_Q, relational_K, value_w, attn_routing, attn_aux_loss = \
             global_routers.get_attention_weights(normed_x, importance)
@@ -685,8 +683,8 @@ class DAWNBlock(nn.Module):
 
         normed_x2 = self.norm2(x)
 
-        # v15.1: 2-stage knowledge retrieval (x only, no h)
-        mem_out, knowledge_info = self.memory(normed_x2, global_routers.neuron_router)
+        # v15: 2-stage knowledge retrieval (shared knowledge_encoder)
+        mem_out, knowledge_info = self.memory(normed_x2, global_routers.neuron_router, knowledge_encoder)
         x = x + self.dropout(mem_out)
 
         # Output norms for attn/mem balance monitoring
@@ -709,13 +707,13 @@ class DAWN(nn.Module):
 
     2-Stage Knowledge Retrieval:
     - Stage 1: x → router → coarse_k candidates (Excitability)
-    - Stage 2: x → proj_q → fine match → fine_k selection
+    - Stage 2: x → knowledge_encoder (shared) → fine match → fine_k selection
 
     Architecture (FRVK):
     - Feature Neurons (F): input compression [Attention only]
     - Relational Neurons (R): Q/K generation
     - Value Neurons (V): V generation
-    - Knowledge Neurons (K): 2-stage retrieval (router coarse → x fine)
+    - Knowledge Neurons (K): 2-stage retrieval (router coarse → encoder fine)
     """
     __version__ = "15.0"
 
@@ -794,6 +792,9 @@ class DAWN(nn.Module):
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing
         )
 
+        # Shared knowledge encoder for 2-stage retrieval (d_model → knowledge_rank)
+        self.knowledge_encoder = nn.Linear(d_model, self.knowledge_rank, bias=False)
+
         self.layers = nn.ModuleList([
             DAWNBlock(
                 shared_neurons=self.shared_neurons, d_model=d_model, n_heads=n_heads,
@@ -851,11 +852,11 @@ class DAWN(nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 x, routing_info, layer_aux_loss = checkpoint(
-                    layer, x, importance, self.global_routers,
+                    layer, x, importance, self.global_routers, self.knowledge_encoder,
                     use_reentrant=False
                 )
             else:
-                x, routing_info, layer_aux_loss = layer(x, importance, self.global_routers)
+                x, routing_info, layer_aux_loss = layer(x, importance, self.global_routers, self.knowledge_encoder)
 
             # Accumulate aux_loss
             self.aux_loss = self.aux_loss + layer_aux_loss
