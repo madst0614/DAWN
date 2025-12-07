@@ -19,7 +19,7 @@ model:
   d_model: 320
   n_layers: 8              # 20M 맞추기
   n_heads: 4
-  d_ff: 1280               # 4 * d_model
+  d_ff: 1344               # 4.2 * d_model (20.1M 맞추기)
   max_seq_len: 512
   dropout: 0.1
 
@@ -42,11 +42,11 @@ log_dir: /content/drive/MyDrive/dawn/logs_baseline_20M_c4_500M
 # 파라미터 계산:
 #   Embedding: 30522 × 320 = 9,767,040
 #   Pos Embedding: 512 × 320 = 163,840
-#   Per Layer: ~1,230,080
-#   8 Layers: ~9,840,640
-#   Total: ~19.8M (weight tying)
+#   Per Layer: ~1,271,040 (d_ff=1344)
+#   8 Layers: ~10,168,320
+#   Total: ~20.1M (weight tying)
 #
 # 비교:
-#   DAWN: 12.3M params
-#   Baseline: 19.8M params
-#   DAWN이 38% 적은 파라미터로 경쟁
+#   DAWN v15: 12.3M params
+#   Baseline: 20.1M params
+#   DAWN이 39% 적은 파라미터로 경쟁
