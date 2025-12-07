@@ -31,6 +31,7 @@ except:
 def load_model_and_tokenizer(checkpoint_path, device):
     """Load model from checkpoint"""
     from transformers import BertTokenizer
+    from models import create_model_by_version
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint.get('config', {})
@@ -43,8 +44,7 @@ def load_model_and_tokenizer(checkpoint_path, device):
         from baseline_transformer import VanillaTransformer
         model = VanillaTransformer(**config)
     else:
-        from model import DAWN
-        model = DAWN(**config)
+        model = create_model_by_version(model_version, config)
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
