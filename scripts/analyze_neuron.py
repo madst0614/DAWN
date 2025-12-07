@@ -409,6 +409,8 @@ class DAWNNeuronAnalyzer:
         token_sum = torch.zeros(vocab_size, device=self.device)
         token_count = torch.zeros(vocab_size, device=self.device)
 
+        debug_first = True  # Debug first batch
+
         self.model.eval()
         with torch.no_grad(), torch.amp.autocast('cuda'):
             for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Routing analysis")):
@@ -442,14 +444,30 @@ class DAWNNeuronAnalyzer:
                     info = routing_info_list[0]  # First layer
                     if isinstance(info, dict):
                         attn_info = info.get('attention', {})
-                        weights = attn_info.get('feature_weights', attn_info.get('neuron_weights'))
+
+                        # Debug first batch
+                        if debug_first:
+                            print(f"\n[DEBUG] attn_info keys: {list(attn_info.keys())}")
+                            for k, v in attn_info.items():
+                                if isinstance(v, torch.Tensor):
+                                    print(f"  {k}: shape={v.shape}, min={v.min():.6f}, max={v.max():.6f}")
+                            debug_first = False
+
+                        # Prefer feature_pref (token-level, non-sparse) over feature_weights (batch-level, sparse)
+                        weights = attn_info.get('feature_pref')  # [B, S, N] - token-level prefs
+                        if weights is None:
+                            weights = attn_info.get('feature_weights')  # May be sparse [B, N]
+                        if weights is None:
+                            weights = attn_info.get('neuron_weights')
 
                         if weights is not None:
                             flat_ids = input_ids.reshape(-1)  # [B*S]
 
                             if weights.dim() == 3 and weights.shape[2] > self.neuron_id:
-                                w_n = weights[:, :, self.neuron_id].reshape(-1).float()  # [B*S]
+                                # [B, S, N] -> [B*S]
+                                w_n = weights[:, :, self.neuron_id].reshape(-1).float()
                             elif weights.dim() == 2 and weights.shape[1] > self.neuron_id:
+                                # [B, N] -> expand to [B, S] -> [B*S]
                                 w_n = weights[:, self.neuron_id].unsqueeze(1).expand(B, S).reshape(-1).float()
                             else:
                                 continue
