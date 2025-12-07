@@ -1140,7 +1140,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
             # Shift for autoregressive loss
             B, S, V = logits.shape
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous().long()  # Ensure Long type for cross_entropy
             loss = F.cross_entropy(
                 shift_logits.view(-1, V),
                 shift_labels.view(-1),
