@@ -130,23 +130,33 @@ class DAWNNeuronAnalyzer:
             # Also compute direction (mean of h normalized)
             h_normalized = F.normalize(h, dim=1)
 
-        # Top tokens by activation strength
-        top_indices = activation_strength.topk(top_k).indices
-        bottom_indices = activation_strength.topk(top_k, largest=False).indices
+        # Filter out [unused*] tokens
+        all_tokens = self.tokenizer.convert_ids_to_tokens(list(range(embed.shape[0])))
+        valid_mask = torch.tensor([
+            not (tok.startswith('[unused') or tok.startswith('##unused'))
+            for tok in all_tokens
+        ], device=activation_strength.device)
 
-        print(f"\nTop {top_k} tokens that activate neuron {self.neuron_id}:")
+        # Get valid indices sorted by activation
+        valid_indices = valid_mask.nonzero().squeeze(-1)
+        valid_strengths = activation_strength[valid_indices]
+        sorted_order = valid_strengths.argsort(descending=True)
+
+        print(f"\nTop {top_k} tokens that activate neuron {self.neuron_id} (excluding [unused*]):")
         print("-" * 60)
         top_results = []
-        for i, idx in enumerate(top_indices):
-            token = self.tokenizer.convert_ids_to_tokens([idx.item()])[0]
+        for i in range(min(top_k, len(sorted_order))):
+            idx = valid_indices[sorted_order[i]].item()
+            token = all_tokens[idx]
             strength = activation_strength[idx].item()
             print(f"  {i+1:3d}. '{token:20s}' | strength={strength:.4f}")
-            top_results.append({'rank': i+1, 'token': token, 'token_id': idx.item(), 'strength': strength})
+            top_results.append({'rank': i+1, 'token': token, 'token_id': idx, 'strength': strength})
 
-        print(f"\nBottom {20} tokens (lowest activation):")
+        print(f"\nBottom 20 tokens (lowest activation, excluding [unused*]):")
         print("-" * 60)
-        for i, idx in enumerate(bottom_indices[:20]):
-            token = self.tokenizer.convert_ids_to_tokens([idx.item()])[0]
+        for i in range(min(20, len(sorted_order))):
+            idx = valid_indices[sorted_order[-(i+1)]].item()
+            token = all_tokens[idx]
             strength = activation_strength[idx].item()
             print(f"  {i+1:3d}. '{token:20s}' | strength={strength:.4f}")
 
@@ -484,27 +494,51 @@ class DAWNNeuronAnalyzer:
         token_mean = torch.zeros_like(token_sum)
         token_mean[valid_mask] = token_sum[valid_mask] / token_count[valid_mask]
 
-        # Get sorted results
-        valid_indices = valid_mask.nonzero().squeeze(-1)
-        valid_means = token_mean[valid_indices]
-        sorted_order = valid_means.argsort(descending=True)
+        # Filter: weight > 0.001 and not [unused*]
+        all_tokens = self.tokenizer.convert_ids_to_tokens(list(range(vocab_size)))
+        weight_threshold = 0.001
 
-        print(f"\nTop 30 tokens by routing weight:")
+        significant_mask = valid_mask & (token_mean > weight_threshold)
+        significant_indices = significant_mask.nonzero().squeeze(-1)
+
+        if len(significant_indices) == 0:
+            print(f"Warning: No tokens with routing weight > {weight_threshold}")
+            # Fall back to valid tokens
+            significant_indices = valid_mask.nonzero().squeeze(-1)
+
+        # Filter out [unused*]
+        filtered_indices = []
+        for idx in significant_indices.tolist():
+            tok = all_tokens[idx]
+            if not (tok.startswith('[unused') or tok.startswith('##unused')):
+                filtered_indices.append(idx)
+
+        if len(filtered_indices) == 0:
+            print("Warning: No valid tokens after filtering")
+            return None
+
+        filtered_indices = torch.tensor(filtered_indices, device=self.device)
+        filtered_means = token_mean[filtered_indices]
+        sorted_order = filtered_means.argsort(descending=True)
+
+        n_significant = len(filtered_indices)
+        print(f"\nTokens with routing weight > {weight_threshold}: {n_significant}")
+        print(f"\nTop 30 tokens by routing weight (excluding [unused*]):")
         print("-" * 50)
         results = []
         for i in range(min(30, len(sorted_order))):
-            idx = valid_indices[sorted_order[i]].item()
+            idx = filtered_indices[sorted_order[i]].item()
             weight = token_mean[idx].item()
             count = int(token_count[idx].item())
-            token = self.tokenizer.convert_ids_to_tokens([idx])[0]
+            token = all_tokens[idx]
             print(f"  {i+1:2d}. '{token:15s}' | weight={weight:.6f} | n={count}")
             results.append({'token': token, 'weight': weight, 'count': count})
 
         print(f"\nBottom 30 tokens by routing weight:")
         for i in range(min(30, len(sorted_order))):
-            idx = valid_indices[sorted_order[-(i+1)]].item()
+            idx = filtered_indices[sorted_order[-(i+1)]].item()
             weight = token_mean[idx].item()
-            token = self.tokenizer.convert_ids_to_tokens([idx])[0]
+            token = all_tokens[idx]
             print(f"  {i+1:2d}. '{token:15s}' | weight={weight:.6f}")
 
         return results
