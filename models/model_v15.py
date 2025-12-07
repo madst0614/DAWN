@@ -68,16 +68,12 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
 
         # Excitability: tau (recovery time constant) + decaying weight
-        self.tau = 2.0  # Higher tau = slower saturation, more recovery time
+        self.tau = 1.0
         self.excitability_weight = 1.0  # Decays over training (like starvation)
-        self.min_excitability_weight = 0.1  # Floor to prevent complete collapse
 
-    def decay_excitability(self, decay_rate=0.9999):
+    def decay_excitability(self, decay_rate=0.9995):
         """Decay excitability_weight each step. Call from training loop."""
-        self.excitability_weight = max(
-            self.min_excitability_weight,
-            self.excitability_weight * decay_rate
-        )
+        self.excitability_weight *= decay_rate
 
     def get_excitability(self, usage_ema):
         """
