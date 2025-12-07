@@ -11,11 +11,13 @@ Features:
 3. Ablation Experiments - 뉴런 제거 실험
 4. Semantic Analysis - 의미론적 뉴런 특화
 5. Neuron Catalog - 뉴런 역할 카탈로그
+6. Knowledge Analysis - Knowledge 슬롯 특화/문맥 분석
 
 Usage:
     python analyze_dawn_advanced.py --checkpoint <path> --val_data <path>
     python analyze_dawn_advanced.py --checkpoint <path> --val_data <path> --mode svd
     python analyze_dawn_advanced.py --checkpoint <path> --val_data <path> --mode sentence --text "The cat sat on the mat."
+    python analyze_dawn_advanced.py --checkpoint <path> --val_data <path> --mode knowledge
 """
 
 import argparse
@@ -531,21 +533,24 @@ class SentenceVisualizer:
                 # v14 FRTK format
                 n_tokens = len(tokens)
 
-                # Feature weights (for Q/K/V compress equivalent)
-                if 'feature_weights' in attn:
-                    raw_weights = attn['feature_weights'][0].cpu()
-                    if len(raw_weights.shape) == 1:
-                        weights = raw_weights.unsqueeze(0).expand(n_tokens, -1).numpy()
-                    else:
-                        weights = raw_weights.numpy()
+                # Feature: feature_pref 우선 (token-level [S, N]), fallback to feature_weights
+                if 'feature_pref' in attn:
+                    raw_weights = attn['feature_pref'][0].cpu()  # [S, 48] token-level
+                elif 'feature_weights' in attn:
+                    raw_weights = attn['feature_weights'][0].cpu()  # [48] batch-level
 
-                    k = min(8, weights.shape[-1])
-                    _, idx = torch.topk(torch.tensor(weights), k, dim=-1)
-                    indices = idx.numpy()
+                if len(raw_weights.shape) == 1:
+                    weights = raw_weights.unsqueeze(0).expand(n_tokens, -1).numpy()
+                else:
+                    weights = raw_weights.numpy()
 
-                    # Use feature weights for all components (they share feature neurons)
-                    for comp in ['Q', 'K', 'V']:
-                        layer_result[comp] = {'weights': weights, 'indices': indices}
+                k = min(8, weights.shape[-1])
+                _, idx = torch.topk(torch.tensor(weights), k, dim=-1)
+                indices = idx.numpy()
+
+                # Use feature weights for all components (they share feature neurons)
+                for comp in ['Q', 'K', 'V']:
+                    layer_result[comp] = {'weights': weights, 'indices': indices}
 
             elif 'compress_pref' in attn or 'compress_weights_dense' in attn or 'compress_weights' in attn:
                 # v12/v13 - compress_pref 우선 (token-level)
@@ -722,10 +727,13 @@ class SemanticAnalyzer:
                 weights = attn['Q']['weights']
                 indices = attn['Q'].get('indices')
                 is_batch_level = False
-            elif 'feature_weights' in attn:
-                # v14 FRTK format
-                weights = attn['feature_weights']
-                indices = None  # v14 doesn't expose top-k indices separately
+            elif 'feature_weights' in attn or 'feature_pref' in attn:
+                # v14 FRTK format - feature_pref 우선 (token-level)
+                if 'feature_pref' in attn:
+                    weights = attn['feature_pref']  # [B, S, 48] token-level
+                else:
+                    weights = attn['feature_weights']  # [B, 48] batch-level
+                indices = None
                 is_batch_level = (len(weights.shape) == 2)
             elif 'compress_pref' in attn or 'compress_weights_dense' in attn or 'compress_weights' in attn:
                 # v12/v13 - compress_pref 우선 (token-level)
@@ -892,10 +900,13 @@ class NeuronCatalog:
                 weights = attn['Q']['weights']
                 indices = attn['Q'].get('indices')
                 is_batch_level = False
-            elif 'feature_weights' in attn:
-                # v14 FRTK format
-                weights = attn['feature_weights']
-                indices = None  # v14 doesn't expose top-k indices separately
+            elif 'feature_weights' in attn or 'feature_pref' in attn:
+                # v14 FRTK format - feature_pref 우선 (token-level)
+                if 'feature_pref' in attn:
+                    weights = attn['feature_pref']  # [B, S, 48] token-level
+                else:
+                    weights = attn['feature_weights']  # [B, 48] batch-level
+                indices = None
                 is_batch_level = (len(weights.shape) == 2)
             elif 'compress_pref' in attn or 'compress_weights_dense' in attn or 'compress_weights' in attn:
                 # v12/v13 - compress_pref 우선 (token-level)
@@ -988,6 +999,310 @@ class NeuronCatalog:
 
 
 # ============================================================
+# Knowledge Slot Analyzer
+# ============================================================
+
+class KnowledgeAnalyzer:
+    """
+    Knowledge Neuron 분석
+
+    1. 슬롯-토큰 매핑: 각 슬롯이 어떤 토큰에서 활성화되는지
+    2. 문맥별 슬롯 비교: 같은 단어가 다른 문맥에서 다른 슬롯 활성화
+    3. 레이어별 패턴: 앞/뒤 레이어의 Knowledge 사용 차이
+    """
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.n_knowledge = getattr(model, 'n_knowledge', 80)
+        self.knowledge_k = getattr(model, 'knowledge_k', 10)
+        self.n_layers = getattr(model, 'n_layers', 4)
+
+    @torch.no_grad()
+    def collect_knowledge_activations(self, texts: List[str], max_samples: int = 500):
+        """
+        텍스트에서 Knowledge 슬롯 활성화 수집
+
+        Returns:
+            slot_token_map: {slot_id: [(token, weight, context), ...]}
+            layer_slot_counts: {layer_id: slot usage counts}
+        """
+        self.model.eval()
+        slot_token_map = defaultdict(list)
+        layer_slot_counts = {i: np.zeros(self.n_knowledge) for i in range(self.n_layers)}
+
+        sample_count = 0
+        for text in tqdm(texts[:max_samples], desc="Collecting Knowledge activations"):
+            tokens = self.tokenizer.encode(text, truncation=True, max_length=128)
+            if len(tokens) < 3:
+                continue
+
+            input_ids = torch.tensor([tokens], device=self.device)
+            token_strs = [self.tokenizer.decode([t]) for t in tokens]
+
+            # Forward with routing info
+            try:
+                _, routing_infos = self.model(input_ids, return_activations=True)
+            except Exception:
+                continue
+
+            for layer_idx, routing in enumerate(routing_infos):
+                mem = routing.get('memory', {})
+                k_indices = mem.get('knowledge_indices')
+                k_weights = mem.get('knowledge_weights')
+
+                if k_indices is None:
+                    continue
+
+                # k_indices: [B, S, K], k_weights: [B, S, K]
+                indices = k_indices[0].cpu().numpy()  # [S, K]
+                weights = k_weights[0].cpu().numpy()  # [S, K]
+
+                for pos, (tok_str, idx_row, w_row) in enumerate(zip(token_strs, indices, weights)):
+                    for slot_id, weight in zip(idx_row, w_row):
+                        if weight > 0.05:  # 의미있는 활성화만
+                            context = ' '.join(token_strs[max(0, pos-2):pos+3])
+                            slot_token_map[int(slot_id)].append({
+                                'token': tok_str.strip(),
+                                'weight': float(weight),
+                                'context': context,
+                                'layer': layer_idx,
+                                'position': pos
+                            })
+                            layer_slot_counts[layer_idx][int(slot_id)] += weight
+
+            sample_count += 1
+
+        return dict(slot_token_map), layer_slot_counts
+
+    def analyze_slot_specialization(self, slot_token_map: Dict) -> Dict:
+        """
+        각 슬롯의 토큰 특화 분석
+
+        Returns:
+            slot_profiles: {slot_id: {top_tokens, entropy, specialization_score}}
+        """
+        slot_profiles = {}
+
+        for slot_id, activations in slot_token_map.items():
+            if not activations:
+                continue
+
+            # 토큰별 총 weight
+            token_weights = defaultdict(float)
+            for act in activations:
+                token_weights[act['token']] += act['weight']
+
+            # Top tokens
+            sorted_tokens = sorted(token_weights.items(), key=lambda x: -x[1])[:20]
+            top_tokens = [t for t, w in sorted_tokens]
+
+            # Entropy (낮을수록 특화됨)
+            total = sum(token_weights.values())
+            probs = np.array([w/total for w in token_weights.values()])
+            entropy = -np.sum(probs * np.log(probs + 1e-10))
+            max_entropy = np.log(len(token_weights))
+            norm_entropy = entropy / max_entropy if max_entropy > 0 else 0
+
+            # Specialization score (1 - normalized entropy)
+            specialization = 1 - norm_entropy
+
+            slot_profiles[slot_id] = {
+                'top_tokens': top_tokens,
+                'token_weights': dict(sorted_tokens),
+                'entropy': float(entropy),
+                'norm_entropy': float(norm_entropy),
+                'specialization': float(specialization),
+                'total_activations': len(activations),
+                'unique_tokens': len(token_weights)
+            }
+
+        return slot_profiles
+
+    def analyze_context_sensitivity(self, texts_pairs: List[Tuple[str, str]]) -> Dict:
+        """
+        같은 단어가 다른 문맥에서 다른 슬롯을 활성화하는지 분석
+
+        Args:
+            texts_pairs: [(text1, text2), ...] 같은 핵심 단어, 다른 문맥
+            예: [("money in the bank", "river bank"), ...]
+
+        Returns:
+            context_analysis: {pair_idx: {slots1, slots2, jaccard, overlap}}
+        """
+        self.model.eval()
+        results = []
+
+        for text1, text2 in texts_pairs:
+            slots1 = self._get_active_slots(text1)
+            slots2 = self._get_active_slots(text2)
+
+            # Jaccard similarity
+            intersection = slots1 & slots2
+            union = slots1 | slots2
+            jaccard = len(intersection) / len(union) if union else 0
+
+            results.append({
+                'text1': text1,
+                'text2': text2,
+                'slots1': list(slots1),
+                'slots2': list(slots2),
+                'overlap': list(intersection),
+                'jaccard': float(jaccard),
+                'unique_to_1': list(slots1 - slots2),
+                'unique_to_2': list(slots2 - slots1),
+            })
+
+        return results
+
+    @torch.no_grad()
+    def _get_active_slots(self, text: str) -> set:
+        """단일 텍스트에서 활성화된 Knowledge 슬롯 집합"""
+        tokens = self.tokenizer.encode(text, truncation=True, max_length=128)
+        input_ids = torch.tensor([tokens], device=self.device)
+
+        try:
+            _, routing_infos = self.model(input_ids, return_activations=True)
+        except Exception:
+            return set()
+
+        active_slots = set()
+        for routing in routing_infos:
+            mem = routing.get('memory', {})
+            k_indices = mem.get('knowledge_indices')
+            if k_indices is not None:
+                active_slots.update(k_indices[0].flatten().cpu().numpy().tolist())
+
+        return active_slots
+
+    def analyze_layer_patterns(self, layer_slot_counts: Dict) -> Dict:
+        """
+        레이어별 Knowledge 사용 패턴 분석
+
+        Returns:
+            layer_analysis: {layer: {top_slots, entropy, concentration}}
+        """
+        layer_analysis = {}
+
+        for layer_idx, counts in layer_slot_counts.items():
+            total = counts.sum()
+            if total == 0:
+                continue
+
+            probs = counts / total
+            entropy = -np.sum(probs * np.log(probs + 1e-10))
+
+            # Top slots
+            top_indices = np.argsort(counts)[::-1][:10]
+            top_slots = [(int(i), float(counts[i])) for i in top_indices]
+
+            # Gini coefficient
+            sorted_counts = np.sort(counts)
+            n = len(sorted_counts)
+            cumsum = np.cumsum(sorted_counts)
+            gini = (2 * np.sum((np.arange(1, n+1) * sorted_counts)) / (n * np.sum(sorted_counts))) - (n + 1) / n
+
+            layer_analysis[layer_idx] = {
+                'top_slots': top_slots,
+                'entropy': float(entropy),
+                'gini': float(gini),
+                'active_slots': int((counts > 0).sum()),
+                'total_usage': float(total)
+            }
+
+        return layer_analysis
+
+    def print_analysis(self, slot_profiles: Dict, layer_analysis: Dict):
+        """분석 결과 출력"""
+        print("\n" + "="*60)
+        print("Knowledge Slot Analysis")
+        print("="*60)
+
+        # 가장 특화된 슬롯
+        sorted_slots = sorted(slot_profiles.items(),
+                              key=lambda x: -x[1]['specialization'])
+
+        print("\n[Most Specialized Slots]")
+        for slot_id, profile in sorted_slots[:10]:
+            tokens = ', '.join(profile['top_tokens'][:5])
+            print(f"  Slot {slot_id:3d}: spec={profile['specialization']:.2f} | "
+                  f"tokens=[{tokens}]")
+
+        # 가장 범용적인 슬롯
+        print("\n[Most General Slots (low specialization)]")
+        for slot_id, profile in sorted_slots[-5:]:
+            tokens = ', '.join(profile['top_tokens'][:5])
+            print(f"  Slot {slot_id:3d}: spec={profile['specialization']:.2f} | "
+                  f"unique={profile['unique_tokens']} tokens")
+
+        # 레이어별 패턴
+        print("\n[Layer-wise Knowledge Usage]")
+        for layer_idx, analysis in sorted(layer_analysis.items()):
+            top = [f"{s}({c:.0f})" for s, c in analysis['top_slots'][:5]]
+            print(f"  Layer {layer_idx}: active={analysis['active_slots']}/{self.n_knowledge} | "
+                  f"gini={analysis['gini']:.2f} | top=[{', '.join(top)}]")
+
+        # 레이어간 차이
+        if len(layer_analysis) >= 2:
+            first_layer = min(layer_analysis.keys())
+            last_layer = max(layer_analysis.keys())
+            first_top = set(s for s, _ in layer_analysis[first_layer]['top_slots'][:20])
+            last_top = set(s for s, _ in layer_analysis[last_layer]['top_slots'][:20])
+
+            print(f"\n[Layer {first_layer} vs Layer {last_layer}]")
+            print(f"  Common top slots: {len(first_top & last_top)}")
+            print(f"  Unique to first: {sorted(first_top - last_top)[:10]}")
+            print(f"  Unique to last: {sorted(last_top - first_top)[:10]}")
+
+
+def compare_knowledge_models(model_v14, model_v15, tokenizer, texts: List[str], device='cuda'):
+    """
+    v14 vs v15 Knowledge 슬롯 비교
+
+    Args:
+        model_v14: DAWN v14 model
+        model_v15: DAWN v15 model
+        tokenizer: shared tokenizer
+        texts: test texts
+
+    Returns:
+        comparison results
+    """
+    analyzer_v14 = KnowledgeAnalyzer(model_v14, tokenizer, device)
+    analyzer_v15 = KnowledgeAnalyzer(model_v15, tokenizer, device)
+
+    results = []
+    for text in texts[:50]:
+        slots_v14 = analyzer_v14._get_active_slots(text)
+        slots_v15 = analyzer_v15._get_active_slots(text)
+
+        intersection = slots_v14 & slots_v15
+        union = slots_v14 | slots_v15
+        jaccard = len(intersection) / len(union) if union else 0
+
+        results.append({
+            'text': text[:50],
+            'v14_slots': len(slots_v14),
+            'v15_slots': len(slots_v15),
+            'overlap': len(intersection),
+            'jaccard': jaccard,
+        })
+
+    # Summary
+    avg_jaccard = np.mean([r['jaccard'] for r in results])
+    avg_v14 = np.mean([r['v14_slots'] for r in results])
+    avg_v15 = np.mean([r['v15_slots'] for r in results])
+
+    print("\n[v14 vs v15 Knowledge Comparison]")
+    print(f"  Avg slots used: v14={avg_v14:.1f}, v15={avg_v15:.1f}")
+    print(f"  Avg Jaccard similarity: {avg_jaccard:.2f}")
+    print(f"  (Low Jaccard = different slot preferences)")
+
+    return results
+
+
+# ============================================================
 # Main Runner
 # ============================================================
 
@@ -997,7 +1312,7 @@ def main():
     parser.add_argument('--val_data', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='./advanced_analysis')
     parser.add_argument('--mode', type=str, default='all',
-                        choices=['all', 'svd', 'sentence', 'semantic', 'catalog'])
+                        choices=['all', 'svd', 'sentence', 'semantic', 'catalog', 'knowledge'])
     parser.add_argument('--text', type=str, default="The cat sat on the mat.",
                         help='Text for sentence visualization')
     parser.add_argument('--max_batches', type=int, default=50)
@@ -1212,6 +1527,47 @@ def main():
             catalog_builder = NeuronCatalog(model, tokenizer, device)
             catalog = catalog_builder.build(dataloader, args.max_batches)
             all_results['catalog'] = catalog
+
+        # 5. Knowledge Analysis
+        if args.mode in ['all', 'knowledge']:
+            print("\n" + "="*60)
+            print("5. KNOWLEDGE SLOT ANALYSIS")
+            print("="*60)
+
+            knowledge_analyzer = KnowledgeAnalyzer(model, tokenizer, device)
+
+            # Collect activations
+            slot_token_map, layer_slot_counts = knowledge_analyzer.collect_knowledge_activations(
+                val_texts, max_samples=min(500, len(val_texts))
+            )
+
+            # Analyze
+            slot_profiles = knowledge_analyzer.analyze_slot_specialization(slot_token_map)
+            layer_analysis = knowledge_analyzer.analyze_layer_patterns(layer_slot_counts)
+
+            # Print results
+            knowledge_analyzer.print_analysis(slot_profiles, layer_analysis)
+
+            # Context sensitivity test (example pairs)
+            context_pairs = [
+                ("money in the bank account", "sitting by the river bank"),
+                ("the bright light shone", "light as a feather"),
+                ("running the program", "running in the park"),
+                ("a cold winter day", "caught a cold"),
+            ]
+            context_results = knowledge_analyzer.analyze_context_sensitivity(context_pairs)
+
+            print("\n[Context Sensitivity Test]")
+            for result in context_results:
+                print(f"  '{result['text1']}' vs '{result['text2']}'")
+                print(f"    Jaccard: {result['jaccard']:.2f} | "
+                      f"Overlap: {len(result['overlap'])} slots")
+
+            all_results['knowledge'] = {
+                'slot_profiles': slot_profiles,
+                'layer_analysis': layer_analysis,
+                'context_sensitivity': context_results
+            }
 
     # Save results
     results_path = os.path.join(args.output_dir, 'advanced_analysis.json')

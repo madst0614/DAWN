@@ -43,7 +43,7 @@ class StandardFFN(nn.Module):
 
 
 class StandardAttention(nn.Module):
-    """Standard Multi-Head Attention"""
+    """Standard Multi-Head Attention with FlashAttention support"""
 
     def __init__(self, d_model=256, n_heads=4, dropout=0.1):
         super().__init__()
@@ -51,33 +51,41 @@ class StandardAttention(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+        self.dropout_p = dropout
 
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.o_proj = nn.Linear(d_model, d_model)
 
-        self.dropout = nn.Dropout(dropout)
-
     def forward(self, x, mask=None):
         B, S, D = x.shape
 
-        # Project
+        # Project: [B, S, D] -> [B, n_heads, S, d_head]
         q = self.q_proj(x).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         k = self.k_proj(x).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
-
+        # FlashAttention via scaled_dot_product_attention
+        # mask: [B, 1, S, S] with 1=attend, 0=mask -> convert to boolean
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            # Convert to boolean mask (True = mask out, False = attend)
+            attn_mask = (mask == 0)  # [B, 1, S, S]
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=False,  # We provide explicit mask
+            )
+        else:
+            # Pure causal attention (FlashAttention optimized path)
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=True,
+            )
 
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-
-        # Output
-        out = torch.matmul(attn, v)
+        # Output: [B, n_heads, S, d_head] -> [B, S, D]
         out = out.transpose(1, 2).contiguous().view(B, S, D)
         out = self.o_proj(out)
 
@@ -176,8 +184,8 @@ class VanillaTransformer(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, labels=None, return_routing_info=False,
-                step=None, total_steps=None):
+    def forward(self, input_ids, labels=None, attention_mask=None,
+                return_routing_info=False, step=None, total_steps=None):
         B, S = input_ids.shape
 
         # Embeddings
@@ -185,9 +193,15 @@ class VanillaTransformer(nn.Module):
         x = self.token_emb(input_ids) + self.pos_emb(pos)
         x = self.dropout(x)
 
-        # Causal mask
-        mask = torch.tril(torch.ones(S, S, device=input_ids.device))
-        mask = mask.unsqueeze(0).unsqueeze(0)
+        # Causal mask + Pad mask
+        if attention_mask is not None:
+            # Combine causal mask with pad mask
+            causal_mask = torch.tril(torch.ones(S, S, device=input_ids.device))
+            pad_mask = attention_mask.unsqueeze(1).unsqueeze(2).float()  # [B, 1, 1, S]
+            mask = causal_mask.unsqueeze(0) * pad_mask  # [B, 1, S, S]
+        else:
+            # No pad mask -> let StandardAttention use is_causal=True
+            mask = None
 
         # Layers
         for layer in self.layers:
@@ -197,11 +211,13 @@ class VanillaTransformer(nn.Module):
         x = self.norm(x)
         logits = self.head(x)
 
-        # Loss calculation (compatible with DAWN train.py)
+        # Loss calculation with CLM shift (compatible with DAWN train.py)
         if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
             loss = F.cross_entropy(
-                logits.view(-1, self.vocab_size),
-                labels.view(-1),
+                shift_logits.view(-1, self.vocab_size),
+                shift_labels.view(-1),
                 ignore_index=-100
             )
             if return_routing_info:

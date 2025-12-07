@@ -22,7 +22,7 @@ model:
   # FRTK Neurons (new naming in v14)
   n_feature: 36                  # compress → feature
   n_relational: 200              # expand_QK → relational
-  n_transfer: 16                 # expand_V → transfer
+  n_value: 16                 # expand_V → transfer
   n_knowledge: 300
   knowledge_k: 20
   knowledge_rank: 64
@@ -33,7 +33,7 @@ model:
   # Top-k settings (FRTK naming)
   top_k_feature: 8               # top_k_compress → top_k_feature
   top_k_relational: 20           # top_k_QK → top_k_relational
-  top_k_transfer: 4              # top_k_V → top_k_transfer
+  top_k_value: 4              # top_k_V → top_k_value
   d_space: 64
   router_dropout: 0.1
   token_routing: false

@@ -1,22 +1,15 @@
 """
-DAWN v14: Feature-Relational-Value-Knowledge (FRVK) Architecture
+DAWN v15: 2-Stage Hierarchical Knowledge Retrieval
 
-Changes from v13.2:
-- Renamed neuron types for clarity:
-  * compress → feature (F)
-  * expand_QK → relational (R)
-  * expand_V → value (V)
-  * knowledge → knowledge (K)
-- Starvation weight → Excitability (refractory-inspired)
-  * usage_ema ≈ 0 → excitability = 1.0 (ready to fire)
-  * usage_ema ≈ tau → excitability ≈ 0.0 (refractory)
-  * Provides opportunity, gradient decides the rest
+2-Stage Knowledge Retrieval:
+- Stage 1: x → router → coarse_k candidates (Excitability for exploration)
+- Stage 2: x → knowledge_encoder (shared) → fine match → fine_k selection
 
 Architecture (FRVK):
-- Feature Neurons (F): x → low-rank projection (compress)
+- Feature Neurons (F): x → low-rank projection (compress) [Attention only]
 - Relational Neurons (R): Q/K generation for attention patterns
 - Value Neurons (V): V generation for value transfer
-- Knowledge Neurons (K): factual memory retrieval
+- Knowledge Neurons (K): 2-stage retrieval (router coarse → x fine)
 - Unified router with Excitability for balanced usage
 """
 
@@ -39,25 +32,27 @@ class UnifiedNeuronRouter(nn.Module):
     """
     통합 뉴런 임베딩 공간에서 토큰-뉴런 매칭
 
-    모든 뉴런(feature, relational, value)이 같은 공간에 존재.
+    모든 뉴런(feature, relational, value, knowledge)이 같은 공간에 존재.
     토큰이 투영되어 가까운 뉴런 선택.
     Excitability (refractory-inspired)로 균형 잡힌 사용 유도.
     """
-    def __init__(self, d_model, n_feature, n_relational, n_value,
+    def __init__(self, d_model, n_feature, n_relational, n_value, n_knowledge,
                  d_space=64, dropout=0.1):
         super().__init__()
         self.n_feature = n_feature
         self.n_relational = n_relational
         self.n_value = n_value
+        self.n_knowledge = n_knowledge
         self.d_space = d_space
 
-        total_neurons = n_feature + n_relational + n_value
+        total_neurons = n_feature + n_relational + n_value + n_knowledge
         self.total_neurons = total_neurons
 
         # 인덱스 경계
         self.feature_end = n_feature
         self.relational_end = n_feature + n_relational
-        # value는 relational_end ~ total_neurons
+        self.value_end = n_feature + n_relational + n_value
+        # knowledge는 value_end ~ total_neurons
 
         # 공유 projection
         self.proj = nn.Linear(d_model, d_space)
@@ -70,6 +65,7 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('usage_ema_feature', torch.zeros(n_feature))
         self.register_buffer('usage_ema_relational', torch.zeros(n_relational))
         self.register_buffer('usage_ema_value', torch.zeros(n_value))
+        self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
 
         # Excitability: tau (recovery time constant) + decaying weight
         self.tau = 1.0
@@ -95,7 +91,7 @@ class UnifiedNeuronRouter(nn.Module):
     def get_logits(self, x, neuron_type):
         """
         x: [B, S, d_model]
-        neuron_type: 'feature', 'relational_Q', 'relational_K', 'value', 'memory'
+        neuron_type: 'feature', 'relational_Q', 'relational_K', 'value', 'knowledge'
         """
         h_proj = self.proj(x)  # [B, S, d_space]
         h_proj = self.dropout(h_proj)
@@ -107,7 +103,7 @@ class UnifiedNeuronRouter(nn.Module):
         all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
 
         # 타입별 슬라이싱 + Excitability (refractory-inspired)
-        if neuron_type in ['feature', 'memory']:
+        if neuron_type == 'feature':
             logits = all_logits[..., :self.feature_end]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_feature)
@@ -120,30 +116,48 @@ class UnifiedNeuronRouter(nn.Module):
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'value':
-            logits = all_logits[..., self.relational_end:]
+            logits = all_logits[..., self.relational_end:self.value_end]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_value)
                 logits = logits + excitability * self.excitability_weight
 
+        elif neuron_type == 'knowledge':
+            logits = all_logits[..., self.value_end:]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_knowledge)
+                logits = logits + excitability * self.excitability_weight
+
         return logits
 
-    def update_usage(self, weights, neuron_type):
+    def update_usage(self, weights, neuron_type, attention_mask=None):
         """top-k 후 선택된 뉴런 사용량 업데이트"""
         if not self.training:
             return
 
         # weights: [B, N] or [B, S, N]
         if weights.dim() == 3:
-            usage = (weights > 0).float().mean(dim=[0, 1])
+            # [B, S, N]
+            active = (weights > 0).float()
+            if attention_mask is not None:
+                # attention_mask: [B, S] → [B, S, 1]
+                mask = attention_mask.unsqueeze(-1).float()
+                active = active * mask
+                count = mask.sum() + 1e-8
+                usage = active.sum(dim=[0, 1]) / count
+            else:
+                usage = active.mean(dim=[0, 1])
         else:
+            # [B, N] - batch-level routing
             usage = (weights > 0).float().mean(dim=0)
 
-        if neuron_type in ['feature', 'memory']:
+        if neuron_type == 'feature':
             self.usage_ema_feature = 0.99 * self.usage_ema_feature + 0.01 * usage
         elif neuron_type == 'relational':
             self.usage_ema_relational = 0.99 * self.usage_ema_relational + 0.01 * usage
         elif neuron_type == 'value':
             self.usage_ema_value = 0.99 * self.usage_ema_value + 0.01 * usage
+        elif neuron_type == 'knowledge':
+            self.usage_ema_knowledge = 0.99 * self.usage_ema_knowledge + 0.01 * usage
 
 class SharedNeurons(nn.Module):
     """v14: Shared neurons with FRVK naming"""
@@ -160,7 +174,7 @@ class SharedNeurons(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
-        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
         self.n_feature = n_feature
         self.n_relational = n_relational
         self.n_value = n_value
@@ -238,10 +252,11 @@ class GlobalSSM(nn.Module):
         nn.init.normal_(self.context_proj.weight, std=0.02)
         nn.init.normal_(self.importance_proj.weight, std=0.02)
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         """
         Args:
             x: [B, S, d_model]
+            attention_mask: [B, S] optional, 1=valid, 0=pad
         Returns:
             importance: [B, S]
             context: [B, S, d_model]
@@ -290,7 +305,13 @@ class GlobalSSM(nn.Module):
         h_final = ssm_out[:, -1, :]  # [B, d_model]
         h_proj = self.importance_proj(h_final)  # [B, d_model]
         raw_importance = torch.einsum('bsd,bd->bs', x, h_proj)  # [B, S] - before softmax
-        importance = F.softmax(raw_importance / self.importance_temperature, dim=-1)
+
+        if attention_mask is not None:
+            # Mask pad positions with -inf so softmax gives 0
+            masked_importance = raw_importance.masked_fill(attention_mask == 0, float('-inf'))
+            importance = F.softmax(masked_importance / self.importance_temperature, dim=-1)
+        else:
+            importance = F.softmax(raw_importance / self.importance_temperature, dim=-1)
 
         # Context enhancement (optional, for memory savings)
         if self.return_context:
@@ -329,14 +350,15 @@ class GlobalSSM(nn.Module):
 
 class GlobalRouters(nn.Module):
     """
-    v14: Unified neuron space routing with FRVK naming
+    v15: Unified neuron space routing with FRVK naming + Knowledge
 
     1 UnifiedNeuronRouter for all neuron types:
     - All neurons in same d_space embedding
-    - Type-specific slicing for feature/relational/value
+    - Type-specific slicing for feature/relational/value/knowledge
     - Excitability (refractory-inspired) for balanced usage
     """
     def __init__(self, d_model: int, n_feature: int, n_relational: int, n_value: int,
+                 n_knowledge: int,
                  top_k_feature: int = 8, top_k_relational: int = 4, top_k_value: int = 6,
                  d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False):
         super().__init__()
@@ -344,6 +366,7 @@ class GlobalRouters(nn.Module):
         self.n_feature = n_feature
         self.n_relational = n_relational
         self.n_value = n_value
+        self.n_knowledge = n_knowledge
         self.top_k_feature = top_k_feature
         self.top_k_relational = top_k_relational
         self.top_k_value = top_k_value
@@ -351,7 +374,7 @@ class GlobalRouters(nn.Module):
 
         # Unified router (replaces 5 separate routers)
         self.neuron_router = UnifiedNeuronRouter(
-            d_model, n_feature, n_relational, n_value,
+            d_model, n_feature, n_relational, n_value, n_knowledge,
             d_space=d_space, dropout=router_dropout
         )
 
@@ -363,9 +386,14 @@ class GlobalRouters(nn.Module):
         sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-8)
         return sparse_weights, topk_idx
 
-    def get_attention_weights(self, x, importance):
+    def get_attention_weights(self, x, importance, attention_mask=None):
         """
         Compute attention routing weights with Top-k sparsification
+
+        Args:
+            x: [B, S, D]
+            importance: [B, S]
+            attention_mask: [B, S] optional, 1=valid, 0=pad
 
         Returns: feature_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
         """
@@ -383,22 +411,27 @@ class GlobalRouters(nn.Module):
         # Compute aux_loss (load balance) directly here
         aux_loss = 0.0
         if self.training:
-            # Feature
-            usage_F = feature_pref.mean(dim=(0, 1))
+            if attention_mask is not None:
+                # Masked mean: [B, S] → [B, S, 1]
+                mask = attention_mask.unsqueeze(-1).float()
+                count = mask.sum() + 1e-8
+                usage_F = (feature_pref * mask).sum(dim=(0, 1)) / count
+                usage_Q = (relational_pref_Q * mask).sum(dim=(0, 1)) / count
+                usage_K = (relational_pref_K * mask).sum(dim=(0, 1)) / count
+                usage_V = (value_pref * mask).sum(dim=(0, 1)) / count
+            else:
+                usage_F = feature_pref.mean(dim=(0, 1))
+                usage_Q = relational_pref_Q.mean(dim=(0, 1))
+                usage_K = relational_pref_K.mean(dim=(0, 1))
+                usage_V = value_pref.mean(dim=(0, 1))
+
             target_F = 1.0 / self.n_feature
             aux_loss = aux_loss + ((usage_F - target_F) ** 2).sum() * self.n_feature
 
-            # Relational Q
-            usage_Q = relational_pref_Q.mean(dim=(0, 1))
             target_R = 1.0 / self.n_relational
             aux_loss = aux_loss + ((usage_Q - target_R) ** 2).sum() * self.n_relational
-
-            # Relational K
-            usage_K = relational_pref_K.mean(dim=(0, 1))
             aux_loss = aux_loss + ((usage_K - target_R) ** 2).sum() * self.n_relational
 
-            # Value
-            usage_V = value_pref.mean(dim=(0, 1))
             target_V = 1.0 / self.n_value
             aux_loss = aux_loss + ((usage_V - target_V) ** 2).sum() * self.n_value
 
@@ -445,52 +478,14 @@ class GlobalRouters(nn.Module):
 
         # Update usage statistics
         if self.training:
-            self.neuron_router.update_usage(feature_weights, 'feature')
-            self.neuron_router.update_usage(value_weights, 'value')
+            self.neuron_router.update_usage(feature_weights, 'feature', attention_mask)
+            self.neuron_router.update_usage(value_weights, 'value', attention_mask)
 
             # Relational: Q OR K에서 선택되면 사용된 것으로 카운트
             relational_used = ((relational_weights_Q > 0) | (relational_weights_K > 0)).float()
-            self.neuron_router.update_usage(relational_used, 'relational')
+            self.neuron_router.update_usage(relational_used, 'relational', attention_mask)
 
         return feature_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
-
-    def get_memory_weights(self, x, importance):
-        """Compute memory routing weights with Top-k sparsification
-
-        Returns: memory_weights, routing_info, aux_loss
-        """
-        memory_logits = self.neuron_router.get_logits(x, 'memory')
-        memory_pref = F.softmax(memory_logits, dim=-1)
-
-        # Compute aux_loss (load balance) directly here
-        aux_loss = 0.0
-        if self.training:
-            usage_M = memory_pref.mean(dim=(0, 1))
-            target_M = 1.0 / self.n_feature
-            aux_loss = ((usage_M - target_M) ** 2).sum() * self.n_feature
-
-        if self.token_routing:
-            # Token-level routing: use per-token weights directly [B, S, N]
-            memory_weights = memory_pref
-            routing_info = {
-                'memory_weights': memory_weights.detach(),
-                'token_routing': True,
-            }
-        else:
-            # Batch-level routing: aggregate by importance [B, N]
-            memory_weights_dense = torch.einsum('bs,bsn->bn', importance, memory_pref)
-            memory_weights, memory_topk_idx = self._topk_sparsify(memory_weights_dense, self.top_k_feature)
-
-            routing_info = {
-                'memory_weights': memory_weights.detach(),
-                'token_routing': False,
-            }
-
-        # Update usage statistics
-        if self.training:
-            self.neuron_router.update_usage(memory_weights, 'memory')
-
-        return memory_weights, routing_info, aux_loss
 
 
 class NeuronCircuit(nn.Module):
@@ -514,7 +509,7 @@ class NeuronCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, feature_weights, relational_weights_Q, relational_weights_K, value_weights):
+    def forward(self, x, feature_weights, relational_weights_Q, relational_weights_K, value_weights, attention_mask=None):
         """
         Args:
             x: [B, S, D]
@@ -522,6 +517,7 @@ class NeuronCircuit(nn.Module):
             relational_weights_Q: [B, N_R] or [B, S, N_R] - Q router weights (uses Relational pool)
             relational_weights_K: [B, N_R] or [B, S, N_R] - K router weights (uses Relational pool)
             value_weights: [B, N_V] or [B, S, N_V] - V router weights (uses Value pool)
+            attention_mask: [B, S] optional, 1=valid, 0=pad
         """
         B, S, D = x.shape
         token_routing = feature_weights.dim() == 3  # [B, S, N] vs [B, N]
@@ -571,11 +567,24 @@ class NeuronCircuit(nn.Module):
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
         # FlashAttention via PyTorch 2.0+
-        attn_out = F.scaled_dot_product_attention(
-            Q, K, V,
-            is_causal=True,
-            dropout_p=self.attn_dropout.p if self.training else 0.0
-        )
+        if attention_mask is not None:
+            # Combine causal mask with padding mask
+            # Causal: [S, S], Padding: [B, 1, 1, S]
+            causal_mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1)
+            pad_mask = (attention_mask == 0).view(B, 1, 1, S)  # [B, 1, 1, S]
+            # Combined: attend where causal allows AND not padding
+            combined_mask = causal_mask.unsqueeze(0).unsqueeze(0) | pad_mask  # True = mask out
+            attn_out = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=~combined_mask,  # PyTorch wants True=attend
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                Q, K, V,
+                is_causal=True,
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.d_model)
 
         # 6. Output projection
@@ -586,94 +595,138 @@ class NeuronCircuit(nn.Module):
 
 
 class NeuronMemory(nn.Module):
-    """v14: Memory using global routing with FRVK naming"""
+    """
+    v15: 2-stage hierarchical knowledge retrieval
+
+    Stage 1: x → router → coarse_k candidates (Excitability for exploration)
+    Stage 2: x → proj_q → fine match within candidates → fine_k selection
+    """
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
-        rank: int,
-        knowledge_k: int = 8,
+        n_knowledge: int,
         knowledge_rank: int = None,
+        coarse_k: int = 20,
+        fine_k: int = 10,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
-        self.rank = rank
-        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
-        self.knowledge_k = knowledge_k
+        self.n_knowledge = n_knowledge
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
+        self.coarse_k = coarse_k
+        self.fine_k = fine_k
 
-        if self.knowledge_rank != rank:
-            self.query_proj = nn.Linear(rank, self.knowledge_rank, bias=False)
-        else:
-            self.query_proj = None
+    def forward(self, x, router, knowledge_encoder, attention_mask=None):
+        """
+        v15: 2-stage hierarchical knowledge retrieval
 
-    def forward(self, x, memory_weights):
+        Args:
+            x: [B, S, D] input embeddings (for both stages)
+            router: UnifiedNeuronRouter (provides knowledge logits)
+            knowledge_encoder: nn.Linear (shared d_model → knowledge_rank)
+            attention_mask: [B, S] optional, 1=valid, 0=pad
+
+        Returns:
+            output: [B, S, D] memory output
+            info: dict with coarse/fine indices and weights
+        """
         B, S, D = x.shape
-        token_routing = memory_weights.dim() == 3  # [B, S, N] vs [B, N]
 
-        if token_routing:
-            # Token-level routing: different matrix per token
-            shared_feature = torch.einsum('bsn,ndr->bsdr', memory_weights,
-                                            self.shared_neurons.feature_neurons)
-            Q = torch.einsum('bsd,bsdr->bsr', x, shared_feature)
-        else:
-            # Batch-level routing: same matrix for all tokens
-            shared_feature = torch.einsum('bn,ndr->bdr', memory_weights,
-                                            self.shared_neurons.feature_neurons)
-            Q = torch.einsum('bsd,bdr->bsr', x, shared_feature)
+        # ===== Stage 1: Coarse candidate selection via router =====
+        # Router's knowledge logits include Excitability during training
+        k_logits = router.get_logits(x, 'knowledge')  # [B, S, n_knowledge]
+        coarse_scores, candidate_idx = torch.topk(k_logits, self.coarse_k, dim=-1)  # [B, S, coarse_k]
 
-        if self.query_proj is not None:
-            Q = self.query_proj(Q)
+        # Update knowledge usage statistics
+        if self.training:
+            # Create sparse indicator for selected candidates
+            coarse_indicator = torch.zeros(B, S, self.n_knowledge, device=x.device)
+            coarse_indicator.scatter_(-1, candidate_idx, 1.0)
+            router.update_usage(coarse_indicator, 'knowledge', attention_mask)
 
-        K = self.shared_neurons.knowledge_neurons_K
-        V = self.shared_neurons.knowledge_neurons_V
+        # ===== Stage 2: Fine matching within candidates =====
+        # x → query for fine-grained similarity (shared encoder)
+        query = knowledge_encoder(x)  # [B, S, knowledge_rank]
 
-        scores = Q @ K.T / math.sqrt(self.knowledge_rank)
-        topk_scores, topk_idx = torch.topk(scores, self.knowledge_k, dim=-1)
-        weights = F.softmax(topk_scores, dim=-1)
+        # Get candidate keys from shared neurons
+        K_all = self.shared_neurons.knowledge_neurons_K  # [n_knowledge, knowledge_rank]
+        V_all = self.shared_neurons.knowledge_neurons_V  # [n_knowledge, d_model]
 
-        idx_expanded = topk_idx.unsqueeze(-1).expand(B, S, self.knowledge_k, self.d_model)
-        V_expanded = V.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
-        selected_V = V_expanded.gather(2, idx_expanded)
+        # Gather candidate keys: [B, S, coarse_k, knowledge_rank]
+        candidate_idx_k = candidate_idx.unsqueeze(-1).expand(B, S, self.coarse_k, self.knowledge_rank)
+        K_candidates = K_all.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).gather(2, candidate_idx_k)
 
-        output = (selected_V * weights.unsqueeze(-1)).sum(dim=2)
+        # Similarity within candidates
+        # query: [B, S, knowledge_rank] → [B, S, 1, knowledge_rank]
+        # K_candidates: [B, S, coarse_k, knowledge_rank]
+        fine_scores = torch.einsum('bsd,bscd->bsc', query, K_candidates) / math.sqrt(self.knowledge_rank)
+        # fine_scores: [B, S, coarse_k]
 
-        return output, {'knowledge_indices': topk_idx, 'knowledge_weights': weights}
+        # Select top-fine_k within coarse candidates
+        fine_topk_scores, fine_topk_local_idx = torch.topk(fine_scores, self.fine_k, dim=-1)  # [B, S, fine_k]
+        fine_weights = F.softmax(fine_topk_scores, dim=-1)  # [B, S, fine_k]
+
+        # Map local indices back to global knowledge indices
+        fine_global_idx = candidate_idx.gather(-1, fine_topk_local_idx)  # [B, S, fine_k]
+
+        # Gather selected values
+        fine_idx_v = fine_global_idx.unsqueeze(-1).expand(B, S, self.fine_k, self.d_model)
+        V_expanded = V_all.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+        selected_V = V_expanded.gather(2, fine_idx_v)  # [B, S, fine_k, d_model]
+
+        # Weighted sum of selected values
+        output = (selected_V * fine_weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
+
+        info = {
+            'coarse_indices': candidate_idx,
+            'coarse_scores': coarse_scores,
+            'fine_indices': fine_global_idx,
+            'fine_weights': fine_weights,
+        }
+
+        return output, info
 
 
 class DAWNBlock(nn.Module):
-    """DAWN v14 block"""
+    """DAWN v15 block with 2-stage knowledge retrieval"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
         n_heads: int,
         rank: int,
-        knowledge_k: int,
+        n_knowledge: int,
         knowledge_rank: int = None,
+        coarse_k: int = 20,
+        fine_k: int = 10,
         dropout: float = 0.1,
     ):
         super().__init__()
 
         self.attn = NeuronCircuit(shared_neurons, d_model, n_heads, rank, dropout)
-        self.memory = NeuronMemory(shared_neurons, d_model, rank, knowledge_k, knowledge_rank)
+        self.memory = NeuronMemory(
+            shared_neurons, d_model, n_knowledge,
+            knowledge_rank=knowledge_rank, coarse_k=coarse_k, fine_k=fine_k
+        )
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, importance, global_routers: GlobalRouters):
+    def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder, attention_mask=None):
         normed_x = self.norm1(x)
         feature_w, relational_Q, relational_K, value_w, attn_routing, attn_aux_loss = \
-            global_routers.get_attention_weights(normed_x, importance)
+            global_routers.get_attention_weights(normed_x, importance, attention_mask)
 
-        attn_out, _ = self.attn(normed_x, feature_w, relational_Q, relational_K, value_w)
+        attn_out, _ = self.attn(normed_x, feature_w, relational_Q, relational_K, value_w, attention_mask)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
-        memory_w, mem_routing, mem_aux_loss = global_routers.get_memory_weights(normed_x2, importance)
 
-        mem_out, knowledge_info = self.memory(normed_x2, memory_w)
+        # v15: 2-stage knowledge retrieval (shared knowledge_encoder)
+        mem_out, knowledge_info = self.memory(normed_x2, global_routers.neuron_router, knowledge_encoder, attention_mask)
         x = x + self.dropout(mem_out)
 
         # Output norms for attn/mem balance monitoring
@@ -682,31 +735,29 @@ class DAWNBlock(nn.Module):
 
         routing_info = {
             'attention': {**attn_routing, 'neuron_weights': feature_w.detach()},
-            'memory': {**mem_routing, **knowledge_info, 'neuron_weights': memory_w.detach()},
+            'memory': {**{k: v.detach() for k, v in knowledge_info.items()}},
             'attn_out_norm': attn_out_norm,
             'mem_out_norm': mem_out_norm,
         }
 
-        aux_loss = attn_aux_loss + mem_aux_loss
-        return x, routing_info, aux_loss
+        return x, routing_info, attn_aux_loss
 
 
 class DAWN(nn.Module):
     """
-    DAWN v14: Feature-Relational-Value-Knowledge (FRVK) Architecture
+    DAWN v15: 2-Stage Hierarchical Knowledge Retrieval
 
-    Changes from v13.2:
-    - Renamed neuron types: compress→feature, expand_QK→relational, expand_V→value
-    - Starvation weight → Excitability (refractory-inspired)
-    - Simple: excitability = 1 - usage_ema / tau
+    2-Stage Knowledge Retrieval:
+    - Stage 1: x → router → coarse_k candidates (Excitability)
+    - Stage 2: x → knowledge_encoder (shared) → fine match → fine_k selection
 
     Architecture (FRVK):
-    - Feature Neurons (F): input compression
+    - Feature Neurons (F): input compression [Attention only]
     - Relational Neurons (R): Q/K generation
     - Value Neurons (V): V generation
-    - Knowledge Neurons (K): factual memory
+    - Knowledge Neurons (K): 2-stage retrieval (router coarse → encoder fine)
     """
-    __version__ = "14.0"
+    __version__ = "15.0"
 
     def __init__(
         self,
@@ -720,7 +771,8 @@ class DAWN(nn.Module):
         n_relational: int = 12,
         n_value: int = 12,
         n_knowledge: int = 80,
-        knowledge_k: int = 10,
+        coarse_k: int = 20,
+        fine_k: int = 10,
         knowledge_rank: int = None,
         state_dim: int = 64,
         top_k_feature: int = 8,
@@ -741,7 +793,7 @@ class DAWN(nn.Module):
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.rank = rank
-        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else rank
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
         self.max_seq_len = max_seq_len
         self.state_dim = state_dim
         self.top_k_feature = top_k_feature
@@ -757,7 +809,8 @@ class DAWN(nn.Module):
         self.n_relational = n_relational
         self.n_value = n_value
         self.n_knowledge = n_knowledge
-        self.knowledge_k = knowledge_k
+        self.coarse_k = coarse_k
+        self.fine_k = fine_k
 
         self.n_neurons = n_feature
         self.basis_rank = rank
@@ -776,15 +829,19 @@ class DAWN(nn.Module):
 
         # Unified Neuron Router (replaces 5 separate routers)
         self.global_routers = GlobalRouters(
-            d_model, n_feature, n_relational, n_value,
+            d_model, n_feature, n_relational, n_value, n_knowledge,
             top_k_feature, top_k_relational, top_k_value,
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing
         )
 
+        # Shared knowledge encoder for 2-stage retrieval (d_model → knowledge_rank)
+        self.knowledge_encoder = nn.Linear(d_model, self.knowledge_rank, bias=False)
+
         self.layers = nn.ModuleList([
             DAWNBlock(
                 shared_neurons=self.shared_neurons, d_model=d_model, n_heads=n_heads,
-                rank=rank, knowledge_k=knowledge_k, knowledge_rank=self.knowledge_rank, dropout=dropout,
+                rank=rank, n_knowledge=n_knowledge, knowledge_rank=self.knowledge_rank,
+                coarse_k=coarse_k, fine_k=fine_k, dropout=dropout,
             )
             for _ in range(n_layers)
         ])
@@ -807,11 +864,12 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, input_ids, labels=None, return_routing_info=False):
+    def forward(self, input_ids, labels=None, attention_mask=None, return_routing_info=False):
         """
         Args:
             input_ids: [B, S] token ids
             labels: [B, S] labels for loss calculation
+            attention_mask: [B, S] optional, 1=valid, 0=pad
             return_routing_info: whether to return routing info
         """
         B, S = input_ids.shape
@@ -828,20 +886,20 @@ class DAWN(nn.Module):
             # Selective SSM: importance + context (recalculated per layer)
             if self.gradient_checkpointing and self.training:
                 importance, context, raw_importance = checkpoint(
-                    self.global_ssm, x, use_reentrant=False
+                    self.global_ssm, x, attention_mask, use_reentrant=False
                 )
             else:
-                importance, context, raw_importance = self.global_ssm(x)
+                importance, context, raw_importance = self.global_ssm(x, attention_mask)
             if context is not None:
                 x = x + context
 
             if self.gradient_checkpointing and self.training:
                 x, routing_info, layer_aux_loss = checkpoint(
-                    layer, x, importance, self.global_routers,
+                    layer, x, importance, self.global_routers, self.knowledge_encoder, attention_mask,
                     use_reentrant=False
                 )
             else:
-                x, routing_info, layer_aux_loss = layer(x, importance, self.global_routers)
+                x, routing_info, layer_aux_loss = layer(x, importance, self.global_routers, self.knowledge_encoder, attention_mask)
 
             # Accumulate aux_loss
             self.aux_loss = self.aux_loss + layer_aux_loss
@@ -924,7 +982,7 @@ class DAWN(nn.Module):
         expand_o = self.layers[0].attn.expand_O.weight.numel() * self.n_layers
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        print(f"=== DAWN v14 Parameter Breakdown (FRVK Architecture) ===")
+        print(f"=== DAWN v15 Parameter Breakdown (FRVK Architecture) ===")
         print(f"FeatureNeurons (F):    {feature:,} ({feature/1e6:.2f}M)")
         print(f"RelationalNeurons (R): {relational:,} ({relational/1e6:.2f}M)")
         print(f"ValueNeurons (V):      {value:,} ({value/1e6:.2f}M)")
@@ -958,7 +1016,8 @@ class DAWN(nn.Module):
             'rank': self.rank, 'knowledge_rank': self.knowledge_rank,
             'max_seq_len': self.max_seq_len, 'n_feature': self.n_feature,
             'n_relational': self.n_relational, 'n_value': self.n_value,
-            'n_knowledge': self.n_knowledge, 'knowledge_k': self.knowledge_k,
+            'n_knowledge': self.n_knowledge,
+            'coarse_k': self.coarse_k, 'fine_k': self.fine_k,
             'state_dim': self.state_dim,
             'top_k_feature': self.top_k_feature,
             'top_k_relational': self.top_k_relational, 'top_k_value': self.top_k_value,
@@ -971,30 +1030,37 @@ class DAWN(nn.Module):
     def get_model_info(self):
         """Return model architecture info for logging (used by train.py)"""
         return [
-            f"DAWN v{self.__version__}: FRVK Architecture",
+            f"DAWN v{self.__version__}: 2-Stage Knowledge Retrieval",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  FeatureNeurons (F): {self.n_feature} × {self.d_model} × {self.rank}",
+            f"  FeatureNeurons (F): {self.n_feature} × {self.d_model} × {self.rank} [Attn only]",
             f"  RelationalNeurons (R): {self.n_relational} × {self.rank} × {self.d_model} (Q/K pool)",
             f"  ValueNeurons (V): {self.n_value} × {self.rank} × {self.d_model} (V pool)",
             f"  Top-k: F={self.top_k_feature}, R={self.top_k_relational}, V={self.top_k_value}",
-            f"  KnowledgeNeurons (K): {self.n_knowledge} (top-{self.knowledge_k})",
-            f"  Memory: x → Feature weighted → Q",
-            f"  Router: d_space={self.d_space}, Excitability (SAR)",
+            f"  KnowledgeNeurons (K): {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
+            f"  Memory: x→router→coarse, x→knowledge_encoder→fine",
+            f"  Router: d_space={self.d_space}, Excitability (SAR), Knowledge integrated",
         ]
 
     def load_state_dict(self, state_dict, strict=True):
-        """Backward compatible load: remap transfer_neurons → value_neurons"""
-        # Remap old parameter names (T → V)
+        """Backward compatible load: remap old parameter names"""
         remapped = {}
         for key, value in state_dict.items():
             new_key = key
-            # Handle parameter name changes
+            # T → V rename (v14 backward compat)
             if 'transfer_neurons' in key:
                 new_key = key.replace('transfer_neurons', 'value_neurons')
             if 'n_transfer' in key:
                 new_key = key.replace('n_transfer', 'n_value')
             if 'usage_ema_transfer' in key:
                 new_key = key.replace('usage_ema_transfer', 'usage_ema_value')
+            # proj_k → knowledge_encoder (old v15 compat)
+            # Old: layers.X.memory.proj_q → New: knowledge_encoder (shared)
+            if 'memory.proj_k' in key or 'memory.proj_q' in key:
+                # Use layer 0's weights for the shared encoder
+                if 'layers.0.memory.proj' in key:
+                    new_key = 'knowledge_encoder.weight'
+                else:
+                    continue  # Skip other layers' proj weights
             remapped[new_key] = value
 
         return super().load_state_dict(remapped, strict=strict)

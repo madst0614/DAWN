@@ -554,7 +554,7 @@ def is_modern_dawn_model(model):
     base_model = get_underlying_model(model)
 
     # Check for v10+ structure
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["10.0", "13.0", "13.1", "13.2", "14.0"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["10.0", "13.0", "13.1", "13.2", "14.0", "15.0"]:
         return True
 
     # Structure check: v10+ has layers with .attn and .memory
@@ -585,35 +585,45 @@ def _get_router_log_lines(router, global_step, total_steps):
     """
     lines = []
 
-    # v14: FRTK with Excitability (refractory-inspired)
+    # v14: FRVK with Excitability (refractory-inspired)
     if hasattr(router, 'usage_ema_feature'):
         ema_F = router.usage_ema_feature
         ema_R = router.usage_ema_relational
-        ema_T = router.usage_ema_transfer
+        ema_V = router.usage_ema_value
 
         # Active neuron counts
         active_F = (ema_F > 0.01).sum().item()
         active_R = (ema_R > 0.01).sum().item()
-        active_T = (ema_T > 0.01).sum().item()
-        n_F, n_R, n_T = ema_F.numel(), ema_R.numel(), ema_T.numel()
+        active_V = (ema_V > 0.01).sum().item()
+        n_F, n_R, n_V = ema_F.numel(), ema_R.numel(), ema_V.numel()
 
         # Gini coefficients
-        gini_F, gini_R, gini_T = _gini(ema_F), _gini(ema_R), _gini(ema_T)
+        gini_F, gini_R, gini_V = _gini(ema_F), _gini(ema_R), _gini(ema_V)
 
         # Excitability: 1 - usage_ema / tau (tau=1.0), with decaying weight
         tau = router.tau if hasattr(router, 'tau') else 1.0
         weight = router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0
         exc_F = torch.clamp(1.0 - ema_F / tau, min=0.0, max=1.0)
         exc_R = torch.clamp(1.0 - ema_R / tau, min=0.0, max=1.0)
-        exc_T = torch.clamp(1.0 - ema_T / tau, min=0.0, max=1.0)
+        exc_V = torch.clamp(1.0 - ema_V / tau, min=0.0, max=1.0)
 
         # Excitability distribution
         min_exc_F, max_exc_F, mean_exc_F = exc_F.min().item(), exc_F.max().item(), exc_F.mean().item()
         min_exc_R, max_exc_R, mean_exc_R = exc_R.min().item(), exc_R.max().item(), exc_R.mean().item()
-        min_exc_T, max_exc_T, mean_exc_T = exc_T.min().item(), exc_T.max().item(), exc_T.mean().item()
+        min_exc_V, max_exc_V, mean_exc_V = exc_V.min().item(), exc_V.max().item(), exc_V.mean().item()
 
-        lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active F/R/T:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_T)}/{n_T} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_T:.2f}")
-        lines.append(f"             Exc F:[{min_exc_F:.2f},{mean_exc_F:.2f},{max_exc_F:.2f}] R:[{min_exc_R:.2f},{mean_exc_R:.2f},{max_exc_R:.2f}] T:[{min_exc_T:.2f},{mean_exc_T:.2f},{max_exc_T:.2f}]")
+        lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active F/R/V:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_V)}/{n_V} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_V:.2f}")
+        lines.append(f"             Exc F:[{min_exc_F:.2f},{mean_exc_F:.2f},{max_exc_F:.2f}] R:[{min_exc_R:.2f},{mean_exc_R:.2f},{max_exc_R:.2f}] V:[{min_exc_V:.2f},{mean_exc_V:.2f},{max_exc_V:.2f}]")
+
+        # v15: Knowledge neurons (if available)
+        if hasattr(router, 'usage_ema_knowledge'):
+            ema_K = router.usage_ema_knowledge
+            active_K = (ema_K > 0.01).sum().item()
+            n_K = ema_K.numel()
+            gini_K = _gini(ema_K)
+            exc_K = torch.clamp(1.0 - ema_K / tau, min=0.0, max=1.0)
+            min_exc_K, max_exc_K, mean_exc_K = exc_K.min().item(), exc_K.max().item(), exc_K.mean().item()
+            lines.append(f"             Knowledge (K): Active {int(active_K)}/{n_K} | Gini:{gini_K:.2f} | Exc:[{min_exc_K:.2f},{mean_exc_K:.2f},{max_exc_K:.2f}]")
 
     # v13.2: Compress/QK/V with starvation
     elif hasattr(router, 'usage_ema_compress'):
@@ -879,25 +889,25 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # v14: FRTK (Feature/Relational/Transfer/Knowledge)
+                    # v14: FRVK (Feature/Relational/Value/Knowledge)
                     if attn.get('feature_pref') is not None:
                         pref_F = attn.get('feature_pref')
                         pref_RQ = attn.get('relational_pref_Q')
                         pref_RK = attn.get('relational_pref_K')
-                        pref_T = attn.get('transfer_pref')
+                        pref_V = attn.get('value_pref')
 
                         ent_F = calc_entropy_ratio(pref_F)
                         ent_RQ = calc_entropy_ratio(pref_RQ)
                         ent_RK = calc_entropy_ratio(pref_RK)
-                        ent_T = calc_entropy_ratio(pref_T)
+                        ent_V = calc_entropy_ratio(pref_V)
 
                         var_F = calc_token_var(pref_F)
                         var_RQ = calc_token_var(pref_RQ)
                         var_RK = calc_token_var(pref_RK)
-                        var_T = calc_token_var(pref_T)
+                        var_V = calc_token_var(pref_V)
 
-                        ent_str = f"Ent F/RQ/RK/T:{ent_F:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_T:.0f}"
-                        var_str = f"TokVar:{var_F:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_T:.4f}"
+                        ent_str = f"Ent F/RQ/RK/V:{ent_F:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
+                        var_str = f"TokVar:{var_F:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
 
                     # v13.2: C/Q/K/V (Compress/Query/Key/Value)
                     else:
@@ -947,15 +957,26 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Knowledge neuron usage stats
                     try:
                         # Collect knowledge indices from all layers
-                        all_knowledge_idx = []
+                        # v15: fine_indices, coarse_indices
+                        # v14: knowledge_indices
+                        all_fine_idx = []
+                        all_coarse_idx = []
                         for layer_info in routing_infos:
                             mem = layer_info.get('memory', {})
+                            # v15: 2-stage retrieval
+                            fine_idx = mem.get('fine_indices')
+                            coarse_idx = mem.get('coarse_indices')
+                            if fine_idx is not None:
+                                all_fine_idx.append(fine_idx.flatten())
+                            if coarse_idx is not None:
+                                all_coarse_idx.append(coarse_idx.flatten())
+                            # v14: single-stage
                             k_idx = mem.get('knowledge_indices')
                             if k_idx is not None:
-                                all_knowledge_idx.append(k_idx.flatten())
+                                all_fine_idx.append(k_idx.flatten())
 
-                        if all_knowledge_idx:
-                            all_idx = torch.cat(all_knowledge_idx)
+                        if all_fine_idx:
+                            all_idx = torch.cat(all_fine_idx)
                             n_knowledge = base_model.n_knowledge if hasattr(base_model, 'n_knowledge') else 80
 
                             # Count usage per knowledge neuron
@@ -973,7 +994,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             # Gini
                             gini_K = _gini(usage_freq)
 
-                            print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f}")
+                            # v15: coarse→fine ratio
+                            if all_coarse_idx:
+                                coarse_all = torch.cat(all_coarse_idx)
+                                coarse_unique = len(torch.unique(coarse_all))
+                                fine_unique = len(torch.unique(all_idx))
+                                # fine_k / coarse_k ratio (how many survive from coarse to fine)
+                                coarse_k = base_model.coarse_k if hasattr(base_model, 'coarse_k') else 20
+                                fine_k = base_model.fine_k if hasattr(base_model, 'fine_k') else 10
+                                print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f} | coarse→fine: {coarse_k}→{fine_k} (unique: {coarse_unique}→{fine_unique})")
+                            else:
+                                print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f}")
                     except Exception:
                         pass
 
@@ -1109,7 +1140,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
             # Shift for autoregressive loss
             B, S, V = logits.shape
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous().long()  # Ensure Long type for cross_entropy
             loss = F.cross_entropy(
                 shift_logits.view(-1, V),
                 shift_labels.view(-1),
@@ -1348,6 +1379,10 @@ def main():
     args.knowledge_k = cfg['model'].get('knowledge_k', 8)
     args.knowledge_rank = cfg['model'].get('knowledge_rank', None)  # None = use rank
 
+    # v15: 2-stage retrieval parameters
+    args.coarse_k = cfg['model'].get('coarse_k', 20)
+    args.fine_k = cfg['model'].get('fine_k', 10)
+
     # SSM parameters
     args.state_dim = cfg['model'].get('state_dim', 64)
 
@@ -1372,13 +1407,13 @@ def main():
     args.d_space = cfg['model'].get('d_space', 64)
     args.router_dropout = cfg['model'].get('router_dropout', 0.1)
 
-    # v14.0 FRTK parameters (feature/relational/transfer naming)
+    # v14.0 FRVK parameters (feature/relational/value naming)
     args.n_feature = cfg['model'].get('n_feature', cfg['model'].get('n_compress', 48))
     args.n_relational = cfg['model'].get('n_relational', cfg['model'].get('n_expand_QK', 12))
-    args.n_transfer = cfg['model'].get('n_transfer', cfg['model'].get('n_expand_V', 12))
+    args.n_value = cfg['model'].get('n_value', cfg['model'].get('n_transfer', cfg['model'].get('n_expand_V', 12)))
     args.top_k_feature = cfg['model'].get('top_k_feature', cfg['model'].get('top_k_compress', 8))
     args.top_k_relational = cfg['model'].get('top_k_relational', cfg['model'].get('top_k_QK', 4))
-    args.top_k_transfer = cfg['model'].get('top_k_transfer', cfg['model'].get('top_k_V', 6))
+    args.top_k_value = cfg['model'].get('top_k_value', cfg['model'].get('top_k_transfer', cfg['model'].get('top_k_V', 6)))
 
     # v9.0 Compress/Expand/Reflection parameters
     args.n_compress = cfg['model'].get('n_compress', 4)
@@ -1602,7 +1637,7 @@ def main():
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
         if args.model_version == '14.0':
-            print(f"   → v14.0 FRTK params: n_feature={getattr(args, 'n_feature', 48)}, n_relational={getattr(args, 'n_relational', 12)}, n_transfer={getattr(args, 'n_transfer', 12)}, rank={args.basis_rank}")
+            print(f"   → v14.0 FRVK params: n_feature={getattr(args, 'n_feature', 48)}, n_relational={getattr(args, 'n_relational', 12)}, n_value={getattr(args, 'n_value', 12)}, rank={args.basis_rank}")
         elif args.model_version in ['13.0', '13.1', '13.2']:
             print(f"   → v{args.model_version} params: n_compress={args.n_compress}, rank={args.basis_rank}, state_dim={getattr(args, 'state_dim', 64)}")
         elif args.model_version == '10.0':
@@ -1622,40 +1657,32 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "14.0":
-            # v14.0: FRTK Architecture with SAR
+        if model_version == "15.0":
+            # v15.0: FRVK + 2-Stage Knowledge Retrieval
             rank = args.basis_rank
-            knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
-            state_dim = getattr(args, 'state_dim', 64)
-            d_head = args.d_model // args.n_heads
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
             n_feature = getattr(args, 'n_feature', 48)
             n_relational = getattr(args, 'n_relational', 12)
-            n_transfer = getattr(args, 'n_transfer', 12)
-            top_k_feature = getattr(args, 'top_k_feature', 8)
-            top_k_relational = getattr(args, 'top_k_relational', 4)
-            top_k_transfer = getattr(args, 'top_k_transfer', 6)
-            d_space = getattr(args, 'd_space', 64)
-            grad_ckpt = getattr(args, 'gradient_checkpointing', False)
-            print(f"DAWN v{model_version}: rank={rank} - FRTK Architecture!")
-            print(f"  FeatureNeurons (F): {n_feature} × {args.d_model} × {rank}")
-            print(f"  RelationalNeurons (R): {n_relational} × {rank} × {args.d_model} (Q/K pool)")
-            print(f"  TransferNeurons (T): {n_transfer} × {rank} × {args.d_model} (V pool)")
-            print(f"  Global SSM: Selective mechanism (token-dependent delta, B_t)")
-            print(f"  Unified Router: d_space={d_space} + SAR (Synaptic Activation Regulation)")
-            print(f"  Context Enhancement: SSM context added to x")
-            print(f"  Top-k Feature: {top_k_feature}/{n_feature}")
-            print(f"  Top-k Relational: {top_k_relational}/{n_relational}")
-            print(f"  Top-k Transfer: {top_k_transfer}/{n_transfer}")
-            print(f"  SSM: state_dim={state_dim}")
-            print(f"  FlashAttention: enabled (scaled_dot_product_attention)")
-            print(f"  Gradient Checkpointing: {grad_ckpt}")
-            print(f"  Load Balance: Switch Transformer style + SAR")
-            print(f"  Architecture: Mamba SSM → Context + Unified Router (SAR) → FlashAttn")
-            print(f"  Attention: d_model space (d_head={d_head})")
-            print(f"  KnowledgeNeurons (K):")
-            print(f"    - K: {args.n_knowledge} × {knowledge_rank}")
-            print(f"    - V: {args.n_knowledge} × {args.d_model}")
-            print(f"    - Knowledge top-k: {args.knowledge_k}")
+            n_value = getattr(args, 'n_value', 12)
+            n_knowledge = getattr(args, 'n_knowledge', 80)
+            coarse_k = getattr(args, 'coarse_k', 20)
+            fine_k = getattr(args, 'fine_k', 10)
+            print(f"DAWN v{model_version}: FRVK + 2-Stage Knowledge Retrieval")
+            print(f"  Feature/Relational/Value: {n_feature}/{n_relational}/{n_value}")
+            print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
+            print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
+            print(f"  (detailed info after model creation)")
+        elif model_version == "14.0":
+            # v14.0: FRVK Architecture
+            rank = args.basis_rank
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
+            n_feature = getattr(args, 'n_feature', 48)
+            n_relational = getattr(args, 'n_relational', 12)
+            n_value = getattr(args, 'n_value', 12)
+            print(f"DAWN v{model_version}: FRVK Architecture")
+            print(f"  Feature/Relational/Value: {n_feature}/{n_relational}/{n_value}")
+            print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
+            print(f"  (detailed info after model creation)")
         elif model_version == "13.2":
             # v13.2: Unified Neuron Router
             rank = args.basis_rank
@@ -1874,20 +1901,39 @@ def main():
             'top_k_V': getattr(args, 'top_k_V', 6),
             'gradient_checkpointing': args.gradient_checkpointing,
         })
-    elif model_version == '14.0':
-        # v14.0: FRTK Architecture with SAR
+    elif model_version == '15.0':
+        # v15.0: FRVK + 2-Stage Knowledge Retrieval
         model_kwargs.update({
             'n_feature': getattr(args, 'n_feature', 48),
             'n_relational': getattr(args, 'n_relational', 12),
-            'n_transfer': getattr(args, 'n_transfer', 12),
+            'n_value': getattr(args, 'n_value', 12),
             'n_knowledge': args.n_knowledge,
-            'knowledge_k': args.knowledge_k,
-            'knowledge_rank': args.knowledge_rank,  # None = use rank
+            'coarse_k': args.coarse_k,
+            'fine_k': args.fine_k,
+            'knowledge_rank': args.knowledge_rank or 128,  # v15: 128 default
             'rank': args.basis_rank,
             'state_dim': getattr(args, 'state_dim', 64),
             'top_k_feature': getattr(args, 'top_k_feature', 8),
             'top_k_relational': getattr(args, 'top_k_relational', 4),
-            'top_k_transfer': getattr(args, 'top_k_transfer', 6),
+            'top_k_value': getattr(args, 'top_k_value', 6),
+            'd_space': getattr(args, 'd_space', 64),
+            'router_dropout': getattr(args, 'router_dropout', 0.1),
+            'gradient_checkpointing': args.gradient_checkpointing,
+        })
+    elif model_version == '14.0':
+        # v14.0: FRVK Architecture
+        model_kwargs.update({
+            'n_feature': getattr(args, 'n_feature', 48),
+            'n_relational': getattr(args, 'n_relational', 12),
+            'n_value': getattr(args, 'n_value', 12),
+            'n_knowledge': args.n_knowledge,
+            'knowledge_k': args.knowledge_k,
+            'knowledge_rank': args.knowledge_rank,
+            'rank': args.basis_rank,
+            'state_dim': getattr(args, 'state_dim', 64),
+            'top_k_feature': getattr(args, 'top_k_feature', 8),
+            'top_k_relational': getattr(args, 'top_k_relational', 4),
+            'top_k_value': getattr(args, 'top_k_value', 6),
             'd_space': getattr(args, 'd_space', 64),
             'router_dropout': getattr(args, 'router_dropout', 0.1),
             'gradient_checkpointing': args.gradient_checkpointing,
@@ -1976,6 +2022,12 @@ def main():
 
     model = model.to(device)
     print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
+
+    # Print detailed model info (v14+)
+    if hasattr(model, 'get_model_info'):
+        print()
+        for line in model.get_model_info():
+            print(line)
 
     # NOTE: torch.compile() is applied AFTER checkpoint loading to avoid _orig_mod. prefix issues
 
