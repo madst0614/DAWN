@@ -6,7 +6,7 @@ v13.0: Final Architecture (Selective SSM + Context + Top-k + FlashAttention)
 v13.1: Separate QK/V Expand Pools (Q/K share, V separate)
 v13.2: Unified Neuron Router (all neurons in same embedding space)
 v14.0: FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR
-v15.0: Direct Knowledge Projection (NeuronMemory bypasses Feature neurons)
+v15.0: 2-Stage Hierarchical Knowledge Retrieval (router coarse → h fine)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -187,12 +187,12 @@ VERSION_REGISTRY = {
         ],
     },
     "15.0": {
-        "description": "Direct Knowledge Projection (NeuronMemory bypasses Feature neurons)",
+        "description": "2-Stage Hierarchical Knowledge Retrieval (router coarse → h fine)",
         "aliases": ["15", "150"],
         "module": "model_v15",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_feature", "n_relational", "n_value", "n_knowledge", "knowledge_k", "rank",
+            "n_feature", "n_relational", "n_value", "n_knowledge", "rank",
         ],
         "optional_params": {
             "dropout": 0.1,
@@ -201,25 +201,27 @@ VERSION_REGISTRY = {
             "top_k_relational": 4,
             "top_k_value": 6,
             "d_space": 64,
+            "coarse_k": 20,
+            "fine_k": 10,
             "knowledge_rank": 128,  # v15 default: 128 (larger matching space)
             "gradient_checkpointing": False,
         },
         "display_info": lambda args: [
-            f"DAWN v15: rank={args.get('rank', args.get('basis_rank'))} (Direct Knowledge Projection)",
+            f"DAWN v15: rank={args.get('rank', args.get('basis_rank'))} (2-Stage Knowledge Retrieval)",
             f"  FeatureNeurons (F): {args.get('n_feature')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} [Attn only]",
             f"  RelationalNeurons (R): {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K pool)",
             f"  ValueNeurons (V): {args.get('n_value')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V pool)",
-            f"  Unified Router: d_space={args.get('d_space', 64)} + SAR (Synaptic Activation Regulation)",
+            f"  Unified Router: d_space={args.get('d_space', 64)} + SAR + Knowledge",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
             f"  Top-k Feature: {args.get('top_k_feature', 8)}/{args.get('n_feature')}",
             f"  Top-k Relational: {args.get('top_k_relational', 4)}/{args.get('n_relational')}",
             f"  Top-k Value: {args.get('top_k_value', 6)}/{args.get('n_value')}",
             f"  Architecture: Mamba SSM → Context → Unified Router (SAR) → FlashAttn",
-            f"  Memory: x → proj_k → Q (direct, bypass Feature)",
+            f"  Memory: 2-stage (x→router→coarse_k, h→proj_q→fine_k)",
             f"  KnowledgeNeurons (K):",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
-            f"    - top-k: {args.get('knowledge_k')}",
+            f"    - coarse_k: {args.get('coarse_k', 20)} → fine_k: {args.get('fine_k', 10)}",
         ],
     },
 }

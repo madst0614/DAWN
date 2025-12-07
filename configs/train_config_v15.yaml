@@ -1,8 +1,8 @@
 # DAWN v15 Training Config
-# Direct Knowledge Projection (NeuronMemory bypasses Feature neurons)
-# F(eature), R(elational), T(ransfer), K(nowledge) neurons
+# 2-Stage Hierarchical Knowledge Retrieval
+# F(eature), R(elational), V(alue), K(nowledge) neurons
 
-# vs v14: Memory uses direct proj_k instead of Feature-weighted query
+# vs v14: NeuronMemory uses 2-stage retrieval (router coarse → h fine)
 
 # Data
 data:
@@ -21,12 +21,13 @@ model:
   rank: 64
   state_dim: 64
 
-  # FRTK Neurons
+  # FRVK Neurons
   n_feature: 12
   n_relational: 48
   n_value: 12
   n_knowledge: 80
-  knowledge_k: 10
+  coarse_k: 20                   # Stage 1: router-based candidate selection
+  fine_k: 10                     # Stage 2: h-based fine matching
   knowledge_rank: 128            # v15: 64 → 128 (larger matching space)
   max_seq_len: 128
   dropout: 0.1
@@ -62,6 +63,8 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v15
 log_dir: /content/drive/MyDrive/dawn/logs_v15
 
 # v15 Changes from v14:
-#   - NeuronMemory: x → proj_k → Q (bypass Feature neurons)
+#   - NeuronMemory: 2-stage hierarchical retrieval
+#     * Stage 1: x → router → top-coarse_k candidates
+#     * Stage 2: h → proj_q → similarity → top-fine_k
+#   - Knowledge neurons integrated into unified router space
 #   - knowledge_rank: 64 → 128 (larger matching space)
-#   - No memory routing (memory_weights removed)
