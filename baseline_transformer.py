@@ -176,8 +176,8 @@ class VanillaTransformer(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, labels=None, return_routing_info=False,
-                step=None, total_steps=None):
+    def forward(self, input_ids, labels=None, attention_mask=None,
+                return_routing_info=False, step=None, total_steps=None):
         B, S = input_ids.shape
 
         # Embeddings
@@ -185,9 +185,15 @@ class VanillaTransformer(nn.Module):
         x = self.token_emb(input_ids) + self.pos_emb(pos)
         x = self.dropout(x)
 
-        # Causal mask
-        mask = torch.tril(torch.ones(S, S, device=input_ids.device))
-        mask = mask.unsqueeze(0).unsqueeze(0)
+        # Causal mask + Pad mask
+        causal_mask = torch.tril(torch.ones(S, S, device=input_ids.device))
+
+        if attention_mask is not None:
+            # attention_mask: [B, S] -> [B, 1, 1, S]
+            pad_mask = attention_mask.unsqueeze(1).unsqueeze(2).float()
+            mask = causal_mask.unsqueeze(0) * pad_mask  # [B, 1, S, S]
+        else:
+            mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
 
         # Layers
         for layer in self.layers:
