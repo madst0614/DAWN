@@ -1,6 +1,5 @@
 # Vanilla Transformer Baseline - 20M Scale
-# Fair comparison with DAWN v13 12M + 500M tokens
-# Goal: Can 12M DAWN beat 20M Baseline?
+# Goal: v15 20M vs Baseline 20M - 동등 파라미터 비교
 
 # Data
 data:
@@ -23,7 +22,7 @@ model:
   max_seq_len: 512
   dropout: 0.1
 
-# Training (same as DAWN 11M)
+# Training (same as DAWN v15)
 training:
   batch_size: 96
   num_epochs: 3
@@ -47,6 +46,6 @@ log_dir: /content/drive/MyDrive/dawn/logs_baseline_20M_c4_500M
 #   Total: ~20.1M (weight tying)
 #
 # 비교:
-#   DAWN v15: 12.3M params
-#   Baseline: 20.1M params
-#   DAWN이 39% 적은 파라미터로 경쟁
+#   DAWN v15: ~20.7M params
+#   Baseline: ~20.1M params
+#   동등 파라미터에서 아키텍처 비교
