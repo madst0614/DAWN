@@ -19,12 +19,13 @@ model:
   rank: 64
   state_dim: 64
 
-  # FRTK Neurons
+  # FRVK Neurons
   n_feature: 36
   n_relational: 200
   n_value: 16
   n_knowledge: 300
-  knowledge_k: 20
+  coarse_k: 20                    # Stage 1: router → coarse candidates
+  fine_k: 10                      # Stage 2: knowledge_encoder → fine selection
   knowledge_rank: 128             # v15: 64 → 128 (larger matching space)
   max_seq_len: 512
   dropout: 0.1
@@ -56,6 +57,7 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v15_20M_c4_500M
 log_dir: /content/drive/MyDrive/dawn/logs_v15_20M_c4_500M
 
 # v15 Changes:
-#   - NeuronMemory: x → proj_k → Q (bypass Feature neurons)
+#   - 2-Stage Hierarchical Knowledge Retrieval
+#     * Stage 1: x → router → coarse_k candidates (Excitability)
+#     * Stage 2: x → knowledge_encoder (shared) → fine match → fine_k selection
 #   - knowledge_rank: 64 → 128 (larger matching space)
-#   - No memory routing (memory_weights removed)

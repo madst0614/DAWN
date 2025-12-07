@@ -1379,6 +1379,10 @@ def main():
     args.knowledge_k = cfg['model'].get('knowledge_k', 8)
     args.knowledge_rank = cfg['model'].get('knowledge_rank', None)  # None = use rank
 
+    # v15: 2-stage retrieval parameters
+    args.coarse_k = cfg['model'].get('coarse_k', 20)
+    args.fine_k = cfg['model'].get('fine_k', 10)
+
     # SSM parameters
     args.state_dim = cfg['model'].get('state_dim', 64)
 
@@ -1653,8 +1657,23 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version in ["14.0", "15.0"]:
-            # v14.0/v15.0: FRVK Architecture - defer to model.get_model_info()
+        if model_version == "15.0":
+            # v15.0: FRVK + 2-Stage Knowledge Retrieval
+            rank = args.basis_rank
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
+            n_feature = getattr(args, 'n_feature', 48)
+            n_relational = getattr(args, 'n_relational', 12)
+            n_value = getattr(args, 'n_value', 12)
+            n_knowledge = getattr(args, 'n_knowledge', 80)
+            coarse_k = getattr(args, 'coarse_k', 20)
+            fine_k = getattr(args, 'fine_k', 10)
+            print(f"DAWN v{model_version}: FRVK + 2-Stage Knowledge Retrieval")
+            print(f"  Feature/Relational/Value: {n_feature}/{n_relational}/{n_value}")
+            print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
+            print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
+            print(f"  (detailed info after model creation)")
+        elif model_version == "14.0":
+            # v14.0: FRVK Architecture
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or rank
             n_feature = getattr(args, 'n_feature', 48)
@@ -1882,15 +1901,34 @@ def main():
             'top_k_V': getattr(args, 'top_k_V', 6),
             'gradient_checkpointing': args.gradient_checkpointing,
         })
-    elif model_version in ['14.0', '15.0']:
-        # v14.0/v15.0: FRVK Architecture
+    elif model_version == '15.0':
+        # v15.0: FRVK + 2-Stage Knowledge Retrieval
+        model_kwargs.update({
+            'n_feature': getattr(args, 'n_feature', 48),
+            'n_relational': getattr(args, 'n_relational', 12),
+            'n_value': getattr(args, 'n_value', 12),
+            'n_knowledge': args.n_knowledge,
+            'coarse_k': args.coarse_k,
+            'fine_k': args.fine_k,
+            'knowledge_rank': args.knowledge_rank or 128,  # v15: 128 default
+            'rank': args.basis_rank,
+            'state_dim': getattr(args, 'state_dim', 64),
+            'top_k_feature': getattr(args, 'top_k_feature', 8),
+            'top_k_relational': getattr(args, 'top_k_relational', 4),
+            'top_k_value': getattr(args, 'top_k_value', 6),
+            'd_space': getattr(args, 'd_space', 64),
+            'router_dropout': getattr(args, 'router_dropout', 0.1),
+            'gradient_checkpointing': args.gradient_checkpointing,
+        })
+    elif model_version == '14.0':
+        # v14.0: FRVK Architecture
         model_kwargs.update({
             'n_feature': getattr(args, 'n_feature', 48),
             'n_relational': getattr(args, 'n_relational', 12),
             'n_value': getattr(args, 'n_value', 12),
             'n_knowledge': args.n_knowledge,
             'knowledge_k': args.knowledge_k,
-            'knowledge_rank': args.knowledge_rank,  # v15: 128 default
+            'knowledge_rank': args.knowledge_rank,
             'rank': args.basis_rank,
             'state_dim': getattr(args, 'state_dim', 64),
             'top_k_feature': getattr(args, 'top_k_feature', 8),
