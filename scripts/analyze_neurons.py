@@ -122,6 +122,9 @@ class VersionDetector:
         self.n_neurons = self._get_neuron_count()
 
     def _detect_version(self) -> str:
+        # v15: has knowledge_encoder (shared across layers)
+        if hasattr(self.model, 'knowledge_encoder'):
+            return '15'
         if hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
             router = self.model.global_routers.neuron_router
             if hasattr(router, 'usage_ema_feature'):
@@ -133,7 +136,7 @@ class VersionDetector:
         return '10'
 
     def _get_neuron_count(self) -> int:
-        if self.version == '14':
+        if self.version in ['14', '15']:
             return self.model.global_routers.neuron_router.n_feature
         elif hasattr(self.model, 'shared_neurons'):
             return self.model.shared_neurons.compress_neurons.shape[0]
@@ -1781,14 +1784,18 @@ def load_model_and_data(args):
 
     # Detect version
     path_str = str(checkpoint_path).lower()
-    if 'v14' in path_str:
+    if 'v15' in path_str:
+        version = '15.0'
+    elif 'v14' in path_str:
         version = '14.0'
     elif 'v13' in path_str:
         version = '13.0'
     else:
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         keys_str = ' '.join(state_dict.keys())
-        if 'feature_neurons' in keys_str:
+        if 'knowledge_encoder' in keys_str:
+            version = '15.0'
+        elif 'feature_neurons' in keys_str:
             version = '14.0'
         elif 'context_proj' in keys_str:
             version = '13.0'
@@ -1813,10 +1820,17 @@ def load_model_and_data(args):
         'dropout': config.get('dropout', 0.1),
     }
 
-    if version.startswith('12') or version.startswith('13') or version.startswith('14'):
+    if version.startswith('12') or version.startswith('13') or version.startswith('14') or version.startswith('15'):
         model_kwargs['state_dim'] = config.get('state_dim', 64)
 
-    if version.startswith('14'):
+    if version.startswith('15'):
+        model_kwargs['n_feature'] = config.get('n_feature', 48)
+        model_kwargs['n_relational'] = config.get('n_relational', 12)
+        model_kwargs['n_value'] = config.get('n_value', 12)
+        model_kwargs['knowledge_rank'] = config.get('knowledge_rank', 128)
+        model_kwargs['coarse_k'] = config.get('coarse_k', 20)
+        model_kwargs['fine_k'] = config.get('fine_k', 10)
+    elif version.startswith('14'):
         model_kwargs['n_feature'] = config.get('n_feature', config.get('n_compress', 48))
         model_kwargs['n_relational'] = config.get('n_relational', config.get('n_expand', 12))
         model_kwargs['n_transfer'] = config.get('n_transfer', config.get('n_expand', 12))
