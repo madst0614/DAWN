@@ -1226,6 +1226,540 @@ class ContextDependency:
 
 
 # ============================================================
+# 10. Semantic Path Similarity
+# ============================================================
+
+class SemanticPathAnalyzer:
+    """의미 유사도 vs 경로 유사도 상관관계 분석"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+
+    @torch.no_grad()
+    def get_path(self, text: str) -> Dict:
+        """텍스트의 뉴런 경로 추출"""
+        self.model.eval()
+
+        tokens = self.tokenizer.encode(text, add_special_tokens=True)
+        input_ids = torch.tensor([tokens], device=self.device)
+
+        _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+        path = {
+            'feature': [],
+            'relational_Q': [],
+            'relational_K': [],
+            'value': [],
+            'knowledge_coarse': [],
+            'knowledge_fine': [],
+        }
+
+        for layer_idx, routing_info in enumerate(routing_infos):
+            attn = routing_info.get('attention', {})
+            mem = routing_info.get('memory', {})
+
+            # Feature weights
+            if 'feature_pref' in attn:
+                weights = attn['feature_pref']
+                if weights.dim() == 3:
+                    weights = weights.mean(dim=1)
+                path['feature'].append(weights[0].cpu().numpy())
+            elif 'feature_weights' in attn:
+                path['feature'].append(attn['feature_weights'][0].cpu().numpy())
+
+            # Relational Q/K
+            if 'relational_weights_Q' in attn:
+                path['relational_Q'].append(attn['relational_weights_Q'][0].cpu().numpy())
+            if 'relational_weights_K' in attn:
+                path['relational_K'].append(attn['relational_weights_K'][0].cpu().numpy())
+
+            # Value
+            if 'value_weights' in attn:
+                path['value'].append(attn['value_weights'][0].cpu().numpy())
+
+            # Knowledge (v15 2-stage)
+            if 'coarse_indices' in mem:
+                path['knowledge_coarse'].append(mem['coarse_indices'][0].cpu().numpy())
+            if 'fine_indices' in mem:
+                path['knowledge_fine'].append(mem['fine_indices'][0].cpu().numpy())
+
+        return path
+
+    def path_similarity(self, path1: Dict, path2: Dict) -> Dict:
+        """두 경로 간 유사도 계산"""
+        similarities = {}
+
+        for key in ['feature', 'relational_Q', 'relational_K', 'value']:
+            if path1.get(key) and path2.get(key):
+                sims = []
+                for w1, w2 in zip(path1[key], path2[key]):
+                    w1_flat = w1.flatten() if len(w1.shape) > 1 else w1
+                    w2_flat = w2.flatten() if len(w2.shape) > 1 else w2
+                    cos_sim = np.dot(w1_flat, w2_flat) / (np.linalg.norm(w1_flat) * np.linalg.norm(w2_flat) + 1e-8)
+                    sims.append(cos_sim)
+                similarities[key] = float(np.mean(sims))
+
+        # Knowledge: Jaccard similarity (set overlap)
+        for key in ['knowledge_coarse', 'knowledge_fine']:
+            if path1.get(key) and path2.get(key):
+                jaccards = []
+                for idx1, idx2 in zip(path1[key], path2[key]):
+                    set1 = set(idx1.flatten().tolist())
+                    set2 = set(idx2.flatten().tolist())
+                    jaccard = len(set1 & set2) / len(set1 | set2) if set1 | set2 else 0
+                    jaccards.append(jaccard)
+                similarities[key] = float(np.mean(jaccards))
+
+        if similarities:
+            similarities['overall'] = float(np.mean(list(similarities.values())))
+
+        return similarities
+
+    def analyze_pairs(self, text_pairs: List[Tuple[str, str, str]]) -> Dict:
+        """텍스트 쌍들의 경로 유사도 분석"""
+        print(f"\n{'='*60}")
+        print(f"SEMANTIC PATH SIMILARITY ANALYSIS")
+        print(f"{'='*60}")
+
+        results = {'pairs': [], 'summary': {}}
+
+        for text1, text2, relation in text_pairs:
+            path1 = self.get_path(text1)
+            path2 = self.get_path(text2)
+
+            sim = self.path_similarity(path1, path2)
+
+            results['pairs'].append({
+                'text1': text1,
+                'text2': text2,
+                'relation': relation,
+                'similarity': sim,
+            })
+
+            print(f"\n[{relation}]")
+            print(f"  '{text1}'")
+            print(f"  '{text2}'")
+            print(f"  → Overall: {sim.get('overall', 0):.4f}")
+            for k, v in sim.items():
+                if k != 'overall':
+                    print(f"     {k}: {v:.4f}")
+
+        # Summary by relation type
+        by_relation = defaultdict(list)
+        for pair in results['pairs']:
+            by_relation[pair['relation']].append(pair['similarity'].get('overall', 0))
+
+        print(f"\n--- Summary by Relation ---")
+        for relation, sims in by_relation.items():
+            avg = np.mean(sims)
+            results['summary'][relation] = float(avg)
+            print(f"  {relation}: {avg:.4f} (n={len(sims)})")
+
+        return results
+
+    def run_default_analysis(self) -> Dict:
+        """기본 예시들로 분석 실행"""
+        similar_pairs = [
+            ("The cat sleeps on the bed.", "The dog rests on the couch.", "similar"),
+            ("She bought a new car.", "He purchased a new vehicle.", "similar"),
+            ("The child is happy.", "The kid is joyful.", "similar"),
+        ]
+
+        different_pairs = [
+            ("The cat sleeps on the bed.", "Stock prices rose sharply.", "different"),
+            ("She bought a new car.", "The algorithm converges quickly.", "different"),
+            ("The child is happy.", "Quantum mechanics is complex.", "different"),
+        ]
+
+        polysemy_pairs = [
+            ("I deposited money at the bank.", "I sat on the river bank.", "polysemy_bank"),
+            ("The bat flew at night.", "He swung the bat hard.", "polysemy_bat"),
+        ]
+
+        all_pairs = similar_pairs + different_pairs + polysemy_pairs
+        return self.analyze_pairs(all_pairs)
+
+
+# ============================================================
+# 11. Semantic Category Neuron Mapping
+# ============================================================
+
+class SemanticCategoryAnalyzer:
+    """의미 카테고리별 뉴런 활성화 분석"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+
+        self.categories = {
+            'animals': ['cat', 'dog', 'bird', 'fish', 'horse', 'elephant', 'tiger', 'lion', 'bear', 'rabbit'],
+            'food': ['pizza', 'pasta', 'bread', 'rice', 'apple', 'banana', 'chicken', 'beef', 'soup', 'salad'],
+            'emotions': ['happy', 'sad', 'angry', 'afraid', 'excited', 'worried', 'calm', 'anxious', 'proud', 'lonely'],
+            'colors': ['red', 'blue', 'green', 'yellow', 'black', 'white', 'orange', 'purple', 'pink', 'brown'],
+            'numbers': ['one', 'two', 'three', 'four', 'five', 'ten', 'hundred', 'thousand', 'first', 'second'],
+            'actions': ['run', 'walk', 'eat', 'sleep', 'read', 'write', 'speak', 'listen', 'think', 'work'],
+            'places': ['house', 'school', 'office', 'hospital', 'park', 'beach', 'mountain', 'city', 'country', 'room'],
+            'time': ['today', 'tomorrow', 'yesterday', 'morning', 'evening', 'night', 'week', 'month', 'year', 'hour'],
+            'tech': ['computer', 'phone', 'internet', 'software', 'algorithm', 'data', 'network', 'server', 'code', 'system'],
+            'nature': ['tree', 'flower', 'river', 'ocean', 'sky', 'cloud', 'rain', 'sun', 'moon', 'star'],
+        }
+
+    @torch.no_grad()
+    def get_word_activations(self, word: str, n_contexts: int = 5) -> np.ndarray:
+        """단어의 평균 뉴런 활성화 추출"""
+        self.model.eval()
+
+        contexts = [
+            f"The {word} is here.",
+            f"I see a {word}.",
+            f"This is about {word}.",
+            f"Look at the {word}.",
+            f"There is a {word} nearby.",
+        ][:n_contexts]
+
+        all_activations = []
+
+        for ctx in contexts:
+            tokens = self.tokenizer.encode(ctx, add_special_tokens=True)
+            input_ids = torch.tensor([tokens], device=self.device)
+
+            token_strs = [self.tokenizer.decode([t]).strip().lower() for t in tokens]
+            try:
+                word_pos = token_strs.index(word.lower())
+            except ValueError:
+                continue
+
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            weights, _ = self.detector.get_weights_from_routing(routing_infos[0])
+            if weights is None:
+                continue
+
+            if weights.dim() == 3:
+                act = weights[0, word_pos].cpu().numpy()
+            else:
+                act = weights[0].cpu().numpy()
+
+            all_activations.append(act)
+
+        if all_activations:
+            return np.mean(all_activations, axis=0)
+        return None
+
+    def analyze_categories(self) -> Dict:
+        """카테고리별 뉴런 활성화 분석"""
+        print(f"\n{'='*60}")
+        print(f"SEMANTIC CATEGORY NEURON ANALYSIS")
+        print(f"{'='*60}")
+
+        results = {
+            'category_activations': {},
+            'category_top_neurons': {},
+            'neuron_categories': {},
+            'category_separation': {},
+        }
+
+        category_acts = {}
+
+        for category, words in tqdm(self.categories.items(), desc="Analyzing categories"):
+            word_acts = []
+            for word in words:
+                act = self.get_word_activations(word)
+                if act is not None:
+                    word_acts.append(act)
+
+            if word_acts:
+                category_acts[category] = np.mean(word_acts, axis=0)
+
+                top_k = 5
+                top_neurons = np.argsort(category_acts[category])[-top_k:][::-1]
+                results['category_top_neurons'][category] = top_neurons.tolist()
+
+        results['category_activations'] = {k: v.tolist() for k, v in category_acts.items()}
+
+        # 뉴런별 주요 카테고리 매핑
+        if category_acts:
+            n_neurons = len(list(category_acts.values())[0])
+            for n in range(n_neurons):
+                neuron_scores = {cat: acts[n] for cat, acts in category_acts.items()}
+                top_cat = max(neuron_scores, key=neuron_scores.get)
+                results['neuron_categories'][n] = {
+                    'primary': top_cat,
+                    'score': float(neuron_scores[top_cat]),
+                }
+
+        # 카테고리 간 분리도
+        categories = list(category_acts.keys())
+        for i, cat1 in enumerate(categories):
+            for cat2 in categories[i+1:]:
+                v1, v2 = category_acts[cat1], category_acts[cat2]
+                cos_sim = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
+                results['category_separation'][f"{cat1}_vs_{cat2}"] = float(1 - cos_sim)
+
+        # Print summary
+        print(f"\n--- Top Neurons by Category ---")
+        for cat, neurons in results['category_top_neurons'].items():
+            print(f"  {cat}: {neurons}")
+
+        print(f"\n--- Category Separation (higher = more separated) ---")
+        separations = list(results['category_separation'].items())
+        separations.sort(key=lambda x: x[1], reverse=True)
+        for pair, sep in separations[:5]:
+            print(f"  {pair}: {sep:.4f}")
+
+        return results
+
+    def visualize(self, results: Dict, output_path: str):
+        """카테고리-뉴런 히트맵 시각화"""
+        if not HAS_MATPLOTLIB or not results.get('category_activations'):
+            return
+
+        categories = list(results['category_activations'].keys())
+        activations = np.array([results['category_activations'][c] for c in categories])
+
+        fig, ax = plt.subplots(figsize=(14, 8))
+        im = ax.imshow(activations, aspect='auto', cmap='YlOrRd')
+
+        ax.set_yticks(range(len(categories)))
+        ax.set_yticklabels(categories)
+        ax.set_xlabel('Neuron ID')
+        ax.set_ylabel('Semantic Category')
+        ax.set_title('Neuron Activation by Semantic Category')
+
+        plt.colorbar(im, label='Average Activation')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"Saved: {output_path}")
+
+
+# ============================================================
+# 12. Knowledge Neuron Content Analysis
+# ============================================================
+
+class KnowledgeNeuronAnalyzer:
+    """v15 Knowledge Neuron 내용 분석"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+
+    @torch.no_grad()
+    def collect_knowledge_activations(self, dataloader, max_batches: int = 50) -> Dict:
+        """Knowledge neuron별 활성화 문맥 수집"""
+        print(f"\n{'='*60}")
+        print(f"KNOWLEDGE NEURON CONTENT ANALYSIS")
+        print(f"{'='*60}")
+
+        self.model.eval()
+
+        knowledge_contexts = defaultdict(list)
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Collecting knowledge activations", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+            B, S = input_ids.shape
+
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            for layer_idx, routing_info in enumerate(routing_infos):
+                mem = routing_info.get('memory', {})
+
+                if 'fine_indices' not in mem or 'fine_weights' not in mem:
+                    continue
+
+                fine_indices = mem['fine_indices'].cpu().numpy()
+                fine_weights = mem['fine_weights'].cpu().numpy()
+
+                for b in range(B):
+                    tokens = input_ids[b].cpu().tolist()
+                    context = self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+                    for s in range(S):
+                        token_str = self.tokenizer.decode([tokens[s]]).strip()
+
+                        for k_idx, k_weight in zip(fine_indices[b, s], fine_weights[b, s]):
+                            if k_weight > 0.1:
+                                knowledge_contexts[int(k_idx)].append({
+                                    'context': context,
+                                    'token': token_str,
+                                    'position': s,
+                                    'weight': float(k_weight),
+                                    'layer': layer_idx,
+                                })
+
+        return dict(knowledge_contexts)
+
+    def analyze_knowledge_content(self, knowledge_contexts: Dict, top_n: int = 10) -> Dict:
+        """Knowledge neuron별 공통 패턴 분석"""
+        results = {'neurons': {}, 'summary': {}}
+
+        for k_id, contexts in knowledge_contexts.items():
+            if len(contexts) < 5:
+                continue
+
+            token_counts = Counter([c['token'].lower() for c in contexts])
+            top_tokens = token_counts.most_common(top_n)
+
+            avg_weight = np.mean([c['weight'] for c in contexts])
+            layer_dist = Counter([c['layer'] for c in contexts])
+
+            results['neurons'][k_id] = {
+                'n_activations': len(contexts),
+                'top_tokens': top_tokens,
+                'avg_weight': float(avg_weight),
+                'layer_distribution': dict(layer_dist),
+                'example_contexts': [c['context'][:100] for c in contexts[:3]],
+            }
+
+        total_neurons = len(results['neurons'])
+        if total_neurons > 0:
+            avg_activations = np.mean([n['n_activations'] for n in results['neurons'].values()])
+            results['summary'] = {
+                'analyzed_neurons': total_neurons,
+                'avg_activations_per_neuron': float(avg_activations),
+            }
+
+        print(f"\n--- Knowledge Neuron Analysis ---")
+        print(f"Analyzed {total_neurons} neurons")
+
+        sorted_neurons = sorted(results['neurons'].items(), key=lambda x: x[1]['n_activations'], reverse=True)
+
+        print(f"\n--- Most Active Knowledge Neurons ---")
+        for k_id, data in sorted_neurons[:5]:
+            tokens = [t for t, _ in data['top_tokens'][:5]]
+            print(f"  K_{k_id}: {data['n_activations']} activations")
+            print(f"    Top tokens: {tokens}")
+
+        return results
+
+    def run_analysis(self, dataloader, max_batches: int = 50) -> Dict:
+        """전체 분석 실행"""
+        contexts = self.collect_knowledge_activations(dataloader, max_batches)
+        return self.analyze_knowledge_content(contexts)
+
+
+# ============================================================
+# 13. Cross-layer Semantic Consistency
+# ============================================================
+
+class CrossLayerConsistencyAnalyzer:
+    """레이어 간 의미 표현 일관성 분석"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+        self.n_layers = self.model.n_layers
+
+    @torch.no_grad()
+    def analyze_consistency(self, dataloader, max_batches: int = 30) -> Dict:
+        """레이어 간 뉴런 활성화 일관성 분석"""
+        print(f"\n{'='*60}")
+        print(f"CROSS-LAYER CONSISTENCY ANALYSIS")
+        print(f"{'='*60}")
+
+        self.model.eval()
+
+        layer_correlations = defaultdict(list)
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Analyzing layers", total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            input_ids = batch["input_ids"].to(self.device)
+
+            _, routing_infos = self.model(input_ids, return_routing_info=True)
+
+            layer_weights = []
+            for routing_info in routing_infos:
+                weights, _ = self.detector.get_weights_from_routing(routing_info)
+                if weights is not None:
+                    if weights.dim() == 3:
+                        weights = weights.mean(dim=1)
+                    layer_weights.append(weights.cpu().numpy())
+
+            for i in range(len(layer_weights)):
+                for j in range(i+1, len(layer_weights)):
+                    for b in range(layer_weights[i].shape[0]):
+                        corr = np.corrcoef(layer_weights[i][b], layer_weights[j][b])[0, 1]
+                        if not np.isnan(corr):
+                            layer_correlations[(i, j)].append(corr)
+
+        results = {
+            'layer_pairs': {},
+            'summary': {},
+        }
+
+        correlation_matrix = np.zeros((self.n_layers, self.n_layers))
+
+        for (i, j), corrs in layer_correlations.items():
+            avg_corr = float(np.mean(corrs))
+            results['layer_pairs'][f"L{i}_L{j}"] = {
+                'correlation': avg_corr,
+                'std': float(np.std(corrs)),
+                'n_samples': len(corrs),
+            }
+            correlation_matrix[i, j] = avg_corr
+            correlation_matrix[j, i] = avg_corr
+
+        np.fill_diagonal(correlation_matrix, 1.0)
+        results['correlation_matrix'] = correlation_matrix.tolist()
+
+        adjacent_corrs = [results['layer_pairs'].get(f"L{i}_L{i+1}", {}).get('correlation', 0)
+                         for i in range(self.n_layers - 1)]
+        distant_corrs = [results['layer_pairs'].get(f"L0_L{self.n_layers-1}", {}).get('correlation', 0)]
+
+        results['summary'] = {
+            'avg_adjacent_correlation': float(np.mean(adjacent_corrs)) if adjacent_corrs else 0,
+            'first_last_correlation': distant_corrs[0] if distant_corrs else 0,
+        }
+
+        print(f"\n--- Layer Pair Correlations ---")
+        for pair, data in sorted(results['layer_pairs'].items()):
+            print(f"  {pair}: {data['correlation']:.4f} (±{data['std']:.4f})")
+
+        print(f"\n--- Summary ---")
+        print(f"  Adjacent layers avg: {results['summary']['avg_adjacent_correlation']:.4f}")
+        print(f"  First-Last correlation: {results['summary']['first_last_correlation']:.4f}")
+
+        return results
+
+    def visualize(self, results: Dict, output_path: str):
+        """레이어 상관관계 히트맵"""
+        if not HAS_MATPLOTLIB or 'correlation_matrix' not in results:
+            return
+
+        corr_matrix = np.array(results['correlation_matrix'])
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        im = ax.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+
+        ax.set_xticks(range(len(corr_matrix)))
+        ax.set_yticks(range(len(corr_matrix)))
+        ax.set_xticklabels([f'L{i}' for i in range(len(corr_matrix))])
+        ax.set_yticklabels([f'L{i}' for i in range(len(corr_matrix))])
+
+        ax.set_title('Cross-Layer Neuron Activation Correlation')
+        plt.colorbar(im, label='Correlation')
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"Saved: {output_path}")
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1343,7 +1877,8 @@ def main():
     parser.add_argument('--mode', type=str, default='all',
                         choices=['all', 'word_map', 'cluster', 'similarity',
                                 'ablation', 'probe', 'layer', 'trajectory',
-                                'distribution', 'context'])
+                                'distribution', 'context',
+                                'semantic_path', 'semantic_category', 'knowledge_content', 'cross_layer'])
     parser.add_argument('--max_batches', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_workers', type=int, default=4)
@@ -1422,6 +1957,37 @@ def main():
         ]
         results = ctx_analyzer.analyze_word("bank", contexts)
         all_results['context'] = results
+
+    # 10. Semantic Path Similarity
+    if args.mode in ['all', 'semantic_path']:
+        path_analyzer = SemanticPathAnalyzer(model, tokenizer, device)
+        results = path_analyzer.run_default_analysis()
+        all_results['semantic_path'] = results
+
+    # 11. Semantic Category
+    if args.mode in ['all', 'semantic_category']:
+        cat_analyzer = SemanticCategoryAnalyzer(model, tokenizer, device)
+        results = cat_analyzer.analyze_categories()
+        cat_analyzer.visualize(results, os.path.join(args.output_dir, 'category_neurons.png'))
+        all_results['semantic_category'] = {
+            'category_top_neurons': results['category_top_neurons'],
+            'category_separation': results['category_separation'],
+        }
+
+    # 12. Knowledge Neuron Content (v15)
+    if args.mode in ['all', 'knowledge_content'] and dataloader:
+        base_model = get_underlying_model(model)
+        if hasattr(base_model, 'knowledge_encoder'):
+            knowledge_analyzer = KnowledgeNeuronAnalyzer(model, tokenizer, device)
+            results = knowledge_analyzer.run_analysis(dataloader, args.max_batches)
+            all_results['knowledge_content'] = results
+
+    # 13. Cross-layer Consistency
+    if args.mode in ['all', 'cross_layer'] and dataloader:
+        cross_analyzer = CrossLayerConsistencyAnalyzer(model, tokenizer, device)
+        results = cross_analyzer.analyze_consistency(dataloader, args.max_batches)
+        cross_analyzer.visualize(results, os.path.join(args.output_dir, 'cross_layer.png'))
+        all_results['cross_layer'] = results
 
     # Save results
     results_path = os.path.join(args.output_dir, 'neuron_analysis.json')
