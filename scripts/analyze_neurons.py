@@ -360,7 +360,7 @@ class NeuronClusterer:
         """Extract neuron weight vectors"""
         shared = self.model.shared_neurons
 
-        if self.detector.version == '14':
+        if self.detector.version in ['14', '15']:
             neurons = shared.feature_neurons.data.cpu().numpy()
         else:
             neurons = shared.compress_neurons.data.cpu().numpy()
@@ -467,7 +467,7 @@ class NeuronSimilarityAnalyzer:
         shared = self.model.shared_neurons
 
         # Get neurons on GPU
-        if self.detector.version == '14':
+        if self.detector.version in ['14', '15']:
             neurons = shared.feature_neurons.data
         else:
             neurons = shared.compress_neurons.data
@@ -588,7 +588,7 @@ class NeuronAblation:
 
         # Ablate each neuron
         shared = self.model.shared_neurons
-        if self.detector.version == '14':
+        if self.detector.version in ['14', '15']:
             neurons = shared.feature_neurons
         else:
             neurons = shared.compress_neurons
