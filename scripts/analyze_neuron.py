@@ -491,7 +491,7 @@ class DAWNNeuronAnalyzer:
 
         return results
 
-    def run_full_analysis(self, dataloader, num_batches=50, max_seq_len=128, save_path=None):
+    def run_full_analysis(self, dataloader, num_batches=50, max_seq_len=128, save_path=None, skip_pos=False):
         """Run complete analysis"""
         results = {
             'neuron_id': self.neuron_id,
@@ -508,9 +508,13 @@ class DAWNNeuronAnalyzer:
         results['activation_patterns'] = self.analyze_activation_patterns(
             dataloader, num_batches=num_batches, max_seq_len=max_seq_len)
 
-        # 3. POS analysis
-        results['pos_analysis'] = self.analyze_pos_patterns(
-            dataloader, num_batches=num_batches//2, max_seq_len=max_seq_len)
+        # 3. POS analysis (optional, slow)
+        if skip_pos:
+            print("\n[Skipping POS analysis (--skip-pos)]")
+            results['pos_analysis'] = None
+        else:
+            results['pos_analysis'] = self.analyze_pos_patterns(
+                dataloader, num_batches=num_batches//2, max_seq_len=max_seq_len)
 
         # 4. Context sensitivity
         results['context_analysis'] = self.analyze_context_sensitivity()
@@ -539,6 +543,7 @@ def main():
     parser.add_argument('--max_seq_len', type=int, default=128)
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--skip-pos', action='store_true', help='Skip POS analysis (slow)')
 
     args = parser.parse_args()
 
@@ -585,7 +590,8 @@ def main():
         dataloader,
         num_batches=args.num_batches,
         max_seq_len=args.max_seq_len,
-        save_path=output_path
+        save_path=output_path,
+        skip_pos=args.skip_pos
     )
 
     print(f"\n{'='*60}")
