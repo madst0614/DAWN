@@ -129,15 +129,25 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits
 
-    def update_usage(self, weights, neuron_type):
+    def update_usage(self, weights, neuron_type, attention_mask=None):
         """top-k 후 선택된 뉴런 사용량 업데이트"""
         if not self.training:
             return
 
         # weights: [B, N] or [B, S, N]
         if weights.dim() == 3:
-            usage = (weights > 0).float().mean(dim=[0, 1])
+            # [B, S, N]
+            active = (weights > 0).float()
+            if attention_mask is not None:
+                # attention_mask: [B, S] → [B, S, 1]
+                mask = attention_mask.unsqueeze(-1).float()
+                active = active * mask
+                count = mask.sum() + 1e-8
+                usage = active.sum(dim=[0, 1]) / count
+            else:
+                usage = active.mean(dim=[0, 1])
         else:
+            # [B, N] - batch-level routing
             usage = (weights > 0).float().mean(dim=0)
 
         if neuron_type == 'feature':
@@ -242,10 +252,11 @@ class GlobalSSM(nn.Module):
         nn.init.normal_(self.context_proj.weight, std=0.02)
         nn.init.normal_(self.importance_proj.weight, std=0.02)
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         """
         Args:
             x: [B, S, d_model]
+            attention_mask: [B, S] optional, 1=valid, 0=pad
         Returns:
             importance: [B, S]
             context: [B, S, d_model]
@@ -294,7 +305,13 @@ class GlobalSSM(nn.Module):
         h_final = ssm_out[:, -1, :]  # [B, d_model]
         h_proj = self.importance_proj(h_final)  # [B, d_model]
         raw_importance = torch.einsum('bsd,bd->bs', x, h_proj)  # [B, S] - before softmax
-        importance = F.softmax(raw_importance / self.importance_temperature, dim=-1)
+
+        if attention_mask is not None:
+            # Mask pad positions with -inf so softmax gives 0
+            masked_importance = raw_importance.masked_fill(attention_mask == 0, float('-inf'))
+            importance = F.softmax(masked_importance / self.importance_temperature, dim=-1)
+        else:
+            importance = F.softmax(raw_importance / self.importance_temperature, dim=-1)
 
         # Context enhancement (optional, for memory savings)
         if self.return_context:
@@ -369,9 +386,14 @@ class GlobalRouters(nn.Module):
         sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-8)
         return sparse_weights, topk_idx
 
-    def get_attention_weights(self, x, importance):
+    def get_attention_weights(self, x, importance, attention_mask=None):
         """
         Compute attention routing weights with Top-k sparsification
+
+        Args:
+            x: [B, S, D]
+            importance: [B, S]
+            attention_mask: [B, S] optional, 1=valid, 0=pad
 
         Returns: feature_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
         """
@@ -389,22 +411,27 @@ class GlobalRouters(nn.Module):
         # Compute aux_loss (load balance) directly here
         aux_loss = 0.0
         if self.training:
-            # Feature
-            usage_F = feature_pref.mean(dim=(0, 1))
+            if attention_mask is not None:
+                # Masked mean: [B, S] → [B, S, 1]
+                mask = attention_mask.unsqueeze(-1).float()
+                count = mask.sum() + 1e-8
+                usage_F = (feature_pref * mask).sum(dim=(0, 1)) / count
+                usage_Q = (relational_pref_Q * mask).sum(dim=(0, 1)) / count
+                usage_K = (relational_pref_K * mask).sum(dim=(0, 1)) / count
+                usage_V = (value_pref * mask).sum(dim=(0, 1)) / count
+            else:
+                usage_F = feature_pref.mean(dim=(0, 1))
+                usage_Q = relational_pref_Q.mean(dim=(0, 1))
+                usage_K = relational_pref_K.mean(dim=(0, 1))
+                usage_V = value_pref.mean(dim=(0, 1))
+
             target_F = 1.0 / self.n_feature
             aux_loss = aux_loss + ((usage_F - target_F) ** 2).sum() * self.n_feature
 
-            # Relational Q
-            usage_Q = relational_pref_Q.mean(dim=(0, 1))
             target_R = 1.0 / self.n_relational
             aux_loss = aux_loss + ((usage_Q - target_R) ** 2).sum() * self.n_relational
-
-            # Relational K
-            usage_K = relational_pref_K.mean(dim=(0, 1))
             aux_loss = aux_loss + ((usage_K - target_R) ** 2).sum() * self.n_relational
 
-            # Value
-            usage_V = value_pref.mean(dim=(0, 1))
             target_V = 1.0 / self.n_value
             aux_loss = aux_loss + ((usage_V - target_V) ** 2).sum() * self.n_value
 
@@ -451,12 +478,12 @@ class GlobalRouters(nn.Module):
 
         # Update usage statistics
         if self.training:
-            self.neuron_router.update_usage(feature_weights, 'feature')
-            self.neuron_router.update_usage(value_weights, 'value')
+            self.neuron_router.update_usage(feature_weights, 'feature', attention_mask)
+            self.neuron_router.update_usage(value_weights, 'value', attention_mask)
 
             # Relational: Q OR K에서 선택되면 사용된 것으로 카운트
             relational_used = ((relational_weights_Q > 0) | (relational_weights_K > 0)).float()
-            self.neuron_router.update_usage(relational_used, 'relational')
+            self.neuron_router.update_usage(relational_used, 'relational', attention_mask)
 
         return feature_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
 
@@ -482,7 +509,7 @@ class NeuronCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, feature_weights, relational_weights_Q, relational_weights_K, value_weights):
+    def forward(self, x, feature_weights, relational_weights_Q, relational_weights_K, value_weights, attention_mask=None):
         """
         Args:
             x: [B, S, D]
@@ -490,6 +517,7 @@ class NeuronCircuit(nn.Module):
             relational_weights_Q: [B, N_R] or [B, S, N_R] - Q router weights (uses Relational pool)
             relational_weights_K: [B, N_R] or [B, S, N_R] - K router weights (uses Relational pool)
             value_weights: [B, N_V] or [B, S, N_V] - V router weights (uses Value pool)
+            attention_mask: [B, S] optional, 1=valid, 0=pad
         """
         B, S, D = x.shape
         token_routing = feature_weights.dim() == 3  # [B, S, N] vs [B, N]
@@ -539,11 +567,24 @@ class NeuronCircuit(nn.Module):
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
         # FlashAttention via PyTorch 2.0+
-        attn_out = F.scaled_dot_product_attention(
-            Q, K, V,
-            is_causal=True,
-            dropout_p=self.attn_dropout.p if self.training else 0.0
-        )
+        if attention_mask is not None:
+            # Combine causal mask with padding mask
+            # Causal: [S, S], Padding: [B, 1, 1, S]
+            causal_mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1)
+            pad_mask = (attention_mask == 0).view(B, 1, 1, S)  # [B, 1, 1, S]
+            # Combined: attend where causal allows AND not padding
+            combined_mask = causal_mask.unsqueeze(0).unsqueeze(0) | pad_mask  # True = mask out
+            attn_out = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=~combined_mask,  # PyTorch wants True=attend
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                Q, K, V,
+                is_causal=True,
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.d_model)
 
         # 6. Output projection
@@ -673,12 +714,12 @@ class DAWNBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder):
+    def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder, attention_mask=None):
         normed_x = self.norm1(x)
         feature_w, relational_Q, relational_K, value_w, attn_routing, attn_aux_loss = \
-            global_routers.get_attention_weights(normed_x, importance)
+            global_routers.get_attention_weights(normed_x, importance, attention_mask)
 
-        attn_out, _ = self.attn(normed_x, feature_w, relational_Q, relational_K, value_w)
+        attn_out, _ = self.attn(normed_x, feature_w, relational_Q, relational_K, value_w, attention_mask)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
@@ -822,11 +863,12 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, input_ids, labels=None, return_routing_info=False):
+    def forward(self, input_ids, labels=None, attention_mask=None, return_routing_info=False):
         """
         Args:
             input_ids: [B, S] token ids
             labels: [B, S] labels for loss calculation
+            attention_mask: [B, S] optional, 1=valid, 0=pad
             return_routing_info: whether to return routing info
         """
         B, S = input_ids.shape
@@ -843,20 +885,20 @@ class DAWN(nn.Module):
             # Selective SSM: importance + context (recalculated per layer)
             if self.gradient_checkpointing and self.training:
                 importance, context, raw_importance = checkpoint(
-                    self.global_ssm, x, use_reentrant=False
+                    self.global_ssm, x, attention_mask, use_reentrant=False
                 )
             else:
-                importance, context, raw_importance = self.global_ssm(x)
+                importance, context, raw_importance = self.global_ssm(x, attention_mask)
             if context is not None:
                 x = x + context
 
             if self.gradient_checkpointing and self.training:
                 x, routing_info, layer_aux_loss = checkpoint(
-                    layer, x, importance, self.global_routers, self.knowledge_encoder,
+                    layer, x, importance, self.global_routers, self.knowledge_encoder, attention_mask,
                     use_reentrant=False
                 )
             else:
-                x, routing_info, layer_aux_loss = layer(x, importance, self.global_routers, self.knowledge_encoder)
+                x, routing_info, layer_aux_loss = layer(x, importance, self.global_routers, self.knowledge_encoder, attention_mask)
 
             # Accumulate aux_loss
             self.aux_loss = self.aux_loss + layer_aux_loss
