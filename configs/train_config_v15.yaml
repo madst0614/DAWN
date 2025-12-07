@@ -65,6 +65,6 @@ log_dir: /content/drive/MyDrive/dawn/logs_v15
 # v15 Changes from v14:
 #   - NeuronMemory: 2-stage hierarchical retrieval
 #     * Stage 1: x → router → coarse_k candidates (Excitability)
-#     * Stage 2: x → proj_q → fine match → fine_k selection
+#     * Stage 2: x → knowledge_encoder (shared) → fine match → fine_k selection
 #   - Knowledge neurons integrated into unified router space
 #   - knowledge_rank: 64 → 128 (larger matching space)
