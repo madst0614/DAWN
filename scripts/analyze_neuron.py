@@ -290,32 +290,36 @@ class DAWNNeuronAnalyzer:
                 h = torch.einsum('bsd,dr->bsr', x, W_n)
                 activation_norm = h.norm(dim=-1).cpu()  # [B, S]
 
-                # Get POS tags
-                for b in range(B):
-                    text = self.tokenizer.decode(input_ids[b].cpu().tolist(), skip_special_tokens=True)
-                    tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b].cpu().tolist())
+                # Batch decode texts
+                input_ids_cpu = input_ids.cpu()
+                texts = [self.tokenizer.decode(input_ids_cpu[b].tolist(), skip_special_tokens=True) for b in range(B)]
+                all_tokens = [self.tokenizer.convert_ids_to_tokens(input_ids_cpu[b].tolist()) for b in range(B)]
 
-                    try:
-                        doc = nlp(text)
-                        spacy_tokens = [(t.text, t.pos_) for t in doc]
+                # Batch POS tagging with nlp.pipe()
+                try:
+                    docs = list(nlp.pipe(texts, batch_size=256))
+                except:
+                    continue
 
-                        # Align (approximate)
-                        for s, bert_token in enumerate(tokens):
-                            if bert_token in ['[CLS]', '[SEP]', '[PAD]', '[UNK]']:
-                                continue
+                for b, doc in enumerate(docs):
+                    tokens = all_tokens[b]
+                    spacy_tokens = [(t.text, t.pos_) for t in doc]
 
-                            # Find closest spaCy token
-                            clean_token = bert_token.replace('##', '')
-                            pos = 'X'
-                            for sp_text, sp_pos in spacy_tokens:
-                                if clean_token.lower() in sp_text.lower() or sp_text.lower() in clean_token.lower():
-                                    pos = sp_pos
-                                    break
+                    # Align (approximate)
+                    for s, bert_token in enumerate(tokens):
+                        if bert_token in ['[CLS]', '[SEP]', '[PAD]', '[UNK]']:
+                            continue
 
-                            act = activation_norm[b, s].item()
-                            pos_activations[pos].append(act)
-                    except:
-                        continue
+                        # Find closest spaCy token
+                        clean_token = bert_token.replace('##', '')
+                        pos = 'X'
+                        for sp_text, sp_pos in spacy_tokens:
+                            if clean_token.lower() in sp_text.lower() or sp_text.lower() in clean_token.lower():
+                                pos = sp_pos
+                                break
+
+                        act = activation_norm[b, s].item()
+                        pos_activations[pos].append(act)
 
                 torch.cuda.empty_cache()
 
