@@ -155,12 +155,13 @@ class NeuronAnalyzer:
                        hasattr(model.layers[0].ffn, 'router') if hasattr(model, 'layers') else False
 
         # Get dimensions
+        model_config = model.get_config() if hasattr(model, 'get_config') else getattr(model, 'config', {})
         if self.is_dawn:
             self.n_layers = len(model.layers)
-            self.d_ff = model.config.get('d_ff', model.config.get('n_basis', 32))
+            self.d_ff = model_config.get('d_ff', model_config.get('n_basis', 32))
         else:
             self.n_layers = len(model.layers) if hasattr(model, 'layers') else model.n_layers
-            self.d_ff = model.config.get('d_ff', 1024)
+            self.d_ff = model_config.get('d_ff', 1024)
 
         print(f"Model type: {'DAWN' if self.is_dawn else 'Transformer'}")
         print(f"Layers: {self.n_layers}, d_ff/n_basis: {self.d_ff}")
