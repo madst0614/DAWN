@@ -5,7 +5,7 @@ v10.0: Simplified Compress/Expand Architecture (Soft Routing, 3 compressors for 
 v13.0: Final Architecture (Selective SSM + Context + Top-k + FlashAttention)
 v13.1: Separate QK/V Expand Pools (Q/K share, V separate)
 v13.2: Unified Neuron Router (all neurons in same embedding space)
-v14.0: FRTK Architecture (Feature-Relational-Transfer-Knowledge) with SAR
+v14.0: FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR
 v15.0: Direct Knowledge Projection (NeuronMemory bypasses Feature neurons)
 
 To add a new version:
@@ -152,32 +152,32 @@ VERSION_REGISTRY = {
         ],
     },
     "14.0": {
-        "description": "FRTK Architecture (Feature-Relational-Transfer-Knowledge) with SAR",
+        "description": "FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR",
         "aliases": ["14", "140"],
         "module": "model_v14",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_feature", "n_relational", "n_transfer", "n_knowledge", "knowledge_k", "rank",
+            "n_feature", "n_relational", "n_value", "n_knowledge", "knowledge_k", "rank",
         ],
         "optional_params": {
             "dropout": 0.1,
             "state_dim": 64,
             "top_k_feature": 8,
             "top_k_relational": 4,
-            "top_k_transfer": 6,
+            "top_k_value": 6,
             "d_space": 64,
             "gradient_checkpointing": False,
         },
         "display_info": lambda args: [
-            f"DAWN v14: rank={args.get('rank', args.get('basis_rank'))} (FRTK Architecture)",
+            f"DAWN v14: rank={args.get('rank', args.get('basis_rank'))} (FRVK Architecture)",
             f"  FeatureNeurons (F): {args.get('n_feature')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))}",
             f"  RelationalNeurons (R): {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K pool)",
-            f"  TransferNeurons (T): {args.get('n_transfer')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V pool)",
+            f"  ValueNeurons (V): {args.get('n_value')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V pool)",
             f"  Unified Router: d_space={args.get('d_space', 64)} + SAR (Synaptic Activation Regulation)",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
             f"  Top-k Feature: {args.get('top_k_feature', 8)}/{args.get('n_feature')}",
             f"  Top-k Relational: {args.get('top_k_relational', 4)}/{args.get('n_relational')}",
-            f"  Top-k Transfer: {args.get('top_k_transfer', 6)}/{args.get('n_transfer')}",
+            f"  Top-k Value: {args.get('top_k_value', 6)}/{args.get('n_value')}",
             f"  Architecture: Mamba SSM → Context → Unified Router (SAR) → FlashAttn",
             f"  Attention: d_model space (d_head={args.get('d_model')}//{args.get('n_heads')})",
             f"  KnowledgeNeurons (K):",
@@ -192,14 +192,14 @@ VERSION_REGISTRY = {
         "module": "model_v15",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_feature", "n_relational", "n_transfer", "n_knowledge", "knowledge_k", "rank",
+            "n_feature", "n_relational", "n_value", "n_knowledge", "knowledge_k", "rank",
         ],
         "optional_params": {
             "dropout": 0.1,
             "state_dim": 64,
             "top_k_feature": 8,
             "top_k_relational": 4,
-            "top_k_transfer": 6,
+            "top_k_value": 6,
             "d_space": 64,
             "knowledge_rank": 128,  # v15 default: 128 (larger matching space)
             "gradient_checkpointing": False,
@@ -208,12 +208,12 @@ VERSION_REGISTRY = {
             f"DAWN v15: rank={args.get('rank', args.get('basis_rank'))} (Direct Knowledge Projection)",
             f"  FeatureNeurons (F): {args.get('n_feature')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} [Attn only]",
             f"  RelationalNeurons (R): {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K pool)",
-            f"  TransferNeurons (T): {args.get('n_transfer')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V pool)",
+            f"  ValueNeurons (V): {args.get('n_value')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V pool)",
             f"  Unified Router: d_space={args.get('d_space', 64)} + SAR (Synaptic Activation Regulation)",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
             f"  Top-k Feature: {args.get('top_k_feature', 8)}/{args.get('n_feature')}",
             f"  Top-k Relational: {args.get('top_k_relational', 4)}/{args.get('n_relational')}",
-            f"  Top-k Transfer: {args.get('top_k_transfer', 6)}/{args.get('n_transfer')}",
+            f"  Top-k Value: {args.get('top_k_value', 6)}/{args.get('n_value')}",
             f"  Architecture: Mamba SSM → Context → Unified Router (SAR) → FlashAttn",
             f"  Memory: x → proj_k → Q (direct, bypass Feature)",
             f"  KnowledgeNeurons (K):",

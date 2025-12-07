@@ -22,7 +22,7 @@ model:
   # FRTK Neurons
   n_feature: 36
   n_relational: 200
-  n_transfer: 16
+  n_value: 16
   n_knowledge: 300
   knowledge_k: 20
   knowledge_rank: 128             # v15: 64 → 128 (larger matching space)
@@ -33,7 +33,7 @@ model:
   # Top-k settings
   top_k_feature: 8
   top_k_relational: 20
-  top_k_transfer: 4
+  top_k_value: 4
   d_space: 64
   router_dropout: 0.1
   token_routing: false
