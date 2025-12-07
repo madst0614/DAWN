@@ -30,23 +30,77 @@ except:
 
 def load_model_and_tokenizer(checkpoint_path, device):
     """Load model from checkpoint"""
+    from pathlib import Path
     from transformers import BertTokenizer
     from models import create_model_by_version
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    config = checkpoint.get('config', {})
-    model_version = config.get('model_version', 'v15')
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    config = checkpoint.get('model_config', checkpoint.get('config', {}))
 
-    print(f"Model version: {model_version}")
+    # Detect version from path or state_dict
+    path_str = str(checkpoint_path).lower()
+    if 'v15' in path_str:
+        version = '15.0'
+    elif 'v14' in path_str:
+        version = '14.0'
+    elif 'v13' in path_str:
+        version = '13.0'
+    elif 'baseline' in path_str or 'vbaseline' in path_str:
+        version = 'baseline'
+    else:
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        keys_str = ' '.join(state_dict.keys())
+        if 'knowledge_encoder' in keys_str:
+            version = '15.0'
+        elif 'feature_neurons' in keys_str:
+            version = '14.0'
+        elif 'context_proj' in keys_str:
+            version = '13.0'
+        else:
+            version = config.get('model_version', '15.0')
+
+    print(f"Model version: {version}")
 
     # Import appropriate model
-    if model_version == 'baseline' or model_version == 'vbaseline':
+    if version == 'baseline' or version == 'vbaseline':
         from baseline_transformer import VanillaTransformer
         model = VanillaTransformer(**config)
     else:
-        model = create_model_by_version(model_version, config)
+        # Build model kwargs
+        model_kwargs = {
+            'vocab_size': config.get('vocab_size', 30522),
+            'd_model': config.get('d_model', 320),
+            'n_layers': config.get('n_layers', 4),
+            'n_heads': config.get('n_heads', 4),
+            'rank': config.get('rank', 64),
+            'max_seq_len': config.get('max_seq_len', 512),
+            'n_compress': config.get('n_compress', 48),
+            'n_expand': config.get('n_expand', 12),
+            'n_knowledge': config.get('n_knowledge', 80),
+            'dropout': config.get('dropout', 0.1),
+            'state_dim': config.get('state_dim', 64),
+        }
 
-    model.load_state_dict(checkpoint['model_state_dict'])
+        if version.startswith('15'):
+            model_kwargs['n_feature'] = config.get('n_feature', 48)
+            model_kwargs['n_relational'] = config.get('n_relational', 12)
+            model_kwargs['n_value'] = config.get('n_value', 12)
+            model_kwargs['knowledge_rank'] = config.get('knowledge_rank', 128)
+            model_kwargs['coarse_k'] = config.get('coarse_k', 20)
+            model_kwargs['fine_k'] = config.get('fine_k', 10)
+        elif version.startswith('14'):
+            model_kwargs['n_feature'] = config.get('n_feature', config.get('n_compress', 48))
+            model_kwargs['n_relational'] = config.get('n_relational', config.get('n_expand', 12))
+            model_kwargs['n_transfer'] = config.get('n_transfer', config.get('n_expand', 12))
+
+        model = create_model_by_version(version, model_kwargs)
+
+    # Load state dict
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
