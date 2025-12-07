@@ -383,6 +383,91 @@ class DAWNNeuronAnalyzer:
 
         return results
 
+    def analyze_routing_activation(self, dataloader, num_batches=50, max_seq_len=64):
+        """Analyze actual routing weights during forward pass"""
+        print(f"\n{'='*60}")
+        print(f"5. Routing Weight Analysis (Forward Pass)")
+        print(f"{'='*60}")
+
+        token_acts = defaultdict(list)
+
+        self.model.eval()
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Routing analysis")):
+                if batch_idx >= num_batches:
+                    break
+
+                if isinstance(batch, (list, tuple)):
+                    input_ids = batch[0].to(self.device)
+                else:
+                    input_ids = batch.to(self.device)
+
+                input_ids = input_ids[:, :max_seq_len]
+                B, S = input_ids.shape
+
+                # Forward with routing info
+                outputs = self.model(input_ids, return_routing_info=True)
+
+                # Get routing_info_list
+                if isinstance(outputs, tuple):
+                    if len(outputs) == 2:
+                        routing_info_list = outputs[1]
+                    elif len(outputs) >= 3:
+                        routing_info_list = outputs[2]
+                    else:
+                        continue
+                else:
+                    continue
+
+                # Layer 0 routing weights
+                if routing_info_list and len(routing_info_list) > 0:
+                    info = routing_info_list[0]  # First layer
+                    if isinstance(info, dict):
+                        attn_info = info.get('attention', {})
+                        weights = attn_info.get('feature_weights', attn_info.get('neuron_weights'))
+
+                        if weights is not None:
+                            # weights: [B, n_feature] or [B, S, n_feature]
+                            if weights.dim() == 3 and weights.shape[2] > self.neuron_id:
+                                w_n = weights[:, :, self.neuron_id].cpu()  # [B, S]
+                                for b in range(B):
+                                    for s in range(S):
+                                        tid = input_ids[b, s].item()
+                                        token_acts[tid].append(w_n[b, s].item())
+                            elif weights.dim() == 2 and weights.shape[1] > self.neuron_id:
+                                w_n = weights[:, self.neuron_id].cpu()  # [B]
+                                for b in range(B):
+                                    for s in range(S):
+                                        tid = input_ids[b, s].item()
+                                        token_acts[tid].append(w_n[b].item())
+
+                torch.cuda.empty_cache()
+
+        # Compute mean
+        token_mean = {tid: sum(acts)/len(acts) for tid, acts in token_acts.items() if len(acts) >= 5}
+
+        if not token_mean:
+            print("Warning: No routing data collected")
+            return None
+
+        sorted_tokens = sorted(token_mean.items(), key=lambda x: x[1], reverse=True)
+
+        print(f"\nTop 30 tokens by routing weight:")
+        print("-" * 50)
+        results = []
+        for i, (tid, act) in enumerate(sorted_tokens[:30]):
+            token = self.tokenizer.convert_ids_to_tokens([tid])[0]
+            count = len(token_acts[tid])
+            print(f"  {i+1:2d}. '{token:15s}' | weight={act:.6f} | n={count}")
+            results.append({'token': token, 'weight': act, 'count': count})
+
+        print(f"\nBottom 30 tokens by routing weight:")
+        for i, (tid, act) in enumerate(sorted_tokens[-30:]):
+            token = self.tokenizer.convert_ids_to_tokens([tid])[0]
+            print(f"  {i+1:2d}. '{token:15s}' | weight={act:.6f}")
+
+        return results
+
     def run_full_analysis(self, dataloader, num_batches=50, max_seq_len=128, save_path=None):
         """Run complete analysis"""
         results = {
@@ -406,6 +491,10 @@ class DAWNNeuronAnalyzer:
 
         # 4. Context sensitivity
         results['context_analysis'] = self.analyze_context_sensitivity()
+
+        # 5. Routing weights (actual forward pass)
+        results['routing_analysis'] = self.analyze_routing_activation(
+            dataloader, num_batches=num_batches//2, max_seq_len=64)
 
         if save_path:
             with open(save_path, 'w') as f:
