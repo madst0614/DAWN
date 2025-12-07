@@ -608,11 +608,22 @@ def main():
     # Try to load validation data
     val_path = os.path.join(args.data_path, 'val', 'c4', 'c4_val_50M.pt')
     if os.path.exists(val_path):
-        data = torch.load(val_path)
+        raw_data = torch.load(val_path, weights_only=False)
+
+        # Handle dict or tensor
+        if isinstance(raw_data, dict):
+            data = raw_data.get('tokens', raw_data.get('input_ids', None))
+            if data is None:
+                data = list(raw_data.values())[0]
+        else:
+            data = raw_data
+
+        # Reshape if 1D
         if data.dim() == 1:
             seq_len = config.get('max_seq_len', 512)
             n_seqs = data.shape[0] // seq_len
             data = data[:n_seqs * seq_len].view(n_seqs, seq_len)
+
         dataset = TensorDataset(data[:10000])  # Limit for speed
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
         print(f"  Loaded {len(dataset)} sequences")
