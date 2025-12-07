@@ -144,7 +144,7 @@ class DAWNNeuronAnalyzer:
         layer_weights = defaultdict(list)  # layer_idx -> list of weights
 
         self.model.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.amp.autocast('cuda'):
             for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Analyzing routing")):
                 if batch_idx >= num_batches:
                     break
@@ -161,8 +161,15 @@ class DAWNNeuronAnalyzer:
                 # Forward with routing info
                 try:
                     outputs = self.model(input_ids, return_routing_info=True)
-                    if len(outputs) >= 3:
-                        routing_info_list = outputs[2]  # List of per-layer routing info
+                    # Without labels: (logits, routing_infos)
+                    # With labels: (loss, logits, routing_infos)
+                    if isinstance(outputs, tuple):
+                        if len(outputs) == 2:
+                            routing_info_list = outputs[1]  # (logits, routing_infos)
+                        elif len(outputs) >= 3:
+                            routing_info_list = outputs[2]  # (loss, logits, routing_infos)
+                        else:
+                            continue
                     else:
                         continue
                 except Exception as e:
@@ -254,7 +261,7 @@ class DAWNNeuronAnalyzer:
         neuron_count = 0
 
         self.model.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.amp.autocast('cuda'):
             for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Usage analysis")):
                 if batch_idx >= num_batches:
                     break
@@ -268,8 +275,13 @@ class DAWNNeuronAnalyzer:
 
                 try:
                     outputs = self.model(input_ids, return_routing_info=True)
-                    if len(outputs) >= 3:
-                        routing_info_list = outputs[2]
+                    if isinstance(outputs, tuple):
+                        if len(outputs) == 2:
+                            routing_info_list = outputs[1]
+                        elif len(outputs) >= 3:
+                            routing_info_list = outputs[2]
+                        else:
+                            continue
                     else:
                         continue
                 except:
@@ -305,6 +317,9 @@ class DAWNNeuronAnalyzer:
         # Normalize
         if neuron_count > 0:
             neuron_avg = neuron_total_weight / neuron_count
+        else:
+            print("Warning: No routing data collected!")
+            return {'neuron_usage': [], 'target_rank': -1}
 
         # Report
         sorted_idx = torch.argsort(neuron_avg, descending=True)
@@ -349,14 +364,22 @@ class DAWNNeuronAnalyzer:
         self.model.eval()
         results = []
 
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.amp.autocast('cuda'):
             for sentence in test_sentences:
                 tokens = self.tokenizer.encode(sentence, return_tensors='pt', max_length=max_seq_len, truncation=True)
                 tokens = tokens.to(self.device)
 
                 try:
                     outputs = self.model(tokens, return_routing_info=True)
-                    routing_info_list = outputs[2] if len(outputs) >= 3 else []
+                    if isinstance(outputs, tuple):
+                        if len(outputs) == 2:
+                            routing_info_list = outputs[1]
+                        elif len(outputs) >= 3:
+                            routing_info_list = outputs[2]
+                        else:
+                            routing_info_list = []
+                    else:
+                        routing_info_list = []
                 except Exception as e:
                     print(f"Error: {e}")
                     continue
@@ -464,7 +487,7 @@ class TransformerNeuronAnalyzer:
 
         self.model.eval()
         try:
-            with torch.no_grad(), torch.cuda.amp.autocast():
+            with torch.no_grad(), torch.amp.autocast('cuda'):
                 for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Scanning")):
                     if batch_idx >= num_batches:
                         break
