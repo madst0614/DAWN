@@ -618,7 +618,7 @@ class NeuronMemory(nn.Module):
         self.coarse_k = coarse_k
         self.fine_k = fine_k
 
-    def forward(self, x, router, knowledge_encoder):
+    def forward(self, x, router, knowledge_encoder, attention_mask=None):
         """
         v15: 2-stage hierarchical knowledge retrieval
 
@@ -626,6 +626,7 @@ class NeuronMemory(nn.Module):
             x: [B, S, D] input embeddings (for both stages)
             router: UnifiedNeuronRouter (provides knowledge logits)
             knowledge_encoder: nn.Linear (shared d_model → knowledge_rank)
+            attention_mask: [B, S] optional, 1=valid, 0=pad
 
         Returns:
             output: [B, S, D] memory output
@@ -643,7 +644,7 @@ class NeuronMemory(nn.Module):
             # Create sparse indicator for selected candidates
             coarse_indicator = torch.zeros(B, S, self.n_knowledge, device=x.device)
             coarse_indicator.scatter_(-1, candidate_idx, 1.0)
-            router.update_usage(coarse_indicator, 'knowledge')
+            router.update_usage(coarse_indicator, 'knowledge', attention_mask)
 
         # ===== Stage 2: Fine matching within candidates =====
         # x → query for fine-grained similarity (shared encoder)
@@ -725,7 +726,7 @@ class DAWNBlock(nn.Module):
         normed_x2 = self.norm2(x)
 
         # v15: 2-stage knowledge retrieval (shared knowledge_encoder)
-        mem_out, knowledge_info = self.memory(normed_x2, global_routers.neuron_router, knowledge_encoder)
+        mem_out, knowledge_info = self.memory(normed_x2, global_routers.neuron_router, knowledge_encoder, attention_mask)
         x = x + self.dropout(mem_out)
 
         # Output norms for attn/mem balance monitoring
