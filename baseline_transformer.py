@@ -214,7 +214,7 @@ class VanillaTransformer(nn.Module):
         # Loss calculation with CLM shift (compatible with DAWN train.py)
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
+            shift_labels = labels[:, 1:].contiguous().long()
             loss = F.cross_entropy(
                 shift_logits.view(-1, self.vocab_size),
                 shift_labels.view(-1),
