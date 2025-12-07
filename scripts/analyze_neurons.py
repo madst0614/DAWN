@@ -243,6 +243,10 @@ class NeuronWordMapper:
                 for s in range(S):
                     word = token_cache[input_ids_cpu[b, s]]
 
+                    # Skip special tokens
+                    if word.lower() in ['[pad]', '[cls]', '[sep]', '[unk]', '<pad>', '<s>', '</s>', '<unk>']:
+                        continue
+
                     if is_batch_level:
                         top_neurons = indices_cpu[b]
                         top_weights = weights_cpu[b]
@@ -1589,6 +1593,10 @@ class KnowledgeNeuronAnalyzer:
 
                     for s in range(S):
                         token_str = self.tokenizer.decode([tokens[s]]).strip()
+
+                        # Skip special tokens
+                        if token_str.lower() in ['[pad]', '[cls]', '[sep]', '[unk]', '<pad>', '<s>', '</s>', '<unk>']:
+                            continue
 
                         for k_idx, k_weight in zip(fine_indices[b, s], fine_weights[b, s]):
                             if k_weight > 0.1:
