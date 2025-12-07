@@ -71,7 +71,7 @@ class UnifiedNeuronRouter(nn.Module):
         self.tau = 1.5
         self.excitability_weight = 1.0  # Decays over training (like starvation)
 
-    def decay_excitability(self, decay_rate=0.999):
+    def decay_excitability(self, decay_rate=0.9997):
         """Decay excitability_weight each step. Call from training loop."""
         self.excitability_weight *= decay_rate
 
