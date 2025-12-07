@@ -176,8 +176,11 @@ class DAWNNeuronAnalyzer:
         print(f"2. Activation Pattern Analysis for Neuron {self.neuron_id}")
         print(f"{'='*60}")
 
-        token_activations = defaultdict(list)  # token_id -> list of activation norms
-        layer_activations = []  # Will store per-layer mean activations
+        # Use tensors for accumulation (faster than dict)
+        vocab_size = self.model.token_emb.weight.shape[0]
+        token_sum = torch.zeros(vocab_size, device=self.device)
+        token_sum_sq = torch.zeros(vocab_size, device=self.device)
+        token_count = torch.zeros(vocab_size, device=self.device)
 
         # Get feature neuron weight
         W_n = self.model.shared_neurons.feature_neurons[self.neuron_id].data  # [d_model, rank]
@@ -204,45 +207,53 @@ class DAWNNeuronAnalyzer:
                 h = torch.einsum('bsd,dr->bsr', x, W_n)  # [B, S, rank]
                 activation_norm = h.norm(dim=-1)  # [B, S]
 
-                # Collect per-token activations
-                for b in range(B):
-                    for s in range(S):
-                        token_id = input_ids[b, s].item()
-                        act = activation_norm[b, s].item()
-                        token_activations[token_id].append(act)
+                # Vectorized accumulation
+                flat_ids = input_ids.view(-1)  # [B*S]
+                flat_acts = activation_norm.view(-1).float()  # [B*S]
 
-                torch.cuda.empty_cache()
+                token_sum.scatter_add_(0, flat_ids, flat_acts)
+                token_sum_sq.scatter_add_(0, flat_ids, flat_acts ** 2)
+                token_count.scatter_add_(0, flat_ids, torch.ones_like(flat_acts))
 
-        # Compute statistics
-        token_mean_act = {}
-        for token_id, acts in token_activations.items():
-            if len(acts) >= 5:
-                token_mean_act[token_id] = sum(acts) / len(acts)
+        # Compute mean and std
+        valid_mask = token_count >= 5
+        token_mean = torch.zeros_like(token_sum)
+        token_std = torch.zeros_like(token_sum)
 
-        # Sort by mean activation
-        sorted_tokens = sorted(token_mean_act.items(), key=lambda x: x[1], reverse=True)
+        token_mean[valid_mask] = token_sum[valid_mask] / token_count[valid_mask]
+        variance = (token_sum_sq[valid_mask] / token_count[valid_mask]) - (token_mean[valid_mask] ** 2)
+        token_std[valid_mask] = variance.clamp(min=0).sqrt()
+
+        # Get top tokens
+        valid_indices = valid_mask.nonzero().squeeze(-1)
+        valid_means = token_mean[valid_indices]
+        sorted_order = valid_means.argsort(descending=True)
 
         print(f"\nTop 50 tokens by actual activation (||x @ W_{self.neuron_id}||):")
         print("-" * 60)
         results = []
-        for i, (token_id, mean_act) in enumerate(sorted_tokens[:50]):
-            token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
-            count = len(token_activations[token_id])
-            std_act = (sum((a - mean_act)**2 for a in token_activations[token_id]) / count) ** 0.5
+        for i in range(min(50, len(sorted_order))):
+            idx = valid_indices[sorted_order[i]].item()
+            mean_act = token_mean[idx].item()
+            std_act = token_std[idx].item()
+            count = int(token_count[idx].item())
+            token = self.tokenizer.convert_ids_to_tokens([idx])[0]
             print(f"  {i+1:3d}. '{token:20s}' | act={mean_act:.4f} +/- {std_act:.4f} | n={count}")
             results.append({'token': token, 'mean_activation': mean_act, 'std': std_act, 'count': count})
 
         print(f"\nBottom 20 tokens by activation:")
-        for i, (token_id, mean_act) in enumerate(sorted_tokens[-20:]):
-            token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+        for i in range(min(20, len(sorted_order))):
+            idx = valid_indices[sorted_order[-(i+1)]].item()
+            mean_act = token_mean[idx].item()
+            token = self.tokenizer.convert_ids_to_tokens([idx])[0]
             print(f"  {i+1:3d}. '{token:20s}' | act={mean_act:.4f}")
 
         # Overall statistics
-        all_acts = [a for acts in token_activations.values() for a in acts]
+        total_count = token_count.sum().item()
+        overall_mean = token_sum.sum().item() / total_count if total_count > 0 else 0
         print(f"\nOverall activation statistics:")
-        print(f"  Mean: {sum(all_acts)/len(all_acts):.4f}")
-        print(f"  Max: {max(all_acts):.4f}")
-        print(f"  Min: {min(all_acts):.4f}")
+        print(f"  Mean: {overall_mean:.4f}")
+        print(f"  Total tokens: {int(total_count)}")
 
         return {'top_tokens': results}
 
@@ -389,7 +400,10 @@ class DAWNNeuronAnalyzer:
         print(f"5. Routing Weight Analysis (Forward Pass)")
         print(f"{'='*60}")
 
-        token_acts = defaultdict(list)
+        # Vectorized accumulation
+        vocab_size = self.model.token_emb.weight.shape[0]
+        token_sum = torch.zeros(vocab_size, device=self.device)
+        token_count = torch.zeros(vocab_size, device=self.device)
 
         self.model.eval()
         with torch.no_grad(), torch.amp.autocast('cuda'):
@@ -427,44 +441,49 @@ class DAWNNeuronAnalyzer:
                         weights = attn_info.get('feature_weights', attn_info.get('neuron_weights'))
 
                         if weights is not None:
-                            # weights: [B, n_feature] or [B, S, n_feature]
-                            if weights.dim() == 3 and weights.shape[2] > self.neuron_id:
-                                w_n = weights[:, :, self.neuron_id].cpu()  # [B, S]
-                                for b in range(B):
-                                    for s in range(S):
-                                        tid = input_ids[b, s].item()
-                                        token_acts[tid].append(w_n[b, s].item())
-                            elif weights.dim() == 2 and weights.shape[1] > self.neuron_id:
-                                w_n = weights[:, self.neuron_id].cpu()  # [B]
-                                for b in range(B):
-                                    for s in range(S):
-                                        tid = input_ids[b, s].item()
-                                        token_acts[tid].append(w_n[b].item())
+                            flat_ids = input_ids.view(-1)  # [B*S]
 
-                torch.cuda.empty_cache()
+                            if weights.dim() == 3 and weights.shape[2] > self.neuron_id:
+                                w_n = weights[:, :, self.neuron_id].view(-1).float()  # [B*S]
+                            elif weights.dim() == 2 and weights.shape[1] > self.neuron_id:
+                                w_n = weights[:, self.neuron_id].unsqueeze(1).expand(B, S).contiguous().view(-1).float()
+                            else:
+                                continue
+
+                            token_sum.scatter_add_(0, flat_ids, w_n)
+                            token_count.scatter_add_(0, flat_ids, torch.ones_like(w_n))
 
         # Compute mean
-        token_mean = {tid: sum(acts)/len(acts) for tid, acts in token_acts.items() if len(acts) >= 5}
-
-        if not token_mean:
+        valid_mask = token_count >= 5
+        if not valid_mask.any():
             print("Warning: No routing data collected")
             return None
 
-        sorted_tokens = sorted(token_mean.items(), key=lambda x: x[1], reverse=True)
+        token_mean = torch.zeros_like(token_sum)
+        token_mean[valid_mask] = token_sum[valid_mask] / token_count[valid_mask]
+
+        # Get sorted results
+        valid_indices = valid_mask.nonzero().squeeze(-1)
+        valid_means = token_mean[valid_indices]
+        sorted_order = valid_means.argsort(descending=True)
 
         print(f"\nTop 30 tokens by routing weight:")
         print("-" * 50)
         results = []
-        for i, (tid, act) in enumerate(sorted_tokens[:30]):
-            token = self.tokenizer.convert_ids_to_tokens([tid])[0]
-            count = len(token_acts[tid])
-            print(f"  {i+1:2d}. '{token:15s}' | weight={act:.6f} | n={count}")
-            results.append({'token': token, 'weight': act, 'count': count})
+        for i in range(min(30, len(sorted_order))):
+            idx = valid_indices[sorted_order[i]].item()
+            weight = token_mean[idx].item()
+            count = int(token_count[idx].item())
+            token = self.tokenizer.convert_ids_to_tokens([idx])[0]
+            print(f"  {i+1:2d}. '{token:15s}' | weight={weight:.6f} | n={count}")
+            results.append({'token': token, 'weight': weight, 'count': count})
 
         print(f"\nBottom 30 tokens by routing weight:")
-        for i, (tid, act) in enumerate(sorted_tokens[-30:]):
-            token = self.tokenizer.convert_ids_to_tokens([tid])[0]
-            print(f"  {i+1:2d}. '{token:15s}' | weight={act:.6f}")
+        for i in range(min(30, len(sorted_order))):
+            idx = valid_indices[sorted_order[-(i+1)]].item()
+            weight = token_mean[idx].item()
+            token = self.tokenizer.convert_ids_to_tokens([idx])[0]
+            print(f"  {i+1:2d}. '{token:15s}' | weight={weight:.6f}")
 
         return results
 
