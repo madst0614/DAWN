@@ -615,6 +615,16 @@ def _get_router_log_lines(router, global_step, total_steps):
         lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active F/R/V:{int(active_F)}/{n_F},{int(active_R)}/{n_R},{int(active_V)}/{n_V} | Gini:{gini_F:.2f}/{gini_R:.2f}/{gini_V:.2f}")
         lines.append(f"             Exc F:[{min_exc_F:.2f},{mean_exc_F:.2f},{max_exc_F:.2f}] R:[{min_exc_R:.2f},{mean_exc_R:.2f},{max_exc_R:.2f}] V:[{min_exc_V:.2f},{mean_exc_V:.2f},{max_exc_V:.2f}]")
 
+        # v15: Knowledge neurons (if available)
+        if hasattr(router, 'usage_ema_knowledge'):
+            ema_K = router.usage_ema_knowledge
+            active_K = (ema_K > 0.01).sum().item()
+            n_K = ema_K.numel()
+            gini_K = _gini(ema_K)
+            exc_K = torch.clamp(1.0 - ema_K / tau, min=0.0, max=1.0)
+            min_exc_K, max_exc_K, mean_exc_K = exc_K.min().item(), exc_K.max().item(), exc_K.mean().item()
+            lines.append(f"             Knowledge (K): Active {int(active_K)}/{n_K} | Gini:{gini_K:.2f} | Exc:[{min_exc_K:.2f},{mean_exc_K:.2f},{max_exc_K:.2f}]")
+
     # v13.2: Compress/QK/V with starvation
     elif hasattr(router, 'usage_ema_compress'):
         ema_C = router.usage_ema_compress
@@ -947,15 +957,26 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Knowledge neuron usage stats
                     try:
                         # Collect knowledge indices from all layers
-                        all_knowledge_idx = []
+                        # v15: fine_indices, coarse_indices
+                        # v14: knowledge_indices
+                        all_fine_idx = []
+                        all_coarse_idx = []
                         for layer_info in routing_infos:
                             mem = layer_info.get('memory', {})
+                            # v15: 2-stage retrieval
+                            fine_idx = mem.get('fine_indices')
+                            coarse_idx = mem.get('coarse_indices')
+                            if fine_idx is not None:
+                                all_fine_idx.append(fine_idx.flatten())
+                            if coarse_idx is not None:
+                                all_coarse_idx.append(coarse_idx.flatten())
+                            # v14: single-stage
                             k_idx = mem.get('knowledge_indices')
                             if k_idx is not None:
-                                all_knowledge_idx.append(k_idx.flatten())
+                                all_fine_idx.append(k_idx.flatten())
 
-                        if all_knowledge_idx:
-                            all_idx = torch.cat(all_knowledge_idx)
+                        if all_fine_idx:
+                            all_idx = torch.cat(all_fine_idx)
                             n_knowledge = base_model.n_knowledge if hasattr(base_model, 'n_knowledge') else 80
 
                             # Count usage per knowledge neuron
@@ -973,7 +994,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             # Gini
                             gini_K = _gini(usage_freq)
 
-                            print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f}")
+                            # v15: coarse→fine ratio
+                            if all_coarse_idx:
+                                coarse_all = torch.cat(all_coarse_idx)
+                                coarse_unique = len(torch.unique(coarse_all))
+                                fine_unique = len(torch.unique(all_idx))
+                                # fine_k / coarse_k ratio (how many survive from coarse to fine)
+                                coarse_k = base_model.coarse_k if hasattr(base_model, 'coarse_k') else 20
+                                fine_k = base_model.fine_k if hasattr(base_model, 'fine_k') else 10
+                                print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f} | coarse→fine: {coarse_k}→{fine_k} (unique: {coarse_unique}→{fine_unique})")
+                            else:
+                                print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f}")
                     except Exception:
                         pass
 
