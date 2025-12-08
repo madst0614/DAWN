@@ -585,34 +585,31 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
-    # v17: Full Vector Neurons with Excitability
-    if hasattr(router, 'n_relational_q'):
+    # v17: Full Vector Neurons with Shared Relational (Q/K) + Soft Weighting
+    if hasattr(router, 'neuron_emb_relational_k'):  # v17 has separate K routing head
         n_fqk = router.n_feature_qk
         n_fv = router.n_feature_v
-        n_rq = router.n_relational_q
-        n_rk = router.n_relational_k
+        n_rel = router.n_relational  # Shared for Q/K
         n_val = router.n_value
         n_k = router.n_knowledge
 
         # Usage EMA stats
         ema_fqk = router.usage_ema_feature_qk
         ema_fv = router.usage_ema_feature_v
-        ema_rq = router.usage_ema_relational_q
-        ema_rk = router.usage_ema_relational_k
+        ema_rel = router.usage_ema_relational  # Shared EMA for Q/K
         ema_val = router.usage_ema_value
         ema_k = router.usage_ema_knowledge
 
         # Active neuron counts (ema > 0.01)
         active_fqk = (ema_fqk > 0.01).sum().item()
         active_fv = (ema_fv > 0.01).sum().item()
-        active_rq = (ema_rq > 0.01).sum().item()
-        active_rk = (ema_rk > 0.01).sum().item()
+        active_rel = (ema_rel > 0.01).sum().item()
         active_val = (ema_val > 0.01).sum().item()
         active_k = (ema_k > 0.01).sum().item()
 
         # Gini coefficients
         gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
-        gini_rq, gini_rk = _gini(ema_rq), _gini(ema_rk)
+        gini_rel = _gini(ema_rel)
         gini_val, gini_k = _gini(ema_val), _gini(ema_k)
 
         # Excitability
@@ -620,16 +617,15 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         weight = router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0
         exc_fqk = torch.clamp(1.0 - ema_fqk / tau, min=0.0, max=1.0)
         exc_fv = torch.clamp(1.0 - ema_fv / tau, min=0.0, max=1.0)
-        exc_rq = torch.clamp(1.0 - ema_rq / tau, min=0.0, max=1.0)
-        exc_rk = torch.clamp(1.0 - ema_rk / tau, min=0.0, max=1.0)
+        exc_rel = torch.clamp(1.0 - ema_rel / tau, min=0.0, max=1.0)
         exc_val = torch.clamp(1.0 - ema_val / tau, min=0.0, max=1.0)
         exc_k = torch.clamp(1.0 - ema_k / tau, min=0.0, max=1.0)
 
-        lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active FQK/FV:{int(active_fqk)}/{n_fqk},{int(active_fv)}/{n_fv} RQ/RK:{int(active_rq)}/{n_rq},{int(active_rk)}/{n_rk} V:{int(active_val)}/{n_val}")
-        lines.append(f"             Gini FQK/FV:{gini_fqk:.2f}/{gini_fv:.2f} RQ/RK:{gini_rq:.2f}/{gini_rk:.2f} V:{gini_val:.2f}")
+        lines.append(f"         v17 Soft | τ={tau:.1f} w={weight:.3f} | FQK:{int(active_fqk)}/{n_fqk} FV:{int(active_fv)}/{n_fv} R(Q/K):{int(active_rel)}/{n_rel} V:{int(active_val)}/{n_val}")
+        lines.append(f"             Gini FQK/FV/R/V: {gini_fqk:.2f}/{gini_fv:.2f}/{gini_rel:.2f}/{gini_val:.2f}")
         lines.append(f"             Exc FQK:[{exc_fqk.min().item():.2f},{exc_fqk.mean().item():.2f},{exc_fqk.max().item():.2f}] FV:[{exc_fv.min().item():.2f},{exc_fv.mean().item():.2f},{exc_fv.max().item():.2f}]")
-        lines.append(f"             Exc RQ:[{exc_rq.min().item():.2f},{exc_rq.mean().item():.2f},{exc_rq.max().item():.2f}] RK:[{exc_rk.min().item():.2f},{exc_rk.mean().item():.2f},{exc_rk.max().item():.2f}] V:[{exc_val.min().item():.2f},{exc_val.mean().item():.2f},{exc_val.max().item():.2f}]")
-        lines.append(f"             Knowledge (K): Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f} | Exc:[{exc_k.min().item():.2f},{exc_k.mean().item():.2f},{exc_k.max().item():.2f}]")
+        lines.append(f"             Exc R(Q/K):[{exc_rel.min().item():.2f},{exc_rel.mean().item():.2f},{exc_rel.max().item():.2f}] V:[{exc_val.min().item():.2f},{exc_val.mean().item():.2f},{exc_val.max().item():.2f}]")
+        lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f} | Exc:[{exc_k.min().item():.2f},{exc_k.mean().item():.2f},{exc_k.max().item():.2f}]")
 
     # v16: Split Feature QK/V with Excitability
     elif hasattr(router, 'usage_ema_feature_qk'):
