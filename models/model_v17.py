@@ -1,20 +1,26 @@
 """
-DAWN v17: Full Vector Neurons
+DAWN v17: Full Vector Neurons + Soft Weighting
 
 Core Changes from v16:
 - ALL neurons are vectors (no rank matrices)
 - 4 routing types: feature_qk, feature_v, relational (shared Q/K), value
+- Soft weighting: top-k → softmax → weighted hidden states (gradient flow)
 - Relational neurons: [n_relational, d_model] - SHARED expansion vectors for Q/K
-- Value neurons: [n_value, d_model] - expansion vectors
 - Excitability (SAR) for balanced neuron usage
-- 82% parameter reduction vs v15
 
 Architecture (FRVK v17):
-- Feature QK: x → top-k selection → h_qk (compression, 320→64)
-- Feature V: x → top-k selection → h_v (compression, 320→32)
-- Relational: h_qk → top-k selection → Q/K (expansion, 64→320, SHARED pool)
-- Value: h_v → top-k selection → V (expansion, 32→320)
+- Feature QK: x → top-k → softmax(topk_weights) → h_qk * soft_qk
+- Feature V: x → top-k → softmax(topk_weights) → h_v * soft_v
+- Relational Q: h_qk * soft_q → Q (shared pool, separate routing)
+- Relational K: h_qk * soft_k → K (shared pool, separate routing)
+- Value: h_v * soft_v2 → V
 - Knowledge: 2-stage retrieval (same as v16)
+
+Soft weighting enables gradient flow through routing decisions:
+  weights = einsum('bs,bsn->bn', importance, pref)
+  topk_weights, idx = topk(weights, k)
+  soft_weights = softmax(topk_weights)
+  h_weighted = h * soft_weights  # gradient flows through soft_weights
 """
 
 import math
@@ -383,14 +389,14 @@ class GlobalRouters(nn.Module):
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         """
-        Compute attention routing weights with top-k selection.
+        Compute attention routing weights with top-k selection + soft weighting.
 
         Returns:
-            idx_qk: [B, top_k_feature_qk] - sorted indices for Feature QK
-            idx_v: [B, top_k_feature_v] - sorted indices for Feature V
-            idx_q: [B, top_k_relational] - sorted indices for Relational Q (from shared pool)
-            idx_k: [B, top_k_relational] - sorted indices for Relational K (from shared pool)
-            idx_v2: [B, top_k_value] - sorted indices for Value
+            idx_qk, soft_qk: [B, top_k_feature_qk] - indices and soft weights for Feature QK
+            idx_v, soft_v: [B, top_k_feature_v] - indices and soft weights for Feature V
+            idx_q, soft_q: [B, top_k_relational] - indices and soft weights for Relational Q
+            idx_k, soft_k: [B, top_k_relational] - indices and soft weights for Relational K
+            idx_v2, soft_v2: [B, top_k_value] - indices and soft weights for Value
             routing_info: dict
             aux_loss: scalar
         """
@@ -399,7 +405,8 @@ class GlobalRouters(nn.Module):
         pref_qk = F.softmax(logits_qk, dim=-1)
         weights_qk = torch.einsum('bs,bsn->bn', importance, pref_qk)
 
-        _, idx_qk = torch.topk(weights_qk, self.top_k_feature_qk, dim=-1)
+        topk_weights_qk, idx_qk = torch.topk(weights_qk, self.top_k_feature_qk, dim=-1)
+        soft_qk = F.softmax(topk_weights_qk, dim=-1)  # [B, top_k] - soft weighting
         idx_qk = idx_qk.sort(dim=-1).values
         # Update usage EMA
         self.neuron_router.update_usage(idx_qk, 'feature_qk', self.n_feature_qk)
@@ -409,7 +416,8 @@ class GlobalRouters(nn.Module):
         pref_v = F.softmax(logits_v, dim=-1)
         weights_v = torch.einsum('bs,bsn->bn', importance, pref_v)
 
-        _, idx_v = torch.topk(weights_v, self.top_k_feature_v, dim=-1)
+        topk_weights_v, idx_v = torch.topk(weights_v, self.top_k_feature_v, dim=-1)
+        soft_v = F.softmax(topk_weights_v, dim=-1)  # [B, top_k] - soft weighting
         idx_v = idx_v.sort(dim=-1).values
         # Update usage EMA
         self.neuron_router.update_usage(idx_v, 'feature_v', self.n_feature_v)
@@ -419,7 +427,8 @@ class GlobalRouters(nn.Module):
         pref_rel_q = F.softmax(logits_rel_q, dim=-1)
         weights_rel_q = torch.einsum('bs,bsn->bn', importance, pref_rel_q)
 
-        _, idx_q = torch.topk(weights_rel_q, self.top_k_relational, dim=-1)
+        topk_weights_q, idx_q = torch.topk(weights_rel_q, self.top_k_relational, dim=-1)
+        soft_q = F.softmax(topk_weights_q, dim=-1)  # [B, top_k] - soft weighting
         idx_q = idx_q.sort(dim=-1).values
         # Update usage EMA (Q selection)
         self.neuron_router.update_usage(idx_q, 'relational', self.n_relational)
@@ -429,7 +438,8 @@ class GlobalRouters(nn.Module):
         pref_rel_k = F.softmax(logits_rel_k, dim=-1)
         weights_rel_k = torch.einsum('bs,bsn->bn', importance, pref_rel_k)
 
-        _, idx_k = torch.topk(weights_rel_k, self.top_k_relational, dim=-1)
+        topk_weights_k, idx_k = torch.topk(weights_rel_k, self.top_k_relational, dim=-1)
+        soft_k = F.softmax(topk_weights_k, dim=-1)  # [B, top_k] - soft weighting
         idx_k = idx_k.sort(dim=-1).values
         # Update usage EMA (K selection)
         self.neuron_router.update_usage(idx_k, 'relational', self.n_relational)
@@ -439,7 +449,8 @@ class GlobalRouters(nn.Module):
         pref_val = F.softmax(logits_val, dim=-1)
         weights_val = torch.einsum('bs,bsn->bn', importance, pref_val)
 
-        _, idx_v2 = torch.topk(weights_val, self.top_k_value, dim=-1)
+        topk_weights_v2, idx_v2 = torch.topk(weights_val, self.top_k_value, dim=-1)
+        soft_v2 = F.softmax(topk_weights_v2, dim=-1)  # [B, top_k] - soft weighting
         idx_v2 = idx_v2.sort(dim=-1).values
         # Update usage EMA
         self.neuron_router.update_usage(idx_v2, 'value', self.n_value)
@@ -476,12 +487,22 @@ class GlobalRouters(nn.Module):
             target_val = 1.0 / self.n_value
             aux_loss = aux_loss + ((usage_val - target_val) ** 2).sum() * self.n_value
 
+        # Soft weights dict for NeuronCircuit
+        soft_weights = {
+            'soft_qk': soft_qk,    # [B, top_k_feature_qk]
+            'soft_v': soft_v,      # [B, top_k_feature_v]
+            'soft_q': soft_q,      # [B, top_k_relational]
+            'soft_k': soft_k,      # [B, top_k_relational]
+            'soft_v2': soft_v2,    # [B, top_k_value]
+        }
+
         routing_info = {
             'idx_qk': idx_qk.detach(),
             'idx_v': idx_v.detach(),
             'idx_q': idx_q.detach(),
             'idx_k': idx_k.detach(),
             'idx_v2': idx_v2.detach(),
+            'soft_weights': {k: v.detach() for k, v in soft_weights.items()},
             'feature_qk_pref': pref_qk.detach(),
             'feature_v_pref': pref_v.detach(),
             'relational_q_pref': pref_rel_q.detach(),
@@ -489,20 +510,22 @@ class GlobalRouters(nn.Module):
             'value_pref': pref_val.detach(),
         }
 
-        return idx_qk, idx_v, idx_q, idx_k, idx_v2, routing_info, aux_loss
+        return idx_qk, idx_v, idx_q, idx_k, idx_v2, soft_weights, routing_info, aux_loss
 
 
 class NeuronCircuit(nn.Module):
     """
-    v17: Attention circuit with ALL vector neurons (shared relational)
+    v17: Attention circuit with ALL vector neurons (shared relational) + soft weighting
 
     Flow:
-    1. x → feature_qk_neurons[idx_qk].T → h_qk (compression: 320→64)
-    2. x → feature_v_neurons[idx_v].T → h_v (compression: 320→32)
-    3. h_qk @ relational_neurons[idx_q] → Q (expansion: 64→320)
-    4. h_qk @ relational_neurons[idx_k] → K (expansion: 64→320)
-    5. h_v @ value_neurons[idx_v2] → V (expansion: 32→320)
+    1. x → feature_qk_neurons[idx_qk].T → h_qk * soft_qk (compression: 320→64, weighted)
+    2. x → feature_v_neurons[idx_v].T → h_v * soft_v (compression: 320→64, weighted)
+    3. h_qk * soft_q @ relational_neurons[idx_q] → Q (expansion: 64→320, weighted)
+    4. h_qk * soft_k @ relational_neurons[idx_k] → K (expansion: 64→320, weighted)
+    5. h_v * soft_v2 @ value_neurons[idx_v2] → V (expansion: 64→320, weighted)
     6. Multi-head attention
+
+    Soft weighting enables gradient flow through routing decisions.
     """
     def __init__(
         self,
@@ -523,7 +546,7 @@ class NeuronCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, idx_qk, idx_v, idx_q, idx_k, idx_v2, attention_mask=None):
+    def forward(self, x, idx_qk, idx_v, idx_q, idx_k, idx_v2, soft_weights, attention_mask=None):
         """
         Args:
             x: [B, S, D]
@@ -532,33 +555,46 @@ class NeuronCircuit(nn.Module):
             idx_q: [B, top_k_rel] - Relational Q indices (from shared pool)
             idx_k: [B, top_k_rel] - Relational K indices (from shared pool)
             idx_v2: [B, top_k_val] - Value indices
+            soft_weights: dict with 'soft_qk', 'soft_v', 'soft_q', 'soft_k', 'soft_v2'
             attention_mask: [B, S] optional
         """
         B, S, D = x.shape
 
-        # 1. Feature QK compression: x → h_qk
+        # Extract soft weights
+        soft_qk = soft_weights['soft_qk']  # [B, top_k_qk]
+        soft_v = soft_weights['soft_v']    # [B, top_k_v]
+        soft_q = soft_weights['soft_q']    # [B, top_k_rel]
+        soft_k = soft_weights['soft_k']    # [B, top_k_rel]
+        soft_v2 = soft_weights['soft_v2']  # [B, top_k_val]
+
+        # 1. Feature QK compression: x → h_qk (with soft weighting)
         # selected_qk: [B, top_k_qk, d_model]
         selected_qk = self.shared_neurons.feature_qk_neurons[idx_qk]
         W_qk = selected_qk.transpose(-1, -2)  # [B, D, top_k_qk]
         h_qk = torch.einsum('bsd,bdk->bsk', x, W_qk)  # [B, S, top_k_qk]
+        h_qk = h_qk * soft_qk.unsqueeze(1)  # [B, S, top_k_qk] - soft weighted
 
-        # 2. Feature V compression: x → h_v
+        # 2. Feature V compression: x → h_v (with soft weighting)
         selected_v = self.shared_neurons.feature_v_neurons[idx_v]  # [B, top_k_v, D]
         W_v = selected_v.transpose(-1, -2)  # [B, D, top_k_v]
         h_v = torch.einsum('bsd,bdk->bsk', x, W_v)  # [B, S, top_k_v]
+        h_v = h_v * soft_v.unsqueeze(1)  # [B, S, top_k_v] - soft weighted
 
-        # 3. Relational Q expansion: h_qk → Q (shared relational_neurons)
+        # 3. Relational Q expansion: h_qk → Q (with soft weighting)
         # selected_rel_q: [B, top_k_rel, d_model]
         selected_rel_q = self.shared_neurons.relational_neurons[idx_q]
-        Q = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_q)  # [B, S, D]
+        h_qk_q = h_qk * soft_q.unsqueeze(1)  # [B, S, top_k_rel] - soft weighted
+        Q = torch.einsum('bsr,brd->bsd', h_qk_q, selected_rel_q)  # [B, S, D]
 
-        # 4. Relational K expansion: h_qk → K (shared relational_neurons)
+        # 4. Relational K expansion: h_qk → K (with soft weighting)
         selected_rel_k = self.shared_neurons.relational_neurons[idx_k]
-        K = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_k)  # [B, S, D]
+        h_qk_k = h_qk * soft_k.unsqueeze(1)  # [B, S, top_k_rel] - soft weighted
+        K = torch.einsum('bsr,brd->bsd', h_qk_k, selected_rel_k)  # [B, S, D]
 
-        # 5. Value expansion: h_v → V
+        # 5. Value expansion: h_v → V (with soft weighting)
         selected_val = self.shared_neurons.value_neurons[idx_v2]  # [B, top_k_val, D]
-        V = torch.einsum('bsr,brd->bsd', h_v, selected_val)  # [B, S, D]
+        h_v_weighted = h_v * soft_v2.unsqueeze(1)  # [B, S, top_k_val] - soft weighted
+        V = torch.einsum('bsr,brd->bsd', h_v_weighted, selected_val)  # [B, S, D]
 
         # 6. Multi-head Attention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -701,10 +737,10 @@ class DAWNBlock(nn.Module):
 
     def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder, attention_mask=None):
         normed_x = self.norm1(x)
-        idx_qk, idx_v, idx_q, idx_k, idx_v2, attn_routing, attn_aux_loss = \
+        idx_qk, idx_v, idx_q, idx_k, idx_v2, soft_weights, attn_routing, attn_aux_loss = \
             global_routers.get_attention_weights(normed_x, importance, attention_mask)
 
-        attn_out, _ = self.attn(normed_x, idx_qk, idx_v, idx_q, idx_k, idx_v2, attention_mask)
+        attn_out, _ = self.attn(normed_x, idx_qk, idx_v, idx_q, idx_k, idx_v2, soft_weights, attention_mask)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
@@ -726,19 +762,19 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v17: Full Vector Neurons
+    DAWN v17: Full Vector Neurons + Soft Weighting
 
     Core Changes from v16:
     - ALL neurons are vectors (no rank matrices)
-    - 4 routing types: feature_qk, feature_v, relational (shared Q/K), value
+    - Soft weighting: gradient flow through routing (top-k → softmax)
+    - 4 routing types with separate Q/K routing heads
     - Excitability (SAR) for balanced neuron usage
-    - 82% parameter reduction vs v15
 
     Architecture:
-    - Feature QK: [n_feature_qk, d_model] compression vectors
-    - Feature V: [n_feature_v, d_model] compression vectors
-    - Relational: [n_relational, d_model] expansion vectors (SHARED for Q/K)
-    - Value: [n_value, d_model] expansion vectors
+    - Feature QK: [n_feature_qk, d_model] compression vectors + soft weighting
+    - Feature V: [n_feature_v, d_model] compression vectors + soft weighting
+    - Relational: [n_relational, d_model] SHARED pool (Q/K have separate routing heads)
+    - Value: [n_value, d_model] expansion vectors + soft weighting
     - Knowledge: 2-stage retrieval
     """
     __version__ = "17.0"
