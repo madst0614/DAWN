@@ -1754,23 +1754,22 @@ def main():
 
     if model_version != 'baseline':
         if model_version == "17.0":
-            # v17.0: Full Vector Neurons (No Excitability)
+            # v17.0: Full Vector Neurons + Soft Weighting (Shared Relational Q/K)
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
-            n_feature_qk = getattr(args, 'n_feature_qk', 128)
-            n_feature_v = getattr(args, 'n_feature_v', 64)
-            n_relational_q = getattr(args, 'n_relational_q', 256)
-            n_relational_k = getattr(args, 'n_relational_k', 256)
-            n_value = getattr(args, 'n_value', 128)
+            n_feature_qk = getattr(args, 'n_feature_qk', 768)
+            n_feature_v = getattr(args, 'n_feature_v', 768)
+            n_relational = getattr(args, 'n_relational', 3072)  # Shared for Q/K
+            n_value = getattr(args, 'n_value', 768)
             n_knowledge = getattr(args, 'n_knowledge', 80)
             coarse_k = getattr(args, 'coarse_k', 20)
             fine_k = getattr(args, 'fine_k', 10)
             top_k_fqk = getattr(args, 'top_k_feature_qk', 64)
-            top_k_fv = getattr(args, 'top_k_feature_v', 32)
+            top_k_fv = getattr(args, 'top_k_feature_v', 64)
             top_k_rel = getattr(args, 'top_k_relational', 64)
-            top_k_val = getattr(args, 'top_k_value', 32)
-            print(f"DAWN v{model_version}: Full Vector Neurons (No Excitability)")
+            top_k_val = getattr(args, 'top_k_value', 64)
+            print(f"DAWN v{model_version}: Full Vector Neurons + Soft Weighting")
             print(f"  Compression: FQK={n_feature_qk}(top-{top_k_fqk}), FV={n_feature_v}(top-{top_k_fv})")
-            print(f"  Expansion: RQ={n_relational_q}, RK={n_relational_k}(top-{top_k_rel}), V={n_value}(top-{top_k_val})")
+            print(f"  Expansion: R(Q/K)={n_relational}(top-{top_k_rel}), V={n_value}(top-{top_k_val})")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
             print(f"  knowledge_rank={knowledge_rank}")
         elif model_version == "16.0":
@@ -2020,22 +2019,21 @@ def main():
 
     # Add version-specific parameters
     if model_version == '17.0':
-        # v17.0: Full Vector Neurons (No Excitability)
+        # v17.0: Full Vector Neurons + Soft Weighting (Shared Relational Q/K)
         model_kwargs.update({
-            'n_feature_qk': getattr(args, 'n_feature_qk', 128),
-            'n_feature_v': getattr(args, 'n_feature_v', 64),
-            'n_relational_q': getattr(args, 'n_relational_q', 256),
-            'n_relational_k': getattr(args, 'n_relational_k', 256),
-            'n_value': getattr(args, 'n_value', 128),
+            'n_feature_qk': getattr(args, 'n_feature_qk', 768),
+            'n_feature_v': getattr(args, 'n_feature_v', 768),
+            'n_relational': getattr(args, 'n_relational', 3072),  # Shared for Q/K
+            'n_value': getattr(args, 'n_value', 768),
             'n_knowledge': args.n_knowledge,
             'coarse_k': args.coarse_k,
             'fine_k': args.fine_k,
             'knowledge_rank': args.knowledge_rank or 128,
             'state_dim': getattr(args, 'state_dim', 64),
             'top_k_feature_qk': getattr(args, 'top_k_feature_qk', 64),
-            'top_k_feature_v': getattr(args, 'top_k_feature_v', 32),
+            'top_k_feature_v': getattr(args, 'top_k_feature_v', 64),
             'top_k_relational': getattr(args, 'top_k_relational', 64),
-            'top_k_value': getattr(args, 'top_k_value', 32),
+            'top_k_value': getattr(args, 'top_k_value', 64),
             'd_space': getattr(args, 'd_space', 64),
             'router_dropout': getattr(args, 'router_dropout', 0.1),
             'gradient_checkpointing': args.gradient_checkpointing,
