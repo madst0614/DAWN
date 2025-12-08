@@ -617,12 +617,36 @@ class NeuronMemory(nn.Module):
         self.coarse_k = coarse_k
         self.fine_k = fine_k
 
+    @torch.compiler.disable
+    def _update_knowledge_usage(self, router, candidate_idx, B, S, attention_mask=None):
+        """Update knowledge neuron usage EMA (index-based)"""
+        with torch.no_grad():
+            # candidate_idx: [B, S, coarse_k]
+            flat_indices = candidate_idx.detach().view(-1)  # [B * S * coarse_k]
+            usage = torch.zeros(self.n_knowledge, device=candidate_idx.device)
+            ones = torch.ones_like(flat_indices, dtype=usage.dtype)
+            usage.scatter_add_(0, flat_indices, ones)
+
+            # Normalize by B*S (each position selects coarse_k neurons)
+            if attention_mask is not None:
+                valid_positions = attention_mask.sum().item()
+            else:
+                valid_positions = B * S
+            usage = usage / max(valid_positions, 1)
+
+            # In-place EMA update
+            router.usage_ema_knowledge.mul_(0.99).add_(usage, alpha=0.01)
+
     def forward(self, x, router, knowledge_encoder, attention_mask=None):
         B, S, D = x.shape
 
         # Stage 1: Coarse candidate selection via router
         k_logits = router.get_logits(x, 'knowledge')
         coarse_scores, candidate_idx = torch.topk(k_logits, self.coarse_k, dim=-1)
+
+        # Update knowledge usage (index-based, [B, S, coarse_k] -> flatten)
+        if self.training:
+            self._update_knowledge_usage(router, candidate_idx, B, S, attention_mask)
 
         # Stage 2: Fine matching within candidates
         query = knowledge_encoder(x)
