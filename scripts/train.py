@@ -1130,8 +1130,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     elif min_ent > 80:
                         print(f"  ⚠ WARNING: Router too uniform! (target: 60%)")
 
-                except Exception:
-                    pass  # Skip if routing_infos format is different
+                except Exception as e:
+                    import traceback
+                    print(f"[DEBUG] Routing log error: {type(e).__name__}: {e}")
+                    traceback.print_exc()
 
         # Log aggregated metrics every 100 steps (same format as console output)
         if log_file and (step + 1) % log_interval == 0:
