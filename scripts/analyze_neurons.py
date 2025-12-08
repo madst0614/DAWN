@@ -159,6 +159,9 @@ class VersionDetector:
         self.n_neurons = self._get_neuron_count()
 
     def _detect_version(self) -> str:
+        # v16: has feature_qk_neurons (split feature)
+        if hasattr(self.model, 'shared_neurons') and hasattr(self.model.shared_neurons, 'feature_qk_neurons'):
+            return '16'
         # v15: has knowledge_encoder (shared across layers)
         if hasattr(self.model, 'knowledge_encoder'):
             return '15'
@@ -173,7 +176,9 @@ class VersionDetector:
         return '10'
 
     def _get_neuron_count(self) -> int:
-        if self.version in ['14', '15']:
+        if self.version == '16':
+            return self.model.global_routers.neuron_router.n_feature_qk
+        elif self.version in ['14', '15']:
             return self.model.global_routers.neuron_router.n_feature
         elif hasattr(self.model, 'shared_neurons'):
             return self.model.shared_neurons.compress_neurons.shape[0]
@@ -183,12 +188,25 @@ class VersionDetector:
         """Extract weights and indices from routing_info"""
         attn = routing_info.get('attention', routing_info)
 
-        if 'feature_pref' in attn:
-            # v14 FRTK: token-level preferences [B, S, N] - 우선 사용!
+        if 'idx_qk' in attn:
+            # v16: index-based selection (no weights, just indices)
+            indices = attn['idx_qk']  # [B, top_k]
+            # Create one-hot weights from indices
+            n_neurons = self.n_neurons
+            B = indices.shape[0]
+            weights = torch.zeros(B, n_neurons, device=indices.device)
+            weights.scatter_(1, indices, 1.0)
+            return weights, indices
+        elif 'feature_qk_pref' in attn:
+            # v16: token-level preferences [B, S, N]
+            weights = attn['feature_qk_pref']
+            indices = attn.get('idx_qk')
+        elif 'feature_pref' in attn:
+            # v14/v15 FRTK: token-level preferences [B, S, N] - 우선 사용!
             weights = attn['feature_pref']
             indices = None
         elif 'feature_weights' in attn:
-            # v14 FRTK: batch-level fallback
+            # v14/v15 FRTK: batch-level fallback
             weights = attn['feature_weights']
             indices = None
         elif 'compress_pref' in attn:
@@ -394,7 +412,11 @@ class NeuronClusterer:
         """Extract neuron weight vectors"""
         shared = self.model.shared_neurons
 
-        if self.detector.version in ['14', '15']:
+        if self.detector.version == '16':
+            # v16: feature_qk_neurons [N, D] - already flat
+            neurons = shared.feature_qk_neurons.data.cpu().numpy()
+            return neurons
+        elif self.detector.version in ['14', '15']:
             neurons = shared.feature_neurons.data.cpu().numpy()
         else:
             neurons = shared.compress_neurons.data.cpu().numpy()
@@ -747,11 +769,11 @@ class NeuronAblation:
 
 
 # ============================================================
-# 4.5. FRVK Ablation Study (v15)
+# 4.5. FRVK Ablation Study (v15/v16)
 # ============================================================
 
 class FRVKAblation:
-    """FRVK (Feature, Relational, Value, Knowledge) neuron type ablation for v15"""
+    """FRVK (Feature, Relational, Value, Knowledge) neuron type ablation for v15/v16"""
 
     def __init__(self, model, tokenizer, device='cuda'):
         self.model = get_underlying_model(model)
@@ -764,11 +786,11 @@ class FRVKAblation:
     def run_frvk_ablation(self, dataloader, max_batches: int = 20) -> Dict:
         """Run ablation study for each FRVK neuron type"""
         print(f"\n{'='*60}")
-        print(f"FRVK ABLATION STUDY (v15)")
+        print(f"FRVK ABLATION STUDY (v{self.detector.version})")
         print(f"{'='*60}")
 
-        if self.detector.version != '15':
-            print(f"Warning: FRVK ablation is designed for v15, current version: {self.detector.version}")
+        if self.detector.version not in ['15', '16']:
+            print(f"Warning: FRVK ablation is designed for v15/v16, current version: {self.detector.version}")
 
         self.model.eval()
 
@@ -792,13 +814,24 @@ class FRVKAblation:
 
         shared = self.model.shared_neurons
 
-        # FRVK neuron types and their tensors
-        neuron_types = {
-            'Feature': ('feature_neurons', getattr(shared, 'feature_neurons', None)),
-            'Relational': ('relational_neurons', getattr(shared, 'relational_neurons', None)),
-            'Value': ('value_neurons', getattr(shared, 'value_neurons', None)),
-            'Knowledge': ('knowledge_neurons', getattr(shared, 'knowledge_neurons', None)),
-        }
+        # FRVK neuron types and their tensors (v16 uses split feature)
+        if hasattr(shared, 'feature_qk_neurons'):
+            # v16: split feature QK/V
+            neuron_types = {
+                'Feature_QK': ('feature_qk_neurons', getattr(shared, 'feature_qk_neurons', None)),
+                'Feature_V': ('feature_v_neurons', getattr(shared, 'feature_v_neurons', None)),
+                'Relational': ('relational_neurons', getattr(shared, 'relational_neurons', None)),
+                'Value': ('value_neurons', getattr(shared, 'value_neurons', None)),
+                'Knowledge': ('knowledge_neurons', getattr(shared, 'knowledge_neurons', None)),
+            }
+        else:
+            # v14/v15: unified feature
+            neuron_types = {
+                'Feature': ('feature_neurons', getattr(shared, 'feature_neurons', None)),
+                'Relational': ('relational_neurons', getattr(shared, 'relational_neurons', None)),
+                'Value': ('value_neurons', getattr(shared, 'value_neurons', None)),
+                'Knowledge': ('knowledge_neurons', getattr(shared, 'knowledge_neurons', None)),
+            }
 
         for type_name, (attr_name, neurons) in neuron_types.items():
             if neurons is None:
@@ -2012,7 +2045,9 @@ def load_model_and_data(args):
 
     # Detect version
     path_str = str(checkpoint_path).lower()
-    if 'v15' in path_str:
+    if 'v16' in path_str:
+        version = '16.0'
+    elif 'v15' in path_str:
         version = '15.0'
     elif 'v14' in path_str:
         version = '14.0'
@@ -2021,7 +2056,9 @@ def load_model_and_data(args):
     else:
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         keys_str = ' '.join(state_dict.keys())
-        if 'knowledge_encoder' in keys_str:
+        if 'feature_qk_neurons' in keys_str:
+            version = '16.0'
+        elif 'knowledge_encoder' in keys_str:
             version = '15.0'
         elif 'feature_neurons' in keys_str:
             version = '14.0'
@@ -2048,10 +2085,22 @@ def load_model_and_data(args):
         'dropout': config.get('dropout', 0.1),
     }
 
-    if version.startswith('12') or version.startswith('13') or version.startswith('14') or version.startswith('15'):
+    if version.startswith('12') or version.startswith('13') or version.startswith('14') or version.startswith('15') or version.startswith('16'):
         model_kwargs['state_dim'] = config.get('state_dim', 64)
 
-    if version.startswith('15'):
+    if version.startswith('16'):
+        model_kwargs['n_feature_qk'] = config.get('n_feature_qk', 128)
+        model_kwargs['n_feature_v'] = config.get('n_feature_v', 64)
+        model_kwargs['n_relational'] = config.get('n_relational', 48)
+        model_kwargs['n_value'] = config.get('n_value', 12)
+        model_kwargs['rank_qk'] = config.get('rank_qk', 64)
+        model_kwargs['rank_v'] = config.get('rank_v', 32)
+        model_kwargs['knowledge_rank'] = config.get('knowledge_rank', 128)
+        model_kwargs['coarse_k'] = config.get('coarse_k', 20)
+        model_kwargs['fine_k'] = config.get('fine_k', 10)
+        model_kwargs['top_k_feature_qk'] = config.get('top_k_feature_qk', 64)
+        model_kwargs['top_k_feature_v'] = config.get('top_k_feature_v', 32)
+    elif version.startswith('15'):
         model_kwargs['n_feature'] = config.get('n_feature', 48)
         model_kwargs['n_relational'] = config.get('n_relational', 12)
         model_kwargs['n_value'] = config.get('n_value', 12)
