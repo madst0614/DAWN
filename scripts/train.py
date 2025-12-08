@@ -604,7 +604,30 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
             top_k_fqk, top_k_fv, top_k_rel, top_k_val = 64, 32, 64, 32
 
         lines.append(f"         v17 Router | FQK:{top_k_fqk}/{n_fqk} FV:{top_k_fv}/{n_fv} | RQ:{top_k_rel}/{n_rq} RK:{top_k_rel}/{n_rk} | V:{top_k_val}/{n_val} | K:{n_k}")
-        lines.append(f"             d_space={router.d_space} | total={router.total_neurons} | No Excitability")
+
+        # Usage EMA stats
+        ema_fqk = router.usage_ema_feature_qk
+        ema_fv = router.usage_ema_feature_v
+        ema_rq = router.usage_ema_relational_q
+        ema_rk = router.usage_ema_relational_k
+        ema_val = router.usage_ema_value
+        ema_k = router.usage_ema_knowledge
+
+        # Active neuron counts (ema > 0.01)
+        active_fqk = (ema_fqk > 0.01).sum().item()
+        active_fv = (ema_fv > 0.01).sum().item()
+        active_rq = (ema_rq > 0.01).sum().item()
+        active_rk = (ema_rk > 0.01).sum().item()
+        active_val = (ema_val > 0.01).sum().item()
+        active_k = (ema_k > 0.01).sum().item()
+
+        # Gini coefficients
+        gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
+        gini_rq, gini_rk = _gini(ema_rq), _gini(ema_rk)
+        gini_val, gini_k = _gini(ema_val), _gini(ema_k)
+
+        lines.append(f"             Active FQK:{int(active_fqk)}/{n_fqk} FV:{int(active_fv)}/{n_fv} | RQ:{int(active_rq)}/{n_rq} RK:{int(active_rk)}/{n_rk} | V:{int(active_val)}/{n_val} | K:{int(active_k)}/{n_k}")
+        lines.append(f"             Gini FQK:{gini_fqk:.2f} FV:{gini_fv:.2f} | RQ:{gini_rq:.2f} RK:{gini_rk:.2f} | V:{gini_val:.2f} | K:{gini_k:.2f}")
 
     # v16: Split Feature QK/V with Excitability
     elif hasattr(router, 'usage_ema_feature_qk'):

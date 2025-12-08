@@ -74,6 +74,39 @@ class UnifiedNeuronRouter(nn.Module):
         # Unified neuron embeddings [total_neurons, d_space]
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
+        # Usage tracking (for logging, no excitability bonus)
+        self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
+        self.register_buffer('usage_ema_feature_v', torch.zeros(n_feature_v))
+        self.register_buffer('usage_ema_relational_q', torch.zeros(n_relational_q))
+        self.register_buffer('usage_ema_relational_k', torch.zeros(n_relational_k))
+        self.register_buffer('usage_ema_value', torch.zeros(n_value))
+        self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
+
+    def update_usage(self, indices, neuron_type, n_neurons):
+        """Update usage EMA for selected neurons (index-based)"""
+        if not self.training:
+            return
+
+        # Count usage from indices
+        B = indices.shape[0]
+        usage = torch.zeros(n_neurons, device=indices.device)
+        for b in range(B):
+            usage.scatter_add_(0, indices[b], torch.ones_like(indices[b], dtype=usage.dtype))
+        usage = usage / B  # Average over batch
+
+        if neuron_type == 'feature_qk':
+            self.usage_ema_feature_qk = 0.99 * self.usage_ema_feature_qk + 0.01 * usage
+        elif neuron_type == 'feature_v':
+            self.usage_ema_feature_v = 0.99 * self.usage_ema_feature_v + 0.01 * usage
+        elif neuron_type == 'relational_q':
+            self.usage_ema_relational_q = 0.99 * self.usage_ema_relational_q + 0.01 * usage
+        elif neuron_type == 'relational_k':
+            self.usage_ema_relational_k = 0.99 * self.usage_ema_relational_k + 0.01 * usage
+        elif neuron_type == 'value':
+            self.usage_ema_value = 0.99 * self.usage_ema_value + 0.01 * usage
+        elif neuron_type == 'knowledge':
+            self.usage_ema_knowledge = 0.99 * self.usage_ema_knowledge + 0.01 * usage
+
     def get_logits(self, x, neuron_type):
         """
         x: [B, S, d_model] or [B, S, rank] for expansion types
@@ -322,6 +355,8 @@ class GlobalRouters(nn.Module):
 
         _, idx_qk = torch.topk(weights_qk, self.top_k_feature_qk, dim=-1)
         idx_qk = idx_qk.sort(dim=-1).values
+        # Update usage EMA
+        self.neuron_router.update_usage(idx_qk, 'feature_qk', self.n_feature_qk)
 
         # Feature V routing
         logits_v = self.neuron_router.get_logits(x, 'feature_v')
@@ -330,6 +365,8 @@ class GlobalRouters(nn.Module):
 
         _, idx_v = torch.topk(weights_v, self.top_k_feature_v, dim=-1)
         idx_v = idx_v.sort(dim=-1).values
+        # Update usage EMA
+        self.neuron_router.update_usage(idx_v, 'feature_v', self.n_feature_v)
 
         # Relational Q routing
         logits_rel_q = self.neuron_router.get_logits(x, 'relational_q')
@@ -338,6 +375,8 @@ class GlobalRouters(nn.Module):
 
         _, idx_q = torch.topk(weights_rel_q, self.top_k_relational, dim=-1)
         idx_q = idx_q.sort(dim=-1).values
+        # Update usage EMA
+        self.neuron_router.update_usage(idx_q, 'relational_q', self.n_relational_q)
 
         # Relational K routing
         logits_rel_k = self.neuron_router.get_logits(x, 'relational_k')
@@ -346,6 +385,8 @@ class GlobalRouters(nn.Module):
 
         _, idx_k = torch.topk(weights_rel_k, self.top_k_relational, dim=-1)
         idx_k = idx_k.sort(dim=-1).values
+        # Update usage EMA
+        self.neuron_router.update_usage(idx_k, 'relational_k', self.n_relational_k)
 
         # Value routing
         logits_val = self.neuron_router.get_logits(x, 'value')
@@ -354,6 +395,8 @@ class GlobalRouters(nn.Module):
 
         _, idx_v2 = torch.topk(weights_val, self.top_k_value, dim=-1)
         idx_v2 = idx_v2.sort(dim=-1).values
+        # Update usage EMA
+        self.neuron_router.update_usage(idx_v2, 'value', self.n_value)
 
         # Compute aux_loss (load balance)
         aux_loss = 0.0
