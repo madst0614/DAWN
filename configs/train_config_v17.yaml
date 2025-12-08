@@ -20,7 +20,7 @@ model:
   state_dim: 64
 
   # Compression 벡터 뉴런 (x → h) - QK/V 공유 풀
-  n_feature: 768                 # QK/V 공유 압축 벡터 풀 (라우팅만 분리)
+  n_feature: 1600                # QK/V 공유 압축 벡터 풀 (라우팅만 분리)
   top_k_feature: 64              # 64개 선택 → h_qk, h_v [B,S,64]
 
   # Expansion 벡터 뉴런 (h → Q/K/V)
@@ -65,13 +65,13 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17
 
 # v17 Changes from v16:
 #   - 모든 뉴런 벡터화 (rank 매트릭스 제거)
-#   - Feature 뉴런 QK/V 공유: 풀은 하나, 라우팅은 분리 (768개)
+#   - Feature 뉴런 QK/V 공유: 풀은 하나, 라우팅은 분리 (1600개)
 #   - Relational 뉴런 Q/K 공유: 풀은 하나, 라우팅은 분리 (1600개)
 #   - Soft weighting: top-k 후 softmax로 gradient flow
 #   - Excitability (SAR) 유지: τ=1.5, weight decay 적용
 #
 # 파라미터:
-#   feature:     768 × 320 = 246K (QK/V 공유)
+#   feature:    1600 × 320 = 512K (QK/V 공유)
 #   relational: 1600 × 320 = 512K (Q/K 공유)
 #   value:       768 × 320 = 246K
-#   총: 1,004K (Feature 공유로 246K 감소)
+#   총: 1,270K
