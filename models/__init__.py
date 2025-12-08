@@ -38,6 +38,12 @@ v16.0: Split Feature QK/V Vector Neurons
 - expand_Q/K/V linear layers for reconstruction
 - 41% parameter reduction from v15
 
+v17.0: Full Vector Neurons
+- ALL neurons are vectors (no rank matrices)
+- 5 separate routing: feature_qk, feature_v, relational_q, relational_k, value
+- Excitability completely removed
+- 82% parameter reduction from v15
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -62,8 +68,11 @@ from .model_v15 import DAWN as DAWN_v15
 # v16.0 - Split Feature QK/V Vector Neurons
 from .model_v16 import DAWN as DAWN_v16
 
-# Default DAWN is v16 (latest)
-DAWN = DAWN_v16
+# v17.0 - Full Vector Neurons (No Excitability)
+from .model_v17 import DAWN as DAWN_v17
+
+# Default DAWN is v17 (latest)
+DAWN = DAWN_v17
 
 # Baseline for comparison
 import sys
@@ -94,6 +103,7 @@ __all__ = [
     'DAWN_v14',
     'DAWN_v15',
     'DAWN_v16',
+    'DAWN_v17',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -108,14 +118,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "16.0"
+__version__ = "17.0"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "10.0", "13.0", "13.1", "13.2", "14.0", "15.0", "16.0", or "baseline"
+        version: "10.0", "13.0", "13.1", "13.2", "14.0", "15.0", "16.0", "17.0", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -140,6 +150,8 @@ def create_model_by_version(version, config):
         return DAWN_v15(**config)
     elif version == "16.0":
         return DAWN_v16(**config)
+    elif version == "17.0":
+        return DAWN_v17(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 13.0, 13.1, 13.2, 14.0, 15.0, 16.0, baseline")
+                        f"Supported versions: 10.0, 13.0, 13.1, 13.2, 14.0, 15.0, 16.0, 17.0, baseline")

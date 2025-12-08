@@ -585,8 +585,20 @@ def _get_router_log_lines(router, global_step, total_steps):
     """
     lines = []
 
+    # v17: Full Vector Neurons (No Excitability)
+    if hasattr(router, 'n_relational_q'):
+        n_fqk = router.n_feature_qk
+        n_fv = router.n_feature_v
+        n_rq = router.n_relational_q
+        n_rk = router.n_relational_k
+        n_val = router.n_value
+        n_k = router.n_knowledge
+
+        lines.append(f"         v17 Router | FQK:{n_fqk} FV:{n_fv} | RQ:{n_rq} RK:{n_rk} | V:{n_val} | K:{n_k}")
+        lines.append(f"             d_space={router.d_space} | total_neurons={router.total_neurons}")
+
     # v16: Split Feature QK/V with Excitability
-    if hasattr(router, 'usage_ema_feature_qk'):
+    elif hasattr(router, 'usage_ema_feature_qk'):
         ema_QK = router.usage_ema_feature_qk
         ema_V = router.usage_ema_feature_v
         ema_R = router.usage_ema_relational
@@ -755,12 +767,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 base_model = get_underlying_model(model)
 
                 # Check if v13.2+ (needs routing_info for usage logging)
-                # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_qk
+                # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_qk, v17: n_relational_q
                 is_v13_2_plus = (hasattr(base_model, 'global_routers') and
                            hasattr(base_model.global_routers, 'neuron_router') and
                            (hasattr(base_model.global_routers.neuron_router, 'usage_ema_compress') or
                             hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature') or
-                            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_qk')))
+                            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_qk') or
+                            hasattr(base_model.global_routers.neuron_router, 'n_relational_q')))
 
                 # v10: DAWN model forward
                 if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2_plus:
@@ -816,12 +829,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             base_model = get_underlying_model(model)
 
             # Check if v13.2+ (needs routing_info for usage logging)
-            # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_qk
+            # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_qk, v17: n_relational_q
             is_v13_2_plus = (hasattr(base_model, 'global_routers') and
                        hasattr(base_model.global_routers, 'neuron_router') and
                        (hasattr(base_model.global_routers.neuron_router, 'usage_ema_compress') or
                         hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature') or
-                        hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_qk')))
+                        hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_qk') or
+                        hasattr(base_model.global_routers.neuron_router, 'n_relational_q')))
 
             # v10: DAWN model forward
             if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2_plus:
@@ -1955,7 +1969,28 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '16.0':
+    if model_version == '17.0':
+        # v17.0: Full Vector Neurons (No Excitability)
+        model_kwargs.update({
+            'n_feature_qk': getattr(args, 'n_feature_qk', 128),
+            'n_feature_v': getattr(args, 'n_feature_v', 64),
+            'n_relational_q': getattr(args, 'n_relational_q', 256),
+            'n_relational_k': getattr(args, 'n_relational_k', 256),
+            'n_value': getattr(args, 'n_value', 128),
+            'n_knowledge': args.n_knowledge,
+            'coarse_k': args.coarse_k,
+            'fine_k': args.fine_k,
+            'knowledge_rank': args.knowledge_rank or 128,
+            'state_dim': getattr(args, 'state_dim', 64),
+            'top_k_feature_qk': getattr(args, 'top_k_feature_qk', 64),
+            'top_k_feature_v': getattr(args, 'top_k_feature_v', 32),
+            'top_k_relational': getattr(args, 'top_k_relational', 64),
+            'top_k_value': getattr(args, 'top_k_value', 32),
+            'd_space': getattr(args, 'd_space', 64),
+            'router_dropout': getattr(args, 'router_dropout', 0.1),
+            'gradient_checkpointing': args.gradient_checkpointing,
+        })
+    elif model_version == '16.0':
         # v16.0: Split Feature QK/V Vector Neurons
         model_kwargs.update({
             'n_feature_qk': getattr(args, 'n_feature_qk', 512),

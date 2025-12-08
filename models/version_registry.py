@@ -8,6 +8,7 @@ v13.2: Unified Neuron Router (all neurons in same embedding space)
 v14.0: FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR
 v15.0: 2-Stage Hierarchical Knowledge Retrieval (x→router→coarse, x→proj_q→fine)
 v16.0: Split Feature QK/V Vector Neurons (41% param reduction)
+v17.0: Full Vector Neurons (82% param reduction, no excitability)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -262,6 +263,48 @@ VERSION_REGISTRY = {
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
             f"    - coarse_k: {args.get('coarse_k', 16)} → fine_k: {args.get('fine_k', 8)}",
+        ],
+    },
+    "17.0": {
+        "description": "Full Vector Neurons (82% param reduction, no excitability)",
+        "aliases": ["17", "170"],
+        "module": "model_v17",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_relational_q", "n_relational_k",
+            "n_value", "n_knowledge",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature_qk": 64,
+            "top_k_feature_v": 32,
+            "top_k_relational": 64,
+            "top_k_value": 32,
+            "d_space": 64,
+            "coarse_k": 20,
+            "fine_k": 10,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+        },
+        "display_info": lambda args: [
+            f"DAWN v17: Full Vector Neurons (No Excitability)",
+            f"  d_model={args.get('d_model')}, n_layers={args.get('n_layers')}, n_heads={args.get('n_heads')}",
+            f"  Compression:",
+            f"    Feature QK: {args.get('n_feature_qk')} × {args.get('d_model')} (top-k={args.get('top_k_feature_qk', 64)})",
+            f"    Feature V: {args.get('n_feature_v')} × {args.get('d_model')} (top-k={args.get('top_k_feature_v', 32)})",
+            f"  Expansion:",
+            f"    Relational Q: {args.get('n_relational_q')} × {args.get('d_model')} (top-k={args.get('top_k_relational', 64)})",
+            f"    Relational K: {args.get('n_relational_k')} × {args.get('d_model')} (top-k={args.get('top_k_relational', 64)})",
+            f"    Value: {args.get('n_value')} × {args.get('d_model')} (top-k={args.get('top_k_value', 32)})",
+            f"  Unified Router: d_space={args.get('d_space', 64)}",
+            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
+            f"  Architecture: Mamba SSM → Context → 5-type Router → Vector Neurons → FlashAttn",
+            f"  Memory: 2-stage (x→router→coarse, x→encoder→fine)",
+            f"  KnowledgeNeurons (K):",
+            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",
+            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
+            f"    - coarse_k: {args.get('coarse_k', 20)} → fine_k: {args.get('fine_k', 10)}",
         ],
     },
 }
