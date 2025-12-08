@@ -578,7 +578,7 @@ def _gini(x):
     return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
 
 
-def _get_router_log_lines(router, global_step, total_steps):
+def _get_router_log_lines(router, global_step, total_steps, global_routers=None):
     """Generate router log lines for both console and file output.
 
     Returns list of log lines (without trailing newlines).
@@ -594,8 +594,17 @@ def _get_router_log_lines(router, global_step, total_steps):
         n_val = router.n_value
         n_k = router.n_knowledge
 
-        lines.append(f"         v17 Router | FQK:{n_fqk} FV:{n_fv} | RQ:{n_rq} RK:{n_rk} | V:{n_val} | K:{n_k}")
-        lines.append(f"             d_space={router.d_space} | total_neurons={router.total_neurons}")
+        # Get top-k values from GlobalRouters
+        if global_routers is not None:
+            top_k_fqk = getattr(global_routers, 'top_k_feature_qk', 64)
+            top_k_fv = getattr(global_routers, 'top_k_feature_v', 32)
+            top_k_rel = getattr(global_routers, 'top_k_relational', 64)
+            top_k_val = getattr(global_routers, 'top_k_value', 32)
+        else:
+            top_k_fqk, top_k_fv, top_k_rel, top_k_val = 64, 32, 64, 32
+
+        lines.append(f"         v17 Router | FQK:{top_k_fqk}/{n_fqk} FV:{top_k_fv}/{n_fv} | RQ:{top_k_rel}/{n_rq} RK:{top_k_rel}/{n_rk} | V:{top_k_val}/{n_val} | K:{n_k}")
+        lines.append(f"             d_space={router.d_space} | total={router.total_neurons} | No Excitability")
 
     # v16: Split Feature QK/V with Excitability
     elif hasattr(router, 'usage_ema_feature_qk'):
@@ -1009,7 +1018,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # v13.2+: Usage EMA logging (v13.2: C/QK/V starvation, v14: F/R/T excitability)
                     if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                         router = base_model.global_routers.neuron_router
-                        for line in _get_router_log_lines(router, global_step, total_steps):
+                        for line in _get_router_log_lines(router, global_step, total_steps, base_model.global_routers):
                             print(line)
 
                     # Knowledge neuron usage stats
@@ -1093,7 +1102,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # v14/v13.2: Add router metrics (same format as console)
                 if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
                     router = base_model.global_routers.neuron_router
-                    for line in _get_router_log_lines(router, global_step, total_steps):
+                    for line in _get_router_log_lines(router, global_step, total_steps, base_model.global_routers):
                         f.write(line + "\n")
 
             # Collect neuron metrics
