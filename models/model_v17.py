@@ -567,34 +567,34 @@ class NeuronCircuit(nn.Module):
         soft_k = soft_weights['soft_k']    # [B, top_k_rel]
         soft_v2 = soft_weights['soft_v2']  # [B, top_k_val]
 
-        # 1. Feature QK compression: x → h_qk (with soft weighting)
+        # 1. Feature QK compression: x → h_qk (soft weight on neurons)
         # selected_qk: [B, top_k_qk, d_model]
         selected_qk = self.shared_neurons.feature_qk_neurons[idx_qk]
+        selected_qk = selected_qk * soft_qk.unsqueeze(-1)  # [B, top_k_qk, D] - weight neurons
         W_qk = selected_qk.transpose(-1, -2)  # [B, D, top_k_qk]
         h_qk = torch.einsum('bsd,bdk->bsk', x, W_qk)  # [B, S, top_k_qk]
-        h_qk = h_qk * soft_qk.unsqueeze(1)  # [B, S, top_k_qk] - soft weighted
 
-        # 2. Feature V compression: x → h_v (with soft weighting)
+        # 2. Feature V compression: x → h_v (soft weight on neurons)
         selected_v = self.shared_neurons.feature_v_neurons[idx_v]  # [B, top_k_v, D]
+        selected_v = selected_v * soft_v.unsqueeze(-1)  # [B, top_k_v, D] - weight neurons
         W_v = selected_v.transpose(-1, -2)  # [B, D, top_k_v]
         h_v = torch.einsum('bsd,bdk->bsk', x, W_v)  # [B, S, top_k_v]
-        h_v = h_v * soft_v.unsqueeze(1)  # [B, S, top_k_v] - soft weighted
 
-        # 3. Relational Q expansion: h_qk → Q (with soft weighting)
+        # 3. Relational Q expansion: h_qk → Q (soft weight on neurons)
         # selected_rel_q: [B, top_k_rel, d_model]
         selected_rel_q = self.shared_neurons.relational_neurons[idx_q]
-        h_qk_q = h_qk * soft_q.unsqueeze(1)  # [B, S, top_k_rel] - soft weighted
-        Q = torch.einsum('bsr,brd->bsd', h_qk_q, selected_rel_q)  # [B, S, D]
+        selected_rel_q = selected_rel_q * soft_q.unsqueeze(-1)  # [B, top_k_rel, D] - weight neurons
+        Q = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_q)  # [B, S, D]
 
-        # 4. Relational K expansion: h_qk → K (with soft weighting)
+        # 4. Relational K expansion: h_qk → K (soft weight on neurons)
         selected_rel_k = self.shared_neurons.relational_neurons[idx_k]
-        h_qk_k = h_qk * soft_k.unsqueeze(1)  # [B, S, top_k_rel] - soft weighted
-        K = torch.einsum('bsr,brd->bsd', h_qk_k, selected_rel_k)  # [B, S, D]
+        selected_rel_k = selected_rel_k * soft_k.unsqueeze(-1)  # [B, top_k_rel, D] - weight neurons
+        K = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_k)  # [B, S, D]
 
-        # 5. Value expansion: h_v → V (with soft weighting)
+        # 5. Value expansion: h_v → V (soft weight on neurons)
         selected_val = self.shared_neurons.value_neurons[idx_v2]  # [B, top_k_val, D]
-        h_v_weighted = h_v * soft_v2.unsqueeze(1)  # [B, S, top_k_val] - soft weighted
-        V = torch.einsum('bsr,brd->bsd', h_v_weighted, selected_val)  # [B, S, D]
+        selected_val = selected_val * soft_v2.unsqueeze(-1)  # [B, top_k_val, D] - weight neurons
+        V = torch.einsum('bsr,brd->bsd', h_v, selected_val)  # [B, S, D]
 
         # 6. Multi-head Attention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
