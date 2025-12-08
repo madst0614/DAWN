@@ -82,30 +82,36 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('usage_ema_value', torch.zeros(n_value))
         self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
 
+    @torch.no_grad()
     def update_usage(self, indices, neuron_type, n_neurons):
-        """Update usage EMA for selected neurons (index-based)"""
+        """Update usage EMA for selected neurons (index-based)
+
+        Uses in-place operations for torch.compile() compatibility.
+        """
         if not self.training:
             return
 
-        # Count usage from indices
+        # Count usage from indices (detached to avoid graph issues)
+        indices = indices.detach()
         B = indices.shape[0]
         usage = torch.zeros(n_neurons, device=indices.device)
         for b in range(B):
             usage.scatter_add_(0, indices[b], torch.ones_like(indices[b], dtype=usage.dtype))
         usage = usage / B  # Average over batch
 
+        # In-place update: ema = 0.99 * ema + 0.01 * usage
         if neuron_type == 'feature_qk':
-            self.usage_ema_feature_qk = 0.99 * self.usage_ema_feature_qk + 0.01 * usage
+            self.usage_ema_feature_qk.mul_(0.99).add_(usage, alpha=0.01)
         elif neuron_type == 'feature_v':
-            self.usage_ema_feature_v = 0.99 * self.usage_ema_feature_v + 0.01 * usage
+            self.usage_ema_feature_v.mul_(0.99).add_(usage, alpha=0.01)
         elif neuron_type == 'relational_q':
-            self.usage_ema_relational_q = 0.99 * self.usage_ema_relational_q + 0.01 * usage
+            self.usage_ema_relational_q.mul_(0.99).add_(usage, alpha=0.01)
         elif neuron_type == 'relational_k':
-            self.usage_ema_relational_k = 0.99 * self.usage_ema_relational_k + 0.01 * usage
+            self.usage_ema_relational_k.mul_(0.99).add_(usage, alpha=0.01)
         elif neuron_type == 'value':
-            self.usage_ema_value = 0.99 * self.usage_ema_value + 0.01 * usage
+            self.usage_ema_value.mul_(0.99).add_(usage, alpha=0.01)
         elif neuron_type == 'knowledge':
-            self.usage_ema_knowledge = 0.99 * self.usage_ema_knowledge + 0.01 * usage
+            self.usage_ema_knowledge.mul_(0.99).add_(usage, alpha=0.01)
 
     def get_logits(self, x, neuron_type):
         """
