@@ -973,32 +973,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # v16/v17: FQK/FV/RQ/RK/V (Feature QK/V, Relational Q/K, Value)
-                    if attn.get('feature_qk_pref') is not None:
-                        pref_FQK = attn.get('feature_qk_pref')
-                        pref_FV = attn.get('feature_v_pref')
-                        # v16: relational_pref_Q/K, v17: relational_q/k_pref
-                        pref_RQ = attn.get('relational_pref_Q') or attn.get('relational_q_pref')
-                        pref_RK = attn.get('relational_pref_K') or attn.get('relational_k_pref')
-                        pref_V = attn.get('value_pref')
-
-                        ent_FQK = calc_entropy_ratio(pref_FQK)
-                        ent_FV = calc_entropy_ratio(pref_FV)
-                        ent_RQ = calc_entropy_ratio(pref_RQ)
-                        ent_RK = calc_entropy_ratio(pref_RK)
-                        ent_V = calc_entropy_ratio(pref_V)
-
-                        var_FQK = calc_token_var(pref_FQK)
-                        var_FV = calc_token_var(pref_FV)
-                        var_RQ = calc_token_var(pref_RQ)
-                        var_RK = calc_token_var(pref_RK)
-                        var_V = calc_token_var(pref_V)
-
-                        ent_str = f"Ent FQK/FV/R:{ent_FQK:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
-                        var_str = f"TokVar:{var_FQK:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_V:.4f}"
-
-                    # v14: FRVK (Feature/Relational/Value/Knowledge)
-                    elif attn.get('feature_pref') is not None:
+                    # v14/v15/v16: FRVK (Feature/Relational/Value/Knowledge)
+                    # v16 also has feature_pref (= feature_qk_pref) for v15 compat
+                    if attn.get('feature_pref') is not None:
                         pref_F = attn.get('feature_pref')
                         pref_RQ = attn.get('relational_pref_Q')
                         pref_RK = attn.get('relational_pref_K')
@@ -1117,10 +1094,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         pass
 
                     # Warning if collapse detected (check min entropy across router types)
-                    # v16/v17: FQK/FV/RQ/RK/V, v14: F/RQ/RK/V, v13: C/Q/K/V
-                    if attn.get('feature_qk_pref') is not None:
-                        min_ent = min(ent_FQK, ent_FV, ent_RQ, ent_RK, ent_V)
-                    elif attn.get('feature_pref') is not None:
+                    # v14/v15/v16: F/RQ/RK/V, v13: C/Q/K/V
+                    if attn.get('feature_pref') is not None:
                         min_ent = min(ent_F, ent_RQ, ent_RK, ent_V)
                     else:
                         min_ent = min(ent_C, ent_Q, ent_K, ent_V)
@@ -1130,10 +1105,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     elif min_ent > 80:
                         print(f"  ⚠ WARNING: Router too uniform! (target: 60%)")
 
-                except Exception as e:
-                    import traceback
-                    print(f"[DEBUG] Routing log error: {type(e).__name__}: {e}")
-                    traceback.print_exc()
+                except Exception:
+                    pass  # Skip if routing_infos format is different
 
         # Log aggregated metrics every 100 steps (same format as console output)
         if log_file and (step + 1) % log_interval == 0:
