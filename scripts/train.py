@@ -1117,9 +1117,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         pass
 
                     # Warning if collapse detected (check min entropy across router types)
-                    # v14: F/RQ/RK/T, v13: C/Q/K/V
-                    if attn.get('feature_pref') is not None:
-                        min_ent = min(ent_F, ent_RQ, ent_RK, ent_T)
+                    # v16/v17: FQK/FV/RQ/RK/V, v14: F/RQ/RK/V, v13: C/Q/K/V
+                    if attn.get('feature_qk_pref') is not None:
+                        min_ent = min(ent_FQK, ent_FV, ent_RQ, ent_RK, ent_V)
+                    elif attn.get('feature_pref') is not None:
+                        min_ent = min(ent_F, ent_RQ, ent_RK, ent_V)
                     else:
                         min_ent = min(ent_C, ent_Q, ent_K, ent_V)
 
