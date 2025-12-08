@@ -1,5 +1,5 @@
 # DAWN v17 Training Config
-# Full Vector Neurons - No Excitability
+# Full Vector Neurons + Excitability (SAR)
 # 모든 뉴런 = 벡터 (rank 매트릭스 없음)
 
 # Data
@@ -68,7 +68,7 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17
 # v17 Changes from v16:
 #   - 모든 뉴런 벡터화 (rank 매트릭스 제거)
 #   - Relational/Value 뉴런 분리: relational_q, relational_k, value
-#   - Excitability 완전 제거
+#   - Excitability (SAR) 유지: τ=1.5, weight decay 적용
 #   - 5타입 라우팅: feature_qk, feature_v, relational_q, relational_k, value
 #
 # 파라미터 비교:

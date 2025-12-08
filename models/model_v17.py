@@ -1,12 +1,12 @@
 """
-DAWN v17: Full Vector Neurons (No Excitability)
+DAWN v17: Full Vector Neurons
 
 Core Changes from v16:
 - ALL neurons are vectors (no rank matrices)
 - 5 separate routing types: feature_qk, feature_v, relational_q, relational_k, value
 - Relational Q/K neurons: [n_relational_q/k, d_model] - expansion vectors
 - Value neurons: [n_value, d_model] - expansion vectors
-- Excitability completely removed
+- Excitability (SAR) for balanced neuron usage
 - 82% parameter reduction vs v15
 
 Architecture (FRVK v17):
@@ -35,7 +35,7 @@ except ImportError:
 
 class UnifiedNeuronRouter(nn.Module):
     """
-    v17: Unified neuron router with 5 separate types, NO excitability
+    v17: Unified neuron router with 5 separate types + Excitability
 
     Neuron types:
     - feature_qk: compression axis vectors for Q/K
@@ -44,6 +44,10 @@ class UnifiedNeuronRouter(nn.Module):
     - relational_k: expansion vectors for K
     - value: expansion vectors for V
     - knowledge: memory retrieval
+
+    Excitability (refractory-inspired):
+    - Less-used neurons get higher excitability bonus
+    - Encourages balanced neuron usage during training
     """
     def __init__(self, d_model, n_feature_qk, n_feature_v, n_relational_q, n_relational_k,
                  n_value, n_knowledge, d_space=64, dropout=0.1):
@@ -74,13 +78,29 @@ class UnifiedNeuronRouter(nn.Module):
         # Unified neuron embeddings [total_neurons, d_space]
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
-        # Usage tracking (for logging, no excitability bonus)
+        # Usage tracking for excitability
         self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
         self.register_buffer('usage_ema_feature_v', torch.zeros(n_feature_v))
         self.register_buffer('usage_ema_relational_q', torch.zeros(n_relational_q))
         self.register_buffer('usage_ema_relational_k', torch.zeros(n_relational_k))
         self.register_buffer('usage_ema_value', torch.zeros(n_value))
         self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
+
+        # Excitability: tau (recovery time constant) + decaying weight
+        self.tau = 1.5
+        self.excitability_weight = 1.0
+
+    def decay_excitability(self, decay_rate=0.9997):
+        """Decay excitability_weight each step."""
+        self.excitability_weight *= decay_rate
+
+    def get_excitability(self, usage_ema):
+        """
+        Neuronal excitability based on usage.
+        - usage_ema ≈ 0 → excitability = 1.0 (fully ready)
+        - usage_ema ≈ tau → excitability ≈ 0.0 (refractory)
+        """
+        return torch.clamp(1.0 - usage_ema / self.tau, min=0.0, max=1.0)
 
     @torch.no_grad()
     def update_usage(self, indices, neuron_type, n_neurons):
@@ -127,19 +147,42 @@ class UnifiedNeuronRouter(nn.Module):
         # Dot product with all neurons
         all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
 
-        # Type-specific slicing (no excitability)
+        # Type-specific slicing + Excitability
         if neuron_type == 'feature_qk':
             logits = all_logits[..., :self.feature_qk_end]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_feature_qk)
+                logits = logits + excitability * self.excitability_weight
+
         elif neuron_type == 'feature_v':
             logits = all_logits[..., self.feature_qk_end:self.feature_v_end]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_feature_v)
+                logits = logits + excitability * self.excitability_weight
+
         elif neuron_type == 'relational_q':
             logits = all_logits[..., self.feature_v_end:self.relational_q_end]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_relational_q)
+                logits = logits + excitability * self.excitability_weight
+
         elif neuron_type == 'relational_k':
             logits = all_logits[..., self.relational_q_end:self.relational_k_end]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_relational_k)
+                logits = logits + excitability * self.excitability_weight
+
         elif neuron_type == 'value':
             logits = all_logits[..., self.relational_k_end:self.value_end]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_value)
+                logits = logits + excitability * self.excitability_weight
+
         elif neuron_type == 'knowledge':
             logits = all_logits[..., self.value_end:]
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_knowledge)
+                logits = logits + excitability * self.excitability_weight
 
         return logits
 
@@ -663,12 +706,12 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v17: Full Vector Neurons (No Excitability)
+    DAWN v17: Full Vector Neurons
 
     Core Changes from v16:
     - ALL neurons are vectors (no rank matrices)
     - 5 separate routing: feature_qk, feature_v, relational_q, relational_k, value
-    - Excitability completely removed
+    - Excitability (SAR) for balanced neuron usage
     - 82% parameter reduction vs v15
 
     Architecture:
@@ -936,7 +979,7 @@ class DAWN(nn.Module):
     def get_model_info(self):
         """Return model architecture info for logging"""
         return [
-            f"DAWN v{self.__version__}: Full Vector Neurons (No Excitability)",
+            f"DAWN v{self.__version__}: Full Vector Neurons",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  Compression:",
             f"    Feature QK: {self.n_feature_qk} × {self.d_model} (top-k={self.top_k_feature_qk})",
@@ -946,5 +989,5 @@ class DAWN(nn.Module):
             f"    Relational K: {self.n_relational_k} × {self.d_model} (top-k={self.top_k_relational})",
             f"    Value: {self.n_value} × {self.d_model} (top-k={self.top_k_value})",
             f"  Knowledge: {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
-            f"  Router: d_space={self.d_space}",
+            f"  Router: d_space={self.d_space}, Excitability (SAR)",
         ]

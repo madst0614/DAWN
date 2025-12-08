@@ -8,7 +8,7 @@ v13.2: Unified Neuron Router (all neurons in same embedding space)
 v14.0: FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR
 v15.0: 2-Stage Hierarchical Knowledge Retrieval (x→router→coarse, x→proj_q→fine)
 v16.0: Split Feature QK/V Vector Neurons (41% param reduction)
-v17.0: Full Vector Neurons (82% param reduction, no excitability)
+v17.0: Full Vector Neurons (82% param reduction, excitability)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -266,7 +266,7 @@ VERSION_REGISTRY = {
         ],
     },
     "17.0": {
-        "description": "Full Vector Neurons (82% param reduction, no excitability)",
+        "description": "Full Vector Neurons (82% param reduction, excitability)",
         "aliases": ["17", "170"],
         "module": "model_v17",
         "required_params": [
@@ -288,7 +288,7 @@ VERSION_REGISTRY = {
             "gradient_checkpointing": False,
         },
         "display_info": lambda args: [
-            f"DAWN v17: Full Vector Neurons (No Excitability)",
+            f"DAWN v17: Full Vector Neurons (Excitability)",
             f"  d_model={args.get('d_model')}, n_layers={args.get('n_layers')}, n_heads={args.get('n_heads')}",
             f"  Compression:",
             f"    Feature QK: {args.get('n_feature_qk')} × {args.get('d_model')} (top-k={args.get('top_k_feature_qk', 64)})",

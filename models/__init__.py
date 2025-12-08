@@ -68,7 +68,7 @@ from .model_v15 import DAWN as DAWN_v15
 # v16.0 - Split Feature QK/V Vector Neurons
 from .model_v16 import DAWN as DAWN_v16
 
-# v17.0 - Full Vector Neurons (No Excitability)
+# v17.0 - Full Vector Neurons with Excitability
 from .model_v17 import DAWN as DAWN_v17
 
 # Default DAWN is v17 (latest)
