@@ -1493,7 +1493,7 @@ def main():
     # Training
     args.batch_size = cfg['training']['batch_size']
     args.num_epochs = cfg['training']['num_epochs']
-    args.lr = cfg['training']['lr']
+    args.lr = cfg['training'].get('lr', cfg['training'].get('learning_rate'))
     args.weight_decay = cfg['training']['weight_decay']
 
     # CLI overrides (takes precedence over config)
