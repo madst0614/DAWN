@@ -7,8 +7,8 @@ v13.1: Separate QK/V Expand Pools (Q/K share, V separate)
 v13.2: Unified Neuron Router (all neurons in same embedding space)
 v14.0: FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR
 v15.0: 2-Stage Hierarchical Knowledge Retrieval (x→router→coarse, x→proj_q→fine)
-v16.0: Split Feature QK/V Vector Neurons (41% param reduction)
-v17.0: Full Vector Neurons (82% param reduction, excitability)
+v16.0: Split Feature QK/V (rank matrix, v15-based) - Feature_QK/V separate compression
+v17.0: Full Vector Neurons + Soft Weighting (shared pools, excitability)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -227,58 +227,58 @@ VERSION_REGISTRY = {
         ],
     },
     "16.0": {
-        "description": "Split Feature QK/V Vector Neurons (41% param reduction)",
+        "description": "Split Feature QK/V (rank matrix, v15-based)",
         "aliases": ["16", "160"],
         "module": "model_v16",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
             "n_feature_qk", "n_feature_v", "n_relational", "n_value", "n_knowledge",
-            "rank_qk", "rank_v",
+            "rank",  # single rank for all matrices
         ],
         "optional_params": {
             "dropout": 0.1,
             "state_dim": 64,
-            "top_k_feature_qk": 64,
-            "top_k_feature_v": 32,
-            "top_k_relational": 16,
-            "top_k_value": 3,
+            "top_k_feature_qk": 8,
+            "top_k_feature_v": 8,
+            "top_k_relational": 4,
+            "top_k_value": 6,
             "d_space": 64,
-            "coarse_k": 16,
-            "fine_k": 8,
+            "coarse_k": 20,
+            "fine_k": 10,
             "knowledge_rank": 128,
             "gradient_checkpointing": False,
         },
         "display_info": lambda args: [
-            f"DAWN v16: Split Feature QK/V Vector Neurons",
-            f"  rank_qk={args.get('rank_qk')}, rank_v={args.get('rank_v')}",
-            f"  Feature QK Neurons: {args.get('n_feature_qk')} × {args.get('d_model')} (top-k={args.get('top_k_feature_qk', 64)})",
-            f"  Feature V Neurons: {args.get('n_feature_v')} × {args.get('d_model')} (top-k={args.get('top_k_feature_v', 32)})",
-            f"  RelationalNeurons (R): {args.get('n_relational')} × {args.get('rank_qk')} × {args.get('d_model')} (Q/K patterns)",
-            f"  ValueNeurons (V): {args.get('n_value')} × {args.get('rank_v')} × {args.get('d_model')} (V patterns)",
+            f"DAWN v16: Split Feature QK/V (rank matrix)",
+            f"  rank={args.get('rank', args.get('basis_rank'))}",
+            f"  Feature_QK: {args.get('n_feature_qk')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (top-k={args.get('top_k_feature_qk', 8)})",
+            f"  Feature_V: {args.get('n_feature_v')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (top-k={args.get('top_k_feature_v', 8)})",
+            f"  Relational: {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K expansion, top-k={args.get('top_k_relational', 4)})",
+            f"  Value: {args.get('n_value')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V expansion, top-k={args.get('top_k_value', 6)})",
             f"  Unified Router: d_space={args.get('d_space', 64)} + SAR",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
-            f"  Architecture: Mamba SSM → Context → Unified Router → Expand Q/K/V → FlashAttn",
+            f"  Architecture: Mamba SSM → Context → Unified Router → Rank Matrix Expand → FlashAttn",
             f"  Memory: 2-stage (x→router→coarse, x→encoder→fine)",
             f"  KnowledgeNeurons (K):",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",
             f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
-            f"    - coarse_k: {args.get('coarse_k', 16)} → fine_k: {args.get('fine_k', 8)}",
+            f"    - coarse_k: {args.get('coarse_k', 20)} → fine_k: {args.get('fine_k', 10)}",
         ],
     },
     "17.0": {
-        "description": "Full Vector Neurons (82% param reduction, excitability)",
+        "description": "Full Vector Neurons + Soft Weighting (shared pools)",
         "aliases": ["17", "170"],
         "module": "model_v17",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_feature_qk", "n_feature_v", "n_relational_q", "n_relational_k",
+            "n_feature",      # SHARED for QK/V (routing heads differ)
+            "n_relational",   # SHARED for Q/K (routing heads differ)
             "n_value", "n_knowledge",
         ],
         "optional_params": {
             "dropout": 0.1,
             "state_dim": 64,
-            "top_k_feature_qk": 64,
-            "top_k_feature_v": 32,
+            "top_k_feature": 64,       # Same top-k for QK and V
             "top_k_relational": 64,
             "top_k_value": 32,
             "d_space": 64,
@@ -288,18 +288,17 @@ VERSION_REGISTRY = {
             "gradient_checkpointing": False,
         },
         "display_info": lambda args: [
-            f"DAWN v17: Full Vector Neurons (Excitability)",
+            f"DAWN v17: Full Vector Neurons + Soft Weighting",
             f"  d_model={args.get('d_model')}, n_layers={args.get('n_layers')}, n_heads={args.get('n_heads')}",
-            f"  Compression:",
-            f"    Feature QK: {args.get('n_feature_qk')} × {args.get('d_model')} (top-k={args.get('top_k_feature_qk', 64)})",
-            f"    Feature V: {args.get('n_feature_v')} × {args.get('d_model')} (top-k={args.get('top_k_feature_v', 32)})",
-            f"  Expansion:",
-            f"    Relational Q: {args.get('n_relational_q')} × {args.get('d_model')} (top-k={args.get('top_k_relational', 64)})",
-            f"    Relational K: {args.get('n_relational_k')} × {args.get('d_model')} (top-k={args.get('top_k_relational', 64)})",
+            f"  Compression (SHARED pools):",
+            f"    Feature: {args.get('n_feature')} × {args.get('d_model')} (top-k={args.get('top_k_feature', 64)}) [QK/V share, routing differs]",
+            f"  Expansion (SHARED pools):",
+            f"    Relational: {args.get('n_relational')} × {args.get('d_model')} (top-k={args.get('top_k_relational', 64)}) [Q/K share, routing differs]",
             f"    Value: {args.get('n_value')} × {args.get('d_model')} (top-k={args.get('top_k_value', 32)})",
-            f"  Unified Router: d_space={args.get('d_space', 64)}",
+            f"  Unified Router: d_space={args.get('d_space', 64)} + Excitability (SAR)",
+            f"  Soft Weighting: top-k → softmax → weighted neurons (gradient flow)",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
-            f"  Architecture: Mamba SSM → Context → 5-type Router → Vector Neurons → FlashAttn",
+            f"  Architecture: Mamba SSM → Context → Soft Router → Vector Neurons → FlashAttn",
             f"  Memory: 2-stage (x→router→coarse, x→encoder→fine)",
             f"  KnowledgeNeurons (K):",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",
