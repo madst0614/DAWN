@@ -1,6 +1,6 @@
 # DAWN v16 Training Config
-# Vector Neurons: 각 뉴런 = 하나의 축 벡터
-# Feature_QK / Feature_V 분리
+# Split Feature QK/V
+# v15 기반 + Feature 뉴런 분리 (QK용 / V용)
 
 # Data
 data:
@@ -16,19 +16,22 @@ model:
   d_model: 320
   n_layers: 4
   n_heads: 4
-  rank_qk: 64                    # Q/K용 축 수 (= top_k_feature_qk)
-  rank_v: 32                     # V용 축 수 (= top_k_feature_v)
+  rank: 64
   state_dim: 64
 
-  # Feature 벡터 뉴런 (v16 핵심)
-  n_feature_qk: 128              # Q/K용 축 벡터 수
-  n_feature_v: 64                # V용 축 벡터 수
-  top_k_feature_qk: 64           # 64개 축 선택
-  top_k_feature_v: 32            # 32개 축 선택
+  # Split Feature Neurons (v16 신규)
+  n_feature_qk: 12               # Q/K compression용
+  n_feature_v: 12                # V compression용
+  top_k_feature_qk: 3
+  top_k_feature_v: 3
 
-  # RVK 뉴런 (유지)
+  # Expansion Neurons (v15와 동일)
   n_relational: 48
   n_value: 12
+  top_k_relational: 12
+  top_k_value: 3
+
+  # Knowledge (v15와 동일)
   n_knowledge: 80
   coarse_k: 20
   fine_k: 10
@@ -36,10 +39,6 @@ model:
 
   max_seq_len: 128
   dropout: 0.1
-
-  # Top-k sparse mixing
-  top_k_relational: 12
-  top_k_value: 3
 
   # Router settings
   d_space: 64
@@ -68,22 +67,7 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16
 log_dir: /content/drive/MyDrive/dawn/logs_v16
 
 # v16 Changes from v15:
-#   - Feature neurons → Vector neurons (각 뉴런 = 하나의 축)
-#   - Feature_QK / Feature_V 분리
-#   - n_feature_qk: 128개 벡터 중 64개 선택 → 64차원
-#   - n_feature_v: 64개 벡터 중 32개 선택 → 32차원
-#   - Top-k 후 idx 정렬 → 위치 고정 학습
-#
-# 파라미터 비교:
-#   v15:
-#     feature: 12 × 320 × 64 = 246K
-#
-#   v16:
-#     feature_qk: 128 × 320 = 41K
-#     feature_v: 64 × 320 = 20K
-#     expand_Q: 64 × 320 = 20K
-#     expand_K: 64 × 320 = 20K
-#     expand_V: 32 × 320 = 10K
-#     총: 111K
-#
-#   절감: 55%
+#   - Feature 뉴런 분리: feature_qk (Q/K용) + feature_v (V용)
+#   - 이론적 근거: Q/K는 "어디를 볼지", V는 "무엇을 가져올지" → 분리 타당
+#   - 파라미터: +737K (Feature_V 추가)
+#   - 나머지 구조는 v15와 동일
