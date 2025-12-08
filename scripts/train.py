@@ -973,12 +973,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # v17: FQK/FV/RQ/RK/V (Feature QK/V, Relational Q/K, Value)
+                    # v16/v17: FQK/FV/RQ/RK/V (Feature QK/V, Relational Q/K, Value)
                     if attn.get('feature_qk_pref') is not None:
                         pref_FQK = attn.get('feature_qk_pref')
                         pref_FV = attn.get('feature_v_pref')
-                        pref_RQ = attn.get('relational_q_pref')
-                        pref_RK = attn.get('relational_k_pref')
+                        # v16: relational_pref_Q/K, v17: relational_q/k_pref
+                        pref_RQ = attn.get('relational_pref_Q') or attn.get('relational_q_pref')
+                        pref_RK = attn.get('relational_pref_K') or attn.get('relational_k_pref')
                         pref_V = attn.get('value_pref')
 
                         ent_FQK = calc_entropy_ratio(pref_FQK)
