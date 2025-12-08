@@ -585,8 +585,50 @@ def _get_router_log_lines(router, global_step, total_steps):
     """
     lines = []
 
-    # v14: FRVK with Excitability (refractory-inspired)
-    if hasattr(router, 'usage_ema_feature'):
+    # v16: Split Feature QK/V with Excitability
+    if hasattr(router, 'usage_ema_feature_qk'):
+        ema_QK = router.usage_ema_feature_qk
+        ema_V = router.usage_ema_feature_v
+        ema_R = router.usage_ema_relational
+        ema_Val = router.usage_ema_value
+
+        # Active neuron counts
+        active_QK = (ema_QK > 0.01).sum().item()
+        active_V = (ema_V > 0.01).sum().item()
+        active_R = (ema_R > 0.01).sum().item()
+        active_Val = (ema_Val > 0.01).sum().item()
+        n_QK, n_V, n_R, n_Val = ema_QK.numel(), ema_V.numel(), ema_R.numel(), ema_Val.numel()
+
+        # Gini coefficients
+        gini_QK, gini_V = _gini(ema_QK), _gini(ema_V)
+        gini_R, gini_Val = _gini(ema_R), _gini(ema_Val)
+
+        # Excitability
+        tau = router.tau if hasattr(router, 'tau') else 1.5
+        weight = router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0
+        exc_QK = torch.clamp(1.0 - ema_QK / tau, min=0.0, max=1.0)
+        exc_V = torch.clamp(1.0 - ema_V / tau, min=0.0, max=1.0)
+
+        # Excitability distribution
+        min_exc_QK, max_exc_QK, mean_exc_QK = exc_QK.min().item(), exc_QK.max().item(), exc_QK.mean().item()
+        min_exc_V, max_exc_V, mean_exc_V = exc_V.min().item(), exc_V.max().item(), exc_V.mean().item()
+
+        lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active FQK/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
+        lines.append(f"             Gini FQK/FV:{gini_QK:.2f}/{gini_V:.2f} R/V:{gini_R:.2f}/{gini_Val:.2f}")
+        lines.append(f"             Exc FQK:[{min_exc_QK:.2f},{mean_exc_QK:.2f},{max_exc_QK:.2f}] FV:[{min_exc_V:.2f},{mean_exc_V:.2f},{max_exc_V:.2f}]")
+
+        # Knowledge neurons (if available)
+        if hasattr(router, 'usage_ema_knowledge'):
+            ema_K = router.usage_ema_knowledge
+            active_K = (ema_K > 0.01).sum().item()
+            n_K = ema_K.numel()
+            gini_K = _gini(ema_K)
+            exc_K = torch.clamp(1.0 - ema_K / tau, min=0.0, max=1.0)
+            min_exc_K, max_exc_K, mean_exc_K = exc_K.min().item(), exc_K.max().item(), exc_K.mean().item()
+            lines.append(f"             Knowledge (K): Active {int(active_K)}/{n_K} | Gini:{gini_K:.2f} | Exc:[{min_exc_K:.2f},{mean_exc_K:.2f},{max_exc_K:.2f}]")
+
+    # v14/v15: FRVK with Excitability (refractory-inspired)
+    elif hasattr(router, 'usage_ema_feature'):
         ema_F = router.usage_ema_feature
         ema_R = router.usage_ema_relational
         ema_V = router.usage_ema_value
@@ -713,11 +755,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 base_model = get_underlying_model(model)
 
                 # Check if v13.2+ (needs routing_info for usage logging)
-                # v13.2: usage_ema_compress, v14: usage_ema_feature
+                # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_qk
                 is_v13_2_plus = (hasattr(base_model, 'global_routers') and
                            hasattr(base_model.global_routers, 'neuron_router') and
                            (hasattr(base_model.global_routers.neuron_router, 'usage_ema_compress') or
-                            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))
+                            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature') or
+                            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_qk')))
 
                 # v10: DAWN model forward
                 if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2_plus:
@@ -773,11 +816,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             base_model = get_underlying_model(model)
 
             # Check if v13.2+ (needs routing_info for usage logging)
-            # v13.2: usage_ema_compress, v14: usage_ema_feature
+            # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_qk
             is_v13_2_plus = (hasattr(base_model, 'global_routers') and
                        hasattr(base_model.global_routers, 'neuron_router') and
                        (hasattr(base_model.global_routers.neuron_router, 'usage_ema_compress') or
-                        hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))
+                        hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature') or
+                        hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_qk')))
 
             # v10: DAWN model forward
             if load_balance_weight > 0 or entropy_weight > 0 or is_v13_2_plus:
