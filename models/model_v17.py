@@ -3,8 +3,8 @@ DAWN v17: Full Vector Neurons
 
 Core Changes from v16:
 - ALL neurons are vectors (no rank matrices)
-- 5 separate routing types: feature_qk, feature_v, relational_q, relational_k, value
-- Relational Q/K neurons: [n_relational_q/k, d_model] - expansion vectors
+- 4 routing types: feature_qk, feature_v, relational (shared Q/K), value
+- Relational neurons: [n_relational, d_model] - SHARED expansion vectors for Q/K
 - Value neurons: [n_value, d_model] - expansion vectors
 - Excitability (SAR) for balanced neuron usage
 - 82% parameter reduction vs v15
@@ -12,8 +12,7 @@ Core Changes from v16:
 Architecture (FRVK v17):
 - Feature QK: x → top-k selection → h_qk (compression, 320→64)
 - Feature V: x → top-k selection → h_v (compression, 320→32)
-- Relational Q: h_qk → top-k selection → Q (expansion, 64→320)
-- Relational K: h_qk → top-k selection → K (expansion, 64→320)
+- Relational: h_qk → top-k selection → Q/K (expansion, 64→320, SHARED pool)
 - Value: h_v → top-k selection → V (expansion, 32→320)
 - Knowledge: 2-stage retrieval (same as v16)
 """
@@ -35,13 +34,12 @@ except ImportError:
 
 class UnifiedNeuronRouter(nn.Module):
     """
-    v17: Unified neuron router with 5 separate types + Excitability
+    v17: Unified neuron router with shared relational + Excitability
 
     Neuron types:
     - feature_qk: compression axis vectors for Q/K
     - feature_v: compression axis vectors for V
-    - relational_q: expansion vectors for Q
-    - relational_k: expansion vectors for K
+    - relational: expansion vectors for Q/K (SHARED, routing differs)
     - value: expansion vectors for V
     - knowledge: memory retrieval
 
@@ -49,26 +47,24 @@ class UnifiedNeuronRouter(nn.Module):
     - Less-used neurons get higher excitability bonus
     - Encourages balanced neuron usage during training
     """
-    def __init__(self, d_model, n_feature_qk, n_feature_v, n_relational_q, n_relational_k,
+    def __init__(self, d_model, n_feature_qk, n_feature_v, n_relational,
                  n_value, n_knowledge, d_space=64, dropout=0.1):
         super().__init__()
         self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
-        self.n_relational_q = n_relational_q
-        self.n_relational_k = n_relational_k
+        self.n_relational = n_relational  # Shared for Q/K
         self.n_value = n_value
         self.n_knowledge = n_knowledge
         self.d_space = d_space
 
-        total_neurons = n_feature_qk + n_feature_v + n_relational_q + n_relational_k + n_value + n_knowledge
+        total_neurons = n_feature_qk + n_feature_v + n_relational + n_value + n_knowledge
         self.total_neurons = total_neurons
 
         # Index boundaries
         self.feature_qk_end = n_feature_qk
         self.feature_v_end = n_feature_qk + n_feature_v
-        self.relational_q_end = n_feature_qk + n_feature_v + n_relational_q
-        self.relational_k_end = n_feature_qk + n_feature_v + n_relational_q + n_relational_k
-        self.value_end = n_feature_qk + n_feature_v + n_relational_q + n_relational_k + n_value
+        self.relational_end = n_feature_qk + n_feature_v + n_relational
+        self.value_end = n_feature_qk + n_feature_v + n_relational + n_value
         # knowledge is value_end ~ total_neurons
 
         # Shared projection
@@ -78,11 +74,14 @@ class UnifiedNeuronRouter(nn.Module):
         # Unified neuron embeddings [total_neurons, d_space]
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
+        # Separate routing head for relational_k (shares same pool, different selection)
+        # This allows Q and K to select different neurons from the shared relational pool
+        self.neuron_emb_relational_k = nn.Parameter(torch.randn(n_relational, d_space) * 0.02)
+
         # Usage tracking for excitability
         self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
         self.register_buffer('usage_ema_feature_v', torch.zeros(n_feature_v))
-        self.register_buffer('usage_ema_relational_q', torch.zeros(n_relational_q))
-        self.register_buffer('usage_ema_relational_k', torch.zeros(n_relational_k))
+        self.register_buffer('usage_ema_relational', torch.zeros(n_relational))  # Shared for Q/K
         self.register_buffer('usage_ema_value', torch.zeros(n_value))
         self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
 
@@ -126,10 +125,8 @@ class UnifiedNeuronRouter(nn.Module):
                 self.usage_ema_feature_qk.mul_(0.99).add_(usage, alpha=0.01)
             elif neuron_type == 'feature_v':
                 self.usage_ema_feature_v.mul_(0.99).add_(usage, alpha=0.01)
-            elif neuron_type == 'relational_q':
-                self.usage_ema_relational_q.mul_(0.99).add_(usage, alpha=0.01)
-            elif neuron_type == 'relational_k':
-                self.usage_ema_relational_k.mul_(0.99).add_(usage, alpha=0.01)
+            elif neuron_type == 'relational':
+                self.usage_ema_relational.mul_(0.99).add_(usage, alpha=0.01)
             elif neuron_type == 'value':
                 self.usage_ema_value.mul_(0.99).add_(usage, alpha=0.01)
             elif neuron_type == 'knowledge':
@@ -139,49 +136,54 @@ class UnifiedNeuronRouter(nn.Module):
         """
         x: [B, S, d_model] or [B, S, rank] for expansion types
         neuron_type: 'feature_qk', 'feature_v', 'relational_q', 'relational_k', 'value', 'knowledge'
+
+        Note: relational_q and relational_k use SHARED neuron pool but SEPARATE routing heads.
+        This allows Q and K to select different neurons from the same pool (like v15).
         """
         h_proj = self.proj(x)  # [B, S, d_space]
         h_proj = self.dropout(h_proj)
 
-        # Normalize neuron embeddings
-        neuron_emb_norm = F.normalize(self.neuron_emb, dim=-1)
-
-        # Dot product with all neurons
-        all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
-
         # Type-specific slicing + Excitability
         if neuron_type == 'feature_qk':
-            logits = all_logits[..., :self.feature_qk_end]
+            neuron_emb_norm = F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_feature_qk)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'feature_v':
-            logits = all_logits[..., self.feature_qk_end:self.feature_v_end]
+            neuron_emb_norm = F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_feature_v)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'relational_q':
-            logits = all_logits[..., self.feature_v_end:self.relational_q_end]
+            # Q routing: uses unified neuron_emb for relational section
+            neuron_emb_norm = F.normalize(self.neuron_emb[self.feature_v_end:self.relational_end], dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
-                excitability = self.get_excitability(self.usage_ema_relational_q)
+                excitability = self.get_excitability(self.usage_ema_relational)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'relational_k':
-            logits = all_logits[..., self.relational_q_end:self.relational_k_end]
+            # K routing: uses SEPARATE neuron_emb_relational_k for different selection
+            neuron_emb_norm = F.normalize(self.neuron_emb_relational_k, dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
-                excitability = self.get_excitability(self.usage_ema_relational_k)
+                excitability = self.get_excitability(self.usage_ema_relational)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'value':
-            logits = all_logits[..., self.relational_k_end:self.value_end]
+            neuron_emb_norm = F.normalize(self.neuron_emb[self.relational_end:self.value_end], dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_value)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'knowledge':
-            logits = all_logits[..., self.value_end:]
+            neuron_emb_norm = F.normalize(self.neuron_emb[self.value_end:], dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_knowledge)
                 logits = logits + excitability * self.excitability_weight
@@ -198,8 +200,7 @@ class SharedNeurons(nn.Module):
     - feature_v_neurons: [n_feature_v, d_model]
 
     Expansion neurons:
-    - relational_q_neurons: [n_relational_q, d_model]
-    - relational_k_neurons: [n_relational_k, d_model]
+    - relational_neurons: [n_relational, d_model] (SHARED for Q/K)
     - value_neurons: [n_value, d_model]
 
     Knowledge neurons:
@@ -211,8 +212,7 @@ class SharedNeurons(nn.Module):
         d_model: int,
         n_feature_qk: int,
         n_feature_v: int,
-        n_relational_q: int,
-        n_relational_k: int,
+        n_relational: int,
         n_value: int,
         n_knowledge: int,
         knowledge_rank: int = None,
@@ -222,8 +222,7 @@ class SharedNeurons(nn.Module):
         self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
         self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
-        self.n_relational_q = n_relational_q
-        self.n_relational_k = n_relational_k
+        self.n_relational = n_relational  # Shared for Q/K
         self.n_value = n_value
         self.n_knowledge = n_knowledge
 
@@ -232,8 +231,7 @@ class SharedNeurons(nn.Module):
         self.feature_v_neurons = nn.Parameter(torch.randn(n_feature_v, d_model) * 0.02)
 
         # Expansion neurons (hidden → output)
-        self.relational_q_neurons = nn.Parameter(torch.randn(n_relational_q, d_model) * 0.02)
-        self.relational_k_neurons = nn.Parameter(torch.randn(n_relational_k, d_model) * 0.02)
+        self.relational_neurons = nn.Parameter(torch.randn(n_relational, d_model) * 0.02)  # Shared
         self.value_neurons = nn.Parameter(torch.randn(n_value, d_model) * 0.02)
 
         # Knowledge neurons
@@ -246,8 +244,7 @@ class SharedNeurons(nn.Module):
         # All vector neurons: normal init
         nn.init.normal_(self.feature_qk_neurons, std=0.02)
         nn.init.normal_(self.feature_v_neurons, std=0.02)
-        nn.init.normal_(self.relational_q_neurons, std=0.02)
-        nn.init.normal_(self.relational_k_neurons, std=0.02)
+        nn.init.normal_(self.relational_neurons, std=0.02)
         nn.init.normal_(self.value_neurons, std=0.02)
 
         nn.init.normal_(self.knowledge_neurons_K, std=0.02)
@@ -354,17 +351,16 @@ class GlobalSSM(nn.Module):
 
 class GlobalRouters(nn.Module):
     """
-    v17: 5-type routing (all vectors)
+    v17: 4-type routing (shared relational for Q/K)
 
     Routes:
     - feature_qk: [B, S, n_feature_qk] → top_k_feature_qk indices
     - feature_v: [B, S, n_feature_v] → top_k_feature_v indices
-    - relational_q: [B, S, n_relational_q] → top_k_relational indices
-    - relational_k: [B, S, n_relational_k] → top_k_relational indices
+    - relational: [B, S, n_relational] → top_k_relational indices (SHARED pool, separate routing for Q/K)
     - value: [B, S, n_value] → top_k_value indices
     """
     def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
-                 n_relational_q: int, n_relational_k: int, n_value: int, n_knowledge: int,
+                 n_relational: int, n_value: int, n_knowledge: int,
                  top_k_feature_qk: int = 64, top_k_feature_v: int = 32,
                  top_k_relational: int = 64, top_k_value: int = 32,
                  d_space: int = 64, router_dropout: float = 0.1):
@@ -372,8 +368,7 @@ class GlobalRouters(nn.Module):
         self.d_model = d_model
         self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
-        self.n_relational_q = n_relational_q
-        self.n_relational_k = n_relational_k
+        self.n_relational = n_relational  # Shared for Q/K
         self.n_value = n_value
         self.n_knowledge = n_knowledge
         self.top_k_feature_qk = top_k_feature_qk
@@ -382,7 +377,7 @@ class GlobalRouters(nn.Module):
         self.top_k_value = top_k_value
 
         self.neuron_router = UnifiedNeuronRouter(
-            d_model, n_feature_qk, n_feature_v, n_relational_q, n_relational_k,
+            d_model, n_feature_qk, n_feature_v, n_relational,
             n_value, n_knowledge, d_space=d_space, dropout=router_dropout
         )
 
@@ -393,8 +388,8 @@ class GlobalRouters(nn.Module):
         Returns:
             idx_qk: [B, top_k_feature_qk] - sorted indices for Feature QK
             idx_v: [B, top_k_feature_v] - sorted indices for Feature V
-            idx_q: [B, top_k_relational] - sorted indices for Relational Q
-            idx_k: [B, top_k_relational] - sorted indices for Relational K
+            idx_q: [B, top_k_relational] - sorted indices for Relational Q (from shared pool)
+            idx_k: [B, top_k_relational] - sorted indices for Relational K (from shared pool)
             idx_v2: [B, top_k_value] - sorted indices for Value
             routing_info: dict
             aux_loss: scalar
@@ -419,25 +414,25 @@ class GlobalRouters(nn.Module):
         # Update usage EMA
         self.neuron_router.update_usage(idx_v, 'feature_v', self.n_feature_v)
 
-        # Relational Q routing
+        # Relational Q routing (shared pool, Q routing head)
         logits_rel_q = self.neuron_router.get_logits(x, 'relational_q')
         pref_rel_q = F.softmax(logits_rel_q, dim=-1)
         weights_rel_q = torch.einsum('bs,bsn->bn', importance, pref_rel_q)
 
         _, idx_q = torch.topk(weights_rel_q, self.top_k_relational, dim=-1)
         idx_q = idx_q.sort(dim=-1).values
-        # Update usage EMA
-        self.neuron_router.update_usage(idx_q, 'relational_q', self.n_relational_q)
+        # Update usage EMA (Q selection)
+        self.neuron_router.update_usage(idx_q, 'relational', self.n_relational)
 
-        # Relational K routing
+        # Relational K routing (shared pool, K routing head - DIFFERENT selection)
         logits_rel_k = self.neuron_router.get_logits(x, 'relational_k')
         pref_rel_k = F.softmax(logits_rel_k, dim=-1)
         weights_rel_k = torch.einsum('bs,bsn->bn', importance, pref_rel_k)
 
         _, idx_k = torch.topk(weights_rel_k, self.top_k_relational, dim=-1)
         idx_k = idx_k.sort(dim=-1).values
-        # Update usage EMA
-        self.neuron_router.update_usage(idx_k, 'relational_k', self.n_relational_k)
+        # Update usage EMA (K selection)
+        self.neuron_router.update_usage(idx_k, 'relational', self.n_relational)
 
         # Value routing
         logits_val = self.neuron_router.get_logits(x, 'value')
@@ -457,14 +452,14 @@ class GlobalRouters(nn.Module):
                 count = mask.sum() + 1e-8
                 usage_fqk = (pref_qk * mask).sum(dim=(0, 1)) / count
                 usage_fv = (pref_v * mask).sum(dim=(0, 1)) / count
-                usage_rq = (pref_rel_q * mask).sum(dim=(0, 1)) / count
-                usage_rk = (pref_rel_k * mask).sum(dim=(0, 1)) / count
+                usage_rel_q = (pref_rel_q * mask).sum(dim=(0, 1)) / count
+                usage_rel_k = (pref_rel_k * mask).sum(dim=(0, 1)) / count
                 usage_val = (pref_val * mask).sum(dim=(0, 1)) / count
             else:
                 usage_fqk = pref_qk.mean(dim=(0, 1))
                 usage_fv = pref_v.mean(dim=(0, 1))
-                usage_rq = pref_rel_q.mean(dim=(0, 1))
-                usage_rk = pref_rel_k.mean(dim=(0, 1))
+                usage_rel_q = pref_rel_q.mean(dim=(0, 1))
+                usage_rel_k = pref_rel_k.mean(dim=(0, 1))
                 usage_val = pref_val.mean(dim=(0, 1))
 
             target_fqk = 1.0 / self.n_feature_qk
@@ -473,11 +468,10 @@ class GlobalRouters(nn.Module):
             target_fv = 1.0 / self.n_feature_v
             aux_loss = aux_loss + ((usage_fv - target_fv) ** 2).sum() * self.n_feature_v
 
-            target_rq = 1.0 / self.n_relational_q
-            aux_loss = aux_loss + ((usage_rq - target_rq) ** 2).sum() * self.n_relational_q
-
-            target_rk = 1.0 / self.n_relational_k
-            aux_loss = aux_loss + ((usage_rk - target_rk) ** 2).sum() * self.n_relational_k
+            # Shared relational pool: both Q and K contribute to load balance
+            target_rel = 1.0 / self.n_relational
+            aux_loss = aux_loss + ((usage_rel_q - target_rel) ** 2).sum() * self.n_relational
+            aux_loss = aux_loss + ((usage_rel_k - target_rel) ** 2).sum() * self.n_relational
 
             target_val = 1.0 / self.n_value
             aux_loss = aux_loss + ((usage_val - target_val) ** 2).sum() * self.n_value
@@ -500,13 +494,13 @@ class GlobalRouters(nn.Module):
 
 class NeuronCircuit(nn.Module):
     """
-    v17: Attention circuit with ALL vector neurons
+    v17: Attention circuit with ALL vector neurons (shared relational)
 
     Flow:
     1. x → feature_qk_neurons[idx_qk].T → h_qk (compression: 320→64)
     2. x → feature_v_neurons[idx_v].T → h_v (compression: 320→32)
-    3. h_qk @ relational_q_neurons[idx_q] → Q (expansion: 64→320)
-    4. h_qk @ relational_k_neurons[idx_k] → K (expansion: 64→320)
+    3. h_qk @ relational_neurons[idx_q] → Q (expansion: 64→320)
+    4. h_qk @ relational_neurons[idx_k] → K (expansion: 64→320)
     5. h_v @ value_neurons[idx_v2] → V (expansion: 32→320)
     6. Multi-head attention
     """
@@ -535,8 +529,8 @@ class NeuronCircuit(nn.Module):
             x: [B, S, D]
             idx_qk: [B, top_k_qk] - Feature QK indices
             idx_v: [B, top_k_v] - Feature V indices
-            idx_q: [B, top_k_rel] - Relational Q indices
-            idx_k: [B, top_k_rel] - Relational K indices
+            idx_q: [B, top_k_rel] - Relational Q indices (from shared pool)
+            idx_k: [B, top_k_rel] - Relational K indices (from shared pool)
             idx_v2: [B, top_k_val] - Value indices
             attention_mask: [B, S] optional
         """
@@ -553,13 +547,13 @@ class NeuronCircuit(nn.Module):
         W_v = selected_v.transpose(-1, -2)  # [B, D, top_k_v]
         h_v = torch.einsum('bsd,bdk->bsk', x, W_v)  # [B, S, top_k_v]
 
-        # 3. Relational Q expansion: h_qk → Q
+        # 3. Relational Q expansion: h_qk → Q (shared relational_neurons)
         # selected_rel_q: [B, top_k_rel, d_model]
-        selected_rel_q = self.shared_neurons.relational_q_neurons[idx_q]
+        selected_rel_q = self.shared_neurons.relational_neurons[idx_q]
         Q = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_q)  # [B, S, D]
 
-        # 4. Relational K expansion: h_qk → K
-        selected_rel_k = self.shared_neurons.relational_k_neurons[idx_k]
+        # 4. Relational K expansion: h_qk → K (shared relational_neurons)
+        selected_rel_k = self.shared_neurons.relational_neurons[idx_k]
         K = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_k)  # [B, S, D]
 
         # 5. Value expansion: h_v → V
@@ -736,15 +730,14 @@ class DAWN(nn.Module):
 
     Core Changes from v16:
     - ALL neurons are vectors (no rank matrices)
-    - 5 separate routing: feature_qk, feature_v, relational_q, relational_k, value
+    - 4 routing types: feature_qk, feature_v, relational (shared Q/K), value
     - Excitability (SAR) for balanced neuron usage
     - 82% parameter reduction vs v15
 
     Architecture:
     - Feature QK: [n_feature_qk, d_model] compression vectors
     - Feature V: [n_feature_v, d_model] compression vectors
-    - Relational Q: [n_relational_q, d_model] expansion vectors
-    - Relational K: [n_relational_k, d_model] expansion vectors
+    - Relational: [n_relational, d_model] expansion vectors (SHARED for Q/K)
     - Value: [n_value, d_model] expansion vectors
     - Knowledge: 2-stage retrieval
     """
@@ -763,8 +756,7 @@ class DAWN(nn.Module):
         top_k_feature_qk: int = 64,
         top_k_feature_v: int = 32,
         # Expansion neurons
-        n_relational_q: int = 256,
-        n_relational_k: int = 256,
+        n_relational: int = 256,  # Shared for Q/K
         n_value: int = 128,
         top_k_relational: int = 64,
         top_k_value: int = 32,
@@ -803,8 +795,7 @@ class DAWN(nn.Module):
         self.top_k_feature_v = top_k_feature_v
 
         # Expansion neuron counts
-        self.n_relational_q = n_relational_q
-        self.n_relational_k = n_relational_k
+        self.n_relational = n_relational  # Shared for Q/K
         self.n_value = n_value
         self.top_k_relational = top_k_relational
         self.top_k_value = top_k_value
@@ -820,7 +811,7 @@ class DAWN(nn.Module):
         self.shared_neurons = SharedNeurons(
             d_model=d_model,
             n_feature_qk=n_feature_qk, n_feature_v=n_feature_v,
-            n_relational_q=n_relational_q, n_relational_k=n_relational_k,
+            n_relational=n_relational,
             n_value=n_value, n_knowledge=n_knowledge,
             knowledge_rank=knowledge_rank,
         )
@@ -828,7 +819,7 @@ class DAWN(nn.Module):
         self.global_ssm = GlobalSSM(d_model, state_dim, return_context=use_ssm_context)
 
         self.global_routers = GlobalRouters(
-            d_model, n_feature_qk, n_feature_v, n_relational_q, n_relational_k,
+            d_model, n_feature_qk, n_feature_v, n_relational,
             n_value, n_knowledge,
             top_k_feature_qk, top_k_feature_v, top_k_relational, top_k_value,
             d_space=d_space, router_dropout=router_dropout
@@ -930,8 +921,7 @@ class DAWN(nn.Module):
     def count_by_component(self):
         feature_qk = self.shared_neurons.feature_qk_neurons.numel()
         feature_v = self.shared_neurons.feature_v_neurons.numel()
-        relational_q = self.shared_neurons.relational_q_neurons.numel()
-        relational_k = self.shared_neurons.relational_k_neurons.numel()
+        relational = self.shared_neurons.relational_neurons.numel()
         value = self.shared_neurons.value_neurons.numel()
         knowledge = self.shared_neurons.knowledge_neurons_K.numel() + self.shared_neurons.knowledge_neurons_V.numel()
         embed = self.token_emb.weight.numel() + self.pos_emb.weight.numel()
@@ -956,8 +946,7 @@ class DAWN(nn.Module):
         print(f"=== DAWN v17 Parameter Breakdown (Full Vector Neurons) ===")
         print(f"Feature QK Neurons:     {feature_qk:,} ({feature_qk/1e3:.1f}K) [{self.n_feature_qk} × {self.d_model}]")
         print(f"Feature V Neurons:      {feature_v:,} ({feature_v/1e3:.1f}K) [{self.n_feature_v} × {self.d_model}]")
-        print(f"Relational Q Neurons:   {relational_q:,} ({relational_q/1e3:.1f}K) [{self.n_relational_q} × {self.d_model}]")
-        print(f"Relational K Neurons:   {relational_k:,} ({relational_k/1e3:.1f}K) [{self.n_relational_k} × {self.d_model}]")
+        print(f"Relational Neurons:     {relational:,} ({relational/1e3:.1f}K) [{self.n_relational} × {self.d_model}] (SHARED Q/K)")
         print(f"Value Neurons:          {value:,} ({value/1e3:.1f}K) [{self.n_value} × {self.d_model}]")
         print(f"Expand O (per layer):   {expand_total:,} ({expand_total/1e3:.1f}K)")
         print(f"Knowledge Neurons (K):  {knowledge:,} ({knowledge/1e3:.1f}K)")
@@ -968,7 +957,7 @@ class DAWN(nn.Module):
         print(f"---")
         print(f"Top-k Feature QK: {self.top_k_feature_qk}/{self.n_feature_qk}")
         print(f"Top-k Feature V:  {self.top_k_feature_v}/{self.n_feature_v}")
-        print(f"Top-k Relational: {self.top_k_relational}/{self.n_relational_q}")
+        print(f"Top-k Relational: {self.top_k_relational}/{self.n_relational} (shared Q/K)")
         print(f"Top-k Value:      {self.top_k_value}/{self.n_value}")
         print(f"Mamba Available: {MAMBA_AVAILABLE}")
         print(f"---")
@@ -976,7 +965,7 @@ class DAWN(nn.Module):
 
         return {
             'feature_qk': feature_qk, 'feature_v': feature_v,
-            'relational_q': relational_q, 'relational_k': relational_k,
+            'relational': relational,
             'value': value, 'expand': expand_total, 'knowledge': knowledge,
             'embeddings': embed, 'ssm': ssm_total,
             'routers': routers, 'norms': norms,
@@ -991,7 +980,7 @@ class DAWN(nn.Module):
             'max_seq_len': self.max_seq_len,
             'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
             'top_k_feature_qk': self.top_k_feature_qk, 'top_k_feature_v': self.top_k_feature_v,
-            'n_relational_q': self.n_relational_q, 'n_relational_k': self.n_relational_k,
+            'n_relational': self.n_relational,  # Shared for Q/K
             'n_value': self.n_value,
             'top_k_relational': self.top_k_relational, 'top_k_value': self.top_k_value,
             'n_knowledge': self.n_knowledge,
@@ -1011,8 +1000,7 @@ class DAWN(nn.Module):
             f"    Feature QK: {self.n_feature_qk} × {self.d_model} (top-k={self.top_k_feature_qk})",
             f"    Feature V: {self.n_feature_v} × {self.d_model} (top-k={self.top_k_feature_v})",
             f"  Expansion:",
-            f"    Relational Q: {self.n_relational_q} × {self.d_model} (top-k={self.top_k_relational})",
-            f"    Relational K: {self.n_relational_k} × {self.d_model} (top-k={self.top_k_relational})",
+            f"    Relational: {self.n_relational} × {self.d_model} (top-k={self.top_k_relational}) [SHARED Q/K]",
             f"    Value: {self.n_value} × {self.d_model} (top-k={self.top_k_value})",
             f"  Knowledge: {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
             f"  Router: d_space={self.d_space}, Excitability (SAR)",

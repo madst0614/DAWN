@@ -25,10 +25,9 @@ model:
   top_k_feature_v: 32            # 32개 선택 → h_v [B,S,32]
 
   # Expansion 벡터 뉴런 (h → Q/K/V)
-  n_relational_q: 256            # Q 확장용 벡터 수
-  n_relational_k: 256            # K 확장용 벡터 수
+  n_relational: 256              # Q/K 공유 벡터 풀 (라우팅만 분리)
   n_value: 128                   # V 확장용 벡터 수
-  top_k_relational: 64           # Q/K 각각 64개 선택
+  top_k_relational: 64           # Q/K 각각 64개 선택 (다른 라우팅)
   top_k_value: 32                # V 32개 선택
 
   # Knowledge 뉴런
@@ -67,9 +66,9 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17
 
 # v17 Changes from v16:
 #   - 모든 뉴런 벡터화 (rank 매트릭스 제거)
-#   - Relational/Value 뉴런 분리: relational_q, relational_k, value
+#   - Relational 뉴런 Q/K 공유: 풀은 하나, 라우팅은 분리 (v15 방식)
 #   - Excitability (SAR) 유지: τ=1.5, weight decay 적용
-#   - 5타입 라우팅: feature_qk, feature_v, relational_q, relational_k, value
+#   - 4타입 뉴런 + 2타입 라우팅: feature_qk, feature_v, relational (Q/K 공유), value
 #
 # 파라미터 비교:
 #   v15:
@@ -81,9 +80,8 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17
 #   v17:
 #     feature_qk: 128 × 320 = 41K
 #     feature_v: 64 × 320 = 20K
-#     relational_q: 256 × 320 = 82K
-#     relational_k: 256 × 320 = 82K
+#     relational: 256 × 320 = 82K (Q/K 공유, 라우팅만 분리)
 #     value: 128 × 320 = 41K
-#     총: 266K
+#     총: 184K
 #
-#   절감: 82%
+#   절감: 87%
