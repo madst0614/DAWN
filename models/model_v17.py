@@ -93,7 +93,7 @@ class UnifiedNeuronRouter(nn.Module):
 
         # Excitability: tau (recovery time constant) + decaying weight
         self.tau = 1.5
-        self.excitability_weight = 1.0
+        self.excitability_weight = 0.0  # Disabled by default
 
     def decay_excitability(self, decay_rate=0.9997):
         """Decay excitability_weight each step."""
