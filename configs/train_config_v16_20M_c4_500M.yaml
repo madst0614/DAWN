@@ -1,0 +1,75 @@
+# DAWN v16 Training Config - 20M Scale, 500M tokens
+# Split Feature QK/V Vector Neurons
+
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+    - train/c4/c4_raw_001.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 500000000
+  max_val_tokens: 2000000
+
+model:
+  model_version: "16.0"
+  d_model: 384
+  n_layers: 12
+  n_heads: 4
+  rank_qk: 64                      # Q/K compression rank
+  rank_v: 32                       # V compression rank
+  state_dim: 64
+
+  # v16: Split Feature Neurons (optimized for 20M scale)
+  n_feature_qk: 512                # QK axis vectors
+  n_feature_v: 256                 # V axis vectors
+  n_relational: 160                # Q/K pattern modulation
+  n_value: 12                      # V pattern modulation
+  n_knowledge: 256
+  coarse_k: 16                     # Stage 1: router → coarse candidates
+  fine_k: 8                        # Stage 2: knowledge_encoder → fine selection
+  knowledge_rank: 128
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: false
+
+  # Top-k settings (optimized)
+  top_k_feature_qk: 64             # Select 64 QK axis vectors
+  top_k_feature_v: 32              # Select 32 V axis vectors
+  top_k_relational: 16
+  top_k_value: 3
+  d_space: 64
+  router_dropout: 0.1
+  token_routing: false
+  use_ssm_context: true
+
+training:
+  batch_size: 96
+  num_epochs: 3
+  lr: 0.00055
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_20M_c4_500M
+log_dir: /content/drive/MyDrive/dawn/logs_v16_20M_c4_500M
+
+# v16 Changes from v15:
+#   - Feature neurons split into QK and V pools
+#   - Each feature neuron = single axis vector (n_feature_qk × d_model)
+#   - expand_Q/K/V linear layers for reconstruction
+#   - 41% parameter reduction
+#
+# Parameter comparison (v15 vs v16 at 20M scale):
+#   v15 feature: 28 × 384 × 64 = 688K
+#   v16 feature_qk: 512 × 384 = 197K
+#   v16 feature_v: 256 × 384 = 98K
+#   v16 expand_Q: 64 × 384 = 25K
+#   v16 expand_K: 64 × 384 = 25K
+#   v16 expand_V: 32 × 384 = 12K
+#   Total v16: 357K (vs 688K, ~48% reduction in feature neurons)

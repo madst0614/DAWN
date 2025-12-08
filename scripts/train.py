@@ -1415,6 +1415,14 @@ def main():
     args.top_k_relational = cfg['model'].get('top_k_relational', cfg['model'].get('top_k_QK', 4))
     args.top_k_value = cfg['model'].get('top_k_value', cfg['model'].get('top_k_transfer', cfg['model'].get('top_k_V', 6)))
 
+    # v16.0 Split Feature QK/V parameters
+    args.n_feature_qk = cfg['model'].get('n_feature_qk', 512)
+    args.n_feature_v = cfg['model'].get('n_feature_v', 256)
+    args.rank_qk = cfg['model'].get('rank_qk', 64)
+    args.rank_v = cfg['model'].get('rank_v', 32)
+    args.top_k_feature_qk = cfg['model'].get('top_k_feature_qk', 64)
+    args.top_k_feature_v = cfg['model'].get('top_k_feature_v', 32)
+
     # v9.0 Compress/Expand/Reflection parameters
     args.n_compress = cfg['model'].get('n_compress', 4)
     args.n_expand = cfg['model'].get('n_expand', 4)
@@ -1657,7 +1665,25 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "15.0":
+        if model_version == "16.0":
+            # v16.0: Split Feature QK/V Vector Neurons
+            rank_qk = getattr(args, 'rank_qk', 64)
+            rank_v = getattr(args, 'rank_v', 32)
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
+            n_feature_qk = getattr(args, 'n_feature_qk', 512)
+            n_feature_v = getattr(args, 'n_feature_v', 256)
+            n_relational = getattr(args, 'n_relational', 160)
+            n_value = getattr(args, 'n_value', 12)
+            n_knowledge = getattr(args, 'n_knowledge', 256)
+            coarse_k = getattr(args, 'coarse_k', 16)
+            fine_k = getattr(args, 'fine_k', 8)
+            print(f"DAWN v{model_version}: Split Feature QK/V Vector Neurons")
+            print(f"  Feature QK/V: {n_feature_qk}/{n_feature_v}")
+            print(f"  Relational/Value: {n_relational}/{n_value}")
+            print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
+            print(f"  rank_qk={rank_qk}, rank_v={rank_v}, knowledge_rank={knowledge_rank}")
+            print(f"  (detailed info after model creation)")
+        elif model_version == "15.0":
             # v15.0: FRVK + 2-Stage Knowledge Retrieval
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
@@ -1885,7 +1911,29 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '13.1':
+    if model_version == '16.0':
+        # v16.0: Split Feature QK/V Vector Neurons
+        model_kwargs.update({
+            'n_feature_qk': getattr(args, 'n_feature_qk', 512),
+            'n_feature_v': getattr(args, 'n_feature_v', 256),
+            'n_relational': getattr(args, 'n_relational', 160),
+            'n_value': getattr(args, 'n_value', 12),
+            'n_knowledge': args.n_knowledge,
+            'coarse_k': args.coarse_k,
+            'fine_k': args.fine_k,
+            'knowledge_rank': args.knowledge_rank or 128,
+            'rank_qk': getattr(args, 'rank_qk', 64),
+            'rank_v': getattr(args, 'rank_v', 32),
+            'state_dim': getattr(args, 'state_dim', 64),
+            'top_k_feature_qk': getattr(args, 'top_k_feature_qk', 64),
+            'top_k_feature_v': getattr(args, 'top_k_feature_v', 32),
+            'top_k_relational': getattr(args, 'top_k_relational', 16),
+            'top_k_value': getattr(args, 'top_k_value', 3),
+            'd_space': getattr(args, 'd_space', 64),
+            'router_dropout': getattr(args, 'router_dropout', 0.1),
+            'gradient_checkpointing': args.gradient_checkpointing,
+        })
+    elif model_version == '13.1':
         # v13.1: Separate QK/V Expand Pools
         model_kwargs.update({
             'n_compress': args.n_compress,

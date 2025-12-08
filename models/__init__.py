@@ -32,6 +32,12 @@ v15.0: Direct Knowledge Projection
 - x → proj_k → Q (direct 128-dim projection)
 - Simpler memory access, independent of router
 
+v16.0: Split Feature QK/V Vector Neurons
+- Feature neurons split into QK and V pools
+- Each neuron = single axis vector (n_feature_qk × d_model)
+- expand_Q/K/V linear layers for reconstruction
+- 41% parameter reduction from v15
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -53,8 +59,11 @@ from .model_v14 import DAWN as DAWN_v14
 # v15.0 - Direct Knowledge Projection
 from .model_v15 import DAWN as DAWN_v15
 
-# Default DAWN is v15 (latest)
-DAWN = DAWN_v15
+# v16.0 - Split Feature QK/V Vector Neurons
+from .model_v16 import DAWN as DAWN_v16
+
+# Default DAWN is v16 (latest)
+DAWN = DAWN_v16
 
 # Baseline for comparison
 import sys
@@ -84,6 +93,7 @@ __all__ = [
     'DAWN_v13_2',
     'DAWN_v14',
     'DAWN_v15',
+    'DAWN_v16',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -98,14 +108,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "15.0"
+__version__ = "16.0"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "10.0", "13.0", "13.1", "13.2", "14.0", "15.0", or "baseline"
+        version: "10.0", "13.0", "13.1", "13.2", "14.0", "15.0", "16.0", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -128,6 +138,8 @@ def create_model_by_version(version, config):
         return DAWN_v14(**config)
     elif version == "15.0":
         return DAWN_v15(**config)
+    elif version == "16.0":
+        return DAWN_v16(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 10.0, 13.0, 13.1, 13.2, 14.0, 15.0, baseline")
+                        f"Supported versions: 10.0, 13.0, 13.1, 13.2, 14.0, 15.0, 16.0, baseline")

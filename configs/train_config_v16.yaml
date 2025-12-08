@@ -1,0 +1,76 @@
+# DAWN v16 Training Config
+# Split Feature QK/V Vector Neurons
+# 41% parameter reduction from v15
+
+# vs v15: Feature neurons split into QK and V pools
+# - feature_qk_neurons: (n_feature_qk, d_model) - axis vectors for Q/K
+# - feature_v_neurons: (n_feature_v, d_model) - axis vectors for V
+# - expand_Q/K/V linear layers replace relational/value neuron expansion
+
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - val/wikitext_5to1_texts.pkl
+
+# Model Architecture
+model:
+  model_version: "16.0"
+  d_model: 320
+  n_layers: 4
+  n_heads: 4
+  rank_qk: 64                      # Q/K compression rank
+  rank_v: 32                       # V compression rank
+  state_dim: 64
+
+  # v16: Split Feature Neurons
+  n_feature_qk: 256                # QK axis vectors
+  n_feature_v: 128                 # V axis vectors
+  n_relational: 48                 # Q/K pattern modulation
+  n_value: 12                      # V pattern modulation
+  n_knowledge: 80
+  coarse_k: 20                     # Stage 1: router-based candidate selection
+  fine_k: 10                       # Stage 2: encoder-based fine matching
+  knowledge_rank: 128
+  max_seq_len: 128
+  dropout: 0.1
+
+  # Top-k sparse mixing
+  top_k_feature_qk: 32             # Select 32 QK axis vectors
+  top_k_feature_v: 16              # Select 16 V axis vectors
+  top_k_relational: 12
+  top_k_value: 3
+
+  # Router settings
+  d_space: 64
+  router_dropout: 0.1
+  token_routing: false
+  use_ssm_context: true
+  gradient_checkpointing: false
+
+# Training
+training:
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
+  # Regularization
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16
+log_dir: /content/drive/MyDrive/dawn/logs_v16
+
+# v16 Changes from v15:
+#   - Feature neurons split: feature_qk + feature_v
+#   - Each feature neuron is a single axis vector (not rank matrix)
+#   - expand_Q/K/V linear layers for reconstruction
+#   - Relational/Value neurons now modulate Q/K/V patterns
+#   - 41% parameter reduction
