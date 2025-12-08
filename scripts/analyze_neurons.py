@@ -81,6 +81,43 @@ except ImportError:
 # Utilities
 # ============================================================
 
+# Global vocab cache (token_id -> word string)
+_VOCAB_CACHE = {}
+_VOCAB_CACHE_BUILT = False
+
+
+def build_vocab_cache(tokenizer, vocab_size: int = None):
+    """Pre-build token_id -> word mapping for fast lookup"""
+    global _VOCAB_CACHE, _VOCAB_CACHE_BUILT
+    if _VOCAB_CACHE_BUILT:
+        return _VOCAB_CACHE
+
+    if vocab_size is None:
+        vocab_size = tokenizer.vocab_size
+
+    print(f"Building vocab cache ({vocab_size} tokens)...")
+    for tid in range(vocab_size):
+        try:
+            _VOCAB_CACHE[tid] = tokenizer.decode([tid]).strip()
+        except:
+            _VOCAB_CACHE[tid] = f"[UNK_{tid}]"
+
+    _VOCAB_CACHE_BUILT = True
+    print(f"Vocab cache built: {len(_VOCAB_CACHE)} entries")
+    return _VOCAB_CACHE
+
+
+def get_word_from_cache(token_id: int, tokenizer=None) -> str:
+    """Get word from cache, decode if not cached"""
+    if token_id in _VOCAB_CACHE:
+        return _VOCAB_CACHE[token_id]
+    if tokenizer is not None:
+        word = tokenizer.decode([token_id]).strip()
+        _VOCAB_CACHE[token_id] = word
+        return word
+    return f"[UNK_{token_id}]"
+
+
 def get_underlying_model(model):
     if hasattr(model, '_orig_mod'):
         return model._orig_mod
@@ -199,12 +236,12 @@ class NeuronWordMapper:
 
         self.model.eval()
 
+        # Build global vocab cache once (fast lookup)
+        build_vocab_cache(self.tokenizer)
+
         # neuron_id -> {word: activation_sum}
         neuron_words = [Counter() for _ in range(self.n_neurons)]
         neuron_total = np.zeros(self.n_neurons)
-
-        # Cache token_id -> word mapping
-        token_cache = {}
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Building word map", total=max_batches)):
             if batch_idx >= max_batches:
@@ -212,14 +249,7 @@ class NeuronWordMapper:
 
             input_ids = batch["input_ids"].to(self.device)
             B, S = input_ids.shape
-
-            # Pre-decode tokens with cache
             input_ids_cpu = input_ids.cpu().numpy()
-            for b in range(B):
-                for s in range(S):
-                    tid = input_ids_cpu[b, s]
-                    if tid not in token_cache:
-                        token_cache[tid] = self.tokenizer.decode([tid]).strip()
 
             _, routing_infos = self.model(input_ids, return_routing_info=True)
 
@@ -241,7 +271,7 @@ class NeuronWordMapper:
 
             for b in range(B):
                 for s in range(S):
-                    word = token_cache[input_ids_cpu[b, s]]
+                    word = get_word_from_cache(input_ids_cpu[b, s], self.tokenizer)
 
                     # Skip special tokens
                     if word.lower() in ['[pad]', '[cls]', '[sep]', '[unk]', '<pad>', '<s>', '</s>', '<unk>']:
@@ -646,7 +676,7 @@ class NeuronAblation:
 
             # Shift for LM loss
             shift_logits = logits[:, :-1, :].contiguous().float()
-            shift_labels = input_ids[:, 1:].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous().long()  # Fix: Int to Long conversion
 
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
@@ -677,8 +707,8 @@ class NeuronAblation:
                 logits = outputs
 
             # Shift for LM loss
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous().float()
+            shift_labels = input_ids[:, 1:].contiguous().long()  # Fix: Int to Long conversion
 
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
@@ -710,6 +740,196 @@ class NeuronAblation:
         ax.set_title('Neuron Ablation Study')
         ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
 
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"Saved: {output_path}")
+
+
+# ============================================================
+# 4.5. FRVK Ablation Study (v15)
+# ============================================================
+
+class FRVKAblation:
+    """FRVK (Feature, Relational, Value, Knowledge) neuron type ablation for v15"""
+
+    def __init__(self, model, tokenizer, device='cuda'):
+        self.model = get_underlying_model(model)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.detector = VersionDetector(model)
+        self.use_amp = HAS_AMP and device != 'cpu'
+
+    @torch.no_grad()
+    def run_frvk_ablation(self, dataloader, max_batches: int = 20) -> Dict:
+        """Run ablation study for each FRVK neuron type"""
+        print(f"\n{'='*60}")
+        print(f"FRVK ABLATION STUDY (v15)")
+        print(f"{'='*60}")
+
+        if self.detector.version != '15':
+            print(f"Warning: FRVK ablation is designed for v15, current version: {self.detector.version}")
+
+        self.model.eval()
+
+        # Cache batches
+        print("Caching data batches...")
+        cached_batches = []
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+            cached_batches.append(batch["input_ids"].to(self.device))
+
+        # Get baseline
+        baseline_loss = self._compute_loss(cached_batches)
+        baseline_ppl = math.exp(baseline_loss)
+        print(f"Baseline perplexity: {baseline_ppl:.2f}")
+
+        results = {
+            'baseline_ppl': baseline_ppl,
+            'neuron_types': {}
+        }
+
+        shared = self.model.shared_neurons
+
+        # FRVK neuron types and their tensors
+        neuron_types = {
+            'Feature': ('feature_neurons', getattr(shared, 'feature_neurons', None)),
+            'Relational': ('relational_neurons', getattr(shared, 'relational_neurons', None)),
+            'Value': ('value_neurons', getattr(shared, 'value_neurons', None)),
+            'Knowledge': ('knowledge_neurons', getattr(shared, 'knowledge_neurons', None)),
+        }
+
+        for type_name, (attr_name, neurons) in neuron_types.items():
+            if neurons is None:
+                print(f"Skipping {type_name}: not found in model")
+                continue
+
+            n_neurons = neurons.shape[0]
+            print(f"\n--- {type_name} Neurons ({n_neurons}) ---")
+
+            original_weights = neurons.data.clone()
+            type_results = {'n_neurons': n_neurons, 'ablations': {}}
+
+            # Test ablating each neuron individually (sample if too many)
+            test_neurons = list(range(min(10, n_neurons)))  # Test first 10 or all
+            if n_neurons > 10:
+                # Also test some random neurons
+                import random
+                random.seed(42)
+                test_neurons.extend(random.sample(range(10, n_neurons), min(5, n_neurons - 10)))
+
+            for n in tqdm(test_neurons, desc=f"Ablating {type_name}"):
+                neurons.data[n] = 0
+
+                ablated_loss = self._compute_loss(cached_batches)
+                ablated_ppl = math.exp(ablated_loss)
+                delta_ppl = ablated_ppl - baseline_ppl
+
+                type_results['ablations'][n] = {
+                    'ppl': ablated_ppl,
+                    'delta_ppl': delta_ppl,
+                    'importance': delta_ppl / baseline_ppl,
+                }
+
+                neurons.data = original_weights.clone()
+
+            # Also test ablating ALL neurons of this type
+            neurons.data.zero_()
+            all_ablated_loss = self._compute_loss(cached_batches)
+            all_ablated_ppl = math.exp(all_ablated_loss)
+            type_results['all_ablated_ppl'] = all_ablated_ppl
+            type_results['all_ablated_delta'] = all_ablated_ppl - baseline_ppl
+            type_results['type_importance'] = (all_ablated_ppl - baseline_ppl) / baseline_ppl
+
+            neurons.data = original_weights.clone()
+
+            results['neuron_types'][type_name] = type_results
+
+            print(f"  All {type_name} ablated: PPL {all_ablated_ppl:.2f} (+{all_ablated_ppl - baseline_ppl:.2f})")
+
+        # Summary
+        print(f"\n--- FRVK Type Importance ---")
+        for type_name, data in sorted(results['neuron_types'].items(),
+                                       key=lambda x: x[1]['type_importance'], reverse=True):
+            print(f"  {type_name}: +{data['all_ablated_delta']:.2f} PPL ({data['type_importance']*100:.1f}%)")
+
+        return results
+
+    def _compute_loss(self, cached_batches: List[torch.Tensor]) -> float:
+        """Compute average loss from cached batches"""
+        total_loss = 0
+        total_tokens = 0
+
+        for input_ids in cached_batches:
+            with autocast(enabled=self.use_amp):
+                outputs = self.model(input_ids)
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+
+            shift_logits = logits[:, :-1, :].contiguous().float()
+            shift_labels = input_ids[:, 1:].contiguous().long()
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction='sum'
+            )
+
+            total_loss += loss.item()
+            total_tokens += shift_labels.numel()
+
+        return total_loss / total_tokens if total_tokens > 0 else 0
+
+    def visualize(self, results: Dict, output_path: str):
+        """Create 4-subplot visualization for FRVK ablation"""
+        if not HAS_MATPLOTLIB or not results.get('neuron_types'):
+            return
+
+        neuron_types = results['neuron_types']
+        n_types = len(neuron_types)
+
+        if n_types == 0:
+            return
+
+        # 2x2 subplot layout
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        axes = axes.flatten()
+
+        type_order = ['Feature', 'Relational', 'Value', 'Knowledge']
+
+        for idx, type_name in enumerate(type_order):
+            ax = axes[idx]
+
+            if type_name not in neuron_types:
+                ax.text(0.5, 0.5, f'{type_name}\n(not available)',
+                       ha='center', va='center', fontsize=12)
+                ax.set_title(type_name)
+                continue
+
+            data = neuron_types[type_name]
+            ablations = data.get('ablations', {})
+
+            if not ablations:
+                ax.text(0.5, 0.5, f'{type_name}\n(no data)',
+                       ha='center', va='center', fontsize=12)
+                ax.set_title(type_name)
+                continue
+
+            neurons = sorted(ablations.keys())
+            importances = [ablations[n]['importance'] * 100 for n in neurons]
+
+            colors = ['red' if imp > 5 else 'orange' if imp > 1 else 'green' for imp in importances]
+            ax.bar(range(len(neurons)), importances, color=colors, alpha=0.7)
+            ax.set_xticks(range(len(neurons)))
+            ax.set_xticklabels([f'{n}' for n in neurons], rotation=45, fontsize=8)
+            ax.set_ylabel('Importance (%)')
+            ax.set_title(f'{type_name} (n={data["n_neurons"]}, all: +{data["type_importance"]*100:.1f}%)')
+            ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+
+        plt.suptitle(f'FRVK Neuron Ablation Study (Baseline PPL: {results["baseline_ppl"]:.2f})', fontsize=14)
         plt.tight_layout()
         plt.savefig(output_path, dpi=150)
         plt.close()
@@ -1863,24 +2083,47 @@ def load_model_and_data(args):
     dataloader = None
     if args.val_data:
         print(f"\nLoading data: {args.val_data}")
-        with open(args.val_data, 'rb') as f:
-            val_texts = pickle.load(f)
+        # Handle both .pt (torch) and .pkl (pickle) files
+        if args.val_data.endswith('.pt'):
+            val_data = torch.load(args.val_data, map_location='cpu', weights_only=False)
+            # Handle different data formats
+            if isinstance(val_data, torch.Tensor):
+                # Raw token tensor - chunk into sequences
+                if val_data.dim() == 1:
+                    seq_len = config.get('max_seq_len', 512)
+                    n_seqs = len(val_data) // seq_len
+                    val_data = val_data[:n_seqs * seq_len].reshape(n_seqs, seq_len)
+                val_texts = val_data  # Will be handled as tensor dataset
+            elif isinstance(val_data, dict):
+                val_texts = val_data.get('input_ids', val_data.get('tokens', None))
+            else:
+                val_texts = val_data
+        else:
+            with open(args.val_data, 'rb') as f:
+                val_texts = pickle.load(f)
 
         class SimpleDataset(torch.utils.data.Dataset):
-            def __init__(self, texts, tokenizer, max_len=128):
-                self.texts = texts
+            def __init__(self, data, tokenizer, max_len=128):
+                self.data = data
                 self.tokenizer = tokenizer
                 self.max_len = max_len
+                # Check if data is tensor (pre-tokenized) or text
+                self.is_tensor = isinstance(data, torch.Tensor)
             def __len__(self):
-                return len(self.texts)
+                return len(self.data)
             def __getitem__(self, idx):
-                encoding = self.tokenizer(
-                    self.texts[idx], truncation=True, max_length=self.max_len,
-                    padding='max_length', return_tensors='pt'
-                )
-                return {'input_ids': encoding['input_ids'].squeeze(0)}
+                if self.is_tensor:
+                    # Pre-tokenized tensor data
+                    return {'input_ids': self.data[idx]}
+                else:
+                    # Text data - tokenize on the fly
+                    encoding = self.tokenizer(
+                        self.data[idx], truncation=True, max_length=self.max_len,
+                        padding='max_length', return_tensors='pt'
+                    )
+                    return {'input_ids': encoding['input_ids'].squeeze(0)}
 
-        dataset = SimpleDataset(val_texts, tokenizer)
+        dataset = SimpleDataset(val_texts, tokenizer, config.get('max_seq_len', 512))
         num_workers = getattr(args, 'num_workers', 4)
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_size=args.batch_size, shuffle=False,
@@ -1898,7 +2141,7 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./neuron_analysis')
     parser.add_argument('--mode', type=str, default='all',
                         choices=['all', 'word_map', 'cluster', 'similarity',
-                                'ablation', 'probe', 'layer', 'trajectory',
+                                'ablation', 'frvk_ablation', 'probe', 'layer', 'trajectory',
                                 'distribution', 'context',
                                 'semantic_path', 'semantic_category', 'knowledge_content', 'cross_layer'])
     parser.add_argument('--max_batches', type=int, default=50)
@@ -1940,6 +2183,15 @@ def main():
         results = ablation.run_ablation(dataloader, max_batches=20)
         ablation.visualize(results, os.path.join(args.output_dir, 'ablation.png'))
         all_results['ablation'] = results
+
+    # 4.5. FRVK Ablation (v15)
+    if args.mode in ['all', 'frvk_ablation'] and dataloader:
+        base_model = get_underlying_model(model)
+        if hasattr(base_model, 'shared_neurons') and hasattr(base_model.shared_neurons, 'feature_neurons'):
+            frvk_ablation = FRVKAblation(model, tokenizer, device)
+            results = frvk_ablation.run_frvk_ablation(dataloader, max_batches=20)
+            frvk_ablation.visualize(results, os.path.join(args.output_dir, 'frvk_ablation.png'))
+            all_results['frvk_ablation'] = results
 
     # 5. Probing
     if args.mode in ['all', 'probe'] and dataloader:
