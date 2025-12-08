@@ -1723,7 +1723,27 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "16.0":
+        if model_version == "17.0":
+            # v17.0: Full Vector Neurons (No Excitability)
+            knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
+            n_feature_qk = getattr(args, 'n_feature_qk', 128)
+            n_feature_v = getattr(args, 'n_feature_v', 64)
+            n_relational_q = getattr(args, 'n_relational_q', 256)
+            n_relational_k = getattr(args, 'n_relational_k', 256)
+            n_value = getattr(args, 'n_value', 128)
+            n_knowledge = getattr(args, 'n_knowledge', 80)
+            coarse_k = getattr(args, 'coarse_k', 20)
+            fine_k = getattr(args, 'fine_k', 10)
+            top_k_fqk = getattr(args, 'top_k_feature_qk', 64)
+            top_k_fv = getattr(args, 'top_k_feature_v', 32)
+            top_k_rel = getattr(args, 'top_k_relational', 64)
+            top_k_val = getattr(args, 'top_k_value', 32)
+            print(f"DAWN v{model_version}: Full Vector Neurons (No Excitability)")
+            print(f"  Compression: FQK={n_feature_qk}(top-{top_k_fqk}), FV={n_feature_v}(top-{top_k_fv})")
+            print(f"  Expansion: RQ={n_relational_q}, RK={n_relational_k}(top-{top_k_rel}), V={n_value}(top-{top_k_val})")
+            print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
+            print(f"  knowledge_rank={knowledge_rank}")
+        elif model_version == "16.0":
             # v16.0: Split Feature QK/V Vector Neurons
             rank_qk = getattr(args, 'rank_qk', 64)
             rank_v = getattr(args, 'rank_v', 32)
