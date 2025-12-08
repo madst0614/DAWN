@@ -1,6 +1,7 @@
 # DAWN v17 Training Config
 # Full Vector Neurons + Soft Weighting + Excitability (SAR)
 # 모든 뉴런 = 벡터, soft weighting으로 gradient flow
+# 공유 풀: Feature (QK/V), Relational (Q/K)
 
 # Data
 data:
@@ -18,17 +19,15 @@ model:
   n_heads: 4
   state_dim: 64
 
-  # Compression 벡터 뉴런 (x → h) - v15 파라미터 매칭
-  n_feature_qk: 768              # Q/K 압축용 벡터 수
-  n_feature_v: 768               # V 압축용 벡터 수
-  top_k_feature_qk: 64           # 64개 선택 → h_qk [B,S,64]
-  top_k_feature_v: 64            # 64개 선택 → h_v [B,S,64]
+  # Compression 벡터 뉴런 (x → h) - QK/V 공유 풀
+  n_feature: 768                 # QK/V 공유 압축 벡터 풀 (라우팅만 분리)
+  top_k_feature: 64              # 64개 선택 → h_qk, h_v [B,S,64]
 
   # Expansion 벡터 뉴런 (h → Q/K/V)
   n_relational: 1600             # Q/K 공유 벡터 풀 (라우팅만 분리)
   n_value: 768                   # V 확장용 벡터 풀
   top_k_relational: 64           # Q/K 각각 64개 선택 (다른 라우팅)
-  top_k_value: 64                # 64개 선택 → h_v [B,S,64]
+  top_k_value: 64                # 64개 선택 → V [B,S,D]
 
   # Knowledge 뉴런
   n_knowledge: 80
@@ -66,13 +65,13 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17
 
 # v17 Changes from v16:
 #   - 모든 뉴런 벡터화 (rank 매트릭스 제거)
-#   - Relational 뉴런 Q/K 공유: 풀은 하나, 라우팅은 분리 (v15 방식)
+#   - Feature 뉴런 QK/V 공유: 풀은 하나, 라우팅은 분리 (768개)
+#   - Relational 뉴런 Q/K 공유: 풀은 하나, 라우팅은 분리 (1600개)
 #   - Soft weighting: top-k 후 softmax로 gradient flow
 #   - Excitability (SAR) 유지: τ=1.5, weight decay 적용
 #
 # 파라미터:
-#   feature_qk:  768 × 320 = 246K
-#   feature_v:   768 × 320 = 246K
+#   feature:     768 × 320 = 246K (QK/V 공유)
 #   relational: 1600 × 320 = 512K (Q/K 공유)
 #   value:       768 × 320 = 246K
-#   총: 1,250K
+#   총: 1,004K (Feature 공유로 246K 감소)

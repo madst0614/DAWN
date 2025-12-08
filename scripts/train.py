@@ -585,45 +585,41 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
-    # v17: Full Vector Neurons with Shared Relational (Q/K) + Soft Weighting
-    if hasattr(router, 'neuron_emb_relational_k'):  # v17 has separate K routing head
-        n_fqk = router.n_feature_qk
-        n_fv = router.n_feature_v
+    # v17: Full Vector Neurons with Shared Feature (QK/V) + Shared Relational (Q/K) + Soft Weighting
+    if hasattr(router, 'neuron_emb_feature_v'):  # v17 has separate V routing head for shared feature pool
+        n_f = router.n_feature  # Shared for QK/V
         n_rel = router.n_relational  # Shared for Q/K
         n_val = router.n_value
         n_k = router.n_knowledge
 
-        # Usage EMA stats
-        ema_fqk = router.usage_ema_feature_qk
-        ema_fv = router.usage_ema_feature_v
+        # Usage EMA stats (shared pools)
+        ema_f = router.usage_ema_feature  # Shared EMA for QK/V
         ema_rel = router.usage_ema_relational  # Shared EMA for Q/K
         ema_val = router.usage_ema_value
         ema_k = router.usage_ema_knowledge
 
         # Active neuron counts (ema > 0.01)
-        active_fqk = (ema_fqk > 0.01).sum().item()
-        active_fv = (ema_fv > 0.01).sum().item()
+        active_f = (ema_f > 0.01).sum().item()
         active_rel = (ema_rel > 0.01).sum().item()
         active_val = (ema_val > 0.01).sum().item()
         active_k = (ema_k > 0.01).sum().item()
 
         # Gini coefficients
-        gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
+        gini_f = _gini(ema_f)
         gini_rel = _gini(ema_rel)
         gini_val, gini_k = _gini(ema_val), _gini(ema_k)
 
         # Excitability
         tau = router.tau if hasattr(router, 'tau') else 1.5
         weight = router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0
-        exc_fqk = torch.clamp(1.0 - ema_fqk / tau, min=0.0, max=1.0)
-        exc_fv = torch.clamp(1.0 - ema_fv / tau, min=0.0, max=1.0)
+        exc_f = torch.clamp(1.0 - ema_f / tau, min=0.0, max=1.0)
         exc_rel = torch.clamp(1.0 - ema_rel / tau, min=0.0, max=1.0)
         exc_val = torch.clamp(1.0 - ema_val / tau, min=0.0, max=1.0)
         exc_k = torch.clamp(1.0 - ema_k / tau, min=0.0, max=1.0)
 
-        lines.append(f"         v17 Soft | τ={tau:.1f} w={weight:.3f} | FQK:{int(active_fqk)}/{n_fqk} FV:{int(active_fv)}/{n_fv} R(Q/K):{int(active_rel)}/{n_rel} V:{int(active_val)}/{n_val}")
-        lines.append(f"             Gini FQK/FV/R/V: {gini_fqk:.2f}/{gini_fv:.2f}/{gini_rel:.2f}/{gini_val:.2f}")
-        lines.append(f"             Exc FQK:[{exc_fqk.min().item():.2f},{exc_fqk.mean().item():.2f},{exc_fqk.max().item():.2f}] FV:[{exc_fv.min().item():.2f},{exc_fv.mean().item():.2f},{exc_fv.max().item():.2f}]")
+        lines.append(f"         v17 Soft | τ={tau:.1f} w={weight:.3f} | F(QK/V):{int(active_f)}/{n_f} R(Q/K):{int(active_rel)}/{n_rel} V:{int(active_val)}/{n_val}")
+        lines.append(f"             Gini F/R/V: {gini_f:.2f}/{gini_rel:.2f}/{gini_val:.2f}")
+        lines.append(f"             Exc F(QK/V):[{exc_f.min().item():.2f},{exc_f.mean().item():.2f},{exc_f.max().item():.2f}]")
         lines.append(f"             Exc R(Q/K):[{exc_rel.min().item():.2f},{exc_rel.mean().item():.2f},{exc_rel.max().item():.2f}] V:[{exc_val.min().item():.2f},{exc_val.mean().item():.2f},{exc_val.max().item():.2f}]")
         lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f} | Exc:[{exc_k.min().item():.2f},{exc_k.mean().item():.2f},{exc_k.max().item():.2f}]")
 
@@ -1526,7 +1522,11 @@ def main():
     args.top_k_relational = cfg['model'].get('top_k_relational', cfg['model'].get('top_k_QK', 4))
     args.top_k_value = cfg['model'].get('top_k_value', cfg['model'].get('top_k_transfer', cfg['model'].get('top_k_V', 6)))
 
-    # v16.0 Split Feature QK/V parameters
+    # v17.0 Shared Feature (QK/V) parameters
+    args.n_feature = cfg['model'].get('n_feature', 768)
+    args.top_k_feature = cfg['model'].get('top_k_feature', 64)
+
+    # v16.0 Split Feature QK/V parameters (backward compat)
     args.n_feature_qk = cfg['model'].get('n_feature_qk', 512)
     args.n_feature_v = cfg['model'].get('n_feature_v', 256)
     args.rank_qk = cfg['model'].get('rank_qk', 64)
@@ -1777,21 +1777,19 @@ def main():
 
     if model_version != 'baseline':
         if model_version == "17.0":
-            # v17.0: Full Vector Neurons + Soft Weighting (Shared Relational Q/K)
+            # v17.0: Full Vector Neurons + Soft Weighting (Shared F(QK/V), Shared R(Q/K))
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
-            n_feature_qk = getattr(args, 'n_feature_qk', 768)
-            n_feature_v = getattr(args, 'n_feature_v', 768)
-            n_relational = getattr(args, 'n_relational', 3072)  # Shared for Q/K
+            n_feature = getattr(args, 'n_feature', 768)  # Shared for QK/V
+            n_relational = getattr(args, 'n_relational', 1600)  # Shared for Q/K
             n_value = getattr(args, 'n_value', 768)
             n_knowledge = getattr(args, 'n_knowledge', 80)
             coarse_k = getattr(args, 'coarse_k', 20)
             fine_k = getattr(args, 'fine_k', 10)
-            top_k_fqk = getattr(args, 'top_k_feature_qk', 64)
-            top_k_fv = getattr(args, 'top_k_feature_v', 64)
+            top_k_f = getattr(args, 'top_k_feature', 64)
             top_k_rel = getattr(args, 'top_k_relational', 64)
             top_k_val = getattr(args, 'top_k_value', 64)
             print(f"DAWN v{model_version}: Full Vector Neurons + Soft Weighting")
-            print(f"  Compression: FQK={n_feature_qk}(top-{top_k_fqk}), FV={n_feature_v}(top-{top_k_fv})")
+            print(f"  Compression: F(QK/V)={n_feature}(top-{top_k_f})")
             print(f"  Expansion: R(Q/K)={n_relational}(top-{top_k_rel}), V={n_value}(top-{top_k_val})")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
             print(f"  knowledge_rank={knowledge_rank}")
@@ -2042,19 +2040,17 @@ def main():
 
     # Add version-specific parameters
     if model_version == '17.0':
-        # v17.0: Full Vector Neurons + Soft Weighting (Shared Relational Q/K)
+        # v17.0: Full Vector Neurons + Soft Weighting (Shared F(QK/V), Shared R(Q/K))
         model_kwargs.update({
-            'n_feature_qk': getattr(args, 'n_feature_qk', 768),
-            'n_feature_v': getattr(args, 'n_feature_v', 768),
-            'n_relational': getattr(args, 'n_relational', 3072),  # Shared for Q/K
+            'n_feature': getattr(args, 'n_feature', 768),  # Shared for QK/V
+            'n_relational': getattr(args, 'n_relational', 1600),  # Shared for Q/K
             'n_value': getattr(args, 'n_value', 768),
             'n_knowledge': args.n_knowledge,
             'coarse_k': args.coarse_k,
             'fine_k': args.fine_k,
             'knowledge_rank': args.knowledge_rank or 128,
             'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature_qk': getattr(args, 'top_k_feature_qk', 64),
-            'top_k_feature_v': getattr(args, 'top_k_feature_v', 64),
+            'top_k_feature': getattr(args, 'top_k_feature', 64),
             'top_k_relational': getattr(args, 'top_k_relational', 64),
             'top_k_value': getattr(args, 'top_k_value', 64),
             'd_space': getattr(args, 'd_space', 64),
