@@ -1,73 +1,89 @@
-# DAWN v17 Training Configuration
+# DAWN v17 Training Config
 # Full Vector Neurons - No Excitability
+# 모든 뉴런 = 벡터 (rank 매트릭스 없음)
 
+# Data
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/wikitext_5to1_texts.pkl
+  val_files:
+    - val/wikitext_5to1_texts.pkl
+
+# Model Architecture
 model:
   model_version: "17.0"
   d_model: 320
   n_layers: 4
   n_heads: 4
+  state_dim: 64
 
-  # Compression neurons
-  n_feature_qk: 128
-  n_feature_v: 64
-  top_k_feature_qk: 64
-  top_k_feature_v: 32
+  # Compression 벡터 뉴런 (x → h)
+  n_feature_qk: 128              # Q/K 압축용 벡터 수
+  n_feature_v: 64                # V 압축용 벡터 수
+  top_k_feature_qk: 64           # 64개 선택 → h_qk [B,S,64]
+  top_k_feature_v: 32            # 32개 선택 → h_v [B,S,32]
 
-  # Expansion neurons
-  n_relational_q: 256
-  n_relational_k: 256
-  n_value: 128
-  top_k_relational: 64
-  top_k_value: 32
+  # Expansion 벡터 뉴런 (h → Q/K/V)
+  n_relational_q: 256            # Q 확장용 벡터 수
+  n_relational_k: 256            # K 확장용 벡터 수
+  n_value: 128                   # V 확장용 벡터 수
+  top_k_relational: 64           # Q/K 각각 64개 선택
+  top_k_value: 32                # V 32개 선택
 
-  # Knowledge
+  # Knowledge 뉴런
   n_knowledge: 80
   coarse_k: 20
   fine_k: 10
   knowledge_rank: 128
 
-  # Other
-  state_dim: 64
-  d_space: 64
+  max_seq_len: 128
   dropout: 0.1
+
+  # Router settings
+  d_space: 64
   router_dropout: 0.1
-  gradient_checkpointing: false
   use_ssm_context: true
+  gradient_checkpointing: false
 
+# Training
 training:
-  batch_size: 32
-  gradient_accumulation_steps: 4
-  num_epochs: 10
-  max_seq_len: 512
-  learning_rate: 3.0e-4
-  weight_decay: 0.01
-  warmup_steps: 2000
-  max_grad_norm: 1.0
-  aux_loss_weight: 0.03
-  orth_loss_weight: 0.0  # No orthogonality loss (all vectors)
-  knowledge_div_weight: 0.001
+  batch_size: 128
+  num_epochs: 30
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_epochs: 2
 
-  optimizer:
-    type: adamw
-    betas: [0.9, 0.95]
-    eps: 1.0e-8
+  # Regularization
+  orthogonality_weight: 0.0      # v17: 벡터라서 불필요
+  diversity_weight: 0.1
+  load_balance_weight: 0.03      # aux_loss coefficient
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
 
-data:
-  dataset_path: "data/train.txt"
-  val_dataset_path: "data/val.txt"
-  vocab_size: 30000
-  tokenizer_path: "tokenizers/bpe_30k.json"
-  num_workers: 4
-  prefetch_factor: 2
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17
+log_dir: /content/drive/MyDrive/dawn/logs_v17
 
-logging:
-  log_interval: 100
-  eval_interval: 1000
-  save_interval: 5000
-  output_dir: "outputs/v17"
-  wandb_project: "dawn-v17"
-  wandb_run_name: "v17-full-vector"
-
-checkpoint:
-  save_total_limit: 3
-  resume_from: null
+# v17 Changes from v16:
+#   - 모든 뉴런 벡터화 (rank 매트릭스 제거)
+#   - Relational/Value 뉴런 분리: relational_q, relational_k, value
+#   - Excitability 완전 제거
+#   - 5타입 라우팅: feature_qk, feature_v, relational_q, relational_k, value
+#
+# 파라미터 비교:
+#   v15:
+#     feature: 12 × 320 × 64 = 246K
+#     relational: 48 × 64 × 320 = 983K
+#     value: 12 × 64 × 320 = 246K
+#     총: 1,475K
+#
+#   v17:
+#     feature_qk: 128 × 320 = 41K
+#     feature_v: 64 × 320 = 20K
+#     relational_q: 256 × 320 = 82K
+#     relational_k: 256 × 320 = 82K
+#     value: 128 × 320 = 41K
+#     총: 266K
+#
+#   절감: 82%
