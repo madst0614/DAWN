@@ -598,11 +598,17 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         ema_val = router.usage_ema_value
         ema_k = router.usage_ema_knowledge
 
-        # Active neuron counts (ema > 0.01)
-        active_f = (ema_f > 0.01).sum().item()
-        active_rel = (ema_rel > 0.01).sum().item()
-        active_val = (ema_val > 0.01).sum().item()
-        active_k = (ema_k > 0.01).sum().item()
+        # For soft selection, EMA values are ~1/n_neurons, so use relative threshold
+        # "Active" = neurons used > 10% of uniform expectation (1/n * 0.1)
+        thresh_f = (1.0 / n_f) * 0.1
+        thresh_rel = (1.0 / n_rel) * 0.1
+        thresh_val = (1.0 / n_val) * 0.1
+        thresh_k = (1.0 / n_k) * 0.1
+
+        active_f = (ema_f > thresh_f).sum().item()
+        active_rel = (ema_rel > thresh_rel).sum().item()
+        active_val = (ema_val > thresh_val).sum().item()
+        active_k = (ema_k > thresh_k).sum().item()
 
         # Gini coefficients
         gini_f = _gini(ema_f)
@@ -619,9 +625,10 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 
         lines.append(f"         v17 Soft | τ={tau:.1f} w={weight:.3f} | F(QK/V):{int(active_f)}/{n_f} R(Q/K):{int(active_rel)}/{n_rel} V:{int(active_val)}/{n_val}")
         lines.append(f"             Gini F/R/V: {gini_f:.2f}/{gini_rel:.2f}/{gini_val:.2f}")
-        lines.append(f"             Exc F(QK/V):[{exc_f.min().item():.2f},{exc_f.mean().item():.2f},{exc_f.max().item():.2f}]")
-        lines.append(f"             Exc R(Q/K):[{exc_rel.min().item():.2f},{exc_rel.mean().item():.2f},{exc_rel.max().item():.2f}] V:[{exc_val.min().item():.2f},{exc_val.mean().item():.2f},{exc_val.max().item():.2f}]")
-        lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f} | Exc:[{exc_k.min().item():.2f},{exc_k.mean().item():.2f},{exc_k.max().item():.2f}]")
+        # EMA stats for soft selection debugging (values are small: ~1/n_neurons)
+        lines.append(f"             EMA F:[{ema_f.min().item():.4f},{ema_f.mean().item():.4f},{ema_f.max().item():.4f}] R:[{ema_rel.min().item():.4f},{ema_rel.mean().item():.4f},{ema_rel.max().item():.4f}]")
+        lines.append(f"             EMA V:[{ema_val.min().item():.4f},{ema_val.mean().item():.4f},{ema_val.max().item():.4f}] K:[{ema_k.min().item():.4f},{ema_k.mean().item():.4f},{ema_k.max().item():.4f}]")
+        lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f}")
 
     # v16: Split Feature QK/V with Excitability
     elif hasattr(router, 'usage_ema_feature_qk'):
@@ -973,9 +980,32 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
+                    # v17: feature_qk_pref, feature_v_pref (shared feature pool, separate routing)
+                    if attn.get('feature_qk_pref') is not None:
+                        pref_FQK = attn.get('feature_qk_pref')
+                        pref_FV = attn.get('feature_v_pref')
+                        pref_RQ = attn.get('relational_q_pref')
+                        pref_RK = attn.get('relational_k_pref')
+                        pref_V = attn.get('value_pref')
+
+                        ent_FQK = calc_entropy_ratio(pref_FQK)
+                        ent_FV = calc_entropy_ratio(pref_FV)
+                        ent_RQ = calc_entropy_ratio(pref_RQ)
+                        ent_RK = calc_entropy_ratio(pref_RK)
+                        ent_V = calc_entropy_ratio(pref_V)
+
+                        var_FQK = calc_token_var(pref_FQK)
+                        var_FV = calc_token_var(pref_FV)
+                        var_RQ = calc_token_var(pref_RQ)
+                        var_RK = calc_token_var(pref_RK)
+                        var_V = calc_token_var(pref_V)
+
+                        ent_str = f"Ent FQK/FV/RQ/RK/V:{ent_FQK:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
+                        var_str = f"TokVar:{var_FQK:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
+
                     # v14/v15/v16: FRVK (Feature/Relational/Value/Knowledge)
                     # v16 also has feature_pref (= feature_qk_pref) for v15 compat
-                    if attn.get('feature_pref') is not None:
+                    elif attn.get('feature_pref') is not None:
                         pref_F = attn.get('feature_pref')
                         pref_RQ = attn.get('relational_pref_Q')
                         pref_RK = attn.get('relational_pref_K')
@@ -1094,8 +1124,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         pass
 
                     # Warning if collapse detected (check min entropy across router types)
-                    # v14/v15/v16: F/RQ/RK/V, v13: C/Q/K/V
-                    if attn.get('feature_pref') is not None:
+                    # v17: FQK/FV/RQ/RK/V, v14/v15/v16: F/RQ/RK/V, v13: C/Q/K/V
+                    if attn.get('feature_qk_pref') is not None:
+                        min_ent = min(ent_FQK, ent_FV, ent_RQ, ent_RK, ent_V)
+                    elif attn.get('feature_pref') is not None:
                         min_ent = min(ent_F, ent_RQ, ent_RK, ent_V)
                     else:
                         min_ent = min(ent_C, ent_Q, ent_K, ent_V)
