@@ -31,7 +31,7 @@ model:
   top_k_value: 4
 
   # Knowledge (same as v15)
-  n_knowledge: 256
+  n_knowledge: 384
   coarse_k: 16
   fine_k: 8
   knowledge_rank: 128
