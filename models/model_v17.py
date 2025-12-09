@@ -527,12 +527,14 @@ class NeuronCircuit(nn.Module):
     - Full softmax over all neurons (no top-k sparsification)
 
     Flow:
-    1. x → feature_neurons @ soft_qk → h_qk
-    2. x → feature_neurons @ soft_v → h_v
-    3. h_qk @ relational_neurons @ soft_q → Q
-    4. h_qk @ relational_neurons @ soft_k → K
-    5. h_v @ value_neurons @ soft_v2 → V
-    6. Multi-head attention
+    1. x → feature_neurons @ soft_qk → h_qk [B, S, n_feature]
+    2. x → feature_neurons @ soft_v → h_v [B, S, n_feature]
+    3. h_qk → proj_to_relational → h_qk_rel [B, S, n_relational]
+    4. h_v → proj_to_value → h_v_val [B, S, n_value]
+    5. h_qk_rel @ relational_neurons @ soft_q → Q
+    6. h_qk_rel @ relational_neurons @ soft_k → K
+    7. h_v_val @ value_neurons @ soft_v2 → V
+    8. Multi-head attention
     """
     def __init__(
         self,
@@ -546,6 +548,16 @@ class NeuronCircuit(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+
+        n_feature = shared_neurons.n_feature
+        n_relational = shared_neurons.n_relational
+        n_value = shared_neurons.n_value
+
+        # Projection from feature hidden dim to expansion dims
+        # h_qk [B, S, n_feature] → [B, S, n_relational] for Q/K expansion
+        self.proj_to_relational = nn.Linear(n_feature, n_relational, bias=False)
+        # h_v [B, S, n_feature] → [B, S, n_value] for V expansion
+        self.proj_to_value = nn.Linear(n_feature, n_value, bias=False)
 
         # Output projection
         self.expand_O = nn.Linear(d_model, d_model, bias=False)
@@ -582,19 +594,25 @@ class NeuronCircuit(nn.Module):
         W_v = weighted_neurons_v.transpose(-1, -2)
         h_v = torch.einsum('bsd,bdk->bsk', x, W_v)  # [B, S, n_feature]
 
-        # 3. Relational Q expansion: h_qk @ (soft_q * neurons) → Q
+        # 3. Project h_qk from n_feature → n_relational for Q/K expansion
+        h_qk_rel = self.proj_to_relational(h_qk)  # [B, S, n_relational]
+
+        # 4. Project h_v from n_feature → n_value for V expansion
+        h_v_val = self.proj_to_value(h_v)  # [B, S, n_value]
+
+        # 5. Relational Q expansion: h_qk_rel @ (soft_q * neurons) → Q
         weighted_rel_q = self.shared_neurons.relational_neurons.unsqueeze(0) * soft_q.unsqueeze(-1)
-        Q = torch.einsum('bsr,brd->bsd', h_qk, weighted_rel_q)  # [B, S, D]
+        Q = torch.einsum('bsr,brd->bsd', h_qk_rel, weighted_rel_q)  # [B, S, D]
 
-        # 4. Relational K expansion: h_qk @ (soft_k * neurons) → K
+        # 6. Relational K expansion: h_qk_rel @ (soft_k * neurons) → K
         weighted_rel_k = self.shared_neurons.relational_neurons.unsqueeze(0) * soft_k.unsqueeze(-1)
-        K = torch.einsum('bsr,brd->bsd', h_qk, weighted_rel_k)  # [B, S, D]
+        K = torch.einsum('bsr,brd->bsd', h_qk_rel, weighted_rel_k)  # [B, S, D]
 
-        # 5. Value expansion: h_v @ (soft_v2 * neurons) → V
+        # 7. Value expansion: h_v_val @ (soft_v2 * neurons) → V
         weighted_val = self.shared_neurons.value_neurons.unsqueeze(0) * soft_v2.unsqueeze(-1)
-        V = torch.einsum('bsr,brd->bsd', h_v, weighted_val)  # [B, S, D]
+        V = torch.einsum('bsr,brd->bsd', h_v_val, weighted_val)  # [B, S, D]
 
-        # 6. Multi-head Attention
+        # 8. Multi-head Attention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         K = K.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
