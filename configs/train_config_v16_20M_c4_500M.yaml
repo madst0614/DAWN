@@ -20,15 +20,15 @@ model:
 
   # v16: Split Feature into R/V
   n_feature_r: 64               # Q/K path compression (FR)
-  n_feature_v: 32               # V path compression (FV)
+  n_feature_v: 48               # V path compression (FV)
   top_k_feature_r: 6
-  top_k_feature_v: 4
+  top_k_feature_v: 6
 
-  # Expansion neurons (same as v15)
+  # Expansion neurons
   n_relational: 160
-  n_value: 12
+  n_value: 16
   top_k_relational: 16
-  top_k_value: 3
+  top_k_value: 4
 
   # Knowledge (same as v15)
   n_knowledge: 256
@@ -61,6 +61,6 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_20M_c4_500M
 log_dir: /content/drive/MyDrive/dawn/logs_v16_20M_c4_500M
 
 # v16 Changes from v15:
-#   - Feature neurons split: FR (64) + FV (32) = 96 total
-#   - v15 had 28 unified → v16 has FR=64 + FV=32
+#   - Feature neurons split: FR (64) + FV (48) = 112 total
+#   - v15 had 28 unified → v16 has FR=64 + FV=48
 #   - Hypothesis: QK needs "what to attend" vs V needs "what to retrieve"
