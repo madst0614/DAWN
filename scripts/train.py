@@ -658,9 +658,9 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         min_exc_QK, max_exc_QK, mean_exc_QK = exc_QK.min().item(), exc_QK.max().item(), exc_QK.mean().item()
         min_exc_V, max_exc_V, mean_exc_V = exc_V.min().item(), exc_V.max().item(), exc_V.mean().item()
 
-        lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active FQK/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
-        lines.append(f"             Gini FQK/FV:{gini_QK:.2f}/{gini_V:.2f} R/V:{gini_R:.2f}/{gini_Val:.2f}")
-        lines.append(f"             Exc FQK:[{min_exc_QK:.2f},{mean_exc_QK:.2f},{max_exc_QK:.2f}] FV:[{min_exc_V:.2f},{mean_exc_V:.2f},{max_exc_V:.2f}]")
+        lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active FR/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
+        lines.append(f"             Gini FR/FV:{gini_QK:.2f}/{gini_V:.2f} R/V:{gini_R:.2f}/{gini_Val:.2f}")
+        lines.append(f"             Exc FR:[{min_exc_QK:.2f},{mean_exc_QK:.2f},{max_exc_QK:.2f}] FV:[{min_exc_V:.2f},{mean_exc_V:.2f},{max_exc_V:.2f}]")
 
         # Knowledge neurons (if available)
         if hasattr(router, 'usage_ema_knowledge'):
@@ -980,28 +980,28 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # v17: feature_qk_pref, feature_v_pref (shared feature pool, separate routing)
+                    # v17: feature_qk_pref (FR), feature_v_pref (FV) - shared feature pool, separate routing
                     if attn.get('feature_qk_pref') is not None:
-                        pref_FQK = attn.get('feature_qk_pref')
+                        pref_FR = attn.get('feature_qk_pref')
                         pref_FV = attn.get('feature_v_pref')
                         pref_RQ = attn.get('relational_q_pref')
                         pref_RK = attn.get('relational_k_pref')
                         pref_V = attn.get('value_pref')
 
-                        ent_FQK = calc_entropy_ratio(pref_FQK)
+                        ent_FR = calc_entropy_ratio(pref_FR)
                         ent_FV = calc_entropy_ratio(pref_FV)
                         ent_RQ = calc_entropy_ratio(pref_RQ)
                         ent_RK = calc_entropy_ratio(pref_RK)
                         ent_V = calc_entropy_ratio(pref_V)
 
-                        var_FQK = calc_token_var(pref_FQK)
+                        var_FR = calc_token_var(pref_FR)
                         var_FV = calc_token_var(pref_FV)
                         var_RQ = calc_token_var(pref_RQ)
                         var_RK = calc_token_var(pref_RK)
                         var_V = calc_token_var(pref_V)
 
-                        ent_str = f"Ent FQK/FV/RQ/RK/V:{ent_FQK:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
-                        var_str = f"TokVar:{var_FQK:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
+                        ent_str = f"Ent FR/FV/RQ/RK/V:{ent_FR:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
+                        var_str = f"TokVar:{var_FR:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
 
                     # v14/v15/v16: FRVK (Feature/Relational/Value/Knowledge)
                     # v16 also has feature_pref (= feature_qk_pref) for v15 compat
@@ -1124,9 +1124,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         pass
 
                     # Warning if collapse detected (check min entropy across router types)
-                    # v17: FQK/FV/RQ/RK/V, v14/v15/v16: F/RQ/RK/V, v13: C/Q/K/V
+                    # v17: FR/FV/RQ/RK/V, v14/v15/v16: F/RQ/RK/V, v13: C/Q/K/V
                     if attn.get('feature_qk_pref') is not None:
-                        min_ent = min(ent_FQK, ent_FV, ent_RQ, ent_RK, ent_V)
+                        min_ent = min(ent_FR, ent_FV, ent_RQ, ent_RK, ent_V)
                     elif attn.get('feature_pref') is not None:
                         min_ent = min(ent_F, ent_RQ, ent_RK, ent_V)
                     else:
