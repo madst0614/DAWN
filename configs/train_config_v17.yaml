@@ -1,7 +1,7 @@
 # DAWN v17 Training Config
-# Full Vector Neurons + Soft/Hard Selection
-# Training: soft selection (all neurons via softmax, gradient flow)
-# Inference: top-k hard selection (sparse, efficient)
+# Full Vector Neurons + Full Soft Selection
+# Both training AND inference: soft selection (all neurons via softmax)
+# No top-k sparsification - full softmax over all neurons
 
 # Data
 data:
@@ -65,8 +65,8 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17
 
 # v17 Changes from v16:
 #   - ALL neurons are vectors [n, d_model] (no rank matrices)
-#   - Training: soft selection (all neurons via softmax)
-#   - Inference: top-k hard selection (sparse)
+#   - FULL SOFT selection: both train AND inference use softmax over all neurons
+#   - No top-k sparsification
 #   - Temperature parameter for softmax sharpness
 #   - Shared pools: Feature (QK/V), Relational (Q/K)
-#   - top_k values only used during inference
+#   - top_k params kept for compatibility but not used

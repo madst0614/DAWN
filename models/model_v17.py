@@ -1,5 +1,5 @@
 """
-DAWN v17: Full Vector Neurons + Soft/Hard Selection
+DAWN v17: Full Vector Neurons + Full Soft Selection
 
 Core Changes from v16:
 - ALL neurons are vectors (no rank matrices)
@@ -7,22 +7,23 @@ Core Changes from v16:
   * Feature: compression neurons (SHARED for QK/V routing)
   * Relational: expansion neurons (SHARED for Q/K routing)
   * Value: expansion neurons
-- Soft/Hard Selection:
-  * Training: soft selection (ALL neurons via softmax, gradient flow)
-  * Inference: top-k hard selection (sparse, efficient)
+- Full Soft Selection (both training AND inference):
+  * All neurons participate via softmax
+  * Gradient flows to all neurons (training)
+  * No top-k sparsification
 - Temperature parameter for controlling selection sharpness
 
 Architecture (FRV v17):
-- Feature QK: x → soft/hard selection → h_qk (shared pool, QK routing)
-- Feature V:  x → soft/hard selection → h_v (shared pool, V routing)
-- Relational Q: h_qk @ selected neurons → Q (shared pool, Q routing)
-- Relational K: h_qk @ selected neurons → K (shared pool, K routing)
-- Value: h_v @ selected neurons → V
+- Feature QK: x → soft selection → h_qk (shared pool, QK routing)
+- Feature V:  x → soft selection → h_v (shared pool, V routing)
+- Relational Q: h_qk @ soft-weighted neurons → Q (shared pool, Q routing)
+- Relational K: h_qk @ soft-weighted neurons → K (shared pool, K routing)
+- Value: h_v @ soft-weighted neurons → V
 - Knowledge: 2-stage retrieval (same as v16)
 
-Soft/Hard selection:
-  Training: weights = softmax(logits / temp) → full weighted sum (gradient to all)
-  Inference: idx, weights = topk(logits, k) → sparse indexed selection (efficient)
+Full soft selection:
+  weights = softmax(logits / temp) → full weighted sum over ALL neurons
+  output = neurons @ soft_weights (gradient flows to all neurons)
 """
 
 import math
@@ -412,18 +413,15 @@ class GlobalRouters(nn.Module):
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         """
-        Compute attention routing weights with Soft/Hard Selection.
+        Compute attention routing weights with Full Soft Selection.
 
-        Training (soft selection):
-            - Returns soft weights for ALL neurons [B, n_neurons]
-            - Gradient flows to all neurons
-
-        Inference (hard selection):
-            - Returns top-k indices and soft weights [B, top_k]
-            - Sparse, efficient computation
+        Both training and inference use soft selection:
+        - Returns soft weights for ALL neurons [B, n_neurons]
+        - Gradient flows to all neurons (training)
+        - Full softmax over all neurons (no top-k sparsification)
 
         Returns:
-            selection_data: dict containing either soft weights (training) or indices+weights (inference)
+            selection_data: dict containing soft weights for all neurons
             routing_info: dict with routing statistics
             aux_loss: scalar
         """
@@ -452,61 +450,31 @@ class GlobalRouters(nn.Module):
         pref_val = F.softmax(logits_val, dim=-1)
         weights_val = torch.einsum('bs,bsn->bn', importance, pref_val)  # [B, n_value]
 
-        if self.training:
-            # SOFT SELECTION: all neurons participate via softmax
-            soft_qk = F.softmax(weights_qk / self.temperature, dim=-1)    # [B, n_feature]
-            soft_v = F.softmax(weights_v / self.temperature, dim=-1)      # [B, n_feature]
-            soft_q = F.softmax(weights_rel_q / self.temperature, dim=-1)  # [B, n_relational]
-            soft_k = F.softmax(weights_rel_k / self.temperature, dim=-1)  # [B, n_relational]
-            soft_v2 = F.softmax(weights_val / self.temperature, dim=-1)   # [B, n_value]
+        # SOFT SELECTION: all neurons participate via softmax (both train and inference)
+        soft_qk = F.softmax(weights_qk / self.temperature, dim=-1)    # [B, n_feature]
+        soft_v = F.softmax(weights_v / self.temperature, dim=-1)      # [B, n_feature]
+        soft_q = F.softmax(weights_rel_q / self.temperature, dim=-1)  # [B, n_relational]
+        soft_k = F.softmax(weights_rel_k / self.temperature, dim=-1)  # [B, n_relational]
+        soft_v2 = F.softmax(weights_val / self.temperature, dim=-1)   # [B, n_value]
 
-            # Update usage EMA (soft selection)
+        # Update usage EMA (soft selection) - only during training
+        if self.training:
             self.neuron_router.update_usage_soft(soft_qk, 'feature')
             self.neuron_router.update_usage_soft(soft_v, 'feature')
             self.neuron_router.update_usage_soft(soft_q, 'relational')
             self.neuron_router.update_usage_soft(soft_k, 'relational')
             self.neuron_router.update_usage_soft(soft_v2, 'value')
 
-            selection_data = {
-                'mode': 'soft',
-                'soft_qk': soft_qk,    # [B, n_feature]
-                'soft_v': soft_v,      # [B, n_feature]
-                'soft_q': soft_q,      # [B, n_relational]
-                'soft_k': soft_k,      # [B, n_relational]
-                'soft_v2': soft_v2,    # [B, n_value]
-            }
-        else:
-            # HARD SELECTION: top-k sparse selection for inference
-            topk_weights_qk, idx_qk = torch.topk(weights_qk, self.top_k_feature, dim=-1)
-            soft_qk = F.softmax(topk_weights_qk / self.temperature, dim=-1)
+        selection_data = {
+            'mode': 'soft',
+            'soft_qk': soft_qk,    # [B, n_feature]
+            'soft_v': soft_v,      # [B, n_feature]
+            'soft_q': soft_q,      # [B, n_relational]
+            'soft_k': soft_k,      # [B, n_relational]
+            'soft_v2': soft_v2,    # [B, n_value]
+        }
 
-            topk_weights_v, idx_v = torch.topk(weights_v, self.top_k_feature, dim=-1)
-            soft_v = F.softmax(topk_weights_v / self.temperature, dim=-1)
-
-            topk_weights_q, idx_q = torch.topk(weights_rel_q, self.top_k_relational, dim=-1)
-            soft_q = F.softmax(topk_weights_q / self.temperature, dim=-1)
-
-            topk_weights_k, idx_k = torch.topk(weights_rel_k, self.top_k_relational, dim=-1)
-            soft_k = F.softmax(topk_weights_k / self.temperature, dim=-1)
-
-            topk_weights_v2, idx_v2 = torch.topk(weights_val, self.top_k_value, dim=-1)
-            soft_v2 = F.softmax(topk_weights_v2 / self.temperature, dim=-1)
-
-            selection_data = {
-                'mode': 'hard',
-                'idx_qk': idx_qk,      # [B, top_k_feature]
-                'idx_v': idx_v,        # [B, top_k_feature]
-                'idx_q': idx_q,        # [B, top_k_relational]
-                'idx_k': idx_k,        # [B, top_k_relational]
-                'idx_v2': idx_v2,      # [B, top_k_value]
-                'soft_qk': soft_qk,    # [B, top_k_feature]
-                'soft_v': soft_v,      # [B, top_k_feature]
-                'soft_q': soft_q,      # [B, top_k_relational]
-                'soft_k': soft_k,      # [B, top_k_relational]
-                'soft_v2': soft_v2,    # [B, top_k_value]
-            }
-
-        # Compute aux_loss (load balance)
+        # Compute aux_loss (load balance) - only during training
         aux_loss = 0.0
         if self.training:
             if attention_mask is not None:
@@ -538,7 +506,7 @@ class GlobalRouters(nn.Module):
             aux_loss = aux_loss + ((usage_val - target_val) ** 2).sum() * self.n_value
 
         routing_info = {
-            'mode': 'soft' if self.training else 'hard',
+            'mode': 'soft',
             'feature_qk_pref': pref_qk.detach(),
             'feature_v_pref': pref_v.detach(),
             'relational_q_pref': pref_rel_q.detach(),
@@ -546,36 +514,24 @@ class GlobalRouters(nn.Module):
             'value_pref': pref_val.detach(),
         }
 
-        if not self.training:
-            routing_info.update({
-                'idx_qk': selection_data['idx_qk'].detach(),
-                'idx_v': selection_data['idx_v'].detach(),
-                'idx_q': selection_data['idx_q'].detach(),
-                'idx_k': selection_data['idx_k'].detach(),
-                'idx_v2': selection_data['idx_v2'].detach(),
-            })
-
         return selection_data, routing_info, aux_loss
 
 
 class NeuronCircuit(nn.Module):
     """
-    v17: Attention circuit with Soft/Hard Selection
+    v17: Attention circuit with Full Soft Selection
 
-    Soft Selection (Training):
+    Always uses soft selection (both training and inference):
     - Weighted sum over ALL neurons: output = sum(soft_weights * neurons)
-    - Gradient flows to all neurons
-
-    Hard Selection (Inference):
-    - Sparse indexed selection: output = sum(soft_weights[idx] * neurons[idx])
-    - Efficient computation
+    - Gradient flows to all neurons (training)
+    - Full softmax over all neurons (no top-k sparsification)
 
     Flow:
-    1. x → feature_neurons @ soft_qk/[idx_qk] → h_qk
-    2. x → feature_neurons @ soft_v/[idx_v] → h_v
-    3. h_qk @ relational_neurons @ soft_q/[idx_q] → Q
-    4. h_qk @ relational_neurons @ soft_k/[idx_k] → K
-    5. h_v @ value_neurons @ soft_v2/[idx_v2] → V
+    1. x → feature_neurons @ soft_qk → h_qk
+    2. x → feature_neurons @ soft_v → h_v
+    3. h_qk @ relational_neurons @ soft_q → Q
+    4. h_qk @ relational_neurons @ soft_k → K
+    5. h_v @ value_neurons @ soft_v2 → V
     6. Multi-head attention
     """
     def __init__(
@@ -601,84 +557,42 @@ class NeuronCircuit(nn.Module):
         """
         Args:
             x: [B, S, D]
-            selection_data: dict with 'mode' and selection weights/indices
+            selection_data: dict with soft selection weights
             attention_mask: [B, S] optional
         """
         B, S, D = x.shape
-        mode = selection_data['mode']
 
-        if mode == 'soft':
-            # SOFT SELECTION: weighted sum over all neurons
-            soft_qk = selection_data['soft_qk']  # [B, n_feature]
-            soft_v = selection_data['soft_v']    # [B, n_feature]
-            soft_q = selection_data['soft_q']    # [B, n_relational]
-            soft_k = selection_data['soft_k']    # [B, n_relational]
-            soft_v2 = selection_data['soft_v2']  # [B, n_value]
+        # SOFT SELECTION: weighted sum over all neurons (both train and inference)
+        soft_qk = selection_data['soft_qk']  # [B, n_feature]
+        soft_v = selection_data['soft_v']    # [B, n_feature]
+        soft_q = selection_data['soft_q']    # [B, n_relational]
+        soft_k = selection_data['soft_k']    # [B, n_relational]
+        soft_v2 = selection_data['soft_v2']  # [B, n_value]
 
-            # 1. Feature QK compression: x @ (soft_qk * neurons).T → h_qk
-            # neurons: [n_feature, D], soft_qk: [B, n_feature]
-            # weighted_neurons_qk: [B, n_feature, D]
-            weighted_neurons_qk = self.shared_neurons.feature_neurons.unsqueeze(0) * soft_qk.unsqueeze(-1)
-            # W_qk: [B, D, n_feature] (effectively weighted projection)
-            W_qk = weighted_neurons_qk.transpose(-1, -2)
-            h_qk = torch.einsum('bsd,bdk->bsk', x, W_qk)  # [B, S, n_feature]
+        # 1. Feature QK compression: x @ (soft_qk * neurons).T → h_qk
+        # neurons: [n_feature, D], soft_qk: [B, n_feature]
+        # weighted_neurons_qk: [B, n_feature, D]
+        weighted_neurons_qk = self.shared_neurons.feature_neurons.unsqueeze(0) * soft_qk.unsqueeze(-1)
+        # W_qk: [B, D, n_feature] (effectively weighted projection)
+        W_qk = weighted_neurons_qk.transpose(-1, -2)
+        h_qk = torch.einsum('bsd,bdk->bsk', x, W_qk)  # [B, S, n_feature]
 
-            # 2. Feature V compression: x @ (soft_v * neurons).T → h_v
-            weighted_neurons_v = self.shared_neurons.feature_neurons.unsqueeze(0) * soft_v.unsqueeze(-1)
-            W_v = weighted_neurons_v.transpose(-1, -2)
-            h_v = torch.einsum('bsd,bdk->bsk', x, W_v)  # [B, S, n_feature]
+        # 2. Feature V compression: x @ (soft_v * neurons).T → h_v
+        weighted_neurons_v = self.shared_neurons.feature_neurons.unsqueeze(0) * soft_v.unsqueeze(-1)
+        W_v = weighted_neurons_v.transpose(-1, -2)
+        h_v = torch.einsum('bsd,bdk->bsk', x, W_v)  # [B, S, n_feature]
 
-            # 3. Relational Q expansion: h_qk @ (soft_q * neurons) → Q
-            weighted_rel_q = self.shared_neurons.relational_neurons.unsqueeze(0) * soft_q.unsqueeze(-1)
-            Q = torch.einsum('bsr,brd->bsd', h_qk, weighted_rel_q)  # [B, S, D]
+        # 3. Relational Q expansion: h_qk @ (soft_q * neurons) → Q
+        weighted_rel_q = self.shared_neurons.relational_neurons.unsqueeze(0) * soft_q.unsqueeze(-1)
+        Q = torch.einsum('bsr,brd->bsd', h_qk, weighted_rel_q)  # [B, S, D]
 
-            # 4. Relational K expansion: h_qk @ (soft_k * neurons) → K
-            weighted_rel_k = self.shared_neurons.relational_neurons.unsqueeze(0) * soft_k.unsqueeze(-1)
-            K = torch.einsum('bsr,brd->bsd', h_qk, weighted_rel_k)  # [B, S, D]
+        # 4. Relational K expansion: h_qk @ (soft_k * neurons) → K
+        weighted_rel_k = self.shared_neurons.relational_neurons.unsqueeze(0) * soft_k.unsqueeze(-1)
+        K = torch.einsum('bsr,brd->bsd', h_qk, weighted_rel_k)  # [B, S, D]
 
-            # 5. Value expansion: h_v @ (soft_v2 * neurons) → V
-            weighted_val = self.shared_neurons.value_neurons.unsqueeze(0) * soft_v2.unsqueeze(-1)
-            V = torch.einsum('bsr,brd->bsd', h_v, weighted_val)  # [B, S, D]
-
-        else:
-            # HARD SELECTION: sparse indexed selection
-            idx_qk = selection_data['idx_qk']    # [B, top_k_feature]
-            idx_v = selection_data['idx_v']      # [B, top_k_feature]
-            idx_q = selection_data['idx_q']      # [B, top_k_relational]
-            idx_k = selection_data['idx_k']      # [B, top_k_relational]
-            idx_v2 = selection_data['idx_v2']    # [B, top_k_value]
-            soft_qk = selection_data['soft_qk']  # [B, top_k_feature]
-            soft_v = selection_data['soft_v']    # [B, top_k_feature]
-            soft_q = selection_data['soft_q']    # [B, top_k_relational]
-            soft_k = selection_data['soft_k']    # [B, top_k_relational]
-            soft_v2 = selection_data['soft_v2']  # [B, top_k_value]
-
-            # 1. Feature QK compression with sparse selection
-            selected_qk = self.shared_neurons.feature_neurons[idx_qk]  # [B, top_k, D]
-            selected_qk = selected_qk * soft_qk.unsqueeze(-1)
-            W_qk = selected_qk.transpose(-1, -2)  # [B, D, top_k]
-            h_qk = torch.einsum('bsd,bdk->bsk', x, W_qk)  # [B, S, top_k]
-
-            # 2. Feature V compression with sparse selection
-            selected_v = self.shared_neurons.feature_neurons[idx_v]
-            selected_v = selected_v * soft_v.unsqueeze(-1)
-            W_v = selected_v.transpose(-1, -2)
-            h_v = torch.einsum('bsd,bdk->bsk', x, W_v)  # [B, S, top_k]
-
-            # 3. Relational Q expansion with sparse selection
-            selected_rel_q = self.shared_neurons.relational_neurons[idx_q]
-            selected_rel_q = selected_rel_q * soft_q.unsqueeze(-1)
-            Q = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_q)  # [B, S, D]
-
-            # 4. Relational K expansion with sparse selection
-            selected_rel_k = self.shared_neurons.relational_neurons[idx_k]
-            selected_rel_k = selected_rel_k * soft_k.unsqueeze(-1)
-            K = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_k)  # [B, S, D]
-
-            # 5. Value expansion with sparse selection
-            selected_val = self.shared_neurons.value_neurons[idx_v2]
-            selected_val = selected_val * soft_v2.unsqueeze(-1)
-            V = torch.einsum('bsr,brd->bsd', h_v, selected_val)  # [B, S, D]
+        # 5. Value expansion: h_v @ (soft_v2 * neurons) → V
+        weighted_val = self.shared_neurons.value_neurons.unsqueeze(0) * soft_v2.unsqueeze(-1)
+        V = torch.einsum('bsr,brd->bsd', h_v, weighted_val)  # [B, S, D]
 
         # 6. Multi-head Attention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -846,13 +760,14 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v17: Full Vector Neurons + Soft/Hard Selection
+    DAWN v17: Full Vector Neurons + Full Soft Selection
 
     Core Changes from v16:
     - ALL neurons are vectors (no rank matrices)
-    - Soft/Hard Selection:
-      * Training: soft selection (ALL neurons via softmax, gradient flow)
-      * Inference: top-k hard selection (sparse, efficient)
+    - Full Soft Selection (both training AND inference):
+      * All neurons participate via softmax
+      * Gradient flows to all neurons (training)
+      * No top-k sparsification
     - Temperature parameter for controlling selection sharpness
     - Shared pools: feature (QK/V), relational (Q/K) with separate routing heads
 
@@ -1062,7 +977,7 @@ class DAWN(nn.Module):
 
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        print(f"=== DAWN v17 Parameter Breakdown (Vector Neurons + Soft/Hard Selection) ===")
+        print(f"=== DAWN v17 Parameter Breakdown (Vector Neurons + Full Soft Selection) ===")
         print(f"Feature Neurons:        {feature:,} ({feature/1e3:.1f}K) [{self.n_feature} × {self.d_model}] (SHARED QK/V)")
         print(f"Relational Neurons:     {relational:,} ({relational/1e3:.1f}K) [{self.n_relational} × {self.d_model}] (SHARED Q/K)")
         print(f"Value Neurons:          {value:,} ({value/1e3:.1f}K) [{self.n_value} × {self.d_model}]")
@@ -1073,11 +988,8 @@ class DAWN(nn.Module):
         print(f"Unified Router:         {routers:,} ({routers/1e3:.1f}K) [d_space={self.d_space}]")
         print(f"LayerNorms:             {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
-        print(f"Selection Mode: SOFT (training) / HARD (inference)")
+        print(f"Selection Mode: FULL SOFT (train & inference)")
         print(f"Temperature:      {self.temperature}")
-        print(f"Top-k Feature:    {self.top_k_feature}/{self.n_feature} (inference only, shared QK/V)")
-        print(f"Top-k Relational: {self.top_k_relational}/{self.n_relational} (inference only, shared Q/K)")
-        print(f"Top-k Value:      {self.top_k_value}/{self.n_value} (inference only)")
         print(f"Mamba Available: {MAMBA_AVAILABLE}")
         print(f"---")
         print(f"Total:                  {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
@@ -1115,14 +1027,14 @@ class DAWN(nn.Module):
     def get_model_info(self):
         """Return model architecture info for logging"""
         return [
-            f"DAWN v{self.__version__}: Vector Neurons + Soft/Hard Selection",
+            f"DAWN v{self.__version__}: Vector Neurons + Full Soft Selection",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  Compression:",
-            f"    Feature: {self.n_feature} × {self.d_model} (top-k={self.top_k_feature} inference) [SHARED QK/V]",
+            f"    Feature: {self.n_feature} × {self.d_model} [SHARED QK/V]",
             f"  Expansion:",
-            f"    Relational: {self.n_relational} × {self.d_model} (top-k={self.top_k_relational} inference) [SHARED Q/K]",
-            f"    Value: {self.n_value} × {self.d_model} (top-k={self.top_k_value} inference)",
+            f"    Relational: {self.n_relational} × {self.d_model} [SHARED Q/K]",
+            f"    Value: {self.n_value} × {self.d_model}",
             f"  Knowledge: {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
-            f"  Selection: SOFT (train, temp={self.temperature}) / HARD (inference)",
+            f"  Selection: FULL SOFT (train & inference, temp={self.temperature})",
             f"  Router: d_space={self.d_space}, Excitability (SAR)",
         ]

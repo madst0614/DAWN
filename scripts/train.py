@@ -1753,7 +1753,7 @@ def main():
 
     if model_version != 'baseline':
         if model_version == "17.0":
-            # v17.0: Full Vector Neurons + Soft/Hard Selection
+            # v17.0: Full Vector Neurons + Full Soft Selection
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
             n_feature = getattr(args, 'n_feature', 768)
             n_relational = getattr(args, 'n_relational', 256)
@@ -1762,15 +1762,11 @@ def main():
             coarse_k = getattr(args, 'coarse_k', 20)
             fine_k = getattr(args, 'fine_k', 10)
             temperature = getattr(args, 'temperature', 1.0)
-            top_k_feature = getattr(args, 'top_k_feature', 64)
-            top_k_relational = getattr(args, 'top_k_relational', 64)
-            top_k_value = getattr(args, 'top_k_value', 32)
-            print(f"DAWN v{model_version}: Full Vector Neurons + Soft/Hard Selection")
-            print(f"  Training: SOFT selection (all neurons via softmax, temp={temperature})")
-            print(f"  Inference: HARD selection (top-k sparse)")
-            print(f"  Feature: {n_feature} × {args.d_model} [SHARED QK/V] (top-k={top_k_feature} @ inference)")
-            print(f"  Relational: {n_relational} × {args.d_model} [SHARED Q/K] (top-k={top_k_relational} @ inference)")
-            print(f"  Value: {n_value} × {args.d_model} (top-k={top_k_value} @ inference)")
+            print(f"DAWN v{model_version}: Full Vector Neurons + Full Soft Selection")
+            print(f"  Selection: FULL SOFT (train & inference, temp={temperature})")
+            print(f"  Feature: {n_feature} × {args.d_model} [SHARED QK/V]")
+            print(f"  Relational: {n_relational} × {args.d_model} [SHARED Q/K]")
+            print(f"  Value: {n_value} × {args.d_model}")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
         elif model_version == "16.0":
             # v16.0: Split Feature QK/V (rank matrix, v15-based)

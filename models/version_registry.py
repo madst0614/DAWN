@@ -8,7 +8,7 @@ v13.2: Unified Neuron Router (all neurons in same embedding space)
 v14.0: FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR
 v15.0: 2-Stage Hierarchical Knowledge Retrieval (x→router→coarse, x→proj_q→fine)
 v16.0: Split Feature QK/V (rank matrix, v15-based) - Feature_QK/V separate compression
-v17.0: Full Vector Neurons + Soft/Hard Selection (vector-based, not rank matrix)
+v17.0: Full Vector Neurons + Full Soft Selection (vector-based, train & inference both use soft)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -266,7 +266,7 @@ VERSION_REGISTRY = {
         ],
     },
     "17.0": {
-        "description": "Full Vector Neurons + Soft/Hard Selection",
+        "description": "Full Vector Neurons + Full Soft Selection",
         "aliases": ["17", "170"],
         "module": "model_v17",
         "required_params": [
@@ -277,9 +277,9 @@ VERSION_REGISTRY = {
         "optional_params": {
             "dropout": 0.1,
             "state_dim": 64,
-            "top_k_feature": 64,      # inference only
-            "top_k_relational": 64,   # inference only
-            "top_k_value": 32,        # inference only
+            "top_k_feature": 64,      # kept for compatibility, not used
+            "top_k_relational": 64,   # kept for compatibility, not used
+            "top_k_value": 32,        # kept for compatibility, not used
             "d_space": 64,
             "coarse_k": 20,
             "fine_k": 10,
@@ -290,16 +290,15 @@ VERSION_REGISTRY = {
             "use_ssm_context": True,
         },
         "display_info": lambda args: [
-            f"DAWN v17: Full Vector Neurons + Soft/Hard Selection",
+            f"DAWN v17: Full Vector Neurons + Full Soft Selection",
             f"  temperature={args.get('temperature', 1.0)}",
-            f"  Training: SOFT selection (all neurons via softmax, gradient flow)",
-            f"  Inference: HARD selection (top-k sparse)",
-            f"  Feature: {args.get('n_feature')} × {args.get('d_model')} (SHARED QK/V, top-k={args.get('top_k_feature', 64)} @ inference)",
-            f"  Relational: {args.get('n_relational')} × {args.get('d_model')} (SHARED Q/K, top-k={args.get('top_k_relational', 64)} @ inference)",
-            f"  Value: {args.get('n_value')} × {args.get('d_model')} (top-k={args.get('top_k_value', 32)} @ inference)",
+            f"  Selection: FULL SOFT (train & inference, all neurons via softmax)",
+            f"  Feature: {args.get('n_feature')} × {args.get('d_model')} (SHARED QK/V)",
+            f"  Relational: {args.get('n_relational')} × {args.get('d_model')} (SHARED Q/K)",
+            f"  Value: {args.get('n_value')} × {args.get('d_model')}",
             f"  Unified Router: d_space={args.get('d_space', 64)} + Excitability (SAR)",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
-            f"  Architecture: Mamba SSM → Context → Soft/Hard Router → Vector Neurons → FlashAttn",
+            f"  Architecture: Mamba SSM → Context → Full Soft Router → Vector Neurons → FlashAttn",
             f"  Memory: 2-stage (x→router→coarse, x→encoder→fine)",
             f"  KnowledgeNeurons (K):",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",
