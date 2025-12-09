@@ -1,20 +1,28 @@
 """
-DAWN v17: Soft Selection Training
+DAWN v17: Full Vector Neurons + Soft/Hard Selection
 
-v16 기반 (Split Feature QK/V, rank matrix) + 학습/추론 분리:
-- 학습: 전체 뉴런에 soft selection (gradient flow to all)
-- 추론: top-k hard selection (efficiency)
+Core Changes from v16:
+- ALL neurons are vectors (no rank matrices)
+- 3 shared pools with separate routing heads:
+  * Feature: compression neurons (SHARED for QK/V routing)
+  * Relational: expansion neurons (SHARED for Q/K routing)
+  * Value: expansion neurons
+- Soft/Hard Selection:
+  * Training: soft selection (ALL neurons via softmax, gradient flow)
+  * Inference: top-k hard selection (sparse, efficient)
+- Temperature parameter for controlling selection sharpness
 
-이론적 근거:
-- Soft selection: 모든 뉴런이 gradient 받아서 specialization 촉진
-- Hard selection: 추론 시 sparse하게 선택해서 효율적
-- Temperature: selection sharpness 조절
+Architecture (FRV v17):
+- Feature QK: x → soft/hard selection → h_qk (shared pool, QK routing)
+- Feature V:  x → soft/hard selection → h_v (shared pool, V routing)
+- Relational Q: h_qk @ selected neurons → Q (shared pool, Q routing)
+- Relational K: h_qk @ selected neurons → K (shared pool, K routing)
+- Value: h_v @ selected neurons → V
+- Knowledge: 2-stage retrieval (same as v16)
 
-Architecture (v16 + Soft/Hard):
-- Feature_QK: x → soft/hard selection → h_qk [rank matrix]
-- Feature_V: x → soft/hard selection → h_v [rank matrix]
-- Relational/Value: soft/hard expansion [rank matrix]
-- Knowledge: 2-stage retrieval (same as v15/v16)
+Soft/Hard selection:
+  Training: weights = softmax(logits / temp) → full weighted sum (gradient to all)
+  Inference: idx, weights = topk(logits, k) → sparse indexed selection (efficient)
 """
 
 import math
@@ -23,7 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-# Mamba selective scan import (fallback 포함)
+# Mamba selective scan import (fallback included)
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
     MAMBA_AVAILABLE = True
@@ -34,139 +42,204 @@ except ImportError:
 
 class UnifiedNeuronRouter(nn.Module):
     """
-    v17: Soft/Hard selection router
+    v17: Unified neuron router with shared pools + Excitability
 
-    Training: soft selection (full softmax)
-    Inference: top-k hard selection
+    Neuron types:
+    - feature: compression axis vectors (SHARED for QK/V, routing differs)
+    - relational: expansion vectors for Q/K (SHARED, routing differs)
+    - value: expansion vectors for V
+    - knowledge: memory retrieval
+
+    Excitability (refractory-inspired):
+    - Less-used neurons get higher excitability bonus
+    - Encourages balanced neuron usage during training
     """
-    def __init__(self, d_model, n_feature_qk, n_feature_v, n_relational, n_value, n_knowledge,
-                 d_space=64, dropout=0.1, temperature=1.0):
+    def __init__(self, d_model, n_feature, n_relational,
+                 n_value, n_knowledge, d_space=64, dropout=0.1):
         super().__init__()
-        self.n_feature_qk = n_feature_qk
-        self.n_feature_v = n_feature_v
-        self.n_relational = n_relational
+        self.n_feature = n_feature  # Shared for QK/V
+        self.n_relational = n_relational  # Shared for Q/K
         self.n_value = n_value
         self.n_knowledge = n_knowledge
         self.d_space = d_space
-        self.temperature = temperature
 
-        total_neurons = n_feature_qk + n_feature_v + n_relational + n_value + n_knowledge
+        total_neurons = n_feature + n_relational + n_value + n_knowledge
         self.total_neurons = total_neurons
 
-        # 인덱스 경계
-        self.feature_qk_end = n_feature_qk
-        self.feature_v_end = n_feature_qk + n_feature_v
-        self.relational_end = n_feature_qk + n_feature_v + n_relational
-        self.value_end = n_feature_qk + n_feature_v + n_relational + n_value
+        # Index boundaries
+        self.feature_end = n_feature
+        self.relational_end = n_feature + n_relational
+        self.value_end = n_feature + n_relational + n_value
+        # knowledge is value_end ~ total_neurons
 
-        # 공유 projection
+        # Shared projection
         self.proj = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
-        # 통합 뉴런 임베딩 [total_neurons, d_space]
+        # Unified neuron embeddings [total_neurons, d_space]
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
-        # 타입별 usage 추적
-        self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
-        self.register_buffer('usage_ema_feature_v', torch.zeros(n_feature_v))
-        self.register_buffer('usage_ema_relational', torch.zeros(n_relational))
+        # Separate routing heads for shared pools
+        # Feature V routing (shares same pool as Feature QK, different selection)
+        self.neuron_emb_feature_v = nn.Parameter(torch.randn(n_feature, d_space) * 0.02)
+        # Relational K routing (shares same pool as Relational Q, different selection)
+        self.neuron_emb_relational_k = nn.Parameter(torch.randn(n_relational, d_space) * 0.02)
+
+        # Usage tracking for excitability
+        self.register_buffer('usage_ema_feature', torch.zeros(n_feature))  # Shared for QK/V
+        self.register_buffer('usage_ema_relational', torch.zeros(n_relational))  # Shared for Q/K
         self.register_buffer('usage_ema_value', torch.zeros(n_value))
         self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
 
         # Excitability: tau (recovery time constant) + decaying weight
         self.tau = 1.5
-        self.excitability_weight = 1.0
+        self.excitability_weight = 0.0  # Disabled by default
 
     def decay_excitability(self, decay_rate=0.9997):
         """Decay excitability_weight each step."""
         self.excitability_weight *= decay_rate
 
     def get_excitability(self, usage_ema):
-        """Neuronal excitability based on usage."""
+        """
+        Neuronal excitability based on usage.
+        - usage_ema ≈ 0 → excitability = 1.0 (fully ready)
+        - usage_ema ≈ tau → excitability ≈ 0.0 (refractory)
+        """
         return torch.clamp(1.0 - usage_ema / self.tau, min=0.0, max=1.0)
+
+    @torch.compiler.disable
+    def update_usage(self, indices, neuron_type, n_neurons):
+        """Update usage EMA for selected neurons (index-based)
+
+        Excluded from torch.compile() to ensure buffer updates work correctly.
+        """
+        if not self.training:
+            return
+
+        with torch.no_grad():
+            # Vectorized counting: flatten indices and use single scatter_add_
+            indices = indices.detach()
+            B = indices.shape[0]
+            flat_indices = indices.view(-1)  # [B * top_k]
+            usage = torch.zeros(n_neurons, device=indices.device)
+            ones = torch.ones_like(flat_indices, dtype=usage.dtype)
+            usage.scatter_add_(0, flat_indices, ones)
+            usage = usage / B  # Normalize by batch size
+
+            # In-place update: ema = 0.99 * ema + 0.01 * usage
+            if neuron_type == 'feature':
+                self.usage_ema_feature.mul_(0.99).add_(usage, alpha=0.01)
+            elif neuron_type == 'relational':
+                self.usage_ema_relational.mul_(0.99).add_(usage, alpha=0.01)
+            elif neuron_type == 'value':
+                self.usage_ema_value.mul_(0.99).add_(usage, alpha=0.01)
+            elif neuron_type == 'knowledge':
+                self.usage_ema_knowledge.mul_(0.99).add_(usage, alpha=0.01)
+
+    @torch.compiler.disable
+    def update_usage_soft(self, weights, neuron_type):
+        """Update usage EMA for soft selection (weight-based)
+
+        weights: [B, n_neurons] - soft selection weights for all neurons
+        """
+        if not self.training:
+            return
+
+        with torch.no_grad():
+            # Average weights across batch
+            usage = weights.detach().mean(dim=0)  # [n_neurons]
+
+            # In-place update: ema = 0.99 * ema + 0.01 * usage
+            if neuron_type == 'feature':
+                self.usage_ema_feature.mul_(0.99).add_(usage, alpha=0.01)
+            elif neuron_type == 'relational':
+                self.usage_ema_relational.mul_(0.99).add_(usage, alpha=0.01)
+            elif neuron_type == 'value':
+                self.usage_ema_value.mul_(0.99).add_(usage, alpha=0.01)
+            elif neuron_type == 'knowledge':
+                self.usage_ema_knowledge.mul_(0.99).add_(usage, alpha=0.01)
 
     def get_logits(self, x, neuron_type):
         """
-        x: [B, S, d_model]
-        neuron_type: 'feature_qk', 'feature_v', 'relational_Q', 'relational_K', 'value', 'knowledge'
+        x: [B, S, d_model] or [B, S, rank] for expansion types
+        neuron_type: 'feature_qk', 'feature_v', 'relational_q', 'relational_k', 'value', 'knowledge'
+
+        Shared pools with separate routing heads:
+        - feature_qk and feature_v: SHARED feature pool, SEPARATE routing heads
+        - relational_q and relational_k: SHARED relational pool, SEPARATE routing heads
         """
         h_proj = self.proj(x)  # [B, S, d_space]
         h_proj = self.dropout(h_proj)
 
-        neuron_emb_norm = F.normalize(self.neuron_emb, dim=-1)
-        all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
-
+        # Type-specific slicing + Excitability
         if neuron_type == 'feature_qk':
-            logits = all_logits[..., :self.feature_qk_end]
+            # QK routing: uses unified neuron_emb for feature section
+            neuron_emb_norm = F.normalize(self.neuron_emb[:self.feature_end], dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
-                excitability = self.get_excitability(self.usage_ema_feature_qk)
+                excitability = self.get_excitability(self.usage_ema_feature)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'feature_v':
-            logits = all_logits[..., self.feature_qk_end:self.feature_v_end]
+            # V routing: uses SEPARATE neuron_emb_feature_v for different selection (same pool)
+            neuron_emb_norm = F.normalize(self.neuron_emb_feature_v, dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
-                excitability = self.get_excitability(self.usage_ema_feature_v)
+                excitability = self.get_excitability(self.usage_ema_feature)
                 logits = logits + excitability * self.excitability_weight
 
-        elif neuron_type in ['relational_Q', 'relational_K']:
-            logits = all_logits[..., self.feature_v_end:self.relational_end]
+        elif neuron_type == 'relational_q':
+            # Q routing: uses unified neuron_emb for relational section
+            neuron_emb_norm = F.normalize(self.neuron_emb[self.feature_end:self.relational_end], dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_relational)
+                logits = logits + excitability * self.excitability_weight
+
+        elif neuron_type == 'relational_k':
+            # K routing: uses SEPARATE neuron_emb_relational_k for different selection
+            neuron_emb_norm = F.normalize(self.neuron_emb_relational_k, dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_relational)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'value':
-            logits = all_logits[..., self.relational_end:self.value_end]
+            neuron_emb_norm = F.normalize(self.neuron_emb[self.relational_end:self.value_end], dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_value)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'knowledge':
-            logits = all_logits[..., self.value_end:]
+            neuron_emb_norm = F.normalize(self.neuron_emb[self.value_end:], dim=-1)
+            logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_knowledge)
                 logits = logits + excitability * self.excitability_weight
 
         return logits
 
-    def update_usage(self, weights, neuron_type, attention_mask=None):
-        """뉴런 사용량 업데이트 (soft weights에서 threshold 기반)"""
-        if not self.training:
-            return
-
-        if weights.dim() == 3:
-            active = (weights > 0).float()
-            if attention_mask is not None:
-                mask = attention_mask.unsqueeze(-1).float()
-                active = active * mask
-                count = mask.sum() + 1e-8
-                usage = active.sum(dim=[0, 1]) / count
-            else:
-                usage = active.mean(dim=[0, 1])
-        else:
-            usage = (weights > 0).float().mean(dim=0)
-
-        if neuron_type == 'feature_qk':
-            self.usage_ema_feature_qk = 0.99 * self.usage_ema_feature_qk + 0.01 * usage
-        elif neuron_type == 'feature_v':
-            self.usage_ema_feature_v = 0.99 * self.usage_ema_feature_v + 0.01 * usage
-        elif neuron_type == 'relational':
-            self.usage_ema_relational = 0.99 * self.usage_ema_relational + 0.01 * usage
-        elif neuron_type == 'value':
-            self.usage_ema_value = 0.99 * self.usage_ema_value + 0.01 * usage
-        elif neuron_type == 'knowledge':
-            self.usage_ema_knowledge = 0.99 * self.usage_ema_knowledge + 0.01 * usage
-
 
 class SharedNeurons(nn.Module):
     """
-    v17: Split Feature QK/V neurons (rank matrix, same as v16)
+    v17: ALL neurons are vectors (no rank matrices)
+
+    Compression neurons:
+    - feature_neurons: [n_feature, d_model] (SHARED for QK/V, routing differs)
+
+    Expansion neurons:
+    - relational_neurons: [n_relational, d_model] (SHARED for Q/K)
+    - value_neurons: [n_value, d_model]
+
+    Knowledge neurons:
+    - knowledge_neurons_K: [n_knowledge, knowledge_rank]
+    - knowledge_neurons_V: [n_knowledge, d_model]
     """
     def __init__(
         self,
         d_model: int,
-        rank: int,
-        n_feature_qk: int,
-        n_feature_v: int,
+        n_feature: int,
         n_relational: int,
         n_value: int,
         n_knowledge: int,
@@ -174,21 +247,18 @@ class SharedNeurons(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
-        self.rank = rank
         self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
-        self.n_feature_qk = n_feature_qk
-        self.n_feature_v = n_feature_v
-        self.n_relational = n_relational
+        self.n_feature = n_feature  # Shared for QK/V
+        self.n_relational = n_relational  # Shared for Q/K
         self.n_value = n_value
         self.n_knowledge = n_knowledge
 
-        # Split Feature pools (rank matrix)
-        self.feature_qk_neurons = nn.Parameter(torch.zeros(n_feature_qk, d_model, rank))
-        self.feature_v_neurons = nn.Parameter(torch.zeros(n_feature_v, d_model, rank))
+        # Compression neurons (input → hidden) - SHARED for QK/V
+        self.feature_neurons = nn.Parameter(torch.randn(n_feature, d_model) * 0.02)
 
-        # Expand pools (rank matrix)
-        self.relational_neurons = nn.Parameter(torch.zeros(n_relational, rank, d_model))
-        self.value_neurons = nn.Parameter(torch.zeros(n_value, rank, d_model))
+        # Expansion neurons (hidden → output)
+        self.relational_neurons = nn.Parameter(torch.randn(n_relational, d_model) * 0.02)  # Shared Q/K
+        self.value_neurons = nn.Parameter(torch.randn(n_value, d_model) * 0.02)
 
         # Knowledge neurons
         self.knowledge_neurons_K = nn.Parameter(torch.zeros(n_knowledge, self.knowledge_rank))
@@ -197,21 +267,19 @@ class SharedNeurons(nn.Module):
         self._init_parameters()
 
     def _init_parameters(self):
-        for i in range(self.n_feature_qk):
-            nn.init.orthogonal_(self.feature_qk_neurons.data[i])
-        for i in range(self.n_feature_v):
-            nn.init.orthogonal_(self.feature_v_neurons.data[i])
-        for i in range(self.n_relational):
-            nn.init.orthogonal_(self.relational_neurons.data[i])
-        for i in range(self.n_value):
-            nn.init.orthogonal_(self.value_neurons.data[i])
+        # All vector neurons: normal init
+        nn.init.normal_(self.feature_neurons, std=0.02)
+        nn.init.normal_(self.relational_neurons, std=0.02)
+        nn.init.normal_(self.value_neurons, std=0.02)
+
         nn.init.normal_(self.knowledge_neurons_K, std=0.02)
         nn.init.normal_(self.knowledge_neurons_V, std=0.02)
 
 
 class GlobalSSM(nn.Module):
     """
-    Selective SSM + Context Enhancement (same as v15/v16)
+    Selective SSM + Context Enhancement with Parallel Scan
+    (Same as v16)
     """
     def __init__(self, d_model: int, state_dim: int, return_context: bool = True):
         super().__init__()
@@ -308,64 +376,135 @@ class GlobalSSM(nn.Module):
 
 class GlobalRouters(nn.Module):
     """
-    v17: Soft/Hard selection routing
+    v17: 4-type routing with Soft/Hard Selection
 
-    Training: soft selection (전체 뉴런 참여, gradient flow)
-    Inference: top-k hard selection (efficiency)
+    Soft/Hard Selection:
+    - Training: soft selection (ALL neurons via softmax, gradient flow to all)
+    - Inference: top-k hard selection (sparse, efficient)
+
+    Routes:
+    - feature_qk: [B, n_feature] soft weights OR [B, top_k] indices (SHARED pool, QK routing)
+    - feature_v: [B, n_feature] soft weights OR [B, top_k] indices (SHARED pool, V routing)
+    - relational: [B, n_relational] soft weights OR [B, top_k] indices (SHARED pool, Q/K routing)
+    - value: [B, n_value] soft weights OR [B, top_k] indices
     """
-    def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
+    def __init__(self, d_model: int, n_feature: int,
                  n_relational: int, n_value: int, n_knowledge: int,
-                 top_k_feature_qk: int = 8, top_k_feature_v: int = 8,
-                 top_k_relational: int = 4, top_k_value: int = 6,
+                 top_k_feature: int = 64,
+                 top_k_relational: int = 64, top_k_value: int = 32,
                  d_space: int = 64, router_dropout: float = 0.1,
                  temperature: float = 1.0):
         super().__init__()
         self.d_model = d_model
-        self.n_feature_qk = n_feature_qk
-        self.n_feature_v = n_feature_v
-        self.n_relational = n_relational
+        self.n_feature = n_feature  # Shared for QK/V
+        self.n_relational = n_relational  # Shared for Q/K
         self.n_value = n_value
         self.n_knowledge = n_knowledge
-        self.top_k_feature_qk = top_k_feature_qk
-        self.top_k_feature_v = top_k_feature_v
+        self.top_k_feature = top_k_feature  # Used only during inference
         self.top_k_relational = top_k_relational
         self.top_k_value = top_k_value
-        self.temperature = temperature
+        self.temperature = temperature  # Controls softmax sharpness
 
         self.neuron_router = UnifiedNeuronRouter(
-            d_model, n_feature_qk, n_feature_v, n_relational, n_value, n_knowledge,
-            d_space=d_space, dropout=router_dropout, temperature=temperature
+            d_model, n_feature, n_relational,
+            n_value, n_knowledge, d_space=d_space, dropout=router_dropout
         )
-
-    def _topk_sparsify(self, weights, k):
-        """Top-k sparsification for inference"""
-        topk_vals, topk_idx = torch.topk(weights, k, dim=-1)
-        sparse_weights = torch.zeros_like(weights)
-        sparse_weights.scatter_(-1, topk_idx, topk_vals)
-        sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-8)
-        return sparse_weights, topk_idx
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         """
-        Training: soft selection (full softmax, all neurons participate)
-        Inference: top-k hard selection (sparse)
+        Compute attention routing weights with Soft/Hard Selection.
 
-        Returns: feature_qk_weights, feature_v_weights, relational_weights_Q,
-                 relational_weights_K, value_weights, routing_info, aux_loss
+        Training (soft selection):
+            - Returns soft weights for ALL neurons [B, n_neurons]
+            - Gradient flows to all neurons
+
+        Inference (hard selection):
+            - Returns top-k indices and soft weights [B, top_k]
+            - Sparse, efficient computation
+
+        Returns:
+            selection_data: dict containing either soft weights (training) or indices+weights (inference)
+            routing_info: dict with routing statistics
+            aux_loss: scalar
         """
-        # Get logits from unified router
-        feature_qk_logits = self.neuron_router.get_logits(x, 'feature_qk')
-        feature_v_logits = self.neuron_router.get_logits(x, 'feature_v')
-        relational_logits_Q = self.neuron_router.get_logits(x, 'relational_Q')
-        relational_logits_K = self.neuron_router.get_logits(x, 'relational_K')
-        value_logits = self.neuron_router.get_logits(x, 'value')
+        # Feature QK routing (shared pool, QK routing head)
+        logits_qk = self.neuron_router.get_logits(x, 'feature_qk')  # [B, S, n_feature]
+        pref_qk = F.softmax(logits_qk, dim=-1)
+        weights_qk = torch.einsum('bs,bsn->bn', importance, pref_qk)  # [B, n_feature]
 
-        # Soft preferences (with temperature)
-        feature_qk_pref = F.softmax(feature_qk_logits / self.temperature, dim=-1)
-        feature_v_pref = F.softmax(feature_v_logits / self.temperature, dim=-1)
-        relational_pref_Q = F.softmax(relational_logits_Q / self.temperature, dim=-1)
-        relational_pref_K = F.softmax(relational_logits_K / self.temperature, dim=-1)
-        value_pref = F.softmax(value_logits / self.temperature, dim=-1)
+        # Feature V routing (shared pool, V routing head)
+        logits_v = self.neuron_router.get_logits(x, 'feature_v')
+        pref_v = F.softmax(logits_v, dim=-1)
+        weights_v = torch.einsum('bs,bsn->bn', importance, pref_v)  # [B, n_feature]
+
+        # Relational Q routing (shared pool, Q routing head)
+        logits_rel_q = self.neuron_router.get_logits(x, 'relational_q')
+        pref_rel_q = F.softmax(logits_rel_q, dim=-1)
+        weights_rel_q = torch.einsum('bs,bsn->bn', importance, pref_rel_q)  # [B, n_relational]
+
+        # Relational K routing (shared pool, K routing head)
+        logits_rel_k = self.neuron_router.get_logits(x, 'relational_k')
+        pref_rel_k = F.softmax(logits_rel_k, dim=-1)
+        weights_rel_k = torch.einsum('bs,bsn->bn', importance, pref_rel_k)  # [B, n_relational]
+
+        # Value routing
+        logits_val = self.neuron_router.get_logits(x, 'value')
+        pref_val = F.softmax(logits_val, dim=-1)
+        weights_val = torch.einsum('bs,bsn->bn', importance, pref_val)  # [B, n_value]
+
+        if self.training:
+            # SOFT SELECTION: all neurons participate via softmax
+            soft_qk = F.softmax(weights_qk / self.temperature, dim=-1)    # [B, n_feature]
+            soft_v = F.softmax(weights_v / self.temperature, dim=-1)      # [B, n_feature]
+            soft_q = F.softmax(weights_rel_q / self.temperature, dim=-1)  # [B, n_relational]
+            soft_k = F.softmax(weights_rel_k / self.temperature, dim=-1)  # [B, n_relational]
+            soft_v2 = F.softmax(weights_val / self.temperature, dim=-1)   # [B, n_value]
+
+            # Update usage EMA (soft selection)
+            self.neuron_router.update_usage_soft(soft_qk, 'feature')
+            self.neuron_router.update_usage_soft(soft_v, 'feature')
+            self.neuron_router.update_usage_soft(soft_q, 'relational')
+            self.neuron_router.update_usage_soft(soft_k, 'relational')
+            self.neuron_router.update_usage_soft(soft_v2, 'value')
+
+            selection_data = {
+                'mode': 'soft',
+                'soft_qk': soft_qk,    # [B, n_feature]
+                'soft_v': soft_v,      # [B, n_feature]
+                'soft_q': soft_q,      # [B, n_relational]
+                'soft_k': soft_k,      # [B, n_relational]
+                'soft_v2': soft_v2,    # [B, n_value]
+            }
+        else:
+            # HARD SELECTION: top-k sparse selection for inference
+            topk_weights_qk, idx_qk = torch.topk(weights_qk, self.top_k_feature, dim=-1)
+            soft_qk = F.softmax(topk_weights_qk / self.temperature, dim=-1)
+
+            topk_weights_v, idx_v = torch.topk(weights_v, self.top_k_feature, dim=-1)
+            soft_v = F.softmax(topk_weights_v / self.temperature, dim=-1)
+
+            topk_weights_q, idx_q = torch.topk(weights_rel_q, self.top_k_relational, dim=-1)
+            soft_q = F.softmax(topk_weights_q / self.temperature, dim=-1)
+
+            topk_weights_k, idx_k = torch.topk(weights_rel_k, self.top_k_relational, dim=-1)
+            soft_k = F.softmax(topk_weights_k / self.temperature, dim=-1)
+
+            topk_weights_v2, idx_v2 = torch.topk(weights_val, self.top_k_value, dim=-1)
+            soft_v2 = F.softmax(topk_weights_v2 / self.temperature, dim=-1)
+
+            selection_data = {
+                'mode': 'hard',
+                'idx_qk': idx_qk,      # [B, top_k_feature]
+                'idx_v': idx_v,        # [B, top_k_feature]
+                'idx_q': idx_q,        # [B, top_k_relational]
+                'idx_k': idx_k,        # [B, top_k_relational]
+                'idx_v2': idx_v2,      # [B, top_k_value]
+                'soft_qk': soft_qk,    # [B, top_k_feature]
+                'soft_v': soft_v,      # [B, top_k_feature]
+                'soft_q': soft_q,      # [B, top_k_relational]
+                'soft_k': soft_k,      # [B, top_k_relational]
+                'soft_v2': soft_v2,    # [B, top_k_value]
+            }
 
         # Compute aux_loss (load balance)
         aux_loss = 0.0
@@ -373,120 +512,77 @@ class GlobalRouters(nn.Module):
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(-1).float()
                 count = mask.sum() + 1e-8
-                usage_FQK = (feature_qk_pref * mask).sum(dim=(0, 1)) / count
-                usage_FV = (feature_v_pref * mask).sum(dim=(0, 1)) / count
-                usage_Q = (relational_pref_Q * mask).sum(dim=(0, 1)) / count
-                usage_K = (relational_pref_K * mask).sum(dim=(0, 1)) / count
-                usage_V = (value_pref * mask).sum(dim=(0, 1)) / count
+                usage_fqk = (pref_qk * mask).sum(dim=(0, 1)) / count
+                usage_fv = (pref_v * mask).sum(dim=(0, 1)) / count
+                usage_rel_q = (pref_rel_q * mask).sum(dim=(0, 1)) / count
+                usage_rel_k = (pref_rel_k * mask).sum(dim=(0, 1)) / count
+                usage_val = (pref_val * mask).sum(dim=(0, 1)) / count
             else:
-                usage_FQK = feature_qk_pref.mean(dim=(0, 1))
-                usage_FV = feature_v_pref.mean(dim=(0, 1))
-                usage_Q = relational_pref_Q.mean(dim=(0, 1))
-                usage_K = relational_pref_K.mean(dim=(0, 1))
-                usage_V = value_pref.mean(dim=(0, 1))
+                usage_fqk = pref_qk.mean(dim=(0, 1))
+                usage_fv = pref_v.mean(dim=(0, 1))
+                usage_rel_q = pref_rel_q.mean(dim=(0, 1))
+                usage_rel_k = pref_rel_k.mean(dim=(0, 1))
+                usage_val = pref_val.mean(dim=(0, 1))
 
-            target_FQK = 1.0 / self.n_feature_qk
-            aux_loss = aux_loss + ((usage_FQK - target_FQK) ** 2).sum() * self.n_feature_qk
+            # Shared feature pool: both QK and V contribute to load balance
+            target_f = 1.0 / self.n_feature
+            aux_loss = aux_loss + ((usage_fqk - target_f) ** 2).sum() * self.n_feature
+            aux_loss = aux_loss + ((usage_fv - target_f) ** 2).sum() * self.n_feature
 
-            target_FV = 1.0 / self.n_feature_v
-            aux_loss = aux_loss + ((usage_FV - target_FV) ** 2).sum() * self.n_feature_v
+            # Shared relational pool: both Q and K contribute to load balance
+            target_rel = 1.0 / self.n_relational
+            aux_loss = aux_loss + ((usage_rel_q - target_rel) ** 2).sum() * self.n_relational
+            aux_loss = aux_loss + ((usage_rel_k - target_rel) ** 2).sum() * self.n_relational
 
-            target_R = 1.0 / self.n_relational
-            aux_loss = aux_loss + ((usage_Q - target_R) ** 2).sum() * self.n_relational
-            aux_loss = aux_loss + ((usage_K - target_R) ** 2).sum() * self.n_relational
+            target_val = 1.0 / self.n_value
+            aux_loss = aux_loss + ((usage_val - target_val) ** 2).sum() * self.n_value
 
-            target_V = 1.0 / self.n_value
-            aux_loss = aux_loss + ((usage_V - target_V) ** 2).sum() * self.n_value
+        routing_info = {
+            'mode': 'soft' if self.training else 'hard',
+            'feature_qk_pref': pref_qk.detach(),
+            'feature_v_pref': pref_v.detach(),
+            'relational_q_pref': pref_rel_q.detach(),
+            'relational_k_pref': pref_rel_k.detach(),
+            'value_pref': pref_val.detach(),
+        }
 
-        # Aggregate by importance: [B, S, N] → [B, N]
-        feature_qk_weights_dense = torch.einsum('bs,bsn->bn', importance, feature_qk_pref)
-        feature_v_weights_dense = torch.einsum('bs,bsn->bn', importance, feature_v_pref)
-        relational_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_Q)
-        relational_weights_K_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_K)
-        value_weights_dense = torch.einsum('bs,bsn->bn', importance, value_pref)
+        if not self.training:
+            routing_info.update({
+                'idx_qk': selection_data['idx_qk'].detach(),
+                'idx_v': selection_data['idx_v'].detach(),
+                'idx_q': selection_data['idx_q'].detach(),
+                'idx_k': selection_data['idx_k'].detach(),
+                'idx_v2': selection_data['idx_v2'].detach(),
+            })
 
-        if self.training:
-            # === SOFT SELECTION ===
-            # 학습 시: 전체 뉴런 참여 (gradient flow to all)
-            feature_qk_weights = feature_qk_weights_dense / (feature_qk_weights_dense.sum(dim=-1, keepdim=True) + 1e-8)
-            feature_v_weights = feature_v_weights_dense / (feature_v_weights_dense.sum(dim=-1, keepdim=True) + 1e-8)
-            relational_weights_Q = relational_weights_Q_dense / (relational_weights_Q_dense.sum(dim=-1, keepdim=True) + 1e-8)
-            relational_weights_K = relational_weights_K_dense / (relational_weights_K_dense.sum(dim=-1, keepdim=True) + 1e-8)
-            value_weights = value_weights_dense / (value_weights_dense.sum(dim=-1, keepdim=True) + 1e-8)
-
-            routing_info = {
-                'feature_qk_weights': feature_qk_weights.detach(),
-                'feature_v_weights': feature_v_weights.detach(),
-                'relational_weights_Q': relational_weights_Q.detach(),
-                'relational_weights_K': relational_weights_K.detach(),
-                'value_weights': value_weights.detach(),
-                # Preferences for logging
-                'feature_qk_pref': feature_qk_pref.detach(),
-                'feature_v_pref': feature_v_pref.detach(),
-                'feature_pref': feature_qk_pref.detach(),  # v15 compat
-                'relational_pref_Q': relational_pref_Q.detach(),
-                'relational_pref_K': relational_pref_K.detach(),
-                'value_pref': value_pref.detach(),
-                'soft_selection': True,
-                'token_routing': False,
-            }
-        else:
-            # === HARD SELECTION ===
-            # 추론 시: top-k sparse selection (efficiency)
-            feature_qk_weights, _ = self._topk_sparsify(feature_qk_weights_dense, self.top_k_feature_qk)
-            feature_v_weights, _ = self._topk_sparsify(feature_v_weights_dense, self.top_k_feature_v)
-            relational_weights_Q, _ = self._topk_sparsify(relational_weights_Q_dense, self.top_k_relational)
-            relational_weights_K, _ = self._topk_sparsify(relational_weights_K_dense, self.top_k_relational)
-            value_weights, _ = self._topk_sparsify(value_weights_dense, self.top_k_value)
-
-            routing_info = {
-                'feature_qk_weights': feature_qk_weights.detach(),
-                'feature_v_weights': feature_v_weights.detach(),
-                'relational_weights_Q': relational_weights_Q.detach(),
-                'relational_weights_K': relational_weights_K.detach(),
-                'value_weights': value_weights.detach(),
-                'feature_qk_pref': feature_qk_pref.detach(),
-                'feature_v_pref': feature_v_pref.detach(),
-                'feature_pref': feature_qk_pref.detach(),
-                'relational_pref_Q': relational_pref_Q.detach(),
-                'relational_pref_K': relational_pref_K.detach(),
-                'value_pref': value_pref.detach(),
-                'soft_selection': False,
-                'token_routing': False,
-            }
-
-        # Update usage statistics (for excitability)
-        if self.training:
-            # For soft selection, use thresholded weights for usage tracking
-            threshold_fqk = 1.0 / self.n_feature_qk
-            threshold_fv = 1.0 / self.n_feature_v
-            threshold_r = 1.0 / self.n_relational
-            threshold_v = 1.0 / self.n_value
-
-            self.neuron_router.update_usage((feature_qk_weights > threshold_fqk).float(), 'feature_qk', attention_mask)
-            self.neuron_router.update_usage((feature_v_weights > threshold_fv).float(), 'feature_v', attention_mask)
-            self.neuron_router.update_usage((value_weights > threshold_v).float(), 'value', attention_mask)
-            relational_used = ((relational_weights_Q > threshold_r) | (relational_weights_K > threshold_r)).float()
-            self.neuron_router.update_usage(relational_used, 'relational', attention_mask)
-
-        return feature_qk_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
+        return selection_data, routing_info, aux_loss
 
 
 class NeuronCircuit(nn.Module):
     """
-    v17: Attention circuit with Soft/Hard selection (rank matrix)
+    v17: Attention circuit with Soft/Hard Selection
 
-    Both training and inference use einsum (weighted sum).
-    The difference is in the sparsity of weights:
-    - Training: dense soft weights (all neurons participate)
-    - Inference: sparse top-k weights (only k neurons have non-zero)
+    Soft Selection (Training):
+    - Weighted sum over ALL neurons: output = sum(soft_weights * neurons)
+    - Gradient flows to all neurons
+
+    Hard Selection (Inference):
+    - Sparse indexed selection: output = sum(soft_weights[idx] * neurons[idx])
+    - Efficient computation
+
+    Flow:
+    1. x → feature_neurons @ soft_qk/[idx_qk] → h_qk
+    2. x → feature_neurons @ soft_v/[idx_v] → h_v
+    3. h_qk @ relational_neurons @ soft_q/[idx_q] → Q
+    4. h_qk @ relational_neurons @ soft_k/[idx_k] → K
+    5. h_v @ value_neurons @ soft_v2/[idx_v2] → V
+    6. Multi-head attention
     """
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
         n_heads: int,
-        rank: int,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -494,49 +590,97 @@ class NeuronCircuit(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.rank = rank
 
+        # Output projection
         self.expand_O = nn.Linear(d_model, d_model, bias=False)
+
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, feature_qk_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, attention_mask=None):
+    def forward(self, x, selection_data, attention_mask=None):
         """
         Args:
             x: [B, S, D]
-            feature_qk_weights: [B, N_FQK] - Q/K compression weights (soft or sparse)
-            feature_v_weights: [B, N_FV] - V compression weights (soft or sparse)
-            relational_weights_Q: [B, N_R] - Q expansion weights
-            relational_weights_K: [B, N_R] - K expansion weights
-            value_weights: [B, N_V] - V expansion weights
+            selection_data: dict with 'mode' and selection weights/indices
+            attention_mask: [B, S] optional
         """
         B, S, D = x.shape
+        mode = selection_data['mode']
 
-        # Feature compression: x → h
-        # [B, N] @ [N, D, R] → [B, D, R]
-        shared_feature_qk = torch.einsum('bn,ndr->bdr', feature_qk_weights,
-                                          self.shared_neurons.feature_qk_neurons)
-        shared_feature_v = torch.einsum('bn,ndr->bdr', feature_v_weights,
-                                         self.shared_neurons.feature_v_neurons)
+        if mode == 'soft':
+            # SOFT SELECTION: weighted sum over all neurons
+            soft_qk = selection_data['soft_qk']  # [B, n_feature]
+            soft_v = selection_data['soft_v']    # [B, n_feature]
+            soft_q = selection_data['soft_q']    # [B, n_relational]
+            soft_k = selection_data['soft_k']    # [B, n_relational]
+            soft_v2 = selection_data['soft_v2']  # [B, n_value]
 
-        # [B, S, D] @ [B, D, R] → [B, S, R]
-        h_qk = torch.einsum('bsd,bdr->bsr', x, shared_feature_qk)
-        h_v = torch.einsum('bsd,bdr->bsr', x, shared_feature_v)
+            # 1. Feature QK compression: x @ (soft_qk * neurons).T → h_qk
+            # neurons: [n_feature, D], soft_qk: [B, n_feature]
+            # weighted_neurons_qk: [B, n_feature, D]
+            weighted_neurons_qk = self.shared_neurons.feature_neurons.unsqueeze(0) * soft_qk.unsqueeze(-1)
+            # W_qk: [B, D, n_feature] (effectively weighted projection)
+            W_qk = weighted_neurons_qk.transpose(-1, -2)
+            h_qk = torch.einsum('bsd,bdk->bsk', x, W_qk)  # [B, S, n_feature]
 
-        # Expansion: h → Q/K/V
-        # [B, N] @ [N, R, D] → [B, R, D]
-        pool_R = self.shared_neurons.relational_neurons
-        pool_V = self.shared_neurons.value_neurons
-        shared_relational_Q = torch.einsum('bn,nrd->brd', relational_weights_Q, pool_R)
-        shared_relational_K = torch.einsum('bn,nrd->brd', relational_weights_K, pool_R)
-        shared_value = torch.einsum('bn,nrd->brd', value_weights, pool_V)
+            # 2. Feature V compression: x @ (soft_v * neurons).T → h_v
+            weighted_neurons_v = self.shared_neurons.feature_neurons.unsqueeze(0) * soft_v.unsqueeze(-1)
+            W_v = weighted_neurons_v.transpose(-1, -2)
+            h_v = torch.einsum('bsd,bdk->bsk', x, W_v)  # [B, S, n_feature]
 
-        # [B, S, R] @ [B, R, D] → [B, S, D]
-        Q = torch.einsum('bsr,brd->bsd', h_qk, shared_relational_Q)
-        K = torch.einsum('bsr,brd->bsd', h_qk, shared_relational_K)
-        V = torch.einsum('bsr,brd->bsd', h_v, shared_value)
+            # 3. Relational Q expansion: h_qk @ (soft_q * neurons) → Q
+            weighted_rel_q = self.shared_neurons.relational_neurons.unsqueeze(0) * soft_q.unsqueeze(-1)
+            Q = torch.einsum('bsr,brd->bsd', h_qk, weighted_rel_q)  # [B, S, D]
 
-        # Multi-head Attention
+            # 4. Relational K expansion: h_qk @ (soft_k * neurons) → K
+            weighted_rel_k = self.shared_neurons.relational_neurons.unsqueeze(0) * soft_k.unsqueeze(-1)
+            K = torch.einsum('bsr,brd->bsd', h_qk, weighted_rel_k)  # [B, S, D]
+
+            # 5. Value expansion: h_v @ (soft_v2 * neurons) → V
+            weighted_val = self.shared_neurons.value_neurons.unsqueeze(0) * soft_v2.unsqueeze(-1)
+            V = torch.einsum('bsr,brd->bsd', h_v, weighted_val)  # [B, S, D]
+
+        else:
+            # HARD SELECTION: sparse indexed selection
+            idx_qk = selection_data['idx_qk']    # [B, top_k_feature]
+            idx_v = selection_data['idx_v']      # [B, top_k_feature]
+            idx_q = selection_data['idx_q']      # [B, top_k_relational]
+            idx_k = selection_data['idx_k']      # [B, top_k_relational]
+            idx_v2 = selection_data['idx_v2']    # [B, top_k_value]
+            soft_qk = selection_data['soft_qk']  # [B, top_k_feature]
+            soft_v = selection_data['soft_v']    # [B, top_k_feature]
+            soft_q = selection_data['soft_q']    # [B, top_k_relational]
+            soft_k = selection_data['soft_k']    # [B, top_k_relational]
+            soft_v2 = selection_data['soft_v2']  # [B, top_k_value]
+
+            # 1. Feature QK compression with sparse selection
+            selected_qk = self.shared_neurons.feature_neurons[idx_qk]  # [B, top_k, D]
+            selected_qk = selected_qk * soft_qk.unsqueeze(-1)
+            W_qk = selected_qk.transpose(-1, -2)  # [B, D, top_k]
+            h_qk = torch.einsum('bsd,bdk->bsk', x, W_qk)  # [B, S, top_k]
+
+            # 2. Feature V compression with sparse selection
+            selected_v = self.shared_neurons.feature_neurons[idx_v]
+            selected_v = selected_v * soft_v.unsqueeze(-1)
+            W_v = selected_v.transpose(-1, -2)
+            h_v = torch.einsum('bsd,bdk->bsk', x, W_v)  # [B, S, top_k]
+
+            # 3. Relational Q expansion with sparse selection
+            selected_rel_q = self.shared_neurons.relational_neurons[idx_q]
+            selected_rel_q = selected_rel_q * soft_q.unsqueeze(-1)
+            Q = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_q)  # [B, S, D]
+
+            # 4. Relational K expansion with sparse selection
+            selected_rel_k = self.shared_neurons.relational_neurons[idx_k]
+            selected_rel_k = selected_rel_k * soft_k.unsqueeze(-1)
+            K = torch.einsum('bsr,brd->bsd', h_qk, selected_rel_k)  # [B, S, D]
+
+            # 5. Value expansion with sparse selection
+            selected_val = self.shared_neurons.value_neurons[idx_v2]
+            selected_val = selected_val * soft_v2.unsqueeze(-1)
+            V = torch.einsum('bsr,brd->bsd', h_v, selected_val)  # [B, S, D]
+
+        # 6. Multi-head Attention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         K = K.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -556,8 +700,10 @@ class NeuronCircuit(nn.Module):
                 is_causal=True,
                 dropout_p=self.attn_dropout.p if self.training else 0.0
             )
+
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.d_model)
 
+        # 7. Output projection
         output = self.expand_O(attn_out)
         output = self.out_dropout(output)
 
@@ -566,7 +712,7 @@ class NeuronCircuit(nn.Module):
 
 class NeuronMemory(nn.Module):
     """
-    v17: 2-stage hierarchical knowledge retrieval (same as v15/v16)
+    v17: 2-stage hierarchical knowledge retrieval (same as v16)
     """
     def __init__(
         self,
@@ -585,6 +731,26 @@ class NeuronMemory(nn.Module):
         self.coarse_k = coarse_k
         self.fine_k = fine_k
 
+    @torch.compiler.disable
+    def _update_knowledge_usage(self, router, candidate_idx, B, S, attention_mask=None):
+        """Update knowledge neuron usage EMA (index-based)"""
+        with torch.no_grad():
+            # candidate_idx: [B, S, coarse_k]
+            flat_indices = candidate_idx.detach().view(-1)  # [B * S * coarse_k]
+            usage = torch.zeros(self.n_knowledge, device=candidate_idx.device)
+            ones = torch.ones_like(flat_indices, dtype=usage.dtype)
+            usage.scatter_add_(0, flat_indices, ones)
+
+            # Normalize by B*S (each position selects coarse_k neurons)
+            if attention_mask is not None:
+                valid_positions = attention_mask.sum().item()
+            else:
+                valid_positions = B * S
+            usage = usage / max(valid_positions, 1)
+
+            # In-place EMA update
+            router.usage_ema_knowledge.mul_(0.99).add_(usage, alpha=0.01)
+
     def forward(self, x, router, knowledge_encoder, attention_mask=None):
         B, S, D = x.shape
 
@@ -592,11 +758,9 @@ class NeuronMemory(nn.Module):
         k_logits = router.get_logits(x, 'knowledge')
         coarse_scores, candidate_idx = torch.topk(k_logits, self.coarse_k, dim=-1)
 
-        # Update knowledge usage statistics
+        # Update knowledge usage (index-based, [B, S, coarse_k] -> flatten)
         if self.training:
-            coarse_indicator = torch.zeros(B, S, self.n_knowledge, device=x.device)
-            coarse_indicator.scatter_(-1, candidate_idx, 1.0)
-            router.update_usage(coarse_indicator, 'knowledge', attention_mask)
+            self._update_knowledge_usage(router, candidate_idx, B, S, attention_mask)
 
         # Stage 2: Fine matching within candidates
         query = knowledge_encoder(x)
@@ -631,13 +795,12 @@ class NeuronMemory(nn.Module):
 
 
 class DAWNBlock(nn.Module):
-    """DAWN v17 block with Soft/Hard selection"""
+    """DAWN v17 block with Soft/Hard Selection"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
         n_heads: int,
-        rank: int,
         n_knowledge: int,
         knowledge_rank: int = None,
         coarse_k: int = 20,
@@ -646,7 +809,7 @@ class DAWNBlock(nn.Module):
     ):
         super().__init__()
 
-        self.attn = NeuronCircuit(shared_neurons, d_model, n_heads, rank, dropout)
+        self.attn = NeuronCircuit(shared_neurons, d_model, n_heads, dropout)
         self.memory = NeuronMemory(
             shared_neurons, d_model, n_knowledge,
             knowledge_rank=knowledge_rank, coarse_k=coarse_k, fine_k=fine_k
@@ -658,10 +821,10 @@ class DAWNBlock(nn.Module):
 
     def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder, attention_mask=None):
         normed_x = self.norm1(x)
-        feature_qk_w, feature_v_w, relational_Q, relational_K, value_w, attn_routing, attn_aux_loss = \
+        selection_data, attn_routing, attn_aux_loss = \
             global_routers.get_attention_weights(normed_x, importance, attention_mask)
 
-        attn_out, _ = self.attn(normed_x, feature_qk_w, feature_v_w, relational_Q, relational_K, value_w, attention_mask)
+        attn_out, _ = self.attn(normed_x, selection_data, attention_mask)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
@@ -683,17 +846,20 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v17: Soft Selection Training
+    DAWN v17: Full Vector Neurons + Soft/Hard Selection
 
-    v16 기반 (Split Feature QK/V, rank matrix) + 학습/추론 분리:
-    - 학습: soft selection (전체 뉴런 gradient flow)
-    - 추론: hard selection (top-k sparse)
+    Core Changes from v16:
+    - ALL neurons are vectors (no rank matrices)
+    - Soft/Hard Selection:
+      * Training: soft selection (ALL neurons via softmax, gradient flow)
+      * Inference: top-k hard selection (sparse, efficient)
+    - Temperature parameter for controlling selection sharpness
+    - Shared pools: feature (QK/V), relational (Q/K) with separate routing heads
 
     Architecture:
-    - Feature_QK: [n_feature_qk, d_model, rank] - Q/K compression
-    - Feature_V: [n_feature_v, d_model, rank] - V compression
-    - Relational: [n_relational, rank, d_model] - Q/K expansion
-    - Value: [n_value, rank, d_model] - V expansion
+    - Feature: [n_feature, d_model] SHARED pool (QK/V have separate routing heads)
+    - Relational: [n_relational, d_model] SHARED pool (Q/K have separate routing heads)
+    - Value: [n_value, d_model] expansion vectors
     - Knowledge: 2-stage retrieval
     """
     __version__ = "17.0"
@@ -704,29 +870,26 @@ class DAWN(nn.Module):
         d_model: int = 320,
         n_layers: int = 4,
         n_heads: int = 4,
-        rank: int = 64,
-        max_seq_len: int = 128,
-        # Split Feature
-        n_feature_qk: int = 36,
-        n_feature_v: int = 36,
-        top_k_feature_qk: int = 8,
-        top_k_feature_v: int = 8,
-        # Expansion
-        n_relational: int = 12,
-        n_value: int = 12,
-        top_k_relational: int = 4,
-        top_k_value: int = 6,
+        max_seq_len: int = 512,
+        # Compression neurons
+        n_feature: int = 768,  # Shared for QK/V
+        top_k_feature: int = 64,  # Inference only
+        # Expansion neurons
+        n_relational: int = 256,  # Shared for Q/K
+        n_value: int = 128,
+        top_k_relational: int = 64,  # Inference only
+        top_k_value: int = 32,  # Inference only
         # Knowledge
         n_knowledge: int = 80,
         coarse_k: int = 20,
         fine_k: int = 10,
-        knowledge_rank: int = None,
+        knowledge_rank: int = 128,
         # Other
         state_dim: int = 64,
         d_space: int = 64,
         dropout: float = 0.1,
         router_dropout: float = 0.1,
-        temperature: float = 1.0,
+        temperature: float = 1.0,  # Soft selection sharpness
         gradient_checkpointing: bool = False,
         use_ssm_context: bool = True,
         **kwargs
@@ -737,8 +900,7 @@ class DAWN(nn.Module):
         self.d_model = d_model
         self.n_layers = n_layers
         self.n_heads = n_heads
-        self.rank = rank
-        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
+        self.knowledge_rank = knowledge_rank
         self.max_seq_len = max_seq_len
         self.state_dim = state_dim
         self.d_space = d_space
@@ -747,14 +909,12 @@ class DAWN(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_ssm_context = use_ssm_context
 
-        # Split Feature
-        self.n_feature_qk = n_feature_qk
-        self.n_feature_v = n_feature_v
-        self.top_k_feature_qk = top_k_feature_qk
-        self.top_k_feature_v = top_k_feature_v
+        # Compression neuron counts (shared pool for QK/V)
+        self.n_feature = n_feature
+        self.top_k_feature = top_k_feature
 
-        # Expansion
-        self.n_relational = n_relational
+        # Expansion neuron counts
+        self.n_relational = n_relational  # Shared for Q/K
         self.n_value = n_value
         self.top_k_relational = top_k_relational
         self.top_k_value = top_k_value
@@ -764,36 +924,33 @@ class DAWN(nn.Module):
         self.coarse_k = coarse_k
         self.fine_k = fine_k
 
-        # v15 compat
-        self.n_feature = n_feature_qk
-        self.n_neurons = n_feature_qk
-        self.basis_rank = rank
-        self.token_routing = False
-
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
 
         self.shared_neurons = SharedNeurons(
-            d_model=d_model, rank=rank,
-            n_feature_qk=n_feature_qk, n_feature_v=n_feature_v,
-            n_relational=n_relational, n_value=n_value,
-            n_knowledge=n_knowledge, knowledge_rank=self.knowledge_rank,
+            d_model=d_model,
+            n_feature=n_feature,
+            n_relational=n_relational,
+            n_value=n_value, n_knowledge=n_knowledge,
+            knowledge_rank=knowledge_rank,
         )
 
         self.global_ssm = GlobalSSM(d_model, state_dim, return_context=use_ssm_context)
 
         self.global_routers = GlobalRouters(
-            d_model, n_feature_qk, n_feature_v, n_relational, n_value, n_knowledge,
-            top_k_feature_qk, top_k_feature_v, top_k_relational, top_k_value,
-            d_space=d_space, router_dropout=router_dropout, temperature=temperature
+            d_model, n_feature, n_relational,
+            n_value, n_knowledge,
+            top_k_feature, top_k_relational, top_k_value,
+            d_space=d_space, router_dropout=router_dropout,
+            temperature=temperature
         )
 
-        self.knowledge_encoder = nn.Linear(d_model, self.knowledge_rank, bias=False)
+        self.knowledge_encoder = nn.Linear(d_model, knowledge_rank, bias=False)
 
         self.layers = nn.ModuleList([
             DAWNBlock(
                 shared_neurons=self.shared_neurons, d_model=d_model, n_heads=n_heads,
-                rank=rank, n_knowledge=n_knowledge, knowledge_rank=self.knowledge_rank,
+                n_knowledge=n_knowledge, knowledge_rank=knowledge_rank,
                 coarse_k=coarse_k, fine_k=fine_k, dropout=dropout,
             )
             for _ in range(n_layers)
@@ -866,26 +1023,6 @@ class DAWN(nn.Module):
             return logits, routing_infos
         return logits
 
-    def orthogonality_loss(self):
-        W_fqk = self.shared_neurons.feature_qk_neurons
-        WtW_fqk = torch.bmm(W_fqk.transpose(1, 2), W_fqk)
-        I = torch.eye(self.rank, device=W_fqk.device).unsqueeze(0)
-        loss_fqk = ((WtW_fqk - I) ** 2).mean()
-
-        W_fv = self.shared_neurons.feature_v_neurons
-        WtW_fv = torch.bmm(W_fv.transpose(1, 2), W_fv)
-        loss_fv = ((WtW_fv - I) ** 2).mean()
-
-        W_r = self.shared_neurons.relational_neurons
-        WWt_r = torch.bmm(W_r, W_r.transpose(1, 2))
-        loss_r = ((WWt_r - I) ** 2).mean()
-
-        W_v = self.shared_neurons.value_neurons
-        WWt_v = torch.bmm(W_v, W_v.transpose(1, 2))
-        loss_v = ((WWt_v - I) ** 2).mean()
-
-        return (loss_fqk + loss_fv + loss_r + loss_v) / 4
-
     def knowledge_diversity_loss(self):
         K = self.shared_neurons.knowledge_neurons_K
         K_norm = F.normalize(K, dim=-1)
@@ -895,7 +1032,6 @@ class DAWN(nn.Module):
 
     def get_auxiliary_losses(self):
         return {
-            'orth_total': self.orthogonality_loss(),
             'knowledge_div': self.knowledge_diversity_loss(),
         }
 
@@ -903,8 +1039,7 @@ class DAWN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def count_by_component(self):
-        feature_qk = self.shared_neurons.feature_qk_neurons.numel()
-        feature_v = self.shared_neurons.feature_v_neurons.numel()
+        feature = self.shared_neurons.feature_neurons.numel()
         relational = self.shared_neurons.relational_neurons.numel()
         value = self.shared_neurons.value_neurons.numel()
         knowledge = self.shared_neurons.knowledge_neurons_K.numel() + self.shared_neurons.knowledge_neurons_V.numel()
@@ -921,34 +1056,36 @@ class DAWN(nn.Module):
 
         routers = sum(p.numel() for p in self.global_routers.neuron_router.parameters())
 
-        expand_o = self.layers[0].attn.expand_O.weight.numel() * self.n_layers
+        # expand_O per layer
+        expand_per_layer = self.layers[0].attn.expand_O.weight.numel()
+        expand_total = expand_per_layer * self.n_layers
+
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
-        print(f"=== DAWN v17 Parameter Breakdown (Soft/Hard Selection) ===")
-        print(f"Feature_QK Neurons:    {feature_qk:,} ({feature_qk/1e6:.2f}M) [{self.n_feature_qk} × {self.d_model} × {self.rank}]")
-        print(f"Feature_V Neurons:     {feature_v:,} ({feature_v/1e6:.2f}M) [{self.n_feature_v} × {self.d_model} × {self.rank}]")
-        print(f"Relational Neurons:    {relational:,} ({relational/1e6:.2f}M) [{self.n_relational} × {self.rank} × {self.d_model}]")
-        print(f"Value Neurons:         {value:,} ({value/1e6:.2f}M) [{self.n_value} × {self.rank} × {self.d_model}]")
-        print(f"expand_O:              {expand_o:,} ({expand_o/1e3:.1f}K)")
-        print(f"Knowledge Neurons:     {knowledge:,} ({knowledge/1e3:.1f}K)")
-        print(f"Embeddings:            {embed:,} ({embed/1e6:.2f}M)")
-        print(f"Mamba SSM:             {ssm_total:,} ({ssm_total/1e3:.1f}K)")
-        print(f"Unified Router:        {routers:,} ({routers/1e3:.1f}K) [d_space={self.d_space}]")
-        print(f"LayerNorms:            {norms:,} ({norms/1e3:.1f}K)")
+        print(f"=== DAWN v17 Parameter Breakdown (Vector Neurons + Soft/Hard Selection) ===")
+        print(f"Feature Neurons:        {feature:,} ({feature/1e3:.1f}K) [{self.n_feature} × {self.d_model}] (SHARED QK/V)")
+        print(f"Relational Neurons:     {relational:,} ({relational/1e3:.1f}K) [{self.n_relational} × {self.d_model}] (SHARED Q/K)")
+        print(f"Value Neurons:          {value:,} ({value/1e3:.1f}K) [{self.n_value} × {self.d_model}]")
+        print(f"Expand O (per layer):   {expand_total:,} ({expand_total/1e3:.1f}K)")
+        print(f"Knowledge Neurons (K):  {knowledge:,} ({knowledge/1e3:.1f}K)")
+        print(f"Embeddings:             {embed:,} ({embed/1e6:.2f}M)")
+        print(f"Mamba SSM:              {ssm_total:,} ({ssm_total/1e3:.1f}K)")
+        print(f"Unified Router:         {routers:,} ({routers/1e3:.1f}K) [d_space={self.d_space}]")
+        print(f"LayerNorms:             {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
+        print(f"Selection Mode: SOFT (training) / HARD (inference)")
         print(f"Temperature:      {self.temperature}")
-        print(f"Top-k Feature_QK: {self.top_k_feature_qk}/{self.n_feature_qk} (inference only)")
-        print(f"Top-k Feature_V:  {self.top_k_feature_v}/{self.n_feature_v} (inference only)")
-        print(f"Top-k Relational: {self.top_k_relational}/{self.n_relational} (inference only)")
+        print(f"Top-k Feature:    {self.top_k_feature}/{self.n_feature} (inference only, shared QK/V)")
+        print(f"Top-k Relational: {self.top_k_relational}/{self.n_relational} (inference only, shared Q/K)")
         print(f"Top-k Value:      {self.top_k_value}/{self.n_value} (inference only)")
         print(f"Mamba Available: {MAMBA_AVAILABLE}")
         print(f"---")
-        print(f"Total:                 {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
+        print(f"Total:                  {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 
         return {
-            'feature_qk': feature_qk, 'feature_v': feature_v,
-            'relational': relational, 'value': value,
-            'expand_o': expand_o, 'knowledge': knowledge,
+            'feature': feature,
+            'relational': relational,
+            'value': value, 'expand': expand_total, 'knowledge': knowledge,
             'embeddings': embed, 'ssm': ssm_total,
             'routers': routers, 'norms': norms,
         }
@@ -958,15 +1095,18 @@ class DAWN(nn.Module):
             'model_version': self.__version__,
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
-            'rank': self.rank, 'knowledge_rank': self.knowledge_rank,
+            'knowledge_rank': self.knowledge_rank,
             'max_seq_len': self.max_seq_len,
-            'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
-            'top_k_feature_qk': self.top_k_feature_qk, 'top_k_feature_v': self.top_k_feature_v,
-            'n_relational': self.n_relational, 'n_value': self.n_value,
-            'top_k_relational': self.top_k_relational, 'top_k_value': self.top_k_value,
+            'n_feature': self.n_feature,  # Shared for QK/V
+            'top_k_feature': self.top_k_feature,  # Inference only
+            'n_relational': self.n_relational,  # Shared for Q/K
+            'n_value': self.n_value,
+            'top_k_relational': self.top_k_relational,  # Inference only
+            'top_k_value': self.top_k_value,  # Inference only
             'n_knowledge': self.n_knowledge,
             'coarse_k': self.coarse_k, 'fine_k': self.fine_k,
-            'state_dim': self.state_dim, 'd_space': self.d_space,
+            'state_dim': self.state_dim,
+            'd_space': self.d_space,
             'router_dropout': self.router_dropout,
             'temperature': self.temperature,
             'gradient_checkpointing': self.gradient_checkpointing,
@@ -975,14 +1115,14 @@ class DAWN(nn.Module):
     def get_model_info(self):
         """Return model architecture info for logging"""
         return [
-            f"DAWN v{self.__version__}: Soft/Hard Selection",
-            f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  Training: soft selection (all neurons, temp={self.temperature})",
-            f"  Inference: top-k hard selection",
-            f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank}",
-            f"  Feature_V:  {self.n_feature_v} × {self.d_model} × {self.rank}",
-            f"  Relational: {self.n_relational} × {self.rank} × {self.d_model}",
-            f"  Value:      {self.n_value} × {self.rank} × {self.d_model}",
-            f"  Knowledge:  {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
+            f"DAWN v{self.__version__}: Vector Neurons + Soft/Hard Selection",
+            f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
+            f"  Compression:",
+            f"    Feature: {self.n_feature} × {self.d_model} (top-k={self.top_k_feature} inference) [SHARED QK/V]",
+            f"  Expansion:",
+            f"    Relational: {self.n_relational} × {self.d_model} (top-k={self.top_k_relational} inference) [SHARED Q/K]",
+            f"    Value: {self.n_value} × {self.d_model} (top-k={self.top_k_value} inference)",
+            f"  Knowledge: {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
+            f"  Selection: SOFT (train, temp={self.temperature}) / HARD (inference)",
             f"  Router: d_space={self.d_space}, Excitability (SAR)",
         ]

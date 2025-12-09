@@ -1,7 +1,7 @@
 # DAWN v17 Training Config
-# Soft Selection Training (v16-based + soft/hard selection)
-# 학습: 전체 뉴런 soft selection (gradient flow to all)
-# 추론: top-k hard selection (efficiency)
+# Full Vector Neurons + Soft/Hard Selection
+# Training: soft selection (all neurons via softmax, gradient flow)
+# Inference: top-k hard selection (sparse, efficient)
 
 # Data
 data:
@@ -17,20 +17,17 @@ model:
   d_model: 320
   n_layers: 4
   n_heads: 4
-  rank: 64                          # rank matrix dimension
   state_dim: 64
 
-  # Split Feature pools (rank matrix)
-  n_feature_qk: 28                  # Q/K path compression [n, D, R]
-  n_feature_v: 16                   # V path compression [n, D, R]
-  top_k_feature_qk: 6               # inference only
-  top_k_feature_v: 4                # inference only
+  # Vector neurons (NO rank matrices - all neurons are [n, d_model])
+  n_feature: 768              # Shared pool for QK/V (separate routing)
+  n_relational: 256           # Shared pool for Q/K (separate routing)
+  n_value: 128                # V expansion neurons
 
-  # Expansion neurons (rank matrix)
-  n_relational: 160                 # Q/K expansion [n, R, D]
-  n_value: 12                       # V expansion [n, R, D]
-  top_k_relational: 16              # inference only
-  top_k_value: 3                    # inference only
+  # Top-k for inference only (training uses soft selection over all)
+  top_k_feature: 64           # inference only
+  top_k_relational: 64        # inference only
+  top_k_value: 32             # inference only
 
   # Knowledge neurons
   n_knowledge: 80
@@ -44,7 +41,7 @@ model:
   # Router settings
   d_space: 64
   router_dropout: 0.1
-  temperature: 1.0                  # soft selection sharpness
+  temperature: 1.0            # soft selection sharpness
   use_ssm_context: true
   gradient_checkpointing: false
 
@@ -57,9 +54,8 @@ training:
   warmup_epochs: 2
 
   # Regularization
-  orthogonality_weight: 0.01        # rank matrix orthogonality
   diversity_weight: 0.1
-  load_balance_weight: 0.03         # aux_loss coefficient
+  load_balance_weight: 0.03   # aux_loss coefficient
   entropy_weight: 0.0
   process_norm_weight: 0.0
 
@@ -68,8 +64,9 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17
 log_dir: /content/drive/MyDrive/dawn/logs_v17
 
 # v17 Changes from v16:
-#   - Training: soft selection (all neurons participate, gradient flow)
-#   - Inference: top-k hard selection (efficiency)
-#   - Temperature parameter for controlling selection sharpness
-#   - Same rank matrix architecture as v16
+#   - ALL neurons are vectors [n, d_model] (no rank matrices)
+#   - Training: soft selection (all neurons via softmax)
+#   - Inference: top-k hard selection (sparse)
+#   - Temperature parameter for softmax sharpness
+#   - Shared pools: Feature (QK/V), Relational (Q/K)
 #   - top_k values only used during inference

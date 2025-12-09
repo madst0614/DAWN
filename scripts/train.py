@@ -1753,24 +1753,25 @@ def main():
 
     if model_version != 'baseline':
         if model_version == "17.0":
-            # v17.0: Soft Selection Training (v16-based + soft/hard selection)
-            rank = args.basis_rank
+            # v17.0: Full Vector Neurons + Soft/Hard Selection
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
-            n_feature_qk = getattr(args, 'n_feature_qk', 28)
-            n_feature_v = getattr(args, 'n_feature_v', 16)
-            n_relational = getattr(args, 'n_relational', 160)
-            n_value = getattr(args, 'n_value', 12)
-            n_knowledge = getattr(args, 'n_knowledge', 256)
+            n_feature = getattr(args, 'n_feature', 768)
+            n_relational = getattr(args, 'n_relational', 256)
+            n_value = getattr(args, 'n_value', 128)
+            n_knowledge = getattr(args, 'n_knowledge', 80)
             coarse_k = getattr(args, 'coarse_k', 20)
             fine_k = getattr(args, 'fine_k', 10)
             temperature = getattr(args, 'temperature', 1.0)
-            print(f"DAWN v{model_version}: Soft Selection Training (v16-based)")
-            print(f"  Training: soft selection (all neurons, temp={temperature})")
-            print(f"  Inference: top-k hard selection")
-            print(f"  Feature QK/V: {n_feature_qk}/{n_feature_v}")
-            print(f"  Relational/Value: {n_relational}/{n_value}")
+            top_k_feature = getattr(args, 'top_k_feature', 64)
+            top_k_relational = getattr(args, 'top_k_relational', 64)
+            top_k_value = getattr(args, 'top_k_value', 32)
+            print(f"DAWN v{model_version}: Full Vector Neurons + Soft/Hard Selection")
+            print(f"  Training: SOFT selection (all neurons via softmax, temp={temperature})")
+            print(f"  Inference: HARD selection (top-k sparse)")
+            print(f"  Feature: {n_feature} × {args.d_model} [SHARED QK/V] (top-k={top_k_feature} @ inference)")
+            print(f"  Relational: {n_relational} × {args.d_model} [SHARED Q/K] (top-k={top_k_relational} @ inference)")
+            print(f"  Value: {n_value} × {args.d_model} (top-k={top_k_value} @ inference)")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
-            print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
         elif model_version == "16.0":
             # v16.0: Split Feature QK/V (rank matrix, v15-based)
             rank = args.basis_rank
@@ -2017,25 +2018,23 @@ def main():
 
     # Add version-specific parameters
     if model_version == '17.0':
-        # v17.0: Soft Selection Training (v16-based + soft/hard selection)
+        # v17.0: Full Vector Neurons + Soft/Hard Selection (no rank matrices)
         model_kwargs.update({
-            'n_feature_qk': getattr(args, 'n_feature_qk', 28),
-            'n_feature_v': getattr(args, 'n_feature_v', 16),
-            'n_relational': getattr(args, 'n_relational', 160),
-            'n_value': getattr(args, 'n_value', 12),
+            'n_feature': getattr(args, 'n_feature', 768),       # Shared QK/V
+            'n_relational': getattr(args, 'n_relational', 256), # Shared Q/K
+            'n_value': getattr(args, 'n_value', 128),
             'n_knowledge': args.n_knowledge,
             'coarse_k': args.coarse_k,
             'fine_k': args.fine_k,
             'knowledge_rank': args.knowledge_rank or 128,
-            'rank': args.basis_rank,  # single rank for all matrices
             'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature_qk': getattr(args, 'top_k_feature_qk', 6),  # inference only
-            'top_k_feature_v': getattr(args, 'top_k_feature_v', 4),    # inference only
-            'top_k_relational': getattr(args, 'top_k_relational', 16), # inference only
-            'top_k_value': getattr(args, 'top_k_value', 3),            # inference only
+            'top_k_feature': getattr(args, 'top_k_feature', 64),       # inference only
+            'top_k_relational': getattr(args, 'top_k_relational', 64), # inference only
+            'top_k_value': getattr(args, 'top_k_value', 32),           # inference only
             'd_space': getattr(args, 'd_space', 64),
             'router_dropout': getattr(args, 'router_dropout', 0.1),
             'temperature': getattr(args, 'temperature', 1.0),
+            'use_ssm_context': getattr(args, 'use_ssm_context', True),
             'gradient_checkpointing': args.gradient_checkpointing,
         })
     elif model_version == '16.0':
