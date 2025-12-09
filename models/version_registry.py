@@ -8,7 +8,7 @@ v13.2: Unified Neuron Router (all neurons in same embedding space)
 v14.0: FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR
 v15.0: 2-Stage Hierarchical Knowledge Retrieval (x→router→coarse, x→proj_q→fine)
 v16.0: Split Feature QK/V (rank matrix, v15-based) - Feature_QK/V separate compression
-v17.0: Full Vector Neurons + Soft Weighting (shared pools, excitability)
+v17.0: Soft Selection Training (v16 + soft/hard selection)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -266,39 +266,40 @@ VERSION_REGISTRY = {
         ],
     },
     "17.0": {
-        "description": "Full Vector Neurons + Soft Weighting (shared pools)",
+        "description": "Soft Selection Training (v16 + soft/hard selection)",
         "aliases": ["17", "170"],
         "module": "model_v17",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_feature",      # SHARED for QK/V (routing heads differ)
-            "n_relational",   # SHARED for Q/K (routing heads differ)
-            "n_value", "n_knowledge",
+            "n_feature_qk", "n_feature_v", "n_relational", "n_value", "n_knowledge",
+            "rank",  # single rank for all matrices
         ],
         "optional_params": {
             "dropout": 0.1,
             "state_dim": 64,
-            "top_k_feature": 64,       # Same top-k for QK and V
-            "top_k_relational": 64,
-            "top_k_value": 32,
+            "top_k_feature_qk": 8,  # inference only
+            "top_k_feature_v": 8,   # inference only
+            "top_k_relational": 4,  # inference only
+            "top_k_value": 6,       # inference only
             "d_space": 64,
             "coarse_k": 20,
             "fine_k": 10,
             "knowledge_rank": 128,
+            "temperature": 1.0,     # soft selection sharpness
             "gradient_checkpointing": False,
         },
         "display_info": lambda args: [
-            f"DAWN v17: Full Vector Neurons + Soft Weighting",
-            f"  d_model={args.get('d_model')}, n_layers={args.get('n_layers')}, n_heads={args.get('n_heads')}",
-            f"  Compression (SHARED pools):",
-            f"    Feature: {args.get('n_feature')} × {args.get('d_model')} (top-k={args.get('top_k_feature', 64)}) [QK/V share, routing differs]",
-            f"  Expansion (SHARED pools):",
-            f"    Relational: {args.get('n_relational')} × {args.get('d_model')} (top-k={args.get('top_k_relational', 64)}) [Q/K share, routing differs]",
-            f"    Value: {args.get('n_value')} × {args.get('d_model')} (top-k={args.get('top_k_value', 32)})",
+            f"DAWN v17: Soft Selection Training (v16-based)",
+            f"  rank={args.get('rank', args.get('basis_rank'))}, temperature={args.get('temperature', 1.0)}",
+            f"  Training: soft selection (all neurons participate, gradient flow)",
+            f"  Inference: top-k hard selection (sparse)",
+            f"  Feature_QK: {args.get('n_feature_qk')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (top-k={args.get('top_k_feature_qk', 8)} @ inference)",
+            f"  Feature_V: {args.get('n_feature_v')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (top-k={args.get('top_k_feature_v', 8)} @ inference)",
+            f"  Relational: {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K expansion, top-k={args.get('top_k_relational', 4)} @ inference)",
+            f"  Value: {args.get('n_value')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V expansion, top-k={args.get('top_k_value', 6)} @ inference)",
             f"  Unified Router: d_space={args.get('d_space', 64)} + Excitability (SAR)",
-            f"  Soft Weighting: top-k → softmax → weighted neurons (gradient flow)",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
-            f"  Architecture: Mamba SSM → Context → Soft Router → Vector Neurons → FlashAttn",
+            f"  Architecture: Mamba SSM → Context → Soft/Hard Router → Rank Matrix → FlashAttn",
             f"  Memory: 2-stage (x→router→coarse, x→encoder→fine)",
             f"  KnowledgeNeurons (K):",
             f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",

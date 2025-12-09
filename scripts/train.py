@@ -1753,22 +1753,24 @@ def main():
 
     if model_version != 'baseline':
         if model_version == "17.0":
-            # v17.0: Full Vector Neurons + Soft Weighting (Shared F(QK/V), Shared R(Q/K))
+            # v17.0: Soft Selection Training (v16-based + soft/hard selection)
+            rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
-            n_feature = getattr(args, 'n_feature', 768)  # Shared for QK/V
-            n_relational = getattr(args, 'n_relational', 1600)  # Shared for Q/K
-            n_value = getattr(args, 'n_value', 768)
-            n_knowledge = getattr(args, 'n_knowledge', 80)
+            n_feature_qk = getattr(args, 'n_feature_qk', 28)
+            n_feature_v = getattr(args, 'n_feature_v', 16)
+            n_relational = getattr(args, 'n_relational', 160)
+            n_value = getattr(args, 'n_value', 12)
+            n_knowledge = getattr(args, 'n_knowledge', 256)
             coarse_k = getattr(args, 'coarse_k', 20)
             fine_k = getattr(args, 'fine_k', 10)
-            top_k_f = getattr(args, 'top_k_feature', 64)
-            top_k_rel = getattr(args, 'top_k_relational', 64)
-            top_k_val = getattr(args, 'top_k_value', 64)
-            print(f"DAWN v{model_version}: Full Vector Neurons + Soft Weighting")
-            print(f"  Compression: F(QK/V)={n_feature}(top-{top_k_f})")
-            print(f"  Expansion: R(Q/K)={n_relational}(top-{top_k_rel}), V={n_value}(top-{top_k_val})")
+            temperature = getattr(args, 'temperature', 1.0)
+            print(f"DAWN v{model_version}: Soft Selection Training (v16-based)")
+            print(f"  Training: soft selection (all neurons, temp={temperature})")
+            print(f"  Inference: top-k hard selection")
+            print(f"  Feature QK/V: {n_feature_qk}/{n_feature_v}")
+            print(f"  Relational/Value: {n_relational}/{n_value}")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
-            print(f"  knowledge_rank={knowledge_rank}")
+            print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
         elif model_version == "16.0":
             # v16.0: Split Feature QK/V (rank matrix, v15-based)
             rank = args.basis_rank
@@ -2015,21 +2017,25 @@ def main():
 
     # Add version-specific parameters
     if model_version == '17.0':
-        # v17.0: Full Vector Neurons + Soft Weighting (Shared F(QK/V), Shared R(Q/K))
+        # v17.0: Soft Selection Training (v16-based + soft/hard selection)
         model_kwargs.update({
-            'n_feature': getattr(args, 'n_feature', 768),  # Shared for QK/V
-            'n_relational': getattr(args, 'n_relational', 1600),  # Shared for Q/K
-            'n_value': getattr(args, 'n_value', 768),
+            'n_feature_qk': getattr(args, 'n_feature_qk', 28),
+            'n_feature_v': getattr(args, 'n_feature_v', 16),
+            'n_relational': getattr(args, 'n_relational', 160),
+            'n_value': getattr(args, 'n_value', 12),
             'n_knowledge': args.n_knowledge,
             'coarse_k': args.coarse_k,
             'fine_k': args.fine_k,
             'knowledge_rank': args.knowledge_rank or 128,
+            'rank': args.basis_rank,  # single rank for all matrices
             'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature': getattr(args, 'top_k_feature', 64),
-            'top_k_relational': getattr(args, 'top_k_relational', 64),
-            'top_k_value': getattr(args, 'top_k_value', 64),
+            'top_k_feature_qk': getattr(args, 'top_k_feature_qk', 6),  # inference only
+            'top_k_feature_v': getattr(args, 'top_k_feature_v', 4),    # inference only
+            'top_k_relational': getattr(args, 'top_k_relational', 16), # inference only
+            'top_k_value': getattr(args, 'top_k_value', 3),            # inference only
             'd_space': getattr(args, 'd_space', 64),
             'router_dropout': getattr(args, 'router_dropout', 0.1),
+            'temperature': getattr(args, 'temperature', 1.0),
             'gradient_checkpointing': args.gradient_checkpointing,
         })
     elif model_version == '16.0':
