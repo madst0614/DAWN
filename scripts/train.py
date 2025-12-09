@@ -630,9 +630,9 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         lines.append(f"             EMA V:[{ema_val.min().item():.4f},{ema_val.mean().item():.4f},{ema_val.max().item():.4f}] K:[{ema_k.min().item():.4f},{ema_k.mean().item():.4f},{ema_k.max().item():.4f}]")
         lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f}")
 
-    # v16: Split Feature QK/V with Excitability
-    elif hasattr(router, 'usage_ema_feature_qk'):
-        ema_QK = router.usage_ema_feature_qk
+    # v16: Split Feature R/V with Excitability
+    elif hasattr(router, 'usage_ema_feature_r'):
+        ema_QK = router.usage_ema_feature_r
         ema_V = router.usage_ema_feature_v
         ema_R = router.usage_ema_relational
         ema_Val = router.usage_ema_value
@@ -800,12 +800,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 base_model = get_underlying_model(model)
 
                 # Check if v13.2+ (needs routing_info for usage logging)
-                # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_qk, v17: n_relational_q
+                # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_r, v17: n_relational_q
                 is_v13_2_plus = (hasattr(base_model, 'global_routers') and
                            hasattr(base_model.global_routers, 'neuron_router') and
                            (hasattr(base_model.global_routers.neuron_router, 'usage_ema_compress') or
                             hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature') or
-                            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_qk') or
+                            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r') or
                             hasattr(base_model.global_routers.neuron_router, 'n_relational_q')))
 
                 # v10: DAWN model forward
@@ -862,12 +862,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             base_model = get_underlying_model(model)
 
             # Check if v13.2+ (needs routing_info for usage logging)
-            # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_qk, v17: n_relational_q
+            # v13.2: usage_ema_compress, v14/v15: usage_ema_feature, v16: usage_ema_feature_r, v17: n_relational_q
             is_v13_2_plus = (hasattr(base_model, 'global_routers') and
                        hasattr(base_model.global_routers, 'neuron_router') and
                        (hasattr(base_model.global_routers.neuron_router, 'usage_ema_compress') or
                         hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature') or
-                        hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_qk') or
+                        hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r') or
                         hasattr(base_model.global_routers.neuron_router, 'n_relational_q')))
 
             # v10: DAWN model forward
@@ -980,9 +980,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # v17: feature_qk_pref (FR), feature_v_pref (FV) - shared feature pool, separate routing
-                    if attn.get('feature_qk_pref') is not None:
-                        pref_FR = attn.get('feature_qk_pref')
+                    # v17: feature_r_pref (FR), feature_v_pref (FV) - shared feature pool, separate routing
+                    if attn.get('feature_r_pref') is not None:
+                        pref_FR = attn.get('feature_r_pref')
                         pref_FV = attn.get('feature_v_pref')
                         pref_RQ = attn.get('relational_q_pref')
                         pref_RK = attn.get('relational_k_pref')
@@ -1004,7 +1004,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         var_str = f"TokVar:{var_FR:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
 
                     # v14/v15/v16: FRVK (Feature/Relational/Value/Knowledge)
-                    # v16 also has feature_pref (= feature_qk_pref) for v15 compat
+                    # v16 also has feature_pref (= feature_r_pref) for v15 compat
                     elif attn.get('feature_pref') is not None:
                         pref_F = attn.get('feature_pref')
                         pref_RQ = attn.get('relational_pref_Q')
@@ -1125,7 +1125,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                     # Warning if collapse detected (check min entropy across router types)
                     # v17: FR/FV/RQ/RK/V, v14/v15/v16: F/RQ/RK/V, v13: C/Q/K/V
-                    if attn.get('feature_qk_pref') is not None:
+                    if attn.get('feature_r_pref') is not None:
                         min_ent = min(ent_FR, ent_FV, ent_RQ, ent_RK, ent_V)
                     elif attn.get('feature_pref') is not None:
                         min_ent = min(ent_F, ent_RQ, ent_RK, ent_V)
@@ -1536,10 +1536,10 @@ def main():
     args.n_feature = cfg['model'].get('n_feature', 768)
     args.top_k_feature = cfg['model'].get('top_k_feature', 64)
 
-    # v16.0 Split Feature QK/V parameters (uses single rank from basis_rank)
-    args.n_feature_qk = cfg['model'].get('n_feature_qk', 512)
+    # v16.0 Split Feature R/V parameters (uses single rank from basis_rank)
+    args.n_feature_r = cfg['model'].get('n_feature_r', 512)
     args.n_feature_v = cfg['model'].get('n_feature_v', 256)
-    args.top_k_feature_qk = cfg['model'].get('top_k_feature_qk', 8)
+    args.top_k_feature_r = cfg['model'].get('top_k_feature_r', 8)
     args.top_k_feature_v = cfg['model'].get('top_k_feature_v', 8)
 
     # v9.0 Compress/Expand/Reflection parameters
@@ -1801,18 +1801,18 @@ def main():
             print(f"  Value: {n_value} × {args.d_model}")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
         elif model_version == "16.0":
-            # v16.0: Split Feature QK/V (rank matrix, v15-based)
+            # v16.0: Split Feature R/V (rank matrix)
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
-            n_feature_qk = getattr(args, 'n_feature_qk', 512)
+            n_feature_r = getattr(args, 'n_feature_r', 512)
             n_feature_v = getattr(args, 'n_feature_v', 256)
             n_relational = getattr(args, 'n_relational', 160)
             n_value = getattr(args, 'n_value', 12)
             n_knowledge = getattr(args, 'n_knowledge', 256)
             coarse_k = getattr(args, 'coarse_k', 20)
             fine_k = getattr(args, 'fine_k', 10)
-            print(f"DAWN v{model_version}: Split Feature QK/V (rank matrix)")
-            print(f"  Feature QK/V: {n_feature_qk}/{n_feature_v}")
+            print(f"DAWN v{model_version}: Split Feature R/V (rank matrix)")
+            print(f"  Feature R/V: {n_feature_r}/{n_feature_v}")
             print(f"  Relational/Value: {n_relational}/{n_value}")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
             print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
@@ -2066,9 +2066,9 @@ def main():
             'gradient_checkpointing': args.gradient_checkpointing,
         })
     elif model_version == '16.0':
-        # v16.0: Split Feature QK/V (rank matrix, v15-based)
+        # v16.0: Split Feature R/V (rank matrix)
         model_kwargs.update({
-            'n_feature_qk': getattr(args, 'n_feature_qk', 512),
+            'n_feature_r': getattr(args, 'n_feature_r', 512),
             'n_feature_v': getattr(args, 'n_feature_v', 256),
             'n_relational': getattr(args, 'n_relational', 160),
             'n_value': getattr(args, 'n_value', 12),
@@ -2078,7 +2078,7 @@ def main():
             'knowledge_rank': args.knowledge_rank or 128,
             'rank': args.basis_rank,  # single rank for all matrices
             'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature_qk': getattr(args, 'top_k_feature_qk', 8),
+            'top_k_feature_r': getattr(args, 'top_k_feature_r', 8),
             'top_k_feature_v': getattr(args, 'top_k_feature_v', 8),
             'top_k_relational': getattr(args, 'top_k_relational', 4),
             'top_k_value': getattr(args, 'top_k_value', 6),

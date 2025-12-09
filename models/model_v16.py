@@ -2,7 +2,7 @@
 DAWN v16: Split Feature QK/V
 
 v15 기반 + Feature 뉴런 분리:
-- Feature_QK: [n_feature_qk, d_model, rank] → Q, K compression
+- Feature_R: [n_feature_r, d_model, rank] → Q, K compression
 - Feature_V: [n_feature_v, d_model, rank] → V compression (새로 추가)
 
 이론적 근거:
@@ -11,7 +11,7 @@ v15 기반 + Feature 뉴런 분리:
 - 이 둘이 같은 compression을 써야 할 이유가 없음
 
 Architecture (Split-FRVK v16):
-- Feature_QK: x → low-rank projection → h_qk [Q, K compression]
+- Feature_R: x → low-rank projection → h_qk [Q, K compression]
 - Feature_V: x → low-rank projection → h_v [V compression]
 - Relational: Q/K generation from h_qk
 - Value: V generation from h_v
@@ -37,27 +37,27 @@ class UnifiedNeuronRouter(nn.Module):
     """
     v16: Split Feature QK/V routing
 
-    모든 뉴런(feature_qk, feature_v, relational, value, knowledge)이 같은 공간에 존재.
+    모든 뉴런(feature_r, feature_v, relational, value, knowledge)이 같은 공간에 존재.
     Feature가 QK용과 V용으로 분리됨.
     """
-    def __init__(self, d_model, n_feature_qk, n_feature_v, n_relational, n_value, n_knowledge,
+    def __init__(self, d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
                  d_space=64, dropout=0.1):
         super().__init__()
-        self.n_feature_qk = n_feature_qk
+        self.n_feature_r = n_feature_r
         self.n_feature_v = n_feature_v
         self.n_relational = n_relational
         self.n_value = n_value
         self.n_knowledge = n_knowledge
         self.d_space = d_space
 
-        total_neurons = n_feature_qk + n_feature_v + n_relational + n_value + n_knowledge
+        total_neurons = n_feature_r + n_feature_v + n_relational + n_value + n_knowledge
         self.total_neurons = total_neurons
 
         # 인덱스 경계
-        self.feature_qk_end = n_feature_qk
-        self.feature_v_end = n_feature_qk + n_feature_v
-        self.relational_end = n_feature_qk + n_feature_v + n_relational
-        self.value_end = n_feature_qk + n_feature_v + n_relational + n_value
+        self.feature_r_end = n_feature_r
+        self.feature_v_end = n_feature_r + n_feature_v
+        self.relational_end = n_feature_r + n_feature_v + n_relational
+        self.value_end = n_feature_r + n_feature_v + n_relational + n_value
         # knowledge는 value_end ~ total_neurons
 
         # 공유 projection
@@ -68,7 +68,7 @@ class UnifiedNeuronRouter(nn.Module):
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
         # 타입별 usage 추적
-        self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
+        self.register_buffer('usage_ema_feature_r', torch.zeros(n_feature_r))
         self.register_buffer('usage_ema_feature_v', torch.zeros(n_feature_v))
         self.register_buffer('usage_ema_relational', torch.zeros(n_relational))
         self.register_buffer('usage_ema_value', torch.zeros(n_value))
@@ -89,7 +89,7 @@ class UnifiedNeuronRouter(nn.Module):
     def get_logits(self, x, neuron_type):
         """
         x: [B, S, d_model]
-        neuron_type: 'feature_qk', 'feature_v', 'relational_Q', 'relational_K', 'value', 'knowledge'
+        neuron_type: 'feature_r', 'feature_v', 'relational_Q', 'relational_K', 'value', 'knowledge'
         """
         h_proj = self.proj(x)  # [B, S, d_space]
         h_proj = self.dropout(h_proj)
@@ -97,14 +97,14 @@ class UnifiedNeuronRouter(nn.Module):
         neuron_emb_norm = F.normalize(self.neuron_emb, dim=-1)
         all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
 
-        if neuron_type == 'feature_qk':
-            logits = all_logits[..., :self.feature_qk_end]
+        if neuron_type == 'feature_r':
+            logits = all_logits[..., :self.feature_r_end]
             if self.training:
-                excitability = self.get_excitability(self.usage_ema_feature_qk)
+                excitability = self.get_excitability(self.usage_ema_feature_r)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'feature_v':
-            logits = all_logits[..., self.feature_qk_end:self.feature_v_end]
+            logits = all_logits[..., self.feature_r_end:self.feature_v_end]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_feature_v)
                 logits = logits + excitability * self.excitability_weight
@@ -146,8 +146,8 @@ class UnifiedNeuronRouter(nn.Module):
         else:
             usage = (weights > 0).float().mean(dim=0)
 
-        if neuron_type == 'feature_qk':
-            self.usage_ema_feature_qk = 0.99 * self.usage_ema_feature_qk + 0.01 * usage
+        if neuron_type == 'feature_r':
+            self.usage_ema_feature_r = 0.99 * self.usage_ema_feature_r + 0.01 * usage
         elif neuron_type == 'feature_v':
             self.usage_ema_feature_v = 0.99 * self.usage_ema_feature_v + 0.01 * usage
         elif neuron_type == 'relational':
@@ -162,7 +162,7 @@ class SharedNeurons(nn.Module):
     """
     v16: Split Feature QK/V neurons (rank matrix)
 
-    Feature_QK: [n_feature_qk, d_model, rank] - Q/K compression
+    Feature_R: [n_feature_r, d_model, rank] - Q/K compression
     Feature_V: [n_feature_v, d_model, rank] - V compression
     Relational: [n_relational, rank, d_model] - Q/K expansion
     Value: [n_value, rank, d_model] - V expansion
@@ -172,7 +172,7 @@ class SharedNeurons(nn.Module):
         self,
         d_model: int,
         rank: int,
-        n_feature_qk: int,
+        n_feature_r: int,
         n_feature_v: int,
         n_relational: int,
         n_value: int,
@@ -183,14 +183,14 @@ class SharedNeurons(nn.Module):
         self.d_model = d_model
         self.rank = rank
         self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
-        self.n_feature_qk = n_feature_qk
+        self.n_feature_r = n_feature_r
         self.n_feature_v = n_feature_v
         self.n_relational = n_relational
         self.n_value = n_value
         self.n_knowledge = n_knowledge
 
         # Split Feature pools (rank matrix)
-        self.feature_qk_neurons = nn.Parameter(torch.zeros(n_feature_qk, d_model, rank))
+        self.feature_r_neurons = nn.Parameter(torch.zeros(n_feature_r, d_model, rank))
         self.feature_v_neurons = nn.Parameter(torch.zeros(n_feature_v, d_model, rank))
 
         # Expand pools (rank matrix)
@@ -204,8 +204,8 @@ class SharedNeurons(nn.Module):
         self._init_parameters()
 
     def _init_parameters(self):
-        for i in range(self.n_feature_qk):
-            nn.init.orthogonal_(self.feature_qk_neurons.data[i])
+        for i in range(self.n_feature_r):
+            nn.init.orthogonal_(self.feature_r_neurons.data[i])
         for i in range(self.n_feature_v):
             nn.init.orthogonal_(self.feature_v_neurons.data[i])
         for i in range(self.n_relational):
@@ -318,31 +318,31 @@ class GlobalRouters(nn.Module):
     """
     v16: Split Feature QK/V routing
 
-    - feature_qk: [B, S, n_feature_qk] → Q/K compression
+    - feature_r: [B, S, n_feature_r] → Q/K compression
     - feature_v: [B, S, n_feature_v] → V compression
     - relational Q/K: Q/K expansion
     - value: V expansion
     """
-    def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
+    def __init__(self, d_model: int, n_feature_r: int, n_feature_v: int,
                  n_relational: int, n_value: int, n_knowledge: int,
-                 top_k_feature_qk: int = 8, top_k_feature_v: int = 8,
+                 top_k_feature_r: int = 8, top_k_feature_v: int = 8,
                  top_k_relational: int = 4, top_k_value: int = 6,
                  d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False):
         super().__init__()
         self.d_model = d_model
-        self.n_feature_qk = n_feature_qk
+        self.n_feature_r = n_feature_r
         self.n_feature_v = n_feature_v
         self.n_relational = n_relational
         self.n_value = n_value
         self.n_knowledge = n_knowledge
-        self.top_k_feature_qk = top_k_feature_qk
+        self.top_k_feature_r = top_k_feature_r
         self.top_k_feature_v = top_k_feature_v
         self.top_k_relational = top_k_relational
         self.top_k_value = top_k_value
         self.token_routing = token_routing
 
         self.neuron_router = UnifiedNeuronRouter(
-            d_model, n_feature_qk, n_feature_v, n_relational, n_value, n_knowledge,
+            d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
             d_space=d_space, dropout=router_dropout
         )
 
@@ -355,16 +355,16 @@ class GlobalRouters(nn.Module):
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         """
-        Returns: feature_qk_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
+        Returns: feature_r_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
         """
         # Get logits from unified router
-        feature_qk_logits = self.neuron_router.get_logits(x, 'feature_qk')
+        feature_r_logits = self.neuron_router.get_logits(x, 'feature_r')
         feature_v_logits = self.neuron_router.get_logits(x, 'feature_v')
         relational_logits_Q = self.neuron_router.get_logits(x, 'relational_Q')
         relational_logits_K = self.neuron_router.get_logits(x, 'relational_K')
         value_logits = self.neuron_router.get_logits(x, 'value')
 
-        feature_qk_pref = F.softmax(feature_qk_logits, dim=-1)
+        feature_r_pref = F.softmax(feature_r_logits, dim=-1)
         feature_v_pref = F.softmax(feature_v_logits, dim=-1)
         relational_pref_Q = F.softmax(relational_logits_Q, dim=-1)
         relational_pref_K = F.softmax(relational_logits_K, dim=-1)
@@ -376,20 +376,20 @@ class GlobalRouters(nn.Module):
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(-1).float()
                 count = mask.sum() + 1e-8
-                usage_FQK = (feature_qk_pref * mask).sum(dim=(0, 1)) / count
+                usage_FQK = (feature_r_pref * mask).sum(dim=(0, 1)) / count
                 usage_FV = (feature_v_pref * mask).sum(dim=(0, 1)) / count
                 usage_Q = (relational_pref_Q * mask).sum(dim=(0, 1)) / count
                 usage_K = (relational_pref_K * mask).sum(dim=(0, 1)) / count
                 usage_V = (value_pref * mask).sum(dim=(0, 1)) / count
             else:
-                usage_FQK = feature_qk_pref.mean(dim=(0, 1))
+                usage_FQK = feature_r_pref.mean(dim=(0, 1))
                 usage_FV = feature_v_pref.mean(dim=(0, 1))
                 usage_Q = relational_pref_Q.mean(dim=(0, 1))
                 usage_K = relational_pref_K.mean(dim=(0, 1))
                 usage_V = value_pref.mean(dim=(0, 1))
 
-            target_FQK = 1.0 / self.n_feature_qk
-            aux_loss = aux_loss + ((usage_FQK - target_FQK) ** 2).sum() * self.n_feature_qk
+            target_FQK = 1.0 / self.n_feature_r
+            aux_loss = aux_loss + ((usage_FQK - target_FQK) ** 2).sum() * self.n_feature_r
 
             target_FV = 1.0 / self.n_feature_v
             aux_loss = aux_loss + ((usage_FV - target_FV) ** 2).sum() * self.n_feature_v
@@ -402,14 +402,14 @@ class GlobalRouters(nn.Module):
             aux_loss = aux_loss + ((usage_V - target_V) ** 2).sum() * self.n_value
 
         if self.token_routing:
-            feature_qk_weights = feature_qk_pref
+            feature_r_weights = feature_r_pref
             feature_v_weights = feature_v_pref
             relational_weights_Q = relational_pref_Q
             relational_weights_K = relational_pref_K
             value_weights = value_pref
 
             routing_info = {
-                'feature_qk_weights': feature_qk_weights.detach(),
+                'feature_r_weights': feature_r_weights.detach(),
                 'feature_v_weights': feature_v_weights.detach(),
                 'relational_weights_Q': relational_weights_Q.detach(),
                 'relational_weights_K': relational_weights_K.detach(),
@@ -418,29 +418,29 @@ class GlobalRouters(nn.Module):
             }
         else:
             # Batch-level routing
-            feature_qk_weights_dense = torch.einsum('bs,bsn->bn', importance, feature_qk_pref)
+            feature_r_weights_dense = torch.einsum('bs,bsn->bn', importance, feature_r_pref)
             feature_v_weights_dense = torch.einsum('bs,bsn->bn', importance, feature_v_pref)
             relational_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_Q)
             relational_weights_K_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_K)
             value_weights_dense = torch.einsum('bs,bsn->bn', importance, value_pref)
 
-            feature_qk_weights, _ = self._topk_sparsify(feature_qk_weights_dense, self.top_k_feature_qk)
+            feature_r_weights, _ = self._topk_sparsify(feature_r_weights_dense, self.top_k_feature_r)
             feature_v_weights, _ = self._topk_sparsify(feature_v_weights_dense, self.top_k_feature_v)
             relational_weights_Q, _ = self._topk_sparsify(relational_weights_Q_dense, self.top_k_relational)
             relational_weights_K, _ = self._topk_sparsify(relational_weights_K_dense, self.top_k_relational)
             value_weights, _ = self._topk_sparsify(value_weights_dense, self.top_k_value)
 
             routing_info = {
-                'feature_qk_weights': feature_qk_weights.detach(),
+                'feature_r_weights': feature_r_weights.detach(),
                 'feature_v_weights': feature_v_weights.detach(),
                 'relational_weights_Q': relational_weights_Q.detach(),
                 'relational_weights_K': relational_weights_K.detach(),
                 'value_weights': value_weights.detach(),
                 # v16: split feature prefs
-                'feature_qk_pref': feature_qk_pref.detach(),
+                'feature_r_pref': feature_r_pref.detach(),
                 'feature_v_pref': feature_v_pref.detach(),
-                # v15 compat: use feature_qk as feature_pref for logging
-                'feature_pref': feature_qk_pref.detach(),
+                # v15 compat: use feature_r as feature_pref for logging
+                'feature_pref': feature_r_pref.detach(),
                 'relational_pref_Q': relational_pref_Q.detach(),
                 'relational_pref_K': relational_pref_K.detach(),
                 'value_pref': value_pref.detach(),
@@ -449,13 +449,13 @@ class GlobalRouters(nn.Module):
 
         # Update usage statistics
         if self.training:
-            self.neuron_router.update_usage(feature_qk_weights, 'feature_qk', attention_mask)
+            self.neuron_router.update_usage(feature_r_weights, 'feature_r', attention_mask)
             self.neuron_router.update_usage(feature_v_weights, 'feature_v', attention_mask)
             self.neuron_router.update_usage(value_weights, 'value', attention_mask)
             relational_used = ((relational_weights_Q > 0) | (relational_weights_K > 0)).float()
             self.neuron_router.update_usage(relational_used, 'relational', attention_mask)
 
-        return feature_qk_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
+        return feature_r_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
 
 
 class NeuronCircuit(nn.Module):
@@ -463,7 +463,7 @@ class NeuronCircuit(nn.Module):
     v16: Attention circuit with Split Feature QK/V
 
     Flow:
-    1. x → feature_qk_neurons → h_qk [Q/K compression]
+    1. x → feature_r_neurons → h_qk [Q/K compression]
     2. x → feature_v_neurons → h_v [V compression]
     3. h_qk → relational_Q → Q
     4. h_qk → relational_K → K
@@ -489,27 +489,27 @@ class NeuronCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, feature_qk_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, attention_mask=None):
+    def forward(self, x, feature_r_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, attention_mask=None):
         """
         Args:
             x: [B, S, D]
-            feature_qk_weights: [B, N_FQK] - Q/K compression weights
+            feature_r_weights: [B, N_FR] - Q/K compression weights
             feature_v_weights: [B, N_FV] - V compression weights
             relational_weights_Q: [B, N_R] - Q expansion weights
             relational_weights_K: [B, N_R] - K expansion weights
             value_weights: [B, N_V] - V expansion weights
         """
         B, S, D = x.shape
-        token_routing = feature_qk_weights.dim() == 3
+        token_routing = feature_r_weights.dim() == 3
 
         if token_routing:
             # Token-level routing
-            shared_feature_qk = torch.einsum('bsn,ndr->bsdr', feature_qk_weights,
-                                              self.shared_neurons.feature_qk_neurons)
+            shared_feature_r = torch.einsum('bsn,ndr->bsdr', feature_r_weights,
+                                              self.shared_neurons.feature_r_neurons)
             shared_feature_v = torch.einsum('bsn,ndr->bsdr', feature_v_weights,
                                              self.shared_neurons.feature_v_neurons)
 
-            h_qk = torch.einsum('bsd,bsdr->bsr', x, shared_feature_qk)
+            h_qk = torch.einsum('bsd,bsdr->bsr', x, shared_feature_r)
             h_v = torch.einsum('bsd,bsdr->bsr', x, shared_feature_v)
 
             pool_R = self.shared_neurons.relational_neurons
@@ -523,12 +523,12 @@ class NeuronCircuit(nn.Module):
             V = torch.einsum('bsr,bsrd->bsd', h_v, shared_value)
         else:
             # Batch-level routing
-            shared_feature_qk = torch.einsum('bn,ndr->bdr', feature_qk_weights,
-                                              self.shared_neurons.feature_qk_neurons)
+            shared_feature_r = torch.einsum('bn,ndr->bdr', feature_r_weights,
+                                              self.shared_neurons.feature_r_neurons)
             shared_feature_v = torch.einsum('bn,ndr->bdr', feature_v_weights,
                                              self.shared_neurons.feature_v_neurons)
 
-            h_qk = torch.einsum('bsd,bdr->bsr', x, shared_feature_qk)
+            h_qk = torch.einsum('bsd,bdr->bsr', x, shared_feature_r)
             h_v = torch.einsum('bsd,bdr->bsr', x, shared_feature_v)
 
             pool_R = self.shared_neurons.relational_neurons
@@ -663,10 +663,10 @@ class DAWNBlock(nn.Module):
 
     def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder, attention_mask=None):
         normed_x = self.norm1(x)
-        feature_qk_w, feature_v_w, relational_Q, relational_K, value_w, attn_routing, attn_aux_loss = \
+        feature_r_w, feature_v_w, relational_Q, relational_K, value_w, attn_routing, attn_aux_loss = \
             global_routers.get_attention_weights(normed_x, importance, attention_mask)
 
-        attn_out, _ = self.attn(normed_x, feature_qk_w, feature_v_w, relational_Q, relational_K, value_w, attention_mask)
+        attn_out, _ = self.attn(normed_x, feature_r_w, feature_v_w, relational_Q, relational_K, value_w, attention_mask)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
@@ -691,11 +691,11 @@ class DAWN(nn.Module):
     DAWN v16: Split Feature QK/V
 
     v15 기반 + Feature 뉴런 분리:
-    - Feature_QK: Q/K compression (rank matrix)
+    - Feature_R: Q/K compression (rank matrix)
     - Feature_V: V compression (rank matrix)
 
     Architecture:
-    - Feature_QK: [n_feature_qk, d_model, rank] - Q/K 압축
+    - Feature_R: [n_feature_r, d_model, rank] - Q/K 압축
     - Feature_V: [n_feature_v, d_model, rank] - V 압축
     - Relational: [n_relational, rank, d_model] - Q/K expansion
     - Value: [n_value, rank, d_model] - V expansion
@@ -712,9 +712,9 @@ class DAWN(nn.Module):
         rank: int = 64,
         max_seq_len: int = 128,
         # Split Feature
-        n_feature_qk: int = 36,
+        n_feature_r: int = 36,
         n_feature_v: int = 36,
-        top_k_feature_qk: int = 8,
+        top_k_feature_r: int = 8,
         top_k_feature_v: int = 8,
         # Expansion
         n_relational: int = 12,
@@ -753,9 +753,9 @@ class DAWN(nn.Module):
         self.use_ssm_context = use_ssm_context
 
         # Split Feature
-        self.n_feature_qk = n_feature_qk
+        self.n_feature_r = n_feature_r
         self.n_feature_v = n_feature_v
-        self.top_k_feature_qk = top_k_feature_qk
+        self.top_k_feature_r = top_k_feature_r
         self.top_k_feature_v = top_k_feature_v
 
         # Expansion
@@ -770,8 +770,8 @@ class DAWN(nn.Module):
         self.fine_k = fine_k
 
         # v15 compat
-        self.n_feature = n_feature_qk
-        self.n_neurons = n_feature_qk
+        self.n_feature = n_feature_r
+        self.n_neurons = n_feature_r
         self.basis_rank = rank
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -779,7 +779,7 @@ class DAWN(nn.Module):
 
         self.shared_neurons = SharedNeurons(
             d_model=d_model, rank=rank,
-            n_feature_qk=n_feature_qk, n_feature_v=n_feature_v,
+            n_feature_r=n_feature_r, n_feature_v=n_feature_v,
             n_relational=n_relational, n_value=n_value,
             n_knowledge=n_knowledge, knowledge_rank=self.knowledge_rank,
         )
@@ -787,8 +787,8 @@ class DAWN(nn.Module):
         self.global_ssm = GlobalSSM(d_model, state_dim, return_context=use_ssm_context)
 
         self.global_routers = GlobalRouters(
-            d_model, n_feature_qk, n_feature_v, n_relational, n_value, n_knowledge,
-            top_k_feature_qk, top_k_feature_v, top_k_relational, top_k_value,
+            d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
+            top_k_feature_r, top_k_feature_v, top_k_relational, top_k_value,
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing
         )
 
@@ -871,7 +871,7 @@ class DAWN(nn.Module):
         return logits
 
     def orthogonality_loss(self):
-        W_fqk = self.shared_neurons.feature_qk_neurons
+        W_fqk = self.shared_neurons.feature_r_neurons
         WtW_fqk = torch.bmm(W_fqk.transpose(1, 2), W_fqk)
         I = torch.eye(self.rank, device=W_fqk.device).unsqueeze(0)
         loss_fqk = ((WtW_fqk - I) ** 2).mean()
@@ -907,7 +907,7 @@ class DAWN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def count_by_component(self):
-        feature_qk = self.shared_neurons.feature_qk_neurons.numel()
+        feature_r = self.shared_neurons.feature_r_neurons.numel()
         feature_v = self.shared_neurons.feature_v_neurons.numel()
         relational = self.shared_neurons.relational_neurons.numel()
         value = self.shared_neurons.value_neurons.numel()
@@ -929,7 +929,7 @@ class DAWN(nn.Module):
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
         print(f"=== DAWN v16 Parameter Breakdown (Split Feature QK/V) ===")
-        print(f"Feature_QK Neurons:    {feature_qk:,} ({feature_qk/1e6:.2f}M) [{self.n_feature_qk} × {self.d_model} × {self.rank}]")
+        print(f"Feature_R Neurons:    {feature_r:,} ({feature_r/1e6:.2f}M) [{self.n_feature_r} × {self.d_model} × {self.rank}]")
         print(f"Feature_V Neurons:     {feature_v:,} ({feature_v/1e6:.2f}M) [{self.n_feature_v} × {self.d_model} × {self.rank}]")
         print(f"Relational Neurons:    {relational:,} ({relational/1e6:.2f}M) [{self.n_relational} × {self.rank} × {self.d_model}]")
         print(f"Value Neurons:         {value:,} ({value/1e6:.2f}M) [{self.n_value} × {self.rank} × {self.d_model}]")
@@ -940,7 +940,7 @@ class DAWN(nn.Module):
         print(f"Unified Router:        {routers:,} ({routers/1e3:.1f}K) [d_space={self.d_space}]")
         print(f"LayerNorms:            {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
-        print(f"Top-k Feature_QK: {self.top_k_feature_qk}/{self.n_feature_qk}")
+        print(f"Top-k Feature_R: {self.top_k_feature_r}/{self.n_feature_r}")
         print(f"Top-k Feature_V:  {self.top_k_feature_v}/{self.n_feature_v}")
         print(f"Top-k Relational: {self.top_k_relational}/{self.n_relational}")
         print(f"Top-k Value:      {self.top_k_value}/{self.n_value}")
@@ -949,7 +949,7 @@ class DAWN(nn.Module):
         print(f"Total:                 {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 
         return {
-            'feature_qk': feature_qk, 'feature_v': feature_v,
+            'feature_r': feature_r, 'feature_v': feature_v,
             'relational': relational, 'value': value,
             'expand_o': expand_o, 'knowledge': knowledge,
             'embeddings': embed, 'ssm': ssm_total,
@@ -963,8 +963,8 @@ class DAWN(nn.Module):
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'rank': self.rank, 'knowledge_rank': self.knowledge_rank,
             'max_seq_len': self.max_seq_len,
-            'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
-            'top_k_feature_qk': self.top_k_feature_qk, 'top_k_feature_v': self.top_k_feature_v,
+            'n_feature_r': self.n_feature_r, 'n_feature_v': self.n_feature_v,
+            'top_k_feature_r': self.top_k_feature_r, 'top_k_feature_v': self.top_k_feature_v,
             'n_relational': self.n_relational, 'n_value': self.n_value,
             'top_k_relational': self.top_k_relational, 'top_k_value': self.top_k_value,
             'n_knowledge': self.n_knowledge,
@@ -980,7 +980,7 @@ class DAWN(nn.Module):
         return [
             f"DAWN v{self.__version__}: Split Feature QK/V",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_qk})",
+            f"  Feature_R: {self.n_feature_r} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_r})",
             f"  Feature_V:  {self.n_feature_v} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_v})",
             f"  Relational: {self.n_relational} × {self.rank} × {self.d_model} (top-k={self.top_k_relational})",
             f"  Value:      {self.n_value} × {self.rank} × {self.d_model} (top-k={self.top_k_value})",

@@ -7,7 +7,7 @@ v13.1: Separate QK/V Expand Pools (Q/K share, V separate)
 v13.2: Unified Neuron Router (all neurons in same embedding space)
 v14.0: FRVK Architecture (Feature-Relational-Value-Knowledge) with SAR
 v15.0: 2-Stage Hierarchical Knowledge Retrieval (x→router→coarse, x→proj_q→fine)
-v16.0: Split Feature QK/V (rank matrix, v15-based) - Feature_QK/V separate compression
+v16.0: Split Feature R/V (rank matrix, v15-based) - Feature_R/V separate compression
 v17.0: Full Vector Neurons + Full Soft Selection (vector-based, train & inference both use soft)
 
 To add a new version:
@@ -232,13 +232,13 @@ VERSION_REGISTRY = {
         "module": "model_v16",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_feature_qk", "n_feature_v", "n_relational", "n_value", "n_knowledge",
+            "n_feature_r", "n_feature_v", "n_relational", "n_value", "n_knowledge",
             "rank",  # single rank for all matrices
         ],
         "optional_params": {
             "dropout": 0.1,
             "state_dim": 64,
-            "top_k_feature_qk": 8,
+            "top_k_feature_r": 8,
             "top_k_feature_v": 8,
             "top_k_relational": 4,
             "top_k_value": 6,
@@ -249,9 +249,9 @@ VERSION_REGISTRY = {
             "gradient_checkpointing": False,
         },
         "display_info": lambda args: [
-            f"DAWN v16: Split Feature QK/V (rank matrix)",
+            f"DAWN v16: Split Feature R/V (rank matrix)",
             f"  rank={args.get('rank', args.get('basis_rank'))}",
-            f"  Feature_QK: {args.get('n_feature_qk')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (top-k={args.get('top_k_feature_qk', 8)})",
+            f"  Feature_R: {args.get('n_feature_r')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (top-k={args.get('top_k_feature_r', 8)})",
             f"  Feature_V: {args.get('n_feature_v')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (top-k={args.get('top_k_feature_v', 8)})",
             f"  Relational: {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K expansion, top-k={args.get('top_k_relational', 4)})",
             f"  Value: {args.get('n_value')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (V expansion, top-k={args.get('top_k_value', 6)})",

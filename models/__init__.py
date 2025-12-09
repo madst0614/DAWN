@@ -32,16 +32,16 @@ v15.0: Direct Knowledge Projection
 - x → proj_k → Q (direct 128-dim projection)
 - Simpler memory access, independent of router
 
-v16.0: Split Feature QK/V Vector Neurons
-- Feature neurons split into QK and V pools
-- Each neuron = single axis vector (n_feature_qk × d_model)
+v16.0: Split Feature R/V Vector Neurons
+- Feature neurons split into R (QK compression) and V pools
+- Each neuron = single axis vector (n_feature_r × d_model)
 - expand_Q/K/V linear layers for reconstruction
 - 41% parameter reduction from v15
 
 v17.0: Full Vector Neurons
 - ALL neurons are vectors (no rank matrices)
-- 5 separate routing: feature_qk, feature_v, relational_q, relational_k, value
-- Excitability completely removed
+- 5 separate routing: feature_r, feature_v, relational_q, relational_k, value
+- Full soft selection (train & inference)
 - 82% parameter reduction from v15
 
 baseline: Vanilla Transformer for fair comparison
@@ -65,7 +65,7 @@ from .model_v14 import DAWN as DAWN_v14
 # v15.0 - Direct Knowledge Projection
 from .model_v15 import DAWN as DAWN_v15
 
-# v16.0 - Split Feature QK/V Vector Neurons
+# v16.0 - Split Feature R/V Vector Neurons
 from .model_v16 import DAWN as DAWN_v16
 
 # v17.0 - Full Vector Neurons with Excitability

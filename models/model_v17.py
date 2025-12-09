@@ -14,7 +14,7 @@ Core Changes from v16:
 - Temperature parameter for controlling selection sharpness
 
 Architecture (FRV v17):
-- Feature QK: x → soft selection → h_qk (shared pool, QK routing)
+- Feature R: x → soft selection → h_qk (shared pool, QK routing)
 - Feature V:  x → soft selection → h_v (shared pool, V routing)
 - Relational Q: h_qk @ soft-weighted neurons → Q (shared pool, Q routing)
 - Relational K: h_qk @ soft-weighted neurons → K (shared pool, K routing)
@@ -163,17 +163,17 @@ class UnifiedNeuronRouter(nn.Module):
     def get_logits(self, x, neuron_type):
         """
         x: [B, S, d_model] or [B, S, rank] for expansion types
-        neuron_type: 'feature_qk', 'feature_v', 'relational_q', 'relational_k', 'value', 'knowledge'
+        neuron_type: 'feature_r', 'feature_v', 'relational_q', 'relational_k', 'value', 'knowledge'
 
         Shared pools with separate routing heads:
-        - feature_qk and feature_v: SHARED feature pool, SEPARATE routing heads
+        - feature_r and feature_v: SHARED feature pool, SEPARATE routing heads
         - relational_q and relational_k: SHARED relational pool, SEPARATE routing heads
         """
         h_proj = self.proj(x)  # [B, S, d_space]
         h_proj = self.dropout(h_proj)
 
         # Type-specific slicing + Excitability
-        if neuron_type == 'feature_qk':
+        if neuron_type == 'feature_r':
             # QK routing: uses unified neuron_emb for feature section
             neuron_emb_norm = F.normalize(self.neuron_emb[:self.feature_end], dim=-1)
             logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
@@ -384,7 +384,7 @@ class GlobalRouters(nn.Module):
     - Inference: top-k hard selection (sparse, efficient)
 
     Routes:
-    - feature_qk: [B, n_feature] soft weights OR [B, top_k] indices (SHARED pool, QK routing)
+    - feature_r: [B, n_feature] soft weights OR [B, top_k] indices (SHARED pool, QK routing)
     - feature_v: [B, n_feature] soft weights OR [B, top_k] indices (SHARED pool, V routing)
     - relational: [B, n_relational] soft weights OR [B, top_k] indices (SHARED pool, Q/K routing)
     - value: [B, n_value] soft weights OR [B, top_k] indices
@@ -426,7 +426,7 @@ class GlobalRouters(nn.Module):
             aux_loss: scalar
         """
         # Feature QK routing (shared pool, QK routing head)
-        logits_qk = self.neuron_router.get_logits(x, 'feature_qk')  # [B, S, n_feature]
+        logits_qk = self.neuron_router.get_logits(x, 'feature_r')  # [B, S, n_feature]
         pref_qk = F.softmax(logits_qk, dim=-1)
         weights_qk = torch.einsum('bs,bsn->bn', importance, pref_qk)  # [B, n_feature]
 
@@ -507,7 +507,7 @@ class GlobalRouters(nn.Module):
 
         routing_info = {
             'mode': 'soft',
-            'feature_qk_pref': pref_qk.detach(),
+            'feature_r_pref': pref_qk.detach(),
             'feature_v_pref': pref_v.detach(),
             'relational_q_pref': pref_rel_q.detach(),
             'relational_k_pref': pref_rel_k.detach(),

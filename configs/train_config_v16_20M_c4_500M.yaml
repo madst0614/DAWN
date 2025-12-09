@@ -18,10 +18,10 @@ model:
   rank: 64
   state_dim: 64
 
-  # v16: Split Feature into QK/V
-  n_feature_qk: 64              # Q/K path compression (FR)
+  # v16: Split Feature into R/V
+  n_feature_r: 64               # Q/K path compression (FR)
   n_feature_v: 32               # V path compression (FV)
-  top_k_feature_qk: 6
+  top_k_feature_r: 6
   top_k_feature_v: 4
 
   # Expansion neurons (same as v15)
