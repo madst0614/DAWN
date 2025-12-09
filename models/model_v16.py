@@ -436,13 +436,11 @@ class GlobalRouters(nn.Module):
                 'relational_weights_Q': relational_weights_Q.detach(),
                 'relational_weights_K': relational_weights_K.detach(),
                 'value_weights': value_weights.detach(),
-                # v16: split feature prefs
+                # v16: split feature prefs (same keys as v17 for logging compat)
                 'feature_r_pref': feature_r_pref.detach(),
                 'feature_v_pref': feature_v_pref.detach(),
-                # v15 compat: use feature_r as feature_pref for logging
-                'feature_pref': feature_r_pref.detach(),
-                'relational_pref_Q': relational_pref_Q.detach(),
-                'relational_pref_K': relational_pref_K.detach(),
+                'relational_q_pref': relational_pref_Q.detach(),
+                'relational_k_pref': relational_pref_K.detach(),
                 'value_pref': value_pref.detach(),
                 'token_routing': False,
             }

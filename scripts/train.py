@@ -898,7 +898,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # v17: feature_r_pref (FR), feature_v_pref (FV) - shared feature pool, separate routing
+                    # v16/v17: feature_r_pref (FR), feature_v_pref (FV), relational_q/k_pref, value_pref
                     if attn.get('feature_r_pref') is not None:
                         pref_FR = attn.get('feature_r_pref')
                         pref_FV = attn.get('feature_v_pref')
@@ -920,26 +920,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                         ent_str = f"Ent FR/FV/RQ/RK/V:{ent_FR:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
                         var_str = f"TokVar:{var_FR:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
-
-                    # v16: feature_pref (= feature_r_pref) for logging compat
-                    elif attn.get('feature_pref') is not None:
-                        pref_F = attn.get('feature_pref')
-                        pref_RQ = attn.get('relational_pref_Q')
-                        pref_RK = attn.get('relational_pref_K')
-                        pref_V = attn.get('value_pref')
-
-                        ent_F = calc_entropy_ratio(pref_F)
-                        ent_RQ = calc_entropy_ratio(pref_RQ)
-                        ent_RK = calc_entropy_ratio(pref_RK)
-                        ent_V = calc_entropy_ratio(pref_V)
-
-                        var_F = calc_token_var(pref_F)
-                        var_RQ = calc_token_var(pref_RQ)
-                        var_RK = calc_token_var(pref_RK)
-                        var_V = calc_token_var(pref_V)
-
-                        ent_str = f"Ent F/RQ/RK/V:{ent_F:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
-                        var_str = f"TokVar:{var_F:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
 
                     else:
                         # Unknown routing_info format
@@ -1023,11 +1003,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         pass
 
                     # Warning if collapse detected (check min entropy across router types)
-                    # v17: FR/FV/RQ/RK/V, v16: F/RQ/RK/V
                     if attn.get('feature_r_pref') is not None:
                         min_ent = min(ent_FR, ent_FV, ent_RQ, ent_RK, ent_V)
-                    elif attn.get('feature_pref') is not None:
-                        min_ent = min(ent_F, ent_RQ, ent_RK, ent_V)
                     else:
                         min_ent = 100  # Unknown format, skip warning
 
