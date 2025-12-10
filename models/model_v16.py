@@ -146,16 +146,17 @@ class UnifiedNeuronRouter(nn.Module):
         else:
             usage = (weights > 0).float().mean(dim=0)
 
+        # In-place update to avoid memory leak from buffer reassignment
         if neuron_type == 'feature_r':
-            self.usage_ema_feature_r = 0.99 * self.usage_ema_feature_r + 0.01 * usage
+            self.usage_ema_feature_r.mul_(0.99).add_(usage, alpha=0.01)
         elif neuron_type == 'feature_v':
-            self.usage_ema_feature_v = 0.99 * self.usage_ema_feature_v + 0.01 * usage
+            self.usage_ema_feature_v.mul_(0.99).add_(usage, alpha=0.01)
         elif neuron_type == 'relational':
-            self.usage_ema_relational = 0.99 * self.usage_ema_relational + 0.01 * usage
+            self.usage_ema_relational.mul_(0.99).add_(usage, alpha=0.01)
         elif neuron_type == 'value':
-            self.usage_ema_value = 0.99 * self.usage_ema_value + 0.01 * usage
+            self.usage_ema_value.mul_(0.99).add_(usage, alpha=0.01)
         elif neuron_type == 'knowledge':
-            self.usage_ema_knowledge = 0.99 * self.usage_ema_knowledge + 0.01 * usage
+            self.usage_ema_knowledge.mul_(0.99).add_(usage, alpha=0.01)
 
 
 class SharedNeurons(nn.Module):

@@ -1098,6 +1098,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 with open(log_file, 'a') as f:
                     f.write(f"epoch={epoch},step={step+1},val_loss={val_loss:.6f},val_acc={val_acc:.6f}\n")
             model.train()  # Back to training mode
+            # Clear CUDA cache after validation
+            if device.type == 'cuda' if hasattr(device, 'type') else 'cuda' in str(device):
+                torch.cuda.empty_cache()
 
     # Log remaining steps at end of epoch
     if log_file and window_count > 0:
