@@ -673,7 +673,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
                 orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0,
                 debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1,
-                total_epoch_steps=None):
+                total_epoch_steps=None, val_loader=None, val_interval=5000):
     """Train for one epoch
 
     Args:
@@ -1089,6 +1089,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 "acc": f"{step_acc:.4f}",
                 "ckpt": f"step{step+1}"
             })
+
+        # Mid-epoch validation every val_interval steps
+        if val_loader is not None and (step + 1) % val_interval == 0:
+            val_loss, val_acc = evaluate(model, val_loader, device, args, tokenizer)
+            print(f"\n[Step {step+1}] Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+            if log_file:
+                with open(log_file, 'a') as f:
+                    f.write(f"epoch={epoch},step={step+1},val_loss={val_loss:.6f},val_acc={val_acc:.6f}\n")
+            model.train()  # Back to training mode
 
     # Log remaining steps at end of epoch
     if log_file and window_count > 0:
@@ -1932,7 +1941,9 @@ def main():
             model_config=model_kwargs,
             start_step=epoch_start_step,
             global_step=global_step,
-            total_steps=total_steps
+            total_steps=total_steps,
+            val_loader=val_loader,
+            val_interval=5000  # Validation every 5000 steps
         )
 
         # Evaluate
