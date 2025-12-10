@@ -41,7 +41,8 @@ class UnifiedNeuronRouter(nn.Module):
     Feature가 R(QK용)과 V용으로 분리됨.
     """
     def __init__(self, d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
-                 d_space=64, dropout=0.1, excitability_tau=1.5, excitability_ema_alpha=0.01):
+                 d_space=64, dropout=0.1, excitability_tau=1.5, excitability_ema_alpha=0.01,
+                 langevin_alpha=0.0003, langevin_beta=0.0006):
         super().__init__()
         self.n_feature_r = n_feature_r
         self.n_feature_v = n_feature_v
@@ -50,6 +51,8 @@ class UnifiedNeuronRouter(nn.Module):
         self.n_knowledge = n_knowledge
         self.d_space = d_space
         self.ema_alpha = excitability_ema_alpha
+        self.langevin_alpha = langevin_alpha
+        self.langevin_beta = langevin_beta
 
         total_neurons = n_feature_r + n_feature_v + n_relational + n_value + n_knowledge
         self.total_neurons = total_neurons
@@ -79,9 +82,25 @@ class UnifiedNeuronRouter(nn.Module):
         self.tau = excitability_tau
         self.excitability_weight = 1.0
 
-    def decay_excitability(self, decay_rate=0.9997):
-        """Decay excitability_weight each step."""
-        self.excitability_weight *= decay_rate
+    def update_excitability_weight(self):
+        """Langevin dynamics: dw = -α*w + β*dead_ratio"""
+        threshold = 0.01
+
+        active_fr = (self.usage_ema_feature_r > threshold).sum().item()
+        active_fv = (self.usage_ema_feature_v > threshold).sum().item()
+        active_r = (self.usage_ema_relational > threshold).sum().item()
+        active_v = (self.usage_ema_value > threshold).sum().item()
+
+        total_neurons = self.n_feature_r + self.n_feature_v + self.n_relational + self.n_value
+        total_active = active_fr + active_fv + active_r + active_v
+        dead_ratio = 1.0 - total_active / total_neurons
+
+        # Langevin dynamics
+        dw = -self.langevin_alpha * self.excitability_weight + self.langevin_beta * dead_ratio
+        self.excitability_weight = self.excitability_weight + dw
+
+        # Clamp to [0, 1]
+        self.excitability_weight = max(0.0, min(1.0, self.excitability_weight))
 
     def get_excitability(self, usage_ema):
         """Neuronal excitability based on usage."""
@@ -331,7 +350,8 @@ class GlobalRouters(nn.Module):
                  top_k_feature_r: int = 8, top_k_feature_v: int = 8,
                  top_k_relational: int = 4, top_k_value: int = 6,
                  d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False,
-                 excitability_tau: float = 1.5, excitability_ema_alpha: float = 0.01):
+                 excitability_tau: float = 1.5, excitability_ema_alpha: float = 0.01,
+                 langevin_alpha: float = 0.0003, langevin_beta: float = 0.0006):
         super().__init__()
         self.d_model = d_model
         self.n_feature_r = n_feature_r
@@ -348,7 +368,8 @@ class GlobalRouters(nn.Module):
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
             d_space=d_space, dropout=router_dropout,
-            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha
+            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
+            langevin_alpha=langevin_alpha, langevin_beta=langevin_beta,
         )
 
     def _topk_sparsify(self, weights, k):
@@ -704,7 +725,7 @@ class DAWN(nn.Module):
     - Value: [n_value, rank, d_model] - V expansion
     - Knowledge: 2-stage retrieval
     """
-    __version__ = "16.0"
+    __version__ = "16.1"
 
     def __init__(
         self,
@@ -740,6 +761,9 @@ class DAWN(nn.Module):
         # Excitability
         excitability_tau: float = 1.5,
         excitability_ema_alpha: float = 0.01,
+        # Langevin dynamics
+        langevin_alpha: float = 0.0003,
+        langevin_beta: float = 0.0006,
         **kwargs
     ):
         super().__init__()
@@ -759,6 +783,8 @@ class DAWN(nn.Module):
         self.use_ssm_context = use_ssm_context
         self.excitability_tau = excitability_tau
         self.excitability_ema_alpha = excitability_ema_alpha
+        self.langevin_alpha = langevin_alpha
+        self.langevin_beta = langevin_beta
 
         # Split Feature
         self.n_feature_r = n_feature_r
@@ -798,7 +824,8 @@ class DAWN(nn.Module):
             d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
             top_k_feature_r, top_k_feature_v, top_k_relational, top_k_value,
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing,
-            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha
+            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
+            langevin_alpha=langevin_alpha, langevin_beta=langevin_beta,
         )
 
         self.knowledge_encoder = nn.Linear(d_model, self.knowledge_rank, bias=False)
@@ -982,17 +1009,21 @@ class DAWN(nn.Module):
             'router_dropout': self.router_dropout,
             'gradient_checkpointing': self.gradient_checkpointing,
             'token_routing': self.token_routing,
+            'excitability_tau': self.excitability_tau,
+            'excitability_ema_alpha': self.excitability_ema_alpha,
+            'langevin_alpha': self.langevin_alpha,
+            'langevin_beta': self.langevin_beta,
         }
 
     def get_model_info(self):
         """Return model architecture info for logging"""
         return [
-            f"DAWN v{self.__version__}: Split Feature R/V",
+            f"DAWN v{self.__version__}: Split Feature R/V + Langevin Excitability",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
             f"  Feature_R: {self.n_feature_r} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_r})",
             f"  Feature_V:  {self.n_feature_v} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_v})",
             f"  Relational: {self.n_relational} × {self.rank} × {self.d_model} (top-k={self.top_k_relational})",
             f"  Value:      {self.n_value} × {self.rank} × {self.d_model} (top-k={self.top_k_value})",
             f"  Knowledge:  {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
-            f"  Router: d_space={self.d_space}, Excitability (SAR)",
+            f"  Router: d_space={self.d_space}, Langevin(α={self.langevin_alpha}, β={self.langevin_beta})",
         ]

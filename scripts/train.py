@@ -673,7 +673,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
                 orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0,
                 debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1,
-                total_epoch_steps=None):
+                total_epoch_steps=None, val_loader=None, val_interval=5000):
     """Train for one epoch
 
     Args:
@@ -845,11 +845,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Increment global step counter
         global_step += 1
 
-        # Decay excitability weight
+        # Update excitability weight (v16.0: decay, v16.1: Langevin)
         if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
             router = base_model.global_routers.neuron_router
-            if hasattr(router, 'decay_excitability'):
-                router.decay_excitability()  # Use model's default (0.9999)
+            if hasattr(router, 'update_excitability_weight'):
+                router.update_excitability_weight()  # v16.1 Langevin dynamics
+            elif hasattr(router, 'decay_excitability'):
+                router.decay_excitability()  # v16.0 simple decay
 
         # Accuracy calculation (CLM: shifted)
         shift_logits = logits[:, :-1, :].contiguous()
@@ -1090,6 +1092,18 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 "ckpt": f"step{step+1}"
             })
 
+        # Mid-epoch validation every val_interval steps
+        if val_loader is not None and (step + 1) % val_interval == 0:
+            val_loss, val_acc = evaluate(model, val_loader, device, args, tokenizer)
+            print(f"\n[Step {step+1}] Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+            if log_file:
+                with open(log_file, 'a') as f:
+                    f.write(f"epoch={epoch},step={step+1},val_loss={val_loss:.6f},val_acc={val_acc:.6f}\n")
+            model.train()  # Back to training mode
+            # Clear CUDA cache after validation
+            if device.type == 'cuda' if hasattr(device, 'type') else 'cuda' in str(device):
+                torch.cuda.empty_cache()
+
     # Log remaining steps at end of epoch
     if log_file and window_count > 0:
         avg_window_loss = window_loss / window_count
@@ -1125,7 +1139,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
     eval_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating", leave=False, total=min(max_batches, len(dataloader)))):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating", leave=False, position=0, dynamic_ncols=True, total=min(max_batches, len(dataloader)))):
             if batch_idx >= max_batches:
                 break
             input_ids = batch["input_ids"].to(device)
@@ -1380,6 +1394,10 @@ def main():
     # Unified router parameters
     args.d_space = cfg['model'].get('d_space', 64)
     args.router_dropout = cfg['model'].get('router_dropout', 0.1)
+    args.excitability_tau = cfg['model'].get('excitability_tau', 1.5)
+    args.excitability_ema_alpha = cfg['model'].get('excitability_ema_alpha', 0.01)
+    args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
+    args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
 
     # v17.0 Shared Feature parameters
     args.n_feature = cfg['model'].get('n_feature', 768)
@@ -1741,6 +1759,33 @@ def main():
             'd_space': getattr(args, 'd_space', 64),
             'router_dropout': getattr(args, 'router_dropout', 0.1),
             'gradient_checkpointing': args.gradient_checkpointing,
+            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
+            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
+        })
+    elif model_version == '16.1':
+        # v16.1: Split Feature R/V + Langevin Excitability
+        model_kwargs.update({
+            'n_feature_r': getattr(args, 'n_feature_r', 512),
+            'n_feature_v': getattr(args, 'n_feature_v', 256),
+            'n_relational': getattr(args, 'n_relational', 160),
+            'n_value': getattr(args, 'n_value', 12),
+            'n_knowledge': args.n_knowledge,
+            'coarse_k': args.coarse_k,
+            'fine_k': args.fine_k,
+            'knowledge_rank': args.knowledge_rank or 128,
+            'rank': args.basis_rank,
+            'state_dim': getattr(args, 'state_dim', 64),
+            'top_k_feature_r': getattr(args, 'top_k_feature_r', 8),
+            'top_k_feature_v': getattr(args, 'top_k_feature_v', 8),
+            'top_k_relational': getattr(args, 'top_k_relational', 4),
+            'top_k_value': getattr(args, 'top_k_value', 6),
+            'd_space': getattr(args, 'd_space', 64),
+            'router_dropout': getattr(args, 'router_dropout', 0.1),
+            'gradient_checkpointing': args.gradient_checkpointing,
+            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
+            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
+            'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
+            'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
         })
 
     # Create model
@@ -1764,6 +1809,10 @@ def main():
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Number of layers: {args.n_layers}")
+    if hasattr(args, 'excitability_tau'):
+        print(f"  Excitability: tau={args.excitability_tau}, ema_alpha={args.excitability_ema_alpha}")
+    if hasattr(args, 'langevin_alpha') and model_version == '16.1':
+        print(f"  Langevin: α={args.langevin_alpha}, β={args.langevin_beta}")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -1932,7 +1981,9 @@ def main():
             model_config=model_kwargs,
             start_step=epoch_start_step,
             global_step=global_step,
-            total_steps=total_steps
+            total_steps=total_steps,
+            val_loader=val_loader,
+            val_interval=5000  # Validation every 5000 steps
         )
 
         # Evaluate

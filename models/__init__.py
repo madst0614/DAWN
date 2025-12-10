@@ -6,6 +6,10 @@ v16.0: Split Feature R/V (Rank Matrix)
 - Each neuron = rank matrix [n × d_model × rank]
 - expand_Q/K/V linear layers for reconstruction
 
+v16.1: Split Feature R/V + Langevin Excitability
+- Same as v16.0 + adaptive dead neuron recovery
+- Langevin dynamics: dw = -α*w + β*dead_ratio
+
 v17.0: Full Vector Neurons + Full Soft Selection
 - ALL neurons are vectors [n × d_model] (no rank matrices)
 - 5 separate routing: feature_r, feature_v, relational_q, relational_k, value
@@ -16,6 +20,9 @@ baseline: Vanilla Transformer for fair comparison
 
 # v16.0 - Split Feature R/V (Rank Matrix)
 from .model_v16 import DAWN as DAWN_v16
+
+# v16.1 - Split Feature R/V + Langevin Excitability
+from .model_v16_1 import DAWN as DAWN_v16_1
 
 # v17.0 - Full Vector Neurons with Full Soft Selection
 from .model_v17 import DAWN as DAWN_v17
@@ -46,6 +53,7 @@ __all__ = [
     # Models
     'DAWN',
     'DAWN_v16',
+    'DAWN_v16_1',
     'DAWN_v17',
     'VanillaTransformer',
     # Version utilities
@@ -81,8 +89,10 @@ def create_model_by_version(version, config):
 
     if version == "16.0":
         return DAWN_v16(**config)
+    elif version == "16.1":
+        return DAWN_v16_1(**config)
     elif version == "17.0":
         return DAWN_v17(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 16.0, 17.0, baseline")
+                        f"Supported versions: 16.0, 16.1, 17.0, baseline")
