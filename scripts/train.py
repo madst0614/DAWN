@@ -1780,6 +1780,8 @@ def main():
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Number of layers: {args.n_layers}")
+    if hasattr(args, 'excitability_tau'):
+        print(f"  Excitability: tau={args.excitability_tau}, ema_alpha={args.excitability_ema_alpha}")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
