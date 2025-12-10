@@ -54,7 +54,7 @@ model:
 
   # Excitability
   excitability_tau: 1.5
-  excitability_ema_alpha: 0.01  # 나중에 0.1로 실험
+  excitability_ema_alpha: 0.1   # 핵심!
 
 training:
   batch_size: 96
