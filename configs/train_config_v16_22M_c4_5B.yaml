@@ -21,7 +21,7 @@ model:
   model_version: "16.0"
   d_model: 384
   n_layers: 12
-  n_heads: 4
+  n_heads: 6              # head_dim=64 (matching baseline)
   rank: 64
   state_dim: 64
   n_feature_r: 72
