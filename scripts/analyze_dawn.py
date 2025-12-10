@@ -199,13 +199,18 @@ class RoutingInfoParser:
         self.is_v12 = model_version.startswith('12')
         self.is_v13 = model_version.startswith('13') and not model_version.startswith('14')
         self.is_v14 = model_version.startswith('14')
-        self.is_topk = model_version in ['12.7', '12.8', '13', '13.0'] or model_version.startswith('13') or model_version.startswith('14')
+        self.is_v15 = model_version.startswith('15')
+        self.is_v16 = model_version.startswith('16')
+        self.is_topk = model_version in ['12.7', '12.8', '13', '13.0'] or model_version.startswith('13') or model_version.startswith('14') or model_version.startswith('15') or model_version.startswith('16')
 
     def detect_version(self, routing_info: Dict) -> str:
         """Auto-detect version from routing_info structure"""
         if 'attention' in routing_info:
             attn = routing_info['attention']
-            # v14: FRTK naming (feature/relational/transfer)
+            # v16: split feature QK/V
+            if 'idx_qk' in attn or 'feature_qk_pref' in attn:
+                return 'v16'
+            # v14/v15: FRTK naming (feature/relational/transfer)
             if 'feature_weights' in attn or 'feature_pref' in attn:
                 return 'v14'
             elif 'Q' in attn and isinstance(attn['Q'], dict):
@@ -242,9 +247,33 @@ class RoutingInfoParser:
             indices = data.get('indices')
             return weights, indices
 
+        elif version == 'v16':
+            attn = routing_info['attention']
+            # v16: separate QK/V feature neurons
+            if comp in ['Q', 'K', 'QK']:
+                if 'feature_qk_pref' in attn:
+                    weights = attn.get('feature_qk_pref')  # [B, S, N] token-level
+                else:
+                    # index-based: create one-hot from idx_qk
+                    indices = attn.get('idx_qk')
+                    if indices is not None:
+                        return None, indices
+                    weights = None
+                indices = attn.get('idx_qk')
+            else:  # V
+                if 'feature_v_pref' in attn:
+                    weights = attn.get('feature_v_pref')  # [B, S, N] token-level
+                else:
+                    indices = attn.get('idx_v')
+                    if indices is not None:
+                        return None, indices
+                    weights = None
+                indices = attn.get('idx_v')
+            return weights, indices
+
         elif version == 'v14':
             attn = routing_info['attention']
-            # v14: feature_pref 우선 (token-level), fallback to feature_weights
+            # v14/v15: feature_pref 우선 (token-level), fallback to feature_weights
             if 'feature_pref' in attn:
                 weights = attn.get('feature_pref')  # [B, S, N] token-level
             else:
@@ -396,8 +425,14 @@ class DAWNAnalyzer:
 
         # Detect version
         if model_version == 'auto':
+            # v16: has feature_qk_neurons (split feature)
+            if hasattr(self.model, 'shared_neurons') and hasattr(self.model.shared_neurons, 'feature_qk_neurons'):
+                model_version = '16.0'
+            # v15: has knowledge_encoder (shared)
+            elif hasattr(self.model, 'knowledge_encoder'):
+                model_version = '15.0'
             # v14: has global_routers with neuron_router (FRTK)
-            if hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
+            elif hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
                 router = self.model.global_routers.neuron_router
                 if hasattr(router, 'usage_ema_feature'):
                     model_version = '14.0'
@@ -430,13 +465,25 @@ class DAWNAnalyzer:
         self.rank = getattr(self.model, 'rank', self.d_model // 4)
         self.n_heads = self.model.n_heads
 
-        # Neuron counts - v14 (FRTK) vs legacy
+        # Neuron counts - v16/v14 (FRTK) vs legacy
         if hasattr(self.model, 'global_routers') and hasattr(self.model.global_routers, 'neuron_router'):
             router = self.model.global_routers.neuron_router
-            # v14: feature/relational/transfer
-            self.n_feature = getattr(router, 'n_feature', 0)
-            self.n_relational = getattr(router, 'n_relational', 0)
-            self.n_transfer = getattr(router, 'n_transfer', 0)
+            if hasattr(router, 'n_feature_qk'):
+                # v16: split feature QK/V
+                self.n_feature_qk = getattr(router, 'n_feature_qk', 0)
+                self.n_feature_v = getattr(router, 'n_feature_v', 0)
+                self.n_feature = self.n_feature_qk  # for compatibility
+                self.n_relational = getattr(router, 'n_relational', 0)
+                self.n_value = getattr(router, 'n_value', 0)
+                self.n_transfer = self.n_value
+            else:
+                # v14/v15: feature/relational/transfer
+                self.n_feature = getattr(router, 'n_feature', 0)
+                self.n_feature_qk = self.n_feature
+                self.n_feature_v = self.n_feature
+                self.n_relational = getattr(router, 'n_relational', 0)
+                self.n_transfer = getattr(router, 'n_transfer', getattr(router, 'n_value', 0))
+                self.n_value = self.n_transfer
             # Map to legacy names for compatibility
             self.n_compress = self.n_feature
             self.n_expand = self.n_relational
@@ -457,15 +504,21 @@ class DAWNAnalyzer:
                 self.n_knowledge = 0
             # v14 aliases
             self.n_feature = self.n_compress
+            self.n_feature_qk = self.n_compress
+            self.n_feature_v = self.n_compress
             self.n_relational = self.n_expand
             self.n_transfer = self.n_expand
+            self.n_value = self.n_expand
         else:
             self.n_compress = getattr(self.model, 'n_compress', 48)
             self.n_expand = getattr(self.model, 'n_expand', 12)
             self.n_knowledge = getattr(self.model, 'n_knowledge', 80)
             self.n_feature = self.n_compress
+            self.n_feature_qk = self.n_compress
+            self.n_feature_v = self.n_compress
             self.n_relational = self.n_expand
             self.n_transfer = self.n_expand
+            self.n_value = self.n_expand
 
         self.knowledge_k = getattr(self.model, 'knowledge_k', 10)
 
@@ -473,8 +526,12 @@ class DAWNAnalyzer:
         print(f"DAWN Analyzer (v{self.version})")
         print(f"{'='*60}")
         print(f"d_model: {self.d_model}, rank: {self.rank}")
-        if self.version.startswith('14'):
-            # v14: FRTK naming
+        if self.version.startswith('16'):
+            # v16: split feature QK/V
+            print(f"n_feature_qk: {self.n_feature_qk}, n_feature_v: {self.n_feature_v}")
+            print(f"n_relational: {self.n_relational}, n_value: {self.n_value}")
+        elif self.version.startswith('14') or self.version.startswith('15'):
+            # v14/v15: FRTK naming
             print(f"n_feature: {self.n_feature}, n_relational: {self.n_relational}, n_transfer: {self.n_transfer}")
         else:
             # Legacy naming
