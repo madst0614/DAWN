@@ -703,13 +703,18 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
     # Skip steps if resuming from middle of epoch
     if start_step > 0:
-        print(f"  Skipping to step {start_step}...")
+        print(f"  Resuming from step {start_step}/{len(dataloader)} (skipping {start_step} batches)...")
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]", initial=start_step, total=len(dataloader))
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]", total=len(dataloader))
     for step, batch in enumerate(pbar):
-        # Skip already completed steps
+        # Skip already completed steps (fast skip, no GPU transfer)
         if step < start_step:
+            if step == 0:
+                pbar.set_description(f"Epoch {epoch} [Skipping]")
             continue
+        elif step == start_step:
+            pbar.set_description(f"Epoch {epoch} [Train]")
+
         input_ids = batch["input_ids"].to(device)
 
         # CLM: labels = input_ids (model does shift internally)
