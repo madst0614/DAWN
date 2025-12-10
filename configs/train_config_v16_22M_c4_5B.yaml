@@ -29,13 +29,13 @@ model:
   # v16: Split Feature into R/V
   n_feature_r: 72                 # Q/K path compression (FR)
   n_feature_v: 48                 # V path compression (FV)
-  top_k_feature_r: 16
+  top_k_feature_r: 8
   top_k_feature_v: 6
 
   # Expansion neurons
   n_relational: 196
   n_value: 24
-  top_k_relational: 8
+  top_k_relational: 16
   top_k_value: 4
 
   # Knowledge
