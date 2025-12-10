@@ -1134,7 +1134,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
     eval_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating", leave=False, total=min(max_batches, len(dataloader)))):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating", leave=False, position=0, dynamic_ncols=True, total=min(max_batches, len(dataloader)))):
             if batch_idx >= max_batches:
                 break
             input_ids = batch["input_ids"].to(device)
