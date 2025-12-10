@@ -753,10 +753,11 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
     collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer, max_seq_len=max_length)
 
     # Create dataloaders with FIXED padding to max_length
+    # shuffle=False: reproducibility, efficient resume, pre-shuffled data
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=2,
         collate_fn=collate_fn
     )
