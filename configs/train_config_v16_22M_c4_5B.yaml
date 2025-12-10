@@ -52,6 +52,10 @@ model:
   token_routing: false
   use_ssm_context: true
 
+  # Excitability
+  excitability_tau: 1.5
+  excitability_ema_alpha: 0.01  # 나중에 0.1로 실험
+
 training:
   batch_size: 96
   num_epochs: 1

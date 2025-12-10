@@ -1392,6 +1392,8 @@ def main():
     # Unified router parameters
     args.d_space = cfg['model'].get('d_space', 64)
     args.router_dropout = cfg['model'].get('router_dropout', 0.1)
+    args.excitability_tau = cfg['model'].get('excitability_tau', 1.5)
+    args.excitability_ema_alpha = cfg['model'].get('excitability_ema_alpha', 0.01)
 
     # v17.0 Shared Feature parameters
     args.n_feature = cfg['model'].get('n_feature', 768)
@@ -1753,6 +1755,8 @@ def main():
             'd_space': getattr(args, 'd_space', 64),
             'router_dropout': getattr(args, 'router_dropout', 0.1),
             'gradient_checkpointing': args.gradient_checkpointing,
+            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
+            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
         })
 
     # Create model
