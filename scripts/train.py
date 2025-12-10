@@ -845,11 +845,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Increment global step counter
         global_step += 1
 
-        # Decay excitability weight
+        # Update excitability weight (v16.0: decay, v16.1: Langevin)
         if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
             router = base_model.global_routers.neuron_router
-            if hasattr(router, 'decay_excitability'):
-                router.decay_excitability()  # Use model's default (0.9999)
+            if hasattr(router, 'update_excitability_weight'):
+                router.update_excitability_weight()  # v16.1 Langevin dynamics
+            elif hasattr(router, 'decay_excitability'):
+                router.decay_excitability()  # v16.0 simple decay
 
         # Accuracy calculation (CLM: shifted)
         shift_logits = logits[:, :-1, :].contiguous()
@@ -1394,6 +1396,8 @@ def main():
     args.router_dropout = cfg['model'].get('router_dropout', 0.1)
     args.excitability_tau = cfg['model'].get('excitability_tau', 1.5)
     args.excitability_ema_alpha = cfg['model'].get('excitability_ema_alpha', 0.01)
+    args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
+    args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
 
     # v17.0 Shared Feature parameters
     args.n_feature = cfg['model'].get('n_feature', 768)
@@ -1758,6 +1762,31 @@ def main():
             'excitability_tau': getattr(args, 'excitability_tau', 1.5),
             'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
         })
+    elif model_version == '16.1':
+        # v16.1: Split Feature R/V + Langevin Excitability
+        model_kwargs.update({
+            'n_feature_r': getattr(args, 'n_feature_r', 512),
+            'n_feature_v': getattr(args, 'n_feature_v', 256),
+            'n_relational': getattr(args, 'n_relational', 160),
+            'n_value': getattr(args, 'n_value', 12),
+            'n_knowledge': args.n_knowledge,
+            'coarse_k': args.coarse_k,
+            'fine_k': args.fine_k,
+            'knowledge_rank': args.knowledge_rank or 128,
+            'rank': args.basis_rank,
+            'state_dim': getattr(args, 'state_dim', 64),
+            'top_k_feature_r': getattr(args, 'top_k_feature_r', 8),
+            'top_k_feature_v': getattr(args, 'top_k_feature_v', 8),
+            'top_k_relational': getattr(args, 'top_k_relational', 4),
+            'top_k_value': getattr(args, 'top_k_value', 6),
+            'd_space': getattr(args, 'd_space', 64),
+            'router_dropout': getattr(args, 'router_dropout', 0.1),
+            'gradient_checkpointing': args.gradient_checkpointing,
+            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
+            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
+            'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
+            'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
+        })
 
     # Create model
     model = create_model_by_version(model_version, model_kwargs)
@@ -1782,6 +1811,8 @@ def main():
     print(f"  Number of layers: {args.n_layers}")
     if hasattr(args, 'excitability_tau'):
         print(f"  Excitability: tau={args.excitability_tau}, ema_alpha={args.excitability_ema_alpha}")
+    if hasattr(args, 'langevin_alpha') and model_version == '16.1':
+        print(f"  Langevin: α={args.langevin_alpha}, β={args.langevin_beta}")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
