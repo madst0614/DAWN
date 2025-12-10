@@ -672,11 +672,13 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
                 orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0,
-                debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1):
+                debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1,
+                total_epoch_steps=None):
     """Train for one epoch
 
     Args:
-        start_step: Step to resume from within this epoch (default 0, start from beginning)
+        start_step: Step offset for this epoch (for logging/checkpointing when resuming)
+        total_epoch_steps: Total steps in full epoch (for progress bar when using subset)
         global_step: Global training step counter
         total_steps: Total training steps
     """
@@ -701,19 +703,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     # Last neuron metrics (for epoch summary)
     last_neuron_metrics = None
 
-    # Skip steps if resuming from middle of epoch
-    if start_step > 0:
-        print(f"  Resuming from step {start_step}/{len(dataloader)} (skipping {start_step} batches)...")
+    # Note: start_step is used to calculate correct global step, but we don't skip
+    # batches here - the caller provides a subset dataloader when resuming
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]", total=len(dataloader))
-    for step, batch in enumerate(pbar):
-        # Skip already completed steps (fast skip, no GPU transfer)
-        if step < start_step:
-            if step == 0:
-                pbar.set_description(f"Epoch {epoch} [Skipping]")
-            continue
-        elif step == start_step:
-            pbar.set_description(f"Epoch {epoch} [Train]")
+    # Use total_epoch_steps for progress bar if provided (shows full epoch progress when resuming)
+    pbar_total = total_epoch_steps if total_epoch_steps else len(dataloader)
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]", initial=start_step, total=pbar_total)
+    for local_step, batch in enumerate(pbar):
+        # Calculate actual step (for logging and checkpointing)
+        step = local_step + start_step
 
         input_ids = batch["input_ids"].to(device)
 
@@ -1899,14 +1897,36 @@ def main():
         # Determine start_step for this epoch (only non-zero for first epoch when resuming)
         epoch_start_step = start_step if epoch == start_epoch else 0
 
+        # Create subset loader if resuming mid-epoch (skip batches efficiently)
+        if epoch_start_step > 0:
+            from torch.utils.data import DataLoader, Subset
+            from functools import partial
+            # Get original dataset and create subset starting from resume point
+            original_dataset = train_loader.dataset
+            start_idx = epoch_start_step * args.batch_size
+            subset_indices = list(range(start_idx, len(original_dataset)))
+            subset_dataset = Subset(original_dataset, subset_indices)
+            # Create new loader without shuffle (preserve order for this partial epoch)
+            epoch_loader = DataLoader(
+                subset_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,  # No shuffle for resume epoch
+                num_workers=2,
+                collate_fn=train_loader.collate_fn
+            )
+            print(f"  Resuming from step {epoch_start_step}/{steps_per_epoch} ({len(subset_dataset)} samples)")
+        else:
+            epoch_loader = train_loader
+
         # Train
         train_loss, train_acc, neuron_metrics, global_step = train_epoch(
-            model, train_loader, optimizer, scheduler, device, epoch, args,
+            model, epoch_loader, optimizer, scheduler, device, epoch, args,
             scaler, tokenizer, log_file=str(training_log_file),
             orthogonality_weight=args.orthogonality_weight,
             diversity_weight=args.diversity_weight,
             load_balance_weight=args.load_balance_weight,
             entropy_weight=args.entropy_weight,
+            total_epoch_steps=steps_per_epoch,  # Full epoch steps for progress bar
             debug_logger=debug_logger,
             ckpt_manager=ckpt_manager,
             model_config=model_kwargs,
