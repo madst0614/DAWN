@@ -17,25 +17,33 @@ data:
     - val/c4/c4_val_50M.pt
   max_train_tokens: 5000000000
   max_val_tokens: 2000000
+
 model:
   model_version: "16.0"
   d_model: 384
   n_layers: 12
-  n_heads: 6              # head_dim=64 (matching baseline)
+  n_heads: 6                      # head_dim=64 (matching baseline)
   rank: 64
   state_dim: 64
-  n_feature_r: 72
-  n_feature_v: 48
+
+  # v16: Split Feature into R/V
+  n_feature_r: 72                 # Q/K path compression (FR)
+  n_feature_v: 48                 # V path compression (FV)
   top_k_feature_r: 8
   top_k_feature_v: 6
+
+  # Expansion neurons
   n_relational: 196
   n_value: 24
   top_k_relational: 20
   top_k_value: 4
+
+  # Knowledge
   n_knowledge: 300
   coarse_k: 16
   fine_k: 8
   knowledge_rank: 128
+
   max_seq_len: 512
   dropout: 0.1
   gradient_checkpointing: false
@@ -43,6 +51,7 @@ model:
   router_dropout: 0.1
   token_routing: false
   use_ssm_context: true
+
 training:
   batch_size: 96
   num_epochs: 1
@@ -54,6 +63,12 @@ training:
   load_balance_weight: 0.0
   entropy_weight: 0.0
   process_norm_weight: 0.0
+
 use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_22M_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_v16_22M_c4_5B
+
+# v16 22M @ 5B tokens
+#   - FR=72, FV=48 (total 120 feature neurons)
+#   - Relational=196, Value=24
+#   - ~101k steps, validation every 5000 steps
