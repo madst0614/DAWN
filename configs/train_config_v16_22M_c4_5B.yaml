@@ -35,7 +35,7 @@ model:
   # Expansion neurons
   n_relational: 196
   n_value: 24
-  top_k_relational: 20
+  top_k_relational: 16
   top_k_value: 4
 
   # Knowledge
