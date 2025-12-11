@@ -368,7 +368,10 @@ class DAWNInterpreter:
 
         print(f"Running spacy on {len(sampled)} unique tokens...")
 
-        docs = list(self.nlp.pipe([str(t).replace('##','').replace('Ġ','').replace('▁','') for t in sampled], batch_size=500))
+        # Vectorized string preprocessing (faster than list comprehension with replace chain)
+        cleaned_tokens = pd.Series(sampled).str.replace(r'##|Ġ|▁', '', regex=True).tolist()
+        docs = list(self.nlp.pipe(cleaned_tokens, batch_size=2000))  # Larger batch for speed
+
         token_to_pos = {tok: doc[0].pos_ for tok, doc in zip(sampled, docs) if len(doc) > 0}
         token_to_dep = {tok: doc[0].dep_ for tok, doc in zip(sampled, docs) if len(doc) > 0}
 
