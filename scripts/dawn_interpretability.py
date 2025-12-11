@@ -181,6 +181,31 @@ class DAWNInterpreter:
             else:
                 docs = [None] * B
 
+            # Pre-compute topk for all layers/neuron types at once (GPU batch)
+            topk_map = {'FR': 8, 'FV': 8, 'R': 4, 'V': 6}
+            all_topk = {}  # {(layer_idx, nt): numpy array [B, L, topk]}
+
+            for layer_idx, layer_info in enumerate(routing_infos):
+                if 'attention' not in layer_info: continue
+                attn = layer_info['attention']
+
+                prefs = {
+                    'FR': attn.get('feature_r_pref'),
+                    'FV': attn.get('feature_v_pref'),
+                    'R': attn.get('relational_q_pref'),
+                    'V': attn.get('value_pref'),
+                }
+
+                for nt, pref in prefs.items():
+                    if pref is None: continue
+                    try:
+                        topk = min(topk_map[nt], pref.shape[-1])
+                        _, topk_indices = torch.topk(pref, topk, dim=-1)  # [B, L, topk]
+                        all_topk[(layer_idx, nt)] = topk_indices.cpu().numpy()
+                    except (IndexError, RuntimeError):
+                        continue
+
+            # Now iterate over tokens (CPU only)
             for b in range(B):
                 tokens = all_tokens[b]
                 decoded_tokens = all_decoded[b]
@@ -204,32 +229,10 @@ class DAWNInterpreter:
                     pos_bin = "first" if pos==0 else "start" if rel_pos<0.25 else "middle" if rel_pos<0.75 else "end"
                     len_bin = next((f"{s}-{e}" for s,e in [(0,32),(32,64),(64,128),(128,256),(256,512)] if s<=L<e), "512+")
 
-                    # Use token-level pref for each layer
-                    for layer_idx, layer_info in enumerate(routing_infos):
-                        if 'attention' not in layer_info: continue
-                        attn = layer_info['attention']
-
-                        # Extract prefs for each neuron type
-                        prefs = {
-                            'FR': attn.get('feature_r_pref'),
-                            'FV': attn.get('feature_v_pref'),
-                            'R': attn.get('relational_q_pref'),
-                            'V': attn.get('value_pref'),
-                        }
-                        topk_map = {'FR': 8, 'FV': 8, 'R': 4, 'V': 6}
-
-                        for nt, pref in prefs.items():
-                            if pref is None: continue
-                            try:
-                                token_pref = pref[b, pos]
-                                topk = min(topk_map[nt], token_pref.shape[0])
-                                _, topk_idx = torch.topk(token_pref, topk)
-                                active_neurons = topk_idx.cpu().tolist()
-
-                                for n_idx in active_neurons:
-                                    self._record(tok_str, nt, n_idx, layer_idx, pos_bin, len_bin, context, ling)
-                            except (IndexError, RuntimeError):
-                                continue
+                    # Record from pre-computed topk (no GPU ops here)
+                    for (layer_idx, nt), topk_np in all_topk.items():
+                        for n_idx in topk_np[b, pos]:
+                            self._record(tok_str, nt, int(n_idx), layer_idx, pos_bin, len_bin, context, ling)
 
         print(f"Collected: {sum(self.total_token_counts.values()):,} tokens, {len(self.token_neuron_map):,} unique")
 
