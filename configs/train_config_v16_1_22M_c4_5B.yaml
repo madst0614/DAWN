@@ -1,5 +1,6 @@
 # DAWN v16.1 Training Config - 22M Scale, 5B tokens
-# Split Feature QK/V + Langevin Excitability
+# Split Feature R/V + Langevin Excitability (adaptive dead neuron recovery)
+
 data:
   base_dir: /content/drive/MyDrive/data
   train_files:
@@ -22,21 +23,21 @@ model:
   model_version: "16.1"
   d_model: 384
   n_layers: 12
-  n_heads: 6                      # head_dim=64 (matching baseline)
+  n_heads: 6
   rank: 64
   state_dim: 64
 
-  # v16: Split Feature into R/V
-  n_feature_r: 72                 # Q/K path compression (FR)
-  n_feature_v: 48                 # V path compression (FV)
-  top_k_feature_r: 8
-  top_k_feature_v: 6
+  # v16.1: Optimized neuron counts
+  n_feature_r: 96                 # FR: 72→96 (병목 해소)
+  n_feature_v: 24                 # FV: 48→24
+  top_k_feature_r: 12             # k: 8→12 (DivRatio 안정화)
+  top_k_feature_v: 3              # k: 6→3
 
-  # Expansion neurons
-  n_relational: 196
-  n_value: 24
-  top_k_relational: 20
-  top_k_value: 4
+  # Symmetric design
+  n_relational: 96                # R: 196→96 (68개 active)
+  n_value: 16                     # V: 24→16
+  top_k_relational: 12            # k: 20→12
+  top_k_value: 2                  # k: 4→2
 
   # Knowledge
   n_knowledge: 300
@@ -52,13 +53,11 @@ model:
   token_routing: false
   use_ssm_context: true
 
-  # Excitability
+  # Excitability + Langevin Dynamics (v16.1 feature)
   excitability_tau: 1.5
   excitability_ema_alpha: 0.01
-
-  # Langevin dynamics (v16.1)
-  langevin_alpha: 0.0003          # decay toward 0
-  langevin_beta: 0.0006           # boost from dead neurons
+  langevin_alpha: 0.0003          # decay rate for excitability weight
+  langevin_beta: 0.0006           # boost rate based on dead_ratio
 
 training:
   batch_size: 96
@@ -73,10 +72,12 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_1_22M_c4_5B
-log_dir: /content/drive/MyDrive/dawn/logs_v16_1_22M_c4_5B
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16.1_22M_c4_5B
+log_dir: /content/drive/MyDrive/dawn/logs_v16.1_22M_c4_5B
 
-# v16.1 22M @ 5B tokens
-#   - Langevin dynamics: w* = (β/α) × dead_ratio = 2 × dead_ratio
-#   - dead=50% → w*=1.0, dead=0% → w*=0.0
-#   - Dead neurons 있으면 excitability 유지
+# v16.1 Architecture + Langevin Excitability
+#   - FR=96 (k=12), FV=24 (k=3)  → 120 feature neurons
+#   - R=96 (k=12), V=16 (k=2)    → 112 expansion neurons
+#   - Total: 232 neurons
+#   - Langevin dynamics: dw = -α*w + β*dead_ratio
+#   - w* = (β/α) × dead_ratio = 2 × dead_ratio
