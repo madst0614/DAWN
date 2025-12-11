@@ -35,7 +35,7 @@ model:
 
   # Symmetric design
   n_relational: 96                # R: 196→96 (68개 active)
-  n_value: 12                     # V: 24→12
+  n_value: 16                     # V: 24→16
   top_k_relational: 12            # k: 20→12
   top_k_value: 2                  # k: 4→2
 
