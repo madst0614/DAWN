@@ -794,7 +794,7 @@ def analyze_fr_r_subspace_similarity(model, dataloader, device, config, max_batc
         'max_entropy': normalized_entropy_r.max().item(),
     }
 
-    return results, fr_r_alignment.cpu().numpy()
+    return results, fr_r_alignment.detach().cpu().numpy()
 
 
 def save_heatmap(co_selection, output_path):
