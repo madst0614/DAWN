@@ -1671,8 +1671,8 @@ def main():
             print(f"  Relational: {n_relational} × {args.d_model} [SHARED Q/K]")
             print(f"  Value: {n_value} × {args.d_model}")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
-        elif model_version == "16.0":
-            # v16.0: Split Feature R/V (rank matrix)
+        elif model_version in ("16.0", "16.1"):
+            # v16.x: Split Feature R/V (rank matrix)
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
             n_feature_r = getattr(args, 'n_feature_r', 512)
@@ -1682,14 +1682,21 @@ def main():
             n_knowledge = getattr(args, 'n_knowledge', 256)
             coarse_k = getattr(args, 'coarse_k', 20)
             fine_k = getattr(args, 'fine_k', 10)
-            print(f"DAWN v{model_version}: Split Feature R/V (rank matrix)")
+            version_desc = "Split Feature R/V (rank matrix)"
+            if model_version == "16.1":
+                version_desc += " + Langevin Excitability"
+            print(f"DAWN v{model_version}: {version_desc}")
             print(f"  Feature R/V: {n_feature_r}/{n_feature_v}")
             print(f"  Relational/Value: {n_relational}/{n_value}")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
             print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
+            if model_version == "16.1":
+                langevin_alpha = getattr(args, 'langevin_alpha', 0.0003)
+                langevin_beta = getattr(args, 'langevin_beta', 0.0006)
+                print(f"  Langevin: α={langevin_alpha}, β={langevin_beta}")
             print(f"  (detailed info after model creation)")
         else:
-            print(f"⚠️  Unsupported version: {model_version}. Supported: 16.0, 17.0")
+            print(f"⚠️  Unsupported version: {model_version}. Supported: 16.0, 16.1, 17.0")
     else:
         print(f"Standard FFN: d_ff={args.d_ff}")
 
