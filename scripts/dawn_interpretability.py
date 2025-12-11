@@ -26,8 +26,8 @@ Usage:
     interpreter.run_v2_experiments(dataloader)
 
 CLI:
-    python dawn_interpretability.py --checkpoint ckpt.pt --val_data val.pt
-    python dawn_interpretability.py --checkpoint ckpt.pt --val_data val.pt --v2  # Include V2
+    python dawn_interpretability.py --checkpoint ckpt.pt --val_data val.pt  # Full + V2 (default)
+    python dawn_interpretability.py --checkpoint ckpt.pt --val_data val.pt --no_v2  # Skip V2
     python dawn_interpretability.py --checkpoint ckpt.pt --val_data val.pt --v2_only  # V2 only
 """
 
@@ -1852,7 +1852,7 @@ if __name__ == "__main__":
     parser.add_argument("--ablation_batches", type=int, default=50, help="Max batches for ablation")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
-    parser.add_argument("--v2", action="store_true", help="Run V2 interpretability experiments (surgical ablation, toxicity, etc.)")
+    parser.add_argument("--no_v2", action="store_true", help="Skip V2 experiments (surgical ablation, toxicity, etc.)")
     parser.add_argument("--v2_only", action="store_true", help="Run ONLY V2 experiments, skip original analysis")
 
     args = parser.parse_args()
@@ -1945,8 +1945,8 @@ if __name__ == "__main__":
             output_dir=args.output_dir
         )
 
-        # Optionally also run V2 experiments
-        if args.v2:
+        # Run V2 experiments by default (unless --no_v2)
+        if not args.no_v2:
             print("\n" + "="*60)
             print("Running V2 Experiments...")
             print("="*60)
