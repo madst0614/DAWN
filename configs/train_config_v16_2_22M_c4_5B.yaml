@@ -35,9 +35,9 @@ model:
 
   # Symmetric design
   n_relational: 96                # R: 196→96 (68개 active)
-  n_value: 8                      # V: 24→8 (5개만 사용)
+  n_value: 12                     # V: 24→12
   top_k_relational: 12            # k: 20→12
-  top_k_value: 3                  # k: 4→3
+  top_k_value: 4                  # k: 4 (유지)
 
   # Knowledge (unchanged)
   n_knowledge: 300
@@ -75,6 +75,6 @@ log_dir: /content/drive/MyDrive/dawn/logs_v16.2_22M_c4_5B
 
 # v16.2 Optimized Architecture
 #   - FR=96 (k=12), FV=16 (k=4)  → 112 feature neurons
-#   - R=96 (k=12), V=8 (k=3)     → 104 expansion neurons
-#   - Total: 216 neurons (vs 340 in v16.0, 36% reduction)
+#   - R=96 (k=12), V=12 (k=4)    → 108 expansion neurons
+#   - Total: 220 neurons (vs 340 in v16.0, 35% reduction)
 #   - Symmetric FR/R design
