@@ -48,9 +48,11 @@ def diagnose_usage_ema(model):
     print("1. Usage EMA Distribution")
     print(f"{'='*60}")
 
+    results = {}
+
     if not hasattr(model, 'global_routers'):
         print("  Model doesn't have global_routers")
-        return
+        return results
 
     router = model.global_routers.neuron_router
 
@@ -67,7 +69,7 @@ def diagnose_usage_ema(model):
             continue
 
         usage = ema.cpu().numpy()
-        dead_count = (usage < 0.01).sum()
+        dead_count = int((usage < 0.01).sum())
 
         print(f"\n  {name} ({len(usage)} neurons):")
         print(f"    max={usage.max():.4f} (idx {usage.argmax()})")
@@ -78,6 +80,20 @@ def diagnose_usage_ema(model):
         # Top 5 most used
         top5_idx = np.argsort(usage)[-5:][::-1]
         print(f"    Top 5: {[(int(i), f'{usage[i]:.4f}') for i in top5_idx]}")
+
+        results[name] = {
+            'n_neurons': len(usage),
+            'max': float(usage.max()),
+            'max_idx': int(usage.argmax()),
+            'min': float(usage.min()),
+            'mean': float(usage.mean()),
+            'std': float(usage.std()),
+            'dead_count': dead_count,
+            'dead_pct': 100 * dead_count / len(usage),
+            'top5': [(int(i), float(usage[i])) for i in top5_idx]
+        }
+
+    return results
 
 
 def diagnose_neuron_selection(model, dataloader, device, max_batches=20):
@@ -146,6 +162,8 @@ def diagnose_neuron_selection(model, dataloader, device, max_batches=20):
 
     print(f"\n  Analyzed {max_batches} batches, {total_tokens} tokens")
 
+    results = {'total_tokens': total_tokens}
+
     for nt, counts in neuron_counts.items():
         if not counts:
             print(f"\n  {nt}: No data")
@@ -162,9 +180,19 @@ def diagnose_neuron_selection(model, dataloader, device, max_batches=20):
         # Coverage: how many neurons cover 50% of selections?
         sorted_counts = sorted(counts.values(), reverse=True)
         cumsum = np.cumsum(sorted_counts)
-        n_for_50 = np.searchsorted(cumsum, total_selections * 0.5) + 1
-        n_for_90 = np.searchsorted(cumsum, total_selections * 0.9) + 1
+        n_for_50 = int(np.searchsorted(cumsum, total_selections * 0.5) + 1)
+        n_for_90 = int(np.searchsorted(cumsum, total_selections * 0.9) + 1)
         print(f"    Coverage: {n_for_50} neurons for 50%, {n_for_90} neurons for 90%")
+
+        results[nt] = {
+            'total_selections': total_selections,
+            'top10': [(int(idx), int(cnt)) for idx, cnt in top10],
+            'n_for_50_coverage': n_for_50,
+            'n_for_90_coverage': n_for_90,
+            'n_active_neurons': len(counts)
+        }
+
+    return results
 
 
 def diagnose_importance_entropy(model, dataloader, tokenizer, device, max_batches=10):
@@ -236,6 +264,8 @@ def diagnose_importance_entropy(model, dataloader, tokenizer, device, max_batche
                                         'entropy': batch_entropy[pos].item()
                                     })
 
+    results = {}
+
     if all_entropies:
         mean_entropy = np.mean(all_entropies)
         std_entropy = np.std(all_entropies)
@@ -248,10 +278,22 @@ def diagnose_importance_entropy(model, dataloader, tokenizer, device, max_batche
         print(f"\n  Reference: uniform over 100 neurons → entropy ≈ {np.log(100):.2f}")
         print(f"  Reference: uniform over 10 neurons → entropy ≈ {np.log(10):.2f}")
 
+        results['mean_entropy'] = float(mean_entropy)
+        results['std_entropy'] = float(std_entropy)
+        results['ref_uniform_100'] = float(np.log(100))
+        results['ref_uniform_10'] = float(np.log(10))
+
     if sample_outputs:
         print(f"\n  Sample tokens with lowest entropy (most concentrated):")
         for s in sample_outputs[:5]:
             print(f"    pos {s['pos']}: '{s['token'].strip()}' (entropy={s['entropy']:.4f})")
+
+        results['sample_low_entropy_tokens'] = [
+            {'pos': s['pos'], 'token': s['token'].strip(), 'entropy': s['entropy']}
+            for s in sample_outputs[:5]
+        ]
+
+    return results
 
 
 def main():
@@ -261,8 +303,12 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_batches", type=int, default=20)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--output_dir", type=str, default="./routing_diagnosis")
 
     args = parser.parse_args()
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # Resolve checkpoint path
     ckpt_path = resolve_checkpoint_path(args.checkpoint)
@@ -311,14 +357,23 @@ def main():
     print("DAWN v16 Routing Diagnostics")
     print(f"{'='*60}")
 
+    results = {}
+
     # 1. Usage EMA
-    diagnose_usage_ema(model)
+    results['usage_ema'] = diagnose_usage_ema(model)
 
     # 2. Neuron Selection
-    diagnose_neuron_selection(model, dataloader, args.device, args.max_batches)
+    results['neuron_selection'] = diagnose_neuron_selection(model, dataloader, args.device, args.max_batches)
 
     # 3. Importance Entropy
-    diagnose_importance_entropy(model, dataloader, tokenizer, args.device, args.max_batches)
+    results['importance_entropy'] = diagnose_importance_entropy(model, dataloader, tokenizer, args.device, args.max_batches)
+
+    # Save results
+    import json
+    output_path = os.path.join(args.output_dir, "routing_diagnosis.json")
+    with open(output_path, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\nResults saved to: {output_path}")
 
     print(f"\n{'='*60}")
     print("Diagnostics Complete")
