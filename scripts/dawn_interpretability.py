@@ -488,7 +488,11 @@ class DAWNInterpreter:
             else: ids = batch.to(self.device)
 
             out = self.model(ids)
-            logits = out.logits if hasattr(out, 'logits') else out[0]
+            # Handle tuple output from return_routing_info
+            if isinstance(out, tuple):
+                logits = out[0]
+            else:
+                logits = out.logits if hasattr(out, 'logits') else out
             sl, st = logits[...,:-1,:].contiguous(), ids[...,1:].contiguous()
             loss += F.cross_entropy(sl.view(-1, sl.size(-1)), st.view(-1), reduction='sum').item()
             correct += (sl.argmax(-1) == st).sum().item()
