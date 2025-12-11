@@ -384,6 +384,7 @@ class DAWNInterpreter:
 
         token_to_pos = {tok: doc[0].pos_ for tok, doc in zip(sampled, docs) if len(doc) > 0}
         token_to_dep = {tok: doc[0].dep_ for tok, doc in zip(sampled, docs) if len(doc) > 0}
+        token_to_morph = {tok: doc[0].morph.to_dict() for tok, doc in zip(sampled, docs) if len(doc) > 0}
 
         # Vectorized map (faster than lambda)
         pos_series = pd.Series(token_to_pos)
@@ -402,6 +403,20 @@ class DAWNInterpreter:
         for (dep, nt, n_idx), count in dep_neuron.items():
             self.dep_neuron_counts[dep][nt][int(n_idx)] += count
             self.neuron_dep_counts[f"{nt}_{int(n_idx)}"][nt][dep] += count
+
+        # Morphology counts (Tense, Number, VerbForm)
+        for tok, morph in token_to_morph.items():
+            tok_df = df[df['token'] == tok]
+            for (nt, n_idx), grp in tok_df.groupby(['nt', 'neuron_idx']):
+                cnt = len(grp)
+                nk = f"{nt}_{int(n_idx)}"
+                for feat, val in morph.items():
+                    mk = f"{feat}={val}"
+                    self.morph_neuron_counts[mk][nt][int(n_idx)] += cnt
+                    self.neuron_morph_counts[nk][nt][mk] += cnt
+                    if feat == "Tense": self.tense_neurons[val][int(n_idx)] += cnt
+                    elif feat == "Number": self.number_neurons[val][int(n_idx)] += cnt
+                    elif feat == "VerbForm": self.verb_form_neurons[val][int(n_idx)] += cnt
 
         # QK vs V comparison
         qk_types = {'FR', 'R'}
