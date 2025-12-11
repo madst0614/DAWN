@@ -651,7 +651,15 @@ class V16Analyzer:
 
                 try:
                     outputs = self.model(input_ids, attention_mask=attention_mask, return_routing_info=True)
-                    routing_info = outputs.get('routing_info', {})
+
+                    # Model returns tuple: (logits, routing_infos) where routing_infos is List[Dict]
+                    if isinstance(outputs, tuple) and len(outputs) == 2:
+                        logits, routing_infos = outputs
+                        # Use first layer's attention routing info
+                        routing_info = routing_infos[0].get('attention', {}) if routing_infos else {}
+                    else:
+                        continue
+
                 except Exception as e:
                     continue
 
