@@ -10,10 +10,25 @@ Full implementation:
 4. Neuron Pool Specialization: QK vs V, Cross-layer reuse
 5. Causal Verification: Ablation studies
 
+V2 Experiments (Enhanced Interpretability Proofs):
+6. Surgical Ablation: Single neuron removal effects on specific POS
+7. Cross-Layer Consistency: Same token → same neurons across layers?
+8. Toxicity Neuron Detection: Find and control behavior neurons (killer demo)
+9. Neuron Steering: Amplify/suppress neurons to control output
+10. Selectivity Scores: Quantify neuron specialization
+
 Usage:
     from dawn_interpretability import DAWNInterpreter
     interpreter = DAWNInterpreter(model, tokenizer, device='cuda')
     interpreter.run_full_analysis(dataloader, max_batches=500)
+
+    # V2 experiments
+    interpreter.run_v2_experiments(dataloader)
+
+CLI:
+    python dawn_interpretability.py --checkpoint ckpt.pt --val_data val.pt
+    python dawn_interpretability.py --checkpoint ckpt.pt --val_data val.pt --v2  # Include V2
+    python dawn_interpretability.py --checkpoint ckpt.pt --val_data val.pt --v2_only  # V2 only
 """
 
 import os, json, re
@@ -953,6 +968,871 @@ class DAWNInterpreter:
 
         return results
 
+    # =========================================================================
+    # V2 EXPERIMENTS - Enhanced Interpretability Proofs
+    # =========================================================================
+
+    def surgical_ablation_experiment(self, dataloader, max_batches=50):
+        """
+        Test: Does removing ONE neuron selectively affect ONE capability?
+
+        Success criteria:
+        - NOUN neuron removal → NOUN accuracy drops, others stable
+        - VERB neuron removal → VERB accuracy drops, others stable
+        """
+        print(f"\n{'='*60}")
+        print("EXPERIMENT: Surgical Ablation (Single Neuron)")
+        print(f"{'='*60}")
+
+        # First, identify top neurons per POS
+        pos_neurons = self._identify_pos_neurons(dataloader, max_batches=20)
+
+        if not pos_neurons:
+            print("  No POS neurons identified, skipping...")
+            return {}
+
+        # Baseline evaluation with POS breakdown
+        print("\n[Baseline]")
+        baseline = self._evaluate_by_pos(dataloader, max_batches)
+        print(f"  Overall: loss={baseline['overall_loss']:.4f}, acc={baseline['overall_acc']:.4f}")
+        for pos, metrics in baseline['pos_metrics'].items():
+            print(f"  {pos}: acc={metrics['accuracy']:.4f} ({metrics['count']} samples)")
+
+        results = {"baseline": baseline, "ablations": {}}
+
+        # Test single neuron ablations
+        for pos in ["NOUN", "VERB", "ADJ", "DET"]:
+            if pos not in pos_neurons or not pos_neurons[pos]:
+                continue
+
+            top_neuron = pos_neurons[pos][0]  # Just the top 1
+            nt, idx = top_neuron
+
+            print(f"\n[Ablating {nt}_{idx} (top {pos} neuron)]")
+
+            # Ablate single neuron
+            self._ablate_single_neuron(nt, idx)
+            ablated = self._evaluate_by_pos(dataloader, max_batches)
+            self._restore_weights()
+
+            # Calculate selective impact
+            results["ablations"][f"{pos}_{nt}_{idx}"] = {
+                "target_pos": pos,
+                "neuron": f"{nt}_{idx}",
+                "overall_loss_increase": ablated['overall_loss'] - baseline['overall_loss'],
+                "overall_acc_drop": baseline['overall_acc'] - ablated['overall_acc'],
+                "pos_impacts": {}
+            }
+
+            print(f"  Overall: loss={ablated['overall_loss']:.4f} (+{ablated['overall_loss']-baseline['overall_loss']:.4f})")
+
+            for p, metrics in ablated['pos_metrics'].items():
+                if p in baseline['pos_metrics']:
+                    base_acc = baseline['pos_metrics'][p]['accuracy']
+                    drop = base_acc - metrics['accuracy']
+                    results["ablations"][f"{pos}_{nt}_{idx}"]["pos_impacts"][p] = {
+                        "accuracy_drop": drop,
+                        "relative_drop": drop / (base_acc + 1e-8)
+                    }
+                    marker = "⬇️" if drop > 0.05 else "→"
+                    print(f"  {p}: acc={metrics['accuracy']:.4f} ({marker} {drop:+.4f})")
+
+        # Analyze selectivity
+        self._analyze_ablation_selectivity(results)
+
+        return results
+
+    def _identify_pos_neurons(self, dataloader, max_batches=20) -> Dict[str, List[Tuple[str, int]]]:
+        """Identify top neurons for each POS tag"""
+        print("\n[Identifying POS-specific neurons...]")
+
+        pos_neuron_counts = defaultdict(lambda: defaultdict(Counter))
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            if isinstance(batch, (list, tuple)):
+                input_ids = batch[0].to(self.device)
+            else:
+                input_ids = batch.to(self.device)
+
+            B, L = input_ids.shape
+
+            with torch.no_grad():
+                output = self.model(input_ids, return_routing_info=True)
+                if isinstance(output, tuple) and len(output) >= 2:
+                    routing_infos = output[-1]
+                else:
+                    continue
+
+            # Get tokens and POS tags
+            for b in range(min(B, 4)):  # Sample subset
+                tokens = input_ids[b].cpu().tolist()
+                text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+                if self.nlp:
+                    doc = self.nlp(text)
+                    token_pos = {tok.text.lower(): tok.pos_ for tok in doc}
+                else:
+                    token_pos = {}
+
+                for layer_idx, layer_info in enumerate(routing_infos):
+                    if 'attention' not in layer_info:
+                        continue
+
+                    attn = layer_info['attention']
+                    for nt, pref_key in [('R', 'relational_q_pref'), ('FR', 'feature_r_pref')]:
+                        pref = attn.get(pref_key)
+                        if pref is None:
+                            continue
+
+                        topk = min(4, pref.shape[-1])
+                        _, topk_idx = torch.topk(pref[b], topk, dim=-1)
+
+                        for pos in range(min(L, 128)):
+                            tok_str = self.tokenizer.decode([tokens[pos]]).strip().lower()
+                            pos_tag = token_pos.get(tok_str, "UNK")
+
+                            for n_idx in topk_idx[pos].cpu().tolist():
+                                pos_neuron_counts[pos_tag][nt][n_idx] += 1
+
+        # Get top neurons per POS
+        result = {}
+        for pos in ["NOUN", "VERB", "ADJ", "DET", "ADP", "PUNCT"]:
+            if pos in pos_neuron_counts:
+                all_neurons = []
+                for nt in ["R", "FR"]:
+                    for n_idx, count in pos_neuron_counts[pos][nt].most_common(3):
+                        all_neurons.append((nt, n_idx, count))
+                all_neurons.sort(key=lambda x: -x[2])
+                result[pos] = [(nt, idx) for nt, idx, _ in all_neurons[:3]]
+                print(f"  {pos}: {result[pos]}")
+
+        return result
+
+    def _evaluate_by_pos(self, dataloader, max_batches) -> Dict:
+        """Evaluate with POS-level breakdown"""
+        total_loss, total_correct, total_count = 0, 0, 0
+        pos_stats = defaultdict(lambda: {"correct": 0, "total": 0})
+
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+
+            if isinstance(batch, (list, tuple)):
+                input_ids = batch[0].to(self.device)
+            else:
+                input_ids = batch.to(self.device)
+
+            B, L = input_ids.shape
+
+            with torch.no_grad():
+                output = self.model(input_ids)
+                logits = output[0] if isinstance(output, tuple) else output
+
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = input_ids[:, 1:].contiguous()
+
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1).long(),
+                    reduction='sum'
+                )
+                total_loss += loss.item()
+
+                preds = shift_logits.argmax(-1)
+                correct = (preds == shift_labels)
+                total_correct += correct.sum().item()
+                total_count += shift_labels.numel()
+
+                # POS breakdown (sample first batch only for speed)
+                if batch_idx == 0 and self.nlp:
+                    for b in range(min(B, 2)):
+                        tokens = input_ids[b].cpu().tolist()
+                        text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+                        doc = self.nlp(text)
+
+                        for i, tok in enumerate(doc):
+                            if i < L - 1:
+                                pos_stats[tok.pos_]["total"] += 1
+                                if correct[b, i].item():
+                                    pos_stats[tok.pos_]["correct"] += 1
+
+        pos_metrics = {}
+        for pos, stats in pos_stats.items():
+            if stats["total"] > 0:
+                pos_metrics[pos] = {
+                    "accuracy": stats["correct"] / stats["total"],
+                    "count": stats["total"]
+                }
+
+        return {
+            "overall_loss": total_loss / total_count if total_count > 0 else 0,
+            "overall_acc": total_correct / total_count if total_count > 0 else 0,
+            "pos_metrics": pos_metrics
+        }
+
+    def _ablate_single_neuron(self, nt: str, idx: int):
+        """Zero out a single neuron"""
+        patterns = {"FR": "feature_r", "FV": "feature_v", "R": "relational", "V": "value"}
+        pattern = patterns.get(nt, nt.lower())
+
+        for name, param in self.model.named_parameters():
+            if pattern in name.lower() and "neurons" in name.lower():
+                if name not in self.original_weights:
+                    self.original_weights[name] = param.data.clone()
+                if idx < param.shape[0]:
+                    param.data[idx] = 0
+
+    def _restore_weights(self):
+        """Restore original weights"""
+        for name, orig in self.original_weights.items():
+            for pname, param in self.model.named_parameters():
+                if pname == name:
+                    param.data = orig.clone()
+        self.original_weights = {}
+
+    def _analyze_ablation_selectivity(self, results):
+        """Analyze if ablations are selective"""
+        print("\n[Selectivity Analysis]")
+
+        for ablation_name, data in results.get("ablations", {}).items():
+            target_pos = data["target_pos"]
+            impacts = data["pos_impacts"]
+
+            if target_pos not in impacts:
+                continue
+
+            target_drop = impacts[target_pos].get("relative_drop", 0)
+            other_drops = [v["relative_drop"] for k, v in impacts.items() if k != target_pos]
+            avg_other_drop = np.mean(other_drops) if other_drops else 0
+
+            selectivity = target_drop / (avg_other_drop + 1e-8) if avg_other_drop > 0 else float('inf')
+
+            if selectivity > 2:
+                verdict = "✅ SELECTIVE"
+            elif selectivity > 1:
+                verdict = "⚠️ PARTIAL"
+            else:
+                verdict = "❌ NOT SELECTIVE"
+
+            print(f"  {ablation_name}: target_drop={target_drop:.3f}, other_avg={avg_other_drop:.3f}, selectivity={selectivity:.2f} {verdict}")
+
+    def cross_layer_consistency_experiment(self, dataloader, max_batches=30):
+        """
+        Test: Does the same token activate the same neurons across layers?
+
+        High consistency = neurons have stable semantic meaning
+        Low consistency = neurons are just computational
+        """
+        print(f"\n{'='*60}")
+        print("EXPERIMENT: Cross-Layer Consistency")
+        print(f"{'='*60}")
+
+        token_layer_neurons = defaultdict(lambda: defaultdict(Counter))
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            if isinstance(batch, (list, tuple)):
+                input_ids = batch[0].to(self.device)
+            else:
+                input_ids = batch.to(self.device)
+
+            B, L = input_ids.shape
+
+            with torch.no_grad():
+                output = self.model(input_ids, return_routing_info=True)
+                routing_infos = output[-1] if isinstance(output, tuple) else []
+
+            if not routing_infos:
+                continue
+
+            for b in range(min(B, 8)):
+                tokens = input_ids[b].cpu().tolist()
+
+                for pos in range(min(L, 256)):
+                    tok_id = tokens[pos]
+                    tok_str = self.tokenizer.decode([tok_id]).strip().lower()
+
+                    if not tok_str or tok_str in ['[PAD]', '<pad>', '[CLS]', '[SEP]']:
+                        continue
+
+                    for layer_idx, layer_info in enumerate(routing_infos):
+                        if 'attention' not in layer_info:
+                            continue
+
+                        pref = layer_info['attention'].get('relational_q_pref')
+                        if pref is None:
+                            continue
+
+                        topk = min(4, pref.shape[-1])
+                        _, topk_idx = torch.topk(pref[b, pos], topk)
+
+                        for n_idx in topk_idx.cpu().tolist():
+                            token_layer_neurons[tok_str][layer_idx][n_idx] += 1
+
+        # Analyze consistency
+        print("\n[Per-Token Consistency]")
+
+        consistencies = []
+        token_results = {}
+
+        for tok, layer_data in list(token_layer_neurons.items())[:100]:
+            if len(layer_data) < 2:
+                continue
+
+            # Get top neurons per layer
+            layer_tops = {}
+            for layer_idx, neuron_counts in layer_data.items():
+                top_neurons = set([n for n, _ in neuron_counts.most_common(3)])
+                layer_tops[layer_idx] = top_neurons
+
+            # Calculate pairwise Jaccard similarity
+            layers = sorted(layer_tops.keys())
+            similarities = []
+            for i in range(len(layers) - 1):
+                for j in range(i + 1, len(layers)):
+                    s1, s2 = layer_tops[layers[i]], layer_tops[layers[j]]
+                    jaccard = len(s1 & s2) / len(s1 | s2) if (s1 | s2) else 0
+                    similarities.append(jaccard)
+
+            avg_sim = np.mean(similarities) if similarities else 0
+            consistencies.append(avg_sim)
+            token_results[tok] = {"consistency": avg_sim, "layers": len(layer_data)}
+
+        # Summary
+        overall_consistency = np.mean(consistencies) if consistencies else 0
+        print(f"\n  Overall consistency: {overall_consistency:.3f}")
+        print(f"  (0 = different neurons each layer, 1 = same neurons all layers)")
+
+        # Top consistent tokens
+        sorted_tokens = sorted(token_results.items(), key=lambda x: -x[1]["consistency"])
+        print("\n  Most consistent tokens:")
+        for tok, data in sorted_tokens[:10]:
+            print(f"    '{tok}': {data['consistency']:.3f}")
+
+        print("\n  Least consistent tokens:")
+        for tok, data in sorted_tokens[-10:]:
+            print(f"    '{tok}': {data['consistency']:.3f}")
+
+        # Visualize
+        self._plot_consistency_distribution(consistencies)
+
+        return {
+            "overall_consistency": overall_consistency,
+            "token_results": token_results,
+            "distribution": consistencies
+        }
+
+    def _plot_consistency_distribution(self, consistencies):
+        """Plot consistency distribution"""
+        if not consistencies:
+            return
+        plt.figure(figsize=(10, 5))
+        plt.hist(consistencies, bins=30, edgecolor='black', alpha=0.7)
+        plt.axvline(np.mean(consistencies), color='red', linestyle='--', label=f'Mean: {np.mean(consistencies):.3f}')
+        plt.xlabel("Cross-Layer Consistency (Jaccard)")
+        plt.ylabel("Count")
+        plt.title("Token-Neuron Consistency Across Layers")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, "cross_layer_consistency.png"), dpi=150)
+        plt.close()
+        print(f"  Saved: cross_layer_consistency.png")
+
+    def toxicity_neuron_experiment(self, toxic_texts: List[str] = None, clean_texts: List[str] = None):
+        """
+        Test: Can we find neurons that activate for toxic content?
+        Can we reduce toxicity by ablating them?
+
+        THIS IS THE KILLER DEMO for proving interpretability value.
+        """
+        print(f"\n{'='*60}")
+        print("EXPERIMENT: Toxicity Neuron Detection")
+        print(f"{'='*60}")
+
+        # Default examples if not provided
+        if toxic_texts is None:
+            toxic_texts = [
+                "I hate you so much, you're worthless",
+                "You're an idiot and everyone knows it",
+                "Shut up, nobody cares about your opinion",
+                "You're pathetic and deserve nothing",
+                "I hope you fail at everything",
+                "You're the worst person I've ever met",
+                "Nobody likes you, just give up",
+                "You're so stupid it's unbelievable",
+            ]
+
+        if clean_texts is None:
+            clean_texts = [
+                "I appreciate your help with this project",
+                "Thank you for sharing your perspective",
+                "That's an interesting point to consider",
+                "I hope you have a wonderful day",
+                "Your work on this has been excellent",
+                "I value our collaboration together",
+                "This is a great opportunity to learn",
+                "I'm grateful for your contribution",
+            ]
+
+        print(f"\n[Collecting activations for {len(toxic_texts)} toxic, {len(clean_texts)} clean texts]")
+
+        toxic_activations = self._collect_text_activations(toxic_texts)
+        clean_activations = self._collect_text_activations(clean_texts)
+
+        # Find differentially activated neurons
+        print("\n[Finding toxicity-specific neurons]")
+        toxic_neurons = self._find_differential_neurons(toxic_activations, clean_activations)
+
+        if not toxic_neurons:
+            print("  No significant differential neurons found")
+            return {}
+
+        print(f"\n  Top toxicity neurons:")
+        for neuron, score in toxic_neurons[:10]:
+            print(f"    {neuron}: diff_score={score:.4f}")
+
+        # Test ablation effect
+        print("\n[Testing toxicity reduction via ablation]")
+        results = self._test_toxicity_ablation(toxic_texts, clean_texts, toxic_neurons[:5])
+
+        return {
+            "toxic_neurons": toxic_neurons[:20],
+            "ablation_results": results
+        }
+
+    def _collect_text_activations(self, texts: List[str]) -> Dict[str, float]:
+        """Collect neuron activations for given texts"""
+        neuron_activations = defaultdict(list)
+
+        for text in texts:
+            input_ids = self.tokenizer.encode(text, return_tensors='pt',
+                                              max_length=128, truncation=True).to(self.device)
+
+            with torch.no_grad():
+                output = self.model(input_ids, return_routing_info=True)
+                routing_infos = output[-1] if isinstance(output, tuple) else []
+
+            for layer_idx, layer_info in enumerate(routing_infos):
+                if 'attention' not in layer_info:
+                    continue
+
+                attn = layer_info['attention']
+                for nt, key in [('R', 'relational_q_pref'), ('FR', 'feature_r_pref'),
+                                ('V', 'value_pref'), ('FV', 'feature_v_pref')]:
+                    pref = attn.get(key)
+                    if pref is None:
+                        continue
+
+                    # Average activation across sequence
+                    avg_activation = pref[0].mean(dim=0).cpu().numpy()
+
+                    for n_idx, act in enumerate(avg_activation):
+                        neuron_activations[f"{nt}_{n_idx}"].append(act)
+
+        # Average across texts
+        return {k: np.mean(v) for k, v in neuron_activations.items()}
+
+    def _find_differential_neurons(self, toxic_act: Dict, clean_act: Dict) -> List[Tuple[str, float]]:
+        """Find neurons that activate more for toxic than clean"""
+        differential = []
+
+        for neuron in toxic_act:
+            if neuron in clean_act:
+                diff = toxic_act[neuron] - clean_act[neuron]
+                if diff > 0.01:  # More active for toxic
+                    differential.append((neuron, diff))
+
+        differential.sort(key=lambda x: -x[1])
+        return differential
+
+    def _test_toxicity_ablation(self, toxic_texts, clean_texts, toxic_neurons):
+        """Test if ablating toxic neurons reduces toxicity-related outputs"""
+        results = {}
+
+        # Baseline perplexity
+        baseline_toxic_ppl = self._compute_text_perplexity(toxic_texts)
+        baseline_clean_ppl = self._compute_text_perplexity(clean_texts)
+
+        print(f"\n  Baseline PPL - Toxic: {baseline_toxic_ppl:.2f}, Clean: {baseline_clean_ppl:.2f}")
+
+        results["baseline"] = {
+            "toxic_ppl": baseline_toxic_ppl,
+            "clean_ppl": baseline_clean_ppl
+        }
+
+        # Ablate toxic neurons
+        for neuron, _ in toxic_neurons:
+            nt, idx = neuron.split("_")
+            idx = int(idx)
+            self._ablate_single_neuron(nt, idx)
+
+        ablated_toxic_ppl = self._compute_text_perplexity(toxic_texts)
+        ablated_clean_ppl = self._compute_text_perplexity(clean_texts)
+
+        self._restore_weights()
+
+        print(f"  Ablated PPL - Toxic: {ablated_toxic_ppl:.2f}, Clean: {ablated_clean_ppl:.2f}")
+
+        toxic_increase = (ablated_toxic_ppl - baseline_toxic_ppl) / baseline_toxic_ppl * 100
+        clean_increase = (ablated_clean_ppl - baseline_clean_ppl) / baseline_clean_ppl * 100
+
+        print(f"\n  Toxic PPL increase: {toxic_increase:+.1f}%")
+        print(f"  Clean PPL increase: {clean_increase:+.1f}%")
+
+        if toxic_increase > clean_increase * 1.5:
+            print("  ✅ SUCCESS: Toxic neurons selectively affect toxic text!")
+        else:
+            print("  ⚠️ Mixed results: Effect not clearly selective")
+
+        results["ablated"] = {
+            "toxic_ppl": ablated_toxic_ppl,
+            "clean_ppl": ablated_clean_ppl,
+            "toxic_increase_pct": toxic_increase,
+            "clean_increase_pct": clean_increase
+        }
+
+        return results
+
+    def _compute_text_perplexity(self, texts: List[str]) -> float:
+        """Compute average perplexity for texts"""
+        total_loss = 0
+        total_tokens = 0
+
+        for text in texts:
+            input_ids = self.tokenizer.encode(text, return_tensors='pt',
+                                              max_length=128, truncation=True).to(self.device)
+
+            with torch.no_grad():
+                output = self.model(input_ids)
+                logits = output[0] if isinstance(output, tuple) else output
+
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = input_ids[:, 1:].contiguous()
+
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1).long(),
+                    reduction='sum'
+                )
+                total_loss += loss.item()
+                total_tokens += shift_labels.numel()
+
+        return np.exp(total_loss / total_tokens) if total_tokens > 0 else float('inf')
+
+    def neuron_steering_experiment(self, dataloader, max_batches=20):
+        """
+        Test: Can we control output by amplifying/suppressing specific neurons?
+        """
+        print(f"\n{'='*60}")
+        print("EXPERIMENT: Neuron Steering")
+        print(f"{'='*60}")
+
+        results = {}
+
+        # Baseline
+        baseline = self._evaluate_simple(dataloader, max_batches)
+        print(f"\n  Baseline: loss={baseline['loss']:.4f}, acc={baseline['acc']:.4f}")
+        results["baseline"] = baseline
+
+        # Find most active neurons first
+        top_neurons = self._find_most_active_neurons(dataloader, max_batches=5)
+
+        if not top_neurons:
+            print("  No neurons found for steering test")
+            return results
+
+        print(f"\n  Testing steering with top neurons: {top_neurons[:3]}")
+
+        for scale in [0.5, 2.0, 3.0]:
+            print(f"\n  [Scale {scale}x on top neurons]")
+
+            for nt, idx in top_neurons[:3]:
+                self._scale_neuron(nt, idx, scale)
+
+            scaled = self._evaluate_simple(dataloader, max_batches)
+
+            for nt, idx in top_neurons[:3]:
+                self._scale_neuron(nt, idx, 1.0 / scale)  # Restore
+
+            change = (scaled['loss'] - baseline['loss']) / baseline['loss'] * 100
+            print(f"    Loss: {scaled['loss']:.4f} ({change:+.1f}%)")
+
+            results[f"scale_{scale}"] = scaled
+
+        return results
+
+    def _find_most_active_neurons(self, dataloader, max_batches=5) -> List[Tuple[str, int]]:
+        """Find neurons with highest average activation"""
+        neuron_activity = defaultdict(float)
+        count = 0
+
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+
+            if isinstance(batch, (list, tuple)):
+                input_ids = batch[0].to(self.device)
+            else:
+                input_ids = batch.to(self.device)
+
+            with torch.no_grad():
+                output = self.model(input_ids, return_routing_info=True)
+                routing_infos = output[-1] if isinstance(output, tuple) else []
+
+            for layer_info in routing_infos:
+                if 'attention' not in layer_info:
+                    continue
+
+                for nt, key in [('R', 'relational_q_pref'), ('FR', 'feature_r_pref')]:
+                    pref = layer_info['attention'].get(key)
+                    if pref is not None:
+                        avg = pref.mean(dim=(0, 1)).cpu().numpy()
+                        for i, v in enumerate(avg):
+                            neuron_activity[(nt, i)] += v
+                            count += 1
+
+        sorted_neurons = sorted(neuron_activity.items(), key=lambda x: -x[1])
+        return [k for k, v in sorted_neurons[:10]]
+
+    def _scale_neuron(self, nt: str, idx: int, scale: float):
+        """Scale a neuron's weights"""
+        patterns = {"FR": "feature_r", "FV": "feature_v", "R": "relational", "V": "value"}
+        pattern = patterns.get(nt, nt.lower())
+
+        for name, param in self.model.named_parameters():
+            if pattern in name.lower() and "neurons" in name.lower():
+                if idx < param.shape[0]:
+                    param.data[idx] *= scale
+
+    def _evaluate_simple(self, dataloader, max_batches) -> Dict:
+        """Simple evaluation"""
+        total_loss, total_correct, total_count = 0, 0, 0
+
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+
+            if isinstance(batch, (list, tuple)):
+                input_ids = batch[0].to(self.device)
+            else:
+                input_ids = batch.to(self.device)
+
+            with torch.no_grad():
+                output = self.model(input_ids)
+                logits = output[0] if isinstance(output, tuple) else output
+
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = input_ids[:, 1:].contiguous()
+
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1).long(),
+                    reduction='sum'
+                )
+                total_loss += loss.item()
+                total_correct += (shift_logits.argmax(-1) == shift_labels).sum().item()
+                total_count += shift_labels.numel()
+
+        return {
+            "loss": total_loss / total_count if total_count > 0 else 0,
+            "acc": total_correct / total_count if total_count > 0 else 0
+        }
+
+    def compute_selectivity_scores(self, dataloader, max_batches=50):
+        """
+        Compute neuron selectivity scores - key metric for paper
+
+        High selectivity = neuron responds to specific linguistic features
+        Low selectivity = neuron is general-purpose
+        """
+        print(f"\n{'='*60}")
+        print("EXPERIMENT: Neuron Selectivity Scores")
+        print(f"{'='*60}")
+
+        # Collect neuron-feature co-occurrences
+        neuron_pos_counts = defaultdict(Counter)
+        neuron_total_counts = Counter()
+
+        for batch_idx, batch in enumerate(tqdm(dataloader, total=max_batches)):
+            if batch_idx >= max_batches:
+                break
+
+            if isinstance(batch, (list, tuple)):
+                input_ids = batch[0].to(self.device)
+            else:
+                input_ids = batch.to(self.device)
+
+            B, L = input_ids.shape
+
+            with torch.no_grad():
+                output = self.model(input_ids, return_routing_info=True)
+                routing_infos = output[-1] if isinstance(output, tuple) else []
+
+            # Get POS tags
+            for b in range(min(B, 4)):
+                tokens = input_ids[b].cpu().tolist()
+                text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+                if self.nlp:
+                    doc = self.nlp(text)
+                    pos_tags = [tok.pos_ for tok in doc]
+                else:
+                    pos_tags = ["UNK"] * L
+
+                for layer_info in routing_infos:
+                    if 'attention' not in layer_info:
+                        continue
+
+                    pref = layer_info['attention'].get('relational_q_pref')
+                    if pref is None:
+                        continue
+
+                    topk = min(4, pref.shape[-1])
+                    _, topk_idx = torch.topk(pref[b], topk, dim=-1)
+
+                    for pos in range(min(len(pos_tags), L)):
+                        pos_tag = pos_tags[pos] if pos < len(pos_tags) else "UNK"
+
+                        for n_idx in topk_idx[pos].cpu().tolist():
+                            neuron_id = f"R_{n_idx}"
+                            neuron_pos_counts[neuron_id][pos_tag] += 1
+                            neuron_total_counts[neuron_id] += 1
+
+        # Compute selectivity scores
+        print("\n[Computing selectivity scores]")
+        selectivity_scores = {}
+
+        for neuron_id, pos_counts in neuron_pos_counts.items():
+            total = neuron_total_counts[neuron_id]
+            if total < 100:
+                continue
+
+            # Compute entropy
+            probs = np.array([c / total for c in pos_counts.values()])
+            entropy = -np.sum(probs * np.log2(probs + 1e-10))
+            max_entropy = np.log2(len(pos_counts)) if len(pos_counts) > 1 else 1
+
+            # Selectivity = 1 - normalized entropy
+            selectivity = 1 - (entropy / max_entropy) if max_entropy > 0 else 0
+
+            # Get dominant POS
+            dominant_pos = pos_counts.most_common(1)[0] if pos_counts else ("UNK", 0)
+            dominance = dominant_pos[1] / total
+
+            selectivity_scores[neuron_id] = {
+                "selectivity": selectivity,
+                "entropy": entropy,
+                "dominant_pos": dominant_pos[0],
+                "dominance": dominance,
+                "total_activations": total
+            }
+
+        # Sort and display
+        sorted_neurons = sorted(selectivity_scores.items(), key=lambda x: -x[1]["selectivity"])
+
+        print("\n  Most selective neurons:")
+        for neuron_id, data in sorted_neurons[:15]:
+            print(f"    {neuron_id}: sel={data['selectivity']:.3f}, "
+                  f"dom={data['dominant_pos']}({data['dominance']:.2f}), "
+                  f"n={data['total_activations']}")
+
+        # Summary statistics
+        all_selectivity = [d["selectivity"] for d in selectivity_scores.values()]
+        if all_selectivity:
+            print(f"\n  Summary:")
+            print(f"    Mean selectivity: {np.mean(all_selectivity):.3f}")
+            print(f"    Std selectivity: {np.std(all_selectivity):.3f}")
+            print(f"    Highly selective (>0.5): {sum(1 for s in all_selectivity if s > 0.5)}/{len(all_selectivity)}")
+
+        # Visualize
+        self._plot_selectivity_distribution(selectivity_scores)
+
+        return selectivity_scores
+
+    def _plot_selectivity_distribution(self, scores):
+        """Plot selectivity distribution"""
+        if not scores:
+            return
+        selectivities = [d["selectivity"] for d in scores.values()]
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Histogram
+        axes[0].hist(selectivities, bins=30, edgecolor='black', alpha=0.7)
+        axes[0].axvline(np.mean(selectivities), color='red', linestyle='--',
+                        label=f'Mean: {np.mean(selectivities):.3f}')
+        axes[0].set_xlabel("Selectivity Score")
+        axes[0].set_ylabel("Count")
+        axes[0].set_title("Neuron Selectivity Distribution")
+        axes[0].legend()
+
+        # By dominant POS
+        pos_selectivity = defaultdict(list)
+        for data in scores.values():
+            pos_selectivity[data["dominant_pos"]].append(data["selectivity"])
+
+        pos_labels = list(pos_selectivity.keys())[:10]
+        pos_means = [np.mean(pos_selectivity[p]) for p in pos_labels]
+
+        axes[1].barh(pos_labels, pos_means)
+        axes[1].set_xlabel("Mean Selectivity")
+        axes[1].set_title("Selectivity by Dominant POS")
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, "selectivity_scores.png"), dpi=150)
+        plt.close()
+        print(f"  Saved: selectivity_scores.png")
+
+    def run_v2_experiments(self, dataloader, max_batches=50, output_dir=None):
+        """Run all V2 interpretability experiments"""
+        if output_dir:
+            self.output_dir = output_dir
+            os.makedirs(output_dir, exist_ok=True)
+
+        results = {}
+
+        print("\n" + "="*70)
+        print("DAWN INTERPRETABILITY V2 EXPERIMENTS")
+        print("="*70)
+
+        # 1. Surgical Ablation
+        results["surgical_ablation"] = self.surgical_ablation_experiment(dataloader, max_batches)
+
+        # 2. Cross-layer Consistency
+        results["cross_layer"] = self.cross_layer_consistency_experiment(dataloader, max_batches)
+
+        # 3. Toxicity Neurons (킬러 데모)
+        results["toxicity"] = self.toxicity_neuron_experiment()
+
+        # 4. Neuron Steering
+        results["steering"] = self.neuron_steering_experiment(dataloader, max_batches)
+
+        # 5. Selectivity Scores
+        results["selectivity"] = self.compute_selectivity_scores(dataloader, max_batches)
+
+        # Save results
+        with open(os.path.join(self.output_dir, "v2_experiment_results.json"), "w") as f:
+            def convert(obj):
+                if isinstance(obj, np.floating): return float(obj)
+                elif isinstance(obj, np.integer): return int(obj)
+                elif isinstance(obj, np.ndarray): return obj.tolist()
+                elif isinstance(obj, dict): return {k: convert(v) for k, v in obj.items()}
+                elif isinstance(obj, list): return [convert(v) for v in obj]
+                return obj
+            json.dump(convert(results), f, indent=2, default=str)
+
+        print(f"\n{'='*70}")
+        print("V2 EXPERIMENTS COMPLETE")
+        print(f"Results saved to: {self.output_dir}")
+        print(f"{'='*70}")
+
+        return results
+
 
 def quick_analysis(model, tokenizer, dataloader, device="cuda", max_batches=500):
     interp = DAWNInterpreter(model, tokenizer, device)
@@ -972,6 +1852,8 @@ if __name__ == "__main__":
     parser.add_argument("--ablation_batches", type=int, default=50, help="Max batches for ablation")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--v2", action="store_true", help="Run V2 interpretability experiments (surgical ablation, toxicity, etc.)")
+    parser.add_argument("--v2_only", action="store_true", help="Run ONLY V2 experiments, skip original analysis")
 
     args = parser.parse_args()
 
@@ -1046,11 +1928,32 @@ if __name__ == "__main__":
 
     # Run analysis
     interp = DAWNInterpreter(model, tokenizer, args.device)
-    interp.run_full_analysis(
-        dataloader,
-        max_batches=args.max_batches,
-        ablation_batches=args.ablation_batches,
-        output_dir=args.output_dir
-    )
+
+    if args.v2_only:
+        # Run only V2 experiments
+        interp.run_v2_experiments(
+            dataloader,
+            max_batches=args.max_batches,
+            output_dir=args.output_dir
+        )
+    else:
+        # Run original analysis
+        interp.run_full_analysis(
+            dataloader,
+            max_batches=args.max_batches,
+            ablation_batches=args.ablation_batches,
+            output_dir=args.output_dir
+        )
+
+        # Optionally also run V2 experiments
+        if args.v2:
+            print("\n" + "="*60)
+            print("Running V2 Experiments...")
+            print("="*60)
+            interp.run_v2_experiments(
+                dataloader,
+                max_batches=args.max_batches,
+                output_dir=args.output_dir
+            )
 
     print(f"\nDone! Results saved to: {args.output_dir}")
