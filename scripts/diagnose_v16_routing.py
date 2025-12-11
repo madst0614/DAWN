@@ -16,7 +16,15 @@ import sys
 import os
 import torch
 import numpy as np
-from collections import Counter
+from collections import Counter, defaultdict
+
+# POS tagging (optional)
+try:
+    import spacy
+    nlp = spacy.load("en_core_web_sm")
+    HAS_SPACY = True
+except:
+    HAS_SPACY = False
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -298,6 +306,242 @@ def diagnose_importance_entropy(model, dataloader, tokenizer, device, max_batche
     return results
 
 
+def diagnose_neuron_roles(model, dataloader, tokenizer, device, target_neurons=None, max_batches=20):
+    """4. 뉴런별 역할 분석 - 어떤 토큰에서 활성화되는가?
+
+    Args:
+        target_neurons: dict of {neuron_type: [neuron_indices]} to analyze
+                       e.g., {'R': [106, 126, 62], 'FR': [0, 5]}
+                       If None, uses top 3 most selected neurons per type
+    """
+    print(f"\n{'='*60}")
+    print("4. Neuron Role Analysis (Token Preference)")
+    print(f"{'='*60}")
+
+    # Collect token preferences for each neuron
+    # Structure: {neuron_type: {neuron_idx: [(token, score, context, pos)]}}
+    neuron_token_data = defaultdict(lambda: defaultdict(list))
+
+    # Track which neurons to analyze (will be filled if target_neurons is None)
+    neuron_selection_counts = defaultdict(Counter)
+
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+
+            if isinstance(batch, (list, tuple)):
+                input_ids = batch[0].to(device)
+            else:
+                input_ids = batch.to(device)
+
+            B, L = input_ids.shape
+
+            output = model(input_ids, return_routing_info=True)
+            if not isinstance(output, tuple) or len(output) < 2:
+                continue
+
+            routing_infos = output[-1]
+
+            # Use layer 0 for analysis
+            if len(routing_infos) == 0 or 'attention' not in routing_infos[0]:
+                continue
+
+            attn = routing_infos[0]['attention']
+
+            pref_map = {
+                'FR': attn.get('feature_r_pref'),
+                'FV': attn.get('feature_v_pref'),
+                'R': attn.get('relational_q_pref'),
+                'V': attn.get('value_pref'),
+            }
+
+            # First pass: count selections to find top neurons
+            for nt, pref in pref_map.items():
+                if pref is None:
+                    continue
+                # pref shape: [B, L, N] or [B, N]
+                if pref.dim() == 3:
+                    # Token-level preference
+                    _, topk_idx = torch.topk(pref, min(4, pref.shape[-1]), dim=-1)
+                    for idx in topk_idx.view(-1).cpu().numpy():
+                        neuron_selection_counts[nt][int(idx)] += 1
+                elif pref.dim() == 2:
+                    # Batch-level preference
+                    _, topk_idx = torch.topk(pref, min(4, pref.shape[-1]), dim=-1)
+                    for idx in topk_idx.view(-1).cpu().numpy():
+                        neuron_selection_counts[nt][int(idx)] += 1
+
+    # Determine target neurons if not specified
+    if target_neurons is None:
+        target_neurons = {}
+        for nt, counts in neuron_selection_counts.items():
+            if counts:
+                top3 = [idx for idx, _ in counts.most_common(3)]
+                target_neurons[nt] = top3
+
+    print(f"\n  Analyzing neurons: {target_neurons}")
+
+    # Second pass: collect token-level data for target neurons
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+
+            if isinstance(batch, (list, tuple)):
+                input_ids = batch[0].to(device)
+            else:
+                input_ids = batch.to(device)
+
+            B, L = input_ids.shape
+            tokens_batch = input_ids.cpu().tolist()
+
+            output = model(input_ids, return_routing_info=True)
+            if not isinstance(output, tuple) or len(output) < 2:
+                continue
+
+            routing_infos = output[-1]
+
+            if len(routing_infos) == 0 or 'attention' not in routing_infos[0]:
+                continue
+
+            attn = routing_infos[0]['attention']
+
+            pref_map = {
+                'FR': attn.get('feature_r_pref'),
+                'FV': attn.get('feature_v_pref'),
+                'R': attn.get('relational_q_pref'),
+                'V': attn.get('value_pref'),
+            }
+
+            for nt, neuron_indices in target_neurons.items():
+                pref = pref_map.get(nt)
+                if pref is None:
+                    continue
+
+                for neuron_idx in neuron_indices:
+                    if neuron_idx >= pref.shape[-1]:
+                        continue
+
+                    if pref.dim() == 3:
+                        # Token-level: pref[:, :, neuron_idx] -> [B, L]
+                        neuron_pref = pref[:, :, neuron_idx]  # [B, L]
+
+                        for b in range(B):
+                            tokens = tokens_batch[b]
+                            prefs_seq = neuron_pref[b].cpu().numpy()  # [L]
+
+                            # Get top 10 positions with highest preference for this neuron
+                            top_pos = np.argsort(prefs_seq)[-10:][::-1]
+
+                            for pos in top_pos:
+                                if pos >= len(tokens):
+                                    continue
+
+                                tok = tokenizer.decode([tokens[pos]]).strip()
+                                score = float(prefs_seq[pos])
+
+                                # Context: ±3 tokens
+                                ctx_start = max(0, pos - 3)
+                                ctx_end = min(len(tokens), pos + 4)
+                                context_tokens = tokens[ctx_start:ctx_end]
+                                context_str = tokenizer.decode(context_tokens)
+
+                                # Mark target position in context
+                                rel_pos = pos - ctx_start
+
+                                neuron_token_data[nt][neuron_idx].append({
+                                    'token': tok,
+                                    'score': score,
+                                    'context': context_str,
+                                    'rel_pos': rel_pos,
+                                    'batch': batch_idx,
+                                    'pos': pos
+                                })
+
+                    elif pref.dim() == 2:
+                        # Batch-level: preference is same for all tokens in batch
+                        neuron_pref = pref[:, neuron_idx]  # [B]
+
+                        for b in range(B):
+                            score = neuron_pref[b].item()
+                            tokens = tokens_batch[b]
+
+                            # For batch-level, record sample tokens from high-preference batches
+                            if score > 0.1:  # Threshold
+                                sample_tokens = tokenizer.decode(tokens[:20])
+                                neuron_token_data[nt][neuron_idx].append({
+                                    'token': '[batch]',
+                                    'score': score,
+                                    'context': sample_tokens,
+                                    'rel_pos': -1,
+                                    'batch': batch_idx,
+                                    'pos': -1
+                                })
+
+    # Analyze and report
+    results = {}
+
+    for nt, neurons_data in neuron_token_data.items():
+        results[nt] = {}
+
+        for neuron_idx, token_list in neurons_data.items():
+            if not token_list:
+                continue
+
+            print(f"\n  {nt}_{neuron_idx}:")
+
+            # Sort by score
+            token_list.sort(key=lambda x: x['score'], reverse=True)
+
+            # Token frequency analysis
+            token_counts = Counter(item['token'] for item in token_list)
+            top20_tokens = token_counts.most_common(20)
+
+            print(f"    Top 20 tokens preferring this neuron:")
+            for tok, cnt in top20_tokens:
+                print(f"      '{tok}': {cnt}")
+
+            # POS analysis (if spacy available)
+            pos_counts = Counter()
+            if HAS_SPACY:
+                for item in token_list[:500]:  # Limit for speed
+                    tok = item['token']
+                    if tok and tok not in ['[batch]', '[CLS]', '[SEP]', '[PAD]']:
+                        try:
+                            doc = nlp(tok)
+                            if doc:
+                                pos_counts[doc[0].pos_] += 1
+                        except:
+                            pass
+
+                if pos_counts:
+                    print(f"\n    POS distribution:")
+                    total_pos = sum(pos_counts.values())
+                    for pos, cnt in pos_counts.most_common(10):
+                        print(f"      {pos}: {cnt} ({100*cnt/total_pos:.1f}%)")
+
+            # Context samples
+            print(f"\n    Context samples (top 10 by score):")
+            for item in token_list[:10]:
+                ctx = item['context'].replace('\n', ' ')[:80]
+                print(f"      [{item['score']:.4f}] ...{ctx}...")
+
+            results[nt][neuron_idx] = {
+                'top20_tokens': [(tok, cnt) for tok, cnt in top20_tokens],
+                'pos_distribution': dict(pos_counts.most_common(10)) if pos_counts else {},
+                'sample_contexts': [
+                    {'score': item['score'], 'context': item['context'][:100]}
+                    for item in token_list[:10]
+                ],
+                'total_samples': len(token_list)
+            }
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="DAWN v16 Routing Diagnostics")
     parser.add_argument("--checkpoint", type=str, required=True)
@@ -306,6 +550,8 @@ def main():
     parser.add_argument("--max_batches", type=int, default=20)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output_dir", type=str, default="./routing_diagnosis")
+    parser.add_argument("--target_neurons", type=str, default=None,
+                       help="Target neurons to analyze, e.g., 'R:106,126,62;FR:0,5' (default: top 3 per type)")
 
     args = parser.parse_args()
 
@@ -369,6 +615,23 @@ def main():
 
     # 3. Importance Entropy
     results['importance_entropy'] = diagnose_importance_entropy(model, dataloader, tokenizer, args.device, args.max_batches)
+
+    # 4. Neuron Role Analysis
+    # Parse target_neurons: "R:106,126,62;FR:0,5" -> {'R': [106, 126, 62], 'FR': [0, 5]}
+    target_neurons = None
+    if args.target_neurons:
+        target_neurons = {}
+        for part in args.target_neurons.split(';'):
+            if ':' in part:
+                nt, indices = part.split(':')
+                target_neurons[nt.strip()] = [int(i.strip()) for i in indices.split(',')]
+        if not target_neurons:
+            target_neurons = None
+
+    results['neuron_roles'] = diagnose_neuron_roles(
+        model, dataloader, tokenizer, args.device,
+        target_neurons=target_neurons, max_batches=args.max_batches
+    )
 
     # Save results
     import json
