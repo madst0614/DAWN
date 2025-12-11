@@ -435,16 +435,25 @@ class DAWNInterpreter:
             self.dep_neuron_counts[dep][nt][int(n_idx)] += count
             self.neuron_dep_counts[f"{nt}_{int(n_idx)}"][nt][dep] += count
 
-        # Morphology counts - Vectorized aggregation (much faster than per-token loop)
-        for morph_col, morph_storage in [('tense', self.tense_neurons),
-                                          ('number', self.number_neurons),
-                                          ('verb_form', self.verb_form_neurons)]:
-            morph_neuron = df[df[morph_col] != 'UNK'].groupby([morph_col, 'nt', 'neuron_idx']).size()
-            for (val, nt, n_idx), count in morph_neuron.items():
-                morph_storage[val][int(n_idx)] += count
-                mk = f"{morph_col.replace('_', '').title()}={val}"
-                self.morph_neuron_counts[mk][nt][int(n_idx)] += count
-                self.neuron_morph_counts[f"{nt}_{int(n_idx)}"][nt][mk] += count
+        # Morphology counts - Single groupby for all features
+        morph_df = df[(df['tense'] != 'UNK') | (df['number'] != 'UNK') | (df['verb_form'] != 'UNK')]
+        if len(morph_df) > 0:
+            morph_agg = morph_df.groupby(['tense', 'number', 'verb_form', 'nt', 'neuron_idx']).size()
+            for (tense, number, verb_form, nt, n_idx), count in morph_agg.items():
+                n_idx = int(n_idx)
+                nk = f"{nt}_{n_idx}"
+                if tense != 'UNK':
+                    self.tense_neurons[tense][n_idx] += count
+                    self.morph_neuron_counts[f"Tense={tense}"][nt][n_idx] += count
+                    self.neuron_morph_counts[nk][nt][f"Tense={tense}"] += count
+                if number != 'UNK':
+                    self.number_neurons[number][n_idx] += count
+                    self.morph_neuron_counts[f"Number={number}"][nt][n_idx] += count
+                    self.neuron_morph_counts[nk][nt][f"Number={number}"] += count
+                if verb_form != 'UNK':
+                    self.verb_form_neurons[verb_form][n_idx] += count
+                    self.morph_neuron_counts[f"Verbform={verb_form}"][nt][n_idx] += count
+                    self.neuron_morph_counts[nk][nt][f"Verbform={verb_form}"] += count
 
         # QK vs V comparison
         qk_types = {'FR', 'R'}
