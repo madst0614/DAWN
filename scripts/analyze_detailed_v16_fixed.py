@@ -175,8 +175,8 @@ def analyze_and_visualize(checkpoint_path, data_path, save_dir='./analysis', n_b
                     print(f"  Warning: {e}")
                 continue
 
-            if batch_idx % 20 == 0:
-                print(f"  Batch {batch_idx}/{n_batches}")
+            if batch_idx % 10 == 0:
+                print(f"  Batch {batch_idx}/{n_batches} ({(batch_idx+1)*batch_size:,} samples)")
 
     if not HAS_MATPLOTLIB:
         print("matplotlib not available, skipping visualization")
