@@ -493,7 +493,9 @@ class DAWNInterpreter:
                 logits = out[0]
             else:
                 logits = out.logits if hasattr(out, 'logits') else out
-            sl, st = logits[...,:-1,:].contiguous(), ids[...,1:].contiguous()
+            sl = logits[...,:-1,:].contiguous()
+            st = ids[...,1:].contiguous().long()  # .long() for cross_entropy
+
             loss += F.cross_entropy(sl.view(-1, sl.size(-1)), st.view(-1), reduction='sum').item()
             correct += (sl.argmax(-1) == st).sum().item()
             total += st.numel()
