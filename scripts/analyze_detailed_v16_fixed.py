@@ -36,7 +36,7 @@ except ImportError:
     HAS_MATPLOTLIB = False
 
 
-def analyze_and_visualize(checkpoint_path, data_path, save_dir='./analysis', n_batches=100, device='cuda'):
+def analyze_and_visualize(checkpoint_path, data_path, save_dir='./analysis', n_batches=100, batch_size=32, device='cuda'):
     os.makedirs(save_dir, exist_ok=True)
     device = device if torch.cuda.is_available() else 'cpu'
 
@@ -90,7 +90,8 @@ def analyze_and_visualize(checkpoint_path, data_path, save_dir='./analysis', n_b
         print(f"Loaded {len(dataset):,} texts")
 
     collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer, max_seq_len=128)
-    dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    print(f"Using batch_size={batch_size}, total batches available: {len(dataloader)}")
 
     # Get config values
     n_neurons = {
@@ -318,6 +319,8 @@ def main():
     parser.add_argument('--output_dir', default='./analysis_detailed', help='Output directory')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--n_batches', '--max_batches', type=int, default=100, dest='n_batches')
+    parser.add_argument('--batch_size', '-bs', type=int, default=128,
+                        help='Batch size for GPU (default: 128, increase for more GPU util)')
 
     args = parser.parse_args()
 
@@ -326,6 +329,7 @@ def main():
         data_path=args.val_data,
         save_dir=args.output_dir,
         n_batches=args.n_batches,
+        batch_size=args.batch_size,
         device=args.device
     )
 
