@@ -653,8 +653,15 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         min_exc_QK, max_exc_QK, mean_exc_QK = exc_QK.min().item(), exc_QK.max().item(), exc_QK.mean().item()
         min_exc_V, max_exc_V, mean_exc_V = exc_V.min().item(), exc_V.max().item(), exc_V.mean().item()
 
+        # Dead neuron ratios (EMA < 0.01)
+        dead_FR = (ema_QK < 0.01).float().mean().item()
+        dead_FV = (ema_V < 0.01).float().mean().item()
+        dead_R = (ema_R < 0.01).float().mean().item()
+        dead_Val = (ema_Val < 0.01).float().mean().item()
+
         lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active FR/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
         lines.append(f"             Gini FR/FV:{gini_QK:.2f}/{gini_V:.2f} R/V:{gini_R:.2f}/{gini_Val:.2f}")
+        lines.append(f"             Dead FR/FV/R/V: {dead_FR:.2%}/{dead_FV:.2%}/{dead_R:.2%}/{dead_Val:.2%}")
         lines.append(f"             Exc FR:[{min_exc_QK:.2f},{mean_exc_QK:.2f},{max_exc_QK:.2f}] FV:[{min_exc_V:.2f},{mean_exc_V:.2f},{max_exc_V:.2f}]")
 
         # Knowledge neurons (if available)
@@ -955,6 +962,27 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         router = base_model.global_routers.neuron_router
                         for line in _get_router_log_lines(router, global_step, total_steps, base_model.global_routers):
                             print(line)
+
+                    # Importance entropy logging (from routing preferences)
+                    try:
+                        imp_entropies = []
+                        for layer_info in routing_infos:
+                            attn_info = layer_info.get('attention', {})
+                            # Try importance tensor first, fallback to relational_q_pref
+                            importance = attn_info.get('importance')
+                            if importance is None:
+                                importance = attn_info.get('relational_q_pref')
+                            if importance is not None and importance.numel() > 0:
+                                # Normalize to probability distribution
+                                p = torch.softmax(importance.float(), dim=-1)
+                                # Entropy: -sum(p * log(p))
+                                ent = -(p * (p + 1e-8).log()).sum(-1).mean()
+                                imp_entropies.append(ent.item())
+                        if imp_entropies:
+                            avg_imp_entropy = sum(imp_entropies) / len(imp_entropies)
+                            print(f"         Importance Entropy: {avg_imp_entropy:.4f} (uniform@100={math.log(100):.2f})")
+                    except Exception:
+                        pass
 
                     # Knowledge neuron usage stats
                     try:
