@@ -156,9 +156,11 @@ def diagnose_neuron_selection(model, dataloader, device, max_batches=20):
                     k = min(topk_map.get(nt, 4), pref.shape[-1])
                     _, topk_idx = torch.topk(pref, k, dim=-1)
 
-                    # Count selections
-                    for idx in topk_idx.view(-1).cpu().tolist():
-                        neuron_counts[nt][idx] += 1
+                    # Count selections (vectorized)
+                    flat_idx = topk_idx.view(-1).cpu().numpy()
+                    unique, counts = np.unique(flat_idx, return_counts=True)
+                    for idx, cnt in zip(unique, counts):
+                        neuron_counts[nt][int(idx)] += int(cnt)
 
     print(f"\n  Analyzed {max_batches} batches, {total_tokens} tokens")
 
