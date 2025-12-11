@@ -612,7 +612,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 
         # Excitability
         tau = router.tau if hasattr(router, 'tau') else 1.5
-        weight = router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0
+        weight = router.excitability_weight.item() if hasattr(router, 'excitability_weight') and hasattr(router.excitability_weight, 'item') else (router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0)
         exc_f = torch.clamp(1.0 - ema_f / tau, min=0.0, max=1.0)
         exc_rel = torch.clamp(1.0 - ema_rel / tau, min=0.0, max=1.0)
         exc_val = torch.clamp(1.0 - ema_val / tau, min=0.0, max=1.0)
@@ -645,7 +645,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 
         # Excitability
         tau = router.tau if hasattr(router, 'tau') else 1.5
-        weight = router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0
+        weight = router.excitability_weight.item() if hasattr(router, 'excitability_weight') and hasattr(router.excitability_weight, 'item') else (router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0)
         exc_QK = torch.clamp(1.0 - ema_QK / tau, min=0.0, max=1.0)
         exc_V = torch.clamp(1.0 - ema_V / tau, min=0.0, max=1.0)
 

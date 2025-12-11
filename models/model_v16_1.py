@@ -80,7 +80,7 @@ class UnifiedNeuronRouter(nn.Module):
 
         # Excitability: tau (recovery time constant) + decaying weight
         self.tau = excitability_tau
-        self.excitability_weight = 1.0
+        self.register_buffer('excitability_weight', torch.tensor(1.0))  # buffer로 등록해야 checkpoint에 저장됨
 
     def update_excitability_weight(self):
         """Langevin dynamics: dw = -α*w + β*dead_ratio"""
@@ -95,12 +95,12 @@ class UnifiedNeuronRouter(nn.Module):
         total_active = active_fr + active_fv + active_r + active_v
         dead_ratio = 1.0 - total_active / total_neurons
 
-        # Langevin dynamics
-        dw = -self.langevin_alpha * self.excitability_weight + self.langevin_beta * dead_ratio
-        self.excitability_weight = self.excitability_weight + dw
+        # Langevin dynamics (in-place update for buffer)
+        dw = -self.langevin_alpha * self.excitability_weight.item() + self.langevin_beta * dead_ratio
+        new_weight = self.excitability_weight.item() + dw
 
-        # Clamp to [0, 1]
-        self.excitability_weight = max(0.0, min(1.0, self.excitability_weight))
+        # Clamp to [0, 1] and update buffer in-place
+        self.excitability_weight.fill_(max(0.0, min(1.0, new_weight)))
 
     def get_excitability(self, usage_ema):
         """Neuronal excitability based on usage."""
