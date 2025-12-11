@@ -57,10 +57,43 @@ def find_checkpoints(folder, pattern="*.pt"):
     return dawn_ckpt, vanilla_ckpt
 
 
+def resolve_checkpoint_path(path):
+    """Resolve path to actual checkpoint file (handles directories)"""
+    if os.path.isfile(path):
+        return path
+
+    if os.path.isdir(path):
+        # Search for checkpoint files in directory
+        patterns = ["*.pt", "*.pth", "checkpoint*.pt", "best*.pt", "final*.pt"]
+        all_ckpts = []
+        for pattern in patterns:
+            all_ckpts.extend(glob.glob(os.path.join(path, pattern)))
+            all_ckpts.extend(glob.glob(os.path.join(path, "**", pattern), recursive=True))
+
+        if all_ckpts:
+            # Prefer 'best' or 'final', otherwise use most recent
+            for ckpt in all_ckpts:
+                name = os.path.basename(ckpt).lower()
+                if 'best' in name or 'final' in name:
+                    print(f"  Found checkpoint: {ckpt}")
+                    return ckpt
+
+            # Sort by modification time, use most recent
+            all_ckpts.sort(key=os.path.getmtime, reverse=True)
+            print(f"  Found checkpoint: {all_ckpts[0]}")
+            return all_ckpts[0]
+
+        raise FileNotFoundError(f"No checkpoint files found in directory: {path}")
+
+    raise FileNotFoundError(f"Path does not exist: {path}")
+
+
 def load_dawn_model(ckpt_path, device='cuda'):
-    """Load DAWN model from checkpoint"""
+    """Load DAWN model from checkpoint (handles directory paths)"""
     from models.model_v16 import DAWN
 
+    # Resolve directory to actual checkpoint file
+    ckpt_path = resolve_checkpoint_path(ckpt_path)
     checkpoint = torch.load(ckpt_path, map_location=device)
     config = checkpoint.get('config', {})
 
@@ -77,7 +110,10 @@ def load_dawn_model(ckpt_path, device='cuda'):
 
 
 def load_vanilla_model(ckpt_path, device='cuda'):
-    """Load Vanilla transformer from checkpoint"""
+    """Load Vanilla transformer from checkpoint (handles directory paths)"""
+    # Resolve directory to actual checkpoint file
+    ckpt_path = resolve_checkpoint_path(ckpt_path)
+
     # Try different model imports
     try:
         from models.model_vanilla import VanillaTransformer
