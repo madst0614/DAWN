@@ -616,62 +616,499 @@ class V16Analyzer:
         return results
 
     # ==========================================================
-    # 7. Sentence Visualization
+    # 7. Active Neuron Diversity (가장 중요!)
     # ==========================================================
-    def visualize_sentence(self, text: str, output_dir: str = None) -> Dict:
-        """Visualize neuron activations for a specific sentence"""
-        self.model.eval()
+    def analyze_diversity(self) -> Dict:
+        """
+        Active Neuron Diversity 분석
+        - 활성 뉴런들이 얼마나 다양하게 사용되는지
+        - Entropy, Effective Count, Coverage 등
+        """
+        if self.router is None:
+            return {'error': 'No router found'}
 
-        # Tokenize
-        tokens = self.tokenizer.tokenize(text)
-        input_ids = self.tokenizer.encode(text, return_tensors='pt').to(self.device)
-        attention_mask = torch.ones_like(input_ids)
+        results = {}
+        threshold = 0.01
 
-        results = {'text': text, 'tokens': tokens}
+        for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
+            ema = getattr(self.router, f'usage_ema_{name}')
+            n_total = getattr(self.router, f'n_{name}')
 
-        with torch.no_grad():
-            try:
-                outputs = self.model(input_ids, attention_mask=attention_mask, return_routing_info=True)
-                routing_info = outputs.get('routing_info', {})
-            except Exception as e:
-                return {'error': str(e)}
+            # Active neurons
+            active_mask = ema > threshold
+            n_active = active_mask.sum().item()
+            active_ema = ema[active_mask]
 
-        # Extract activations for each token
-        activations = {}
-        for key in ['feature_r_weights', 'feature_v_weights', 'relational_weights_Q', 'value_weights']:
-            if key in routing_info:
-                w = routing_info[key]
-                if w.dim() == 3:  # [B, S, N]
-                    activations[key] = w[0].cpu().numpy()  # [S, N]
+            if n_active == 0:
+                results[name] = {
+                    'n_total': n_total,
+                    'n_active': 0,
+                    'diversity_entropy': 0.0,
+                    'effective_count': 0.0,
+                    'coverage': 0.0,
+                    'concentration_ratio': 1.0,
+                    'top5_share': 1.0,
+                }
+                continue
 
-        results['activations'] = {k: v.tolist() for k, v in activations.items()}
+            # Normalize to distribution
+            p = active_ema / (active_ema.sum() + 1e-8)
+
+            # Shannon entropy (higher = more diverse)
+            entropy = -torch.sum(p * torch.log(p + 1e-8)).item()
+            max_entropy = np.log(n_active)  # Maximum possible entropy
+
+            # Effective count (exponential of entropy)
+            effective_count = np.exp(entropy)
+
+            # Normalized entropy (0-1 scale)
+            normalized_entropy = entropy / (max_entropy + 1e-8) if max_entropy > 0 else 0
+
+            # Coverage: what fraction of total neurons are active
+            coverage = n_active / n_total
+
+            # Concentration ratio: top-5 neurons' share
+            top5_ema = torch.topk(ema, min(5, len(ema))).values
+            top5_share = top5_ema.sum().item() / (ema.sum().item() + 1e-8)
+
+            # Gini coefficient (0=equal, 1=concentrated)
+            gini = gini_coefficient(ema)
+
+            results[name] = {
+                'n_total': n_total,
+                'n_active': int(n_active),
+                'diversity_entropy': float(entropy),
+                'normalized_entropy': float(normalized_entropy),
+                'effective_count': float(effective_count),
+                'coverage': float(coverage),
+                'concentration_ratio': float(1 - normalized_entropy),
+                'top5_share': float(top5_share),
+                'gini': float(gini),
+            }
+
+        # Overall diversity score (weighted average)
+        weights = {'feature_r': 2, 'feature_v': 2, 'relational': 1.5, 'value': 1.5, 'knowledge': 1}
+        total_weight = sum(weights.values())
+        overall_diversity = sum(
+            results[name].get('normalized_entropy', 0) * weights[name]
+            for name in weights if name in results
+        ) / total_weight
+
+        results['overall'] = {
+            'diversity_score': float(overall_diversity),
+            'health': 'good' if overall_diversity > 0.7 else 'warning' if overall_diversity > 0.4 else 'critical'
+        }
+
+        return results
+
+    # ==========================================================
+    # 8. Dead Neuron Potential (축소 결정용)
+    # ==========================================================
+    def analyze_dead_neurons(self, output_dir: str = None) -> Dict:
+        """
+        Dead Neuron 분석 - 축소 가능성 판단
+        - Dead: EMA < threshold, 거의 사용 안됨
+        - Dying: EMA가 decay 중
+        - Revivable: Dead지만 excitability 높음
+        """
+        if self.router is None:
+            return {'error': 'No router found'}
+
+        results = {}
+        threshold = 0.01
+        dying_threshold = 0.05  # 죽어가는 중
+        tau = self.router.tau
+
+        for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
+            ema = getattr(self.router, f'usage_ema_{name}')
+            n_total = getattr(self.router, f'n_{name}')
+
+            # Categories
+            dead_mask = ema < threshold
+            dying_mask = (ema >= threshold) & (ema < dying_threshold)
+            active_mask = ema >= dying_threshold
+
+            n_dead = dead_mask.sum().item()
+            n_dying = dying_mask.sum().item()
+            n_active = active_mask.sum().item()
+
+            # Excitability for dead neurons
+            exc = torch.clamp(1.0 - ema / tau, min=0.0, max=1.0)
+            dead_exc = exc[dead_mask]
+
+            # Revivable: dead but high excitability
+            revivable_mask = dead_mask & (exc > 0.8)
+            n_revivable = revivable_mask.sum().item()
+
+            # Candidates for removal (dead + low excitability)
+            removable_mask = dead_mask & (exc < 0.3)
+            n_removable = removable_mask.sum().item()
+
+            results[name] = {
+                'n_total': n_total,
+                'n_dead': int(n_dead),
+                'n_dying': int(n_dying),
+                'n_active': int(n_active),
+                'n_revivable': int(n_revivable),
+                'n_removable': int(n_removable),
+                'dead_ratio': float(n_dead / n_total),
+                'removable_ratio': float(n_removable / n_total),
+                'dead_neuron_ids': dead_mask.nonzero().squeeze(-1).tolist() if n_dead > 0 else [],
+                'removable_neuron_ids': removable_mask.nonzero().squeeze(-1).tolist() if n_removable > 0 else [],
+            }
+
+        # Shrink recommendations
+        total_removable = sum(r['n_removable'] for r in results.values() if isinstance(r, dict))
+        total_neurons = sum(r['n_total'] for r in results.values() if isinstance(r, dict))
+
+        results['shrink_recommendation'] = {
+            'total_removable': total_removable,
+            'shrink_ratio': float(total_removable / total_neurons),
+            'recommended_action': 'shrink' if total_removable > total_neurons * 0.2 else 'keep',
+            'per_type': {
+                name: {
+                    'current': results[name]['n_total'],
+                    'recommended': results[name]['n_total'] - results[name]['n_removable'],
+                    'remove': results[name]['n_removable'],
+                }
+                for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']
+                if name in results
+            }
+        }
 
         # Visualization
-        if HAS_MATPLOTLIB and output_dir and activations:
+        if HAS_MATPLOTLIB and output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-            n_types = len(activations)
-            fig, axes = plt.subplots(n_types, 1, figsize=(12, 3 * n_types))
-            if n_types == 1:
-                axes = [axes]
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            axes = axes.flatten()
 
-            token_labels = ['[CLS]'] + tokens + ['[SEP]']
+            colors = ['green', 'yellow', 'red']
+            labels = ['Active', 'Dying', 'Dead']
 
-            for ax, (key, act) in zip(axes, activations.items()):
-                act = np.array(act)
-                im = ax.imshow(act.T, aspect='auto', cmap='viridis')
-                ax.set_title(key)
-                ax.set_xlabel('Token Position')
-                ax.set_ylabel('Neuron ID')
-                ax.set_xticks(range(len(token_labels)))
-                ax.set_xticklabels(token_labels, rotation=45, ha='right')
-                plt.colorbar(im, ax=ax)
+            for ax, name in zip(axes[:5], ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']):
+                data = results[name]
+                sizes = [data['n_active'], data['n_dying'], data['n_dead']]
+                ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+                ax.set_title(f'{name}\n(removable: {data["n_removable"]})')
+
+            # Summary bar
+            ax = axes[5]
+            names = ['FR', 'FV', 'R', 'V', 'K']
+            removable = [results[n]['n_removable'] for n in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']]
+            ax.bar(names, removable, color='red', alpha=0.7)
+            ax.set_title('Removable Neurons')
+            ax.set_ylabel('Count')
 
             plt.tight_layout()
-            path = os.path.join(output_dir, 'sentence_activation.png')
-            plt.savefig(path, dpi=150, bbox_inches='tight')
+            path = os.path.join(output_dir, 'dead_neurons.png')
+            plt.savefig(path, dpi=150)
             plt.close()
             results['visualization'] = path
+
+        return results
+
+    # ==========================================================
+    # 9. Neuron Clustering
+    # ==========================================================
+    def analyze_clustering(self, n_clusters: int = 5, output_dir: str = None) -> Dict:
+        """
+        Neuron Clustering - 뉴런들의 기능적 그룹 분석
+        """
+        if self.router is None or not HAS_SKLEARN:
+            return {'error': 'No router found or sklearn not available'}
+
+        results = {}
+        emb = self.router.neuron_emb.detach().cpu().numpy()
+
+        # Type boundaries
+        boundaries = {
+            'FR': (0, self.router.n_feature_r),
+            'FV': (self.router.n_feature_r, self.router.n_feature_r + self.router.n_feature_v),
+            'R': (self.router.n_feature_r + self.router.n_feature_v,
+                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational),
+            'V': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational,
+                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value),
+            'K': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value,
+                  self.router.total_neurons),
+        }
+
+        for name, (start, end) in boundaries.items():
+            type_emb = emb[start:end]
+            n_neurons = type_emb.shape[0]
+
+            if n_neurons < n_clusters:
+                results[name] = {'error': f'Not enough neurons for {n_clusters} clusters'}
+                continue
+
+            # K-means clustering
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(type_emb)
+
+            # Cluster stats
+            cluster_stats = []
+            for c in range(n_clusters):
+                cluster_mask = labels == c
+                cluster_size = cluster_mask.sum()
+
+                # Get usage EMA for this type
+                ema_attr = f'usage_ema_{name.lower()}' if name != 'FR' else 'usage_ema_feature_r'
+                if name == 'FV':
+                    ema_attr = 'usage_ema_feature_v'
+                elif name == 'R':
+                    ema_attr = 'usage_ema_relational'
+                elif name == 'V':
+                    ema_attr = 'usage_ema_value'
+                elif name == 'K':
+                    ema_attr = 'usage_ema_knowledge'
+
+                ema = getattr(self.router, ema_attr).cpu().numpy()
+                cluster_ema = ema[cluster_mask]
+
+                cluster_stats.append({
+                    'cluster_id': c,
+                    'size': int(cluster_size),
+                    'avg_usage': float(cluster_ema.mean()),
+                    'active_count': int((cluster_ema > 0.01).sum()),
+                    'neuron_ids': np.where(cluster_mask)[0].tolist(),
+                })
+
+            # Sort by average usage
+            cluster_stats.sort(key=lambda x: x['avg_usage'], reverse=True)
+
+            results[name] = {
+                'n_clusters': n_clusters,
+                'clusters': cluster_stats,
+                'inertia': float(kmeans.inertia_),
+            }
+
+        # Visualization
+        if HAS_MATPLOTLIB and output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            axes = axes.flatten()
+
+            for ax, (name, (start, end)) in zip(axes[:5], boundaries.items()):
+                if name not in results or 'error' in results[name]:
+                    ax.axis('off')
+                    continue
+
+                type_emb = emb[start:end]
+
+                # PCA for visualization
+                pca = PCA(n_components=2)
+                emb_2d = pca.fit_transform(type_emb)
+
+                # Get cluster labels
+                kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+                labels = kmeans.fit_predict(type_emb)
+
+                scatter = ax.scatter(emb_2d[:, 0], emb_2d[:, 1], c=labels, cmap='tab10', alpha=0.6, s=20)
+                ax.set_title(f'{name} Clusters')
+                ax.set_xlabel('PC1')
+                ax.set_ylabel('PC2')
+
+            axes[5].axis('off')
+
+            plt.tight_layout()
+            path = os.path.join(output_dir, 'neuron_clusters.png')
+            plt.savefig(path, dpi=150)
+            plt.close()
+            results['visualization'] = path
+
+        return results
+
+    # ==========================================================
+    # 10. Token Trajectory
+    # ==========================================================
+    def analyze_token_trajectory(self, dataloader, max_batches: int = 20) -> Dict:
+        """
+        Token Trajectory - 토큰이 어떤 뉴런 경로를 따르는지 분석
+        POS별로 뉴런 사용 패턴 분석
+        """
+        if self.router is None:
+            return {'error': 'No router found'}
+
+        # POS -> neuron usage accumulator
+        pos_neuron_usage = {
+            'feature_r': defaultdict(lambda: defaultdict(float)),
+            'feature_v': defaultdict(lambda: defaultdict(float)),
+            'relational': defaultdict(lambda: defaultdict(float)),
+            'value': defaultdict(lambda: defaultdict(float)),
+        }
+        pos_counts = Counter()
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc='Token Trajectory', total=max_batches)):
+                if batch_idx >= max_batches:
+                    break
+
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+
+                try:
+                    outputs = self.model(input_ids, attention_mask=attention_mask, return_routing_info=True)
+                    routing_info = outputs.get('routing_info', {})
+                except:
+                    continue
+
+                # Process each token
+                for b in range(input_ids.shape[0]):
+                    for s in range(input_ids.shape[1]):
+                        if attention_mask[b, s] == 0:
+                            continue
+
+                        token_id = input_ids[b, s].item()
+                        token = self.tokenizer.decode([token_id])
+                        pos = simple_pos_tag(token)
+                        pos_counts[pos] += 1
+
+                        # Accumulate neuron activations per POS
+                        for ntype, key in [
+                            ('feature_r', 'feature_r_idx'),
+                            ('feature_v', 'feature_v_idx'),
+                            ('relational', 'relational_idx_Q'),
+                            ('value', 'value_idx'),
+                        ]:
+                            if key in routing_info:
+                                idx = routing_info[key]
+                                if idx.dim() >= 2:
+                                    neuron_ids = idx[b, s].cpu().tolist()
+                                    if isinstance(neuron_ids, int):
+                                        neuron_ids = [neuron_ids]
+                                    for nid in neuron_ids:
+                                        pos_neuron_usage[ntype][pos][nid] += 1
+
+        # Aggregate results
+        results = {'pos_counts': dict(pos_counts)}
+
+        for ntype in pos_neuron_usage:
+            results[ntype] = {}
+            for pos in pos_neuron_usage[ntype]:
+                neuron_counts = pos_neuron_usage[ntype][pos]
+                if not neuron_counts:
+                    continue
+
+                # Top neurons for this POS
+                sorted_neurons = sorted(neuron_counts.items(), key=lambda x: x[1], reverse=True)
+                top_neurons = sorted_neurons[:10]
+
+                # Entropy of neuron usage
+                counts = np.array(list(neuron_counts.values()))
+                p = counts / (counts.sum() + 1e-8)
+                entropy = -np.sum(p * np.log(p + 1e-8))
+
+                results[ntype][pos] = {
+                    'top_neurons': [(int(n), float(c)) for n, c in top_neurons],
+                    'unique_neurons': len(neuron_counts),
+                    'entropy': float(entropy),
+                }
+
+        return results
+
+    # ==========================================================
+    # 11. Probing Classifier
+    # ==========================================================
+    def run_probing(self, dataloader, max_batches: int = 50) -> Dict:
+        """
+        Probing Classifier - 뉴런이 어떤 정보를 인코딩하는지
+        POS 분류 태스크로 뉴런 활성화 패턴 분석
+        """
+        if not HAS_SKLEARN:
+            return {'error': 'sklearn not available'}
+
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import accuracy_score, classification_report
+
+        # Collect activations and labels
+        X_data = {
+            'feature_r': [],
+            'feature_v': [],
+            'relational': [],
+            'value': [],
+        }
+        y_labels = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc='Probing', total=max_batches)):
+                if batch_idx >= max_batches:
+                    break
+
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+
+                try:
+                    outputs = self.model(input_ids, attention_mask=attention_mask, return_routing_info=True)
+                    routing_info = outputs.get('routing_info', {})
+                except:
+                    continue
+
+                # Get routing weights
+                for ntype, key in [
+                    ('feature_r', 'feature_r_weights'),
+                    ('feature_v', 'feature_v_weights'),
+                    ('relational', 'relational_weights_Q'),
+                    ('value', 'value_weights'),
+                ]:
+                    if key in routing_info:
+                        w = routing_info[key]
+                        if w.dim() == 3:  # [B, S, N]
+                            for b in range(w.shape[0]):
+                                for s in range(w.shape[1]):
+                                    if attention_mask[b, s] == 0:
+                                        continue
+                                    X_data[ntype].append(w[b, s].cpu().numpy())
+
+                # Labels (POS tags)
+                for b in range(input_ids.shape[0]):
+                    for s in range(input_ids.shape[1]):
+                        if attention_mask[b, s] == 0:
+                            continue
+                        token = self.tokenizer.decode([input_ids[b, s].item()])
+                        pos = simple_pos_tag(token)
+                        y_labels.append(pos)
+
+        results = {}
+
+        # Train probing classifier for each neuron type
+        for ntype in X_data:
+            X = np.array(X_data[ntype])
+            y = np.array(y_labels[:len(X)])
+
+            if len(X) < 100 or len(np.unique(y)) < 2:
+                results[ntype] = {'error': 'Not enough data'}
+                continue
+
+            # Split
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+            # Train
+            clf = LogisticRegression(max_iter=500, random_state=42, multi_class='ovr')
+            try:
+                clf.fit(X_train, y_train)
+                y_pred = clf.predict(X_test)
+                acc = accuracy_score(y_test, y_pred)
+
+                # Per-class accuracy
+                unique_classes = np.unique(y_test)
+                per_class_acc = {}
+                for cls in unique_classes:
+                    mask = y_test == cls
+                    if mask.sum() > 0:
+                        per_class_acc[cls] = float((y_pred[mask] == cls).mean())
+
+                results[ntype] = {
+                    'accuracy': float(acc),
+                    'n_samples': len(X),
+                    'n_classes': len(unique_classes),
+                    'per_class_accuracy': per_class_acc,
+                }
+            except Exception as e:
+                results[ntype] = {'error': str(e)}
 
         return results
 
@@ -884,14 +1321,49 @@ def print_neuron_summary(neuron: Dict):
 # Main
 # ============================================================
 
+def print_diversity_summary(div: Dict):
+    print("\n" + "="*60)
+    print("ACTIVE NEURON DIVERSITY")
+    print("="*60)
+    print(f"{'Type':<12} {'Active':>8} {'EffCount':>10} {'Coverage':>10} {'Top5Share':>10} {'Entropy':>10}")
+    print("-"*70)
+    for key in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
+        if key not in div:
+            continue
+        d = div[key]
+        print(f"{key:<12} {d['n_active']:>8} {d['effective_count']:>10.1f} {d['coverage']:>10.2%} {d['top5_share']:>10.2%} {d['normalized_entropy']:>10.2f}")
+    if 'overall' in div:
+        print("-"*70)
+        print(f"Overall Diversity Score: {div['overall']['diversity_score']:.2f} ({div['overall']['health']})")
+
+
+def print_dead_neurons_summary(dead: Dict):
+    print("\n" + "="*60)
+    print("DEAD NEURON ANALYSIS")
+    print("="*60)
+    print(f"{'Type':<12} {'Dead':>8} {'Dying':>8} {'Active':>8} {'Revivable':>10} {'Removable':>10}")
+    print("-"*70)
+    for key in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
+        if key not in dead:
+            continue
+        d = dead[key]
+        print(f"{key:<12} {d['n_dead']:>8} {d['n_dying']:>8} {d['n_active']:>8} {d['n_revivable']:>10} {d['n_removable']:>10}")
+    if 'shrink_recommendation' in dead:
+        rec = dead['shrink_recommendation']
+        print("-"*70)
+        print(f"Shrink Recommendation: {rec['recommended_action'].upper()}")
+        print(f"Total Removable: {rec['total_removable']} ({rec['shrink_ratio']:.1%})")
+
+
 def main():
     parser = argparse.ArgumentParser(description='DAWN v16 Analysis')
-    parser.add_argument('--checkpoint', required=True, help='Checkpoint path')
+    parser.add_argument('--checkpoint', required=True, help='Checkpoint path (file or directory)')
     parser.add_argument('--val_data', help='Validation data path')
     parser.add_argument('--output_dir', default='./analysis_v16', help='Output directory')
     parser.add_argument('--mode', default='all',
                         choices=['all', 'usage', 'excitability', 'embedding', 'weight_svd',
-                                 'neuron', 'similarity', 'sentence', 'ablation'])
+                                 'neuron', 'similarity', 'diversity', 'dead_neurons',
+                                 'clustering', 'trajectory', 'probing', 'ablation'])
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--max_batches', type=int, default=100)
 
@@ -900,8 +1372,8 @@ def main():
     parser.add_argument('--neuron_type', default='feature_r',
                         choices=['feature_r', 'feature_v', 'relational', 'value'])
 
-    # Sentence visualization
-    parser.add_argument('--text', type=str, default="The quick brown fox jumps over the lazy dog.")
+    # Clustering
+    parser.add_argument('--n_clusters', type=int, default=5)
 
     args = parser.parse_args()
 
@@ -964,11 +1436,70 @@ def main():
         with open(os.path.join(args.output_dir, f'neuron_{args.neuron_type}_{args.neuron_id}.json'), 'w') as f:
             json.dump(convert_to_serializable(neuron), f, indent=2)
 
-    if args.mode == 'sentence':
-        sent = analyzer.visualize_sentence(args.text, args.output_dir)
-        print(f"\nSentence visualization saved to: {sent.get('visualization', 'N/A')}")
-        with open(os.path.join(args.output_dir, 'sentence.json'), 'w') as f:
-            json.dump(convert_to_serializable(sent), f, indent=2)
+    # NEW: Diversity analysis (most important!)
+    if args.mode in ['all', 'diversity']:
+        div = analyzer.analyze_diversity()
+        print_diversity_summary(div)
+        with open(os.path.join(args.output_dir, 'diversity.json'), 'w') as f:
+            json.dump(div, f, indent=2)
+
+    # NEW: Dead neuron analysis (for shrink decisions)
+    if args.mode in ['all', 'dead_neurons']:
+        dead = analyzer.analyze_dead_neurons(args.output_dir)
+        print_dead_neurons_summary(dead)
+        with open(os.path.join(args.output_dir, 'dead_neurons.json'), 'w') as f:
+            json.dump(convert_to_serializable(dead), f, indent=2)
+
+    # NEW: Neuron clustering
+    if args.mode in ['all', 'clustering']:
+        clusters = analyzer.analyze_clustering(args.n_clusters, args.output_dir)
+        print("\n" + "="*60)
+        print("NEURON CLUSTERING")
+        print("="*60)
+        for name, data in clusters.items():
+            if name == 'visualization' or 'error' in str(data):
+                continue
+            print(f"\n{name}: {data['n_clusters']} clusters")
+            for c in data.get('clusters', [])[:3]:
+                print(f"  Cluster {c['cluster_id']}: size={c['size']}, active={c['active_count']}, usage={c['avg_usage']:.4f}")
+        with open(os.path.join(args.output_dir, 'clustering.json'), 'w') as f:
+            json.dump(convert_to_serializable(clusters), f, indent=2)
+
+    # NEW: Token trajectory (requires data)
+    if args.mode == 'trajectory' and args.val_data:
+        from utils.data import TextDataset, collate_fn_dynamic_padding
+        from torch.utils.data import DataLoader
+
+        dataset = TextDataset(args.val_data, tokenizer, max_length=128)
+        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
+
+        traj = analyzer.analyze_token_trajectory(dataloader, args.max_batches)
+        print("\n" + "="*60)
+        print("TOKEN TRAJECTORY")
+        print("="*60)
+        print(f"POS counts: {traj.get('pos_counts', {})}")
+        with open(os.path.join(args.output_dir, 'trajectory.json'), 'w') as f:
+            json.dump(convert_to_serializable(traj), f, indent=2)
+
+    # NEW: Probing classifier (requires data)
+    if args.mode == 'probing' and args.val_data:
+        from utils.data import TextDataset, collate_fn_dynamic_padding
+        from torch.utils.data import DataLoader
+
+        dataset = TextDataset(args.val_data, tokenizer, max_length=128)
+        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
+
+        probing = analyzer.run_probing(dataloader, args.max_batches)
+        print("\n" + "="*60)
+        print("PROBING CLASSIFIER")
+        print("="*60)
+        for ntype, data in probing.items():
+            if 'error' in data:
+                print(f"{ntype}: {data['error']}")
+            else:
+                print(f"{ntype}: accuracy={data['accuracy']:.2%}, samples={data['n_samples']}")
+        with open(os.path.join(args.output_dir, 'probing.json'), 'w') as f:
+            json.dump(convert_to_serializable(probing), f, indent=2)
 
     if args.mode == 'ablation' and args.val_data:
         from utils.data import TextDataset, collate_fn_dynamic_padding
