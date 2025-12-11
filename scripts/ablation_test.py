@@ -404,7 +404,12 @@ def main():
     print(f"  n_relational={config.get('n_relational')}, top_k_relational={config.get('top_k_relational')}")
 
     model = DAWN(**config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Load with strict=False to handle missing excitability_weight in old checkpoints
+    load_result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    if load_result.missing_keys:
+        print(f"  Note: Missing keys (using defaults): {load_result.missing_keys}")
+
     model.to(args.device)
     model.eval()
 

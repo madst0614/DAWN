@@ -337,7 +337,14 @@ def main():
     print(f"Model config: d_model={config.get('d_model')}, n_layers={config.get('n_layers')}")
 
     model = DAWN(**config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Load with strict=False to handle missing excitability_weight in old checkpoints
+    load_result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    if load_result.missing_keys:
+        print(f"  Note: Missing keys (using defaults): {load_result.missing_keys}")
+    if load_result.unexpected_keys:
+        print(f"  Note: Unexpected keys (ignored): {load_result.unexpected_keys}")
+
     model.to(args.device)
     model.eval()
 
