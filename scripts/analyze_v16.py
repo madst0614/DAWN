@@ -1466,6 +1466,27 @@ def print_selection_diversity_summary(sel: Dict):
         print(f"Batches processed: {sel['summary']['n_batches_processed']}")
 
 
+def create_analysis_dataloader(data_path: str, tokenizer, max_length: int = 128, batch_size: int = 32):
+    """Create dataloader for analysis - supports both .pt and .pkl files"""
+    from functools import partial
+    from torch.utils.data import DataLoader
+    from utils.data import load_single_file, TokenDataset, TextDataset, collate_fn_dynamic_padding
+
+    data, is_pretokenized = load_single_file(data_path, max_length)
+
+    if is_pretokenized:
+        dataset = TokenDataset(data, max_length)
+        print(f"Loaded {len(dataset):,} sequences (pre-tokenized)")
+    else:
+        dataset = TextDataset(data, tokenizer, max_length)
+        print(f"Loaded {len(dataset):,} texts")
+
+    collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer, max_seq_len=max_length)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
+
+    return dataloader
+
+
 def print_dead_neurons_summary(dead: Dict):
     print("\n" + "="*60)
     print("DEAD NEURON ANALYSIS")
@@ -1576,14 +1597,7 @@ def main():
 
         # 2. Selection diversity (requires data)
         if args.val_data:
-            from functools import partial
-            from utils.data import TextDataset, collate_fn_dynamic_padding
-            from torch.utils.data import DataLoader
-
-            dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-            collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
-            dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
-
+            dataloader = create_analysis_dataloader(args.val_data, tokenizer)
             sel_div = analyzer.analyze_selection_diversity(dataloader, args.max_batches)
             print_selection_diversity_summary(sel_div)
             with open(os.path.join(args.output_dir, 'diversity_selection.json'), 'w') as f:
@@ -1593,14 +1607,7 @@ def main():
 
     # Selection diversity only mode
     if args.mode == 'selection_diversity' and args.val_data:
-        from functools import partial
-        from utils.data import TextDataset, collate_fn_dynamic_padding
-        from torch.utils.data import DataLoader
-
-        dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-        collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
-        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
-
+        dataloader = create_analysis_dataloader(args.val_data, tokenizer)
         sel_div = analyzer.analyze_selection_diversity(dataloader, args.max_batches)
         print_selection_diversity_summary(sel_div)
         with open(os.path.join(args.output_dir, 'diversity_selection.json'), 'w') as f:
@@ -1630,14 +1637,7 @@ def main():
 
     # NEW: Token trajectory (requires data)
     if args.mode == 'trajectory' and args.val_data:
-        from functools import partial
-        from utils.data import TextDataset, collate_fn_dynamic_padding
-        from torch.utils.data import DataLoader
-
-        dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-        collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
-        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
-
+        dataloader = create_analysis_dataloader(args.val_data, tokenizer)
         traj = analyzer.analyze_token_trajectory(dataloader, args.max_batches)
         print("\n" + "="*60)
         print("TOKEN TRAJECTORY")
@@ -1648,14 +1648,7 @@ def main():
 
     # NEW: Probing classifier (requires data)
     if args.mode == 'probing' and args.val_data:
-        from functools import partial
-        from utils.data import TextDataset, collate_fn_dynamic_padding
-        from torch.utils.data import DataLoader
-
-        dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-        collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
-        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
-
+        dataloader = create_analysis_dataloader(args.val_data, tokenizer)
         probing = analyzer.run_probing(dataloader, args.max_batches)
         print("\n" + "="*60)
         print("PROBING CLASSIFIER")
@@ -1669,14 +1662,7 @@ def main():
             json.dump(convert_to_serializable(probing), f, indent=2)
 
     if args.mode == 'ablation' and args.val_data:
-        from functools import partial
-        from utils.data import TextDataset, collate_fn_dynamic_padding
-        from torch.utils.data import DataLoader
-
-        dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-        collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
-        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
-
+        dataloader = create_analysis_dataloader(args.val_data, tokenizer)
         ablation = analyzer.run_ablation(dataloader, args.max_batches)
         print("\n" + "="*60)
         print("ABLATION STUDY")
