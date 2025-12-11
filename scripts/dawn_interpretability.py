@@ -610,10 +610,28 @@ class DAWNInterpreter:
 
         if groups is None:
             groups = {}
-            for pos in ["NOUN","VERB","DET"]:
+
+            # POS-based groups
+            for pos in ["NOUN", "VERB", "DET", "ADJ", "ADP"]:
                 if pos in self.pos_neuron_counts:
                     top = [n for n,_ in self.pos_neuron_counts[pos]["R"].most_common(5)]
                     if top: groups[f"POS_{pos}"] = [("R", top)]
+
+            # Dependency-based groups
+            for dep in ["nsubj", "ROOT", "dobj", "amod"]:
+                if dep in self.dep_neuron_counts:
+                    top = [n for n,_ in self.dep_neuron_counts[dep]["R"].most_common(5)]
+                    if top: groups[f"DEP_{dep}"] = [("R", top)]
+
+            # RANDOM CONTROL - Critical for proving specificity
+            all_r_neurons = set()
+            for pos_counts in self.pos_neuron_counts.values():
+                all_r_neurons.update(pos_counts["R"].keys())
+            if all_r_neurons:
+                import random
+                random.seed(42)
+                random_neurons = random.sample(list(all_r_neurons), min(5, len(all_r_neurons)))
+                groups["RANDOM_CONTROL"] = [("R", random_neurons)]
 
         if not groups:
             print("No groups")
@@ -797,6 +815,8 @@ class DAWNInterpreter:
         self.run_ablation(dataloader, max_batches=ablation_batches)
         self.generate_viz()
         self.save_results()
+        self.print_neuron_examples(nt="R", top_n=5)
+        self.export_for_paper()
 
         print("\n" + "="*60 + "\nCOMPLETE\n" + "="*60)
 
@@ -835,6 +855,75 @@ class DAWNInterpreter:
     def get_neurons_for_pos(self, pos, nt="R", k=10): return self.pos_neuron_counts[pos][nt].most_common(k)
     def get_neurons_for_dep(self, dep, nt="R", k=10): return self.dep_neuron_counts[dep][nt].most_common(k)
     def get_neurons_for_entity(self, et, nt="R", k=10): return self.entity_neuron_counts[et][nt].most_common(k)
+
+    def print_neuron_examples(self, nt="R", top_n=5, examples_per_neuron=3):
+        """Print neuron examples in paper-friendly format"""
+        print(f"\n{'='*60}\nNeuron Examples ({nt})\n{'='*60}")
+
+        # Get top specialized neurons
+        spec_neurons = self.specialized_neurons.get(nt, [])[:top_n]
+
+        for neuron_info in spec_neurons:
+            idx = neuron_info['idx']
+            nk = f"{nt}_{idx}"
+            spec = neuron_info['spec']
+            top_pos = neuron_info.get('pos', 'UNK')
+
+            # Get contexts
+            contexts = self.neuron_token_map[nk].get("contexts", [])[:examples_per_neuron]
+            tokens = self.neuron_token_map[nk]["tokens"].most_common(5)
+
+            print(f"\n{nk} (spec={spec:.3f}, dominant_pos={top_pos}):")
+            print(f"  Top tokens: {[t for t,_ in tokens]}")
+            for ctx in contexts:
+                tok = ctx.get('token', '')
+                context = ctx.get('context', '')
+                layer = ctx.get('layer', 0)
+                # Highlight the token in context
+                highlighted = context.replace(tok, f"**{tok}**")
+                print(f"  - L{layer}: \"{highlighted}\"")
+
+    def export_for_paper(self, output_path=None):
+        """Export key results in paper-friendly format"""
+        if output_path is None:
+            output_path = os.path.join(self.output_dir, "paper_results.json")
+
+        results = {
+            "specialized_neurons": self.specialized_neurons,
+            "ablation_results": self.ablation_results,
+            "top_pos_neurons": {},
+            "top_dep_neurons": {},
+        }
+
+        # Top neurons per POS
+        for pos in ["NOUN", "VERB", "DET", "ADJ", "ADP", "PUNCT"]:
+            if pos in self.pos_neuron_counts:
+                results["top_pos_neurons"][pos] = {
+                    nt: [(n, c) for n, c in self.pos_neuron_counts[pos][nt].most_common(5)]
+                    for nt in ["FR", "FV", "R", "V"]
+                }
+
+        # Top neurons per DEP
+        for dep in ["nsubj", "ROOT", "dobj", "amod", "det", "prep"]:
+            if dep in self.dep_neuron_counts:
+                results["top_dep_neurons"][dep] = {
+                    nt: [(n, c) for n, c in self.dep_neuron_counts[dep][nt].most_common(5)]
+                    for nt in ["FR", "FV", "R", "V"]
+                }
+
+        # Layer distribution summary
+        results["layer_usage"] = {}
+        for layer in sorted(self.layer_neuron_counts.keys()):
+            results["layer_usage"][int(layer)] = {
+                nt: len([c for c in self.layer_neuron_counts[layer][nt].values() if c > 0])
+                for nt in ["FR", "FV", "R", "V"]
+            }
+
+        with open(output_path, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"Paper results exported to: {output_path}")
+
+        return results
 
 
 def quick_analysis(model, tokenizer, dataloader, device="cuda", max_batches=500):
