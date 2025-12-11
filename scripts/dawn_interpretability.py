@@ -399,13 +399,29 @@ class DAWNInterpreter:
 
         token_to_pos = {tok: doc[0].pos_ for tok, doc in zip(sampled, docs) if len(doc) > 0}
         token_to_dep = {tok: doc[0].dep_ for tok, doc in zip(sampled, docs) if len(doc) > 0}
-        token_to_morph = {tok: doc[0].morph.to_dict() for tok, doc in zip(sampled, docs) if len(doc) > 0}
+
+        # Build morphology lookup dict with specific features
+        token_to_morph = {}
+        for tok, doc in zip(sampled, docs):
+            if len(doc) > 0:
+                morph = doc[0].morph.to_dict()
+                token_to_morph[tok] = {
+                    'tense': morph.get('Tense', 'UNK'),
+                    'number': morph.get('Number', 'UNK'),
+                    'verb_form': morph.get('VerbForm', 'UNK'),
+                    'full': morph
+                }
 
         # Vectorized map (faster than lambda)
         pos_series = pd.Series(token_to_pos)
         dep_series = pd.Series(token_to_dep)
         df['pos_tag'] = df['token'].map(pos_series).fillna('UNK')
         df['dep_tag'] = df['token'].map(dep_series).fillna('UNK')
+
+        # Vectorized morphology mapping
+        df['tense'] = df['token'].map(lambda t: token_to_morph.get(t, {}).get('tense', 'UNK'))
+        df['number'] = df['token'].map(lambda t: token_to_morph.get(t, {}).get('number', 'UNK'))
+        df['verb_form'] = df['token'].map(lambda t: token_to_morph.get(t, {}).get('verb_form', 'UNK'))
 
         # POS-Neuron counts
         pos_neuron = df.groupby(['pos_tag', 'nt', 'neuron_idx']).size()
@@ -419,19 +435,16 @@ class DAWNInterpreter:
             self.dep_neuron_counts[dep][nt][int(n_idx)] += count
             self.neuron_dep_counts[f"{nt}_{int(n_idx)}"][nt][dep] += count
 
-        # Morphology counts (Tense, Number, VerbForm)
-        for tok, morph in token_to_morph.items():
-            tok_df = df[df['token'] == tok]
-            for (nt, n_idx), grp in tok_df.groupby(['nt', 'neuron_idx']):
-                cnt = len(grp)
-                nk = f"{nt}_{int(n_idx)}"
-                for feat, val in morph.items():
-                    mk = f"{feat}={val}"
-                    self.morph_neuron_counts[mk][nt][int(n_idx)] += cnt
-                    self.neuron_morph_counts[nk][nt][mk] += cnt
-                    if feat == "Tense": self.tense_neurons[val][int(n_idx)] += cnt
-                    elif feat == "Number": self.number_neurons[val][int(n_idx)] += cnt
-                    elif feat == "VerbForm": self.verb_form_neurons[val][int(n_idx)] += cnt
+        # Morphology counts - Vectorized aggregation (much faster than per-token loop)
+        for morph_col, morph_storage in [('tense', self.tense_neurons),
+                                          ('number', self.number_neurons),
+                                          ('verb_form', self.verb_form_neurons)]:
+            morph_neuron = df[df[morph_col] != 'UNK'].groupby([morph_col, 'nt', 'neuron_idx']).size()
+            for (val, nt, n_idx), count in morph_neuron.items():
+                morph_storage[val][int(n_idx)] += count
+                mk = f"{morph_col.replace('_', '').title()}={val}"
+                self.morph_neuron_counts[mk][nt][int(n_idx)] += count
+                self.neuron_morph_counts[f"{nt}_{int(n_idx)}"][nt][mk] += count
 
         # QK vs V comparison
         qk_types = {'FR', 'R'}
