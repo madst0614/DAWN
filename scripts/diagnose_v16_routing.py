@@ -104,11 +104,20 @@ def diagnose_usage_ema(model):
     return results
 
 
-def diagnose_neuron_selection(model, dataloader, device, max_batches=20):
+def diagnose_neuron_selection(model, dataloader, device, config, max_batches=20):
     """2. 실제 뉴런 선택 빈도 확인"""
     print(f"\n{'='*60}")
     print("2. Neuron Selection Frequency (from routing)")
     print(f"{'='*60}")
+
+    # Build topk_map from config
+    topk_map = {
+        'FR': config.get('top_k_feature_r', 8),
+        'FV': config.get('top_k_feature_v', 6),
+        'R': config.get('top_k_relational', 20),
+        'V': config.get('top_k_value', 4),
+    }
+    print(f"  Using top-k from config: {topk_map}")
 
     neuron_counts = {
         'FR': Counter(),
@@ -155,8 +164,6 @@ def diagnose_neuron_selection(model, dataloader, device, max_batches=20):
                     'R': attn.get('relational_q_pref'),
                     'V': attn.get('value_pref'),
                 }
-
-                topk_map = {'FR': 8, 'FV': 6, 'R': 20, 'V': 4}
 
                 for nt, pref in pref_map.items():
                     if pref is None:
@@ -611,7 +618,7 @@ def main():
     results['usage_ema'] = diagnose_usage_ema(model)
 
     # 2. Neuron Selection
-    results['neuron_selection'] = diagnose_neuron_selection(model, dataloader, args.device, args.max_batches)
+    results['neuron_selection'] = diagnose_neuron_selection(model, dataloader, args.device, config, args.max_batches)
 
     # 3. Importance Entropy
     results['importance_entropy'] = diagnose_importance_entropy(model, dataloader, tokenizer, args.device, args.max_batches)
