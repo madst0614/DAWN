@@ -178,6 +178,11 @@ class DAWNInterpreter:
             all_tokens = [input_ids[b].cpu().tolist() for b in range(B)]
             all_texts = [self.tokenizer.decode(toks, skip_special_tokens=True) for toks in all_tokens]
 
+            # Batch decode all individual tokens (65536x faster)
+            all_flat_tokens = input_ids.view(-1).tolist()
+            all_decoded_flat = self.tokenizer.convert_ids_to_tokens(all_flat_tokens)
+            all_decoded = [all_decoded_flat[b*L:(b+1)*L] for b in range(B)]
+
             # Spacy batch processing
             if self.nlp:
                 docs = list(self.nlp.pipe(all_texts, batch_size=B))
@@ -186,11 +191,12 @@ class DAWNInterpreter:
 
             for b in range(B):
                 tokens = all_tokens[b]
+                decoded_tokens = all_decoded[b]
                 doc = docs[b]
                 spacy_idx = 0
 
                 for pos in range(L):
-                    tok_str = self.tokenizer.decode([tokens[pos]]).strip()
+                    tok_str = decoded_tokens[pos].replace('##', '').replace('Ġ', '').replace('▁', '').strip()
                     if not tok_str or tok_str in ['[PAD]','<pad>','[CLS]','[SEP]']: continue
 
                     self.total_token_counts[tok_str] += 1
