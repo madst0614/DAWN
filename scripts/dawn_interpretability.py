@@ -164,15 +164,7 @@ class DAWNInterpreter:
             else:
                 routing_infos = []
 
-            # Flatten routing info from all layers
-            routing = {}
-            for layer_idx, layer_info in enumerate(routing_infos):
-                if 'attention' in layer_info:
-                    attn = layer_info['attention']
-                    for k, v in attn.items():
-                        if isinstance(v, torch.Tensor):
-                            routing[f"layer{layer_idx}_{k}"] = v
-            if not routing: continue
+            if not routing_infos: continue
 
             # Batch decode all texts first
             all_tokens = [input_ids[b].cpu().tolist() for b in range(B)]
@@ -212,15 +204,32 @@ class DAWNInterpreter:
                     pos_bin = "first" if pos==0 else "start" if rel_pos<0.25 else "middle" if rel_pos<0.75 else "end"
                     len_bin = next((f"{s}-{e}" for s,e in [(0,32),(32,64),(64,128),(128,256),(256,512)] if s<=L<e), "512+")
 
-                    for key, weights in routing.items():
-                        nt = self._get_neuron_type(key)
-                        if not nt or not isinstance(weights, torch.Tensor): continue
-                        layer = self._get_layer_idx(key)
+                    # Use token-level pref for each layer
+                    for layer_idx, layer_info in enumerate(routing_infos):
+                        if 'attention' not in layer_info: continue
+                        attn = layer_info['attention']
 
-                        active_neurons = self._get_active_neurons(weights, b, pos, L)
-                        if not active_neurons: continue
-                        for n_idx in active_neurons:
-                            self._record(tok_str, nt, n_idx, layer, pos_bin, len_bin, context, ling)
+                        # Extract prefs for each neuron type
+                        prefs = {
+                            'FR': attn.get('feature_r_pref'),
+                            'FV': attn.get('feature_v_pref'),
+                            'R': attn.get('relational_q_pref'),
+                            'V': attn.get('value_pref'),
+                        }
+                        topk_map = {'FR': 8, 'FV': 8, 'R': 4, 'V': 6}
+
+                        for nt, pref in prefs.items():
+                            if pref is None: continue
+                            try:
+                                token_pref = pref[b, pos]
+                                topk = min(topk_map[nt], token_pref.shape[0])
+                                _, topk_idx = torch.topk(token_pref, topk)
+                                active_neurons = topk_idx.cpu().tolist()
+
+                                for n_idx in active_neurons:
+                                    self._record(tok_str, nt, n_idx, layer_idx, pos_bin, len_bin, context, ling)
+                            except (IndexError, RuntimeError):
+                                continue
 
         print(f"Collected: {sum(self.total_token_counts.values()):,} tokens, {len(self.token_neuron_map):,} unique")
 
