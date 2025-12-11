@@ -710,7 +710,16 @@ if __name__ == "__main__":
         input_ids = val_data.get('input_ids', val_data.get('tokens'))
     else:
         input_ids = val_data
-    print(f"Data shape: {input_ids.shape}")
+
+    # Handle 1D data (flat tokens) - reshape to 2D
+    if input_ids.dim() == 1:
+        seq_len = config.get('max_seq_len', 128)
+        n_tokens = input_ids.shape[0]
+        n_seqs = n_tokens // seq_len
+        input_ids = input_ids[:n_seqs * seq_len].view(n_seqs, seq_len)
+        print(f"Reshaped 1D data to: {input_ids.shape}")
+    else:
+        print(f"Data shape: {input_ids.shape}")
 
     # Create dataloader
     dataset = torch.utils.data.TensorDataset(input_ids)
