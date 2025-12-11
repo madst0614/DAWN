@@ -77,11 +77,11 @@ class UnifiedNeuronRouter(nn.Module):
 
         # Excitability: tau (recovery time constant) + decaying weight
         self.tau = excitability_tau
-        self.excitability_weight = 1.0
+        self.register_buffer('excitability_weight', torch.tensor(1.0))  # buffer로 등록해야 checkpoint에 저장됨
 
     def decay_excitability(self, decay_rate=0.9997):
         """Decay excitability_weight each step."""
-        self.excitability_weight *= decay_rate
+        self.excitability_weight.mul_(decay_rate)
 
     def get_excitability(self, usage_ema):
         """Neuronal excitability based on usage."""
