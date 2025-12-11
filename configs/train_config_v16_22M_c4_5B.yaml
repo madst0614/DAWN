@@ -30,13 +30,13 @@ model:
   n_feature_r: 72                 # Q/K path compression (FR)
   n_feature_v: 48                 # V path compression (FV)
   top_k_feature_r: 8
-  top_k_feature_v: 6
+  top_k_feature_v: 3
 
   # Expansion neurons
   n_relational: 196
   n_value: 24
   top_k_relational: 20
-  top_k_value: 4
+  top_k_value: 2
 
   # Knowledge
   n_knowledge: 300
