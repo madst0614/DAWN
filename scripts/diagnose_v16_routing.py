@@ -156,7 +156,7 @@ def diagnose_neuron_selection(model, dataloader, device, max_batches=20):
                     'V': attn.get('value_pref'),
                 }
 
-                topk_map = {'FR': 8, 'FV': 8, 'R': 4, 'V': 6}
+                topk_map = {'FR': 8, 'FV': 6, 'R': 20, 'V': 4}
 
                 for nt, pref in pref_map.items():
                     if pref is None:
