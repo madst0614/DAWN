@@ -22,21 +22,21 @@ model:
   model_version: "16.0"
   d_model: 384
   n_layers: 12
-  n_heads: 6                      # head_dim=64 (matching baseline)
+  n_heads: 6
   rank: 64
   state_dim: 64
 
   # v16: Split Feature into R/V
-  n_feature_r: 72                 # Q/K path compression (FR)
-  n_feature_v: 48                 # V path compression (FV)
+  n_feature_r: 72
+  n_feature_v: 48
   top_k_feature_r: 8
-  top_k_feature_v: 3
+  top_k_feature_v: 6
 
   # Expansion neurons
   n_relational: 196
   n_value: 24
   top_k_relational: 20
-  top_k_value: 2
+  top_k_value: 4
 
   # Knowledge
   n_knowledge: 300
@@ -51,10 +51,6 @@ model:
   router_dropout: 0.1
   token_routing: false
   use_ssm_context: true
-
-  # Excitability
-  excitability_tau: 1.5
-  excitability_ema_alpha: 0.01
 
 training:
   batch_size: 96
@@ -71,8 +67,3 @@ training:
 use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_22M_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_v16_22M_c4_5B
-
-# v16 22M @ 5B tokens
-#   - FR=72, FV=48 (total 120 feature neurons)
-#   - Relational=196, Value=24
-#   - ~101k steps, validation every 5000 steps
