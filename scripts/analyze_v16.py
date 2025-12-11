@@ -9,15 +9,23 @@ Features:
 1. Neuron Usage - FR/FV/R/V/K 타입별 활성화 분석
 2. Excitability - Langevin dynamics 상태
 3. Gini Coefficient - 뉴런 활용 불균형
-4. Neuron Embedding - 뉴런 임베딩 시각화
+4. Neuron Embedding - 뉴런 임베딩 시각화 (t-SNE/PCA)
 5. Word-Neuron Mapping - 단어별 뉴런 활성화
-6. Knowledge Health - Knowledge 뉴런 상태
+6. Weight Analysis - SVD/PCA 가중치 분석
+7. Single Neuron Analysis - 단일 뉴런 심층 분석
+8. Ablation Study - 뉴런 제거 실험
+9. Sentence Visualization - 문장별 활성화 시각화
+10. Neuron Similarity - 뉴런간 유사도 히트맵
 
 Usage:
     python scripts/analyze_v16.py --checkpoint <path>
-    python scripts/analyze_v16.py --checkpoint <path> --val_data <path> --mode all
+    python scripts/analyze_v16.py --checkpoint <path> --mode all
     python scripts/analyze_v16.py --checkpoint <path> --mode usage
     python scripts/analyze_v16.py --checkpoint <path> --mode embedding
+    python scripts/analyze_v16.py --checkpoint <path> --mode neuron --neuron_id 5 --neuron_type feature_r
+    python scripts/analyze_v16.py --checkpoint <path> --mode sentence --text "The cat sat on the mat."
+    python scripts/analyze_v16.py --checkpoint <path> --mode ablation --val_data <path>
+    python scripts/analyze_v16.py --checkpoint <path> --mode weight_svd
 """
 
 import argparse
@@ -26,10 +34,11 @@ import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
@@ -47,9 +56,16 @@ except ImportError:
 try:
     from sklearn.manifold import TSNE
     from sklearn.decomposition import PCA
+    from sklearn.cluster import KMeans
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
+
+try:
+    import seaborn as sns
+    HAS_SEABORN = True
+except ImportError:
+    HAS_SEABORN = False
 
 
 # ============================================================
@@ -71,7 +87,6 @@ def gini_coefficient(x: torch.Tensor) -> float:
     x = x / x.sum()
     x_sorted = torch.sort(x)[0]
     n = len(x_sorted)
-    cumsum = torch.cumsum(x_sorted, dim=0)
     gini = (2 * torch.sum((torch.arange(1, n+1, device=x.device).float()) * x_sorted) - (n + 1) * x_sorted.sum()) / (n * x_sorted.sum() + 1e-8)
     return gini.item()
 
@@ -102,14 +117,79 @@ def simple_pos_tag(token: str) -> str:
     return 'OTHER'
 
 
+def convert_to_serializable(obj):
+    """Convert numpy/torch types to Python native types"""
+    if isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, torch.Tensor):
+        return obj.cpu().tolist()
+    elif isinstance(obj, dict):
+        return {str(k): convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(i) for i in obj]
+    elif isinstance(obj, Counter):
+        return dict(obj)
+    return obj
+
+
 # ============================================================
 # Model Loading
 # ============================================================
 
+def find_latest_checkpoint(path: str) -> str:
+    """Find the latest checkpoint in a directory or return the path if it's a file"""
+    from pathlib import Path
+
+    path = Path(path)
+
+    # If it's a file, return it directly
+    if path.is_file():
+        return str(path)
+
+    # If it's a directory, find the latest .pt file
+    if path.is_dir():
+        pt_files = list(path.glob('*.pt'))
+
+        if not pt_files:
+            # Try subdirectories (e.g., checkpoints/run_xxx/)
+            pt_files = list(path.glob('**/*.pt'))
+
+        if not pt_files:
+            raise FileNotFoundError(f"No .pt files found in {path}")
+
+        # Sort by modification time (newest first)
+        pt_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+        # Prefer 'best' or 'latest' checkpoints
+        for f in pt_files:
+            if 'best' in f.name.lower():
+                print(f"Found best checkpoint: {f}")
+                return str(f)
+
+        for f in pt_files:
+            if 'latest' in f.name.lower():
+                print(f"Found latest checkpoint: {f}")
+                return str(f)
+
+        # Otherwise return the most recently modified
+        print(f"Using most recent checkpoint: {pt_files[0]}")
+        return str(pt_files[0])
+
+    raise FileNotFoundError(f"Path not found: {path}")
+
+
 def load_model(checkpoint_path: str, device: str = 'cuda'):
-    """Load v16 model from checkpoint"""
+    """Load v16 model from checkpoint (supports directory auto-discovery)"""
     from transformers import BertTokenizer
     from models import create_model_by_version
+
+    # Auto-discover checkpoint if directory is given
+    checkpoint_path = find_latest_checkpoint(checkpoint_path)
+    print(f"Loading from: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
@@ -141,11 +221,11 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
 
 
 # ============================================================
-# Analysis Functions
+# V16 Analyzer Class
 # ============================================================
 
 class V16Analyzer:
-    """v16 모델 분석기"""
+    """v16 모델 분석기 - 모든 분석 기능 통합"""
 
     def __init__(self, model, tokenizer, device='cuda'):
         self.model = get_underlying_model(model)
@@ -166,9 +246,9 @@ class V16Analyzer:
             return self.model.shared_neurons
         return None
 
-    # --------------------------------------------------
+    # ==========================================================
     # 1. Usage Analysis
-    # --------------------------------------------------
+    # ==========================================================
     def analyze_usage(self) -> Dict:
         """Analyze neuron usage patterns from EMA buffers"""
         if self.router is None:
@@ -177,91 +257,34 @@ class V16Analyzer:
         results = {}
         threshold = 0.01
 
-        # Feature R
-        ema_fr = self.router.usage_ema_feature_r
-        active_fr = (ema_fr > threshold).sum().item()
-        results['feature_r'] = {
-            'total': self.router.n_feature_r,
-            'active': int(active_fr),
-            'ratio': active_fr / self.router.n_feature_r,
-            'gini': gini_coefficient(ema_fr),
-            'ema_stats': {
-                'min': ema_fr.min().item(),
-                'max': ema_fr.max().item(),
-                'mean': ema_fr.mean().item(),
-                'std': ema_fr.std().item(),
+        for name, attr in [
+            ('feature_r', 'usage_ema_feature_r'),
+            ('feature_v', 'usage_ema_feature_v'),
+            ('relational', 'usage_ema_relational'),
+            ('value', 'usage_ema_value'),
+            ('knowledge', 'usage_ema_knowledge'),
+        ]:
+            ema = getattr(self.router, attr)
+            n_total = getattr(self.router, f'n_{name}')
+            active = (ema > threshold).sum().item()
+            results[name] = {
+                'total': n_total,
+                'active': int(active),
+                'ratio': active / n_total,
+                'gini': gini_coefficient(ema),
+                'ema_stats': {
+                    'min': ema.min().item(),
+                    'max': ema.max().item(),
+                    'mean': ema.mean().item(),
+                    'std': ema.std().item(),
+                }
             }
-        }
-
-        # Feature V
-        ema_fv = self.router.usage_ema_feature_v
-        active_fv = (ema_fv > threshold).sum().item()
-        results['feature_v'] = {
-            'total': self.router.n_feature_v,
-            'active': int(active_fv),
-            'ratio': active_fv / self.router.n_feature_v,
-            'gini': gini_coefficient(ema_fv),
-            'ema_stats': {
-                'min': ema_fv.min().item(),
-                'max': ema_fv.max().item(),
-                'mean': ema_fv.mean().item(),
-                'std': ema_fv.std().item(),
-            }
-        }
-
-        # Relational
-        ema_r = self.router.usage_ema_relational
-        active_r = (ema_r > threshold).sum().item()
-        results['relational'] = {
-            'total': self.router.n_relational,
-            'active': int(active_r),
-            'ratio': active_r / self.router.n_relational,
-            'gini': gini_coefficient(ema_r),
-            'ema_stats': {
-                'min': ema_r.min().item(),
-                'max': ema_r.max().item(),
-                'mean': ema_r.mean().item(),
-                'std': ema_r.std().item(),
-            }
-        }
-
-        # Value
-        ema_v = self.router.usage_ema_value
-        active_v = (ema_v > threshold).sum().item()
-        results['value'] = {
-            'total': self.router.n_value,
-            'active': int(active_v),
-            'ratio': active_v / self.router.n_value,
-            'gini': gini_coefficient(ema_v),
-            'ema_stats': {
-                'min': ema_v.min().item(),
-                'max': ema_v.max().item(),
-                'mean': ema_v.mean().item(),
-                'std': ema_v.std().item(),
-            }
-        }
-
-        # Knowledge
-        ema_k = self.router.usage_ema_knowledge
-        active_k = (ema_k > threshold).sum().item()
-        results['knowledge'] = {
-            'total': self.router.n_knowledge,
-            'active': int(active_k),
-            'ratio': active_k / self.router.n_knowledge,
-            'gini': gini_coefficient(ema_k),
-            'ema_stats': {
-                'min': ema_k.min().item(),
-                'max': ema_k.max().item(),
-                'mean': ema_k.mean().item(),
-                'std': ema_k.std().item(),
-            }
-        }
 
         return results
 
-    # --------------------------------------------------
+    # ==========================================================
     # 2. Excitability Analysis
-    # --------------------------------------------------
+    # ==========================================================
     def analyze_excitability(self) -> Dict:
         """Analyze excitability state"""
         if self.router is None:
@@ -273,18 +296,13 @@ class V16Analyzer:
         results = {
             'tau': tau,
             'weight': weight,
-            'langevin_alpha': self.router.langevin_alpha,
-            'langevin_beta': self.router.langevin_beta,
+            'langevin_alpha': getattr(self.router, 'langevin_alpha', 0),
+            'langevin_beta': getattr(self.router, 'langevin_beta', 0),
         }
 
         # Per-type excitability
-        for name, ema in [
-            ('feature_r', self.router.usage_ema_feature_r),
-            ('feature_v', self.router.usage_ema_feature_v),
-            ('relational', self.router.usage_ema_relational),
-            ('value', self.router.usage_ema_value),
-            ('knowledge', self.router.usage_ema_knowledge),
-        ]:
+        for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
+            ema = getattr(self.router, f'usage_ema_{name}')
             exc = torch.clamp(1.0 - ema / tau, min=0.0, max=1.0)
             results[f'{name}_excitability'] = {
                 'min': exc.min().item(),
@@ -294,15 +312,15 @@ class V16Analyzer:
 
         return results
 
-    # --------------------------------------------------
-    # 3. Neuron Embedding Analysis
-    # --------------------------------------------------
+    # ==========================================================
+    # 3. Neuron Embedding Analysis (t-SNE/PCA)
+    # ==========================================================
     def analyze_embeddings(self, output_dir: str = None) -> Dict:
         """Analyze neuron embeddings with t-SNE/PCA"""
         if self.router is None:
             return {'error': 'No router found'}
 
-        emb = self.router.neuron_emb.detach().cpu().numpy()  # [total, d_space]
+        emb = self.router.neuron_emb.detach().cpu().numpy()
 
         # Type labels
         labels = []
@@ -345,117 +363,408 @@ class V16Analyzer:
         if HAS_SKLEARN and HAS_MATPLOTLIB and output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-            # t-SNE
             tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(emb)-1))
             emb_2d = tsne.fit_transform(emb)
 
-            # PCA
             pca = PCA(n_components=2)
             emb_pca = pca.fit_transform(emb)
 
-            # Plot
             fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
             colors = {'FR': 'red', 'FV': 'orange', 'R': 'blue', 'V': 'green', 'K': 'purple'}
 
             for ax, data, title in [(axes[0], emb_2d, 't-SNE'), (axes[1], emb_pca, 'PCA')]:
                 for t in colors:
-                    mask = [l == t for l in labels]
+                    mask = np.array([l == t for l in labels])
                     ax.scatter(data[mask, 0], data[mask, 1], c=colors[t], label=t, alpha=0.6, s=20)
                 ax.set_title(f'Neuron Embeddings ({title})')
                 ax.legend()
-                ax.set_xlabel('Dim 1')
-                ax.set_ylabel('Dim 2')
 
             plt.tight_layout()
             plt.savefig(os.path.join(output_dir, 'neuron_embeddings.png'), dpi=150)
             plt.close()
-
             results['visualization'] = os.path.join(output_dir, 'neuron_embeddings.png')
 
         return results
 
-    # --------------------------------------------------
-    # 4. Word-Neuron Mapping (requires data)
-    # --------------------------------------------------
-    def analyze_word_neuron_mapping(self, dataloader, max_batches: int = 100) -> Dict:
-        """Analyze which words activate which neurons"""
+    # ==========================================================
+    # 4. Weight SVD/PCA Analysis
+    # ==========================================================
+    def analyze_weight_svd(self, output_dir: str = None) -> Dict:
+        """Analyze neuron weight matrices with SVD"""
+        if self.neurons is None:
+            return {'error': 'No shared neurons found'}
+
+        results = {}
+
+        # Analyze each neuron type's weight matrix
+        weight_configs = [
+            ('feature_r', 'feature_r_neurons'),  # [n, d_model, rank]
+            ('feature_v', 'feature_v_neurons'),
+            ('relational', 'relational_neurons'),  # [n, rank, d_model]
+            ('value', 'value_neurons'),
+        ]
+
+        for name, attr in weight_configs:
+            if not hasattr(self.neurons, attr):
+                continue
+
+            W = getattr(self.neurons, attr).detach().cpu()  # [n, ...]
+            n_neurons = W.shape[0]
+
+            # Flatten each neuron's weight to a vector
+            W_flat = W.view(n_neurons, -1).numpy()
+
+            # SVD on the neuron weight matrix
+            U, S, Vh = np.linalg.svd(W_flat, full_matrices=False)
+
+            # Effective rank (using singular value entropy)
+            S_norm = S / (S.sum() + 1e-8)
+            entropy = -np.sum(S_norm * np.log(S_norm + 1e-8))
+            effective_rank = np.exp(entropy)
+
+            # Explained variance ratio
+            var_ratio = (S ** 2) / (np.sum(S ** 2) + 1e-8)
+            cumvar = np.cumsum(var_ratio)
+
+            results[name] = {
+                'n_neurons': n_neurons,
+                'weight_shape': list(W.shape),
+                'effective_rank': float(effective_rank),
+                'top_5_singular_values': S[:5].tolist(),
+                'var_explained_by_top5': float(cumvar[4]) if len(cumvar) > 4 else float(cumvar[-1]),
+                'var_explained_by_top10': float(cumvar[9]) if len(cumvar) > 9 else float(cumvar[-1]),
+            }
+
+        # Visualization
+        if HAS_MATPLOTLIB and output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            axes = axes.flatten()
+
+            for ax, (name, attr) in zip(axes, weight_configs):
+                if name not in results:
+                    continue
+                W = getattr(self.neurons, attr).detach().cpu()
+                W_flat = W.view(W.shape[0], -1).numpy()
+                _, S, _ = np.linalg.svd(W_flat, full_matrices=False)
+
+                ax.plot(S[:min(50, len(S))], 'b-o', markersize=3)
+                ax.set_title(f'{name} Singular Values')
+                ax.set_xlabel('Index')
+                ax.set_ylabel('Singular Value')
+                ax.set_yscale('log')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'weight_svd.png'), dpi=150)
+            plt.close()
+            results['visualization'] = os.path.join(output_dir, 'weight_svd.png')
+
+        return results
+
+    # ==========================================================
+    # 5. Single Neuron Analysis
+    # ==========================================================
+    def analyze_single_neuron(self, neuron_id: int, neuron_type: str = 'feature_r', top_k: int = 50) -> Dict:
+        """Analyze what a specific neuron encodes"""
+        if self.neurons is None:
+            return {'error': 'No shared neurons found'}
+
+        results = {'neuron_id': neuron_id, 'neuron_type': neuron_type}
+
+        # Get weight matrix for this neuron type
+        attr_map = {
+            'feature_r': 'feature_r_neurons',
+            'feature_v': 'feature_v_neurons',
+            'relational': 'relational_neurons',
+            'value': 'value_neurons',
+        }
+
+        if neuron_type not in attr_map:
+            return {'error': f'Unknown neuron type: {neuron_type}'}
+
+        W_all = getattr(self.neurons, attr_map[neuron_type]).data
+        n_neurons = W_all.shape[0]
+
+        if neuron_id >= n_neurons:
+            return {'error': f'Neuron ID {neuron_id} out of range (max: {n_neurons-1})'}
+
+        W_n = W_all[neuron_id]  # [d_model, rank] or [rank, d_model]
+
+        # Get token embeddings
+        embed = self.model.token_emb.weight.data  # [vocab, d_model]
+
+        # Compute activation strength for each token
+        with torch.no_grad():
+            if neuron_type in ['feature_r', 'feature_v']:
+                # W: [d_model, rank], embed: [vocab, d_model]
+                h = embed @ W_n  # [vocab, rank]
+            else:
+                # W: [rank, d_model], need to transpose
+                h = embed @ W_n.T  # [vocab, rank]
+
+            activation_strength = h.norm(dim=1)  # [vocab]
+
+        # Filter special tokens
+        all_tokens = self.tokenizer.convert_ids_to_tokens(list(range(embed.shape[0])))
+        valid_mask = torch.tensor([
+            not (tok.startswith('[unused') or tok.startswith('##unused') or tok.startswith('['))
+            for tok in all_tokens
+        ], device=activation_strength.device)
+
+        valid_indices = valid_mask.nonzero().squeeze(-1)
+        valid_strengths = activation_strength[valid_indices]
+        sorted_order = valid_strengths.argsort(descending=True)
+
+        # Top-k tokens
+        top_tokens = []
+        for i in range(min(top_k, len(sorted_order))):
+            idx = valid_indices[sorted_order[i]].item()
+            token = all_tokens[idx]
+            strength = activation_strength[idx].item()
+            pos = simple_pos_tag(token)
+            top_tokens.append({
+                'token': token,
+                'strength': strength,
+                'pos': pos
+            })
+
+        results['top_tokens'] = top_tokens
+
+        # POS distribution
+        pos_counts = Counter([t['pos'] for t in top_tokens])
+        results['pos_distribution'] = dict(pos_counts)
+
+        # Neuron stats
+        results['weight_stats'] = {
+            'mean': W_n.mean().item(),
+            'std': W_n.std().item(),
+            'norm': W_n.norm().item(),
+        }
+
+        # Usage EMA for this neuron
+        ema_attr = f'usage_ema_{neuron_type}'
+        if self.router and hasattr(self.router, ema_attr):
+            ema = getattr(self.router, ema_attr)
+            results['usage_ema'] = ema[neuron_id].item()
+            results['excitability'] = max(0, 1 - ema[neuron_id].item() / self.router.tau)
+
+        return results
+
+    # ==========================================================
+    # 6. Neuron Similarity Heatmap
+    # ==========================================================
+    def analyze_similarity(self, output_dir: str = None) -> Dict:
+        """Analyze similarity between neurons within each type"""
         if self.router is None:
             return {'error': 'No router found'}
 
-        # Token -> neuron activation counts
-        token_neuron_counts = {
-            'feature_r': defaultdict(lambda: defaultdict(float)),
-            'feature_v': defaultdict(lambda: defaultdict(float)),
-            'relational': defaultdict(lambda: defaultdict(float)),
-            'value': defaultdict(lambda: defaultdict(float)),
+        results = {}
+        emb = self.router.neuron_emb.detach()  # [total, d_space]
+
+        # Boundaries
+        boundaries = {
+            'FR': (0, self.router.n_feature_r),
+            'FV': (self.router.n_feature_r, self.router.n_feature_r + self.router.n_feature_v),
+            'R': (self.router.n_feature_r + self.router.n_feature_v,
+                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational),
+            'V': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational,
+                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value),
+            'K': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value,
+                  self.router.total_neurons),
         }
 
-        token_counts = Counter()
+        for name, (start, end) in boundaries.items():
+            type_emb = emb[start:end]
+            type_emb_norm = F.normalize(type_emb, dim=-1)
+            sim_matrix = (type_emb_norm @ type_emb_norm.T).cpu().numpy()
 
+            # Stats (excluding diagonal)
+            n = sim_matrix.shape[0]
+            off_diag = sim_matrix[~np.eye(n, dtype=bool)]
+
+            results[name] = {
+                'n_neurons': n,
+                'avg_similarity': float(off_diag.mean()),
+                'max_similarity': float(off_diag.max()),
+                'min_similarity': float(off_diag.min()),
+                'std_similarity': float(off_diag.std()),
+            }
+
+        # Visualization
+        if HAS_MATPLOTLIB and HAS_SEABORN and output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            axes = axes.flatten()
+
+            for ax, (name, (start, end)) in zip(axes, boundaries.items()):
+                type_emb = emb[start:end]
+                type_emb_norm = F.normalize(type_emb, dim=-1)
+                sim_matrix = (type_emb_norm @ type_emb_norm.T).cpu().numpy()
+
+                sns.heatmap(sim_matrix, ax=ax, cmap='RdBu_r', center=0, vmin=-1, vmax=1)
+                ax.set_title(f'{name} Neuron Similarity')
+
+            axes[-1].axis('off')  # Hide last subplot
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'neuron_similarity.png'), dpi=150)
+            plt.close()
+            results['visualization'] = os.path.join(output_dir, 'neuron_similarity.png')
+
+        return results
+
+    # ==========================================================
+    # 7. Sentence Visualization
+    # ==========================================================
+    def visualize_sentence(self, text: str, output_dir: str = None) -> Dict:
+        """Visualize neuron activations for a specific sentence"""
         self.model.eval()
+
+        # Tokenize
+        tokens = self.tokenizer.tokenize(text)
+        input_ids = self.tokenizer.encode(text, return_tensors='pt').to(self.device)
+        attention_mask = torch.ones_like(input_ids)
+
+        results = {'text': text, 'tokens': tokens}
+
         with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(dataloader, desc='Word-Neuron', total=max_batches)):
+            try:
+                outputs = self.model(input_ids, attention_mask=attention_mask, return_routing_info=True)
+                routing_info = outputs.get('routing_info', {})
+            except Exception as e:
+                return {'error': str(e)}
+
+        # Extract activations for each token
+        activations = {}
+        for key in ['feature_r_weights', 'feature_v_weights', 'relational_weights_Q', 'value_weights']:
+            if key in routing_info:
+                w = routing_info[key]
+                if w.dim() == 3:  # [B, S, N]
+                    activations[key] = w[0].cpu().numpy()  # [S, N]
+
+        results['activations'] = {k: v.tolist() for k, v in activations.items()}
+
+        # Visualization
+        if HAS_MATPLOTLIB and output_dir and activations:
+            os.makedirs(output_dir, exist_ok=True)
+
+            n_types = len(activations)
+            fig, axes = plt.subplots(n_types, 1, figsize=(12, 3 * n_types))
+            if n_types == 1:
+                axes = [axes]
+
+            token_labels = ['[CLS]'] + tokens + ['[SEP]']
+
+            for ax, (key, act) in zip(axes, activations.items()):
+                act = np.array(act)
+                im = ax.imshow(act.T, aspect='auto', cmap='viridis')
+                ax.set_title(key)
+                ax.set_xlabel('Token Position')
+                ax.set_ylabel('Neuron ID')
+                ax.set_xticks(range(len(token_labels)))
+                ax.set_xticklabels(token_labels, rotation=45, ha='right')
+                plt.colorbar(im, ax=ax)
+
+            plt.tight_layout()
+            path = os.path.join(output_dir, 'sentence_activation.png')
+            plt.savefig(path, dpi=150, bbox_inches='tight')
+            plt.close()
+            results['visualization'] = path
+
+        return results
+
+    # ==========================================================
+    # 8. Ablation Study
+    # ==========================================================
+    def run_ablation(self, dataloader, max_batches: int = 50) -> Dict:
+        """Run ablation study to measure neuron importance"""
+        from copy import deepcopy
+
+        results = {}
+
+        # Get baseline loss
+        baseline_loss = self._compute_loss(dataloader, max_batches)
+        results['baseline_loss'] = baseline_loss
+
+        # Ablate each neuron type
+        neuron_types = ['feature_r', 'feature_v', 'relational', 'value']
+
+        for neuron_type in neuron_types:
+            attr_map = {
+                'feature_r': 'feature_r_neurons',
+                'feature_v': 'feature_v_neurons',
+                'relational': 'relational_neurons',
+                'value': 'value_neurons',
+            }
+
+            if not hasattr(self.neurons, attr_map[neuron_type]):
+                continue
+
+            W = getattr(self.neurons, attr_map[neuron_type])
+            n_neurons = W.shape[0]
+            original_W = W.data.clone()
+
+            # Ablate top-k used neurons
+            ema = getattr(self.router, f'usage_ema_{neuron_type}')
+            top_indices = ema.argsort(descending=True)[:5]  # Top 5 most used
+
+            ablation_results = []
+            for idx in top_indices:
+                idx = idx.item()
+                # Zero out this neuron
+                W.data[idx] = 0
+
+                ablated_loss = self._compute_loss(dataloader, max_batches)
+                loss_delta = ablated_loss - baseline_loss
+
+                ablation_results.append({
+                    'neuron_id': idx,
+                    'usage_ema': ema[idx].item(),
+                    'ablated_loss': ablated_loss,
+                    'loss_delta': loss_delta,
+                    'importance': loss_delta / (baseline_loss + 1e-8),
+                })
+
+                # Restore
+                W.data[idx] = original_W[idx]
+
+            results[neuron_type] = ablation_results
+
+        return results
+
+    def _compute_loss(self, dataloader, max_batches: int) -> float:
+        """Compute average loss on dataloader"""
+        self.model.eval()
+        total_loss = 0
+        n_batches = 0
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
                 if batch_idx >= max_batches:
                     break
 
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch.get('labels', input_ids).to(self.device)
 
-                # Forward pass to get routing info
-                try:
-                    outputs = self.model(input_ids, attention_mask=attention_mask, return_routing_info=True)
-                    routing_info = outputs.get('routing_info', {})
-                except Exception as e:
-                    print(f"Forward pass error: {e}")
-                    continue
+                outputs = self.model(input_ids, attention_mask=attention_mask)
+                logits = outputs['logits'] if isinstance(outputs, dict) else outputs
 
-                # Decode tokens
-                for b in range(input_ids.shape[0]):
-                    for s in range(input_ids.shape[1]):
-                        if attention_mask[b, s] == 0:
-                            continue
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=-100
+                )
+                total_loss += loss.item()
+                n_batches += 1
 
-                        token_id = input_ids[b, s].item()
-                        token = self.tokenizer.decode([token_id])
-                        token_counts[token] += 1
+        return total_loss / max(n_batches, 1)
 
-                        # Get neuron activations for this token
-                        for neuron_type, key in [
-                            ('feature_r', 'feature_r_weights'),
-                            ('feature_v', 'feature_v_weights'),
-                            ('relational', 'relational_weights_Q'),
-                            ('value', 'value_weights'),
-                        ]:
-                            if key in routing_info:
-                                weights = routing_info[key]
-                                if weights.dim() == 3:  # [B, S, N]
-                                    w = weights[b, s].cpu().numpy()
-                                    top_neurons = np.argsort(w)[-5:]  # top 5
-                                    for n in top_neurons:
-                                        token_neuron_counts[neuron_type][token][int(n)] += w[n]
-
-        # Aggregate results: top tokens per neuron
-        results = {}
-        for neuron_type in token_neuron_counts:
-            neuron_top_tokens = defaultdict(list)
-            for token, neuron_weights in token_neuron_counts[neuron_type].items():
-                for neuron_id, weight in neuron_weights.items():
-                    neuron_top_tokens[neuron_id].append((token, weight))
-
-            # Sort and keep top 10 tokens per neuron
-            for neuron_id in neuron_top_tokens:
-                neuron_top_tokens[neuron_id] = sorted(
-                    neuron_top_tokens[neuron_id], key=lambda x: x[1], reverse=True
-                )[:10]
-
-            results[neuron_type] = dict(neuron_top_tokens)
-
-        return results
-
-    # --------------------------------------------------
-    # 5. Usage Histogram Visualization
-    # --------------------------------------------------
+    # ==========================================================
+    # 9. Usage Histogram Visualization
+    # ==========================================================
     def visualize_usage(self, output_dir: str):
         """Create usage histogram plots"""
         if not HAS_MATPLOTLIB:
@@ -487,7 +796,7 @@ class V16Analyzer:
             ax.text(0.95, 0.95, f'Active: {active}/{total}', transform=ax.transAxes,
                     ha='right', va='top', fontsize=10)
 
-        # Last subplot: summary bar chart
+        # Summary bar chart
         ax = axes[5]
         names = [d[0] for d in data]
         active_ratios = [(d[1] > 0.01).float().mean().item() for d in data]
@@ -504,9 +813,9 @@ class V16Analyzer:
 
         return {'visualization': path}
 
-    # --------------------------------------------------
-    # 6. Full Report
-    # --------------------------------------------------
+    # ==========================================================
+    # 10. Full Report
+    # ==========================================================
     def generate_report(self, output_dir: str = None) -> Dict:
         """Generate comprehensive analysis report"""
         report = {
@@ -516,41 +825,37 @@ class V16Analyzer:
 
         if output_dir:
             report['embeddings'] = self.analyze_embeddings(output_dir)
+            report['weight_svd'] = self.analyze_weight_svd(output_dir)
+            report['similarity'] = self.analyze_similarity(output_dir)
             report['usage_viz'] = self.visualize_usage(output_dir)
 
         return report
 
 
 # ============================================================
-# Main
+# Print Functions
 # ============================================================
 
 def print_usage_summary(usage: Dict):
-    """Print usage summary to console"""
     print("\n" + "="*60)
     print("NEURON USAGE SUMMARY")
     print("="*60)
-
-    headers = ['Type', 'Active', 'Total', 'Ratio', 'Gini', 'EMA Mean']
     print(f"{'Type':<12} {'Active':>8} {'Total':>8} {'Ratio':>8} {'Gini':>8} {'Mean':>10}")
     print("-"*60)
-
     for key in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
         d = usage[key]
         print(f"{key:<12} {d['active']:>8} {d['total']:>8} {d['ratio']:>8.2%} {d['gini']:>8.2f} {d['ema_stats']['mean']:>10.4f}")
 
 
 def print_excitability_summary(exc: Dict):
-    """Print excitability summary to console"""
     print("\n" + "="*60)
     print("EXCITABILITY STATE")
     print("="*60)
     print(f"tau: {exc['tau']:.2f}")
     print(f"weight: {exc['weight']:.4f}")
-    print(f"langevin_alpha: {exc['langevin_alpha']}")
-    print(f"langevin_beta: {exc['langevin_beta']}")
+    print(f"langevin_alpha: {exc.get('langevin_alpha', 'N/A')}")
+    print(f"langevin_beta: {exc.get('langevin_beta', 'N/A')}")
     print()
-
     print(f"{'Type':<12} {'Min':>8} {'Mean':>8} {'Max':>8}")
     print("-"*40)
     for key in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
@@ -558,14 +863,46 @@ def print_excitability_summary(exc: Dict):
         print(f"{key:<12} {d['min']:>8.2f} {d['mean']:>8.2f} {d['max']:>8.2f}")
 
 
+def print_neuron_summary(neuron: Dict):
+    print("\n" + "="*60)
+    print(f"SINGLE NEURON ANALYSIS: {neuron['neuron_type']} #{neuron['neuron_id']}")
+    print("="*60)
+    print(f"Usage EMA: {neuron.get('usage_ema', 'N/A'):.4f}")
+    print(f"Excitability: {neuron.get('excitability', 'N/A'):.4f}")
+    print(f"\nWeight Stats:")
+    for k, v in neuron.get('weight_stats', {}).items():
+        print(f"  {k}: {v:.4f}")
+    print(f"\nTop Tokens:")
+    for t in neuron.get('top_tokens', [])[:20]:
+        print(f"  {t['token']:<20} {t['strength']:>8.4f}  [{t['pos']}]")
+    print(f"\nPOS Distribution:")
+    for pos, count in neuron.get('pos_distribution', {}).items():
+        print(f"  {pos}: {count}")
+
+
+# ============================================================
+# Main
+# ============================================================
+
 def main():
     parser = argparse.ArgumentParser(description='DAWN v16 Analysis')
     parser.add_argument('--checkpoint', required=True, help='Checkpoint path')
     parser.add_argument('--val_data', help='Validation data path')
     parser.add_argument('--output_dir', default='./analysis_v16', help='Output directory')
-    parser.add_argument('--mode', default='all', choices=['all', 'usage', 'excitability', 'embedding', 'word_neuron'])
+    parser.add_argument('--mode', default='all',
+                        choices=['all', 'usage', 'excitability', 'embedding', 'weight_svd',
+                                 'neuron', 'similarity', 'sentence', 'ablation'])
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--max_batches', type=int, default=100, help='Max batches for word-neuron analysis')
+    parser.add_argument('--max_batches', type=int, default=100)
+
+    # Single neuron analysis
+    parser.add_argument('--neuron_id', type=int, default=0)
+    parser.add_argument('--neuron_type', default='feature_r',
+                        choices=['feature_r', 'feature_v', 'relational', 'value'])
+
+    # Sentence visualization
+    parser.add_argument('--text', type=str, default="The quick brown fox jumps over the lazy dog.")
+
     args = parser.parse_args()
 
     # Load model
@@ -574,10 +911,9 @@ def main():
 
     # Create analyzer
     analyzer = V16Analyzer(model, tokenizer, args.device)
-
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Run analysis
+    # Run analysis based on mode
     if args.mode in ['all', 'usage']:
         usage = analyzer.analyze_usage()
         print_usage_summary(usage)
@@ -592,32 +928,72 @@ def main():
 
     if args.mode in ['all', 'embedding']:
         emb = analyzer.analyze_embeddings(args.output_dir)
-        print("\n" + "="*60)
-        print("EMBEDDING ANALYSIS")
-        print("="*60)
-        print(f"Total neurons: {emb['total_neurons']}")
-        print(f"Embedding dim: {emb['embedding_dim']}")
-        print("\nType similarity (cosine):")
-        for k, v in emb.get('type_similarity', {}).items():
-            print(f"  {k}: {v:.3f}")
+        print(f"\nEmbedding visualization saved to: {emb.get('visualization', 'N/A')}")
         with open(os.path.join(args.output_dir, 'embeddings.json'), 'w') as f:
             json.dump(emb, f, indent=2)
 
-    if args.mode in ['all']:
-        viz = analyzer.visualize_usage(args.output_dir)
-        print(f"\nUsage visualization saved to: {viz.get('visualization', 'N/A')}")
+    if args.mode in ['all', 'weight_svd']:
+        svd = analyzer.analyze_weight_svd(args.output_dir)
+        print("\n" + "="*60)
+        print("WEIGHT SVD ANALYSIS")
+        print("="*60)
+        for name, data in svd.items():
+            if name == 'visualization':
+                continue
+            print(f"\n{name}:")
+            print(f"  Effective rank: {data['effective_rank']:.2f}")
+            print(f"  Var explained by top 5: {data['var_explained_by_top5']:.2%}")
+        with open(os.path.join(args.output_dir, 'weight_svd.json'), 'w') as f:
+            json.dump(convert_to_serializable(svd), f, indent=2)
 
-    if args.mode == 'word_neuron' and args.val_data:
+    if args.mode in ['all', 'similarity']:
+        sim = analyzer.analyze_similarity(args.output_dir)
+        print("\n" + "="*60)
+        print("NEURON SIMILARITY")
+        print("="*60)
+        for name, data in sim.items():
+            if name == 'visualization':
+                continue
+            print(f"{name}: avg={data['avg_similarity']:.3f}, max={data['max_similarity']:.3f}")
+        with open(os.path.join(args.output_dir, 'similarity.json'), 'w') as f:
+            json.dump(sim, f, indent=2)
+
+    if args.mode == 'neuron':
+        neuron = analyzer.analyze_single_neuron(args.neuron_id, args.neuron_type)
+        print_neuron_summary(neuron)
+        with open(os.path.join(args.output_dir, f'neuron_{args.neuron_type}_{args.neuron_id}.json'), 'w') as f:
+            json.dump(convert_to_serializable(neuron), f, indent=2)
+
+    if args.mode == 'sentence':
+        sent = analyzer.visualize_sentence(args.text, args.output_dir)
+        print(f"\nSentence visualization saved to: {sent.get('visualization', 'N/A')}")
+        with open(os.path.join(args.output_dir, 'sentence.json'), 'w') as f:
+            json.dump(convert_to_serializable(sent), f, indent=2)
+
+    if args.mode == 'ablation' and args.val_data:
         from utils.data import TextDataset, collate_fn_dynamic_padding
         from torch.utils.data import DataLoader
 
         dataset = TextDataset(args.val_data, tokenizer, max_length=128)
         dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
 
-        word_neuron = analyzer.analyze_word_neuron_mapping(dataloader, args.max_batches)
-        with open(os.path.join(args.output_dir, 'word_neuron.json'), 'w') as f:
-            json.dump(word_neuron, f, indent=2)
-        print(f"\nWord-neuron mapping saved to: {os.path.join(args.output_dir, 'word_neuron.json')}")
+        ablation = analyzer.run_ablation(dataloader, args.max_batches)
+        print("\n" + "="*60)
+        print("ABLATION STUDY")
+        print("="*60)
+        print(f"Baseline loss: {ablation['baseline_loss']:.4f}")
+        for ntype, results in ablation.items():
+            if ntype == 'baseline_loss':
+                continue
+            print(f"\n{ntype}:")
+            for r in results:
+                print(f"  Neuron {r['neuron_id']}: delta={r['loss_delta']:.4f}, importance={r['importance']:.2%}")
+        with open(os.path.join(args.output_dir, 'ablation.json'), 'w') as f:
+            json.dump(convert_to_serializable(ablation), f, indent=2)
+
+    if args.mode == 'all':
+        viz = analyzer.visualize_usage(args.output_dir)
+        print(f"\nUsage visualization saved to: {viz.get('visualization', 'N/A')}")
 
     print(f"\n{'='*60}")
     print(f"Analysis complete! Results saved to: {args.output_dir}")
