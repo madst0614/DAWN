@@ -29,7 +29,7 @@ model:
 
   # v16.2: Optimized based on usage analysis
   n_feature_r: 96                 # FR: 72→96 (병목 해소)
-  n_feature_v: 16                 # FV: 48→16 (8개만 사용)
+  n_feature_v: 24                 # FV: 48→24
   top_k_feature_r: 12             # k: 8→12 (DivRatio 안정화)
   top_k_feature_v: 4              # k: 6→4
 
@@ -74,7 +74,7 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16.2_22M_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_v16.2_22M_c4_5B
 
 # v16.2 Optimized Architecture
-#   - FR=96 (k=12), FV=16 (k=4)  → 112 feature neurons
+#   - FR=96 (k=12), FV=24 (k=4)  → 120 feature neurons
 #   - R=96 (k=12), V=12 (k=3)    → 108 expansion neurons
-#   - Total: 220 neurons (vs 340 in v16.0, 35% reduction)
+#   - Total: 228 neurons (vs 340 in v16.0, 33% reduction)
 #   - Symmetric FR/R design
