@@ -31,13 +31,13 @@ model:
   n_feature_r: 96                 # FR: 72→96 (병목 해소)
   n_feature_v: 24                 # FV: 48→24
   top_k_feature_r: 12             # k: 8→12 (DivRatio 안정화)
-  top_k_feature_v: 4              # k: 6→4
+  top_k_feature_v: 3              # k: 6→3
 
   # Symmetric design
   n_relational: 96                # R: 196→96 (68개 active)
   n_value: 12                     # V: 24→12
   top_k_relational: 12            # k: 20→12
-  top_k_value: 3                  # k: 4→3
+  top_k_value: 2                  # k: 4→2
 
   # Knowledge (unchanged)
   n_knowledge: 300
