@@ -50,10 +50,10 @@ class DAWNInterpreter:
         self.nlp = None
         if SPACY_AVAILABLE:
             try:
-                self.nlp = spacy.load("en_core_web_sm")
+                self.nlp = spacy.load("en_core_web_sm", disable=["ner", "lemmatizer"])
             except:
                 os.system("python -m spacy download en_core_web_sm")
-                self.nlp = spacy.load("en_core_web_sm")
+                self.nlp = spacy.load("en_core_web_sm", disable=["ner", "lemmatizer"])
 
         self._init_storage()
         self.output_dir = "./interpretability_results"
@@ -174,10 +174,19 @@ class DAWNInterpreter:
                             routing[f"layer{layer_idx}_{k}"] = v
             if not routing: continue
 
+            # Batch decode all texts first
+            all_tokens = [input_ids[b].cpu().tolist() for b in range(B)]
+            all_texts = [self.tokenizer.decode(toks, skip_special_tokens=True) for toks in all_tokens]
+
+            # Spacy batch processing
+            if self.nlp:
+                docs = list(self.nlp.pipe(all_texts, batch_size=B))
+            else:
+                docs = [None] * B
+
             for b in range(B):
-                tokens = input_ids[b].cpu().tolist()
-                text = self.tokenizer.decode(tokens, skip_special_tokens=True)
-                doc = self.nlp(text) if self.nlp else None
+                tokens = all_tokens[b]
+                doc = docs[b]
                 spacy_idx = 0
 
                 for pos in range(L):
@@ -202,7 +211,9 @@ class DAWNInterpreter:
                         if not nt or not isinstance(weights, torch.Tensor): continue
                         layer = self._get_layer_idx(key)
 
-                        for n_idx in self._get_active_neurons(weights, b, pos, L):
+                        active_neurons = self._get_active_neurons(weights, b, pos, L)
+                        if not active_neurons: continue
+                        for n_idx in active_neurons:
                             self._record(tok_str, nt, n_idx, layer, pos_bin, len_bin, context, ling)
 
         print(f"Collected: {sum(self.total_token_counts.values()):,} tokens, {len(self.token_neuron_map):,} unique")
