@@ -315,7 +315,8 @@ def main():
     parser.add_argument('--val_data', required=True, help='Validation data path (.pt)')
     parser.add_argument('--output_dir', default='./analysis_detailed', help='Output directory')
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--n_batches', type=int, default=100)
+    parser.add_argument('--n_batches', '--max_batches', type=int, default=100, dest='n_batches',
+                        help='Number of batches to analyze')
     parser.add_argument('--batch_size', type=int, default=32)
 
     args = parser.parse_args()
