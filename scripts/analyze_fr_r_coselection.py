@@ -279,6 +279,207 @@ def analyze_coselection_matrix(co_selection, fr_counts, r_counts, n_feature_r, n
     return results
 
 
+def analyze_neuron_subspace_diversity(model, dataloader, device, config, max_batches=20):
+    """FR/R 뉴런 간 subspace 다양성 분석 - 뉴런들이 서로 다른 subspace를 사용하는가?"""
+
+    import torch.nn.functional as F
+
+    print(f"\n{'='*60}")
+    print("Neuron Subspace Diversity Analysis")
+    print(f"{'='*60}")
+
+    results = {}
+
+    # Get neuron embeddings from router
+    if not hasattr(model, 'global_routers'):
+        print("  Model doesn't have global_routers")
+        return results
+
+    router = model.global_routers.neuron_router
+
+    # Analyze FR neurons (compression matrices)
+    if hasattr(router, 'neuron_emb_feature_r'):
+        print(f"\n  FR Neurons Subspace Analysis:")
+
+        # Get FR neuron parameters from layers
+        # FR neurons: W_down [d_model, rank] per neuron
+        fr_embeddings = []
+
+        # Check if we can access layer neurons
+        for layer in model.layers:
+            if hasattr(layer, 'attn') and hasattr(layer.attn, 'feature_r_neurons'):
+                fr_neurons = layer.attn.feature_r_neurons  # Should be [n_feature_r, d_model, rank]
+                if fr_neurons is not None:
+                    fr_embeddings.append(fr_neurons)
+                    break
+
+        if fr_embeddings:
+            fr_neurons = fr_embeddings[0]  # [n_feature_r, d_model, rank]
+            n_fr = fr_neurons.shape[0]
+
+            # Flatten each neuron's matrix to a vector for comparison
+            fr_flat = fr_neurons.view(n_fr, -1)  # [n_feature_r, d_model * rank]
+
+            # Compute pairwise cosine similarity
+            fr_norm = F.normalize(fr_flat, dim=-1)
+            fr_sim = torch.mm(fr_norm, fr_norm.t())  # [n_fr, n_fr]
+
+            # Remove diagonal (self-similarity)
+            mask = ~torch.eye(n_fr, dtype=torch.bool, device=device)
+            fr_sim_off_diag = fr_sim[mask]
+
+            avg_sim = fr_sim_off_diag.mean().item()
+            max_sim = fr_sim_off_diag.max().item()
+            min_sim = fr_sim_off_diag.min().item()
+            std_sim = fr_sim_off_diag.std().item()
+
+            print(f"    Pairwise cosine similarity:")
+            print(f"      Mean: {avg_sim:.4f}")
+            print(f"      Std:  {std_sim:.4f}")
+            print(f"      Min:  {min_sim:.4f}")
+            print(f"      Max:  {max_sim:.4f}")
+
+            # Interpretation
+            if avg_sim < 0.3:
+                print(f"    → DIVERSE: FR neurons use distinct subspaces (good!)")
+            elif avg_sim < 0.6:
+                print(f"    → MODERATE: Some overlap in FR neuron subspaces")
+            else:
+                print(f"    → COLLAPSED: FR neurons converging to similar subspaces (bad!)")
+
+            # Find most similar pairs
+            top_k_pairs = 10
+            sim_flat = fr_sim.view(-1)
+            # Exclude diagonal
+            for i in range(n_fr):
+                sim_flat[i * n_fr + i] = -1
+
+            top_vals, top_idx = torch.topk(sim_flat, top_k_pairs)
+            print(f"\n    Most similar FR neuron pairs:")
+            for i in range(top_k_pairs):
+                idx = top_idx[i].item()
+                fr_i = idx // n_fr
+                fr_j = idx % n_fr
+                sim_val = top_vals[i].item()
+                print(f"      FR_{fr_i} - FR_{fr_j}: {sim_val:.4f}")
+
+            results['fr_subspace'] = {
+                'mean_similarity': avg_sim,
+                'std_similarity': std_sim,
+                'min_similarity': min_sim,
+                'max_similarity': max_sim,
+                'interpretation': 'diverse' if avg_sim < 0.3 else ('moderate' if avg_sim < 0.6 else 'collapsed'),
+                'top_similar_pairs': [(int(top_idx[i].item() // n_fr), int(top_idx[i].item() % n_fr), float(top_vals[i].item())) for i in range(top_k_pairs)]
+            }
+        else:
+            print("    Could not access FR neuron weights")
+
+    # Analyze R neurons (expansion matrices)
+    print(f"\n  R Neurons Subspace Analysis:")
+
+    r_embeddings = []
+    for layer in model.layers:
+        if hasattr(layer, 'attn') and hasattr(layer.attn, 'relational_neurons_Q'):
+            r_neurons = layer.attn.relational_neurons_Q  # Should be [n_relational, rank, d_model]
+            if r_neurons is not None:
+                r_embeddings.append(r_neurons)
+                break
+
+    if r_embeddings:
+        r_neurons = r_embeddings[0]  # [n_relational, rank, d_model]
+        n_r = r_neurons.shape[0]
+
+        # Flatten each neuron's matrix
+        r_flat = r_neurons.view(n_r, -1)  # [n_relational, rank * d_model]
+
+        # Compute pairwise cosine similarity
+        r_norm = F.normalize(r_flat, dim=-1)
+        r_sim = torch.mm(r_norm, r_norm.t())  # [n_r, n_r]
+
+        # Remove diagonal
+        mask = ~torch.eye(n_r, dtype=torch.bool, device=device)
+        r_sim_off_diag = r_sim[mask]
+
+        avg_sim = r_sim_off_diag.mean().item()
+        max_sim = r_sim_off_diag.max().item()
+        min_sim = r_sim_off_diag.min().item()
+        std_sim = r_sim_off_diag.std().item()
+
+        print(f"    Pairwise cosine similarity:")
+        print(f"      Mean: {avg_sim:.4f}")
+        print(f"      Std:  {std_sim:.4f}")
+        print(f"      Min:  {min_sim:.4f}")
+        print(f"      Max:  {max_sim:.4f}")
+
+        if avg_sim < 0.3:
+            print(f"    → DIVERSE: R neurons use distinct subspaces (good!)")
+        elif avg_sim < 0.6:
+            print(f"    → MODERATE: Some overlap in R neuron subspaces")
+        else:
+            print(f"    → COLLAPSED: R neurons converging to similar subspaces (bad!)")
+
+        # Find most similar pairs
+        top_k_pairs = 10
+        sim_flat = r_sim.view(-1)
+        for i in range(n_r):
+            sim_flat[i * n_r + i] = -1
+
+        top_vals, top_idx = torch.topk(sim_flat, top_k_pairs)
+        print(f"\n    Most similar R neuron pairs:")
+        for i in range(top_k_pairs):
+            idx = top_idx[i].item()
+            r_i = idx // n_r
+            r_j = idx % n_r
+            sim_val = top_vals[i].item()
+            print(f"      R_{r_i} - R_{r_j}: {sim_val:.4f}")
+
+        results['r_subspace'] = {
+            'mean_similarity': avg_sim,
+            'std_similarity': std_sim,
+            'min_similarity': min_sim,
+            'max_similarity': max_sim,
+            'interpretation': 'diverse' if avg_sim < 0.3 else ('moderate' if avg_sim < 0.6 else 'collapsed'),
+            'top_similar_pairs': [(int(top_idx[i].item() // n_r), int(top_idx[i].item() % n_r), float(top_vals[i].item())) for i in range(top_k_pairs)]
+        }
+    else:
+        print("    Could not access R neuron weights")
+
+    # Analyze router embeddings (d_space dimension)
+    print(f"\n  Router Embedding Analysis:")
+
+    router_embs = {
+        'FR': getattr(router, 'neuron_emb_feature_r', None),
+        'FV': getattr(router, 'neuron_emb_feature_v', None),
+        'R': getattr(router, 'neuron_emb_relational', None),
+        'V': getattr(router, 'neuron_emb_value', None),
+    }
+
+    for name, emb in router_embs.items():
+        if emb is None:
+            continue
+
+        n_neurons = emb.shape[0]
+        emb_norm = F.normalize(emb, dim=-1)
+        sim = torch.mm(emb_norm, emb_norm.t())
+
+        mask = ~torch.eye(n_neurons, dtype=torch.bool, device=device)
+        sim_off_diag = sim[mask]
+
+        avg_sim = sim_off_diag.mean().item()
+        print(f"    {name} router embeddings: mean sim = {avg_sim:.4f}", end="")
+
+        if avg_sim < 0.3:
+            print(" (diverse)")
+        elif avg_sim < 0.6:
+            print(" (moderate)")
+        else:
+            print(" (collapsed!)")
+
+        results[f'{name.lower()}_router_emb_similarity'] = avg_sim
+
+    return results
+
+
 def save_heatmap(co_selection, output_path):
     """Save co-selection heatmap as image."""
     try:
@@ -366,8 +567,12 @@ def main():
     dataset = torch.utils.data.TensorDataset(input_ids)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
-    # Run analysis
+    # Run co-selection analysis
     results, co_matrix = analyze_coselection(model, dataloader, args.device, config, args.max_batches)
+
+    # Run subspace diversity analysis
+    subspace_results = analyze_neuron_subspace_diversity(model, dataloader, args.device, config, args.max_batches)
+    results['subspace_diversity'] = subspace_results
 
     # Save heatmap
     heatmap_path = os.path.join(args.output_dir, "fr_r_coselection_heatmap.png")
