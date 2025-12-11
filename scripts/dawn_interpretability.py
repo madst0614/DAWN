@@ -239,12 +239,14 @@ class DAWNInterpreter:
     @torch.no_grad()
     def collect_data_vectorized(self, dataloader, max_batches=500, verbose=True):
         """Fully vectorized data collection - 50x faster"""
+        import time
+        import pandas as pd
         print(f"\n{'='*60}\nStep 1: Collecting Data (Vectorized)\n{'='*60}")
 
-        import pandas as pd
+        t_start = time.time()
         topk_map = {'FR': 8, 'FV': 8, 'R': 4, 'V': 6}
         all_records = []
-        seq_len = 512  # will be updated from data
+        seq_len = 512
 
         for batch_idx, batch in enumerate(tqdm(dataloader, disable=not verbose)):
             if batch_idx >= max_batches: break
@@ -254,7 +256,7 @@ class DAWNInterpreter:
 
             B, L = input_ids.shape
             seq_len = L
-            token_ids = input_ids.cpu().numpy()
+            token_ids = input_ids.cpu().numpy().astype(np.int32)
 
             output = self.model(input_ids, return_routing_info=True)
             routing_infos = output[-1] if isinstance(output, tuple) else []
@@ -275,29 +277,42 @@ class DAWNInterpreter:
                     if pref is None: continue
                     k = min(topk_map[nt], pref.shape[-1])
                     _, topk_idx = torch.topk(pref, k, dim=-1)
-                    topk_np = topk_idx.cpu().numpy()
+                    topk_np = topk_idx.cpu().numpy().astype(np.int16)
 
                     b_idx, l_idx, k_idx = np.indices(topk_np.shape)
                     records = np.stack([
                         token_ids[b_idx, l_idx].ravel(),
-                        np.full(topk_np.size, nt_idx),
+                        np.full(topk_np.size, nt_idx, dtype=np.int8),
                         topk_np.ravel(),
-                        np.full(topk_np.size, layer_idx),
-                        l_idx.ravel(),
+                        np.full(topk_np.size, layer_idx, dtype=np.int8),
+                        l_idx.ravel().astype(np.int16),
                     ], axis=1)
                     all_records.append(records)
+
+        t_forward = time.time()
+        print(f"  Forward pass: {t_forward - t_start:.1f}s")
 
         if not all_records:
             print("No records collected")
             return None
 
         all_records = np.concatenate(all_records, axis=0)
-        print(f"Raw records: {len(all_records):,}")
+        print(f"  Raw records: {len(all_records):,}")
 
+        # Optimize dtypes for memory
         df = pd.DataFrame(all_records, columns=['token_id', 'nt_idx', 'neuron_idx', 'layer_idx', 'pos'])
+        df['token_id'] = df['token_id'].astype(np.int32)
+        df['nt_idx'] = df['nt_idx'].astype(np.int8)
+        df['neuron_idx'] = df['neuron_idx'].astype(np.int16)
+        df['layer_idx'] = df['layer_idx'].astype(np.int8)
+        df['pos'] = df['pos'].astype(np.int16)
 
+        t_df = time.time()
+        print(f"  DataFrame created: {t_df - t_forward:.1f}s")
+
+        # Token string mapping (vectorized)
         unique_ids = df['token_id'].unique()
-        id_to_str = {tid: self.tokenizer.convert_ids_to_tokens([int(tid)])[0] for tid in unique_ids}
+        id_to_str = {int(tid): self.tokenizer.convert_ids_to_tokens([int(tid)])[0] for tid in unique_ids}
         df['token'] = df['token_id'].map(id_to_str)
 
         nt_names = {0: 'FR', 1: 'FV', 2: 'R', 3: 'V'}
@@ -306,16 +321,20 @@ class DAWNInterpreter:
         df['pos_bin'] = pd.cut(df['pos'] / seq_len, bins=[-0.01, 0.01, 0.25, 0.75, 1.01],
                                labels=['first', 'start', 'middle', 'end'])
 
+        t_map = time.time()
+        print(f"  Mapping: {t_map - t_df:.1f}s")
+
         # Token-Neuron counts
         token_neuron = df.groupby(['token', 'nt', 'neuron_idx']).size()
         for (tok, nt, n_idx), count in token_neuron.items():
             self.token_neuron_map[tok][nt][int(n_idx)] += count
             self.neuron_token_map[f"{nt}_{int(n_idx)}"]["tokens"][tok] += count
 
-        # Layer counts
+        # Layer counts + neuron_layer_distribution
         layer_counts = df.groupby(['layer_idx', 'nt', 'neuron_idx']).size()
         for (layer, nt, n_idx), count in layer_counts.items():
             self.layer_neuron_counts[int(layer)][nt][int(n_idx)] += count
+            self.neuron_layer_distribution[f"{nt}_{int(n_idx)}"][int(layer)] += count
 
         # Position counts
         pos_counts = df.groupby(['pos_bin', 'nt', 'neuron_idx']).size()
@@ -327,6 +346,9 @@ class DAWNInterpreter:
         for tok, count in tok_counts.items():
             self.total_token_counts[tok] += count
 
+        t_agg = time.time()
+        print(f"  Aggregation: {t_agg - t_map:.1f}s")
+        print(f"  Total: {t_agg - t_start:.1f}s")
         print(f"Collected: {len(df):,} records, {len(unique_ids):,} unique tokens")
 
         self._add_spacy_features_sampled(df, sample_ratio=0.1)
@@ -335,11 +357,11 @@ class DAWNInterpreter:
 
     def _add_spacy_features_sampled(self, df, sample_ratio=0.1):
         """Spacy analysis on sampled unique tokens only"""
+        import pandas as pd
         if not self.nlp or df is None:
             return
 
         unique_tokens = df['token'].unique()
-        # Filter out special tokens
         unique_tokens = [t for t in unique_tokens if t not in ['[PAD]','<pad>','[CLS]','[SEP]','[UNK]']]
         sample_size = max(1000, int(len(unique_tokens) * sample_ratio))
         sampled = np.random.choice(unique_tokens, min(sample_size, len(unique_tokens)), replace=False)
@@ -347,24 +369,34 @@ class DAWNInterpreter:
         print(f"Running spacy on {len(sampled)} unique tokens...")
 
         docs = list(self.nlp.pipe([str(t).replace('##','').replace('Ġ','').replace('▁','') for t in sampled], batch_size=500))
-        token_to_pos = {}
-        token_to_dep = {}
+        token_to_pos = {tok: doc[0].pos_ for tok, doc in zip(sampled, docs) if len(doc) > 0}
+        token_to_dep = {tok: doc[0].dep_ for tok, doc in zip(sampled, docs) if len(doc) > 0}
 
-        for tok, doc in zip(sampled, docs):
-            if len(doc) > 0:
-                token_to_pos[tok] = doc[0].pos_
-                token_to_dep[tok] = doc[0].dep_
+        # Vectorized map (faster than lambda)
+        pos_series = pd.Series(token_to_pos)
+        dep_series = pd.Series(token_to_dep)
+        df['pos_tag'] = df['token'].map(pos_series).fillna('UNK')
+        df['dep_tag'] = df['token'].map(dep_series).fillna('UNK')
 
-        df['pos_tag'] = df['token'].map(lambda x: token_to_pos.get(x, 'UNK'))
-        df['dep_tag'] = df['token'].map(lambda x: token_to_dep.get(x, 'UNK'))
-
+        # POS-Neuron counts
         pos_neuron = df.groupby(['pos_tag', 'nt', 'neuron_idx']).size()
         for (pos, nt, n_idx), count in pos_neuron.items():
             self.pos_neuron_counts[pos][nt][int(n_idx)] += count
+            self.neuron_pos_counts[f"{nt}_{int(n_idx)}"][nt][pos] += count
 
+        # Dep-Neuron counts
         dep_neuron = df.groupby(['dep_tag', 'nt', 'neuron_idx']).size()
         for (dep, nt, n_idx), count in dep_neuron.items():
             self.dep_neuron_counts[dep][nt][int(n_idx)] += count
+            self.neuron_dep_counts[f"{nt}_{int(n_idx)}"][nt][dep] += count
+
+        # QK vs V comparison
+        qk_types = {'FR', 'R'}
+        for (pos, nt, n_idx), count in pos_neuron.items():
+            if nt in qk_types:
+                self.qk_v_comparison["qk_neurons"][pos][int(n_idx)] += count
+            else:
+                self.qk_v_comparison["v_neurons"][pos][int(n_idx)] += count
 
         print(f"Spacy features added for {len(token_to_pos)} tokens")
 
