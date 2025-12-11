@@ -618,6 +618,110 @@ class V16Analyzer:
     # ==========================================================
     # 7. Active Neuron Diversity (가장 중요!)
     # ==========================================================
+    def analyze_selection_diversity(self, dataloader, n_batches: int = 100) -> Dict:
+        """
+        Selection Diversity - 배치별 실제 선택 다양성 측정
+        EMA 기반이 아닌 실제 forward pass에서의 선택 패턴 분석
+        """
+        if self.router is None:
+            return {'error': 'No router found'}
+
+        # Track selected neurons
+        union_selected = {
+            'feature_r': set(),
+            'feature_v': set(),
+            'relational': set(),
+            'value': set(),
+        }
+        per_batch_counts = {
+            'feature_r': [],
+            'feature_v': [],
+            'relational': [],
+            'value': [],
+        }
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(dataloader, desc='Selection Diversity', total=n_batches)):
+                if i >= n_batches:
+                    break
+
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
+
+                try:
+                    outputs = self.model(input_ids, attention_mask=attention_mask, return_routing_info=True)
+                    routing_info = outputs.get('routing_info', {})
+                except Exception as e:
+                    continue
+
+                # Track selections for each neuron type
+                for ntype, weight_key in [
+                    ('feature_r', 'feature_r_weights'),
+                    ('feature_v', 'feature_v_weights'),
+                    ('relational', 'relational_weights_Q'),
+                    ('value', 'value_weights'),
+                ]:
+                    if weight_key in routing_info:
+                        weights = routing_info[weight_key]
+                        # weights: [B, S, N] - batch, seq, neurons
+                        if weights.dim() == 3:
+                            # Neurons selected if weight > 0 for any token in batch
+                            selected = (weights > 0).any(dim=0).any(dim=0).cpu()  # [N]
+                            union_selected[ntype].update(selected.nonzero().flatten().tolist())
+                            per_batch_counts[ntype].append(selected.sum().item())
+                        elif weights.dim() == 2:
+                            selected = (weights > 0).any(dim=0).cpu()
+                            union_selected[ntype].update(selected.nonzero().flatten().tolist())
+                            per_batch_counts[ntype].append(selected.sum().item())
+
+        # Calculate results
+        results = {}
+        n_totals = {
+            'feature_r': self.router.n_feature_r,
+            'feature_v': self.router.n_feature_v,
+            'relational': self.router.n_relational,
+            'value': self.router.n_value,
+        }
+
+        for ntype in union_selected:
+            n_total = n_totals[ntype]
+            union_count = len(union_selected[ntype])
+            batch_counts = per_batch_counts[ntype]
+
+            if len(batch_counts) > 0:
+                per_batch_avg = np.mean(batch_counts)
+                per_batch_std = np.std(batch_counts)
+                per_batch_min = np.min(batch_counts)
+                per_batch_max = np.max(batch_counts)
+            else:
+                per_batch_avg = per_batch_std = per_batch_min = per_batch_max = 0
+
+            results[ntype] = {
+                'n_total': n_total,
+                'per_batch_avg': float(per_batch_avg),
+                'per_batch_std': float(per_batch_std),
+                'per_batch_min': int(per_batch_min),
+                'per_batch_max': int(per_batch_max),
+                'union_count': union_count,
+                'union_coverage': float(union_count / n_total) if n_total > 0 else 0,
+                'diversity_ratio': float(union_count / per_batch_avg) if per_batch_avg > 0 else 0,
+            }
+
+        # Summary
+        total_union = sum(len(union_selected[k]) for k in union_selected)
+        total_neurons = sum(n_totals.values())
+        results['summary'] = {
+            'n_batches_processed': min(n_batches, len(per_batch_counts['feature_r'])),
+            'total_union_coverage': float(total_union / total_neurons) if total_neurons > 0 else 0,
+            'interpretation': (
+                'High diversity_ratio (>2) = 많은 뉴런이 batch마다 다르게 선택됨\n'
+                'Low diversity_ratio (~1) = 항상 같은 뉴런만 선택됨'
+            ),
+        }
+
+        return results
+
     def analyze_diversity(self) -> Dict:
         """
         Active Neuron Diversity 분석
@@ -1337,6 +1441,23 @@ def print_diversity_summary(div: Dict):
         print(f"Overall Diversity Score: {div['overall']['diversity_score']:.2f} ({div['overall']['health']})")
 
 
+def print_selection_diversity_summary(sel: Dict):
+    print("\n" + "="*60)
+    print("SELECTION DIVERSITY (실시간 Forward Pass)")
+    print("="*60)
+    print(f"{'Type':<12} {'PerBatch':>10} {'Union':>8} {'Total':>8} {'Coverage':>10} {'DivRatio':>10}")
+    print("-"*70)
+    for key in ['feature_r', 'feature_v', 'relational', 'value']:
+        if key not in sel:
+            continue
+        d = sel[key]
+        print(f"{key:<12} {d['per_batch_avg']:>10.1f} {d['union_count']:>8} {d['n_total']:>8} {d['union_coverage']:>10.1%} {d['diversity_ratio']:>10.2f}")
+    if 'summary' in sel:
+        print("-"*70)
+        print(f"Total Union Coverage: {sel['summary']['total_union_coverage']:.1%}")
+        print(f"Batches processed: {sel['summary']['n_batches_processed']}")
+
+
 def print_dead_neurons_summary(dead: Dict):
     print("\n" + "="*60)
     print("DEAD NEURON ANALYSIS")
@@ -1362,8 +1483,8 @@ def main():
     parser.add_argument('--output_dir', default='./analysis_v16', help='Output directory')
     parser.add_argument('--mode', default='all',
                         choices=['all', 'usage', 'excitability', 'embedding', 'weight_svd',
-                                 'neuron', 'similarity', 'diversity', 'dead_neurons',
-                                 'clustering', 'trajectory', 'probing', 'ablation'])
+                                 'neuron', 'similarity', 'diversity', 'selection_diversity',
+                                 'dead_neurons', 'clustering', 'trajectory', 'probing', 'ablation'])
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--max_batches', type=int, default=100)
 
@@ -1437,11 +1558,41 @@ def main():
             json.dump(convert_to_serializable(neuron), f, indent=2)
 
     # NEW: Diversity analysis (most important!)
+    # Shows BOTH EMA-based diversity AND selection diversity
     if args.mode in ['all', 'diversity']:
+        # 1. EMA-based diversity
         div = analyzer.analyze_diversity()
         print_diversity_summary(div)
-        with open(os.path.join(args.output_dir, 'diversity.json'), 'w') as f:
+        with open(os.path.join(args.output_dir, 'diversity_ema.json'), 'w') as f:
             json.dump(div, f, indent=2)
+
+        # 2. Selection diversity (requires data)
+        if args.val_data:
+            from utils.data import TextDataset, collate_fn_dynamic_padding
+            from torch.utils.data import DataLoader
+
+            dataset = TextDataset(args.val_data, tokenizer, max_length=128)
+            dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
+
+            sel_div = analyzer.analyze_selection_diversity(dataloader, args.max_batches)
+            print_selection_diversity_summary(sel_div)
+            with open(os.path.join(args.output_dir, 'diversity_selection.json'), 'w') as f:
+                json.dump(sel_div, f, indent=2)
+        else:
+            print("\n[Info] Selection diversity requires --val_data")
+
+    # Selection diversity only mode
+    if args.mode == 'selection_diversity' and args.val_data:
+        from utils.data import TextDataset, collate_fn_dynamic_padding
+        from torch.utils.data import DataLoader
+
+        dataset = TextDataset(args.val_data, tokenizer, max_length=128)
+        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
+
+        sel_div = analyzer.analyze_selection_diversity(dataloader, args.max_batches)
+        print_selection_diversity_summary(sel_div)
+        with open(os.path.join(args.output_dir, 'diversity_selection.json'), 'w') as f:
+            json.dump(sel_div, f, indent=2)
 
     # NEW: Dead neuron analysis (for shrink decisions)
     if args.mode in ['all', 'dead_neurons']:
