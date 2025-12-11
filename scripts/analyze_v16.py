@@ -1568,11 +1568,13 @@ def main():
 
         # 2. Selection diversity (requires data)
         if args.val_data:
+            from functools import partial
             from utils.data import TextDataset, collate_fn_dynamic_padding
             from torch.utils.data import DataLoader
 
             dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-            dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
+            collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+            dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
 
             sel_div = analyzer.analyze_selection_diversity(dataloader, args.max_batches)
             print_selection_diversity_summary(sel_div)
@@ -1583,11 +1585,13 @@ def main():
 
     # Selection diversity only mode
     if args.mode == 'selection_diversity' and args.val_data:
+        from functools import partial
         from utils.data import TextDataset, collate_fn_dynamic_padding
         from torch.utils.data import DataLoader
 
         dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
+        collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
 
         sel_div = analyzer.analyze_selection_diversity(dataloader, args.max_batches)
         print_selection_diversity_summary(sel_div)
@@ -1618,11 +1622,13 @@ def main():
 
     # NEW: Token trajectory (requires data)
     if args.mode == 'trajectory' and args.val_data:
+        from functools import partial
         from utils.data import TextDataset, collate_fn_dynamic_padding
         from torch.utils.data import DataLoader
 
         dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
+        collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
 
         traj = analyzer.analyze_token_trajectory(dataloader, args.max_batches)
         print("\n" + "="*60)
@@ -1634,11 +1640,13 @@ def main():
 
     # NEW: Probing classifier (requires data)
     if args.mode == 'probing' and args.val_data:
+        from functools import partial
         from utils.data import TextDataset, collate_fn_dynamic_padding
         from torch.utils.data import DataLoader
 
         dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
+        collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
 
         probing = analyzer.run_probing(dataloader, args.max_batches)
         print("\n" + "="*60)
@@ -1653,11 +1661,13 @@ def main():
             json.dump(convert_to_serializable(probing), f, indent=2)
 
     if args.mode == 'ablation' and args.val_data:
+        from functools import partial
         from utils.data import TextDataset, collate_fn_dynamic_padding
         from torch.utils.data import DataLoader
 
         dataset = TextDataset(args.val_data, tokenizer, max_length=128)
-        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_dynamic_padding)
+        collate_fn = partial(collate_fn_dynamic_padding, tokenizer=tokenizer)
+        dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn)
 
         ablation = analyzer.run_ablation(dataloader, args.max_batches)
         print("\n" + "="*60)
