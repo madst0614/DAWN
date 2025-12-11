@@ -480,6 +480,328 @@ def analyze_neuron_subspace_diversity(model, dataloader, device, config, max_bat
     return results
 
 
+def analyze_fr_r_subspace_similarity(model, dataloader, device, config, max_batches=20):
+    """
+    FR/R Subspace Similarity Analysis (Data-Driven)
+
+    실제 데이터를 통해 FR 뉴런 출력 벡터와 R 뉴런 입력 선호도를 분석:
+    1. FR output vectors: 실제 x @ FR_neuron 출력의 평균
+    2. R input preference: SVD로 각 R 뉴런의 선호 입력 방향 추출
+    3. FR-R alignment: FR 출력이 어떤 R 입력과 정렬되는지
+    """
+    import torch.nn.functional as F
+
+    print(f"\n{'='*60}")
+    print("FR/R Subspace Similarity Analysis (Data-Driven)")
+    print(f"{'='*60}")
+
+    n_feature_r = config.get('n_feature_r', 96)
+    n_relational = config.get('n_relational', 96)
+    rank = config.get('rank', 64)
+
+    print(f"  n_feature_r: {n_feature_r}")
+    print(f"  n_relational: {n_relational}")
+    print(f"  rank (subspace dim): {rank}")
+
+    results = {}
+
+    # Get neuron weights from first layer
+    layer = model.layers[0]
+
+    if not hasattr(layer.attn, 'feature_r_neurons') or not hasattr(layer.attn, 'relational_neurons_Q'):
+        print("  Error: Cannot access FR/R neuron weights")
+        return results, None
+
+    fr_neurons = layer.attn.feature_r_neurons  # [n_fr, d_model, rank]
+    r_neurons = layer.attn.relational_neurons_Q  # [n_r, rank, d_model]
+
+    if fr_neurons is None or r_neurons is None:
+        print("  Error: FR/R neurons are None")
+        return results, None
+
+    print(f"  FR neurons shape: {fr_neurons.shape}")
+    print(f"  R neurons shape: {r_neurons.shape}")
+
+    # =========================================================================
+    # Step 1: Compute FR output vectors using actual data
+    # =========================================================================
+    print(f"\n  Computing FR output vectors from {max_batches} batches...")
+
+    fr_outputs = [[] for _ in range(n_feature_r)]
+
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= max_batches:
+                break
+
+            if isinstance(batch, (list, tuple)):
+                input_ids = batch[0].to(device)
+            else:
+                input_ids = batch.to(device)
+
+            # Get embeddings (token + position)
+            x = model.token_emb(input_ids)
+
+            if hasattr(model, 'pos_emb'):
+                seq_len = input_ids.shape[1]
+                positions = torch.arange(seq_len, device=device).unsqueeze(0)
+                x = x + model.pos_emb(positions)
+
+            # Compute FR outputs: x @ FR_neuron[i] → [B, S, rank]
+            for i in range(n_feature_r):
+                # fr_neurons[i]: [d_model, rank]
+                out = torch.matmul(x, fr_neurons[i])  # [B, S, rank]
+                # Average over batch and sequence to get representative vector
+                fr_outputs[i].append(out.mean(dim=[0, 1]))  # [rank]
+
+            if (batch_idx + 1) % 10 == 0:
+                print(f"    Processed {batch_idx + 1}/{max_batches} batches...")
+
+    # Average FR outputs across batches
+    fr_vecs = torch.stack([torch.stack(outputs).mean(0) for outputs in fr_outputs])  # [n_fr, rank]
+    fr_vecs_norm = F.normalize(fr_vecs, dim=-1)
+
+    # =========================================================================
+    # Step 2: Compute R "preferred input" vectors via SVD
+    # =========================================================================
+    print(f"\n  Computing R preferred input directions (SVD)...")
+
+    r_vecs = []
+    r_singular_values = []
+
+    for j in range(n_relational):
+        W = r_neurons[j]  # [rank, d_model]
+        # SVD to find dominant input direction
+        # W = U @ S @ V^T, U[:,0] is the input direction that produces max output
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+        r_vecs.append(U[:, 0])  # First left singular vector (rank-dimensional)
+        r_singular_values.append(S[0].item())
+
+    r_vecs = torch.stack(r_vecs)  # [n_r, rank]
+    r_vecs_norm = F.normalize(r_vecs, dim=-1)
+
+    # =========================================================================
+    # Step 3: FR-FR Similarity (in rank space)
+    # =========================================================================
+    print(f"\n{'='*60}")
+    print("FR Output Similarity (64-dim rank space)")
+    print(f"{'='*60}")
+
+    fr_fr_sim = torch.mm(fr_vecs_norm, fr_vecs_norm.t())  # [n_fr, n_fr]
+
+    # Remove diagonal for statistics
+    mask = ~torch.eye(n_feature_r, dtype=torch.bool, device=device)
+    fr_fr_off_diag = fr_fr_sim[mask]
+
+    avg_sim = fr_fr_off_diag.mean().item()
+    std_sim = fr_fr_off_diag.std().item()
+    min_sim = fr_fr_off_diag.min().item()
+    max_sim = fr_fr_off_diag.max().item()
+
+    print(f"  Pairwise cosine similarity:")
+    print(f"    Mean: {avg_sim:.4f}")
+    print(f"    Std:  {std_sim:.4f}")
+    print(f"    Min:  {min_sim:.4f}")
+    print(f"    Max:  {max_sim:.4f}")
+
+    if avg_sim < 0.3:
+        interp = "DIVERSE: FR neurons output in distinct directions (good!)"
+    elif avg_sim < 0.6:
+        interp = "MODERATE: Some overlap in FR output directions"
+    else:
+        interp = "COLLAPSED: FR outputs converging (bad!)"
+    print(f"  → {interp}")
+
+    # Top similar FR pairs
+    top_k = 10
+    sim_flat = fr_fr_sim.clone().view(-1)
+    for i in range(n_feature_r):
+        sim_flat[i * n_feature_r + i] = -2  # Exclude diagonal
+
+    top_vals, top_idx = torch.topk(sim_flat, top_k)
+    print(f"\n  Most similar FR output pairs:")
+    fr_similar_pairs = []
+    for i in range(top_k):
+        idx = top_idx[i].item()
+        fr_i = idx // n_feature_r
+        fr_j = idx % n_feature_r
+        sim_val = top_vals[i].item()
+        print(f"    FR_{fr_i} - FR_{fr_j}: {sim_val:.4f}")
+        fr_similar_pairs.append((fr_i, fr_j, sim_val))
+
+    results['fr_output_similarity'] = {
+        'mean': avg_sim,
+        'std': std_sim,
+        'min': min_sim,
+        'max': max_sim,
+        'interpretation': interp,
+        'top_similar_pairs': fr_similar_pairs
+    }
+
+    # =========================================================================
+    # Step 4: R-R Similarity (preferred input directions)
+    # =========================================================================
+    print(f"\n{'='*60}")
+    print("R Preferred Input Similarity (64-dim rank space)")
+    print(f"{'='*60}")
+
+    r_r_sim = torch.mm(r_vecs_norm, r_vecs_norm.t())  # [n_r, n_r]
+
+    mask = ~torch.eye(n_relational, dtype=torch.bool, device=device)
+    r_r_off_diag = r_r_sim[mask]
+
+    avg_sim = r_r_off_diag.mean().item()
+    std_sim = r_r_off_diag.std().item()
+    min_sim = r_r_off_diag.min().item()
+    max_sim = r_r_off_diag.max().item()
+
+    print(f"  Pairwise cosine similarity:")
+    print(f"    Mean: {avg_sim:.4f}")
+    print(f"    Std:  {std_sim:.4f}")
+    print(f"    Min:  {min_sim:.4f}")
+    print(f"    Max:  {max_sim:.4f}")
+
+    if avg_sim < 0.3:
+        interp = "DIVERSE: R neurons prefer distinct input directions (good!)"
+    elif avg_sim < 0.6:
+        interp = "MODERATE: Some overlap in R input preferences"
+    else:
+        interp = "COLLAPSED: R input preferences converging (bad!)"
+    print(f"  → {interp}")
+
+    # Top similar R pairs
+    sim_flat = r_r_sim.clone().view(-1)
+    for i in range(n_relational):
+        sim_flat[i * n_relational + i] = -2
+
+    top_vals, top_idx = torch.topk(sim_flat, top_k)
+    print(f"\n  Most similar R preferred input pairs:")
+    r_similar_pairs = []
+    for i in range(top_k):
+        idx = top_idx[i].item()
+        r_i = idx // n_relational
+        r_j = idx % n_relational
+        sim_val = top_vals[i].item()
+        print(f"    R_{r_i} - R_{r_j}: {sim_val:.4f}")
+        r_similar_pairs.append((r_i, r_j, sim_val))
+
+    results['r_input_similarity'] = {
+        'mean': avg_sim,
+        'std': std_sim,
+        'min': min_sim,
+        'max': max_sim,
+        'interpretation': interp,
+        'top_similar_pairs': r_similar_pairs
+    }
+
+    # =========================================================================
+    # Step 5: FR-R Alignment (which FR outputs align with which R inputs)
+    # =========================================================================
+    print(f"\n{'='*60}")
+    print("FR-R Alignment (FR output → R input)")
+    print(f"{'='*60}")
+
+    fr_r_alignment = torch.mm(fr_vecs_norm, r_vecs_norm.t())  # [n_fr, n_r]
+
+    print(f"  Alignment matrix shape: [{n_feature_r}, {n_relational}]")
+
+    # Statistics
+    avg_align = fr_r_alignment.abs().mean().item()
+    max_align = fr_r_alignment.abs().max().item()
+
+    print(f"  Mean |alignment|: {avg_align:.4f}")
+    print(f"  Max |alignment|:  {max_align:.4f}")
+
+    # Top aligned FR-R pairs
+    align_flat = fr_r_alignment.abs().view(-1)
+    top_vals, top_idx = torch.topk(align_flat, 20)
+
+    print(f"\n  Top 20 FR-R Aligned Pairs:")
+    fr_r_pairs = []
+    for i in range(20):
+        idx = top_idx[i].item()
+        fr_i = idx // n_relational
+        r_j = idx % n_relational
+        align_val = fr_r_alignment[fr_i, r_j].item()
+        print(f"    FR_{fr_i} → R_{r_j}: {align_val:+.4f}")
+        fr_r_pairs.append((fr_i, r_j, align_val))
+
+    results['fr_r_alignment'] = {
+        'mean_abs': avg_align,
+        'max_abs': max_align,
+        'top_pairs': fr_r_pairs
+    }
+
+    # =========================================================================
+    # Step 6: Per-FR specialization (how many R neurons does each FR align with?)
+    # =========================================================================
+    print(f"\n{'='*60}")
+    print("FR Specialization (alignment concentration)")
+    print(f"{'='*60}")
+
+    # For each FR, compute entropy of its R alignments
+    fr_align_probs = F.softmax(fr_r_alignment.abs() * 5, dim=-1)  # Temperature scaling
+    fr_entropy = -(fr_align_probs * (fr_align_probs + 1e-10).log()).sum(dim=-1)  # [n_fr]
+
+    max_entropy = np.log(n_relational)
+    normalized_entropy = fr_entropy / max_entropy
+
+    # Most specialized (low entropy) and least specialized (high entropy)
+    sorted_idx = torch.argsort(normalized_entropy)
+
+    print(f"  Most specialized FR neurons (low alignment entropy):")
+    for i in range(min(10, n_feature_r)):
+        fr_i = sorted_idx[i].item()
+        ent = normalized_entropy[fr_i].item()
+        top_r = fr_r_alignment[fr_i].abs().argmax().item()
+        top_val = fr_r_alignment[fr_i, top_r].item()
+        print(f"    FR_{fr_i}: entropy={ent:.3f}, strongest→R_{top_r} ({top_val:+.4f})")
+
+    print(f"\n  Least specialized FR neurons (high alignment entropy):")
+    for i in range(max(0, n_feature_r - 5), n_feature_r):
+        fr_i = sorted_idx[i].item()
+        ent = normalized_entropy[fr_i].item()
+        print(f"    FR_{fr_i}: entropy={ent:.3f}")
+
+    results['fr_specialization'] = {
+        'mean_entropy': normalized_entropy.mean().item(),
+        'min_entropy': normalized_entropy.min().item(),
+        'max_entropy': normalized_entropy.max().item(),
+    }
+
+    # =========================================================================
+    # Step 7: Per-R receptiveness (how many FR neurons feed into each R?)
+    # =========================================================================
+    print(f"\n{'='*60}")
+    print("R Receptiveness (how many FR neurons feed each R)")
+    print(f"{'='*60}")
+
+    r_align_probs = F.softmax(fr_r_alignment.abs().t() * 5, dim=-1)  # [n_r, n_fr]
+    r_entropy = -(r_align_probs * (r_align_probs + 1e-10).log()).sum(dim=-1)
+
+    max_entropy_r = np.log(n_feature_r)
+    normalized_entropy_r = r_entropy / max_entropy_r
+
+    sorted_idx_r = torch.argsort(normalized_entropy_r)
+
+    print(f"  Most selective R neurons (few FR sources):")
+    for i in range(min(10, n_relational)):
+        r_j = sorted_idx_r[i].item()
+        ent = normalized_entropy_r[r_j].item()
+        top_fr = fr_r_alignment[:, r_j].abs().argmax().item()
+        top_val = fr_r_alignment[top_fr, r_j].item()
+        print(f"    R_{r_j}: entropy={ent:.3f}, strongest←FR_{top_fr} ({top_val:+.4f})")
+
+    results['r_receptiveness'] = {
+        'mean_entropy': normalized_entropy_r.mean().item(),
+        'min_entropy': normalized_entropy_r.min().item(),
+        'max_entropy': normalized_entropy_r.max().item(),
+    }
+
+    return results, fr_r_alignment.cpu().numpy()
+
+
 def save_heatmap(co_selection, output_path):
     """Save co-selection heatmap as image."""
     try:
@@ -497,6 +819,28 @@ def save_heatmap(co_selection, output_path):
         print(f"\n  Heatmap saved to: {output_path}")
     except ImportError:
         print("\n  Warning: matplotlib not available, skipping heatmap")
+
+
+def save_alignment_heatmap(alignment_matrix, output_path):
+    """Save FR-R alignment heatmap as image."""
+    try:
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(14, 10))
+
+        # Use diverging colormap for alignment (positive/negative)
+        vmax = max(abs(alignment_matrix.min()), abs(alignment_matrix.max()))
+        plt.imshow(alignment_matrix, aspect='auto', cmap='RdBu_r', vmin=-vmax, vmax=vmax)
+        plt.colorbar(label='Alignment (cosine similarity)')
+        plt.xlabel('R neuron index (preferred input direction)')
+        plt.ylabel('FR neuron index (output direction)')
+        plt.title('FR-R Subspace Alignment\n(+: aligned, -: anti-aligned)')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"\n  Alignment heatmap saved to: {output_path}")
+    except ImportError:
+        print("\n  Warning: matplotlib not available, skipping alignment heatmap")
 
 
 def main():
@@ -570,13 +914,26 @@ def main():
     # Run co-selection analysis
     results, co_matrix = analyze_coselection(model, dataloader, args.device, config, args.max_batches)
 
-    # Run subspace diversity analysis
+    # Run subspace diversity analysis (weight-based)
     subspace_results = analyze_neuron_subspace_diversity(model, dataloader, args.device, config, args.max_batches)
     results['subspace_diversity'] = subspace_results
 
-    # Save heatmap
+    # Run FR/R subspace similarity analysis (data-driven)
+    fr_r_sim_results, fr_r_alignment = analyze_fr_r_subspace_similarity(
+        model, dataloader, args.device, config, args.max_batches
+    )
+    results['fr_r_subspace_similarity'] = fr_r_sim_results
+
+    # Save heatmaps
     heatmap_path = os.path.join(args.output_dir, "fr_r_coselection_heatmap.png")
     save_heatmap(co_matrix, heatmap_path)
+
+    # Save FR-R alignment heatmap
+    if fr_r_alignment is not None and len(fr_r_alignment) > 0:
+        alignment_heatmap_path = os.path.join(args.output_dir, "fr_r_alignment_heatmap.png")
+        save_alignment_heatmap(fr_r_alignment, alignment_heatmap_path)
+        np.save(os.path.join(args.output_dir, "fr_r_alignment_matrix.npy"), fr_r_alignment)
+        print(f"FR-R alignment matrix saved to: {args.output_dir}/fr_r_alignment_matrix.npy")
 
     # Save results
     import json
