@@ -37,7 +37,7 @@ model:
   n_relational: 96                # R: 196→96 (68개 active)
   n_value: 16                     # V: 24→16
   top_k_relational: 12            # k: 20→12
-  top_k_value: 2                  # k: 4→2
+  top_k_value: 3
 
   # Knowledge
   n_knowledge: 300
