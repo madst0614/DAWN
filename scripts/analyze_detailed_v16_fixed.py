@@ -137,24 +137,34 @@ def analyze_and_visualize(checkpoint_path, data_path, save_dir='./analysis', n_b
 
                 batch_sets = {ntype: set() for ntype in n_neurons}
 
-                # Aggregate across all layers
-                for layer_routing in routing_infos:
-                    routing_info = layer_routing.get('attention', {})
+                # Use first layer's routing info (same as analyze_v16.py)
+                routing_info = routing_infos[0].get('attention', {}) if routing_infos else {}
 
-                    for ntype, weight_key in [
-                        ('FR', 'feature_r_weights'),
-                        ('FV', 'feature_v_weights'),
-                        ('R', 'relational_weights_Q'),
-                        ('V', 'value_weights'),
-                    ]:
-                        if weight_key in routing_info:
-                            weights = routing_info[weight_key]
-                            if weights.dim() == 3:
-                                # Find selected neurons (weight > 0)
-                                selected = (weights > 0).any(dim=0).any(dim=0).cpu().numpy()
-                                for idx in np.where(selected)[0]:
-                                    usage_counts[ntype][idx] += 1
-                                batch_sets[ntype].update(np.where(selected)[0].tolist())
+                # Debug: print available keys on first batch
+                if batch_idx == 0:
+                    print(f"  Available routing keys: {list(routing_info.keys())}")
+
+                for ntype, weight_key in [
+                    ('FR', 'feature_r_weights'),
+                    ('FV', 'feature_v_weights'),
+                    ('R', 'relational_weights_Q'),
+                    ('V', 'value_weights'),
+                ]:
+                    if weight_key in routing_info:
+                        weights = routing_info[weight_key]
+                        if weights.dim() == 3:
+                            # Find selected neurons (weight > 0)
+                            selected = (weights > 0).any(dim=0).any(dim=0).cpu()
+                            selected_indices = selected.nonzero().flatten().tolist()
+                            for idx in selected_indices:
+                                usage_counts[ntype][idx] += 1
+                            batch_sets[ntype].update(selected_indices)
+                        elif weights.dim() == 2:
+                            selected = (weights > 0).any(dim=0).cpu()
+                            selected_indices = selected.nonzero().flatten().tolist()
+                            for idx in selected_indices:
+                                usage_counts[ntype][idx] += 1
+                            batch_sets[ntype].update(selected_indices)
 
                 for ntype in n_neurons:
                     batch_unique[ntype].append(len(batch_sets[ntype]))
