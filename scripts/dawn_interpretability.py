@@ -262,6 +262,8 @@ class DAWNInterpreter:
             routing_infos = output[-1] if isinstance(output, tuple) else []
             if not routing_infos: continue
 
+            # Collect all topk on GPU first (async), then batch CPU transfer
+            batch_topk_gpu = []  # (nt_idx, layer_idx, topk_tensor)
             for layer_idx, layer_info in enumerate(routing_infos):
                 if 'attention' not in layer_info: continue
                 attn = layer_info['attention']
@@ -277,17 +279,25 @@ class DAWNInterpreter:
                     if pref is None: continue
                     k = min(topk_map[nt], pref.shape[-1])
                     _, topk_idx = torch.topk(pref, k, dim=-1)
-                    topk_np = topk_idx.cpu().numpy().astype(np.int16)
+                    batch_topk_gpu.append((nt_idx, layer_idx, topk_idx))
 
-                    b_idx, l_idx, k_idx = np.indices(topk_np.shape)
-                    records = np.stack([
-                        token_ids[b_idx, l_idx].ravel(),
-                        np.full(topk_np.size, nt_idx, dtype=np.int8),
-                        topk_np.ravel(),
-                        np.full(topk_np.size, layer_idx, dtype=np.int8),
-                        l_idx.ravel().astype(np.int16),
-                    ], axis=1)
-                    all_records.append(records)
+            # Single sync point: wait for all GPU ops to finish
+            if self.device != 'cpu':
+                torch.cuda.synchronize()
+
+            # Now CPU transfers are fast (data already computed)
+            for nt_idx, layer_idx, topk_gpu in batch_topk_gpu:
+                topk_np = topk_gpu.cpu().numpy().astype(np.int16)
+
+                b_idx, l_idx, k_idx = np.indices(topk_np.shape)
+                records = np.stack([
+                    token_ids[b_idx, l_idx].ravel(),
+                    np.full(topk_np.size, nt_idx, dtype=np.int8),
+                    topk_np.ravel(),
+                    np.full(topk_np.size, layer_idx, dtype=np.int8),
+                    l_idx.ravel().astype(np.int16),
+                ], axis=1)
+                all_records.append(records)
 
         t_forward = time.time()
         print(f"  Forward pass: {t_forward - t_start:.1f}s")
