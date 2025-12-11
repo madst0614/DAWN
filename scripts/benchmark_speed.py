@@ -5,18 +5,56 @@ DAWN vs Vanilla Speed Benchmark
 Compares inference speed (ms/token) between DAWN and Vanilla transformers.
 
 Usage:
+    python benchmark_speed.py --folder checkpoints/  # Auto-discover
     python benchmark_speed.py --dawn_ckpt path/to/dawn.pt --vanilla_ckpt path/to/vanilla.pt
     python benchmark_speed.py --dawn_ckpt path/to/dawn.pt  # DAWN only
+
+Auto-discovery looks for:
+    - DAWN: files containing 'dawn', 'v16', 'v15', 'v14'
+    - Vanilla: files containing 'vanilla', 'baseline', 'gpt', 'transformer'
+    - Prefers 'best' or 'final' checkpoints
 """
 
 import argparse
 import sys
 import os
 import time
+import glob
 import torch
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def find_checkpoints(folder, pattern="*.pt"):
+    """Auto-discover checkpoints in folder"""
+    if not os.path.isdir(folder):
+        return None, None
+
+    all_ckpts = glob.glob(os.path.join(folder, "**", pattern), recursive=True)
+    all_ckpts += glob.glob(os.path.join(folder, "**", "*.pth"), recursive=True)
+
+    dawn_ckpt = None
+    vanilla_ckpt = None
+
+    for ckpt in all_ckpts:
+        name = os.path.basename(ckpt).lower()
+        if any(x in name for x in ['dawn', 'v16', 'v15', 'v14']):
+            if dawn_ckpt is None or 'best' in name or 'final' in name:
+                dawn_ckpt = ckpt
+        elif any(x in name for x in ['vanilla', 'baseline', 'gpt', 'transformer']):
+            if vanilla_ckpt is None or 'best' in name or 'final' in name:
+                vanilla_ckpt = ckpt
+
+    # Fallback: if no specific match, use most recent
+    if dawn_ckpt is None and all_ckpts:
+        # Sort by modification time
+        all_ckpts.sort(key=os.path.getmtime, reverse=True)
+        dawn_ckpt = all_ckpts[0]
+        if len(all_ckpts) > 1:
+            vanilla_ckpt = all_ckpts[1]
+
+    return dawn_ckpt, vanilla_ckpt
 
 
 def load_dawn_model(ckpt_path, device='cuda'):
@@ -169,7 +207,8 @@ def compare_results(dawn_results, vanilla_results):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark DAWN vs Vanilla speed")
-    parser.add_argument("--dawn_ckpt", type=str, required=True, help="Path to DAWN checkpoint")
+    parser.add_argument("--folder", type=str, default=None, help="Folder to auto-discover checkpoints")
+    parser.add_argument("--dawn_ckpt", type=str, default=None, help="Path to DAWN checkpoint")
     parser.add_argument("--vanilla_ckpt", type=str, default=None, help="Path to Vanilla checkpoint")
     parser.add_argument("--seq_len", type=int, default=512, help="Sequence length")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
@@ -178,6 +217,20 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device")
 
     args = parser.parse_args()
+
+    # Auto-discover checkpoints if folder provided
+    if args.folder:
+        print(f"Searching for checkpoints in: {args.folder}")
+        found_dawn, found_vanilla = find_checkpoints(args.folder)
+        if found_dawn:
+            print(f"  Found DAWN: {found_dawn}")
+            args.dawn_ckpt = args.dawn_ckpt or found_dawn
+        if found_vanilla:
+            print(f"  Found Vanilla: {found_vanilla}")
+            args.vanilla_ckpt = args.vanilla_ckpt or found_vanilla
+
+    if not args.dawn_ckpt:
+        parser.error("--dawn_ckpt required (or use --folder for auto-discovery)")
 
     print(f"\n{'='*50}")
     print("DAWN vs Vanilla Speed Benchmark")
