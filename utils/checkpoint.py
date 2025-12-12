@@ -185,6 +185,25 @@ def load_checkpoint_smart(
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     state_dict = strip_compile_prefix(state_dict)
 
+    # Handle missing excitability_weight for old checkpoints
+    # Estimate based on training progress: w = 1.0 * (decay_rate ^ steps)
+    excitability_key = 'global_routers.neuron_router.excitability_weight'
+    if excitability_key not in state_dict:
+        # Estimate from training progress
+        step = checkpoint.get('step', checkpoint.get('global_step', 0))
+        total_steps = checkpoint.get('total_steps', 100000)
+        decay_rate = 0.9997  # default decay rate
+
+        if step > 0:
+            # Approximate: w ≈ 1.0 * decay_rate^step, but clamped
+            import math
+            estimated_w = max(0.01, decay_rate ** min(step, 50000))
+        else:
+            estimated_w = 1.0
+
+        state_dict[excitability_key] = torch.tensor(estimated_w)
+        print(f"  Note: excitability_weight missing, estimated from step {step}: {estimated_w:.4f}")
+
     # Load state dict
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
 
