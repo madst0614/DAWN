@@ -645,11 +645,26 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 
         # Excitability
         tau = router.tau if hasattr(router, 'tau') else 1.5
-        weight = router.excitability_weight.item() if hasattr(router, 'excitability_weight') and hasattr(router.excitability_weight, 'item') else (router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0)
+
+        # Per-neuron excitability weights (v16.1)
+        if hasattr(router, 'excitability_weight_fr'):
+            w_fr = router.excitability_weight_fr
+            w_fv = router.excitability_weight_fv
+            w_r = router.excitability_weight_r
+            w_v = router.excitability_weight_v
+            w_fr_stats = f"[{w_fr.min().item():.2f},{w_fr.mean().item():.2f},{w_fr.max().item():.2f}]"
+            w_fv_stats = f"[{w_fv.min().item():.2f},{w_fv.mean().item():.2f},{w_fv.max().item():.2f}]"
+            w_r_stats = f"[{w_r.min().item():.2f},{w_r.mean().item():.2f},{w_r.max().item():.2f}]"
+            w_v_stats = f"[{w_v.min().item():.2f},{w_v.mean().item():.2f},{w_v.max().item():.2f}]"
+        else:
+            # Old scalar weight (backwards compat)
+            weight = router.excitability_weight.item() if hasattr(router, 'excitability_weight') and hasattr(router.excitability_weight, 'item') else 1.0
+            w_fr_stats = w_fv_stats = w_r_stats = w_v_stats = f"{weight:.3f}"
+
         exc_QK = torch.clamp(1.0 - ema_QK / tau, min=0.0, max=1.0)
         exc_V = torch.clamp(1.0 - ema_V / tau, min=0.0, max=1.0)
 
-        # Excitability distribution
+        # Excitability distribution (usage-based)
         min_exc_QK, max_exc_QK, mean_exc_QK = exc_QK.min().item(), exc_QK.max().item(), exc_QK.mean().item()
         min_exc_V, max_exc_V, mean_exc_V = exc_V.min().item(), exc_V.max().item(), exc_V.mean().item()
 
@@ -659,10 +674,10 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         dead_R = (ema_R < 0.01).float().mean().item()
         dead_Val = (ema_Val < 0.01).float().mean().item()
 
-        lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active FR/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
+        lines.append(f"         Excitability | τ={tau:.1f} | Active FR/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
         lines.append(f"             Gini FR/FV:{gini_QK:.2f}/{gini_V:.2f} R/V:{gini_R:.2f}/{gini_Val:.2f}")
         lines.append(f"             Dead FR/FV/R/V: {dead_FR:.2%}/{dead_FV:.2%}/{dead_R:.2%}/{dead_Val:.2%}")
-        lines.append(f"             Exc FR:[{min_exc_QK:.2f},{mean_exc_QK:.2f},{max_exc_QK:.2f}] FV:[{min_exc_V:.2f},{mean_exc_V:.2f},{max_exc_V:.2f}]")
+        lines.append(f"             Weight FR:{w_fr_stats} FV:{w_fv_stats} R:{w_r_stats} V:{w_v_stats}")
 
         # Knowledge neurons (if available)
         if hasattr(router, 'usage_ema_knowledge'):
@@ -670,9 +685,16 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
             active_K = (ema_K > 0.01).sum().item()
             n_K = ema_K.numel()
             gini_K = _gini(ema_K)
-            exc_K = torch.clamp(1.0 - ema_K / tau, min=0.0, max=1.0)
-            min_exc_K, max_exc_K, mean_exc_K = exc_K.min().item(), exc_K.max().item(), exc_K.mean().item()
-            lines.append(f"             Knowledge (K): Active {int(active_K)}/{n_K} | Gini:{gini_K:.2f} | Exc:[{min_exc_K:.2f},{mean_exc_K:.2f},{max_exc_K:.2f}]")
+            dead_K = (ema_K < 0.01).float().mean().item()
+
+            # K weight
+            if hasattr(router, 'excitability_weight_k'):
+                w_k = router.excitability_weight_k
+                w_k_stats = f"[{w_k.min().item():.2f},{w_k.mean().item():.2f},{w_k.max().item():.2f}]"
+            else:
+                w_k_stats = w_fr_stats  # fallback
+
+            lines.append(f"             Knowledge (K): Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f} | W:{w_k_stats}")
 
     return lines
 
