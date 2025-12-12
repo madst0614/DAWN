@@ -199,9 +199,28 @@ def load_checkpoint_smart(
     has_new_vectors = any(k in state_dict for k in new_excitability_keys)
 
     if has_old_scalar and not has_new_vectors:
-        # Migration: old scalar → remove (model will use defaults)
+        # Migration: old scalar → broadcast to new per-neuron vectors
+        old_w = state_dict[old_excitability_key]
+        if isinstance(old_w, torch.Tensor):
+            old_w = old_w.item()
+        old_w = max(0.1, min(0.5, old_w))  # clamp to valid range
+
+        # Get neuron counts from config
+        config = checkpoint.get('config', {})
+        n_fr = config.get('n_feature_r', 72)
+        n_fv = config.get('n_feature_v', 72)
+        n_r = config.get('n_relational', 196)
+        n_v = config.get('n_value', 48)
+
+        # Broadcast scalar to vectors
+        state_dict['global_routers.neuron_router.excitability_weight_fr'] = torch.full((n_fr,), old_w)
+        state_dict['global_routers.neuron_router.excitability_weight_fv'] = torch.full((n_fv,), old_w)
+        state_dict['global_routers.neuron_router.excitability_weight_r'] = torch.full((n_r,), old_w)
+        state_dict['global_routers.neuron_router.excitability_weight_v'] = torch.full((n_v,), old_w)
+
+        # Remove old scalar
         del state_dict[old_excitability_key]
-        print(f"  Note: Migrating from scalar excitability_weight to per-neuron vectors (using defaults 0.3)")
+        print(f"  Note: Migrating scalar excitability_weight={old_w:.4f} → per-neuron vectors")
 
     elif not has_old_scalar and not has_new_vectors:
         # Very old checkpoint without any excitability weight - model will use defaults
