@@ -3,7 +3,7 @@ DAWN Model Version Registry
 
 v16.0: Split Feature R/V (rank matrix) - Feature_R/V separate compression
 v16.1: Split Feature R/V + Langevin Excitability (adaptive dead neuron recovery)
-v17.0: Full Vector Neurons + Full Soft Selection (vector-based, train & inference both use soft)
+v17.0: Hierarchical Neuron Circuits - 2-level routing (circuit top-k + neuron softmax)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -95,44 +95,46 @@ VERSION_REGISTRY = {
         ],
     },
     "17.0": {
-        "description": "Full Vector Neurons + Full Soft Selection",
+        "description": "Hierarchical Neuron Circuits (2-level routing)",
         "aliases": ["17", "170"],
         "module": "model_v17",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_feature", "n_relational", "n_value", "n_knowledge",
-            # Note: NO rank - all neurons are vectors [n, d_model]
+            "neurons_per_circuit",
+            "n_circuits_r", "n_circuits_v", "n_circuits_rel", "n_circuits_val",
+            "n_knowledge",
         ],
         "optional_params": {
             "dropout": 0.1,
             "state_dim": 64,
-            "top_k_feature": 64,      # kept for compatibility, not used
-            "top_k_relational": 64,   # kept for compatibility, not used
-            "top_k_value": 32,        # kept for compatibility, not used
             "d_space": 64,
-            "coarse_k": 20,
-            "fine_k": 10,
+            "top_k_circuits_r": 12,
+            "top_k_circuits_v": 6,
+            "top_k_circuits_rel": 12,
+            "top_k_circuits_val": 4,
+            "coarse_k": 16,
+            "fine_k": 8,
             "knowledge_rank": 128,
-            "temperature": 1.0,       # soft selection sharpness
-            "router_dropout": 0.1,
-            "gradient_checkpointing": False,
-            "use_ssm_context": True,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "langevin_alpha": 0.0003,
+            "langevin_beta": 0.0006,
         },
         "display_info": lambda args: [
-            f"DAWN v17: Full Vector Neurons + Full Soft Selection",
-            f"  temperature={args.get('temperature', 1.0)}",
-            f"  Selection: FULL SOFT (train & inference, all neurons via softmax)",
-            f"  Feature: {args.get('n_feature')} × {args.get('d_model')} (SHARED QK/V)",
-            f"  Relational: {args.get('n_relational')} × {args.get('d_model')} (SHARED Q/K)",
-            f"  Value: {args.get('n_value')} × {args.get('d_model')}",
-            f"  Unified Router: d_space={args.get('d_space', 64)} + Excitability (SAR)",
+            f"DAWN v17: Hierarchical Neuron Circuits",
+            f"  2-Level Routing:",
+            f"    Level 1: Circuit selection (top-k)",
+            f"    Level 2: Neuron weighting within circuit (softmax)",
+            f"  neurons_per_circuit={args.get('neurons_per_circuit')}",
+            f"  Circuit_R: {args.get('n_circuits_r')} circuits × {args.get('neurons_per_circuit')} neurons (top-k={args.get('top_k_circuits_r', 12)})",
+            f"  Circuit_V: {args.get('n_circuits_v')} circuits × {args.get('neurons_per_circuit')} neurons (top-k={args.get('top_k_circuits_v', 6)})",
+            f"  Circuit_Rel: {args.get('n_circuits_rel')} circuits × {args.get('neurons_per_circuit')} neurons (top-k={args.get('top_k_circuits_rel', 12)})",
+            f"  Circuit_Val: {args.get('n_circuits_val')} circuits × {args.get('neurons_per_circuit')} neurons (top-k={args.get('top_k_circuits_val', 4)})",
+            f"  Router: d_space={args.get('d_space', 64)} + Per-circuit Excitability",
+            f"  Langevin: α={args.get('langevin_alpha', 0.0003)}, β={args.get('langevin_beta', 0.0006)}",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
-            f"  Architecture: Mamba SSM → Context → Full Soft Router → Vector Neurons → FlashAttn",
-            f"  Memory: 2-stage (x→router→coarse, x→encoder→fine)",
-            f"  KnowledgeNeurons (K):",
-            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",
-            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
-            f"    - coarse_k: {args.get('coarse_k', 20)} → fine_k: {args.get('fine_k', 10)}",
+            f"  KnowledgeNeurons: {args.get('n_knowledge')} × rank={args.get('knowledge_rank', 128)}",
+            f"    coarse_k={args.get('coarse_k', 16)} → fine_k={args.get('fine_k', 8)}",
         ],
     },
 }
