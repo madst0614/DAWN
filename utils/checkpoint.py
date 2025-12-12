@@ -192,6 +192,7 @@ def load_checkpoint_smart(
         'global_routers.neuron_router.excitability_weight_fv',
         'global_routers.neuron_router.excitability_weight_r',
         'global_routers.neuron_router.excitability_weight_v',
+        'global_routers.neuron_router.excitability_weight_k',
     ]
 
     # Check if we have old scalar or new per-neuron format
@@ -211,12 +212,14 @@ def load_checkpoint_smart(
         n_fv = config.get('n_feature_v', 72)
         n_r = config.get('n_relational', 196)
         n_v = config.get('n_value', 48)
+        n_k = config.get('n_knowledge', 300)
 
         # Broadcast scalar to vectors
         state_dict['global_routers.neuron_router.excitability_weight_fr'] = torch.full((n_fr,), old_w)
         state_dict['global_routers.neuron_router.excitability_weight_fv'] = torch.full((n_fv,), old_w)
         state_dict['global_routers.neuron_router.excitability_weight_r'] = torch.full((n_r,), old_w)
         state_dict['global_routers.neuron_router.excitability_weight_v'] = torch.full((n_v,), old_w)
+        state_dict['global_routers.neuron_router.excitability_weight_k'] = torch.full((n_k,), old_w)
 
         # Remove old scalar
         del state_dict[old_excitability_key]

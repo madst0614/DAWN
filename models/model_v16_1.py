@@ -85,6 +85,7 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('excitability_weight_fv', torch.ones(n_feature_v) * 0.3)
         self.register_buffer('excitability_weight_r', torch.ones(n_relational) * 0.3)
         self.register_buffer('excitability_weight_v', torch.ones(n_value) * 0.3)
+        self.register_buffer('excitability_weight_k', torch.ones(n_knowledge) * 0.3)
 
     def update_excitability_weight(self):
         """Per-neuron Langevin dynamics: dw_i = -α*w_i + β*dead_ratio_i"""
@@ -111,6 +112,11 @@ class UnifiedNeuronRouter(nn.Module):
         dead_ratio_v = (self.usage_ema_value < threshold).float()
         dw_v = -alpha * self.excitability_weight_v + beta * dead_ratio_v
         self.excitability_weight_v.add_(dw_v).clamp_(0.1, 0.5)
+
+        # K (Knowledge) neurons
+        dead_ratio_k = (self.usage_ema_knowledge < threshold).float()
+        dw_k = -alpha * self.excitability_weight_k + beta * dead_ratio_k
+        self.excitability_weight_k.add_(dw_k).clamp_(0.1, 0.5)
 
     def get_excitability(self, usage_ema):
         """Neuronal excitability based on usage."""
@@ -155,7 +161,7 @@ class UnifiedNeuronRouter(nn.Module):
             logits = all_logits[..., self.value_end:]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_knowledge)
-                logits = logits + excitability * self.excitability_weight_v  # use V weights for knowledge
+                logits = logits + excitability * self.excitability_weight_k  # [n_k] broadcast
 
         return logits
 
