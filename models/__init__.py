@@ -10,10 +10,10 @@ v16.1: Split Feature R/V + Langevin Excitability
 - Same as v16.0 + adaptive dead neuron recovery
 - Langevin dynamics: dw = -α*w + β*dead_ratio
 
-v17.0: Full Vector Neurons + Full Soft Selection
-- ALL neurons are vectors [n × d_model] (no rank matrices)
-- 5 separate routing: feature_r, feature_v, relational_q, relational_k, value
-- Full soft selection (train & inference)
+v17.0: Hierarchical Neuron Circuits
+- 2-level routing: Circuit selection (top-k) + Neuron weighting (softmax)
+- Circuit = team of cooperating neurons [neurons_per_circuit × d_model]
+- Per-circuit excitability with Langevin dynamics
 
 baseline: Vanilla Transformer for fair comparison
 """
@@ -24,7 +24,7 @@ from .model_v16 import DAWN as DAWN_v16
 # v16.1 - Split Feature R/V + Langevin Excitability
 from .model_v16_1 import DAWN as DAWN_v16_1
 
-# v17.0 - Full Vector Neurons with Full Soft Selection
+# v17.0 - Hierarchical Neuron Circuits (2-level routing)
 from .model_v17 import DAWN as DAWN_v17
 
 # Default DAWN is v17 (latest)

@@ -580,50 +580,55 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
-    # v17: Full Vector Neurons with Shared Feature (QK/V) + Shared Relational (Q/K) + Soft Weighting
-    if hasattr(router, 'neuron_emb_feature_v'):  # v17 has separate V routing head for shared feature pool
-        n_f = router.n_feature  # Shared for QK/V
-        n_rel = router.n_relational  # Shared for Q/K
-        n_val = router.n_value
+    # v17: Hierarchical Neuron Circuits (2-level routing)
+    if hasattr(router, 'n_circuits_r'):
+        n_r = router.n_circuits_r
+        n_v = router.n_circuits_v
+        n_rel = router.n_circuits_rel
+        n_val = router.n_circuits_val
         n_k = router.n_knowledge
 
-        # Usage EMA stats (shared pools)
-        ema_f = router.usage_ema_feature  # Shared EMA for QK/V
-        ema_rel = router.usage_ema_relational  # Shared EMA for Q/K
-        ema_val = router.usage_ema_value
-        ema_k = router.usage_ema_knowledge
+        # Usage stats (per circuit)
+        usage_r = router.usage_r
+        usage_v = router.usage_v
+        usage_rel = router.usage_rel
+        usage_val = router.usage_val
+        usage_k = router.usage_k
 
-        # For soft selection, EMA values are ~1/n_neurons, so use relative threshold
-        # "Active" = neurons used > 10% of uniform expectation (1/n * 0.1)
-        thresh_f = (1.0 / n_f) * 0.1
-        thresh_rel = (1.0 / n_rel) * 0.1
-        thresh_val = (1.0 / n_val) * 0.1
-        thresh_k = (1.0 / n_k) * 0.1
-
-        active_f = (ema_f > thresh_f).sum().item()
-        active_rel = (ema_rel > thresh_rel).sum().item()
-        active_val = (ema_val > thresh_val).sum().item()
-        active_k = (ema_k > thresh_k).sum().item()
+        # Active circuits (usage > 0.01)
+        active_r = (usage_r > 0.01).sum().item()
+        active_v = (usage_v > 0.01).sum().item()
+        active_rel = (usage_rel > 0.01).sum().item()
+        active_val = (usage_val > 0.01).sum().item()
+        active_k = (usage_k > 0.01).sum().item()
 
         # Gini coefficients
-        gini_f = _gini(ema_f)
-        gini_rel = _gini(ema_rel)
-        gini_val, gini_k = _gini(ema_val), _gini(ema_k)
+        gini_r = _gini(usage_r)
+        gini_v = _gini(usage_v)
+        gini_rel = _gini(usage_rel)
+        gini_val = _gini(usage_val)
+        gini_k = _gini(usage_k)
 
-        # Excitability
+        # Excitability weights
+        exc_r = router.exc_r
+        exc_v = router.exc_v
+        exc_rel = router.exc_rel
+        exc_val = router.exc_val
+        exc_k = router.exc_k
+
         tau = router.tau if hasattr(router, 'tau') else 1.5
-        weight = router.excitability_weight.item() if hasattr(router, 'excitability_weight') and hasattr(router.excitability_weight, 'item') else (router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0)
-        exc_f = torch.clamp(1.0 - ema_f / tau, min=0.0, max=1.0)
-        exc_rel = torch.clamp(1.0 - ema_rel / tau, min=0.0, max=1.0)
-        exc_val = torch.clamp(1.0 - ema_val / tau, min=0.0, max=1.0)
-        exc_k = torch.clamp(1.0 - ema_k / tau, min=0.0, max=1.0)
 
-        lines.append(f"         v17 Soft | τ={tau:.1f} w={weight:.3f} | F(QK/V):{int(active_f)}/{n_f} R(Q/K):{int(active_rel)}/{n_rel} V:{int(active_val)}/{n_val}")
-        lines.append(f"             Gini F/R/V: {gini_f:.2f}/{gini_rel:.2f}/{gini_val:.2f}")
-        # EMA stats for soft selection debugging (values are small: ~1/n_neurons)
-        lines.append(f"             EMA F:[{ema_f.min().item():.4f},{ema_f.mean().item():.4f},{ema_f.max().item():.4f}] R:[{ema_rel.min().item():.4f},{ema_rel.mean().item():.4f},{ema_rel.max().item():.4f}]")
-        lines.append(f"             EMA V:[{ema_val.min().item():.4f},{ema_val.mean().item():.4f},{ema_val.max().item():.4f}] K:[{ema_k.min().item():.4f},{ema_k.mean().item():.4f},{ema_k.max().item():.4f}]")
-        lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f}")
+        # Dead circuit ratios
+        dead_r = (usage_r < 0.01).float().mean().item()
+        dead_v = (usage_v < 0.01).float().mean().item()
+        dead_rel = (usage_rel < 0.01).float().mean().item()
+        dead_val = (usage_val < 0.01).float().mean().item()
+
+        lines.append(f"         v17 Circuit | τ={tau:.1f} | R:{int(active_r)}/{n_r} V:{int(active_v)}/{n_v} Rel:{int(active_rel)}/{n_rel} Val:{int(active_val)}/{n_val}")
+        lines.append(f"             Gini R/V/Rel/Val: {gini_r:.2f}/{gini_v:.2f}/{gini_rel:.2f}/{gini_val:.2f}")
+        lines.append(f"             Dead R/V/Rel/Val: {dead_r:.1%}/{dead_v:.1%}/{dead_rel:.1%}/{dead_val:.1%}")
+        lines.append(f"             Exc R:[{exc_r.min().item():.2f},{exc_r.mean().item():.2f},{exc_r.max().item():.2f}] Rel:[{exc_rel.min().item():.2f},{exc_rel.mean().item():.2f},{exc_rel.max().item():.2f}]")
+        lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f} | Dead:{(usage_k < 0.01).float().mean().item():.1%}")
 
     # v16: Split Feature R/V with Excitability
     elif hasattr(router, 'usage_ema_feature_r'):
@@ -874,10 +879,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Increment global step counter
         global_step += 1
 
-        # Update excitability weight (v16.0: decay, v16.1: Langevin)
-        if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+        # Update excitability (v17: update_excitability, v16.1: update_excitability_weight, v16.0: decay)
+        router = None
+        if hasattr(base_model, 'router'):  # v17
+            router = base_model.router
+        elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
             router = base_model.global_routers.neuron_router
-            if hasattr(router, 'update_excitability_weight'):
+
+        if router is not None:
+            if hasattr(router, 'update_excitability'):
+                router.update_excitability()  # v17 Langevin dynamics
+            elif hasattr(router, 'update_excitability_weight'):
                 router.update_excitability_weight()  # v16.1 Langevin dynamics
             elif hasattr(router, 'decay_excitability'):
                 router.decay_excitability()  # v16.0 simple decay
@@ -980,9 +992,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
 
                     # Usage EMA logging
-                    if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+                    router = None
+                    if hasattr(base_model, 'router'):  # v17
+                        router = base_model.router
+                    elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                         router = base_model.global_routers.neuron_router
-                        for line in _get_router_log_lines(router, global_step, total_steps, base_model.global_routers):
+                    if router is not None:
+                        for line in _get_router_log_lines(router, global_step, total_steps):
                             print(line)
 
                     # Importance entropy logging (from routing preferences)
@@ -1081,9 +1097,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
 
                 # Add router metrics (same format as console)
-                if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+                router = None
+                if hasattr(base_model, 'router'):  # v17
+                    router = base_model.router
+                elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                     router = base_model.global_routers.neuron_router
-                    for line in _get_router_log_lines(router, global_step, total_steps, base_model.global_routers):
+                if router is not None:
+                    for line in _get_router_log_lines(router, global_step, total_steps):
                         f.write(line + "\n")
 
             # Collect neuron metrics
@@ -1449,13 +1469,16 @@ def main():
     args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
     args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
 
-    # v17.0 Shared Feature parameters
-    args.n_feature = cfg['model'].get('n_feature', 768)
-    args.n_relational = cfg['model'].get('n_relational', 160)
-    args.n_value = cfg['model'].get('n_value', 12)
-    args.top_k_feature = cfg['model'].get('top_k_feature', 64)
-    args.top_k_relational = cfg['model'].get('top_k_relational', 4)
-    args.top_k_value = cfg['model'].get('top_k_value', 6)
+    # v17.0 Hierarchical Circuit parameters
+    args.neurons_per_circuit = cfg['model'].get('neurons_per_circuit', 64)
+    args.n_circuits_r = cfg['model'].get('n_circuits_r', 96)
+    args.n_circuits_v = cfg['model'].get('n_circuits_v', 24)
+    args.n_circuits_rel = cfg['model'].get('n_circuits_rel', 96)
+    args.n_circuits_val = cfg['model'].get('n_circuits_val', 16)
+    args.top_k_circuits_r = cfg['model'].get('top_k_circuits_r', 12)
+    args.top_k_circuits_v = cfg['model'].get('top_k_circuits_v', 6)
+    args.top_k_circuits_rel = cfg['model'].get('top_k_circuits_rel', 12)
+    args.top_k_circuits_val = cfg['model'].get('top_k_circuits_val', 4)
 
     # v16.0 Split Feature R/V parameters (uses single rank from basis_rank)
     args.n_feature_r = cfg['model'].get('n_feature_r', 512)
@@ -1678,20 +1701,26 @@ def main():
 
     if model_version != 'baseline':
         if model_version == "17.0":
-            # v17.0: Full Vector Neurons + Full Soft Selection
-            knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
-            n_feature = getattr(args, 'n_feature', 768)
-            n_relational = getattr(args, 'n_relational', 256)
-            n_value = getattr(args, 'n_value', 128)
-            n_knowledge = getattr(args, 'n_knowledge', 80)
-            coarse_k = getattr(args, 'coarse_k', 20)
-            fine_k = getattr(args, 'fine_k', 10)
-            temperature = getattr(args, 'temperature', 1.0)
-            print(f"DAWN v{model_version}: Full Vector Neurons + Full Soft Selection")
-            print(f"  Selection: FULL SOFT (train & inference, temp={temperature})")
-            print(f"  Feature: {n_feature} × {args.d_model} [SHARED QK/V]")
-            print(f"  Relational: {n_relational} × {args.d_model} [SHARED Q/K]")
-            print(f"  Value: {n_value} × {args.d_model}")
+            # v17.0: Hierarchical Neuron Circuits (2-level routing)
+            neurons_per_circuit = getattr(args, 'neurons_per_circuit', 64)
+            n_circuits_r = getattr(args, 'n_circuits_r', 96)
+            n_circuits_v = getattr(args, 'n_circuits_v', 24)
+            n_circuits_rel = getattr(args, 'n_circuits_rel', 96)
+            n_circuits_val = getattr(args, 'n_circuits_val', 16)
+            top_k_r = getattr(args, 'top_k_circuits_r', 12)
+            top_k_v = getattr(args, 'top_k_circuits_v', 6)
+            top_k_rel = getattr(args, 'top_k_circuits_rel', 12)
+            top_k_val = getattr(args, 'top_k_circuits_val', 4)
+            n_knowledge = getattr(args, 'n_knowledge', 300)
+            coarse_k = getattr(args, 'coarse_k', 16)
+            fine_k = getattr(args, 'fine_k', 8)
+            print(f"DAWN v{model_version}: Hierarchical Neuron Circuits")
+            print(f"  2-Level Routing: Circuit top-k → Neuron softmax")
+            print(f"  neurons_per_circuit={neurons_per_circuit}")
+            print(f"  Circuit_R: {n_circuits_r} × {neurons_per_circuit} (top-k={top_k_r})")
+            print(f"  Circuit_V: {n_circuits_v} × {neurons_per_circuit} (top-k={top_k_v})")
+            print(f"  Circuit_Rel: {n_circuits_rel} × {neurons_per_circuit} (top-k={top_k_rel})")
+            print(f"  Circuit_Val: {n_circuits_val} × {neurons_per_circuit} (top-k={top_k_val})")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
         elif model_version in ("16.0", "16.1"):
             # v16.x: Split Feature R/V (rank matrix)
@@ -1777,24 +1806,27 @@ def main():
 
     # Add version-specific parameters
     if model_version == '17.0':
-        # v17.0: Full Vector Neurons + Soft/Hard Selection (no rank matrices)
+        # v17.0: Hierarchical Neuron Circuits (2-level routing)
         model_kwargs.update({
-            'n_feature': getattr(args, 'n_feature', 768),       # Shared QK/V
-            'n_relational': getattr(args, 'n_relational', 256), # Shared Q/K
-            'n_value': getattr(args, 'n_value', 128),
+            'neurons_per_circuit': getattr(args, 'neurons_per_circuit', 64),
+            'n_circuits_r': getattr(args, 'n_circuits_r', 96),
+            'n_circuits_v': getattr(args, 'n_circuits_v', 24),
+            'n_circuits_rel': getattr(args, 'n_circuits_rel', 96),
+            'n_circuits_val': getattr(args, 'n_circuits_val', 16),
+            'top_k_circuits_r': getattr(args, 'top_k_circuits_r', 12),
+            'top_k_circuits_v': getattr(args, 'top_k_circuits_v', 6),
+            'top_k_circuits_rel': getattr(args, 'top_k_circuits_rel', 12),
+            'top_k_circuits_val': getattr(args, 'top_k_circuits_val', 4),
             'n_knowledge': args.n_knowledge,
             'coarse_k': args.coarse_k,
             'fine_k': args.fine_k,
             'knowledge_rank': args.knowledge_rank or 128,
             'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature': getattr(args, 'top_k_feature', 64),       # inference only
-            'top_k_relational': getattr(args, 'top_k_relational', 64), # inference only
-            'top_k_value': getattr(args, 'top_k_value', 32),           # inference only
             'd_space': getattr(args, 'd_space', 64),
-            'router_dropout': getattr(args, 'router_dropout', 0.1),
-            'temperature': getattr(args, 'temperature', 1.0),
-            'use_ssm_context': getattr(args, 'use_ssm_context', True),
-            'gradient_checkpointing': args.gradient_checkpointing,
+            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
+            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
+            'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
+            'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
         })
     elif model_version == '16.0':
         # v16.0: Split Feature R/V (rank matrix)
