@@ -760,11 +760,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
-                # Check if v16+ (needs routing_info for usage logging)
-                is_v16_plus = (hasattr(base_model, 'global_routers') and
-                           hasattr(base_model.global_routers, 'neuron_router') and
-                           (hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r') or  # v16
-                            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))      # v17
+                # Check if v16+ or v17 (needs routing_info for usage logging)
+                is_v16_plus = (
+                    # v17: router at base_model.router
+                    (hasattr(base_model, 'router') and hasattr(base_model.router, 'usage_ema_r')) or
+                    # v16: router at base_model.global_routers.neuron_router
+                    (hasattr(base_model, 'global_routers') and
+                     hasattr(base_model.global_routers, 'neuron_router') and
+                     hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r'))
+                )
 
                 # v10: DAWN model forward
                 if load_balance_weight > 0 or entropy_weight > 0 or is_v16_plus:
@@ -819,11 +823,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Non-AMP training (CPU or no CUDA)
             base_model = get_underlying_model(model)
 
-            # Check if v16+ (needs routing_info for usage logging)
-            is_v16_plus = (hasattr(base_model, 'global_routers') and
-                       hasattr(base_model.global_routers, 'neuron_router') and
-                       (hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r') or  # v16
-                        hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))      # v17
+            # Check if v16+ or v17 (needs routing_info for usage logging)
+            is_v16_plus = (
+                # v17: router at base_model.router
+                (hasattr(base_model, 'router') and hasattr(base_model.router, 'usage_ema_r')) or
+                # v16: router at base_model.global_routers.neuron_router
+                (hasattr(base_model, 'global_routers') and
+                 hasattr(base_model.global_routers, 'neuron_router') and
+                 hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r'))
+            )
 
             # v10: DAWN model forward
             if load_balance_weight > 0 or entropy_weight > 0 or is_v16_plus:
