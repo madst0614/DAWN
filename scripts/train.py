@@ -52,7 +52,7 @@ import math
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
-from models import create_model_by_version, print_version_info, normalize_version
+from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.checkpoint import load_checkpoint_smart, load_optimizer_state, strip_compile_prefix
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
@@ -1722,70 +1722,43 @@ def main():
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    # Build model kwargs from args (already updated from checkpoint if resuming)
-    model_version = getattr(args, 'model_version', '9.0')
+    # Build model kwargs from args using version_registry
+    model_version = getattr(args, 'model_version', '16.1')
 
-    # Common parameters
-    model_kwargs = {
+    # Build config dict from args for version_registry
+    args_config = {
         'vocab_size': vocab_size,
         'd_model': args.d_model,
         'n_layers': args.n_layers,
         'n_heads': args.n_heads,
-        'd_ff': args.d_ff,
         'max_seq_len': args.max_seq_len,
         'dropout': args.dropout,
+        'rank': args.basis_rank,
+        'n_feature_r': getattr(args, 'n_feature_r', 96),
+        'n_feature_v': getattr(args, 'n_feature_v', 24),
+        'n_relational': getattr(args, 'n_relational', 96),
+        'n_value': getattr(args, 'n_value', 16),
+        'n_knowledge': args.n_knowledge,
+        'coarse_k': args.coarse_k,
+        'fine_k': args.fine_k,
+        'knowledge_rank': args.knowledge_rank or 128,
+        'state_dim': getattr(args, 'state_dim', 64),
+        'top_k_feature_r': getattr(args, 'top_k_feature_r', 12),
+        'top_k_feature_v': getattr(args, 'top_k_feature_v', 3),
+        'top_k_relational': getattr(args, 'top_k_relational', 12),
+        'top_k_value': getattr(args, 'top_k_value', 3),
+        'd_space': getattr(args, 'd_space', 64),
+        'router_dropout': getattr(args, 'router_dropout', 0.1),
+        'gradient_checkpointing': args.gradient_checkpointing,
+        'excitability_tau': getattr(args, 'excitability_tau', 1.5),
+        'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
+        'excitability_decay_rate': getattr(args, 'excitability_decay_rate', 0.99995),
+        'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
+        'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
     }
 
-    # Add version-specific parameters
-    if model_version == '16.0':
-        # v16.0: Split Feature R/V (rank matrix)
-        model_kwargs.update({
-            'n_feature_r': getattr(args, 'n_feature_r', 512),
-            'n_feature_v': getattr(args, 'n_feature_v', 256),
-            'n_relational': getattr(args, 'n_relational', 160),
-            'n_value': getattr(args, 'n_value', 12),
-            'n_knowledge': args.n_knowledge,
-            'coarse_k': args.coarse_k,
-            'fine_k': args.fine_k,
-            'knowledge_rank': args.knowledge_rank or 128,
-            'rank': args.basis_rank,  # single rank for all matrices
-            'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature_r': getattr(args, 'top_k_feature_r', 8),
-            'top_k_feature_v': getattr(args, 'top_k_feature_v', 8),
-            'top_k_relational': getattr(args, 'top_k_relational', 4),
-            'top_k_value': getattr(args, 'top_k_value', 6),
-            'd_space': getattr(args, 'd_space', 64),
-            'router_dropout': getattr(args, 'router_dropout', 0.1),
-            'gradient_checkpointing': args.gradient_checkpointing,
-            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
-            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
-            'excitability_decay_rate': getattr(args, 'excitability_decay_rate', 0.99995),
-        })
-    elif model_version == '16.1':
-        # v16.1: Split Feature R/V + Langevin Excitability
-        model_kwargs.update({
-            'n_feature_r': getattr(args, 'n_feature_r', 512),
-            'n_feature_v': getattr(args, 'n_feature_v', 256),
-            'n_relational': getattr(args, 'n_relational', 160),
-            'n_value': getattr(args, 'n_value', 12),
-            'n_knowledge': args.n_knowledge,
-            'coarse_k': args.coarse_k,
-            'fine_k': args.fine_k,
-            'knowledge_rank': args.knowledge_rank or 128,
-            'rank': args.basis_rank,
-            'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature_r': getattr(args, 'top_k_feature_r', 8),
-            'top_k_feature_v': getattr(args, 'top_k_feature_v', 8),
-            'top_k_relational': getattr(args, 'top_k_relational', 4),
-            'top_k_value': getattr(args, 'top_k_value', 6),
-            'd_space': getattr(args, 'd_space', 64),
-            'router_dropout': getattr(args, 'router_dropout', 0.1),
-            'gradient_checkpointing': args.gradient_checkpointing,
-            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
-            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
-            'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
-            'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
-        })
+    # Use version_registry to build model_kwargs with correct params for version
+    model_kwargs = build_model_kwargs(model_version, args_config)
 
     # Create model
     model = create_model_by_version(model_version, model_kwargs)
