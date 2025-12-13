@@ -321,12 +321,14 @@ class GlobalSSM(nn.Module):
         A = -torch.exp(self.A_log)
 
         if MAMBA_AVAILABLE:
+            # Cast to input dtype for AMP compatibility
             x_t = x.transpose(1, 2).contiguous()
             delta_t = delta.transpose(1, 2).contiguous()
+            A_t = A.to(x.dtype)  # A must match input dtype for mamba kernel
             B_t = B_sel.transpose(1, 2).contiguous()
             C_t = C_sel.transpose(1, 2).contiguous()
 
-            y = selective_scan_fn(x_t, delta_t, A, B_t, C_t,
+            y = selective_scan_fn(x_t, delta_t, A_t, B_t, C_t,
                                   D=None, z=None, delta_bias=None,
                                   delta_softplus=False, return_last_state=False)
             ssm_out = y.transpose(1, 2).contiguous()
