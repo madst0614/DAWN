@@ -64,6 +64,9 @@ class UnifiedNeuronRouter(nn.Module):
 
         # 공유 projection
         self.proj = nn.Linear(d_model, d_space)
+        # Q/K 분리 projection (relational용)
+        self.proj_rel_Q = nn.Linear(d_model, d_space)
+        self.proj_rel_K = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
         # 통합 뉴런 임베딩 [total_neurons, d_space]
@@ -112,8 +115,20 @@ class UnifiedNeuronRouter(nn.Module):
                 excitability = self.get_excitability(self.usage_ema_feature_v)
                 logits = logits + excitability * self.excitability_weight
 
-        elif neuron_type in ['relational_Q', 'relational_K']:
-            logits = all_logits[..., self.feature_v_end:self.relational_end]
+        elif neuron_type == 'relational_Q':
+            h_proj_Q = self.proj_rel_Q(x)
+            h_proj_Q = self.dropout(h_proj_Q)
+            rel_emb = neuron_emb_norm[self.feature_v_end:self.relational_end]
+            logits = torch.einsum('bsd,nd->bsn', h_proj_Q, rel_emb)
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_relational)
+                logits = logits + excitability * self.excitability_weight
+
+        elif neuron_type == 'relational_K':
+            h_proj_K = self.proj_rel_K(x)
+            h_proj_K = self.dropout(h_proj_K)
+            rel_emb = neuron_emb_norm[self.feature_v_end:self.relational_end]
+            logits = torch.einsum('bsd,nd->bsn', h_proj_K, rel_emb)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_relational)
                 logits = logits + excitability * self.excitability_weight
