@@ -1,17 +1,20 @@
 """
-DAWN v16_2: Split Feature R/V + Separate Q/K Projections
+DAWN v16_2: Full Q/K Projection Separation
 
-v16 기반 + relational Q/K projection 분리:
-- proj_rel_Q, proj_rel_K: 별도의 projection으로 Q/K routing 분리
+v16 기반 + Feature_R과 Relational 모두 Q/K projection 분리:
+- proj_FR_Q, proj_FR_K: Feature_R Q/K용 별도 projection
+- proj_rel_Q, proj_rel_K: Relational Q/K용 별도 projection
 
 v16의 문제:
-- relational_Q와 relational_K가 같은 proj를 사용해서 동일한 logits 생성
+- Feature_R이 Q/K에 같은 neuron 선택 → 같은 compression
+- relational_Q와 relational_K도 같은 proj 사용
 
 Architecture (Split-FRVK v16_2):
-- Feature_R: x → low-rank projection → h_r [Q, K compression]
+- Feature_R_Q: proj_FR_Q(x) → Q compression routing
+- Feature_R_K: proj_FR_K(x) → K compression routing
 - Feature_V: x → low-rank projection → h_v [V compression]
-- Relational Q: proj_rel_Q(x) → Q routing (separate projection)
-- Relational K: proj_rel_K(x) → K routing (separate projection)
+- Relational Q: proj_rel_Q(x) → Q expansion routing
+- Relational K: proj_rel_K(x) → K expansion routing
 - Value: V generation from h_v
 - Knowledge: 2-stage retrieval (same as v15)
 """
@@ -60,8 +63,11 @@ class UnifiedNeuronRouter(nn.Module):
         self.value_end = n_feature_r + n_feature_v + n_relational + n_value
         # knowledge는 value_end ~ total_neurons
 
-        # 공유 projection
+        # 공유 projection (feature_v, value, knowledge용)
         self.proj = nn.Linear(d_model, d_space)
+        # Q/K 분리 projection (feature_r용)
+        self.proj_FR_Q = nn.Linear(d_model, d_space)
+        self.proj_FR_K = nn.Linear(d_model, d_space)
         # Q/K 분리 projection (relational용)
         self.proj_rel_Q = nn.Linear(d_model, d_space)
         self.proj_rel_K = nn.Linear(d_model, d_space)
@@ -93,21 +99,32 @@ class UnifiedNeuronRouter(nn.Module):
     def get_logits(self, x, neuron_type):
         """
         x: [B, S, d_model]
-        neuron_type: 'feature_r', 'feature_v', 'relational_Q', 'relational_K', 'value', 'knowledge'
+        neuron_type: 'feature_r_Q', 'feature_r_K', 'feature_v', 'relational_Q', 'relational_K', 'value', 'knowledge'
         """
-        h_proj = self.proj(x)  # [B, S, d_space]
-        h_proj = self.dropout(h_proj)
-
         neuron_emb_norm = F.normalize(self.neuron_emb, dim=-1)
-        all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
 
-        if neuron_type == 'feature_r':
-            logits = all_logits[..., :self.feature_r_end]
+        if neuron_type == 'feature_r_Q':
+            h_proj_Q = self.proj_FR_Q(x)
+            h_proj_Q = self.dropout(h_proj_Q)
+            fr_emb = neuron_emb_norm[:self.feature_r_end]
+            logits = torch.einsum('bsd,nd->bsn', h_proj_Q, fr_emb)
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_feature_r)
+                logits = logits + excitability * self.excitability_weight
+
+        elif neuron_type == 'feature_r_K':
+            h_proj_K = self.proj_FR_K(x)
+            h_proj_K = self.dropout(h_proj_K)
+            fr_emb = neuron_emb_norm[:self.feature_r_end]
+            logits = torch.einsum('bsd,nd->bsn', h_proj_K, fr_emb)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_feature_r)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'feature_v':
+            h_proj = self.proj(x)
+            h_proj = self.dropout(h_proj)
+            all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
             logits = all_logits[..., self.feature_r_end:self.feature_v_end]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_feature_v)
@@ -132,13 +149,19 @@ class UnifiedNeuronRouter(nn.Module):
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'value':
-            logits = all_logits[..., self.relational_end:self.value_end]
+            h_proj = self.proj(x)
+            h_proj = self.dropout(h_proj)
+            value_emb = neuron_emb_norm[self.relational_end:self.value_end]
+            logits = torch.einsum('bsd,nd->bsn', h_proj, value_emb)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_value)
                 logits = logits + excitability * self.excitability_weight
 
         elif neuron_type == 'knowledge':
-            logits = all_logits[..., self.value_end:]
+            h_proj = self.proj(x)
+            h_proj = self.dropout(h_proj)
+            knowledge_emb = neuron_emb_norm[self.value_end:]
+            logits = torch.einsum('bsd,nd->bsn', h_proj, knowledge_emb)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_knowledge)
                 logits = logits + excitability * self.excitability_weight
@@ -377,16 +400,18 @@ class GlobalRouters(nn.Module):
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         """
-        Returns: feature_r_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
+        Returns: feature_r_weights_Q, feature_r_weights_K, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
         """
-        # Get logits from unified router
-        feature_r_logits = self.neuron_router.get_logits(x, 'feature_r')
+        # Get logits from unified router (Q/K separated)
+        feature_r_logits_Q = self.neuron_router.get_logits(x, 'feature_r_Q')
+        feature_r_logits_K = self.neuron_router.get_logits(x, 'feature_r_K')
         feature_v_logits = self.neuron_router.get_logits(x, 'feature_v')
         relational_logits_Q = self.neuron_router.get_logits(x, 'relational_Q')
         relational_logits_K = self.neuron_router.get_logits(x, 'relational_K')
         value_logits = self.neuron_router.get_logits(x, 'value')
 
-        feature_r_pref = F.softmax(feature_r_logits, dim=-1)
+        feature_r_pref_Q = F.softmax(feature_r_logits_Q, dim=-1)
+        feature_r_pref_K = F.softmax(feature_r_logits_K, dim=-1)
         feature_v_pref = F.softmax(feature_v_logits, dim=-1)
         relational_pref_Q = F.softmax(relational_logits_Q, dim=-1)
         relational_pref_K = F.softmax(relational_logits_K, dim=-1)
@@ -398,40 +423,45 @@ class GlobalRouters(nn.Module):
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(-1).float()
                 count = mask.sum() + 1e-8
-                usage_FR = (feature_r_pref * mask).sum(dim=(0, 1)) / count
+                usage_FR_Q = (feature_r_pref_Q * mask).sum(dim=(0, 1)) / count
+                usage_FR_K = (feature_r_pref_K * mask).sum(dim=(0, 1)) / count
                 usage_FV = (feature_v_pref * mask).sum(dim=(0, 1)) / count
-                usage_Q = (relational_pref_Q * mask).sum(dim=(0, 1)) / count
-                usage_K = (relational_pref_K * mask).sum(dim=(0, 1)) / count
+                usage_rel_Q = (relational_pref_Q * mask).sum(dim=(0, 1)) / count
+                usage_rel_K = (relational_pref_K * mask).sum(dim=(0, 1)) / count
                 usage_V = (value_pref * mask).sum(dim=(0, 1)) / count
             else:
-                usage_FR = feature_r_pref.mean(dim=(0, 1))
+                usage_FR_Q = feature_r_pref_Q.mean(dim=(0, 1))
+                usage_FR_K = feature_r_pref_K.mean(dim=(0, 1))
                 usage_FV = feature_v_pref.mean(dim=(0, 1))
-                usage_Q = relational_pref_Q.mean(dim=(0, 1))
-                usage_K = relational_pref_K.mean(dim=(0, 1))
+                usage_rel_Q = relational_pref_Q.mean(dim=(0, 1))
+                usage_rel_K = relational_pref_K.mean(dim=(0, 1))
                 usage_V = value_pref.mean(dim=(0, 1))
 
             target_FR = 1.0 / self.n_feature_r
-            aux_loss = aux_loss + ((usage_FR - target_FR) ** 2).sum() * self.n_feature_r
+            aux_loss = aux_loss + ((usage_FR_Q - target_FR) ** 2).sum() * self.n_feature_r
+            aux_loss = aux_loss + ((usage_FR_K - target_FR) ** 2).sum() * self.n_feature_r
 
             target_FV = 1.0 / self.n_feature_v
             aux_loss = aux_loss + ((usage_FV - target_FV) ** 2).sum() * self.n_feature_v
 
             target_R = 1.0 / self.n_relational
-            aux_loss = aux_loss + ((usage_Q - target_R) ** 2).sum() * self.n_relational
-            aux_loss = aux_loss + ((usage_K - target_R) ** 2).sum() * self.n_relational
+            aux_loss = aux_loss + ((usage_rel_Q - target_R) ** 2).sum() * self.n_relational
+            aux_loss = aux_loss + ((usage_rel_K - target_R) ** 2).sum() * self.n_relational
 
             target_V = 1.0 / self.n_value
             aux_loss = aux_loss + ((usage_V - target_V) ** 2).sum() * self.n_value
 
         if self.token_routing:
-            feature_r_weights = feature_r_pref
+            feature_r_weights_Q = feature_r_pref_Q
+            feature_r_weights_K = feature_r_pref_K
             feature_v_weights = feature_v_pref
             relational_weights_Q = relational_pref_Q
             relational_weights_K = relational_pref_K
             value_weights = value_pref
 
             routing_info = {
-                'feature_r_weights': feature_r_weights.detach(),
+                'feature_r_weights_Q': feature_r_weights_Q.detach(),
+                'feature_r_weights_K': feature_r_weights_K.detach(),
                 'feature_v_weights': feature_v_weights.detach(),
                 'relational_weights_Q': relational_weights_Q.detach(),
                 'relational_weights_K': relational_weights_K.detach(),
@@ -440,26 +470,30 @@ class GlobalRouters(nn.Module):
             }
         else:
             # Batch-level routing
-            feature_r_weights_dense = torch.einsum('bs,bsn->bn', importance, feature_r_pref)
+            feature_r_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, feature_r_pref_Q)
+            feature_r_weights_K_dense = torch.einsum('bs,bsn->bn', importance, feature_r_pref_K)
             feature_v_weights_dense = torch.einsum('bs,bsn->bn', importance, feature_v_pref)
             relational_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_Q)
             relational_weights_K_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_K)
             value_weights_dense = torch.einsum('bs,bsn->bn', importance, value_pref)
 
-            feature_r_weights, _ = self._topk_sparsify(feature_r_weights_dense, self.top_k_feature_r)
+            feature_r_weights_Q, _ = self._topk_sparsify(feature_r_weights_Q_dense, self.top_k_feature_r)
+            feature_r_weights_K, _ = self._topk_sparsify(feature_r_weights_K_dense, self.top_k_feature_r)
             feature_v_weights, _ = self._topk_sparsify(feature_v_weights_dense, self.top_k_feature_v)
             relational_weights_Q, _ = self._topk_sparsify(relational_weights_Q_dense, self.top_k_relational)
             relational_weights_K, _ = self._topk_sparsify(relational_weights_K_dense, self.top_k_relational)
             value_weights, _ = self._topk_sparsify(value_weights_dense, self.top_k_value)
 
             routing_info = {
-                'feature_r_weights': feature_r_weights.detach(),
+                'feature_r_weights_Q': feature_r_weights_Q.detach(),
+                'feature_r_weights_K': feature_r_weights_K.detach(),
                 'feature_v_weights': feature_v_weights.detach(),
                 'relational_weights_Q': relational_weights_Q.detach(),
                 'relational_weights_K': relational_weights_K.detach(),
                 'value_weights': value_weights.detach(),
-                # v16: split feature prefs (same keys as v17 for logging compat)
-                'feature_r_pref': feature_r_pref.detach(),
+                # v16.2: split feature prefs
+                'feature_r_q_pref': feature_r_pref_Q.detach(),
+                'feature_r_k_pref': feature_r_pref_K.detach(),
                 'feature_v_pref': feature_v_pref.detach(),
                 'relational_q_pref': relational_pref_Q.detach(),
                 'relational_k_pref': relational_pref_K.detach(),
@@ -469,26 +503,28 @@ class GlobalRouters(nn.Module):
 
         # Update usage statistics
         if self.training:
-            self.neuron_router.update_usage(feature_r_weights, 'feature_r', attention_mask)
+            feature_r_used = ((feature_r_weights_Q > 0) | (feature_r_weights_K > 0)).float()
+            self.neuron_router.update_usage(feature_r_used, 'feature_r', attention_mask)
             self.neuron_router.update_usage(feature_v_weights, 'feature_v', attention_mask)
             self.neuron_router.update_usage(value_weights, 'value', attention_mask)
             relational_used = ((relational_weights_Q > 0) | (relational_weights_K > 0)).float()
             self.neuron_router.update_usage(relational_used, 'relational', attention_mask)
 
-        return feature_r_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
+        return feature_r_weights_Q, feature_r_weights_K, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
 
 
 class NeuronCircuit(nn.Module):
     """
-    v16: Attention circuit with Split Feature R/V
+    v16.2: Attention circuit with Full Q/K Separation
 
     Flow:
-    1. x → feature_r_neurons → h_r [Q/K compression]
-    2. x → feature_v_neurons → h_v [V compression]
-    3. h_r → relational_Q → Q
-    4. h_r → relational_K → K
-    5. h_v → value → V
-    6. Multi-head attention
+    1. x → feature_r_Q_neurons → h_r_Q [Q compression]
+    2. x → feature_r_K_neurons → h_r_K [K compression]
+    3. x → feature_v_neurons → h_v [V compression]
+    4. h_r_Q → relational_Q → Q
+    5. h_r_K → relational_K → K
+    6. h_v → value → V
+    7. Multi-head attention
     """
     def __init__(
         self,
@@ -509,27 +545,31 @@ class NeuronCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, feature_r_weights, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, attention_mask=None):
+    def forward(self, x, feature_r_weights_Q, feature_r_weights_K, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, attention_mask=None):
         """
         Args:
             x: [B, S, D]
-            feature_r_weights: [B, N_FR] - Q/K compression weights
+            feature_r_weights_Q: [B, N_FR] - Q compression weights
+            feature_r_weights_K: [B, N_FR] - K compression weights
             feature_v_weights: [B, N_FV] - V compression weights
             relational_weights_Q: [B, N_R] - Q expansion weights
             relational_weights_K: [B, N_R] - K expansion weights
             value_weights: [B, N_V] - V expansion weights
         """
         B, S, D = x.shape
-        token_routing = feature_r_weights.dim() == 3
+        token_routing = feature_r_weights_Q.dim() == 3
 
         if token_routing:
             # Token-level routing
-            shared_feature_r = torch.einsum('bsn,ndr->bsdr', feature_r_weights,
-                                              self.shared_neurons.feature_r_neurons)
+            shared_feature_r_Q = torch.einsum('bsn,ndr->bsdr', feature_r_weights_Q,
+                                               self.shared_neurons.feature_r_neurons)
+            shared_feature_r_K = torch.einsum('bsn,ndr->bsdr', feature_r_weights_K,
+                                               self.shared_neurons.feature_r_neurons)
             shared_feature_v = torch.einsum('bsn,ndr->bsdr', feature_v_weights,
                                              self.shared_neurons.feature_v_neurons)
 
-            h_r = torch.einsum('bsd,bsdr->bsr', x, shared_feature_r)
+            h_r_Q = torch.einsum('bsd,bsdr->bsr', x, shared_feature_r_Q)
+            h_r_K = torch.einsum('bsd,bsdr->bsr', x, shared_feature_r_K)
             h_v = torch.einsum('bsd,bsdr->bsr', x, shared_feature_v)
 
             pool_R = self.shared_neurons.relational_neurons
@@ -538,17 +578,20 @@ class NeuronCircuit(nn.Module):
             shared_relational_K = torch.einsum('bsn,nrd->bsrd', relational_weights_K, pool_R)
             shared_value = torch.einsum('bsn,nrd->bsrd', value_weights, pool_V)
 
-            Q = torch.einsum('bsr,bsrd->bsd', h_r, shared_relational_Q)
-            K = torch.einsum('bsr,bsrd->bsd', h_r, shared_relational_K)
+            Q = torch.einsum('bsr,bsrd->bsd', h_r_Q, shared_relational_Q)
+            K = torch.einsum('bsr,bsrd->bsd', h_r_K, shared_relational_K)
             V = torch.einsum('bsr,bsrd->bsd', h_v, shared_value)
         else:
             # Batch-level routing
-            shared_feature_r = torch.einsum('bn,ndr->bdr', feature_r_weights,
-                                              self.shared_neurons.feature_r_neurons)
+            shared_feature_r_Q = torch.einsum('bn,ndr->bdr', feature_r_weights_Q,
+                                               self.shared_neurons.feature_r_neurons)
+            shared_feature_r_K = torch.einsum('bn,ndr->bdr', feature_r_weights_K,
+                                               self.shared_neurons.feature_r_neurons)
             shared_feature_v = torch.einsum('bn,ndr->bdr', feature_v_weights,
                                              self.shared_neurons.feature_v_neurons)
 
-            h_r = torch.einsum('bsd,bdr->bsr', x, shared_feature_r)
+            h_r_Q = torch.einsum('bsd,bdr->bsr', x, shared_feature_r_Q)
+            h_r_K = torch.einsum('bsd,bdr->bsr', x, shared_feature_r_K)
             h_v = torch.einsum('bsd,bdr->bsr', x, shared_feature_v)
 
             pool_R = self.shared_neurons.relational_neurons
@@ -557,8 +600,8 @@ class NeuronCircuit(nn.Module):
             shared_relational_K = torch.einsum('bn,nrd->brd', relational_weights_K, pool_R)
             shared_value = torch.einsum('bn,nrd->brd', value_weights, pool_V)
 
-            Q = torch.einsum('bsr,brd->bsd', h_r, shared_relational_Q)
-            K = torch.einsum('bsr,brd->bsd', h_r, shared_relational_K)
+            Q = torch.einsum('bsr,brd->bsd', h_r_Q, shared_relational_Q)
+            K = torch.einsum('bsr,brd->bsd', h_r_K, shared_relational_K)
             V = torch.einsum('bsr,brd->bsd', h_v, shared_value)
 
         # Multi-head Attention
@@ -656,7 +699,7 @@ class NeuronMemory(nn.Module):
 
 
 class DAWNBlock(nn.Module):
-    """DAWN v16 block with Split Feature R/V"""
+    """DAWN v16.2 block with Full Q/K Separation"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
@@ -683,10 +726,10 @@ class DAWNBlock(nn.Module):
 
     def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder, attention_mask=None):
         normed_x = self.norm1(x)
-        feature_r_w, feature_v_w, relational_Q, relational_K, value_w, attn_routing, attn_aux_loss = \
+        feature_r_w_Q, feature_r_w_K, feature_v_w, relational_Q, relational_K, value_w, attn_routing, attn_aux_loss = \
             global_routers.get_attention_weights(normed_x, importance, attention_mask)
 
-        attn_out, _ = self.attn(normed_x, feature_r_w, feature_v_w, relational_Q, relational_K, value_w, attention_mask)
+        attn_out, _ = self.attn(normed_x, feature_r_w_Q, feature_r_w_K, feature_v_w, relational_Q, relational_K, value_w, attention_mask)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
@@ -708,16 +751,16 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v16: Split Feature R/V
+    DAWN v16.2: Full Q/K Projection Separation
 
-    v15 기반 + Feature 뉴런 분리:
-    - Feature_R: Q/K compression (rank matrix)
-    - Feature_V: V compression (rank matrix)
+    v16 기반 + Feature_R과 Relational 모두 Q/K projection 분리:
+    - Feature_R_Q/K: 별도 projection으로 Q/K compression routing 분리
+    - Relational_Q/K: 별도 projection으로 Q/K expansion routing 분리
 
     Architecture:
-    - Feature_R: [n_feature_r, d_model, rank] - Q/K 압축
+    - Feature_R: [n_feature_r, d_model, rank] - Q/K용 별도 routing
     - Feature_V: [n_feature_v, d_model, rank] - V 압축
-    - Relational: [n_relational, rank, d_model] - Q/K expansion
+    - Relational: [n_relational, rank, d_model] - Q/K용 별도 routing
     - Value: [n_value, rank, d_model] - V expansion
     - Knowledge: 2-stage retrieval
     """
@@ -1006,12 +1049,12 @@ class DAWN(nn.Module):
     def get_model_info(self):
         """Return model architecture info for logging"""
         return [
-            f"DAWN v{self.__version__}: Split Feature R/V",
+            f"DAWN v{self.__version__}: Full Q/K Projection Separation",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  Feature_R: {self.n_feature_r} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_r})",
-            f"  Feature_V:  {self.n_feature_v} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_v})",
-            f"  Relational: {self.n_relational} × {self.rank} × {self.d_model} (top-k={self.top_k_relational})",
-            f"  Value:      {self.n_value} × {self.rank} × {self.d_model} (top-k={self.top_k_value})",
-            f"  Knowledge:  {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
+            f"  Feature_R: {self.n_feature_r} × {self.d_model} × {self.rank} (Q/K separate, top-k={self.top_k_feature_r})",
+            f"  Feature_V: {self.n_feature_v} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_v})",
+            f"  Relational: {self.n_relational} × {self.rank} × {self.d_model} (Q/K separate, top-k={self.top_k_relational})",
+            f"  Value:     {self.n_value} × {self.rank} × {self.d_model} (top-k={self.top_k_value})",
+            f"  Knowledge: {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
             f"  Router: d_space={self.d_space}, Excitability (SAR)",
         ]

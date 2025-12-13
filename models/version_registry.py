@@ -96,6 +96,42 @@ VERSION_REGISTRY = {
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
         ],
     },
+    "16.2": {
+        "description": "Full Q/K Projection Separation",
+        "aliases": ["162"],
+        "module": "model_v16_2",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_r", "n_feature_v", "n_relational", "n_value", "n_knowledge",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature_r": 8,
+            "top_k_feature_v": 8,
+            "top_k_relational": 4,
+            "top_k_value": 6,
+            "d_space": 64,
+            "coarse_k": 20,
+            "fine_k": 10,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
+        },
+        "display_info": lambda args: [
+            f"DAWN v16.2: Full Q/K Projection Separation",
+            f"  rank={args.get('rank', args.get('basis_rank'))}",
+            f"  Feature_R: {args.get('n_feature_r')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (Q/K separate, top-k={args.get('top_k_feature_r', 8)})",
+            f"  Feature_V: {args.get('n_feature_v')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (top-k={args.get('top_k_feature_v', 8)})",
+            f"  Relational: {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K separate, top-k={args.get('top_k_relational', 4)})",
+            f"  Value: {args.get('n_value')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (top-k={args.get('top_k_value', 6)})",
+            f"  Unified Router: d_space={args.get('d_space', 64)} + SAR",
+            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
+        ],
+    },
 }
 
 

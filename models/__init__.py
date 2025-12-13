@@ -10,6 +10,11 @@ v16.1: Split Feature R/V + Langevin Excitability
 - Same as v16.0 + adaptive dead neuron recovery
 - Langevin dynamics: dw = -α*w + β*dead_ratio
 
+v16.2: Full Q/K Projection Separation
+- Feature_R과 Relational 모두 Q/K projection 분리
+- proj_FR_Q, proj_FR_K: Feature_R Q/K용 별도 projection
+- proj_rel_Q, proj_rel_K: Relational Q/K용 별도 projection
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -19,8 +24,11 @@ from .model_v16 import DAWN as DAWN_v16
 # v16.1 - Split Feature R/V + Langevin Excitability
 from .model_v16_1 import DAWN as DAWN_v16_1
 
-# Default DAWN is v16.1 (latest)
-DAWN = DAWN_v16_1
+# v16.2 - Full Q/K Projection Separation
+from .model_v16_2 import DAWN as DAWN_v16_2
+
+# Default DAWN is v16.2 (latest)
+DAWN = DAWN_v16_2
 
 # Baseline for comparison
 import sys
@@ -46,6 +54,7 @@ __all__ = [
     'DAWN',
     'DAWN_v16',
     'DAWN_v16_1',
+    'DAWN_v16_2',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -60,14 +69,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "16.1"
+__version__ = "16.2"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "16.0", "16.1", or "baseline"
+        version: "16.0", "16.1", "16.2", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -82,6 +91,8 @@ def create_model_by_version(version, config):
         return DAWN_v16(**config)
     elif version == "16.1":
         return DAWN_v16_1(**config)
+    elif version == "16.2":
+        return DAWN_v16_2(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 16.0, 16.1, baseline")
+                        f"Supported versions: 16.0, 16.1, 16.2, baseline")
