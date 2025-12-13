@@ -8,11 +8,11 @@ To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
 2. Create model file in models/model_vX_Y.py
 3. Update models/__init__.py
-4. Update scripts/train.py if router/routing_info structure changed
-5. Create config in configs/train_config_vX_Y.yaml
+4. Create config in configs/train_config_vX_Y.yaml
 """
 
 from typing import Dict, Any, List
+import torch
 
 
 VERSION_REGISTRY = {
