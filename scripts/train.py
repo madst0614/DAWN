@@ -894,9 +894,37 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # v16.2: feature_r_q_pref/feature_r_k_pref (separate Q/K)
+                    # v16.3: fq_pref/fk_pref/fv_pref/rq_pref/rk_pref/rv_pref (complete pool separation)
+                    # v16.2: feature_r_q_pref/feature_r_k_pref (separate Q/K projections)
                     # v16.0: feature_r_pref (shared Q/K)
-                    if attn.get('feature_r_q_pref') is not None:
+                    if attn.get('fq_pref') is not None:
+                        # v16.3: Complete pool separation
+                        pref_FQ = attn.get('fq_pref')
+                        pref_FK = attn.get('fk_pref')
+                        pref_FV = attn.get('fv_pref')
+                        pref_RQ = attn.get('rq_pref')
+                        pref_RK = attn.get('rk_pref')
+                        pref_RV = attn.get('rv_pref')
+
+                        ent_FQ = calc_entropy_ratio(pref_FQ)
+                        ent_FK = calc_entropy_ratio(pref_FK)
+                        ent_FV = calc_entropy_ratio(pref_FV)
+                        ent_RQ = calc_entropy_ratio(pref_RQ)
+                        ent_RK = calc_entropy_ratio(pref_RK)
+                        ent_RV = calc_entropy_ratio(pref_RV)
+
+                        var_FQ = calc_token_var(pref_FQ)
+                        var_FK = calc_token_var(pref_FK)
+                        var_FV = calc_token_var(pref_FV)
+                        var_RQ = calc_token_var(pref_RQ)
+                        var_RK = calc_token_var(pref_RK)
+                        var_RV = calc_token_var(pref_RV)
+
+                        ent_str = f"Ent FQ/FK/FV/RQ/RK/RV:{ent_FQ:.0f}/{ent_FK:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_RV:.0f}"
+                        var_str = f"TokVar:{var_FQ:.4f}/{var_FK:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_RV:.4f}"
+                        overlap_str = None  # v16.3 has separate pools, no overlap
+
+                    elif attn.get('feature_r_q_pref') is not None:
                         # v16.2: Full Q/K separation
                         pref_FRQ = attn.get('feature_r_q_pref')
                         pref_FRK = attn.get('feature_r_k_pref')
