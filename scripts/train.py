@@ -580,7 +580,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
-    # v17: Hierarchical Neuron Circuits (2-level routing)
+    # v17: Hierarchical Neuron Circuits (2-level routing, v16-style excitability)
     if hasattr(router, 'n_circuits_r'):
         n_r = router.n_circuits_r
         n_v = router.n_circuits_v
@@ -588,47 +588,47 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         n_val = router.n_circuits_val
         n_k = router.n_knowledge
 
-        # Usage stats (per circuit)
-        usage_r = router.usage_r
-        usage_v = router.usage_v
-        usage_rel = router.usage_rel
-        usage_val = router.usage_val
-        usage_k = router.usage_k
+        # Usage EMA stats (per circuit, v16-style)
+        ema_r = router.usage_ema_r
+        ema_v = router.usage_ema_v
+        ema_rel = router.usage_ema_rel
+        ema_val = router.usage_ema_val
+        ema_k = router.usage_ema_k
 
         # Active circuits (usage > 0.01)
-        active_r = (usage_r > 0.01).sum().item()
-        active_v = (usage_v > 0.01).sum().item()
-        active_rel = (usage_rel > 0.01).sum().item()
-        active_val = (usage_val > 0.01).sum().item()
-        active_k = (usage_k > 0.01).sum().item()
+        active_r = (ema_r > 0.01).sum().item()
+        active_v = (ema_v > 0.01).sum().item()
+        active_rel = (ema_rel > 0.01).sum().item()
+        active_val = (ema_val > 0.01).sum().item()
+        active_k = (ema_k > 0.01).sum().item()
 
         # Gini coefficients
-        gini_r = _gini(usage_r)
-        gini_v = _gini(usage_v)
-        gini_rel = _gini(usage_rel)
-        gini_val = _gini(usage_val)
-        gini_k = _gini(usage_k)
+        gini_r = _gini(ema_r)
+        gini_v = _gini(ema_v)
+        gini_rel = _gini(ema_rel)
+        gini_val = _gini(ema_val)
+        gini_k = _gini(ema_k)
 
-        # Excitability weights
-        exc_r = router.exc_r
-        exc_v = router.exc_v
-        exc_rel = router.exc_rel
-        exc_val = router.exc_val
-        exc_k = router.exc_k
+        # Excitability weights (v16-style naming)
+        w_r = router.excitability_weight_r
+        w_v = router.excitability_weight_v
+        w_rel = router.excitability_weight_rel
+        w_val = router.excitability_weight_val
+        w_k = router.excitability_weight_k
 
         tau = router.tau if hasattr(router, 'tau') else 1.5
 
         # Dead circuit ratios
-        dead_r = (usage_r < 0.01).float().mean().item()
-        dead_v = (usage_v < 0.01).float().mean().item()
-        dead_rel = (usage_rel < 0.01).float().mean().item()
-        dead_val = (usage_val < 0.01).float().mean().item()
+        dead_r = (ema_r < 0.01).float().mean().item()
+        dead_v = (ema_v < 0.01).float().mean().item()
+        dead_rel = (ema_rel < 0.01).float().mean().item()
+        dead_val = (ema_val < 0.01).float().mean().item()
 
         lines.append(f"         v17 Circuit | τ={tau:.1f} | R:{int(active_r)}/{n_r} V:{int(active_v)}/{n_v} Rel:{int(active_rel)}/{n_rel} Val:{int(active_val)}/{n_val}")
         lines.append(f"             Gini R/V/Rel/Val: {gini_r:.2f}/{gini_v:.2f}/{gini_rel:.2f}/{gini_val:.2f}")
         lines.append(f"             Dead R/V/Rel/Val: {dead_r:.1%}/{dead_v:.1%}/{dead_rel:.1%}/{dead_val:.1%}")
-        lines.append(f"             Exc R:[{exc_r.min().item():.2f},{exc_r.mean().item():.2f},{exc_r.max().item():.2f}] Rel:[{exc_rel.min().item():.2f},{exc_rel.mean().item():.2f},{exc_rel.max().item():.2f}]")
-        lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f} | Dead:{(usage_k < 0.01).float().mean().item():.1%}")
+        lines.append(f"             Weight R:[{w_r.min().item():.2f},{w_r.mean().item():.2f},{w_r.max().item():.2f}] Rel:[{w_rel.min().item():.2f},{w_rel.mean().item():.2f},{w_rel.max().item():.2f}]")
+        lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f} | Dead:{(ema_k < 0.01).float().mean().item():.1%}")
 
     # v16: Split Feature R/V with Excitability
     elif hasattr(router, 'usage_ema_feature_r'):
@@ -879,7 +879,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Increment global step counter
         global_step += 1
 
-        # Update excitability (v17: update_excitability, v16.1: update_excitability_weight, v16.0: decay)
+        # Update excitability (v16.1/v17: update_excitability_weight, v16.0: decay_excitability)
         router = None
         if hasattr(base_model, 'router'):  # v17
             router = base_model.router
@@ -887,10 +887,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             router = base_model.global_routers.neuron_router
 
         if router is not None:
-            if hasattr(router, 'update_excitability'):
-                router.update_excitability()  # v17 Langevin dynamics
-            elif hasattr(router, 'update_excitability_weight'):
-                router.update_excitability_weight()  # v16.1 Langevin dynamics
+            if hasattr(router, 'update_excitability_weight'):
+                router.update_excitability_weight()  # v16.1/v17 Langevin dynamics
             elif hasattr(router, 'decay_excitability'):
                 router.decay_excitability()  # v16.0 simple decay
 

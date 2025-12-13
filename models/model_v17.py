@@ -161,19 +161,23 @@ class CircuitRouter(nn.Module):
         self.neuron_proj_rel_Q = nn.Linear(d_model, d_space, bias=False)
         self.neuron_proj_rel_K = nn.Linear(d_model, d_space, bias=False)
 
-        # Usage tracking (per circuit)
-        self.register_buffer('usage_r', torch.zeros(n_circuits_r))
-        self.register_buffer('usage_v', torch.zeros(n_circuits_v))
-        self.register_buffer('usage_rel', torch.zeros(n_circuits_rel))
-        self.register_buffer('usage_val', torch.zeros(n_circuits_val))
-        self.register_buffer('usage_k', torch.zeros(n_knowledge))
+        # Usage tracking (EMA-based, like v16)
+        self.register_buffer('usage_ema_r', torch.zeros(n_circuits_r))
+        self.register_buffer('usage_ema_v', torch.zeros(n_circuits_v))
+        self.register_buffer('usage_ema_rel', torch.zeros(n_circuits_rel))
+        self.register_buffer('usage_ema_val', torch.zeros(n_circuits_val))
+        self.register_buffer('usage_ema_k', torch.zeros(n_knowledge))
 
-        # Excitability weights
-        self.register_buffer('exc_r', torch.ones(n_circuits_r) * 0.3)
-        self.register_buffer('exc_v', torch.ones(n_circuits_v) * 0.3)
-        self.register_buffer('exc_rel', torch.ones(n_circuits_rel) * 0.3)
-        self.register_buffer('exc_val', torch.ones(n_circuits_val) * 0.3)
-        self.register_buffer('exc_k', torch.ones(n_knowledge) * 0.3)
+        # Excitability weights (per-circuit, like v16)
+        self.register_buffer('excitability_weight_r', torch.ones(n_circuits_r) * 0.3)
+        self.register_buffer('excitability_weight_v', torch.ones(n_circuits_v) * 0.3)
+        self.register_buffer('excitability_weight_rel', torch.ones(n_circuits_rel) * 0.3)
+        self.register_buffer('excitability_weight_val', torch.ones(n_circuits_val) * 0.3)
+        self.register_buffer('excitability_weight_k', torch.ones(n_knowledge) * 0.3)
+
+    def get_excitability(self, usage_ema):
+        """v16-style: excitability from usage EMA"""
+        return torch.clamp(1.0 - usage_ema / self.tau, min=0.0, max=1.0)
 
     def get_circuit_logits(self, x, circuit_type):
         """Level 1: Get circuit selection logits"""
@@ -194,31 +198,36 @@ class CircuitRouter(nn.Module):
         else:
             logits = torch.einsum('bsd,nd->bsn', h, emb_norm)  # [B, S, total]
 
-        # Slice for circuit type
+        # Slice for circuit type (v16-style naming)
         if circuit_type == 'feature_r':
             idx = self.idx_r
-            usage, exc = self.usage_r, self.exc_r
+            usage_ema = self.usage_ema_r
+            exc_weight = self.excitability_weight_r
         elif circuit_type == 'feature_v':
             idx = self.idx_v
-            usage, exc = self.usage_v, self.exc_v
+            usage_ema = self.usage_ema_v
+            exc_weight = self.excitability_weight_v
         elif circuit_type in ['relational', 'relational_Q', 'relational_K']:
             idx = self.idx_rel
-            usage, exc = self.usage_rel, self.exc_rel
+            usage_ema = self.usage_ema_rel
+            exc_weight = self.excitability_weight_rel
         elif circuit_type == 'value':
             idx = self.idx_val
-            usage, exc = self.usage_val, self.exc_val
+            usage_ema = self.usage_ema_val
+            exc_weight = self.excitability_weight_val
         elif circuit_type == 'knowledge':
             idx = self.idx_k
-            usage, exc = self.usage_k, self.exc_k
+            usage_ema = self.usage_ema_k
+            exc_weight = self.excitability_weight_k
         else:
             raise ValueError(f"Unknown circuit type: {circuit_type}")
 
         logits = logits[..., idx[0]:idx[1]]
 
-        # Add excitability during training
+        # Add excitability during training (v16-style)
         if self.training:
-            excitability = torch.clamp(1.0 - usage / self.tau, 0.0, 1.0)
-            logits = logits + excitability * exc
+            excitability = self.get_excitability(usage_ema)
+            logits = logits + excitability * exc_weight
 
         return logits
 
@@ -266,7 +275,7 @@ class CircuitRouter(nn.Module):
         return weights
 
     def update_usage(self, weights, circuit_type, mask=None):
-        """Update circuit usage EMA"""
+        """Update circuit usage EMA (v16-style)"""
         if not self.training:
             return
 
@@ -275,25 +284,46 @@ class CircuitRouter(nn.Module):
 
         decay = 1 - self.ema_alpha
         if circuit_type == 'feature_r':
-            self.usage_r.mul_(decay).add_(usage, alpha=self.ema_alpha)
+            self.usage_ema_r.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif circuit_type == 'feature_v':
-            self.usage_v.mul_(decay).add_(usage, alpha=self.ema_alpha)
+            self.usage_ema_v.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif circuit_type == 'relational':
-            self.usage_rel.mul_(decay).add_(usage, alpha=self.ema_alpha)
+            self.usage_ema_rel.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif circuit_type == 'value':
-            self.usage_val.mul_(decay).add_(usage, alpha=self.ema_alpha)
+            self.usage_ema_val.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif circuit_type == 'knowledge':
-            self.usage_k.mul_(decay).add_(usage, alpha=self.ema_alpha)
+            self.usage_ema_k.mul_(decay).add_(usage, alpha=self.ema_alpha)
 
-    def update_excitability(self):
-        """Langevin dynamics for excitability"""
+    def update_excitability_weight(self):
+        """Per-circuit Langevin dynamics (v16-style): dw_i = -α*w_i + β*dead_ratio_i"""
         threshold = 0.01
-        for usage, exc in [(self.usage_r, self.exc_r), (self.usage_v, self.exc_v),
-                           (self.usage_rel, self.exc_rel), (self.usage_val, self.exc_val),
-                           (self.usage_k, self.exc_k)]:
-            dead = (usage < threshold).float()
-            dw = -self.langevin_alpha * exc + self.langevin_beta * dead
-            exc.add_(dw).clamp_(0.1, 0.5)
+        alpha = self.langevin_alpha
+        beta = self.langevin_beta
+
+        # R circuits
+        dead_ratio_r = (self.usage_ema_r < threshold).float()
+        dw_r = -alpha * self.excitability_weight_r + beta * dead_ratio_r
+        self.excitability_weight_r.add_(dw_r).clamp_(0.1, 0.5)
+
+        # V circuits
+        dead_ratio_v = (self.usage_ema_v < threshold).float()
+        dw_v = -alpha * self.excitability_weight_v + beta * dead_ratio_v
+        self.excitability_weight_v.add_(dw_v).clamp_(0.1, 0.5)
+
+        # Rel circuits
+        dead_ratio_rel = (self.usage_ema_rel < threshold).float()
+        dw_rel = -alpha * self.excitability_weight_rel + beta * dead_ratio_rel
+        self.excitability_weight_rel.add_(dw_rel).clamp_(0.1, 0.5)
+
+        # Val circuits
+        dead_ratio_val = (self.usage_ema_val < threshold).float()
+        dw_val = -alpha * self.excitability_weight_val + beta * dead_ratio_val
+        self.excitability_weight_val.add_(dw_val).clamp_(0.1, 0.5)
+
+        # K (Knowledge)
+        dead_ratio_k = (self.usage_ema_k < threshold).float()
+        dw_k = -alpha * self.excitability_weight_k + beta * dead_ratio_k
+        self.excitability_weight_k.add_(dw_k).clamp_(0.1, 0.5)
 
 
 class GlobalSSM(nn.Module):
