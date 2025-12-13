@@ -1498,15 +1498,29 @@ def main():
     args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
     args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
 
-    # v16.0 Split Feature R/V parameters (uses single rank from basis_rank)
-    args.n_feature_r = cfg['model'].get('n_feature_r', 512)
-    args.n_feature_v = cfg['model'].get('n_feature_v', 256)
+    # v16.0/16.1/16.2 Split Feature R/V parameters
+    args.n_feature_r = cfg['model'].get('n_feature_r', 96)
+    args.n_feature_v = cfg['model'].get('n_feature_v', 24)
     args.top_k_feature_r = cfg['model'].get('top_k_feature_r', 8)
     args.top_k_feature_v = cfg['model'].get('top_k_feature_v', 8)
     args.n_relational = cfg['model'].get('n_relational', 96)
     args.n_value = cfg['model'].get('n_value', 16)
     args.top_k_relational = cfg['model'].get('top_k_relational', 4)
     args.top_k_value = cfg['model'].get('top_k_value', 6)
+
+    # v16.3 Complete Pool Separation parameters
+    args.n_fq = cfg['model'].get('n_fq', 32)
+    args.n_fk = cfg['model'].get('n_fk', 32)
+    args.n_fv = cfg['model'].get('n_fv', 24)
+    args.n_rq = cfg['model'].get('n_rq', 32)
+    args.n_rk = cfg['model'].get('n_rk', 32)
+    args.n_rv = cfg['model'].get('n_rv', 24)
+    args.top_k_fq = cfg['model'].get('top_k_fq', 8)
+    args.top_k_fk = cfg['model'].get('top_k_fk', 8)
+    args.top_k_fv = cfg['model'].get('top_k_fv', 8)
+    args.top_k_rq = cfg['model'].get('top_k_rq', 8)
+    args.top_k_rk = cfg['model'].get('top_k_rk', 8)
+    args.top_k_rv = cfg['model'].get('top_k_rv', 8)
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -1689,7 +1703,7 @@ def main():
         args.basis_rank = args.rank  # Sync basis_rank with rank for model creation
         args.n_knowledge = checkpoint_config.get('n_knowledge', getattr(args, 'n_knowledge', 64))
 
-        # v16 architecture params (must match checkpoint)
+        # v16.0/16.1/16.2 architecture params (must match checkpoint)
         args.n_feature_r = checkpoint_config.get('n_feature_r', getattr(args, 'n_feature_r', 96))
         args.n_feature_v = checkpoint_config.get('n_feature_v', getattr(args, 'n_feature_v', 24))
         args.n_relational = checkpoint_config.get('n_relational', getattr(args, 'n_relational', 96))
@@ -1698,6 +1712,20 @@ def main():
         args.top_k_feature_v = checkpoint_config.get('top_k_feature_v', getattr(args, 'top_k_feature_v', 3))
         args.top_k_relational = checkpoint_config.get('top_k_relational', getattr(args, 'top_k_relational', 4))
         args.top_k_value = checkpoint_config.get('top_k_value', getattr(args, 'top_k_value', 6))
+
+        # v16.3 architecture params (must match checkpoint)
+        args.n_fq = checkpoint_config.get('n_fq', getattr(args, 'n_fq', 32))
+        args.n_fk = checkpoint_config.get('n_fk', getattr(args, 'n_fk', 32))
+        args.n_fv = checkpoint_config.get('n_fv', getattr(args, 'n_fv', 24))
+        args.n_rq = checkpoint_config.get('n_rq', getattr(args, 'n_rq', 32))
+        args.n_rk = checkpoint_config.get('n_rk', getattr(args, 'n_rk', 32))
+        args.n_rv = checkpoint_config.get('n_rv', getattr(args, 'n_rv', 24))
+        args.top_k_fq = checkpoint_config.get('top_k_fq', getattr(args, 'top_k_fq', 8))
+        args.top_k_fk = checkpoint_config.get('top_k_fk', getattr(args, 'top_k_fk', 8))
+        args.top_k_fv = checkpoint_config.get('top_k_fv', getattr(args, 'top_k_fv', 8))
+        args.top_k_rq = checkpoint_config.get('top_k_rq', getattr(args, 'top_k_rq', 8))
+        args.top_k_rk = checkpoint_config.get('top_k_rk', getattr(args, 'top_k_rk', 8))
+        args.top_k_rv = checkpoint_config.get('top_k_rv', getattr(args, 'top_k_rv', 8))
 
         if checkpoint_training_config:
             # Training hyperparameters (only if not overridden by CLI)
@@ -1732,32 +1760,12 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version in ("16.0", "16.1"):
-            # v16.x: Split Feature R/V (rank matrix)
-            rank = args.basis_rank
-            knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
-            n_feature_r = getattr(args, 'n_feature_r', 512)
-            n_feature_v = getattr(args, 'n_feature_v', 256)
-            n_relational = getattr(args, 'n_relational', 160)
-            n_value = getattr(args, 'n_value', 12)
-            n_knowledge = getattr(args, 'n_knowledge', 256)
-            coarse_k = getattr(args, 'coarse_k', 20)
-            fine_k = getattr(args, 'fine_k', 10)
-            version_desc = "Split Feature R/V (rank matrix)"
-            if model_version == "16.1":
-                version_desc += " + Langevin Excitability"
-            print(f"DAWN v{model_version}: {version_desc}")
-            print(f"  Feature R/V: {n_feature_r}/{n_feature_v}")
-            print(f"  Relational/Value: {n_relational}/{n_value}")
-            print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
-            print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
-            if model_version == "16.1":
-                langevin_alpha = getattr(args, 'langevin_alpha', 0.0003)
-                langevin_beta = getattr(args, 'langevin_beta', 0.0006)
-                print(f"  Langevin: α={langevin_alpha}, β={langevin_beta}")
-            print(f"  (detailed info after model creation)")
-        else:
-            print(f"⚠️  Unsupported version: {model_version}. Supported: 16.0, 16.1")
+        # Use version_registry for version info (detailed info after model creation)
+        try:
+            normalized = normalize_version(model_version)
+            print(f"DAWN v{normalized} (detailed info after model creation)")
+        except ValueError:
+            print(f"⚠️  Unknown version: {model_version}")
     else:
         print(f"Standard FFN: d_ff={args.d_ff}")
 
@@ -1812,19 +1820,34 @@ def main():
         'max_seq_len': args.max_seq_len,
         'dropout': args.dropout,
         'rank': args.basis_rank,
+        # v16.0/16.1/16.2 params
         'n_feature_r': getattr(args, 'n_feature_r', 96),
         'n_feature_v': getattr(args, 'n_feature_v', 24),
         'n_relational': getattr(args, 'n_relational', 96),
         'n_value': getattr(args, 'n_value', 16),
+        'top_k_feature_r': getattr(args, 'top_k_feature_r', 12),
+        'top_k_feature_v': getattr(args, 'top_k_feature_v', 3),
+        'top_k_relational': getattr(args, 'top_k_relational', 12),
+        'top_k_value': getattr(args, 'top_k_value', 3),
+        # v16.3 params (complete pool separation)
+        'n_fq': getattr(args, 'n_fq', 32),
+        'n_fk': getattr(args, 'n_fk', 32),
+        'n_fv': getattr(args, 'n_fv', 24),
+        'n_rq': getattr(args, 'n_rq', 32),
+        'n_rk': getattr(args, 'n_rk', 32),
+        'n_rv': getattr(args, 'n_rv', 24),
+        'top_k_fq': getattr(args, 'top_k_fq', 8),
+        'top_k_fk': getattr(args, 'top_k_fk', 8),
+        'top_k_fv': getattr(args, 'top_k_fv', 8),
+        'top_k_rq': getattr(args, 'top_k_rq', 8),
+        'top_k_rk': getattr(args, 'top_k_rk', 8),
+        'top_k_rv': getattr(args, 'top_k_rv', 8),
+        # Common params
         'n_knowledge': args.n_knowledge,
         'coarse_k': args.coarse_k,
         'fine_k': args.fine_k,
         'knowledge_rank': args.knowledge_rank or 128,
         'state_dim': getattr(args, 'state_dim', 64),
-        'top_k_feature_r': getattr(args, 'top_k_feature_r', 12),
-        'top_k_feature_v': getattr(args, 'top_k_feature_v', 3),
-        'top_k_relational': getattr(args, 'top_k_relational', 12),
-        'top_k_value': getattr(args, 'top_k_value', 3),
         'd_space': getattr(args, 'd_space', 64),
         'router_dropout': getattr(args, 'router_dropout', 0.1),
         'gradient_checkpointing': args.gradient_checkpointing,
