@@ -894,8 +894,53 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # v16/v17: feature_r_pref (FR), feature_v_pref (FV), relational_q/k_pref, value_pref
-                    if attn.get('feature_r_pref') is not None:
+                    # v16.2: feature_r_q_pref/feature_r_k_pref (separate Q/K)
+                    # v16.0: feature_r_pref (shared Q/K)
+                    if attn.get('feature_r_q_pref') is not None:
+                        # v16.2: Full Q/K separation
+                        pref_FRQ = attn.get('feature_r_q_pref')
+                        pref_FRK = attn.get('feature_r_k_pref')
+                        pref_FV = attn.get('feature_v_pref')
+                        pref_RQ = attn.get('relational_q_pref')
+                        pref_RK = attn.get('relational_k_pref')
+                        pref_V = attn.get('value_pref')
+
+                        ent_FRQ = calc_entropy_ratio(pref_FRQ)
+                        ent_FRK = calc_entropy_ratio(pref_FRK)
+                        ent_FV = calc_entropy_ratio(pref_FV)
+                        ent_RQ = calc_entropy_ratio(pref_RQ)
+                        ent_RK = calc_entropy_ratio(pref_RK)
+                        ent_V = calc_entropy_ratio(pref_V)
+
+                        var_FRQ = calc_token_var(pref_FRQ)
+                        var_FRK = calc_token_var(pref_FRK)
+                        var_FV = calc_token_var(pref_FV)
+                        var_RQ = calc_token_var(pref_RQ)
+                        var_RK = calc_token_var(pref_RK)
+                        var_V = calc_token_var(pref_V)
+
+                        ent_str = f"Ent FRQ/FRK/FV/RQ/RK/V:{ent_FRQ:.0f}/{ent_FRK:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
+                        var_str = f"TokVar:{var_FRQ:.4f}/{var_FRK:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
+
+                        # Q/K overlap ratio (v16.2 only)
+                        def calc_overlap_ratio(weights_Q, weights_K):
+                            if weights_Q is None or weights_K is None:
+                                return 0.0
+                            overlap = ((weights_Q > 0) & (weights_K > 0)).float()
+                            active_Q = (weights_Q > 0).float().sum(-1)
+                            return (overlap.sum(-1) / (active_Q + 1e-8)).mean().item()
+
+                        w_FRQ = attn.get('feature_r_weights_Q')
+                        w_FRK = attn.get('feature_r_weights_K')
+                        w_RQ = attn.get('relational_weights_Q')
+                        w_RK = attn.get('relational_weights_K')
+
+                        overlap_FR = calc_overlap_ratio(w_FRQ, w_FRK)
+                        overlap_R = calc_overlap_ratio(w_RQ, w_RK)
+                        overlap_str = f"Q/K Overlap FR/R:{overlap_FR:.2f}/{overlap_R:.2f}"
+
+                    elif attn.get('feature_r_pref') is not None:
+                        # v16.0: Shared Q/K
                         pref_FR = attn.get('feature_r_pref')
                         pref_FV = attn.get('feature_v_pref')
                         pref_RQ = attn.get('relational_q_pref')
@@ -916,11 +961,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                         ent_str = f"Ent FR/FV/RQ/RK/V:{ent_FR:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
                         var_str = f"TokVar:{var_FR:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
+                        overlap_str = None
 
                     else:
                         # Unknown routing_info format
                         ent_str = "Ent: N/A"
                         var_str = "TokVar: N/A"
+                        overlap_str = None
 
                     # Attention ratio (attn_out_norm vs mem_out_norm per layer)
                     attn_ratios = []
@@ -939,7 +986,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     avg_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
 
                     # Compact output with loss/acc
-                    print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
+                    if overlap_str:
+                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
+                    else:
+                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
 
                     # Usage EMA logging
                     router = None
