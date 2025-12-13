@@ -554,7 +554,7 @@ def is_modern_dawn_model(model):
     base_model = get_underlying_model(model)
 
     # Check for v16+ structure
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["16.0", "16.1", "17.0"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["16.0", "16.1"]:
         return True
 
     # Structure check: v16+ has layers with .attn and .memory
@@ -563,13 +563,6 @@ def is_modern_dawn_model(model):
             return True
 
     return False
-
-
-def is_v17_model(model):
-    """Check if model is DAWN v17.x (hierarchical circuits)"""
-    base_model = get_underlying_model(model)
-    # v17 has router at base_model.router with usage_ema_r
-    return hasattr(base_model, 'router') and hasattr(base_model.router, 'usage_ema_r')
 
 
 def is_v16_model(model):
@@ -583,7 +576,7 @@ def is_v16_model(model):
 
 def needs_routing_info(model):
     """Check if model needs routing_info for excitability logging"""
-    return is_v17_model(model) or is_v16_model(model)
+    return is_v16_model(model)
 
 
 def _gini(x):
@@ -601,58 +594,8 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
-    # v17: Hierarchical Neuron Circuits (2-level routing, v16-style excitability)
-    if hasattr(router, 'n_circuits_r'):
-        n_r = router.n_circuits_r
-        n_v = router.n_circuits_v
-        n_rel = router.n_circuits_rel
-        n_val = router.n_circuits_val
-        n_k = router.n_knowledge
-
-        # Usage EMA stats (per circuit, v16-style)
-        ema_r = router.usage_ema_r
-        ema_v = router.usage_ema_v
-        ema_rel = router.usage_ema_rel
-        ema_val = router.usage_ema_val
-        ema_k = router.usage_ema_k
-
-        # Active circuits (usage > 0.01)
-        active_r = (ema_r > 0.01).sum().item()
-        active_v = (ema_v > 0.01).sum().item()
-        active_rel = (ema_rel > 0.01).sum().item()
-        active_val = (ema_val > 0.01).sum().item()
-        active_k = (ema_k > 0.01).sum().item()
-
-        # Gini coefficients
-        gini_r = _gini(ema_r)
-        gini_v = _gini(ema_v)
-        gini_rel = _gini(ema_rel)
-        gini_val = _gini(ema_val)
-        gini_k = _gini(ema_k)
-
-        # Excitability weights (v16-style naming)
-        w_r = router.excitability_weight_r
-        w_v = router.excitability_weight_v
-        w_rel = router.excitability_weight_rel
-        w_val = router.excitability_weight_val
-        w_k = router.excitability_weight_k
-
-        tau = router.tau if hasattr(router, 'tau') else 1.5
-
-        # Dead circuit ratios
-        dead_r = (ema_r < 0.01).float().mean().item()
-        dead_v = (ema_v < 0.01).float().mean().item()
-        dead_rel = (ema_rel < 0.01).float().mean().item()
-        dead_val = (ema_val < 0.01).float().mean().item()
-
-        lines.append(f"         v17 Circuit | τ={tau:.1f} | R:{int(active_r)}/{n_r} V:{int(active_v)}/{n_v} Rel:{int(active_rel)}/{n_rel} Val:{int(active_val)}/{n_val}")
-        lines.append(f"             Gini R/V/Rel/Val: {gini_r:.2f}/{gini_v:.2f}/{gini_rel:.2f}/{gini_val:.2f}")
-        lines.append(f"             Dead R/V/Rel/Val: {dead_r:.1%}/{dead_v:.1%}/{dead_rel:.1%}/{dead_val:.1%}")
-        lines.append(f"             Weight R:[{w_r.min().item():.2f},{w_r.mean().item():.2f},{w_r.max().item():.2f}] Rel:[{w_rel.min().item():.2f},{w_rel.mean().item():.2f},{w_rel.max().item():.2f}]")
-        lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f} | Dead:{(ema_k < 0.01).float().mean().item():.1%}")
-
     # v16: Split Feature R/V with Excitability
-    elif hasattr(router, 'usage_ema_feature_r'):
+    if hasattr(router, 'usage_ema_feature_r'):
         ema_QK = router.usage_ema_feature_r
         ema_V = router.usage_ema_feature_v
         ema_R = router.usage_ema_relational
@@ -1476,17 +1419,6 @@ def main():
     args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
     args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
 
-    # v17.0 Hierarchical Circuit parameters
-    args.neurons_per_circuit = cfg['model'].get('neurons_per_circuit', 64)
-    args.n_circuits_r = cfg['model'].get('n_circuits_r', 96)
-    args.n_circuits_v = cfg['model'].get('n_circuits_v', 24)
-    args.n_circuits_rel = cfg['model'].get('n_circuits_rel', 96)
-    args.n_circuits_val = cfg['model'].get('n_circuits_val', 16)
-    args.top_k_circuits_r = cfg['model'].get('top_k_circuits_r', 12)
-    args.top_k_circuits_v = cfg['model'].get('top_k_circuits_v', 6)
-    args.top_k_circuits_rel = cfg['model'].get('top_k_circuits_rel', 12)
-    args.top_k_circuits_val = cfg['model'].get('top_k_circuits_val', 4)
-
     # v16.0 Split Feature R/V parameters (uses single rank from basis_rank)
     args.n_feature_r = cfg['model'].get('n_feature_r', 512)
     args.n_feature_v = cfg['model'].get('n_feature_v', 256)
@@ -1684,17 +1616,6 @@ def main():
         args.top_k_relational = checkpoint_config.get('top_k_relational', getattr(args, 'top_k_relational', 4))
         args.top_k_value = checkpoint_config.get('top_k_value', getattr(args, 'top_k_value', 6))
 
-        # v17 architecture params (must match checkpoint)
-        args.neurons_per_circuit = checkpoint_config.get('neurons_per_circuit', getattr(args, 'neurons_per_circuit', 64))
-        args.n_circuits_r = checkpoint_config.get('n_circuits_r', getattr(args, 'n_circuits_r', 96))
-        args.n_circuits_v = checkpoint_config.get('n_circuits_v', getattr(args, 'n_circuits_v', 24))
-        args.n_circuits_rel = checkpoint_config.get('n_circuits_rel', getattr(args, 'n_circuits_rel', 96))
-        args.n_circuits_val = checkpoint_config.get('n_circuits_val', getattr(args, 'n_circuits_val', 16))
-        args.top_k_circuits_r = checkpoint_config.get('top_k_circuits_r', getattr(args, 'top_k_circuits_r', 12))
-        args.top_k_circuits_v = checkpoint_config.get('top_k_circuits_v', getattr(args, 'top_k_circuits_v', 6))
-        args.top_k_circuits_rel = checkpoint_config.get('top_k_circuits_rel', getattr(args, 'top_k_circuits_rel', 12))
-        args.top_k_circuits_val = checkpoint_config.get('top_k_circuits_val', getattr(args, 'top_k_circuits_val', 4))
-
         if checkpoint_training_config:
             # Training hyperparameters (only if not overridden by CLI)
             if cli_args.batch_size is None:
@@ -1728,29 +1649,7 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "17.0":
-            # v17.0: Hierarchical Neuron Circuits (2-level routing)
-            neurons_per_circuit = getattr(args, 'neurons_per_circuit', 64)
-            n_circuits_r = getattr(args, 'n_circuits_r', 96)
-            n_circuits_v = getattr(args, 'n_circuits_v', 24)
-            n_circuits_rel = getattr(args, 'n_circuits_rel', 96)
-            n_circuits_val = getattr(args, 'n_circuits_val', 16)
-            top_k_r = getattr(args, 'top_k_circuits_r', 12)
-            top_k_v = getattr(args, 'top_k_circuits_v', 6)
-            top_k_rel = getattr(args, 'top_k_circuits_rel', 12)
-            top_k_val = getattr(args, 'top_k_circuits_val', 4)
-            n_knowledge = getattr(args, 'n_knowledge', 300)
-            coarse_k = getattr(args, 'coarse_k', 16)
-            fine_k = getattr(args, 'fine_k', 8)
-            print(f"DAWN v{model_version}: Hierarchical Neuron Circuits")
-            print(f"  2-Level Routing: Circuit top-k → Neuron softmax")
-            print(f"  neurons_per_circuit={neurons_per_circuit}")
-            print(f"  Circuit_R: {n_circuits_r} × {neurons_per_circuit} (top-k={top_k_r})")
-            print(f"  Circuit_V: {n_circuits_v} × {neurons_per_circuit} (top-k={top_k_v})")
-            print(f"  Circuit_Rel: {n_circuits_rel} × {neurons_per_circuit} (top-k={top_k_rel})")
-            print(f"  Circuit_Val: {n_circuits_val} × {neurons_per_circuit} (top-k={top_k_val})")
-            print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
-        elif model_version in ("16.0", "16.1"):
+        if model_version in ("16.0", "16.1"):
             # v16.x: Split Feature R/V (rank matrix)
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
@@ -1775,7 +1674,7 @@ def main():
                 print(f"  Langevin: α={langevin_alpha}, β={langevin_beta}")
             print(f"  (detailed info after model creation)")
         else:
-            print(f"⚠️  Unsupported version: {model_version}. Supported: 16.0, 16.1, 17.0")
+            print(f"⚠️  Unsupported version: {model_version}. Supported: 16.0, 16.1")
     else:
         print(f"Standard FFN: d_ff={args.d_ff}")
 
@@ -1833,30 +1732,7 @@ def main():
     }
 
     # Add version-specific parameters
-    if model_version == '17.0':
-        # v17.0: Hierarchical Neuron Circuits (2-level routing)
-        model_kwargs.update({
-            'neurons_per_circuit': getattr(args, 'neurons_per_circuit', 64),
-            'n_circuits_r': getattr(args, 'n_circuits_r', 96),
-            'n_circuits_v': getattr(args, 'n_circuits_v', 24),
-            'n_circuits_rel': getattr(args, 'n_circuits_rel', 96),
-            'n_circuits_val': getattr(args, 'n_circuits_val', 16),
-            'top_k_circuits_r': getattr(args, 'top_k_circuits_r', 12),
-            'top_k_circuits_v': getattr(args, 'top_k_circuits_v', 6),
-            'top_k_circuits_rel': getattr(args, 'top_k_circuits_rel', 12),
-            'top_k_circuits_val': getattr(args, 'top_k_circuits_val', 4),
-            'n_knowledge': args.n_knowledge,
-            'coarse_k': args.coarse_k,
-            'fine_k': args.fine_k,
-            'knowledge_rank': args.knowledge_rank or 128,
-            'state_dim': getattr(args, 'state_dim', 64),
-            'd_space': getattr(args, 'd_space', 64),
-            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
-            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
-            'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
-            'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
-        })
-    elif model_version == '16.0':
+    if model_version == '16.0':
         # v16.0: Split Feature R/V (rank matrix)
         model_kwargs.update({
             'n_feature_r': getattr(args, 'n_feature_r', 512),

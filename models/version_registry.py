@@ -3,7 +3,6 @@ DAWN Model Version Registry
 
 v16.0: Split Feature R/V (rank matrix) - Feature_R/V separate compression
 v16.1: Split Feature R/V + Langevin Excitability (adaptive dead neuron recovery)
-v17.0: Hierarchical Neuron Circuits - 2-level routing (circuit top-k + neuron softmax)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -92,49 +91,6 @@ VERSION_REGISTRY = {
             f"  Unified Router: d_space={args.get('d_space', 64)}",
             f"  Langevin: α={args.get('langevin_alpha', 0.0003)}, β={args.get('langevin_beta', 0.0006)}",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
-        ],
-    },
-    "17.0": {
-        "description": "Hierarchical Neuron Circuits (2-level routing)",
-        "aliases": ["17", "170"],
-        "module": "model_v17",
-        "required_params": [
-            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "neurons_per_circuit",
-            "n_circuits_r", "n_circuits_v", "n_circuits_rel", "n_circuits_val",
-            "n_knowledge",
-        ],
-        "optional_params": {
-            "dropout": 0.1,
-            "state_dim": 64,
-            "d_space": 64,
-            "top_k_circuits_r": 12,
-            "top_k_circuits_v": 6,
-            "top_k_circuits_rel": 12,
-            "top_k_circuits_val": 4,
-            "coarse_k": 16,
-            "fine_k": 8,
-            "knowledge_rank": 128,
-            "excitability_tau": 1.5,
-            "excitability_ema_alpha": 0.01,
-            "langevin_alpha": 0.0003,
-            "langevin_beta": 0.0006,
-        },
-        "display_info": lambda args: [
-            f"DAWN v17: Hierarchical Neuron Circuits",
-            f"  2-Level Routing:",
-            f"    Level 1: Circuit selection (top-k)",
-            f"    Level 2: Neuron weighting within circuit (softmax)",
-            f"  neurons_per_circuit={args.get('neurons_per_circuit')}",
-            f"  Circuit_R: {args.get('n_circuits_r')} circuits × {args.get('neurons_per_circuit')} neurons (top-k={args.get('top_k_circuits_r', 12)})",
-            f"  Circuit_V: {args.get('n_circuits_v')} circuits × {args.get('neurons_per_circuit')} neurons (top-k={args.get('top_k_circuits_v', 6)})",
-            f"  Circuit_Rel: {args.get('n_circuits_rel')} circuits × {args.get('neurons_per_circuit')} neurons (top-k={args.get('top_k_circuits_rel', 12)})",
-            f"  Circuit_Val: {args.get('n_circuits_val')} circuits × {args.get('neurons_per_circuit')} neurons (top-k={args.get('top_k_circuits_val', 4)})",
-            f"  Router: d_space={args.get('d_space', 64)} + Per-circuit Excitability",
-            f"  Langevin: α={args.get('langevin_alpha', 0.0003)}, β={args.get('langevin_beta', 0.0006)}",
-            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
-            f"  KnowledgeNeurons: {args.get('n_knowledge')} × rank={args.get('knowledge_rank', 128)}",
-            f"    coarse_k={args.get('coarse_k', 16)} → fine_k={args.get('fine_k', 8)}",
         ],
     },
 }
