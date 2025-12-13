@@ -313,7 +313,7 @@ class GlobalSSM(nn.Module):
         self.temperature = 0.5
 
     def forward(self, x, attention_mask=None):
-        B, S, D = x.shape
+        batch, S, D = x.shape
 
         delta = F.softplus(self.W_delta(x))
         B_sel = self.W_B(x)
@@ -321,12 +321,13 @@ class GlobalSSM(nn.Module):
         A = -torch.exp(self.A_log)
 
         if MAMBA_AVAILABLE:
-            # Cast to input dtype for AMP compatibility
+            # Cast ALL tensors to same dtype for AMP compatibility with mamba kernel
+            dtype = x.dtype
             x_t = x.transpose(1, 2).contiguous()
-            delta_t = delta.transpose(1, 2).contiguous()
-            A_t = A.to(x.dtype)  # A must match input dtype for mamba kernel
-            B_t = B_sel.transpose(1, 2).contiguous()
-            C_t = C_sel.transpose(1, 2).contiguous()
+            delta_t = delta.to(dtype).transpose(1, 2).contiguous()
+            A_t = A.to(dtype)
+            B_t = B_sel.to(dtype).transpose(1, 2).contiguous()
+            C_t = C_sel.to(dtype).transpose(1, 2).contiguous()
 
             y = selective_scan_fn(x_t, delta_t, A_t, B_t, C_t,
                                   D=None, z=None, delta_bias=None,
@@ -349,8 +350,8 @@ class GlobalSSM(nn.Module):
         return importance, raw
 
     def _slow_ssm(self, x, delta, A, B_sel, C_sel):
-        B, S, D = x.shape
-        h = torch.zeros(B, D, self.state_dim, device=x.device, dtype=x.dtype)
+        batch, S, D = x.shape
+        h = torch.zeros(batch, D, self.state_dim, device=x.device, dtype=x.dtype)
         outputs = []
 
         for t in range(S):
