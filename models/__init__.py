@@ -14,10 +14,6 @@ v17.0: Hierarchical Neuron Circuits
 - 2-level routing: Circuit selection (top-k) + Neuron weighting (softmax)
 - Circuit = team of cooperating neurons [neurons_per_circuit × d_model]
 
-v17.1: Hierarchical Circuits + v16-style Langevin Excitability
-- Same as v17.0 + v16-style naming (usage_ema_*, excitability_weight_*)
-- Per-circuit Langevin dynamics: dw = -α*w + β*dead_ratio
-
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -30,11 +26,8 @@ from .model_v16_1 import DAWN as DAWN_v16_1
 # v17.0 - Hierarchical Neuron Circuits (2-level routing)
 from .model_v17 import DAWN as DAWN_v17
 
-# v17.1 - Hierarchical Circuits + v16-style Langevin Excitability
-from .model_v17_1 import DAWN as DAWN_v17_1
-
-# Default DAWN is v17.1 (latest)
-DAWN = DAWN_v17_1
+# Default DAWN is v17.0 (latest)
+DAWN = DAWN_v17
 
 # Baseline for comparison
 import sys
@@ -61,7 +54,6 @@ __all__ = [
     'DAWN_v16',
     'DAWN_v16_1',
     'DAWN_v17',
-    'DAWN_v17_1',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -76,7 +68,7 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "17.1"
+__version__ = "17.0"
 
 
 def create_model_by_version(version, config):
@@ -100,8 +92,6 @@ def create_model_by_version(version, config):
         return DAWN_v16_1(**config)
     elif version == "17.0":
         return DAWN_v17(**config)
-    elif version == "17.1":
-        return DAWN_v17_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 16.0, 16.1, 17.0, 17.1, baseline")
+                        f"Supported versions: 16.0, 16.1, 17.0, baseline")

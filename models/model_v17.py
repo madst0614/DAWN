@@ -231,12 +231,14 @@ class CircuitRouter(nn.Module):
 
         return logits
 
-    def get_inner_weights(self, x_agg, selected_idx, neuron_emb, circuit_type):
+    def get_inner_weights(self, x, importance, selected_idx, neuron_emb, circuit_type):
         """
-        Level 2: Get neuron weights using neuron embeddings
+        Level 2: Get neuron weights using neuron embeddings (v16 style)
+        Token별 preference 먼저 계산 후 importance로 aggregate
 
         Args:
-            x_agg: [B, D] - importance-weighted aggregated input
+            x: [B, S, D] - full sequence
+            importance: [B, S] - token importance weights
             selected_idx: [B, k] - selected circuit indices
             neuron_emb: [n_circuits, neurons, d_space] - neuron embeddings
             circuit_type: for selecting projection
@@ -244,33 +246,40 @@ class CircuitRouter(nn.Module):
         Returns:
             [B, k, neurons] - soft weights for neurons in each selected circuit
         """
-        B, k = selected_idx.shape
+        B, S, D = x.shape
+        k = selected_idx.shape[1]
 
-        # Project x to neuron selection space
+        # 1. Token별 projection
         if circuit_type == 'relational_Q':
-            h = self.neuron_proj_rel_Q(x_agg)  # [B, d_space]
+            h = self.neuron_proj_rel_Q(x)  # [B, S, d_space]
         elif circuit_type == 'relational_K':
-            h = self.neuron_proj_rel_K(x_agg)
+            h = self.neuron_proj_rel_K(x)
         else:
-            h = self.neuron_proj(x_agg)
+            h = self.neuron_proj(x)  # [B, S, d_space]
 
-        # Gather selected circuits' neuron embeddings
+        # 2. 선택된 circuit의 neuron embedding 가져오기
         # neuron_emb: [n_circuits, neurons, d_space]
-        # selected_idx: [B, k] → [B, k, neurons, d_space]
-        idx_expanded = selected_idx.view(B, k, 1, 1).expand(
-            B, k, self.neurons_per_circuit, self.d_space
+        # selected_idx: [B, k]
+        idx_expanded = selected_idx.view(B, 1, k, 1, 1).expand(
+            B, S, k, self.neurons_per_circuit, self.d_space
         )
-        selected_neuron_emb = neuron_emb.unsqueeze(0).expand(B, -1, -1, -1).gather(1, idx_expanded)
-        # selected_neuron_emb: [B, k, neurons, d_space]
+        neuron_emb_expanded = neuron_emb.view(1, 1, -1, self.neurons_per_circuit, self.d_space)
+        neuron_emb_expanded = neuron_emb_expanded.expand(B, S, -1, -1, -1)
 
-        # Normalize embeddings
+        selected_neuron_emb = neuron_emb_expanded.gather(2, idx_expanded)
+        # [B, S, k, neurons, d_space]
+
         selected_neuron_emb = F.normalize(selected_neuron_emb, dim=-1)
 
-        # Compute similarity: h [B, d_space] vs neuron_emb [B, k, neurons, d_space]
-        logits = torch.einsum('bd,bknd->bkn', h, selected_neuron_emb)  # [B, k, neurons]
+        # 3. Token별 preference 계산
+        token_pref = torch.einsum('bsd,bsknd->bskn', h, selected_neuron_emb)  # [B, S, k, neurons]
+        token_pref = F.softmax(token_pref, dim=-1)
 
-        # Softmax within each circuit
-        weights = F.softmax(logits, dim=-1)  # [B, k, neurons]
+        # 4. Importance로 aggregate (v16 스타일)
+        weights = torch.einsum('bs,bskn->bkn', importance, token_pref)  # [B, k, neurons]
+
+        # 5. Renormalize
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
 
         return weights
 
@@ -697,20 +706,18 @@ class DAWN(nn.Module):
         circuit_rel_K_idx, circuit_rel_K_w = topk_select(self.router.get_circuit_logits(x, 'relational_K'), self.top_k_rel)
         circuit_val_idx, circuit_val_w = topk_select(self.router.get_circuit_logits(x, 'value'), self.top_k_val)
 
-        # Aggregate x for neuron selection
-        x_agg = torch.einsum('bs,bsd->bd', importance, x)  # [B, D]
-
         # Level 2: Inner neuron weights using neuron embeddings [B, k, neurons]
+        # v16 style: token별 preference 후 importance aggregate
         inner_r = self.router.get_inner_weights(
-            x_agg, circuit_r_idx, self.circuits.feature_r_neuron_emb, 'feature_r')
+            x, importance, circuit_r_idx, self.circuits.feature_r_neuron_emb, 'feature_r')
         inner_v = self.router.get_inner_weights(
-            x_agg, circuit_v_idx, self.circuits.feature_v_neuron_emb, 'feature_v')
+            x, importance, circuit_v_idx, self.circuits.feature_v_neuron_emb, 'feature_v')
         inner_rel_Q = self.router.get_inner_weights(
-            x_agg, circuit_rel_Q_idx, self.circuits.relational_neuron_emb, 'relational_Q')
+            x, importance, circuit_rel_Q_idx, self.circuits.relational_neuron_emb, 'relational_Q')
         inner_rel_K = self.router.get_inner_weights(
-            x_agg, circuit_rel_K_idx, self.circuits.relational_neuron_emb, 'relational_K')
+            x, importance, circuit_rel_K_idx, self.circuits.relational_neuron_emb, 'relational_K')
         inner_val = self.router.get_inner_weights(
-            x_agg, circuit_val_idx, self.circuits.value_neuron_emb, 'value')
+            x, importance, circuit_val_idx, self.circuits.value_neuron_emb, 'value')
 
         # Update usage (create full sparse tensor for tracking)
         if self.training:

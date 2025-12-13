@@ -554,7 +554,7 @@ def is_modern_dawn_model(model):
     base_model = get_underlying_model(model)
 
     # Check for v16+ structure
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["16.0", "16.1", "17.0", "17.1"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["16.0", "16.1", "17.0"]:
         return True
 
     # Structure check: v16+ has layers with .attn and .memory
