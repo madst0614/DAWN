@@ -53,9 +53,10 @@ model:
   token_routing: false
   use_ssm_context: true
 
-  # Excitability (no Langevin in v16.0)
+  # Excitability (decay-based in v16.0, no Langevin)
   excitability_tau: 1.5
   excitability_ema_alpha: 0.01
+  excitability_decay_rate: 0.99995
 
 training:
   batch_size: 96

@@ -41,7 +41,8 @@ class UnifiedNeuronRouter(nn.Module):
     Feature가 R(QK용)과 V용으로 분리됨.
     """
     def __init__(self, d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
-                 d_space=64, dropout=0.1, excitability_tau=1.5, excitability_ema_alpha=0.01):
+                 d_space=64, dropout=0.1, excitability_tau=1.5, excitability_ema_alpha=0.01,
+                 excitability_decay_rate=0.99995):
         super().__init__()
         self.n_feature_r = n_feature_r
         self.n_feature_v = n_feature_v
@@ -77,11 +78,12 @@ class UnifiedNeuronRouter(nn.Module):
 
         # Excitability: tau (recovery time constant) + decaying weight
         self.tau = excitability_tau
+        self.decay_rate = excitability_decay_rate
         self.register_buffer('excitability_weight', torch.tensor(1.0))  # buffer로 등록해야 checkpoint에 저장됨
 
-    def decay_excitability(self, decay_rate=0.9997):
+    def decay_excitability(self):
         """Decay excitability_weight each step."""
-        self.excitability_weight.mul_(decay_rate)
+        self.excitability_weight.mul_(self.decay_rate)
 
     def get_excitability(self, usage_ema):
         """Neuronal excitability based on usage."""
@@ -331,7 +333,8 @@ class GlobalRouters(nn.Module):
                  top_k_feature_r: int = 8, top_k_feature_v: int = 8,
                  top_k_relational: int = 4, top_k_value: int = 6,
                  d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False,
-                 excitability_tau: float = 1.5, excitability_ema_alpha: float = 0.01):
+                 excitability_tau: float = 1.5, excitability_ema_alpha: float = 0.01,
+                 excitability_decay_rate: float = 0.99995):
         super().__init__()
         self.d_model = d_model
         self.n_feature_r = n_feature_r
@@ -348,7 +351,8 @@ class GlobalRouters(nn.Module):
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
             d_space=d_space, dropout=router_dropout,
-            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha
+            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
+            excitability_decay_rate=excitability_decay_rate
         )
 
     def _topk_sparsify(self, weights, k):
@@ -740,6 +744,7 @@ class DAWN(nn.Module):
         # Excitability
         excitability_tau: float = 1.5,
         excitability_ema_alpha: float = 0.01,
+        excitability_decay_rate: float = 0.99995,
         **kwargs
     ):
         super().__init__()
@@ -798,7 +803,8 @@ class DAWN(nn.Module):
             d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
             top_k_feature_r, top_k_feature_v, top_k_relational, top_k_value,
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing,
-            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha
+            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
+            excitability_decay_rate=excitability_decay_rate
         )
 
         self.knowledge_encoder = nn.Linear(d_model, self.knowledge_rank, bias=False)

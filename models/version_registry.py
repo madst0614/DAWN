@@ -37,6 +37,9 @@ VERSION_REGISTRY = {
             "fine_k": 10,
             "knowledge_rank": 128,
             "gradient_checkpointing": False,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
         },
         "display_info": lambda args: [
             f"DAWN v16: Split Feature R/V (rank matrix)",

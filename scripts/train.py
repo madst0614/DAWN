@@ -1416,6 +1416,7 @@ def main():
     args.router_dropout = cfg['model'].get('router_dropout', 0.1)
     args.excitability_tau = cfg['model'].get('excitability_tau', 1.5)
     args.excitability_ema_alpha = cfg['model'].get('excitability_ema_alpha', 0.01)
+    args.excitability_decay_rate = cfg['model'].get('excitability_decay_rate', 0.99995)
     args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
     args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
 
@@ -1754,6 +1755,7 @@ def main():
             'gradient_checkpointing': args.gradient_checkpointing,
             'excitability_tau': getattr(args, 'excitability_tau', 1.5),
             'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
+            'excitability_decay_rate': getattr(args, 'excitability_decay_rate', 0.99995),
         })
     elif model_version == '16.1':
         # v16.1: Split Feature R/V + Langevin Excitability
