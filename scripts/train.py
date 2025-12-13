@@ -1667,6 +1667,27 @@ def main():
         args.basis_rank = args.rank  # Sync basis_rank with rank for model creation
         args.n_knowledge = checkpoint_config.get('n_knowledge', getattr(args, 'n_knowledge', 64))
 
+        # v16 architecture params (must match checkpoint)
+        args.n_feature_r = checkpoint_config.get('n_feature_r', getattr(args, 'n_feature_r', 96))
+        args.n_feature_v = checkpoint_config.get('n_feature_v', getattr(args, 'n_feature_v', 24))
+        args.n_relational = checkpoint_config.get('n_relational', getattr(args, 'n_relational', 96))
+        args.n_value = checkpoint_config.get('n_value', getattr(args, 'n_value', 16))
+        args.top_k_feature_r = checkpoint_config.get('top_k_feature_r', getattr(args, 'top_k_feature_r', 12))
+        args.top_k_feature_v = checkpoint_config.get('top_k_feature_v', getattr(args, 'top_k_feature_v', 3))
+        args.top_k_relational = checkpoint_config.get('top_k_relational', getattr(args, 'top_k_relational', 4))
+        args.top_k_value = checkpoint_config.get('top_k_value', getattr(args, 'top_k_value', 6))
+
+        # v17 architecture params (must match checkpoint)
+        args.neurons_per_circuit = checkpoint_config.get('neurons_per_circuit', getattr(args, 'neurons_per_circuit', 64))
+        args.n_circuits_r = checkpoint_config.get('n_circuits_r', getattr(args, 'n_circuits_r', 96))
+        args.n_circuits_v = checkpoint_config.get('n_circuits_v', getattr(args, 'n_circuits_v', 24))
+        args.n_circuits_rel = checkpoint_config.get('n_circuits_rel', getattr(args, 'n_circuits_rel', 96))
+        args.n_circuits_val = checkpoint_config.get('n_circuits_val', getattr(args, 'n_circuits_val', 16))
+        args.top_k_circuits_r = checkpoint_config.get('top_k_circuits_r', getattr(args, 'top_k_circuits_r', 12))
+        args.top_k_circuits_v = checkpoint_config.get('top_k_circuits_v', getattr(args, 'top_k_circuits_v', 6))
+        args.top_k_circuits_rel = checkpoint_config.get('top_k_circuits_rel', getattr(args, 'top_k_circuits_rel', 12))
+        args.top_k_circuits_val = checkpoint_config.get('top_k_circuits_val', getattr(args, 'top_k_circuits_val', 4))
+
         if checkpoint_training_config:
             # Training hyperparameters (only if not overridden by CLI)
             if cli_args.batch_size is None:
