@@ -78,29 +78,45 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('usage_ema_value', torch.zeros(n_value))
         self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
 
-        # Excitability: tau (recovery time constant) + decaying weight
+        # Excitability: tau (recovery time constant) + per-neuron decaying weights
         self.tau = excitability_tau
-        self.excitability_weight = 1.0
+        # Per-neuron excitability weights (separate for each pool)
+        self.register_buffer('excitability_weight_fr', torch.ones(n_feature_r) * 0.3)
+        self.register_buffer('excitability_weight_fv', torch.ones(n_feature_v) * 0.3)
+        self.register_buffer('excitability_weight_r', torch.ones(n_relational) * 0.3)
+        self.register_buffer('excitability_weight_v', torch.ones(n_value) * 0.3)
+        self.register_buffer('excitability_weight_k', torch.ones(n_knowledge) * 0.3)
 
     def update_excitability_weight(self):
-        """Langevin dynamics: dw = -α*w + β*dead_ratio"""
+        """Per-neuron Langevin dynamics: dw_i = -α*w_i + β*dead_ratio_i"""
         threshold = 0.01
+        alpha = self.langevin_alpha
+        beta = self.langevin_beta
 
-        active_fr = (self.usage_ema_feature_r > threshold).sum().item()
-        active_fv = (self.usage_ema_feature_v > threshold).sum().item()
-        active_r = (self.usage_ema_relational > threshold).sum().item()
-        active_v = (self.usage_ema_value > threshold).sum().item()
+        # FR neurons
+        dead_ratio_fr = (self.usage_ema_feature_r < threshold).float()
+        dw_fr = -alpha * self.excitability_weight_fr + beta * dead_ratio_fr
+        self.excitability_weight_fr.add_(dw_fr).clamp_(0.1, 0.5)
 
-        total_neurons = self.n_feature_r + self.n_feature_v + self.n_relational + self.n_value
-        total_active = active_fr + active_fv + active_r + active_v
-        dead_ratio = 1.0 - total_active / total_neurons
+        # FV neurons
+        dead_ratio_fv = (self.usage_ema_feature_v < threshold).float()
+        dw_fv = -alpha * self.excitability_weight_fv + beta * dead_ratio_fv
+        self.excitability_weight_fv.add_(dw_fv).clamp_(0.1, 0.5)
 
-        # Langevin dynamics
-        dw = -self.langevin_alpha * self.excitability_weight + self.langevin_beta * dead_ratio
-        self.excitability_weight = self.excitability_weight + dw
+        # R neurons
+        dead_ratio_r = (self.usage_ema_relational < threshold).float()
+        dw_r = -alpha * self.excitability_weight_r + beta * dead_ratio_r
+        self.excitability_weight_r.add_(dw_r).clamp_(0.1, 0.5)
 
-        # Clamp to [0, 1]
-        self.excitability_weight = max(0.0, min(1.0, self.excitability_weight))
+        # V neurons
+        dead_ratio_v = (self.usage_ema_value < threshold).float()
+        dw_v = -alpha * self.excitability_weight_v + beta * dead_ratio_v
+        self.excitability_weight_v.add_(dw_v).clamp_(0.1, 0.5)
+
+        # K (Knowledge) neurons
+        dead_ratio_k = (self.usage_ema_knowledge < threshold).float()
+        dw_k = -alpha * self.excitability_weight_k + beta * dead_ratio_k
+        self.excitability_weight_k.add_(dw_k).clamp_(0.1, 0.5)
 
     def get_excitability(self, usage_ema):
         """Neuronal excitability based on usage."""
@@ -121,31 +137,31 @@ class UnifiedNeuronRouter(nn.Module):
             logits = all_logits[..., :self.feature_r_end]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_feature_r)
-                logits = logits + excitability * self.excitability_weight
+                logits = logits + excitability * self.excitability_weight_fr  # [n_fr] broadcast
 
         elif neuron_type == 'feature_v':
             logits = all_logits[..., self.feature_r_end:self.feature_v_end]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_feature_v)
-                logits = logits + excitability * self.excitability_weight
+                logits = logits + excitability * self.excitability_weight_fv  # [n_fv] broadcast
 
         elif neuron_type in ['relational_Q', 'relational_K']:
             logits = all_logits[..., self.feature_v_end:self.relational_end]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_relational)
-                logits = logits + excitability * self.excitability_weight
+                logits = logits + excitability * self.excitability_weight_r  # [n_r] broadcast
 
         elif neuron_type == 'value':
             logits = all_logits[..., self.relational_end:self.value_end]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_value)
-                logits = logits + excitability * self.excitability_weight
+                logits = logits + excitability * self.excitability_weight_v  # [n_v] broadcast
 
         elif neuron_type == 'knowledge':
             logits = all_logits[..., self.value_end:]
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_knowledge)
-                logits = logits + excitability * self.excitability_weight
+                logits = logits + excitability * self.excitability_weight_k  # [n_k] broadcast
 
         return logits
 

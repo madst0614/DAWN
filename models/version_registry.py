@@ -3,7 +3,6 @@ DAWN Model Version Registry
 
 v16.0: Split Feature R/V (rank matrix) - Feature_R/V separate compression
 v16.1: Split Feature R/V + Langevin Excitability (adaptive dead neuron recovery)
-v17.0: Full Vector Neurons + Full Soft Selection (vector-based, train & inference both use soft)
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -38,6 +37,9 @@ VERSION_REGISTRY = {
             "fine_k": 10,
             "knowledge_rank": 128,
             "gradient_checkpointing": False,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
         },
         "display_info": lambda args: [
             f"DAWN v16: Split Feature R/V (rank matrix)",
@@ -92,47 +94,6 @@ VERSION_REGISTRY = {
             f"  Unified Router: d_space={args.get('d_space', 64)}",
             f"  Langevin: α={args.get('langevin_alpha', 0.0003)}, β={args.get('langevin_beta', 0.0006)}",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
-        ],
-    },
-    "17.0": {
-        "description": "Full Vector Neurons + Full Soft Selection",
-        "aliases": ["17", "170"],
-        "module": "model_v17",
-        "required_params": [
-            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_feature", "n_relational", "n_value", "n_knowledge",
-            # Note: NO rank - all neurons are vectors [n, d_model]
-        ],
-        "optional_params": {
-            "dropout": 0.1,
-            "state_dim": 64,
-            "top_k_feature": 64,      # kept for compatibility, not used
-            "top_k_relational": 64,   # kept for compatibility, not used
-            "top_k_value": 32,        # kept for compatibility, not used
-            "d_space": 64,
-            "coarse_k": 20,
-            "fine_k": 10,
-            "knowledge_rank": 128,
-            "temperature": 1.0,       # soft selection sharpness
-            "router_dropout": 0.1,
-            "gradient_checkpointing": False,
-            "use_ssm_context": True,
-        },
-        "display_info": lambda args: [
-            f"DAWN v17: Full Vector Neurons + Full Soft Selection",
-            f"  temperature={args.get('temperature', 1.0)}",
-            f"  Selection: FULL SOFT (train & inference, all neurons via softmax)",
-            f"  Feature: {args.get('n_feature')} × {args.get('d_model')} (SHARED QK/V)",
-            f"  Relational: {args.get('n_relational')} × {args.get('d_model')} (SHARED Q/K)",
-            f"  Value: {args.get('n_value')} × {args.get('d_model')}",
-            f"  Unified Router: d_space={args.get('d_space', 64)} + Excitability (SAR)",
-            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
-            f"  Architecture: Mamba SSM → Context → Full Soft Router → Vector Neurons → FlashAttn",
-            f"  Memory: 2-stage (x→router→coarse, x→encoder→fine)",
-            f"  KnowledgeNeurons (K):",
-            f"    - K: {args.get('n_knowledge')} × {args.get('knowledge_rank', 128)}",
-            f"    - V: {args.get('n_knowledge')} × {args.get('d_model')}",
-            f"    - coarse_k: {args.get('coarse_k', 20)} → fine_k: {args.get('fine_k', 10)}",
         ],
     },
 }

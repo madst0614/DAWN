@@ -1,5 +1,6 @@
-# DAWN v16 Training Config - 22M Scale, 5B tokens
-# Split Feature QK/V Architecture
+# DAWN v16.0 Training Config - 22M Scale, 5B tokens
+# Split Feature R/V (rank matrix)
+
 data:
   base_dir: /content/drive/MyDrive/data
   train_files:
@@ -26,17 +27,17 @@ model:
   rank: 64
   state_dim: 64
 
-  # v16: Split Feature into R/V
-  n_feature_r: 72
-  n_feature_v: 48
-  top_k_feature_r: 8
-  top_k_feature_v: 6
+  # v16.0: Optimized neuron counts
+  n_feature_r: 96
+  n_feature_v: 24
+  top_k_feature_r: 12
+  top_k_feature_v: 3
 
-  # Expansion neurons
-  n_relational: 196
-  n_value: 24
-  top_k_relational: 20
-  top_k_value: 4
+  # Symmetric design
+  n_relational: 96
+  n_value: 16
+  top_k_relational: 12
+  top_k_value: 3
 
   # Knowledge
   n_knowledge: 300
@@ -52,6 +53,11 @@ model:
   token_routing: false
   use_ssm_context: true
 
+  # Excitability (decay-based in v16.0, no Langevin)
+  excitability_tau: 1.5
+  excitability_ema_alpha: 0.01
+  excitability_decay_rate: 0.99995
+
 training:
   batch_size: 96
   num_epochs: 1
@@ -65,5 +71,10 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_22M_c4_5B
-log_dir: /content/drive/MyDrive/dawn/logs_v16_22M_c4_5B
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_20M_c4_5B
+log_dir: /content/drive/MyDrive/dawn/logs_v16_20M_c4_5B
+
+# v16.0 Architecture (no Langevin)
+#   - FR=96 (k=12), FV=24 (k=3)  -> 120 feature neurons
+#   - R=96 (k=12), V=16 (k=3)    -> 112 expansion neurons
+#   - Total: 232 neurons

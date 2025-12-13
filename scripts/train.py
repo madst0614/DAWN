@@ -52,7 +52,7 @@ import math
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
-from models import create_model_by_version, print_version_info, normalize_version
+from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.checkpoint import load_checkpoint_smart, load_optimizer_state, strip_compile_prefix
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
@@ -554,7 +554,7 @@ def is_modern_dawn_model(model):
     base_model = get_underlying_model(model)
 
     # Check for v16+ structure
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["16.0", "17.0"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["16.0", "16.1"]:
         return True
 
     # Structure check: v16+ has layers with .attn and .memory
@@ -563,6 +563,20 @@ def is_modern_dawn_model(model):
             return True
 
     return False
+
+
+def is_v16_model(model):
+    """Check if model is DAWN v16.x (split feature R/V)"""
+    base_model = get_underlying_model(model)
+    # v16 has router at base_model.global_routers.neuron_router
+    return (hasattr(base_model, 'global_routers') and
+            hasattr(base_model.global_routers, 'neuron_router') and
+            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r'))
+
+
+def needs_routing_info(model):
+    """Check if model needs routing_info for excitability logging"""
+    return is_v16_model(model)
 
 
 def _gini(x):
@@ -580,53 +594,8 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
-    # v17: Full Vector Neurons with Shared Feature (QK/V) + Shared Relational (Q/K) + Soft Weighting
-    if hasattr(router, 'neuron_emb_feature_v'):  # v17 has separate V routing head for shared feature pool
-        n_f = router.n_feature  # Shared for QK/V
-        n_rel = router.n_relational  # Shared for Q/K
-        n_val = router.n_value
-        n_k = router.n_knowledge
-
-        # Usage EMA stats (shared pools)
-        ema_f = router.usage_ema_feature  # Shared EMA for QK/V
-        ema_rel = router.usage_ema_relational  # Shared EMA for Q/K
-        ema_val = router.usage_ema_value
-        ema_k = router.usage_ema_knowledge
-
-        # For soft selection, EMA values are ~1/n_neurons, so use relative threshold
-        # "Active" = neurons used > 10% of uniform expectation (1/n * 0.1)
-        thresh_f = (1.0 / n_f) * 0.1
-        thresh_rel = (1.0 / n_rel) * 0.1
-        thresh_val = (1.0 / n_val) * 0.1
-        thresh_k = (1.0 / n_k) * 0.1
-
-        active_f = (ema_f > thresh_f).sum().item()
-        active_rel = (ema_rel > thresh_rel).sum().item()
-        active_val = (ema_val > thresh_val).sum().item()
-        active_k = (ema_k > thresh_k).sum().item()
-
-        # Gini coefficients
-        gini_f = _gini(ema_f)
-        gini_rel = _gini(ema_rel)
-        gini_val, gini_k = _gini(ema_val), _gini(ema_k)
-
-        # Excitability
-        tau = router.tau if hasattr(router, 'tau') else 1.5
-        weight = router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0
-        exc_f = torch.clamp(1.0 - ema_f / tau, min=0.0, max=1.0)
-        exc_rel = torch.clamp(1.0 - ema_rel / tau, min=0.0, max=1.0)
-        exc_val = torch.clamp(1.0 - ema_val / tau, min=0.0, max=1.0)
-        exc_k = torch.clamp(1.0 - ema_k / tau, min=0.0, max=1.0)
-
-        lines.append(f"         v17 Soft | τ={tau:.1f} w={weight:.3f} | F(QK/V):{int(active_f)}/{n_f} R(Q/K):{int(active_rel)}/{n_rel} V:{int(active_val)}/{n_val}")
-        lines.append(f"             Gini F/R/V: {gini_f:.2f}/{gini_rel:.2f}/{gini_val:.2f}")
-        # EMA stats for soft selection debugging (values are small: ~1/n_neurons)
-        lines.append(f"             EMA F:[{ema_f.min().item():.4f},{ema_f.mean().item():.4f},{ema_f.max().item():.4f}] R:[{ema_rel.min().item():.4f},{ema_rel.mean().item():.4f},{ema_rel.max().item():.4f}]")
-        lines.append(f"             EMA V:[{ema_val.min().item():.4f},{ema_val.mean().item():.4f},{ema_val.max().item():.4f}] K:[{ema_k.min().item():.4f},{ema_k.mean().item():.4f},{ema_k.max().item():.4f}]")
-        lines.append(f"             Knowledge: Active {int(active_k)}/{n_k} | Gini:{gini_k:.2f}")
-
     # v16: Split Feature R/V with Excitability
-    elif hasattr(router, 'usage_ema_feature_r'):
+    if hasattr(router, 'usage_ema_feature_r'):
         ema_QK = router.usage_ema_feature_r
         ema_V = router.usage_ema_feature_v
         ema_R = router.usage_ema_relational
@@ -645,17 +614,39 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 
         # Excitability
         tau = router.tau if hasattr(router, 'tau') else 1.5
-        weight = router.excitability_weight if hasattr(router, 'excitability_weight') else 1.0
+
+        # Per-neuron excitability weights (v16.1)
+        if hasattr(router, 'excitability_weight_fr'):
+            w_fr = router.excitability_weight_fr
+            w_fv = router.excitability_weight_fv
+            w_r = router.excitability_weight_r
+            w_v = router.excitability_weight_v
+            w_fr_stats = f"[{w_fr.min().item():.2f},{w_fr.mean().item():.2f},{w_fr.max().item():.2f}]"
+            w_fv_stats = f"[{w_fv.min().item():.2f},{w_fv.mean().item():.2f},{w_fv.max().item():.2f}]"
+            w_r_stats = f"[{w_r.min().item():.2f},{w_r.mean().item():.2f},{w_r.max().item():.2f}]"
+            w_v_stats = f"[{w_v.min().item():.2f},{w_v.mean().item():.2f},{w_v.max().item():.2f}]"
+        else:
+            # Old scalar weight (backwards compat)
+            weight = router.excitability_weight.item() if hasattr(router, 'excitability_weight') and hasattr(router.excitability_weight, 'item') else 1.0
+            w_fr_stats = w_fv_stats = w_r_stats = w_v_stats = f"{weight:.3f}"
+
         exc_QK = torch.clamp(1.0 - ema_QK / tau, min=0.0, max=1.0)
         exc_V = torch.clamp(1.0 - ema_V / tau, min=0.0, max=1.0)
 
-        # Excitability distribution
+        # Excitability distribution (usage-based)
         min_exc_QK, max_exc_QK, mean_exc_QK = exc_QK.min().item(), exc_QK.max().item(), exc_QK.mean().item()
         min_exc_V, max_exc_V, mean_exc_V = exc_V.min().item(), exc_V.max().item(), exc_V.mean().item()
 
-        lines.append(f"         Excitability | τ={tau:.1f} w={weight:.3f} | Active FR/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
+        # Dead neuron ratios (EMA < 0.01)
+        dead_FR = (ema_QK < 0.01).float().mean().item()
+        dead_FV = (ema_V < 0.01).float().mean().item()
+        dead_R = (ema_R < 0.01).float().mean().item()
+        dead_Val = (ema_Val < 0.01).float().mean().item()
+
+        lines.append(f"         Excitability | τ={tau:.1f} | Active FR/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
         lines.append(f"             Gini FR/FV:{gini_QK:.2f}/{gini_V:.2f} R/V:{gini_R:.2f}/{gini_Val:.2f}")
-        lines.append(f"             Exc FR:[{min_exc_QK:.2f},{mean_exc_QK:.2f},{max_exc_QK:.2f}] FV:[{min_exc_V:.2f},{mean_exc_V:.2f},{max_exc_V:.2f}]")
+        lines.append(f"             Dead FR/FV/R/V: {dead_FR:.2%}/{dead_FV:.2%}/{dead_R:.2%}/{dead_Val:.2%}")
+        lines.append(f"             Weight FR:{w_fr_stats} FV:{w_fv_stats} R:{w_r_stats} V:{w_v_stats}")
 
         # Knowledge neurons (if available)
         if hasattr(router, 'usage_ema_knowledge'):
@@ -663,9 +654,16 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
             active_K = (ema_K > 0.01).sum().item()
             n_K = ema_K.numel()
             gini_K = _gini(ema_K)
-            exc_K = torch.clamp(1.0 - ema_K / tau, min=0.0, max=1.0)
-            min_exc_K, max_exc_K, mean_exc_K = exc_K.min().item(), exc_K.max().item(), exc_K.mean().item()
-            lines.append(f"             Knowledge (K): Active {int(active_K)}/{n_K} | Gini:{gini_K:.2f} | Exc:[{min_exc_K:.2f},{mean_exc_K:.2f},{max_exc_K:.2f}]")
+            dead_K = (ema_K < 0.01).float().mean().item()
+
+            # K weight
+            if hasattr(router, 'excitability_weight_k'):
+                w_k = router.excitability_weight_k
+                w_k_stats = f"[{w_k.min().item():.2f},{w_k.mean().item():.2f},{w_k.max().item():.2f}]"
+            else:
+                w_k_stats = w_fr_stats  # fallback
+
+            lines.append(f"             Knowledge (K): Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f} | W:{w_k_stats}")
 
     return lines
 
@@ -726,14 +724,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
-                # Check if v16+ (needs routing_info for usage logging)
-                is_v16_plus = (hasattr(base_model, 'global_routers') and
-                           hasattr(base_model.global_routers, 'neuron_router') and
-                           (hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r') or  # v16
-                            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))      # v17
-
                 # v10: DAWN model forward
-                if load_balance_weight > 0 or entropy_weight > 0 or is_v16_plus:
+                if load_balance_weight > 0 or entropy_weight > 0 or needs_routing_info(model):
                     ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                 else:
                     ce_loss, logits = model(input_ids, labels)
@@ -785,14 +777,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Non-AMP training (CPU or no CUDA)
             base_model = get_underlying_model(model)
 
-            # Check if v16+ (needs routing_info for usage logging)
-            is_v16_plus = (hasattr(base_model, 'global_routers') and
-                       hasattr(base_model.global_routers, 'neuron_router') and
-                       (hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r') or  # v16
-                        hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature')))      # v17
-
             # v10: DAWN model forward
-            if load_balance_weight > 0 or entropy_weight > 0 or is_v16_plus:
+            if load_balance_weight > 0 or entropy_weight > 0 or needs_routing_info(model):
                 ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
             else:
                 ce_loss, logits = model(input_ids, labels)
@@ -845,11 +831,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Increment global step counter
         global_step += 1
 
-        # Update excitability weight (v16.0: decay, v16.1: Langevin)
-        if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+        # Update excitability (v16.1/v17: update_excitability_weight, v16.0: decay_excitability)
+        router = None
+        if hasattr(base_model, 'router'):  # v17
+            router = base_model.router
+        elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
             router = base_model.global_routers.neuron_router
+
+        if router is not None:
             if hasattr(router, 'update_excitability_weight'):
-                router.update_excitability_weight()  # v16.1 Langevin dynamics
+                router.update_excitability_weight()  # v16.1/v17 Langevin dynamics
             elif hasattr(router, 'decay_excitability'):
                 router.decay_excitability()  # v16.0 simple decay
 
@@ -951,10 +942,35 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
 
                     # Usage EMA logging
-                    if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+                    router = None
+                    if hasattr(base_model, 'router'):  # v17
+                        router = base_model.router
+                    elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                         router = base_model.global_routers.neuron_router
-                        for line in _get_router_log_lines(router, global_step, total_steps, base_model.global_routers):
+                    if router is not None:
+                        for line in _get_router_log_lines(router, global_step, total_steps):
                             print(line)
+
+                    # Importance entropy logging (from routing preferences)
+                    try:
+                        imp_entropies = []
+                        for layer_info in routing_infos:
+                            attn_info = layer_info.get('attention', {})
+                            # Try importance tensor first, fallback to relational_q_pref
+                            importance = attn_info.get('importance')
+                            if importance is None:
+                                importance = attn_info.get('relational_q_pref')
+                            if importance is not None and importance.numel() > 0:
+                                # Normalize to probability distribution
+                                p = torch.softmax(importance.float(), dim=-1)
+                                # Entropy: -sum(p * log(p))
+                                ent = -(p * (p + 1e-8).log()).sum(-1).mean()
+                                imp_entropies.append(ent.item())
+                        if imp_entropies:
+                            avg_imp_entropy = sum(imp_entropies) / len(imp_entropies)
+                            print(f"         Importance Entropy: {avg_imp_entropy:.4f} (uniform@100={math.log(100):.2f})")
+                    except Exception:
+                        pass
 
                     # Knowledge neuron usage stats
                     try:
@@ -1031,9 +1047,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
 
                 # Add router metrics (same format as console)
-                if hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+                router = None
+                if hasattr(base_model, 'router'):  # v17
+                    router = base_model.router
+                elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                     router = base_model.global_routers.neuron_router
-                    for line in _get_router_log_lines(router, global_step, total_steps, base_model.global_routers):
+                if router is not None:
+                    for line in _get_router_log_lines(router, global_step, total_steps):
                         f.write(line + "\n")
 
             # Collect neuron metrics
@@ -1396,22 +1416,19 @@ def main():
     args.router_dropout = cfg['model'].get('router_dropout', 0.1)
     args.excitability_tau = cfg['model'].get('excitability_tau', 1.5)
     args.excitability_ema_alpha = cfg['model'].get('excitability_ema_alpha', 0.01)
+    args.excitability_decay_rate = cfg['model'].get('excitability_decay_rate', 0.99995)
     args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
     args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
-
-    # v17.0 Shared Feature parameters
-    args.n_feature = cfg['model'].get('n_feature', 768)
-    args.n_relational = cfg['model'].get('n_relational', 160)
-    args.n_value = cfg['model'].get('n_value', 12)
-    args.top_k_feature = cfg['model'].get('top_k_feature', 64)
-    args.top_k_relational = cfg['model'].get('top_k_relational', 4)
-    args.top_k_value = cfg['model'].get('top_k_value', 6)
 
     # v16.0 Split Feature R/V parameters (uses single rank from basis_rank)
     args.n_feature_r = cfg['model'].get('n_feature_r', 512)
     args.n_feature_v = cfg['model'].get('n_feature_v', 256)
     args.top_k_feature_r = cfg['model'].get('top_k_feature_r', 8)
     args.top_k_feature_v = cfg['model'].get('top_k_feature_v', 8)
+    args.n_relational = cfg['model'].get('n_relational', 96)
+    args.n_value = cfg['model'].get('n_value', 16)
+    args.top_k_relational = cfg['model'].get('top_k_relational', 4)
+    args.top_k_value = cfg['model'].get('top_k_value', 6)
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -1594,6 +1611,16 @@ def main():
         args.basis_rank = args.rank  # Sync basis_rank with rank for model creation
         args.n_knowledge = checkpoint_config.get('n_knowledge', getattr(args, 'n_knowledge', 64))
 
+        # v16 architecture params (must match checkpoint)
+        args.n_feature_r = checkpoint_config.get('n_feature_r', getattr(args, 'n_feature_r', 96))
+        args.n_feature_v = checkpoint_config.get('n_feature_v', getattr(args, 'n_feature_v', 24))
+        args.n_relational = checkpoint_config.get('n_relational', getattr(args, 'n_relational', 96))
+        args.n_value = checkpoint_config.get('n_value', getattr(args, 'n_value', 16))
+        args.top_k_feature_r = checkpoint_config.get('top_k_feature_r', getattr(args, 'top_k_feature_r', 12))
+        args.top_k_feature_v = checkpoint_config.get('top_k_feature_v', getattr(args, 'top_k_feature_v', 3))
+        args.top_k_relational = checkpoint_config.get('top_k_relational', getattr(args, 'top_k_relational', 4))
+        args.top_k_value = checkpoint_config.get('top_k_value', getattr(args, 'top_k_value', 6))
+
         if checkpoint_training_config:
             # Training hyperparameters (only if not overridden by CLI)
             if cli_args.batch_size is None:
@@ -1627,24 +1654,8 @@ def main():
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, heads={args.n_heads}")
 
     if model_version != 'baseline':
-        if model_version == "17.0":
-            # v17.0: Full Vector Neurons + Full Soft Selection
-            knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
-            n_feature = getattr(args, 'n_feature', 768)
-            n_relational = getattr(args, 'n_relational', 256)
-            n_value = getattr(args, 'n_value', 128)
-            n_knowledge = getattr(args, 'n_knowledge', 80)
-            coarse_k = getattr(args, 'coarse_k', 20)
-            fine_k = getattr(args, 'fine_k', 10)
-            temperature = getattr(args, 'temperature', 1.0)
-            print(f"DAWN v{model_version}: Full Vector Neurons + Full Soft Selection")
-            print(f"  Selection: FULL SOFT (train & inference, temp={temperature})")
-            print(f"  Feature: {n_feature} × {args.d_model} [SHARED QK/V]")
-            print(f"  Relational: {n_relational} × {args.d_model} [SHARED Q/K]")
-            print(f"  Value: {n_value} × {args.d_model}")
-            print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
-        elif model_version == "16.0":
-            # v16.0: Split Feature R/V (rank matrix)
+        if model_version in ("16.0", "16.1"):
+            # v16.x: Split Feature R/V (rank matrix)
             rank = args.basis_rank
             knowledge_rank = getattr(args, 'knowledge_rank', None) or 128
             n_feature_r = getattr(args, 'n_feature_r', 512)
@@ -1654,14 +1665,21 @@ def main():
             n_knowledge = getattr(args, 'n_knowledge', 256)
             coarse_k = getattr(args, 'coarse_k', 20)
             fine_k = getattr(args, 'fine_k', 10)
-            print(f"DAWN v{model_version}: Split Feature R/V (rank matrix)")
+            version_desc = "Split Feature R/V (rank matrix)"
+            if model_version == "16.1":
+                version_desc += " + Langevin Excitability"
+            print(f"DAWN v{model_version}: {version_desc}")
             print(f"  Feature R/V: {n_feature_r}/{n_feature_v}")
             print(f"  Relational/Value: {n_relational}/{n_value}")
             print(f"  Knowledge: {n_knowledge} (coarse_k={coarse_k} → fine_k={fine_k})")
             print(f"  rank={rank}, knowledge_rank={knowledge_rank}")
+            if model_version == "16.1":
+                langevin_alpha = getattr(args, 'langevin_alpha', 0.0003)
+                langevin_beta = getattr(args, 'langevin_beta', 0.0006)
+                print(f"  Langevin: α={langevin_alpha}, β={langevin_beta}")
             print(f"  (detailed info after model creation)")
         else:
-            print(f"⚠️  Unsupported version: {model_version}. Supported: 16.0, 17.0")
+            print(f"⚠️  Unsupported version: {model_version}. Supported: 16.0, 16.1")
     else:
         print(f"Standard FFN: d_ff={args.d_ff}")
 
@@ -1704,89 +1722,43 @@ def main():
     print("Creating DAWN model...")
     print(f"{'='*60}")
 
-    # Build model kwargs from args (already updated from checkpoint if resuming)
-    model_version = getattr(args, 'model_version', '9.0')
+    # Build model kwargs from args using version_registry
+    model_version = getattr(args, 'model_version', '16.1')
 
-    # Common parameters
-    model_kwargs = {
+    # Build config dict from args for version_registry
+    args_config = {
         'vocab_size': vocab_size,
         'd_model': args.d_model,
         'n_layers': args.n_layers,
         'n_heads': args.n_heads,
-        'd_ff': args.d_ff,
         'max_seq_len': args.max_seq_len,
         'dropout': args.dropout,
+        'rank': args.basis_rank,
+        'n_feature_r': getattr(args, 'n_feature_r', 96),
+        'n_feature_v': getattr(args, 'n_feature_v', 24),
+        'n_relational': getattr(args, 'n_relational', 96),
+        'n_value': getattr(args, 'n_value', 16),
+        'n_knowledge': args.n_knowledge,
+        'coarse_k': args.coarse_k,
+        'fine_k': args.fine_k,
+        'knowledge_rank': args.knowledge_rank or 128,
+        'state_dim': getattr(args, 'state_dim', 64),
+        'top_k_feature_r': getattr(args, 'top_k_feature_r', 12),
+        'top_k_feature_v': getattr(args, 'top_k_feature_v', 3),
+        'top_k_relational': getattr(args, 'top_k_relational', 12),
+        'top_k_value': getattr(args, 'top_k_value', 3),
+        'd_space': getattr(args, 'd_space', 64),
+        'router_dropout': getattr(args, 'router_dropout', 0.1),
+        'gradient_checkpointing': args.gradient_checkpointing,
+        'excitability_tau': getattr(args, 'excitability_tau', 1.5),
+        'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
+        'excitability_decay_rate': getattr(args, 'excitability_decay_rate', 0.99995),
+        'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
+        'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
     }
 
-    # Add version-specific parameters
-    if model_version == '17.0':
-        # v17.0: Full Vector Neurons + Soft/Hard Selection (no rank matrices)
-        model_kwargs.update({
-            'n_feature': getattr(args, 'n_feature', 768),       # Shared QK/V
-            'n_relational': getattr(args, 'n_relational', 256), # Shared Q/K
-            'n_value': getattr(args, 'n_value', 128),
-            'n_knowledge': args.n_knowledge,
-            'coarse_k': args.coarse_k,
-            'fine_k': args.fine_k,
-            'knowledge_rank': args.knowledge_rank or 128,
-            'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature': getattr(args, 'top_k_feature', 64),       # inference only
-            'top_k_relational': getattr(args, 'top_k_relational', 64), # inference only
-            'top_k_value': getattr(args, 'top_k_value', 32),           # inference only
-            'd_space': getattr(args, 'd_space', 64),
-            'router_dropout': getattr(args, 'router_dropout', 0.1),
-            'temperature': getattr(args, 'temperature', 1.0),
-            'use_ssm_context': getattr(args, 'use_ssm_context', True),
-            'gradient_checkpointing': args.gradient_checkpointing,
-        })
-    elif model_version == '16.0':
-        # v16.0: Split Feature R/V (rank matrix)
-        model_kwargs.update({
-            'n_feature_r': getattr(args, 'n_feature_r', 512),
-            'n_feature_v': getattr(args, 'n_feature_v', 256),
-            'n_relational': getattr(args, 'n_relational', 160),
-            'n_value': getattr(args, 'n_value', 12),
-            'n_knowledge': args.n_knowledge,
-            'coarse_k': args.coarse_k,
-            'fine_k': args.fine_k,
-            'knowledge_rank': args.knowledge_rank or 128,
-            'rank': args.basis_rank,  # single rank for all matrices
-            'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature_r': getattr(args, 'top_k_feature_r', 8),
-            'top_k_feature_v': getattr(args, 'top_k_feature_v', 8),
-            'top_k_relational': getattr(args, 'top_k_relational', 4),
-            'top_k_value': getattr(args, 'top_k_value', 6),
-            'd_space': getattr(args, 'd_space', 64),
-            'router_dropout': getattr(args, 'router_dropout', 0.1),
-            'gradient_checkpointing': args.gradient_checkpointing,
-            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
-            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
-        })
-    elif model_version == '16.1':
-        # v16.1: Split Feature R/V + Langevin Excitability
-        model_kwargs.update({
-            'n_feature_r': getattr(args, 'n_feature_r', 512),
-            'n_feature_v': getattr(args, 'n_feature_v', 256),
-            'n_relational': getattr(args, 'n_relational', 160),
-            'n_value': getattr(args, 'n_value', 12),
-            'n_knowledge': args.n_knowledge,
-            'coarse_k': args.coarse_k,
-            'fine_k': args.fine_k,
-            'knowledge_rank': args.knowledge_rank or 128,
-            'rank': args.basis_rank,
-            'state_dim': getattr(args, 'state_dim', 64),
-            'top_k_feature_r': getattr(args, 'top_k_feature_r', 8),
-            'top_k_feature_v': getattr(args, 'top_k_feature_v', 8),
-            'top_k_relational': getattr(args, 'top_k_relational', 4),
-            'top_k_value': getattr(args, 'top_k_value', 6),
-            'd_space': getattr(args, 'd_space', 64),
-            'router_dropout': getattr(args, 'router_dropout', 0.1),
-            'gradient_checkpointing': args.gradient_checkpointing,
-            'excitability_tau': getattr(args, 'excitability_tau', 1.5),
-            'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
-            'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
-            'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
-        })
+    # Use version_registry to build model_kwargs with correct params for version
+    model_kwargs = build_model_kwargs(model_version, args_config)
 
     # Create model
     model = create_model_by_version(model_version, model_kwargs)
