@@ -609,6 +609,7 @@ class NeuronMemory(nn.Module):
             coarse_indicator = torch.zeros(B, S, self.n_knowledge, device=x.device)
             coarse_indicator.scatter_(-1, candidate_idx, 1.0)
             router.update_usage(coarse_indicator, 'knowledge', attention_mask)
+            del coarse_indicator
 
         # Stage 2: Fine matching within candidates
         query = knowledge_encoder(x)
@@ -633,10 +634,10 @@ class NeuronMemory(nn.Module):
         output = (selected_V * fine_weights.unsqueeze(-1)).sum(dim=2)
 
         info = {
-            'coarse_indices': candidate_idx,
-            'coarse_scores': coarse_scores,
-            'fine_indices': fine_global_idx,
-            'fine_weights': fine_weights,
+            'coarse_indices': candidate_idx.detach(),
+            'coarse_scores': coarse_scores.detach(),
+            'fine_indices': fine_global_idx.detach(),
+            'fine_weights': fine_weights.detach(),
         }
 
         return output, info
