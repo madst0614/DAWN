@@ -566,15 +566,10 @@ def is_modern_dawn_model(model):
 
 
 def is_v16_model(model):
-    """Check if model is DAWN v16.x (split feature R/V or complete pool separation)"""
+    """Check if model is DAWN v16.x by version string"""
     base_model = get_underlying_model(model)
-    # v16 has router at base_model.global_routers.neuron_router
-    if not (hasattr(base_model, 'global_routers') and
-            hasattr(base_model.global_routers, 'neuron_router')):
-        return False
-    router = base_model.global_routers.neuron_router
-    # v16.0/16.1/16.2: usage_ema_feature_r, v16.3: usage_ema_fq
-    return hasattr(router, 'usage_ema_feature_r') or hasattr(router, 'usage_ema_fq')
+    version = getattr(base_model, '__version__', '')
+    return version.startswith('16.')
 
 
 def needs_routing_info(model):
