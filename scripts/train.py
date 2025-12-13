@@ -554,7 +554,7 @@ def is_modern_dawn_model(model):
     base_model = get_underlying_model(model)
 
     # Check for v16+ structure
-    if hasattr(base_model, '__version__') and base_model.__version__ in ["16.0", "17.0"]:
+    if hasattr(base_model, '__version__') and base_model.__version__ in ["16.0", "16.1", "17.0", "17.1"]:
         return True
 
     # Structure check: v16+ has layers with .attn and .memory
@@ -563,6 +563,27 @@ def is_modern_dawn_model(model):
             return True
 
     return False
+
+
+def is_v17_model(model):
+    """Check if model is DAWN v17.x (hierarchical circuits)"""
+    base_model = get_underlying_model(model)
+    # v17 has router at base_model.router with usage_ema_r
+    return hasattr(base_model, 'router') and hasattr(base_model.router, 'usage_ema_r')
+
+
+def is_v16_model(model):
+    """Check if model is DAWN v16.x (split feature R/V)"""
+    base_model = get_underlying_model(model)
+    # v16 has router at base_model.global_routers.neuron_router
+    return (hasattr(base_model, 'global_routers') and
+            hasattr(base_model.global_routers, 'neuron_router') and
+            hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r'))
+
+
+def needs_routing_info(model):
+    """Check if model needs routing_info for excitability logging"""
+    return is_v17_model(model) or is_v16_model(model)
 
 
 def _gini(x):
@@ -760,18 +781,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
-                # Check if v16+ or v17 (needs routing_info for usage logging)
-                is_v16_plus = (
-                    # v17: router at base_model.router
-                    (hasattr(base_model, 'router') and hasattr(base_model.router, 'usage_ema_r')) or
-                    # v16: router at base_model.global_routers.neuron_router
-                    (hasattr(base_model, 'global_routers') and
-                     hasattr(base_model.global_routers, 'neuron_router') and
-                     hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r'))
-                )
-
                 # v10: DAWN model forward
-                if load_balance_weight > 0 or entropy_weight > 0 or is_v16_plus:
+                if load_balance_weight > 0 or entropy_weight > 0 or needs_routing_info(model):
                     ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
                 else:
                     ce_loss, logits = model(input_ids, labels)
@@ -823,18 +834,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Non-AMP training (CPU or no CUDA)
             base_model = get_underlying_model(model)
 
-            # Check if v16+ or v17 (needs routing_info for usage logging)
-            is_v16_plus = (
-                # v17: router at base_model.router
-                (hasattr(base_model, 'router') and hasattr(base_model.router, 'usage_ema_r')) or
-                # v16: router at base_model.global_routers.neuron_router
-                (hasattr(base_model, 'global_routers') and
-                 hasattr(base_model.global_routers, 'neuron_router') and
-                 hasattr(base_model.global_routers.neuron_router, 'usage_ema_feature_r'))
-            )
-
             # v10: DAWN model forward
-            if load_balance_weight > 0 or entropy_weight > 0 or is_v16_plus:
+            if load_balance_weight > 0 or entropy_weight > 0 or needs_routing_info(model):
                 ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
             else:
                 ce_loss, logits = model(input_ids, labels)
