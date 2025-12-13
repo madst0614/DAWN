@@ -1425,6 +1425,10 @@ def main():
     args.n_feature_v = cfg['model'].get('n_feature_v', 256)
     args.top_k_feature_r = cfg['model'].get('top_k_feature_r', 8)
     args.top_k_feature_v = cfg['model'].get('top_k_feature_v', 8)
+    args.n_relational = cfg['model'].get('n_relational', 96)
+    args.n_value = cfg['model'].get('n_value', 16)
+    args.top_k_relational = cfg['model'].get('top_k_relational', 4)
+    args.top_k_value = cfg['model'].get('top_k_value', 6)
 
     # Training
     args.batch_size = cfg['training']['batch_size']
