@@ -257,22 +257,14 @@ class CircuitRouter(nn.Module):
         else:
             h = self.neuron_proj(x)  # [B, S, d_space]
 
-        # 2. 선택된 circuit의 neuron embedding 가져오기
-        # neuron_emb: [n_circuits, neurons, d_space]
-        # selected_idx: [B, k]
-        idx_expanded = selected_idx.view(B, 1, k, 1, 1).expand(
-            B, S, k, self.neurons_per_circuit, self.d_space
-        )
-        neuron_emb_expanded = neuron_emb.view(1, 1, -1, self.neurons_per_circuit, self.d_space)
-        neuron_emb_expanded = neuron_emb_expanded.expand(B, S, -1, -1, -1)
-
-        selected_neuron_emb = neuron_emb_expanded.gather(2, idx_expanded)
-        # [B, S, k, neurons, d_space]
-
+        # 2. 선택된 circuit의 neuron embedding만 gather (S 차원 확장 안 함)
+        # neuron_emb: [n_circuits, neurons, d_space] → [B, k, neurons, d_space]
+        idx_for_emb = selected_idx.view(B, k, 1, 1).expand(B, k, self.neurons_per_circuit, self.d_space)
+        selected_neuron_emb = neuron_emb.unsqueeze(0).expand(B, -1, -1, -1).gather(1, idx_for_emb)
         selected_neuron_emb = F.normalize(selected_neuron_emb, dim=-1)
 
-        # 3. Token별 preference 계산
-        token_pref = torch.einsum('bsd,bsknd->bskn', h, selected_neuron_emb)  # [B, S, k, neurons]
+        # 3. Token별 preference: [B, S, d_space] vs [B, k, neurons, d_space] → [B, S, k, neurons]
+        token_pref = torch.einsum('bsd,bknd->bskn', h, selected_neuron_emb)
         token_pref = F.softmax(token_pref, dim=-1)
 
         # 4. Importance로 aggregate (v16 스타일)
