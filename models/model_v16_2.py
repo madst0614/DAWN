@@ -1,19 +1,17 @@
 """
-DAWN v16: Split Feature R/V
+DAWN v16_2: Split Feature R/V + Separate Q/K Projections
 
-v15 기반 + Feature 뉴런 분리:
-- Feature_R: [n_feature_r, d_model, rank] → Q, K compression
-- Feature_V: [n_feature_v, d_model, rank] → V compression (새로 추가)
+v16 기반 + relational Q/K projection 분리:
+- proj_rel_Q, proj_rel_K: 별도의 projection으로 Q/K routing 분리
 
-이론적 근거:
-- Q/K는 "어디를 볼지" 결정 → attention pattern
-- V는 "무엇을 가져올지" 결정 → content
-- 이 둘이 같은 compression을 써야 할 이유가 없음
+v16의 문제:
+- relational_Q와 relational_K가 같은 proj를 사용해서 동일한 logits 생성
 
-Architecture (Split-FRVK v16):
+Architecture (Split-FRVK v16_2):
 - Feature_R: x → low-rank projection → h_r [Q, K compression]
 - Feature_V: x → low-rank projection → h_v [V compression]
-- Relational: Q/K generation from h_r
+- Relational Q: proj_rel_Q(x) → Q routing (separate projection)
+- Relational K: proj_rel_K(x) → K routing (separate projection)
 - Value: V generation from h_v
 - Knowledge: 2-stage retrieval (same as v15)
 """
@@ -64,6 +62,9 @@ class UnifiedNeuronRouter(nn.Module):
 
         # 공유 projection
         self.proj = nn.Linear(d_model, d_space)
+        # Q/K 분리 projection (relational용)
+        self.proj_rel_Q = nn.Linear(d_model, d_space)
+        self.proj_rel_K = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
         # 통합 뉴런 임베딩 [total_neurons, d_space]
@@ -112,8 +113,20 @@ class UnifiedNeuronRouter(nn.Module):
                 excitability = self.get_excitability(self.usage_ema_feature_v)
                 logits = logits + excitability * self.excitability_weight
 
-        elif neuron_type in ['relational_Q', 'relational_K']:
-            logits = all_logits[..., self.feature_v_end:self.relational_end]
+        elif neuron_type == 'relational_Q':
+            h_proj_Q = self.proj_rel_Q(x)
+            h_proj_Q = self.dropout(h_proj_Q)
+            rel_emb = neuron_emb_norm[self.feature_v_end:self.relational_end]
+            logits = torch.einsum('bsd,nd->bsn', h_proj_Q, rel_emb)
+            if self.training:
+                excitability = self.get_excitability(self.usage_ema_relational)
+                logits = logits + excitability * self.excitability_weight
+
+        elif neuron_type == 'relational_K':
+            h_proj_K = self.proj_rel_K(x)
+            h_proj_K = self.dropout(h_proj_K)
+            rel_emb = neuron_emb_norm[self.feature_v_end:self.relational_end]
+            logits = torch.einsum('bsd,nd->bsn', h_proj_K, rel_emb)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_relational)
                 logits = logits + excitability * self.excitability_weight
@@ -708,7 +721,7 @@ class DAWN(nn.Module):
     - Value: [n_value, rank, d_model] - V expansion
     - Knowledge: 2-stage retrieval
     """
-    __version__ = "16.0"
+    __version__ = "16.2"
 
     def __init__(
         self,
