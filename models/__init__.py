@@ -56,6 +56,7 @@ from .version_registry import (
     print_version_info,
     list_versions,
     get_all_versions_info,
+    get_routing_log_info,
 )
 
 __all__ = [
@@ -76,6 +77,7 @@ __all__ = [
     'print_version_info',
     'list_versions',
     'get_all_versions_info',
+    'get_routing_log_info',
     'create_model_by_version',
 ]
 

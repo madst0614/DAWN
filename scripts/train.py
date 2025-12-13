@@ -52,7 +52,7 @@ import math
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
-from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs
+from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs, get_routing_log_info
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.checkpoint import load_checkpoint_smart, load_optimizer_state, strip_compile_prefix
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
@@ -880,9 +880,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         if (step + 1) % 200 == 0 and routing_infos is not None:
             with torch.no_grad():
                 try:
-                    # Layer 0 for routing analysis
-                    attn = routing_infos[0].get('attention', routing_infos[0])
-
+                    # Helper functions for entropy/variance calculation
                     def calc_entropy_ratio(pref):
                         if pref is None:
                             return 0.0
@@ -894,108 +892,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             return 0.0
                         return pref.var(dim=1).mean().item()
 
-                    # v16.3: fq_pref/fk_pref/fv_pref/rq_pref/rk_pref/rv_pref (complete pool separation)
-                    # v16.2: feature_r_q_pref/feature_r_k_pref (separate Q/K projections)
-                    # v16.0: feature_r_pref (shared Q/K)
-                    if attn.get('fq_pref') is not None:
-                        # v16.3: Complete pool separation
-                        pref_FQ = attn.get('fq_pref')
-                        pref_FK = attn.get('fk_pref')
-                        pref_FV = attn.get('fv_pref')
-                        pref_RQ = attn.get('rq_pref')
-                        pref_RK = attn.get('rk_pref')
-                        pref_RV = attn.get('rv_pref')
-
-                        ent_FQ = calc_entropy_ratio(pref_FQ)
-                        ent_FK = calc_entropy_ratio(pref_FK)
-                        ent_FV = calc_entropy_ratio(pref_FV)
-                        ent_RQ = calc_entropy_ratio(pref_RQ)
-                        ent_RK = calc_entropy_ratio(pref_RK)
-                        ent_RV = calc_entropy_ratio(pref_RV)
-
-                        var_FQ = calc_token_var(pref_FQ)
-                        var_FK = calc_token_var(pref_FK)
-                        var_FV = calc_token_var(pref_FV)
-                        var_RQ = calc_token_var(pref_RQ)
-                        var_RK = calc_token_var(pref_RK)
-                        var_RV = calc_token_var(pref_RV)
-
-                        ent_str = f"Ent FQ/FK/FV/RQ/RK/RV:{ent_FQ:.0f}/{ent_FK:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_RV:.0f}"
-                        var_str = f"TokVar:{var_FQ:.4f}/{var_FK:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_RV:.4f}"
-                        overlap_str = None  # v16.3 has separate pools, no overlap
-
-                    elif attn.get('feature_r_q_pref') is not None:
-                        # v16.2: Full Q/K separation
-                        pref_FRQ = attn.get('feature_r_q_pref')
-                        pref_FRK = attn.get('feature_r_k_pref')
-                        pref_FV = attn.get('feature_v_pref')
-                        pref_RQ = attn.get('relational_q_pref')
-                        pref_RK = attn.get('relational_k_pref')
-                        pref_V = attn.get('value_pref')
-
-                        ent_FRQ = calc_entropy_ratio(pref_FRQ)
-                        ent_FRK = calc_entropy_ratio(pref_FRK)
-                        ent_FV = calc_entropy_ratio(pref_FV)
-                        ent_RQ = calc_entropy_ratio(pref_RQ)
-                        ent_RK = calc_entropy_ratio(pref_RK)
-                        ent_V = calc_entropy_ratio(pref_V)
-
-                        var_FRQ = calc_token_var(pref_FRQ)
-                        var_FRK = calc_token_var(pref_FRK)
-                        var_FV = calc_token_var(pref_FV)
-                        var_RQ = calc_token_var(pref_RQ)
-                        var_RK = calc_token_var(pref_RK)
-                        var_V = calc_token_var(pref_V)
-
-                        ent_str = f"Ent FRQ/FRK/FV/RQ/RK/V:{ent_FRQ:.0f}/{ent_FRK:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
-                        var_str = f"TokVar:{var_FRQ:.4f}/{var_FRK:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
-
-                        # Q/K overlap ratio (v16.2 only)
-                        def calc_overlap_ratio(weights_Q, weights_K):
-                            if weights_Q is None or weights_K is None:
-                                return 0.0
-                            overlap = ((weights_Q > 0) & (weights_K > 0)).float()
-                            active_Q = (weights_Q > 0).float().sum(-1)
-                            return (overlap.sum(-1) / (active_Q + 1e-8)).mean().item()
-
-                        w_FRQ = attn.get('feature_r_weights_Q')
-                        w_FRK = attn.get('feature_r_weights_K')
-                        w_RQ = attn.get('relational_weights_Q')
-                        w_RK = attn.get('relational_weights_K')
-
-                        overlap_FR = calc_overlap_ratio(w_FRQ, w_FRK)
-                        overlap_R = calc_overlap_ratio(w_RQ, w_RK)
-                        overlap_str = f"Q/K Overlap FR/R:{overlap_FR:.2f}/{overlap_R:.2f}"
-
-                    elif attn.get('feature_r_pref') is not None:
-                        # v16.0: Shared Q/K
-                        pref_FR = attn.get('feature_r_pref')
-                        pref_FV = attn.get('feature_v_pref')
-                        pref_RQ = attn.get('relational_q_pref')
-                        pref_RK = attn.get('relational_k_pref')
-                        pref_V = attn.get('value_pref')
-
-                        ent_FR = calc_entropy_ratio(pref_FR)
-                        ent_FV = calc_entropy_ratio(pref_FV)
-                        ent_RQ = calc_entropy_ratio(pref_RQ)
-                        ent_RK = calc_entropy_ratio(pref_RK)
-                        ent_V = calc_entropy_ratio(pref_V)
-
-                        var_FR = calc_token_var(pref_FR)
-                        var_FV = calc_token_var(pref_FV)
-                        var_RQ = calc_token_var(pref_RQ)
-                        var_RK = calc_token_var(pref_RK)
-                        var_V = calc_token_var(pref_V)
-
-                        ent_str = f"Ent FR/FV/RQ/RK/V:{ent_FR:.0f}/{ent_FV:.0f}/{ent_RQ:.0f}/{ent_RK:.0f}/{ent_V:.0f}"
-                        var_str = f"TokVar:{var_FR:.4f}/{var_FV:.4f}/{var_RQ:.4f}/{var_RK:.4f}/{var_V:.4f}"
-                        overlap_str = None
-
-                    else:
-                        # Unknown routing_info format
-                        ent_str = "Ent: N/A"
-                        var_str = "TokVar: N/A"
-                        overlap_str = None
+                    # Use version_registry for routing log info (auto-detects version)
+                    log_info = get_routing_log_info(routing_infos[0], calc_entropy_ratio, calc_token_var)
+                    ent_str = log_info['ent_str']
+                    var_str = log_info['var_str']
+                    overlap_str = log_info['overlap_str']
 
                     # Attention ratio (attn_out_norm vs mem_out_norm per layer)
                     attn_ratios = []
