@@ -1517,10 +1517,10 @@ def main():
     args.n_rv = cfg['model'].get('n_rv', 24)
     args.top_k_fq = cfg['model'].get('top_k_fq', 8)
     args.top_k_fk = cfg['model'].get('top_k_fk', 8)
-    args.top_k_fv = cfg['model'].get('top_k_fv', 8)
+    args.top_k_fv = cfg['model'].get('top_k_fv', 3)
     args.top_k_rq = cfg['model'].get('top_k_rq', 8)
     args.top_k_rk = cfg['model'].get('top_k_rk', 8)
-    args.top_k_rv = cfg['model'].get('top_k_rv', 8)
+    args.top_k_rv = cfg['model'].get('top_k_rv', 3)
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -1722,10 +1722,10 @@ def main():
         args.n_rv = checkpoint_config.get('n_rv', getattr(args, 'n_rv', 24))
         args.top_k_fq = checkpoint_config.get('top_k_fq', getattr(args, 'top_k_fq', 8))
         args.top_k_fk = checkpoint_config.get('top_k_fk', getattr(args, 'top_k_fk', 8))
-        args.top_k_fv = checkpoint_config.get('top_k_fv', getattr(args, 'top_k_fv', 8))
+        args.top_k_fv = checkpoint_config.get('top_k_fv', getattr(args, 'top_k_fv', 3))
         args.top_k_rq = checkpoint_config.get('top_k_rq', getattr(args, 'top_k_rq', 8))
         args.top_k_rk = checkpoint_config.get('top_k_rk', getattr(args, 'top_k_rk', 8))
-        args.top_k_rv = checkpoint_config.get('top_k_rv', getattr(args, 'top_k_rv', 8))
+        args.top_k_rv = checkpoint_config.get('top_k_rv', getattr(args, 'top_k_rv', 3))
 
         if checkpoint_training_config:
             # Training hyperparameters (only if not overridden by CLI)
@@ -1838,10 +1838,10 @@ def main():
         'n_rv': getattr(args, 'n_rv', 24),
         'top_k_fq': getattr(args, 'top_k_fq', 8),
         'top_k_fk': getattr(args, 'top_k_fk', 8),
-        'top_k_fv': getattr(args, 'top_k_fv', 8),
+        'top_k_fv': getattr(args, 'top_k_fv', 3),
         'top_k_rq': getattr(args, 'top_k_rq', 8),
         'top_k_rk': getattr(args, 'top_k_rk', 8),
-        'top_k_rv': getattr(args, 'top_k_rv', 8),
+        'top_k_rv': getattr(args, 'top_k_rv', 3),
         # Common params
         'n_knowledge': args.n_knowledge,
         'coarse_k': args.coarse_k,

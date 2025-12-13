@@ -802,8 +802,8 @@ class DAWN(nn.Module):
         # V pool
         n_fv: int = 24,
         n_rv: int = 24,
-        top_k_fv: int = 8,
-        top_k_rv: int = 8,
+        top_k_fv: int = 3,
+        top_k_rv: int = 3,
         # Knowledge
         n_knowledge: int = 256,
         coarse_k: int = 40,

@@ -43,8 +43,8 @@ model:
   # V compression/restoration
   n_fv: 24
   n_rv: 24
-  top_k_fv: 6
-  top_k_rv: 6
+  top_k_fv: 3
+  top_k_rv: 3
 
   # Knowledge
   n_knowledge: 256
