@@ -598,8 +598,50 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
+    # v16.4: Shared Pool + Separate Routing
+    if hasattr(router, 'usage_ema_feature_qk'):
+        ema_fqk = router.usage_ema_feature_qk
+        ema_fv = router.usage_ema_feature_v
+        ema_rqk = router.usage_ema_restore_qk
+        ema_rv = router.usage_ema_restore_v
+
+        # Active neuron counts
+        active_fqk = (ema_fqk > 0.01).sum().item()
+        active_fv = (ema_fv > 0.01).sum().item()
+        active_rqk = (ema_rqk > 0.01).sum().item()
+        active_rv = (ema_rv > 0.01).sum().item()
+        n_fqk, n_fv = ema_fqk.numel(), ema_fv.numel()
+        n_rqk, n_rv = ema_rqk.numel(), ema_rv.numel()
+
+        # Gini coefficients
+        gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
+        gini_rqk, gini_rv = _gini(ema_rqk), _gini(ema_rv)
+
+        # Dead neuron ratios (EMA < 0.01)
+        dead_fqk = (ema_fqk < 0.01).float().mean().item()
+        dead_fv = (ema_fv < 0.01).float().mean().item()
+        dead_rqk = (ema_rqk < 0.01).float().mean().item()
+        dead_rv = (ema_rv < 0.01).float().mean().item()
+
+        # Excitability
+        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
+
+        lines.append(f"         Excitability | w={exc_w:.4f} | Active FQK/FV:{int(active_fqk)}/{n_fqk},{int(active_fv)}/{n_fv}")
+        lines.append(f"             Active RQK/RV:{int(active_rqk)}/{n_rqk},{int(active_rv)}/{n_rv}")
+        lines.append(f"             Gini FQK/FV: {gini_fqk:.2f}/{gini_fv:.2f} | RQK/RV: {gini_rqk:.2f}/{gini_rv:.2f}")
+        lines.append(f"             Dead FQK/FV: {dead_fqk:.1%}/{dead_fv:.1%} | RQK/RV: {dead_rqk:.1%}/{dead_rv:.1%}")
+
+        # Knowledge neurons (if available)
+        if hasattr(router, 'usage_ema_knowledge'):
+            ema_K = router.usage_ema_knowledge
+            active_K = (ema_K > 0.01).sum().item()
+            n_K = ema_K.numel()
+            gini_K = _gini(ema_K)
+            dead_K = (ema_K < 0.01).float().mean().item()
+            lines.append(f"             Knowledge: Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f}")
+
     # v16.3: Complete Q/K/V Pool Separation
-    if hasattr(router, 'usage_ema_fq'):
+    elif hasattr(router, 'usage_ema_fq'):
         ema_fq = router.usage_ema_fq
         ema_fk = router.usage_ema_fk
         ema_fv = router.usage_ema_fv
