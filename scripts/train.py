@@ -37,6 +37,9 @@ import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
 warnings.filterwarnings('ignore', message='.*online softmax.*')
 
+# CUDA memory optimization
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,7 +55,7 @@ import math
 # Speed optimization: TF32 and cuDNN settings for Ampere+ GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = False  # False for dynamic routing
+torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
 
 from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs, get_routing_log_info
