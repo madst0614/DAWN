@@ -627,9 +627,9 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         dead_rv = (ema_rv < 0.01).float().mean().item()
 
         # Excitability
-        tau = router.tau if hasattr(router, 'tau') else 1.5
+        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
 
-        lines.append(f"         Excitability | τ={tau:.1f} | Active FQ/FK/FV:{int(active_fq)}/{n_fq},{int(active_fk)}/{n_fk},{int(active_fv)}/{n_fv}")
+        lines.append(f"         Excitability | w={exc_w:.4f} | Active FQ/FK/FV:{int(active_fq)}/{n_fq},{int(active_fk)}/{n_fk},{int(active_fv)}/{n_fv}")
         lines.append(f"             Active RQ/RK/RV:{int(active_rq)}/{n_rq},{int(active_rk)}/{n_rk},{int(active_rv)}/{n_rv}")
         lines.append(f"             Gini FQ/FK/FV: {gini_fq:.2f}/{gini_fk:.2f}/{gini_fv:.2f} | RQ/RK/RV: {gini_rq:.2f}/{gini_rk:.2f}/{gini_rv:.2f}")
         lines.append(f"             Dead FQ/FK/FV: {dead_fq:.1%}/{dead_fk:.1%}/{dead_fv:.1%} | RQ/RK/RV: {dead_rq:.1%}/{dead_rk:.1%}/{dead_rv:.1%}")
