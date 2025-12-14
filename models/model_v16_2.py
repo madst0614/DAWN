@@ -673,8 +673,8 @@ class NeuronMemory(nn.Module):
         K_all = self.shared_neurons.knowledge_neurons_K
         V_all = self.shared_neurons.knowledge_neurons_V
 
-        candidate_idx_k = candidate_idx.unsqueeze(-1).expand(B, S, self.coarse_k, self.knowledge_rank)
-        K_candidates = K_all.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).gather(2, candidate_idx_k)
+        # Memory-optimized: direct indexing instead of expand+gather
+        K_candidates = K_all[candidate_idx]  # [B, S, coarse_k, knowledge_rank]
 
         fine_scores = torch.einsum('bsd,bscd->bsc', query, K_candidates) / math.sqrt(self.knowledge_rank)
 
@@ -683,9 +683,8 @@ class NeuronMemory(nn.Module):
 
         fine_global_idx = candidate_idx.gather(-1, fine_topk_local_idx)
 
-        fine_idx_v = fine_global_idx.unsqueeze(-1).expand(B, S, self.fine_k, self.d_model)
-        V_expanded = V_all.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
-        selected_V = V_expanded.gather(2, fine_idx_v)
+        # Memory-optimized: direct indexing instead of expand+gather
+        selected_V = V_all[fine_global_idx]  # [B, S, fine_k, d_model]
 
         output = (selected_V * fine_weights.unsqueeze(-1)).sum(dim=2)
 
