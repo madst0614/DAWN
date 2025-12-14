@@ -21,6 +21,11 @@ v16.3: Complete Q/K/V Pool Separation
 - K path: x → FK → RK → K
 - V path: x → FV → RV → V
 
+v16.4: Shared Pool + Separate Routing (v16.3 optimized)
+- Q/K 공유 풀 + 분리 routing
+- Feature_QK, Feature_V (압축) + Restore_QK, Restore_V (복원)
+- proj_all 통합 + matmul/bmm 최적화
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -36,8 +41,11 @@ from .model_v16_2 import DAWN as DAWN_v16_2
 # v16.3 - Complete Q/K/V Pool Separation
 from .model_v16_3 import DAWN as DAWN_v16_3
 
-# Default DAWN is v16.3 (latest)
-DAWN = DAWN_v16_3
+# v16.4 - Shared Pool + Separate Routing (v16.3 optimized)
+from .model_v16_4 import DAWN as DAWN_v16_4
+
+# Default DAWN is v16.4 (latest)
+DAWN = DAWN_v16_4
 
 # Baseline for comparison
 import sys
@@ -66,6 +74,7 @@ __all__ = [
     'DAWN_v16_1',
     'DAWN_v16_2',
     'DAWN_v16_3',
+    'DAWN_v16_4',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -81,14 +90,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "16.3"
+__version__ = "16.4"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "16.0", "16.1", "16.2", "16.3", or "baseline"
+        version: "16.0", "16.1", "16.2", "16.3", "16.4", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -107,6 +116,8 @@ def create_model_by_version(version, config):
         return DAWN_v16_2(**config)
     elif version == "16.3":
         return DAWN_v16_3(**config)
+    elif version == "16.4":
+        return DAWN_v16_4(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 16.0, 16.1, 16.2, 16.3, baseline")
+                        f"Supported versions: 16.0, 16.1, 16.2, 16.3, 16.4, baseline")

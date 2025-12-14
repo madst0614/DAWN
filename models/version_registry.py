@@ -3,6 +3,9 @@ DAWN Model Version Registry
 
 v16.0: Split Feature R/V (rank matrix) - Feature_R/V separate compression
 v16.1: Split Feature R/V + Langevin Excitability (adaptive dead neuron recovery)
+v16.2: Full Q/K Projection Separation - Q/K routing paths separated
+v16.3: Complete Q/K/V Pool Separation - FQ/FK/FV, RQ/RK/RV all independent
+v16.4: Shared Pool + Separate Routing - v16.3 optimized, Q/K shared pool with separate routing
 
 To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
@@ -173,6 +176,43 @@ VERSION_REGISTRY = {
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
         ],
     },
+    "16.4": {
+        "description": "Shared Pool + Separate Routing (v16.3 optimized)",
+        "aliases": ["164"],
+        "module": "model_v16_4",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v", "n_knowledge",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature_qk": 8,
+            "top_k_feature_v": 3,
+            "top_k_restore_qk": 8,
+            "top_k_restore_v": 3,
+            "d_space": 64,
+            "coarse_k": 16,
+            "fine_k": 8,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
+        },
+        "display_info": lambda args: [
+            f"DAWN v16.4: Shared Pool + Separate Routing",
+            f"  rank={args.get('rank', args.get('basis_rank'))}",
+            f"  Feature_QK: {args.get('n_feature_qk')} × {args.get('d_model')} × {args.get('rank')} (Q/K shared, top-k={args.get('top_k_feature_qk', 8)})",
+            f"  Feature_V: {args.get('n_feature_v')} × {args.get('d_model')} × {args.get('rank')} (top-k={args.get('top_k_feature_v', 3)})",
+            f"  Restore_QK: {args.get('n_restore_qk')} × {args.get('rank')} × {args.get('d_model')} (Q/K shared, top-k={args.get('top_k_restore_qk', 8)})",
+            f"  Restore_V: {args.get('n_restore_v')} × {args.get('rank')} × {args.get('d_model')} (top-k={args.get('top_k_restore_v', 3)})",
+            f"  Knowledge: {args.get('n_knowledge')} (coarse={args.get('coarse_k', 16)} → fine={args.get('fine_k', 8)})",
+            f"  Unified Router: d_space={args.get('d_space', 64)} + proj_all optimized",
+            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
+        ],
+    },
 }
 
 
@@ -270,8 +310,42 @@ def get_routing_log_info(routing_info: Dict[str, Any], calc_entropy_fn, calc_var
     """
     attn = routing_info.get('attention', routing_info)
 
+    # v16.4: Shared Pool + Separate Routing (fqk_q_pref exists)
+    if attn.get('fqk_q_pref') is not None:
+        prefs = {
+            'FQK_Q': attn.get('fqk_q_pref'),
+            'FQK_K': attn.get('fqk_k_pref'),
+            'FV': attn.get('fv_pref'),
+            'RQK_Q': attn.get('rqk_q_pref'),
+            'RQK_K': attn.get('rqk_k_pref'),
+            'RV': attn.get('rv_pref'),
+        }
+        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
+        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+
+        ent_str = f"Ent FQK_Q/K/FV/RQK_Q/K/RV:{ents['FQK_Q']:.0f}/{ents['FQK_K']:.0f}/{ents['FV']:.0f}/{ents['RQK_Q']:.0f}/{ents['RQK_K']:.0f}/{ents['RV']:.0f}"
+        var_str = f"TokVar:{vars_['FQK_Q']:.4f}/{vars_['FQK_K']:.4f}/{vars_['FV']:.4f}/{vars_['RQK_Q']:.4f}/{vars_['RQK_K']:.4f}/{vars_['RV']:.4f}"
+
+        # Q/K overlap ratio for shared pools
+        def calc_overlap(w_Q, w_K):
+            if w_Q is None or w_K is None:
+                return 0.0
+            overlap = ((w_Q > 0) & (w_K > 0)).float()
+            active_Q = (w_Q > 0).float().sum(-1)
+            return (overlap.sum(-1) / (active_Q + 1e-8)).mean().item()
+
+        w_FQK_Q = attn.get('fqk_weights_Q')
+        w_FQK_K = attn.get('fqk_weights_K')
+        w_RQK_Q = attn.get('rqk_weights_Q')
+        w_RQK_K = attn.get('rqk_weights_K')
+        overlap_FQK = calc_overlap(w_FQK_Q, w_FQK_K)
+        overlap_RQK = calc_overlap(w_RQK_Q, w_RQK_K)
+        overlap_str = f"Q/K Overlap FQK/RQK:{overlap_FQK:.2f}/{overlap_RQK:.2f}"
+
+        return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': overlap_str, 'version': '16.4'}
+
     # v16.3: Complete pool separation (fq_pref exists)
-    if attn.get('fq_pref') is not None:
+    elif attn.get('fq_pref') is not None:
         prefs = {
             'FQ': attn.get('fq_pref'),
             'FK': attn.get('fk_pref'),
