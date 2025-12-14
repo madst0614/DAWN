@@ -29,14 +29,14 @@ model:
 
   # v16.3: Complete Pool Separation
   # Q compression/restoration
-  n_fq: 32
-  n_rq: 32
+  n_fq: 48
+  n_rq: 48
   top_k_fq: 8
   top_k_rq: 8
 
   # K compression/restoration
-  n_fk: 32
-  n_rk: 32
+  n_fk: 48
+  n_rk: 48
   top_k_fk: 8
   top_k_rk: 8
 
@@ -82,8 +82,8 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_3_20M_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_v16_3_20M_c4_5B
 
 # v16.3 Architecture (Complete Q/K/V Pool Separation)
-#   - FQ=32 (k=8), FK=32 (k=8), FV=24 (k=6) -> 88 compression neurons
-#   - RQ=32 (k=8), RK=32 (k=8), RV=24 (k=6) -> 88 restoration neurons
+#   - FQ=48 (k=8), FK=48 (k=8), FV=24 (k=3) -> 120 compression neurons
+#   - RQ=48 (k=8), RK=48 (k=8), RV=24 (k=3) -> 120 restoration neurons
 #   - Knowledge=256 (coarse=40 -> fine=15)
 #   Routing paths:
 #   - Q: x -> FQ -> h_q -> RQ -> Q
