@@ -763,10 +763,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Calculate actual step (for logging and checkpointing)
         step = local_step + start_step
 
-        # Memory monitoring (every 10 steps)
-        if step % 10 == 0 and device.type == 'cuda':
-            print(f"Step {step}: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
-
         input_ids = batch["input_ids"].to(device)
 
         # CLM: labels = input_ids (model does shift internally)
@@ -774,9 +770,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         optimizer.zero_grad()
 
-        # Mixed precision training (disabled for pure fp32 test)
+        # Mixed precision training
         if scaler is not None:
-            with torch.amp.autocast('cuda', enabled=False):
+            with torch.amp.autocast('cuda', enabled=True):
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
