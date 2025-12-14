@@ -758,14 +758,20 @@ def load_data(data_config, max_length=128, batch_size=128, tokenizer_path=None):
         train_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2,
-        collate_fn=collate_fn
+        num_workers=4,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        num_workers=2,
-        collate_fn=collate_fn
+        num_workers=4,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
     )
 
     return train_loader, val_loader, tokenizer
