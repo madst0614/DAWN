@@ -168,6 +168,49 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits
 
+    def get_all_logits(self, x):
+        """한번에 모든 logits 계산 (정규화 1번, projection 통합)"""
+        # 뉴런 임베딩 정규화 (1번만)
+        emb_norm = F.normalize(self.neuron_emb, dim=-1)
+
+        # 모든 projection 한번에
+        h_shared = self.dropout(self.proj(x))  # feature_v, value, knowledge 공용
+        h_FR_Q = self.dropout(self.proj_FR_Q(x))
+        h_FR_K = self.dropout(self.proj_FR_K(x))
+        h_rel_Q = self.dropout(self.proj_rel_Q(x))
+        h_rel_K = self.dropout(self.proj_rel_K(x))
+
+        # 뉴런 임베딩 슬라이스 (view라 비용 없음)
+        fr_emb = emb_norm[:self.feature_r_end]
+        fv_emb = emb_norm[self.feature_r_end:self.feature_v_end]
+        rel_emb = emb_norm[self.feature_v_end:self.relational_end]
+        val_emb = emb_norm[self.relational_end:self.value_end]
+
+        # 각각 자기 영역만 연산
+        logits_FR_Q = torch.einsum('bsd,nd->bsn', h_FR_Q, fr_emb)
+        logits_FR_K = torch.einsum('bsd,nd->bsn', h_FR_K, fr_emb)
+        logits_FV = torch.einsum('bsd,nd->bsn', h_shared, fv_emb)
+        logits_rel_Q = torch.einsum('bsd,nd->bsn', h_rel_Q, rel_emb)
+        logits_rel_K = torch.einsum('bsd,nd->bsn', h_rel_K, rel_emb)
+        logits_val = torch.einsum('bsd,nd->bsn', h_shared, val_emb)
+
+        # Excitability 한번에 적용
+        if self.training:
+            w = self.excitability_weight
+            exc_fr = self.get_excitability(self.usage_ema_feature_r) * w
+            exc_fv = self.get_excitability(self.usage_ema_feature_v) * w
+            exc_rel = self.get_excitability(self.usage_ema_relational) * w
+            exc_val = self.get_excitability(self.usage_ema_value) * w
+
+            logits_FR_Q = logits_FR_Q + exc_fr
+            logits_FR_K = logits_FR_K + exc_fr
+            logits_FV = logits_FV + exc_fv
+            logits_rel_Q = logits_rel_Q + exc_rel
+            logits_rel_K = logits_rel_K + exc_rel
+            logits_val = logits_val + exc_val
+
+        return logits_FR_Q, logits_FR_K, logits_FV, logits_rel_Q, logits_rel_K, logits_val
+
     def update_usage(self, weights, neuron_type, attention_mask=None):
         """top-k 후 선택된 뉴런 사용량 업데이트"""
         if not self.training:
@@ -402,13 +445,9 @@ class GlobalRouters(nn.Module):
         """
         Returns: feature_r_weights_Q, feature_r_weights_K, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
         """
-        # Get logits from unified router (Q/K separated)
-        feature_r_logits_Q = self.neuron_router.get_logits(x, 'feature_r_Q')
-        feature_r_logits_K = self.neuron_router.get_logits(x, 'feature_r_K')
-        feature_v_logits = self.neuron_router.get_logits(x, 'feature_v')
-        relational_logits_Q = self.neuron_router.get_logits(x, 'relational_Q')
-        relational_logits_K = self.neuron_router.get_logits(x, 'relational_K')
-        value_logits = self.neuron_router.get_logits(x, 'value')
+        # Get all logits at once (정규화 1번, 최적화)
+        (feature_r_logits_Q, feature_r_logits_K, feature_v_logits,
+         relational_logits_Q, relational_logits_K, value_logits) = self.neuron_router.get_all_logits(x)
 
         feature_r_pref_Q = F.softmax(feature_r_logits_Q, dim=-1)
         feature_r_pref_K = F.softmax(feature_r_logits_K, dim=-1)
@@ -582,11 +621,12 @@ class NeuronCircuit(nn.Module):
             K = torch.einsum('bsr,bsrd->bsd', h_r_K, shared_relational_K)
             V = torch.einsum('bsr,bsrd->bsd', h_v, shared_value)
         else:
-            # Batch-level routing
-            shared_feature_r_Q = torch.einsum('bn,ndr->bdr', feature_r_weights_Q,
-                                               self.shared_neurons.feature_r_neurons)
-            shared_feature_r_K = torch.einsum('bn,ndr->bdr', feature_r_weights_K,
-                                               self.shared_neurons.feature_r_neurons)
+            # Batch-level routing (Q/K 스택 최적화)
+            # Feature_r: Q/K 스택해서 한번에
+            fr_weights_QK = torch.stack([feature_r_weights_Q, feature_r_weights_K], dim=1)  # [B, 2, N]
+            shared_fr_QK = torch.einsum('bkn,ndr->bkdr', fr_weights_QK, self.shared_neurons.feature_r_neurons)
+            shared_feature_r_Q, shared_feature_r_K = shared_fr_QK[:, 0], shared_fr_QK[:, 1]
+
             shared_feature_v = torch.einsum('bn,ndr->bdr', feature_v_weights,
                                              self.shared_neurons.feature_v_neurons)
 
@@ -594,10 +634,12 @@ class NeuronCircuit(nn.Module):
             h_r_K = torch.einsum('bsd,bdr->bsr', x, shared_feature_r_K)
             h_v = torch.einsum('bsd,bdr->bsr', x, shared_feature_v)
 
+            # Relational: Q/K 스택해서 한번에
             pool_R = self.shared_neurons.relational_neurons
             pool_V = self.shared_neurons.value_neurons
-            shared_relational_Q = torch.einsum('bn,nrd->brd', relational_weights_Q, pool_R)
-            shared_relational_K = torch.einsum('bn,nrd->brd', relational_weights_K, pool_R)
+            rel_weights_QK = torch.stack([relational_weights_Q, relational_weights_K], dim=1)  # [B, 2, N]
+            shared_rel_QK = torch.einsum('bkn,nrd->bkrd', rel_weights_QK, pool_R)
+            shared_relational_Q, shared_relational_K = shared_rel_QK[:, 0], shared_rel_QK[:, 1]
             shared_value = torch.einsum('bn,nrd->brd', value_weights, pool_V)
 
             Q = torch.einsum('bsr,brd->bsd', h_r_Q, shared_relational_Q)
