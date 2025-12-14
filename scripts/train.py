@@ -55,7 +55,7 @@ import math
 # Speed optimization: TF32 and cuDNN settings for Ampere+ GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision('medium')
 
 from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs, get_routing_log_info
