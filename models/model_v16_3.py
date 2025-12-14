@@ -149,31 +149,31 @@ class UnifiedNeuronRouter(nn.Module):
         return logits
 
     def get_all_logits(self, x):
-        """6개 풀 logits를 한 번에 계산 (속도 최적화)"""
-        # 통합 projection 한 번에 계산 후 분할
+        """6개 풀 logits를 한 번에 계산 (stack + single einsum)"""
+        B, S, D = x.shape
+
+        # 6개 projection 한번에 → chunk
         all_proj = self.dropout(self.proj_all(x))  # [B, S, d_space * 6]
         h_fq, h_fk, h_fv, h_rq, h_rk, h_rv = all_proj.chunk(6, dim=-1)
 
+        # stack으로 묶음
+        h_stack = torch.stack([h_fq, h_fk, h_fv, h_rq, h_rk, h_rv], dim=2)  # [B, S, 6, d_space]
+
         # 뉴런 임베딩 정규화 (한 번만)
-        emb_norm = F.normalize(self.neuron_emb, dim=-1)
+        emb_norm = F.normalize(self.neuron_emb, dim=-1)  # [total_neurons, d_space]
 
-        # 각 풀 슬라이스
-        emb_fq = emb_norm[:self.fq_end]
-        emb_fk = emb_norm[self.fq_end:self.fk_end]
-        emb_fv = emb_norm[self.fk_end:self.fv_end]
-        emb_rq = emb_norm[self.fv_end:self.rq_end]
-        emb_rk = emb_norm[self.rq_end:self.rk_end]
-        emb_rv = emb_norm[self.rk_end:self.rv_end]
+        # 한번에 전체 연산
+        all_logits = torch.einsum('bshd,nd->bshn', h_stack, emb_norm)  # [B, S, 6, total_neurons]
 
-        # einsum으로 logits 계산
-        logits_fq = torch.einsum('bsd,nd->bsn', h_fq, emb_fq)
-        logits_fk = torch.einsum('bsd,nd->bsn', h_fk, emb_fk)
-        logits_fv = torch.einsum('bsd,nd->bsn', h_fv, emb_fv)
-        logits_rq = torch.einsum('bsd,nd->bsn', h_rq, emb_rq)
-        logits_rk = torch.einsum('bsd,nd->bsn', h_rk, emb_rk)
-        logits_rv = torch.einsum('bsd,nd->bsn', h_rv, emb_rv)
+        # 각 타입별 자기 영역만 슬라이싱
+        logits_fq = all_logits[:, :, 0, :self.fq_end]
+        logits_fk = all_logits[:, :, 1, self.fq_end:self.fk_end]
+        logits_fv = all_logits[:, :, 2, self.fk_end:self.fv_end]
+        logits_rq = all_logits[:, :, 3, self.fv_end:self.rq_end]
+        logits_rk = all_logits[:, :, 4, self.rq_end:self.rk_end]
+        logits_rv = all_logits[:, :, 5, self.rk_end:self.rv_end]
 
-        # excitability 추가 (training일 때만)
+        # excitability 추가
         if self.training:
             w = self.excitability_weight
             logits_fq = logits_fq + self.get_excitability(self.usage_ema_fq) * w
@@ -453,13 +453,8 @@ class GlobalRouters(nn.Module):
         """
         Returns: fq_weights, fk_weights, fv_weights, rq_weights, rk_weights, rv_weights, routing_info, aux_loss
         """
-        # Get logits individually (v16.2 style - speed test)
-        fq_logits = self.neuron_router.get_logits(x, 'fq')
-        fk_logits = self.neuron_router.get_logits(x, 'fk')
-        fv_logits = self.neuron_router.get_logits(x, 'fv')
-        rq_logits = self.neuron_router.get_logits(x, 'rq')
-        rk_logits = self.neuron_router.get_logits(x, 'rk')
-        rv_logits = self.neuron_router.get_logits(x, 'rv')
+        # Get all logits at once (stack + single einsum)
+        fq_logits, fk_logits, fv_logits, rq_logits, rk_logits, rv_logits = self.neuron_router.get_all_logits(x)
 
         fq_pref = F.softmax(fq_logits, dim=-1)
         fk_pref = F.softmax(fk_logits, dim=-1)
