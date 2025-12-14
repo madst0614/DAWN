@@ -69,8 +69,13 @@ class UnifiedNeuronRouter(nn.Module):
         self.rv_end = n_fq + n_fk + n_fv + n_rq + n_rk + n_rv
         # knowledge는 rv_end ~ total_neurons
 
-        # 통합 projection (6개 → 1개로 최적화)
-        self.proj_all = nn.Linear(d_model, d_space * 6)
+        # 개별 projection (v16.2 스타일 - 속도 테스트용)
+        self.proj_fq = nn.Linear(d_model, d_space)
+        self.proj_fk = nn.Linear(d_model, d_space)
+        self.proj_fv = nn.Linear(d_model, d_space)
+        self.proj_rq = nn.Linear(d_model, d_space)
+        self.proj_rk = nn.Linear(d_model, d_space)
+        self.proj_rv = nn.Linear(d_model, d_space)
         self.proj_knowledge = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
@@ -102,19 +107,46 @@ class UnifiedNeuronRouter(nn.Module):
     def get_logits(self, x, neuron_type):
         """
         x: [B, S, d_model]
-        neuron_type: 'knowledge' only (6개 풀은 get_all_logits 사용)
+        neuron_type: 'fq', 'fk', 'fv', 'rq', 'rk', 'rv', 'knowledge'
         """
-        if neuron_type == 'knowledge':
-            neuron_emb_norm = F.normalize(self.neuron_emb, dim=-1)
+        emb_norm = F.normalize(self.neuron_emb, dim=-1)
+
+        if neuron_type == 'fq':
+            h_proj = self.dropout(self.proj_fq(x))
+            emb = emb_norm[:self.fq_end]
+            usage_ema = self.usage_ema_fq
+        elif neuron_type == 'fk':
+            h_proj = self.dropout(self.proj_fk(x))
+            emb = emb_norm[self.fq_end:self.fk_end]
+            usage_ema = self.usage_ema_fk
+        elif neuron_type == 'fv':
+            h_proj = self.dropout(self.proj_fv(x))
+            emb = emb_norm[self.fk_end:self.fv_end]
+            usage_ema = self.usage_ema_fv
+        elif neuron_type == 'rq':
+            h_proj = self.dropout(self.proj_rq(x))
+            emb = emb_norm[self.fv_end:self.rq_end]
+            usage_ema = self.usage_ema_rq
+        elif neuron_type == 'rk':
+            h_proj = self.dropout(self.proj_rk(x))
+            emb = emb_norm[self.rq_end:self.rk_end]
+            usage_ema = self.usage_ema_rk
+        elif neuron_type == 'rv':
+            h_proj = self.dropout(self.proj_rv(x))
+            emb = emb_norm[self.rk_end:self.rv_end]
+            usage_ema = self.usage_ema_rv
+        elif neuron_type == 'knowledge':
             h_proj = self.dropout(self.proj_knowledge(x))
-            emb = neuron_emb_norm[self.rv_end:]
-            logits = torch.einsum('bsd,nd->bsn', h_proj, emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_knowledge)
-                logits = logits + excitability * self.excitability_weight
-            return logits
+            emb = emb_norm[self.rv_end:]
+            usage_ema = self.usage_ema_knowledge
         else:
-            raise ValueError(f"Use get_all_logits() for {neuron_type}")
+            raise ValueError(f"Unknown neuron_type: {neuron_type}")
+
+        logits = torch.einsum('bsd,nd->bsn', h_proj, emb)
+        if self.training:
+            excitability = self.get_excitability(usage_ema)
+            logits = logits + excitability * self.excitability_weight
+        return logits
 
     def get_all_logits(self, x):
         """6개 풀 logits를 한 번에 계산 (속도 최적화)"""
@@ -421,9 +453,13 @@ class GlobalRouters(nn.Module):
         """
         Returns: fq_weights, fk_weights, fv_weights, rq_weights, rk_weights, rv_weights, routing_info, aux_loss
         """
-        # Get all logits in one call (optimized)
-        fq_logits, fk_logits, fv_logits, rq_logits, rk_logits, rv_logits = \
-            self.neuron_router.get_all_logits(x)
+        # Get logits individually (v16.2 style - speed test)
+        fq_logits = self.neuron_router.get_logits(x, 'fq')
+        fk_logits = self.neuron_router.get_logits(x, 'fk')
+        fv_logits = self.neuron_router.get_logits(x, 'fv')
+        rq_logits = self.neuron_router.get_logits(x, 'rq')
+        rk_logits = self.neuron_router.get_logits(x, 'rk')
+        rv_logits = self.neuron_router.get_logits(x, 'rv')
 
         fq_pref = F.softmax(fq_logits, dim=-1)
         fk_pref = F.softmax(fk_logits, dim=-1)
