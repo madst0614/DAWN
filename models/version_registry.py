@@ -268,6 +268,70 @@ def build_model_kwargs(version: str, config: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
+def build_args_config(args, vocab_size: int) -> Dict[str, Any]:
+    """Build config dict from args object dynamically using VERSION_REGISTRY.
+
+    Extracts all params defined in any version's required_params and optional_params.
+    This is the single source of truth - no need to hardcode params in train.py.
+
+    Args:
+        args: Namespace object with model config attributes
+        vocab_size: Vocabulary size (usually from tokenizer)
+
+    Returns:
+        Config dict ready for build_model_kwargs()
+    """
+    # Collect all param names and defaults from all versions
+    all_params = {}  # param_name -> default_value
+
+    for version_info in VERSION_REGISTRY.values():
+        # Required params (no default, will use None)
+        for param in version_info.get('required_params', []):
+            if param not in all_params:
+                all_params[param] = None
+
+        # Optional params (with defaults)
+        for param, default in version_info.get('optional_params', {}).items():
+            if param not in all_params:
+                all_params[param] = default
+
+    # Build config from args
+    config = {'vocab_size': vocab_size}
+
+    # Special mappings (args attribute name -> config param name)
+    special_mappings = {
+        'basis_rank': 'rank',  # args.basis_rank -> config['rank']
+    }
+
+    for param, default in all_params.items():
+        # Check special mappings first
+        args_attr = None
+        for args_name, config_name in special_mappings.items():
+            if config_name == param:
+                args_attr = args_name
+                break
+
+        if args_attr is None:
+            args_attr = param
+
+        # Get value from args with default
+        if hasattr(args, args_attr):
+            value = getattr(args, args_attr)
+            # Handle None values for optional params
+            if value is None and default is not None:
+                value = default
+            config[param] = value
+        elif hasattr(args, param):
+            value = getattr(args, param)
+            if value is None and default is not None:
+                value = default
+            config[param] = value
+        elif default is not None:
+            config[param] = default
+
+    return config
+
+
 def print_version_info(version: str, args: Dict[str, Any]) -> None:
     """Print version-specific architecture information."""
     version = normalize_version(version)

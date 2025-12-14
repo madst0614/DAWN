@@ -58,7 +58,7 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
 
-from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs, get_routing_log_info
+from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs, build_args_config, get_routing_log_info
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.checkpoint import load_checkpoint_smart, load_optimizer_state, strip_compile_prefix
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
@@ -1807,63 +1807,8 @@ def main():
     # Build model kwargs from args using version_registry
     model_version = getattr(args, 'model_version', '16.1')
 
-    # Build config dict from args for version_registry
-    args_config = {
-        'vocab_size': vocab_size,
-        'd_model': args.d_model,
-        'n_layers': args.n_layers,
-        'n_heads': args.n_heads,
-        'max_seq_len': args.max_seq_len,
-        'dropout': args.dropout,
-        'rank': args.basis_rank,
-        # v16.0/16.1/16.2 params
-        'n_feature_r': getattr(args, 'n_feature_r', 96),
-        'n_feature_v': getattr(args, 'n_feature_v', 24),
-        'n_relational': getattr(args, 'n_relational', 96),
-        'n_value': getattr(args, 'n_value', 16),
-        'top_k_feature_r': getattr(args, 'top_k_feature_r', 12),
-        'top_k_feature_v': getattr(args, 'top_k_feature_v', 3),
-        'top_k_relational': getattr(args, 'top_k_relational', 12),
-        'top_k_value': getattr(args, 'top_k_value', 3),
-        # v16.3 params (complete pool separation)
-        'n_fq': getattr(args, 'n_fq', 32),
-        'n_fk': getattr(args, 'n_fk', 32),
-        'n_fv': getattr(args, 'n_fv', 24),
-        'n_rq': getattr(args, 'n_rq', 32),
-        'n_rk': getattr(args, 'n_rk', 32),
-        'n_rv': getattr(args, 'n_rv', 24),
-        'top_k_fq': getattr(args, 'top_k_fq', 8),
-        'top_k_fk': getattr(args, 'top_k_fk', 8),
-        'top_k_fv': getattr(args, 'top_k_fv', 3),
-        'top_k_rq': getattr(args, 'top_k_rq', 8),
-        'top_k_rk': getattr(args, 'top_k_rk', 8),
-        'top_k_rv': getattr(args, 'top_k_rv', 3),
-        # v16.4 params (shared pool + separate routing)
-        'n_feature_qk': getattr(args, 'n_feature_qk', 96),
-        'n_feature_v': getattr(args, 'n_feature_v', 24),
-        'n_restore_qk': getattr(args, 'n_restore_qk', 96),
-        'n_restore_v': getattr(args, 'n_restore_v', 24),
-        'top_k_feature_qk': getattr(args, 'top_k_feature_qk', 8),
-        'top_k_feature_v': getattr(args, 'top_k_feature_v', 3),
-        'top_k_restore_qk': getattr(args, 'top_k_restore_qk', 8),
-        'top_k_restore_v': getattr(args, 'top_k_restore_v', 3),
-        # Common params
-        'n_knowledge': args.n_knowledge,
-        'coarse_k': args.coarse_k,
-        'fine_k': args.fine_k,
-        'knowledge_rank': args.knowledge_rank or 128,
-        'state_dim': getattr(args, 'state_dim', 64),
-        'd_space': getattr(args, 'd_space', 64),
-        'router_dropout': getattr(args, 'router_dropout', 0.1),
-        'token_routing': getattr(args, 'token_routing', False),
-        'use_ssm_context': getattr(args, 'use_ssm_context', True),
-        'gradient_checkpointing': args.gradient_checkpointing,
-        'excitability_tau': getattr(args, 'excitability_tau', 1.5),
-        'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
-        'excitability_decay_rate': getattr(args, 'excitability_decay_rate', 0.99995),
-        'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
-        'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
-    }
+    # Build config dict dynamically from VERSION_REGISTRY (single source of truth)
+    args_config = build_args_config(args, vocab_size)
 
     # Use version_registry to build model_kwargs with correct params for version
     model_kwargs = build_model_kwargs(model_version, args_config)
