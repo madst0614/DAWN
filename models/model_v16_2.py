@@ -1,21 +1,21 @@
 """
 DAWN v16_2: Full Q/K Projection Separation
 
-v16 기반 + Feature_R과 Relational 모두 Q/K projection 분리:
-- proj_FR_Q, proj_FR_K: Feature_R Q/K용 별도 projection
-- proj_rel_Q, proj_rel_K: Relational Q/K용 별도 projection
+v16 기반 + Feature_QK과 Restore_QK 모두 Q/K projection 분리:
+- proj_FR_Q, proj_FR_K: Feature_QK Q/K용 별도 projection
+- proj_rel_Q, proj_rel_K: Restore_QK Q/K용 별도 projection
 
 v16의 문제:
-- Feature_R이 Q/K에 같은 neuron 선택 → 같은 compression
-- relational_Q와 relational_K도 같은 proj 사용
+- Feature_QK이 Q/K에 같은 neuron 선택 → 같은 compression
+- restore_qk_Q와 restore_qk_K도 같은 proj 사용
 
 Architecture (Split-FRVK v16_2):
-- Feature_R_Q: proj_FR_Q(x) → Q compression routing
-- Feature_R_K: proj_FR_K(x) → K compression routing
+- Feature_QK_Q: proj_FR_Q(x) → Q compression routing
+- Feature_QK_K: proj_FR_K(x) → K compression routing
 - Feature_V: x → low-rank projection → h_v [V compression]
-- Relational Q: proj_rel_Q(x) → Q expansion routing
-- Relational K: proj_rel_K(x) → K expansion routing
-- Value: V generation from h_v
+- Restore_QK Q: proj_rel_Q(x) → Q expansion routing
+- Restore_QK K: proj_rel_K(x) → K expansion routing
+- Restore_V: V generation from h_v
 - Knowledge: 2-stage retrieval (same as v15)
 """
 
@@ -38,30 +38,30 @@ class UnifiedNeuronRouter(nn.Module):
     """
     v16: Split Feature R/V routing
 
-    모든 뉴런(feature_r, feature_v, relational, value, knowledge)이 같은 공간에 존재.
+    모든 뉴런(feature_qk, feature_v, restore_qk, value, knowledge)이 같은 공간에 존재.
     Feature가 R(QK용)과 V용으로 분리됨.
     """
-    def __init__(self, d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
+    def __init__(self, d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v, n_knowledge,
                  d_space=64, dropout=0.1, excitability_tau=1.5, excitability_ema_alpha=0.01,
                  excitability_decay_rate=0.99995):
         super().__init__()
-        self.n_feature_r = n_feature_r
+        self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
-        self.n_relational = n_relational
-        self.n_value = n_value
+        self.n_restore_qk = n_restore_qk
+        self.n_restore_v = n_restore_v
         self.n_knowledge = n_knowledge
         self.d_space = d_space
         self.ema_alpha = excitability_ema_alpha
 
-        total_neurons = n_feature_r + n_feature_v + n_relational + n_value + n_knowledge
+        total_neurons = n_feature_qk + n_feature_v + n_restore_qk + n_restore_v + n_knowledge
         self.total_neurons = total_neurons
 
         # 인덱스 경계
-        self.feature_r_end = n_feature_r
-        self.feature_v_end = n_feature_r + n_feature_v
-        self.relational_end = n_feature_r + n_feature_v + n_relational
-        self.value_end = n_feature_r + n_feature_v + n_relational + n_value
-        # knowledge는 value_end ~ total_neurons
+        self.feature_qk_end = n_feature_qk
+        self.feature_v_end = n_feature_qk + n_feature_v
+        self.restore_qk_end = n_feature_qk + n_feature_v + n_restore_qk
+        self.restore_v_end = n_feature_qk + n_feature_v + n_restore_qk + n_restore_v
+        # knowledge는 restore_v_end ~ total_neurons
 
         # 통합 projection (shared, FR_Q, FR_K, rel_Q, rel_K)
         self.proj_all = nn.Linear(d_model, d_space * 5)
@@ -71,10 +71,10 @@ class UnifiedNeuronRouter(nn.Module):
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
         # 타입별 usage 추적
-        self.register_buffer('usage_ema_feature_r', torch.zeros(n_feature_r))
+        self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
         self.register_buffer('usage_ema_feature_v', torch.zeros(n_feature_v))
-        self.register_buffer('usage_ema_relational', torch.zeros(n_relational))
-        self.register_buffer('usage_ema_value', torch.zeros(n_value))
+        self.register_buffer('usage_ema_restore_qk', torch.zeros(n_restore_qk))
+        self.register_buffer('usage_ema_restore_v', torch.zeros(n_restore_v))
         self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
 
         # Excitability: tau (recovery time constant) + decaying weight
@@ -98,7 +98,7 @@ class UnifiedNeuronRouter(nn.Module):
         emb_norm = F.normalize(self.neuron_emb, dim=-1)
         # knowledge는 shared projection 사용 → proj_all의 첫번째 chunk
         h_shared = self.dropout(self.proj_all(x).chunk(5, dim=-1)[0])
-        knowledge_emb = emb_norm[self.value_end:]
+        knowledge_emb = emb_norm[self.restore_v_end:]
 
         logits = torch.einsum('bsd,nd->bsn', h_shared, knowledge_emb)
         if self.training:
@@ -116,10 +116,10 @@ class UnifiedNeuronRouter(nn.Module):
         h_shared, h_FR_Q, h_FR_K, h_rel_Q, h_rel_K = all_proj.chunk(5, dim=-1)
 
         # 뉴런 임베딩 슬라이스 (view라 비용 없음)
-        fr_emb = emb_norm[:self.feature_r_end]
-        fv_emb = emb_norm[self.feature_r_end:self.feature_v_end]
-        rel_emb = emb_norm[self.feature_v_end:self.relational_end]
-        val_emb = emb_norm[self.relational_end:self.value_end]
+        fr_emb = emb_norm[:self.feature_qk_end]
+        fv_emb = emb_norm[self.feature_qk_end:self.feature_v_end]
+        rel_emb = emb_norm[self.feature_v_end:self.restore_qk_end]
+        restore_v_emb = emb_norm[self.restore_qk_end:self.restore_v_end]
 
         # 각각 자기 영역만 연산
         logits_FR_Q = torch.einsum('bsd,nd->bsn', h_FR_Q, fr_emb)
@@ -127,24 +127,24 @@ class UnifiedNeuronRouter(nn.Module):
         logits_FV = torch.einsum('bsd,nd->bsn', h_shared, fv_emb)
         logits_rel_Q = torch.einsum('bsd,nd->bsn', h_rel_Q, rel_emb)
         logits_rel_K = torch.einsum('bsd,nd->bsn', h_rel_K, rel_emb)
-        logits_val = torch.einsum('bsd,nd->bsn', h_shared, val_emb)
+        logits_restore_v = torch.einsum('bsd,nd->bsn', h_shared, restore_v_emb)
 
         # Excitability 한번에 적용
         if self.training:
             w = self.excitability_weight
-            exc_fr = self.get_excitability(self.usage_ema_feature_r) * w
+            exc_fr = self.get_excitability(self.usage_ema_feature_qk) * w
             exc_fv = self.get_excitability(self.usage_ema_feature_v) * w
-            exc_rel = self.get_excitability(self.usage_ema_relational) * w
-            exc_val = self.get_excitability(self.usage_ema_value) * w
+            exc_rel = self.get_excitability(self.usage_ema_restore_qk) * w
+            exc_restore_v = self.get_excitability(self.usage_ema_restore_v) * w
 
             logits_FR_Q = logits_FR_Q + exc_fr
             logits_FR_K = logits_FR_K + exc_fr
             logits_FV = logits_FV + exc_fv
             logits_rel_Q = logits_rel_Q + exc_rel
             logits_rel_K = logits_rel_K + exc_rel
-            logits_val = logits_val + exc_val
+            logits_restore_v = logits_restore_v + exc_restore_v
 
-        return logits_FR_Q, logits_FR_K, logits_FV, logits_rel_Q, logits_rel_K, logits_val
+        return logits_FR_Q, logits_FR_K, logits_FV, logits_rel_Q, logits_rel_K, logits_restore_v
 
     def update_usage(self, weights, neuron_type, attention_mask=None):
         """top-k 후 선택된 뉴런 사용량 업데이트"""
@@ -165,14 +165,14 @@ class UnifiedNeuronRouter(nn.Module):
 
         # In-place update to avoid memory leak from buffer reassignment
         decay = 1 - self.ema_alpha
-        if neuron_type == 'feature_r':
-            self.usage_ema_feature_r.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        if neuron_type == 'feature_qk':
+            self.usage_ema_feature_qk.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif neuron_type == 'feature_v':
             self.usage_ema_feature_v.mul_(decay).add_(usage, alpha=self.ema_alpha)
-        elif neuron_type == 'relational':
-            self.usage_ema_relational.mul_(decay).add_(usage, alpha=self.ema_alpha)
-        elif neuron_type == 'value':
-            self.usage_ema_value.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        elif neuron_type == 'restore_qk':
+            self.usage_ema_restore_qk.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        elif neuron_type == 'restore_v':
+            self.usage_ema_restore_v.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif neuron_type == 'knowledge':
             self.usage_ema_knowledge.mul_(decay).add_(usage, alpha=self.ema_alpha)
 
@@ -181,20 +181,20 @@ class SharedNeurons(nn.Module):
     """
     v16: Split Feature R/V neurons (rank matrix)
 
-    Feature_R: [n_feature_r, d_model, rank] - Q/K compression
+    Feature_QK: [n_feature_qk, d_model, rank] - Q/K compression
     Feature_V: [n_feature_v, d_model, rank] - V compression
-    Relational: [n_relational, rank, d_model] - Q/K expansion
-    Value: [n_value, rank, d_model] - V expansion
+    Restore_QK: [n_restore_qk, rank, d_model] - Q/K expansion
+    Restore_V: [n_restore_v, rank, d_model] - V expansion
     Knowledge: 2-stage retrieval
     """
     def __init__(
         self,
         d_model: int,
         rank: int,
-        n_feature_r: int,
+        n_feature_qk: int,
         n_feature_v: int,
-        n_relational: int,
-        n_value: int,
+        n_restore_qk: int,
+        n_restore_v: int,
         n_knowledge: int,
         knowledge_rank: int = None,
     ):
@@ -202,19 +202,19 @@ class SharedNeurons(nn.Module):
         self.d_model = d_model
         self.rank = rank
         self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
-        self.n_feature_r = n_feature_r
+        self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
-        self.n_relational = n_relational
-        self.n_value = n_value
+        self.n_restore_qk = n_restore_qk
+        self.n_restore_v = n_restore_v
         self.n_knowledge = n_knowledge
 
         # Split Feature pools (rank matrix)
-        self.feature_r_neurons = nn.Parameter(torch.zeros(n_feature_r, d_model, rank))
+        self.feature_qk_neurons = nn.Parameter(torch.zeros(n_feature_qk, d_model, rank))
         self.feature_v_neurons = nn.Parameter(torch.zeros(n_feature_v, d_model, rank))
 
         # Expand pools (rank matrix)
-        self.relational_neurons = nn.Parameter(torch.zeros(n_relational, rank, d_model))
-        self.value_neurons = nn.Parameter(torch.zeros(n_value, rank, d_model))
+        self.restore_qk_neurons = nn.Parameter(torch.zeros(n_restore_qk, rank, d_model))
+        self.restore_v_neurons = nn.Parameter(torch.zeros(n_restore_v, rank, d_model))
 
         # Knowledge neurons
         self.knowledge_neurons_K = nn.Parameter(torch.zeros(n_knowledge, self.knowledge_rank))
@@ -223,14 +223,14 @@ class SharedNeurons(nn.Module):
         self._init_parameters()
 
     def _init_parameters(self):
-        for i in range(self.n_feature_r):
-            nn.init.orthogonal_(self.feature_r_neurons.data[i])
+        for i in range(self.n_feature_qk):
+            nn.init.orthogonal_(self.feature_qk_neurons.data[i])
         for i in range(self.n_feature_v):
             nn.init.orthogonal_(self.feature_v_neurons.data[i])
-        for i in range(self.n_relational):
-            nn.init.orthogonal_(self.relational_neurons.data[i])
-        for i in range(self.n_value):
-            nn.init.orthogonal_(self.value_neurons.data[i])
+        for i in range(self.n_restore_qk):
+            nn.init.orthogonal_(self.restore_qk_neurons.data[i])
+        for i in range(self.n_restore_v):
+            nn.init.orthogonal_(self.restore_v_neurons.data[i])
         nn.init.normal_(self.knowledge_neurons_K, std=0.02)
         nn.init.normal_(self.knowledge_neurons_V, std=0.02)
 
@@ -337,33 +337,33 @@ class GlobalRouters(nn.Module):
     """
     v16: Split Feature R/V routing
 
-    - feature_r: [B, S, n_feature_r] → Q/K compression
+    - feature_qk: [B, S, n_feature_qk] → Q/K compression
     - feature_v: [B, S, n_feature_v] → V compression
-    - relational Q/K: Q/K expansion
+    - restore_qk Q/K: Q/K expansion
     - value: V expansion
     """
-    def __init__(self, d_model: int, n_feature_r: int, n_feature_v: int,
-                 n_relational: int, n_value: int, n_knowledge: int,
-                 top_k_feature_r: int = 8, top_k_feature_v: int = 8,
-                 top_k_relational: int = 4, top_k_value: int = 6,
+    def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
+                 n_restore_qk: int, n_restore_v: int, n_knowledge: int,
+                 top_k_feature_qk: int = 8, top_k_feature_v: int = 8,
+                 top_k_restore_qk: int = 4, top_k_restore_v: int = 6,
                  d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False,
                  excitability_tau: float = 1.5, excitability_ema_alpha: float = 0.01,
                  excitability_decay_rate: float = 0.99995):
         super().__init__()
         self.d_model = d_model
-        self.n_feature_r = n_feature_r
+        self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
-        self.n_relational = n_relational
-        self.n_value = n_value
+        self.n_restore_qk = n_restore_qk
+        self.n_restore_v = n_restore_v
         self.n_knowledge = n_knowledge
-        self.top_k_feature_r = top_k_feature_r
+        self.top_k_feature_qk = top_k_feature_qk
         self.top_k_feature_v = top_k_feature_v
-        self.top_k_relational = top_k_relational
-        self.top_k_value = top_k_value
+        self.top_k_restore_qk = top_k_restore_qk
+        self.top_k_restore_v = top_k_restore_v
         self.token_routing = token_routing
 
         self.neuron_router = UnifiedNeuronRouter(
-            d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
+            d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v, n_knowledge,
             d_space=d_space, dropout=router_dropout,
             excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
             excitability_decay_rate=excitability_decay_rate
@@ -378,18 +378,18 @@ class GlobalRouters(nn.Module):
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         """
-        Returns: feature_r_weights_Q, feature_r_weights_K, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
+        Returns: feature_qk_weights_Q, feature_qk_weights_K, feature_v_weights, restore_qk_weights_Q, restore_qk_weights_K, restore_v_weights, routing_info, aux_loss
         """
         # Get all logits at once (정규화 1번, 최적화)
-        (feature_r_logits_Q, feature_r_logits_K, feature_v_logits,
-         relational_logits_Q, relational_logits_K, value_logits) = self.neuron_router.get_all_logits(x)
+        (feature_qk_logits_Q, feature_qk_logits_K, feature_v_logits,
+         restore_qk_logits_Q, restore_qk_logits_K, restore_v_logits) = self.neuron_router.get_all_logits(x)
 
-        feature_r_pref_Q = F.softmax(feature_r_logits_Q, dim=-1)
-        feature_r_pref_K = F.softmax(feature_r_logits_K, dim=-1)
+        feature_qk_pref_Q = F.softmax(feature_qk_logits_Q, dim=-1)
+        feature_qk_pref_K = F.softmax(feature_qk_logits_K, dim=-1)
         feature_v_pref = F.softmax(feature_v_logits, dim=-1)
-        relational_pref_Q = F.softmax(relational_logits_Q, dim=-1)
-        relational_pref_K = F.softmax(relational_logits_K, dim=-1)
-        value_pref = F.softmax(value_logits, dim=-1)
+        restore_qk_pref_Q = F.softmax(restore_qk_logits_Q, dim=-1)
+        restore_qk_pref_K = F.softmax(restore_qk_logits_K, dim=-1)
+        restore_v_pref = F.softmax(restore_v_logits, dim=-1)
 
         # Compute aux_loss
         aux_loss = 0.0
@@ -397,94 +397,94 @@ class GlobalRouters(nn.Module):
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(-1).float()
                 count = mask.sum() + 1e-8
-                usage_FR_Q = (feature_r_pref_Q * mask).sum(dim=(0, 1)) / count
-                usage_FR_K = (feature_r_pref_K * mask).sum(dim=(0, 1)) / count
+                usage_FR_Q = (feature_qk_pref_Q * mask).sum(dim=(0, 1)) / count
+                usage_FR_K = (feature_qk_pref_K * mask).sum(dim=(0, 1)) / count
                 usage_FV = (feature_v_pref * mask).sum(dim=(0, 1)) / count
-                usage_rel_Q = (relational_pref_Q * mask).sum(dim=(0, 1)) / count
-                usage_rel_K = (relational_pref_K * mask).sum(dim=(0, 1)) / count
-                usage_V = (value_pref * mask).sum(dim=(0, 1)) / count
+                usage_rel_Q = (restore_qk_pref_Q * mask).sum(dim=(0, 1)) / count
+                usage_rel_K = (restore_qk_pref_K * mask).sum(dim=(0, 1)) / count
+                usage_restore_v = (restore_v_pref * mask).sum(dim=(0, 1)) / count
             else:
-                usage_FR_Q = feature_r_pref_Q.mean(dim=(0, 1))
-                usage_FR_K = feature_r_pref_K.mean(dim=(0, 1))
+                usage_FR_Q = feature_qk_pref_Q.mean(dim=(0, 1))
+                usage_FR_K = feature_qk_pref_K.mean(dim=(0, 1))
                 usage_FV = feature_v_pref.mean(dim=(0, 1))
-                usage_rel_Q = relational_pref_Q.mean(dim=(0, 1))
-                usage_rel_K = relational_pref_K.mean(dim=(0, 1))
-                usage_V = value_pref.mean(dim=(0, 1))
+                usage_rel_Q = restore_qk_pref_Q.mean(dim=(0, 1))
+                usage_rel_K = restore_qk_pref_K.mean(dim=(0, 1))
+                usage_restore_v = restore_v_pref.mean(dim=(0, 1))
 
-            target_FR = 1.0 / self.n_feature_r
-            aux_loss = aux_loss + ((usage_FR_Q - target_FR) ** 2).sum() * self.n_feature_r
-            aux_loss = aux_loss + ((usage_FR_K - target_FR) ** 2).sum() * self.n_feature_r
+            target_FR = 1.0 / self.n_feature_qk
+            aux_loss = aux_loss + ((usage_FR_Q - target_FR) ** 2).sum() * self.n_feature_qk
+            aux_loss = aux_loss + ((usage_FR_K - target_FR) ** 2).sum() * self.n_feature_qk
 
             target_FV = 1.0 / self.n_feature_v
             aux_loss = aux_loss + ((usage_FV - target_FV) ** 2).sum() * self.n_feature_v
 
-            target_R = 1.0 / self.n_relational
-            aux_loss = aux_loss + ((usage_rel_Q - target_R) ** 2).sum() * self.n_relational
-            aux_loss = aux_loss + ((usage_rel_K - target_R) ** 2).sum() * self.n_relational
+            target_R = 1.0 / self.n_restore_qk
+            aux_loss = aux_loss + ((usage_rel_Q - target_R) ** 2).sum() * self.n_restore_qk
+            aux_loss = aux_loss + ((usage_rel_K - target_R) ** 2).sum() * self.n_restore_qk
 
-            target_V = 1.0 / self.n_value
-            aux_loss = aux_loss + ((usage_V - target_V) ** 2).sum() * self.n_value
+            target_V = 1.0 / self.n_restore_v
+            aux_loss = aux_loss + ((usage_restore_v - target_V) ** 2).sum() * self.n_restore_v
 
         if self.token_routing:
-            feature_r_weights_Q = feature_r_pref_Q
-            feature_r_weights_K = feature_r_pref_K
+            feature_qk_weights_Q = feature_qk_pref_Q
+            feature_qk_weights_K = feature_qk_pref_K
             feature_v_weights = feature_v_pref
-            relational_weights_Q = relational_pref_Q
-            relational_weights_K = relational_pref_K
-            value_weights = value_pref
+            restore_qk_weights_Q = restore_qk_pref_Q
+            restore_qk_weights_K = restore_qk_pref_K
+            restore_v_weights = restore_v_pref
 
             routing_info = {
-                'feature_r_weights_Q': feature_r_weights_Q.detach(),
-                'feature_r_weights_K': feature_r_weights_K.detach(),
+                'feature_qk_weights_Q': feature_qk_weights_Q.detach(),
+                'feature_qk_weights_K': feature_qk_weights_K.detach(),
                 'feature_v_weights': feature_v_weights.detach(),
-                'relational_weights_Q': relational_weights_Q.detach(),
-                'relational_weights_K': relational_weights_K.detach(),
-                'value_weights': value_weights.detach(),
+                'restore_qk_weights_Q': restore_qk_weights_Q.detach(),
+                'restore_qk_weights_K': restore_qk_weights_K.detach(),
+                'restore_v_weights': restore_v_weights.detach(),
                 'token_routing': True,
             }
         else:
             # Batch-level routing
-            feature_r_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, feature_r_pref_Q)
-            feature_r_weights_K_dense = torch.einsum('bs,bsn->bn', importance, feature_r_pref_K)
+            feature_qk_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, feature_qk_pref_Q)
+            feature_qk_weights_K_dense = torch.einsum('bs,bsn->bn', importance, feature_qk_pref_K)
             feature_v_weights_dense = torch.einsum('bs,bsn->bn', importance, feature_v_pref)
-            relational_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_Q)
-            relational_weights_K_dense = torch.einsum('bs,bsn->bn', importance, relational_pref_K)
-            value_weights_dense = torch.einsum('bs,bsn->bn', importance, value_pref)
+            restore_qk_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, restore_qk_pref_Q)
+            restore_qk_weights_K_dense = torch.einsum('bs,bsn->bn', importance, restore_qk_pref_K)
+            restore_v_weights_dense = torch.einsum('bs,bsn->bn', importance, restore_v_pref)
 
-            feature_r_weights_Q, _ = self._topk_sparsify(feature_r_weights_Q_dense, self.top_k_feature_r)
-            feature_r_weights_K, _ = self._topk_sparsify(feature_r_weights_K_dense, self.top_k_feature_r)
+            feature_qk_weights_Q, _ = self._topk_sparsify(feature_qk_weights_Q_dense, self.top_k_feature_qk)
+            feature_qk_weights_K, _ = self._topk_sparsify(feature_qk_weights_K_dense, self.top_k_feature_qk)
             feature_v_weights, _ = self._topk_sparsify(feature_v_weights_dense, self.top_k_feature_v)
-            relational_weights_Q, _ = self._topk_sparsify(relational_weights_Q_dense, self.top_k_relational)
-            relational_weights_K, _ = self._topk_sparsify(relational_weights_K_dense, self.top_k_relational)
-            value_weights, _ = self._topk_sparsify(value_weights_dense, self.top_k_value)
+            restore_qk_weights_Q, _ = self._topk_sparsify(restore_qk_weights_Q_dense, self.top_k_restore_qk)
+            restore_qk_weights_K, _ = self._topk_sparsify(restore_qk_weights_K_dense, self.top_k_restore_qk)
+            restore_v_weights, _ = self._topk_sparsify(restore_v_weights_dense, self.top_k_restore_v)
 
             routing_info = {
-                'feature_r_weights_Q': feature_r_weights_Q.detach(),
-                'feature_r_weights_K': feature_r_weights_K.detach(),
+                'feature_qk_weights_Q': feature_qk_weights_Q.detach(),
+                'feature_qk_weights_K': feature_qk_weights_K.detach(),
                 'feature_v_weights': feature_v_weights.detach(),
-                'relational_weights_Q': relational_weights_Q.detach(),
-                'relational_weights_K': relational_weights_K.detach(),
-                'value_weights': value_weights.detach(),
+                'restore_qk_weights_Q': restore_qk_weights_Q.detach(),
+                'restore_qk_weights_K': restore_qk_weights_K.detach(),
+                'restore_v_weights': restore_v_weights.detach(),
                 # v16.2: split feature prefs
-                'feature_r_q_pref': feature_r_pref_Q.detach(),
-                'feature_r_k_pref': feature_r_pref_K.detach(),
+                'feature_qk_q_pref': feature_qk_pref_Q.detach(),
+                'feature_qk_k_pref': feature_qk_pref_K.detach(),
                 'feature_v_pref': feature_v_pref.detach(),
-                'relational_q_pref': relational_pref_Q.detach(),
-                'relational_k_pref': relational_pref_K.detach(),
-                'value_pref': value_pref.detach(),
+                'restore_qk_q_pref': restore_qk_pref_Q.detach(),
+                'restore_qk_k_pref': restore_qk_pref_K.detach(),
+                'restore_v_pref': restore_v_pref.detach(),
                 'token_routing': False,
             }
 
         # Update usage statistics
         if self.training:
-            feature_r_used = ((feature_r_weights_Q > 0) | (feature_r_weights_K > 0)).float()
-            self.neuron_router.update_usage(feature_r_used, 'feature_r', attention_mask)
+            feature_qk_used = ((feature_qk_weights_Q > 0) | (feature_qk_weights_K > 0)).float()
+            self.neuron_router.update_usage(feature_qk_used, 'feature_qk', attention_mask)
             self.neuron_router.update_usage(feature_v_weights, 'feature_v', attention_mask)
-            self.neuron_router.update_usage(value_weights, 'value', attention_mask)
-            relational_used = ((relational_weights_Q > 0) | (relational_weights_K > 0)).float()
-            self.neuron_router.update_usage(relational_used, 'relational', attention_mask)
+            self.neuron_router.update_usage(restore_v_weights, 'restore_v', attention_mask)
+            restore_qk_used = ((restore_qk_weights_Q > 0) | (restore_qk_weights_K > 0)).float()
+            self.neuron_router.update_usage(restore_qk_used, 'restore_qk', attention_mask)
 
-        return feature_r_weights_Q, feature_r_weights_K, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, routing_info, aux_loss
+        return feature_qk_weights_Q, feature_qk_weights_K, feature_v_weights, restore_qk_weights_Q, restore_qk_weights_K, restore_v_weights, routing_info, aux_loss
 
 
 class NeuronCircuit(nn.Module):
@@ -492,11 +492,11 @@ class NeuronCircuit(nn.Module):
     v16.2: Attention circuit with Full Q/K Separation
 
     Flow:
-    1. x → feature_r_Q_neurons → h_r_Q [Q compression]
-    2. x → feature_r_K_neurons → h_r_K [K compression]
+    1. x → feature_qk_Q_neurons → h_r_Q [Q compression]
+    2. x → feature_qk_K_neurons → h_r_K [K compression]
     3. x → feature_v_neurons → h_v [V compression]
-    4. h_r_Q → relational_Q → Q
-    5. h_r_K → relational_K → K
+    4. h_r_Q → restore_qk_Q → Q
+    5. h_r_K → restore_qk_K → K
     6. h_v → value → V
     7. Multi-head attention
     """
@@ -519,41 +519,41 @@ class NeuronCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, feature_r_weights_Q, feature_r_weights_K, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, attention_mask=None):
+    def forward(self, x, feature_qk_weights_Q, feature_qk_weights_K, feature_v_weights, restore_qk_weights_Q, restore_qk_weights_K, restore_v_weights, attention_mask=None):
         B, S, D = x.shape
         R = self.rank
-        token_routing = feature_r_weights_Q.dim() == 3
+        token_routing = feature_qk_weights_Q.dim() == 3
 
         if token_routing:
             # Token-level routing (유지 - 사용 안함)
-            shared_feature_r_Q = torch.einsum('bsn,ndr->bsdr', feature_r_weights_Q,
-                                               self.shared_neurons.feature_r_neurons)
-            shared_feature_r_K = torch.einsum('bsn,ndr->bsdr', feature_r_weights_K,
-                                               self.shared_neurons.feature_r_neurons)
+            shared_feature_qk_Q = torch.einsum('bsn,ndr->bsdr', feature_qk_weights_Q,
+                                               self.shared_neurons.feature_qk_neurons)
+            shared_feature_qk_K = torch.einsum('bsn,ndr->bsdr', feature_qk_weights_K,
+                                               self.shared_neurons.feature_qk_neurons)
             shared_feature_v = torch.einsum('bsn,ndr->bsdr', feature_v_weights,
                                              self.shared_neurons.feature_v_neurons)
 
-            h_r_Q = torch.einsum('bsd,bsdr->bsr', x, shared_feature_r_Q)
-            h_r_K = torch.einsum('bsd,bsdr->bsr', x, shared_feature_r_K)
+            h_r_Q = torch.einsum('bsd,bsdr->bsr', x, shared_feature_qk_Q)
+            h_r_K = torch.einsum('bsd,bsdr->bsr', x, shared_feature_qk_K)
             h_v = torch.einsum('bsd,bsdr->bsr', x, shared_feature_v)
 
-            pool_R = self.shared_neurons.relational_neurons
-            pool_V = self.shared_neurons.value_neurons
-            shared_relational_Q = torch.einsum('bsn,nrd->bsrd', relational_weights_Q, pool_R)
-            shared_relational_K = torch.einsum('bsn,nrd->bsrd', relational_weights_K, pool_R)
-            shared_value = torch.einsum('bsn,nrd->bsrd', value_weights, pool_V)
+            pool_R = self.shared_neurons.restore_qk_neurons
+            pool_restore_v = self.shared_neurons.restore_v_neurons
+            shared_restore_qk_Q = torch.einsum('bsn,nrd->bsrd', restore_qk_weights_Q, pool_R)
+            shared_restore_qk_K = torch.einsum('bsn,nrd->bsrd', restore_qk_weights_K, pool_R)
+            shared_restore_v = torch.einsum('bsn,nrd->bsrd', restore_v_weights, pool_restore_v)
 
-            Q = torch.einsum('bsr,bsrd->bsd', h_r_Q, shared_relational_Q)
-            K = torch.einsum('bsr,bsrd->bsd', h_r_K, shared_relational_K)
-            V = torch.einsum('bsr,bsrd->bsd', h_v, shared_value)
+            Q = torch.einsum('bsr,bsrd->bsd', h_r_Q, shared_restore_qk_Q)
+            K = torch.einsum('bsr,bsrd->bsd', h_r_K, shared_restore_qk_K)
+            V = torch.einsum('bsr,bsrd->bsd', h_v, shared_restore_v)
         else:
             # Batch-level routing - matmul 최적화
 
-            # Feature_R neurons: [N, D, R] → [N, D*R]
-            fr_flat = self.shared_neurons.feature_r_neurons.view(-1, D * R)
+            # Feature_QK neurons: [N, D, R] → [N, D*R]
+            fr_flat = self.shared_neurons.feature_qk_neurons.view(-1, D * R)
             # Q/K weights @ flattened neurons → reshape
-            shared_fr_Q = (feature_r_weights_Q @ fr_flat).view(B, D, R)
-            shared_fr_K = (feature_r_weights_K @ fr_flat).view(B, D, R)
+            shared_fr_Q = (feature_qk_weights_Q @ fr_flat).view(B, D, R)
+            shared_fr_K = (feature_qk_weights_K @ fr_flat).view(B, D, R)
 
             # Feature_V neurons
             fv_flat = self.shared_neurons.feature_v_neurons.view(-1, D * R)
@@ -564,14 +564,14 @@ class NeuronCircuit(nn.Module):
             h_r_K = torch.bmm(x, shared_fr_K)
             h_v = torch.bmm(x, shared_fv)
 
-            # Relational neurons: [N, R, D] → [N, R*D]
-            rel_flat = self.shared_neurons.relational_neurons.view(-1, R * D)
-            shared_rel_Q = (relational_weights_Q @ rel_flat).view(B, R, D)
-            shared_rel_K = (relational_weights_K @ rel_flat).view(B, R, D)
+            # Restore_QK neurons: [N, R, D] → [N, R*D]
+            rel_flat = self.shared_neurons.restore_qk_neurons.view(-1, R * D)
+            shared_rel_Q = (restore_qk_weights_Q @ rel_flat).view(B, R, D)
+            shared_rel_K = (restore_qk_weights_K @ rel_flat).view(B, R, D)
 
             # Value neurons
-            val_flat = self.shared_neurons.value_neurons.view(-1, R * D)
-            shared_val = (value_weights @ val_flat).view(B, R, D)
+            val_flat = self.shared_neurons.restore_v_neurons.view(-1, R * D)
+            shared_val = (restore_v_weights @ val_flat).view(B, R, D)
 
             # Restoration: bmm
             Q = torch.bmm(h_r_Q, shared_rel_Q)  # [B, S, D]
@@ -700,10 +700,10 @@ class DAWNBlock(nn.Module):
 
     def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder, attention_mask=None):
         normed_x = self.norm1(x)
-        feature_r_w_Q, feature_r_w_K, feature_v_w, relational_Q, relational_K, value_w, attn_routing, attn_aux_loss = \
+        feature_qk_w_Q, feature_qk_w_K, feature_v_w, restore_qk_Q, restore_qk_K, value_w, attn_routing, attn_aux_loss = \
             global_routers.get_attention_weights(normed_x, importance, attention_mask)
 
-        attn_out, _ = self.attn(normed_x, feature_r_w_Q, feature_r_w_K, feature_v_w, relational_Q, relational_K, value_w, attention_mask)
+        attn_out, _ = self.attn(normed_x, feature_qk_w_Q, feature_qk_w_K, feature_v_w, restore_qk_Q, restore_qk_K, value_w, attention_mask)
         x = x + attn_out
 
         normed_x2 = self.norm2(x)
@@ -727,15 +727,15 @@ class DAWN(nn.Module):
     """
     DAWN v16.2: Full Q/K Projection Separation
 
-    v16 기반 + Feature_R과 Relational 모두 Q/K projection 분리:
-    - Feature_R_Q/K: 별도 projection으로 Q/K compression routing 분리
-    - Relational_Q/K: 별도 projection으로 Q/K expansion routing 분리
+    v16 기반 + Feature_QK과 Restore_QK 모두 Q/K projection 분리:
+    - Feature_QK_Q/K: 별도 projection으로 Q/K compression routing 분리
+    - Restore_QK_Q/K: 별도 projection으로 Q/K expansion routing 분리
 
     Architecture:
-    - Feature_R: [n_feature_r, d_model, rank] - Q/K용 별도 routing
+    - Feature_QK: [n_feature_qk, d_model, rank] - Q/K용 별도 routing
     - Feature_V: [n_feature_v, d_model, rank] - V 압축
-    - Relational: [n_relational, rank, d_model] - Q/K용 별도 routing
-    - Value: [n_value, rank, d_model] - V expansion
+    - Restore_QK: [n_restore_qk, rank, d_model] - Q/K용 별도 routing
+    - Restore_V: [n_restore_v, rank, d_model] - V expansion
     - Knowledge: 2-stage retrieval
     """
     __version__ = "16.2"
@@ -749,15 +749,15 @@ class DAWN(nn.Module):
         rank: int = 64,
         max_seq_len: int = 128,
         # Split Feature
-        n_feature_r: int = 36,
+        n_feature_qk: int = 36,
         n_feature_v: int = 36,
-        top_k_feature_r: int = 8,
+        top_k_feature_qk: int = 8,
         top_k_feature_v: int = 8,
         # Expansion
-        n_relational: int = 12,
-        n_value: int = 12,
-        top_k_relational: int = 4,
-        top_k_value: int = 6,
+        n_restore_qk: int = 12,
+        n_restore_v: int = 12,
+        top_k_restore_qk: int = 4,
+        top_k_restore_v: int = 6,
         # Knowledge
         n_knowledge: int = 80,
         coarse_k: int = 20,
@@ -796,16 +796,16 @@ class DAWN(nn.Module):
         self.excitability_ema_alpha = excitability_ema_alpha
 
         # Split Feature
-        self.n_feature_r = n_feature_r
+        self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
-        self.top_k_feature_r = top_k_feature_r
+        self.top_k_feature_qk = top_k_feature_qk
         self.top_k_feature_v = top_k_feature_v
 
         # Expansion
-        self.n_relational = n_relational
-        self.n_value = n_value
-        self.top_k_relational = top_k_relational
-        self.top_k_value = top_k_value
+        self.n_restore_qk = n_restore_qk
+        self.n_restore_v = n_restore_v
+        self.top_k_restore_qk = top_k_restore_qk
+        self.top_k_restore_v = top_k_restore_v
 
         # Knowledge
         self.n_knowledge = n_knowledge
@@ -813,8 +813,8 @@ class DAWN(nn.Module):
         self.fine_k = fine_k
 
         # v15 compat
-        self.n_feature = n_feature_r
-        self.n_neurons = n_feature_r
+        self.n_feature = n_feature_qk
+        self.n_neurons = n_feature_qk
         self.basis_rank = rank
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -822,16 +822,16 @@ class DAWN(nn.Module):
 
         self.shared_neurons = SharedNeurons(
             d_model=d_model, rank=rank,
-            n_feature_r=n_feature_r, n_feature_v=n_feature_v,
-            n_relational=n_relational, n_value=n_value,
+            n_feature_qk=n_feature_qk, n_feature_v=n_feature_v,
+            n_restore_qk=n_restore_qk, n_restore_v=n_restore_v,
             n_knowledge=n_knowledge, knowledge_rank=self.knowledge_rank,
         )
 
         self.global_ssm = GlobalSSM(d_model, state_dim, return_context=use_ssm_context)
 
         self.global_routers = GlobalRouters(
-            d_model, n_feature_r, n_feature_v, n_relational, n_value, n_knowledge,
-            top_k_feature_r, top_k_feature_v, top_k_relational, top_k_value,
+            d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v, n_knowledge,
+            top_k_feature_qk, top_k_feature_v, top_k_restore_qk, top_k_restore_v,
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing,
             excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
             excitability_decay_rate=excitability_decay_rate
@@ -916,7 +916,7 @@ class DAWN(nn.Module):
         return logits
 
     def orthogonality_loss(self):
-        W_fr = self.shared_neurons.feature_r_neurons
+        W_fr = self.shared_neurons.feature_qk_neurons
         WtW_fr = torch.bmm(W_fr.transpose(1, 2), W_fr)
         I = torch.eye(self.rank, device=W_fr.device).unsqueeze(0)
         loss_fr = ((WtW_fr - I) ** 2).mean()
@@ -925,11 +925,11 @@ class DAWN(nn.Module):
         WtW_fv = torch.bmm(W_fv.transpose(1, 2), W_fv)
         loss_fv = ((WtW_fv - I) ** 2).mean()
 
-        W_r = self.shared_neurons.relational_neurons
+        W_r = self.shared_neurons.restore_qk_neurons
         WWt_r = torch.bmm(W_r, W_r.transpose(1, 2))
         loss_r = ((WWt_r - I) ** 2).mean()
 
-        W_v = self.shared_neurons.value_neurons
+        W_v = self.shared_neurons.restore_v_neurons
         WWt_v = torch.bmm(W_v, W_v.transpose(1, 2))
         loss_v = ((WWt_v - I) ** 2).mean()
 
@@ -952,10 +952,10 @@ class DAWN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def count_by_component(self):
-        feature_r = self.shared_neurons.feature_r_neurons.numel()
+        feature_qk = self.shared_neurons.feature_qk_neurons.numel()
         feature_v = self.shared_neurons.feature_v_neurons.numel()
-        relational = self.shared_neurons.relational_neurons.numel()
-        value = self.shared_neurons.value_neurons.numel()
+        restore_qk = self.shared_neurons.restore_qk_neurons.numel()
+        restore_v = self.shared_neurons.restore_v_neurons.numel()
         knowledge = self.shared_neurons.knowledge_neurons_K.numel() + self.shared_neurons.knowledge_neurons_V.numel()
         embed = self.token_emb.weight.numel() + self.pos_emb.weight.numel()
 
@@ -974,10 +974,10 @@ class DAWN(nn.Module):
         norms = sum(p.numel() for n, p in self.named_parameters() if 'norm' in n)
 
         print(f"=== DAWN v16 Parameter Breakdown (Split Feature R/V) ===")
-        print(f"Feature_R Neurons:    {feature_r:,} ({feature_r/1e6:.2f}M) [{self.n_feature_r} × {self.d_model} × {self.rank}]")
+        print(f"Feature_QK Neurons:    {feature_qk:,} ({feature_qk/1e6:.2f}M) [{self.n_feature_qk} × {self.d_model} × {self.rank}]")
         print(f"Feature_V Neurons:     {feature_v:,} ({feature_v/1e6:.2f}M) [{self.n_feature_v} × {self.d_model} × {self.rank}]")
-        print(f"Relational Neurons:    {relational:,} ({relational/1e6:.2f}M) [{self.n_relational} × {self.rank} × {self.d_model}]")
-        print(f"Value Neurons:         {value:,} ({value/1e6:.2f}M) [{self.n_value} × {self.rank} × {self.d_model}]")
+        print(f"Restore_QK Neurons:    {restore_qk:,} ({restore_qk/1e6:.2f}M) [{self.n_restore_qk} × {self.rank} × {self.d_model}]")
+        print(f"Restore_V Neurons:     {restore_v:,} ({restore_v/1e6:.2f}M) [{self.n_restore_v} × {self.rank} × {self.d_model}]")
         print(f"expand_O:              {expand_o:,} ({expand_o/1e3:.1f}K)")
         print(f"Knowledge Neurons:     {knowledge:,} ({knowledge/1e3:.1f}K)")
         print(f"Embeddings:            {embed:,} ({embed/1e6:.2f}M)")
@@ -985,17 +985,17 @@ class DAWN(nn.Module):
         print(f"Unified Router:        {routers:,} ({routers/1e3:.1f}K) [d_space={self.d_space}]")
         print(f"LayerNorms:            {norms:,} ({norms/1e3:.1f}K)")
         print(f"---")
-        print(f"Top-k Feature_R: {self.top_k_feature_r}/{self.n_feature_r}")
+        print(f"Top-k Feature_QK: {self.top_k_feature_qk}/{self.n_feature_qk}")
         print(f"Top-k Feature_V:  {self.top_k_feature_v}/{self.n_feature_v}")
-        print(f"Top-k Relational: {self.top_k_relational}/{self.n_relational}")
-        print(f"Top-k Value:      {self.top_k_value}/{self.n_value}")
+        print(f"Top-k Restore_QK: {self.top_k_restore_qk}/{self.n_restore_qk}")
+        print(f"Top-k Restore_V:      {self.top_k_restore_v}/{self.n_restore_v}")
         print(f"Mamba Available: {MAMBA_AVAILABLE}")
         print(f"---")
         print(f"Total:                 {self.count_parameters():,} ({self.count_parameters()/1e6:.2f}M)")
 
         return {
-            'feature_r': feature_r, 'feature_v': feature_v,
-            'relational': relational, 'value': value,
+            'feature_qk': feature_qk, 'feature_v': feature_v,
+            'restore_qk': restore_qk, 'restore_v': restore_v,
             'expand_o': expand_o, 'knowledge': knowledge,
             'embeddings': embed, 'ssm': ssm_total,
             'routers': routers, 'norms': norms,
@@ -1008,10 +1008,10 @@ class DAWN(nn.Module):
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'rank': self.rank, 'knowledge_rank': self.knowledge_rank,
             'max_seq_len': self.max_seq_len,
-            'n_feature_r': self.n_feature_r, 'n_feature_v': self.n_feature_v,
-            'top_k_feature_r': self.top_k_feature_r, 'top_k_feature_v': self.top_k_feature_v,
-            'n_relational': self.n_relational, 'n_value': self.n_value,
-            'top_k_relational': self.top_k_relational, 'top_k_value': self.top_k_value,
+            'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
+            'top_k_feature_qk': self.top_k_feature_qk, 'top_k_feature_v': self.top_k_feature_v,
+            'n_restore_qk': self.n_restore_qk, 'n_restore_v': self.n_restore_v,
+            'top_k_restore_qk': self.top_k_restore_qk, 'top_k_restore_v': self.top_k_restore_v,
             'n_knowledge': self.n_knowledge,
             'coarse_k': self.coarse_k, 'fine_k': self.fine_k,
             'state_dim': self.state_dim, 'd_space': self.d_space,
@@ -1025,10 +1025,10 @@ class DAWN(nn.Module):
         return [
             f"DAWN v{self.__version__}: Full Q/K Projection Separation",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  Feature_R: {self.n_feature_r} × {self.d_model} × {self.rank} (Q/K separate, top-k={self.top_k_feature_r})",
+            f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank} (Q/K separate, top-k={self.top_k_feature_qk})",
             f"  Feature_V: {self.n_feature_v} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_v})",
-            f"  Relational: {self.n_relational} × {self.rank} × {self.d_model} (Q/K separate, top-k={self.top_k_relational})",
-            f"  Value:     {self.n_value} × {self.rank} × {self.d_model} (top-k={self.top_k_value})",
+            f"  Restore_QK: {self.n_restore_qk} × {self.rank} × {self.d_model} (Q/K separate, top-k={self.top_k_restore_qk})",
+            f"  Restore_V:     {self.n_restore_v} × {self.rank} × {self.d_model} (top-k={self.top_k_restore_v})",
             f"  Knowledge: {self.n_knowledge} (coarse={self.coarse_k} → fine={self.fine_k})",
             f"  Router: d_space={self.d_space}, Excitability (SAR)",
         ]
