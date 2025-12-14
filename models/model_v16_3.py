@@ -69,13 +69,8 @@ class UnifiedNeuronRouter(nn.Module):
         self.rv_end = n_fq + n_fk + n_fv + n_rq + n_rk + n_rv
         # knowledge는 rv_end ~ total_neurons
 
-        # 각 풀별 projection
-        self.proj_fq = nn.Linear(d_model, d_space)
-        self.proj_fk = nn.Linear(d_model, d_space)
-        self.proj_fv = nn.Linear(d_model, d_space)
-        self.proj_rq = nn.Linear(d_model, d_space)
-        self.proj_rk = nn.Linear(d_model, d_space)
-        self.proj_rv = nn.Linear(d_model, d_space)
+        # 통합 projection (6개 → 1개로 최적화)
+        self.proj_all = nn.Linear(d_model, d_space * 6)
         self.proj_knowledge = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
@@ -107,74 +102,56 @@ class UnifiedNeuronRouter(nn.Module):
     def get_logits(self, x, neuron_type):
         """
         x: [B, S, d_model]
-        neuron_type: 'fq', 'fk', 'fv', 'rq', 'rk', 'rv', 'knowledge'
+        neuron_type: 'knowledge' only (6개 풀은 get_all_logits 사용)
         """
-        neuron_emb_norm = F.normalize(self.neuron_emb, dim=-1)
-
-        if neuron_type == 'fq':
-            h_proj = self.proj_fq(x)
-            h_proj = self.dropout(h_proj)
-            emb = neuron_emb_norm[:self.fq_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj, emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_fq)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'fk':
-            h_proj = self.proj_fk(x)
-            h_proj = self.dropout(h_proj)
-            emb = neuron_emb_norm[self.fq_end:self.fk_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj, emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_fk)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'fv':
-            h_proj = self.proj_fv(x)
-            h_proj = self.dropout(h_proj)
-            emb = neuron_emb_norm[self.fk_end:self.fv_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj, emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_fv)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'rq':
-            h_proj = self.proj_rq(x)
-            h_proj = self.dropout(h_proj)
-            emb = neuron_emb_norm[self.fv_end:self.rq_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj, emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_rq)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'rk':
-            h_proj = self.proj_rk(x)
-            h_proj = self.dropout(h_proj)
-            emb = neuron_emb_norm[self.rq_end:self.rk_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj, emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_rk)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'rv':
-            h_proj = self.proj_rv(x)
-            h_proj = self.dropout(h_proj)
-            emb = neuron_emb_norm[self.rk_end:self.rv_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj, emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_rv)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'knowledge':
-            h_proj = self.proj_knowledge(x)
-            h_proj = self.dropout(h_proj)
+        if neuron_type == 'knowledge':
+            neuron_emb_norm = F.normalize(self.neuron_emb, dim=-1)
+            h_proj = self.dropout(self.proj_knowledge(x))
             emb = neuron_emb_norm[self.rv_end:]
             logits = torch.einsum('bsd,nd->bsn', h_proj, emb)
             if self.training:
                 excitability = self.get_excitability(self.usage_ema_knowledge)
                 logits = logits + excitability * self.excitability_weight
+            return logits
+        else:
+            raise ValueError(f"Use get_all_logits() for {neuron_type}")
 
-        return logits
+    def get_all_logits(self, x):
+        """6개 풀 logits를 한 번에 계산 (속도 최적화)"""
+        # 통합 projection 한 번에 계산 후 분할
+        all_proj = self.dropout(self.proj_all(x))  # [B, S, d_space * 6]
+        h_fq, h_fk, h_fv, h_rq, h_rk, h_rv = all_proj.chunk(6, dim=-1)
+
+        # 뉴런 임베딩 정규화 (한 번만)
+        emb_norm = F.normalize(self.neuron_emb, dim=-1)
+
+        # 각 풀 슬라이스
+        emb_fq = emb_norm[:self.fq_end]
+        emb_fk = emb_norm[self.fq_end:self.fk_end]
+        emb_fv = emb_norm[self.fk_end:self.fv_end]
+        emb_rq = emb_norm[self.fv_end:self.rq_end]
+        emb_rk = emb_norm[self.rq_end:self.rk_end]
+        emb_rv = emb_norm[self.rk_end:self.rv_end]
+
+        # einsum으로 logits 계산
+        logits_fq = torch.einsum('bsd,nd->bsn', h_fq, emb_fq)
+        logits_fk = torch.einsum('bsd,nd->bsn', h_fk, emb_fk)
+        logits_fv = torch.einsum('bsd,nd->bsn', h_fv, emb_fv)
+        logits_rq = torch.einsum('bsd,nd->bsn', h_rq, emb_rq)
+        logits_rk = torch.einsum('bsd,nd->bsn', h_rk, emb_rk)
+        logits_rv = torch.einsum('bsd,nd->bsn', h_rv, emb_rv)
+
+        # excitability 추가 (training일 때만)
+        if self.training:
+            w = self.excitability_weight
+            logits_fq = logits_fq + self.get_excitability(self.usage_ema_fq) * w
+            logits_fk = logits_fk + self.get_excitability(self.usage_ema_fk) * w
+            logits_fv = logits_fv + self.get_excitability(self.usage_ema_fv) * w
+            logits_rq = logits_rq + self.get_excitability(self.usage_ema_rq) * w
+            logits_rk = logits_rk + self.get_excitability(self.usage_ema_rk) * w
+            logits_rv = logits_rv + self.get_excitability(self.usage_ema_rv) * w
+
+        return logits_fq, logits_fk, logits_fv, logits_rq, logits_rk, logits_rv
 
     def update_usage(self, weights, neuron_type, attention_mask=None):
         """top-k 후 선택된 뉴런 사용량 업데이트"""
@@ -429,13 +406,9 @@ class GlobalRouters(nn.Module):
         """
         Returns: fq_weights, fk_weights, fv_weights, rq_weights, rk_weights, rv_weights, routing_info, aux_loss
         """
-        # Get logits from unified router
-        fq_logits = self.neuron_router.get_logits(x, 'fq')
-        fk_logits = self.neuron_router.get_logits(x, 'fk')
-        fv_logits = self.neuron_router.get_logits(x, 'fv')
-        rq_logits = self.neuron_router.get_logits(x, 'rq')
-        rk_logits = self.neuron_router.get_logits(x, 'rk')
-        rv_logits = self.neuron_router.get_logits(x, 'rv')
+        # Get all logits in one call (optimized)
+        fq_logits, fk_logits, fv_logits, rq_logits, rk_logits, rv_logits = \
+            self.neuron_router.get_all_logits(x)
 
         fq_pref = F.softmax(fq_logits, dim=-1)
         fk_pref = F.softmax(fk_logits, dim=-1)
