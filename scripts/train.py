@@ -763,6 +763,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Calculate actual step (for logging and checkpointing)
         step = local_step + start_step
 
+        # Memory monitoring (every 10 steps)
+        if step % 10 == 0 and device.type == 'cuda':
+            print(f"Step {step}: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
+
         input_ids = batch["input_ids"].to(device)
 
         # CLM: labels = input_ids (model does shift internally)
