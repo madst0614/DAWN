@@ -8,11 +8,11 @@ To add a new version:
 1. Add entry to VERSION_REGISTRY below (with display_info lambda)
 2. Create model file in models/model_vX_Y.py
 3. Update models/__init__.py
-4. Update scripts/train.py if router/routing_info structure changed
-5. Create config in configs/train_config_vX_Y.yaml
+4. Create config in configs/train_config_vX_Y.yaml
 """
 
 from typing import Dict, Any, List
+import torch
 
 
 VERSION_REGISTRY = {
@@ -96,6 +96,83 @@ VERSION_REGISTRY = {
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
         ],
     },
+    "16.2": {
+        "description": "Full Q/K Projection Separation",
+        "aliases": ["162"],
+        "module": "model_v16_2",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_r", "n_feature_v", "n_relational", "n_value", "n_knowledge",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature_r": 8,
+            "top_k_feature_v": 8,
+            "top_k_relational": 4,
+            "top_k_value": 6,
+            "d_space": 64,
+            "coarse_k": 20,
+            "fine_k": 10,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
+        },
+        "display_info": lambda args: [
+            f"DAWN v16.2: Full Q/K Projection Separation",
+            f"  rank={args.get('rank', args.get('basis_rank'))}",
+            f"  Feature_R: {args.get('n_feature_r')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (Q/K separate, top-k={args.get('top_k_feature_r', 8)})",
+            f"  Feature_V: {args.get('n_feature_v')} × {args.get('d_model')} × {args.get('rank', args.get('basis_rank'))} (top-k={args.get('top_k_feature_v', 8)})",
+            f"  Relational: {args.get('n_relational')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (Q/K separate, top-k={args.get('top_k_relational', 4)})",
+            f"  Value: {args.get('n_value')} × {args.get('rank', args.get('basis_rank'))} × {args.get('d_model')} (top-k={args.get('top_k_value', 6)})",
+            f"  Unified Router: d_space={args.get('d_space', 64)} + SAR",
+            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
+        ],
+    },
+    "16.3": {
+        "description": "Complete Q/K/V Pool Separation",
+        "aliases": ["163"],
+        "module": "model_v16_3",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_fq", "n_fk", "n_fv", "n_rq", "n_rk", "n_rv", "n_knowledge",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_fq": 8,
+            "top_k_fk": 8,
+            "top_k_fv": 3,
+            "top_k_rq": 8,
+            "top_k_rk": 8,
+            "top_k_rv": 3,
+            "d_space": 64,
+            "coarse_k": 40,
+            "fine_k": 15,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
+        },
+        "display_info": lambda args: [
+            f"DAWN v16.3: Complete Q/K/V Pool Separation",
+            f"  rank={args.get('rank', args.get('basis_rank'))}",
+            f"  FQ: {args.get('n_fq')} × {args.get('d_model')} × {args.get('rank')} (top-k={args.get('top_k_fq', 8)})",
+            f"  FK: {args.get('n_fk')} × {args.get('d_model')} × {args.get('rank')} (top-k={args.get('top_k_fk', 8)})",
+            f"  FV: {args.get('n_fv')} × {args.get('d_model')} × {args.get('rank')} (top-k={args.get('top_k_fv', 8)})",
+            f"  RQ: {args.get('n_rq')} × {args.get('rank')} × {args.get('d_model')} (top-k={args.get('top_k_rq', 8)})",
+            f"  RK: {args.get('n_rk')} × {args.get('rank')} × {args.get('d_model')} (top-k={args.get('top_k_rk', 8)})",
+            f"  RV: {args.get('n_rv')} × {args.get('rank')} × {args.get('d_model')} (top-k={args.get('top_k_rv', 8)})",
+            f"  Knowledge: {args.get('n_knowledge')} (coarse={args.get('coarse_k', 40)} → fine={args.get('fine_k', 15)})",
+            f"  Unified Router: d_space={args.get('d_space', 64)} + SAR",
+            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
+        ],
+    },
 }
 
 
@@ -176,3 +253,90 @@ def get_all_versions_info() -> str:
         alias_str = f" (aliases: {', '.join(aliases)})" if aliases else ""
         lines.append(f"  v{version}: {info['description']}{alias_str}")
     return "\n".join(lines)
+
+
+def get_routing_log_info(routing_info: Dict[str, Any], calc_entropy_fn, calc_var_fn) -> Dict[str, Any]:
+    """
+    Extract routing log info based on routing_info structure.
+    Auto-detects version from routing_info keys.
+
+    Args:
+        routing_info: Layer 0 routing info from model forward
+        calc_entropy_fn: Function to calculate entropy ratio (pref -> float)
+        calc_var_fn: Function to calculate token variance (pref -> float)
+
+    Returns:
+        Dict with keys: 'ent_str', 'var_str', 'overlap_str', 'version'
+    """
+    attn = routing_info.get('attention', routing_info)
+
+    # v16.3: Complete pool separation (fq_pref exists)
+    if attn.get('fq_pref') is not None:
+        prefs = {
+            'FQ': attn.get('fq_pref'),
+            'FK': attn.get('fk_pref'),
+            'FV': attn.get('fv_pref'),
+            'RQ': attn.get('rq_pref'),
+            'RK': attn.get('rk_pref'),
+            'RV': attn.get('rv_pref'),
+        }
+        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
+        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+
+        ent_str = f"Ent FQ/FK/FV/RQ/RK/RV:{ents['FQ']:.0f}/{ents['FK']:.0f}/{ents['FV']:.0f}/{ents['RQ']:.0f}/{ents['RK']:.0f}/{ents['RV']:.0f}"
+        var_str = f"TokVar:{vars_['FQ']:.4f}/{vars_['FK']:.4f}/{vars_['FV']:.4f}/{vars_['RQ']:.4f}/{vars_['RK']:.4f}/{vars_['RV']:.4f}"
+        return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': None, 'version': '16.3'}
+
+    # v16.2: Q/K projection separation (feature_r_q_pref exists)
+    elif attn.get('feature_r_q_pref') is not None:
+        prefs = {
+            'FRQ': attn.get('feature_r_q_pref'),
+            'FRK': attn.get('feature_r_k_pref'),
+            'FV': attn.get('feature_v_pref'),
+            'RQ': attn.get('relational_q_pref'),
+            'RK': attn.get('relational_k_pref'),
+            'V': attn.get('value_pref'),
+        }
+        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
+        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+
+        ent_str = f"Ent FRQ/FRK/FV/RQ/RK/V:{ents['FRQ']:.0f}/{ents['FRK']:.0f}/{ents['FV']:.0f}/{ents['RQ']:.0f}/{ents['RK']:.0f}/{ents['V']:.0f}"
+        var_str = f"TokVar:{vars_['FRQ']:.4f}/{vars_['FRK']:.4f}/{vars_['FV']:.4f}/{vars_['RQ']:.4f}/{vars_['RK']:.4f}/{vars_['V']:.4f}"
+
+        # Q/K overlap ratio
+        def calc_overlap(w_Q, w_K):
+            if w_Q is None or w_K is None:
+                return 0.0
+            overlap = ((w_Q > 0) & (w_K > 0)).float()
+            active_Q = (w_Q > 0).float().sum(-1)
+            return (overlap.sum(-1) / (active_Q + 1e-8)).mean().item()
+
+        w_FRQ = attn.get('feature_r_weights_Q')
+        w_FRK = attn.get('feature_r_weights_K')
+        w_RQ = attn.get('relational_weights_Q')
+        w_RK = attn.get('relational_weights_K')
+        overlap_FR = calc_overlap(w_FRQ, w_FRK)
+        overlap_R = calc_overlap(w_RQ, w_RK)
+        overlap_str = f"Q/K Overlap FR/R:{overlap_FR:.2f}/{overlap_R:.2f}"
+
+        return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': overlap_str, 'version': '16.2'}
+
+    # v16.0/16.1: Shared Q/K (feature_r_pref exists)
+    elif attn.get('feature_r_pref') is not None:
+        prefs = {
+            'FR': attn.get('feature_r_pref'),
+            'FV': attn.get('feature_v_pref'),
+            'RQ': attn.get('relational_q_pref'),
+            'RK': attn.get('relational_k_pref'),
+            'V': attn.get('value_pref'),
+        }
+        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
+        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+
+        ent_str = f"Ent FR/FV/RQ/RK/V:{ents['FR']:.0f}/{ents['FV']:.0f}/{ents['RQ']:.0f}/{ents['RK']:.0f}/{ents['V']:.0f}"
+        var_str = f"TokVar:{vars_['FR']:.4f}/{vars_['FV']:.4f}/{vars_['RQ']:.4f}/{vars_['RK']:.4f}/{vars_['V']:.4f}"
+        return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': None, 'version': '16.0'}
+
+    # Unknown format
+    else:
+        return {'ent_str': "Ent: N/A", 'var_str': "TokVar: N/A", 'overlap_str': None, 'version': 'unknown'}
