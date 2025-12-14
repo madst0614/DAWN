@@ -282,6 +282,11 @@ def load_checkpoint_smart(
         if migrated:
             print("  Note: Migrated separate neuron params → contiguous f_neurons/r_neurons")
 
+    # v16.2 proj migration: 5개 개별 proj → proj_all 통합
+    if needs_v16_2_migration(state_dict):
+        print("  Migrating v16.2 checkpoint: 5 proj → proj_all...")
+        state_dict = migrate_v16_2_proj_to_unified(state_dict)
+
     # Load state dict
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
 
