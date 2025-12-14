@@ -28,16 +28,16 @@ model:
   state_dim: 64
 
   # v16.4: Shared Pool + Separate Routing
-  # Feature_QK: Q/K compression shared pool
-  n_feature_qk: 48
+  # Feature_QK: Q/K compression shared pool (v16.3 FQ+FK 대응)
+  n_feature_qk: 96
   top_k_feature_qk: 8
 
   # Feature_V: V compression
   n_feature_v: 24
   top_k_feature_v: 3
 
-  # Restore_QK: Q/K restoration shared pool
-  n_restore_qk: 48
+  # Restore_QK: Q/K restoration shared pool (v16.3 RQ+RK 대응)
+  n_restore_qk: 96
   top_k_restore_qk: 8
 
   # Restore_V: V restoration
@@ -80,9 +80,9 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_4_20M_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_v16_4_20M_c4_5B
 
 # v16.4 Architecture (Shared Pool + Separate Routing)
-#   - Feature_QK=48 (k=8) - Q/K shared pool, separate routing
+#   - Feature_QK=96 (k=8) - Q/K shared pool, separate routing
 #   - Feature_V=24 (k=3) - V compression
-#   - Restore_QK=48 (k=8) - Q/K shared pool, separate routing
+#   - Restore_QK=96 (k=8) - Q/K shared pool, separate routing
 #   - Restore_V=24 (k=3) - V restoration
 #   - Knowledge=256 (coarse=16 -> fine=8)
 #   Routing paths:
