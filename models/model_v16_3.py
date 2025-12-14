@@ -560,7 +560,7 @@ class NeuronCircuit(nn.Module):
         token_routing = fq_weights.dim() == 3
 
         if token_routing:
-            # Token-level routing
+            # Token-level routing (keep einsum for now)
             shared_fq = torch.einsum('bsn,ndr->bsdr', fq_weights, self.shared_neurons.fq_neurons)
             shared_fk = torch.einsum('bsn,ndr->bsdr', fk_weights, self.shared_neurons.fk_neurons)
             shared_fv = torch.einsum('bsn,ndr->bsdr', fv_weights, self.shared_neurons.fv_neurons)
@@ -577,22 +577,28 @@ class NeuronCircuit(nn.Module):
             K = torch.einsum('bsr,bsrd->bsd', h_k, shared_rk)
             V = torch.einsum('bsr,bsrd->bsd', h_v, shared_rv)
         else:
-            # Batch-level routing
-            shared_fq = torch.einsum('bn,ndr->bdr', fq_weights, self.shared_neurons.fq_neurons)
-            shared_fk = torch.einsum('bn,ndr->bdr', fk_weights, self.shared_neurons.fk_neurons)
-            shared_fv = torch.einsum('bn,ndr->bdr', fv_weights, self.shared_neurons.fv_neurons)
+            # Batch-level routing - optimized with matmul
+            R = self.rank
 
-            h_q = torch.einsum('bsd,bdr->bsr', x, shared_fq)
-            h_k = torch.einsum('bsd,bdr->bsr', x, shared_fk)
-            h_v = torch.einsum('bsd,bdr->bsr', x, shared_fv)
+            # Feature neurons: einsum 'bn,ndr->bdr' → matmul + reshape
+            shared_fq = (fq_weights @ self.shared_neurons.fq_neurons.view(-1, D*R)).view(B, D, R)
+            shared_fk = (fk_weights @ self.shared_neurons.fk_neurons.view(-1, D*R)).view(B, D, R)
+            shared_fv = (fv_weights @ self.shared_neurons.fv_neurons.view(-1, D*R)).view(B, D, R)
 
-            shared_rq = torch.einsum('bn,nrd->brd', rq_weights, self.shared_neurons.rq_neurons)
-            shared_rk = torch.einsum('bn,nrd->brd', rk_weights, self.shared_neurons.rk_neurons)
-            shared_rv = torch.einsum('bn,nrd->brd', rv_weights, self.shared_neurons.rv_neurons)
+            # Compression: einsum 'bsd,bdr->bsr' → bmm
+            h_q = torch.bmm(x, shared_fq)  # [B, S, R]
+            h_k = torch.bmm(x, shared_fk)
+            h_v = torch.bmm(x, shared_fv)
 
-            Q = torch.einsum('bsr,brd->bsd', h_q, shared_rq)
-            K = torch.einsum('bsr,brd->bsd', h_k, shared_rk)
-            V = torch.einsum('bsr,brd->bsd', h_v, shared_rv)
+            # Restore neurons: einsum 'bn,nrd->brd' → matmul + reshape
+            shared_rq = (rq_weights @ self.shared_neurons.rq_neurons.view(-1, R*D)).view(B, R, D)
+            shared_rk = (rk_weights @ self.shared_neurons.rk_neurons.view(-1, R*D)).view(B, R, D)
+            shared_rv = (rv_weights @ self.shared_neurons.rv_neurons.view(-1, R*D)).view(B, R, D)
+
+            # Restoration: einsum 'bsr,brd->bsd' → bmm
+            Q = torch.bmm(h_q, shared_rq)  # [B, S, D]
+            K = torch.bmm(h_k, shared_rk)
+            V = torch.bmm(h_v, shared_rv)
 
         # Multi-head Attention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
