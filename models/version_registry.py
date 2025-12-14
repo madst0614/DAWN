@@ -268,6 +268,52 @@ def build_model_kwargs(version: str, config: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
+def load_model_params_to_args(args, config: Dict[str, Any]) -> None:
+    """Load model params from config dict to args object using VERSION_REGISTRY.
+
+    Updates args in-place with values from config, using VERSION_REGISTRY defaults.
+    This is the inverse of build_args_config - used for loading from YAML or checkpoint.
+
+    Args:
+        args: Namespace object to update
+        config: Config dict (from YAML or checkpoint)
+    """
+    # Collect all param names and defaults from all versions
+    all_params = {}
+
+    for version_info in VERSION_REGISTRY.values():
+        for param in version_info.get('required_params', []):
+            if param not in all_params:
+                all_params[param] = None
+        for param, default in version_info.get('optional_params', {}).items():
+            if param not in all_params:
+                all_params[param] = default
+
+    # Special mappings (config param name -> args attribute name)
+    special_mappings = {
+        'rank': 'basis_rank',  # config['rank'] -> args.basis_rank
+    }
+
+    for param, default in all_params.items():
+        # Skip vocab_size (set separately)
+        if param in ('vocab_size',):
+            continue
+
+        # Get args attribute name
+        args_attr = special_mappings.get(param, param)
+
+        # Get value from config with fallback to current args value, then default
+        current_value = getattr(args, args_attr, default)
+        value = config.get(param, current_value)
+
+        # Set on args
+        setattr(args, args_attr, value)
+
+        # Also set 'rank' if we set 'basis_rank' (keep them in sync)
+        if args_attr == 'basis_rank':
+            setattr(args, 'rank', value)
+
+
 def build_args_config(args, vocab_size: int) -> Dict[str, Any]:
     """Build config dict from args object dynamically using VERSION_REGISTRY.
 

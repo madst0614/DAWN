@@ -58,7 +58,7 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
 
-from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs, build_args_config, get_routing_log_info
+from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs, build_args_config, load_model_params_to_args, get_routing_log_info
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.checkpoint import load_checkpoint_smart, load_optimizer_state, strip_compile_prefix
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
@@ -1494,29 +1494,8 @@ def main():
     args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
     args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
 
-    # v16.0/16.1/16.2 Split Feature R/V parameters
-    args.n_feature_r = cfg['model'].get('n_feature_r', 96)
-    args.n_feature_v = cfg['model'].get('n_feature_v', 24)
-    args.top_k_feature_r = cfg['model'].get('top_k_feature_r', 8)
-    args.top_k_feature_v = cfg['model'].get('top_k_feature_v', 8)
-    args.n_relational = cfg['model'].get('n_relational', 96)
-    args.n_value = cfg['model'].get('n_value', 16)
-    args.top_k_relational = cfg['model'].get('top_k_relational', 4)
-    args.top_k_value = cfg['model'].get('top_k_value', 6)
-
-    # v16.3 Complete Pool Separation parameters
-    args.n_fq = cfg['model'].get('n_fq', 32)
-    args.n_fk = cfg['model'].get('n_fk', 32)
-    args.n_fv = cfg['model'].get('n_fv', 24)
-    args.n_rq = cfg['model'].get('n_rq', 32)
-    args.n_rk = cfg['model'].get('n_rk', 32)
-    args.n_rv = cfg['model'].get('n_rv', 24)
-    args.top_k_fq = cfg['model'].get('top_k_fq', 8)
-    args.top_k_fk = cfg['model'].get('top_k_fk', 8)
-    args.top_k_fv = cfg['model'].get('top_k_fv', 3)
-    args.top_k_rq = cfg['model'].get('top_k_rq', 8)
-    args.top_k_rk = cfg['model'].get('top_k_rk', 8)
-    args.top_k_rv = cfg['model'].get('top_k_rv', 3)
+    # Load all version-specific model params from VERSION_REGISTRY
+    load_model_params_to_args(args, cfg['model'])
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -1699,29 +1678,8 @@ def main():
         args.basis_rank = args.rank  # Sync basis_rank with rank for model creation
         args.n_knowledge = checkpoint_config.get('n_knowledge', getattr(args, 'n_knowledge', 64))
 
-        # v16.0/16.1/16.2 architecture params (must match checkpoint)
-        args.n_feature_r = checkpoint_config.get('n_feature_r', getattr(args, 'n_feature_r', 96))
-        args.n_feature_v = checkpoint_config.get('n_feature_v', getattr(args, 'n_feature_v', 24))
-        args.n_relational = checkpoint_config.get('n_relational', getattr(args, 'n_relational', 96))
-        args.n_value = checkpoint_config.get('n_value', getattr(args, 'n_value', 16))
-        args.top_k_feature_r = checkpoint_config.get('top_k_feature_r', getattr(args, 'top_k_feature_r', 12))
-        args.top_k_feature_v = checkpoint_config.get('top_k_feature_v', getattr(args, 'top_k_feature_v', 3))
-        args.top_k_relational = checkpoint_config.get('top_k_relational', getattr(args, 'top_k_relational', 4))
-        args.top_k_value = checkpoint_config.get('top_k_value', getattr(args, 'top_k_value', 6))
-
-        # v16.3 architecture params (must match checkpoint)
-        args.n_fq = checkpoint_config.get('n_fq', getattr(args, 'n_fq', 32))
-        args.n_fk = checkpoint_config.get('n_fk', getattr(args, 'n_fk', 32))
-        args.n_fv = checkpoint_config.get('n_fv', getattr(args, 'n_fv', 24))
-        args.n_rq = checkpoint_config.get('n_rq', getattr(args, 'n_rq', 32))
-        args.n_rk = checkpoint_config.get('n_rk', getattr(args, 'n_rk', 32))
-        args.n_rv = checkpoint_config.get('n_rv', getattr(args, 'n_rv', 24))
-        args.top_k_fq = checkpoint_config.get('top_k_fq', getattr(args, 'top_k_fq', 8))
-        args.top_k_fk = checkpoint_config.get('top_k_fk', getattr(args, 'top_k_fk', 8))
-        args.top_k_fv = checkpoint_config.get('top_k_fv', getattr(args, 'top_k_fv', 3))
-        args.top_k_rq = checkpoint_config.get('top_k_rq', getattr(args, 'top_k_rq', 8))
-        args.top_k_rk = checkpoint_config.get('top_k_rk', getattr(args, 'top_k_rk', 8))
-        args.top_k_rv = checkpoint_config.get('top_k_rv', getattr(args, 'top_k_rv', 3))
+        # Load all version-specific architecture params from checkpoint (must match)
+        load_model_params_to_args(args, checkpoint_config)
 
         if checkpoint_training_config:
             # Training hyperparameters (only if not overridden by CLI)
