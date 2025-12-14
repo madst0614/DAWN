@@ -185,9 +185,9 @@ def load_checkpoint_smart(
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     state_dict = strip_compile_prefix(state_dict)
 
-    # Handle excitability_weight migration: old scalar → new per-neuron vectors
-    old_excitability_key = 'global_routers.neuron_router.excitability_weight'
-    new_excitability_keys = [
+    # Handle excitability_weight migration between versions
+    scalar_key = 'global_routers.neuron_router.excitability_weight'
+    v16_vector_keys = [
         'global_routers.neuron_router.excitability_weight_fr',
         'global_routers.neuron_router.excitability_weight_fv',
         'global_routers.neuron_router.excitability_weight_r',
@@ -195,18 +195,35 @@ def load_checkpoint_smart(
         'global_routers.neuron_router.excitability_weight_k',
     ]
 
-    # Check if we have old scalar or new per-neuron format
-    has_old_scalar = old_excitability_key in state_dict
-    has_new_vectors = any(k in state_dict for k in new_excitability_keys)
+    # Check checkpoint format
+    ckpt_has_scalar = scalar_key in state_dict
+    ckpt_has_vectors = any(k in state_dict for k in v16_vector_keys)
 
-    if has_old_scalar and not has_new_vectors:
-        # Migration: old scalar → broadcast to new per-neuron vectors
-        old_w = state_dict[old_excitability_key]
+    # Check model format (v16.3 uses scalar, v16.0/16.1/16.2 use vectors)
+    model_state_keys = set(model.state_dict().keys())
+    model_expects_scalar = scalar_key in model_state_keys
+    model_expects_vectors = any(k in model_state_keys for k in v16_vector_keys)
+
+    if ckpt_has_vectors and model_expects_scalar and not model_expects_vectors:
+        # v16.0/16.1/16.2 checkpoint → v16.3 model: vectors → scalar
+        all_weights = []
+        for k in v16_vector_keys:
+            if k in state_dict:
+                w = state_dict[k]
+                if isinstance(w, torch.Tensor):
+                    all_weights.append(w.mean().item())
+                del state_dict[k]
+        avg_w = sum(all_weights) / len(all_weights) if all_weights else 0.5
+        state_dict[scalar_key] = torch.tensor(avg_w)
+        print(f"  Note: Migrating per-neuron vectors → scalar excitability_weight={avg_w:.4f}")
+
+    elif ckpt_has_scalar and model_expects_vectors and not model_expects_scalar:
+        # Old scalar checkpoint → v16.0/16.1/16.2 model: scalar → vectors
+        old_w = state_dict[scalar_key]
         if isinstance(old_w, torch.Tensor):
             old_w = old_w.item()
-        old_w = max(0.1, min(0.5, old_w))  # clamp to valid range
+        old_w = max(0.1, min(0.5, old_w))
 
-        # Get neuron counts from config
         config = checkpoint.get('config', {})
         n_fr = config.get('n_feature_r', 72)
         n_fv = config.get('n_feature_v', 72)
@@ -214,20 +231,13 @@ def load_checkpoint_smart(
         n_v = config.get('n_value', 48)
         n_k = config.get('n_knowledge', 300)
 
-        # Broadcast scalar to vectors
         state_dict['global_routers.neuron_router.excitability_weight_fr'] = torch.full((n_fr,), old_w)
         state_dict['global_routers.neuron_router.excitability_weight_fv'] = torch.full((n_fv,), old_w)
         state_dict['global_routers.neuron_router.excitability_weight_r'] = torch.full((n_r,), old_w)
         state_dict['global_routers.neuron_router.excitability_weight_v'] = torch.full((n_v,), old_w)
         state_dict['global_routers.neuron_router.excitability_weight_k'] = torch.full((n_k,), old_w)
-
-        # Remove old scalar
-        del state_dict[old_excitability_key]
+        del state_dict[scalar_key]
         print(f"  Note: Migrating scalar excitability_weight={old_w:.4f} → per-neuron vectors")
-
-    elif not has_old_scalar and not has_new_vectors:
-        # Very old checkpoint without any excitability weight - model will use defaults
-        print(f"  Note: No excitability_weight found, using default per-neuron values (0.3)")
 
     # Load state dict
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
