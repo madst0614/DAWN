@@ -48,8 +48,8 @@ model:
 
   # Knowledge
   n_knowledge: 256
-  coarse_k: 40
-  fine_k: 15
+  coarse_k: 16
+  fine_k: 8
   knowledge_rank: 128
 
   max_seq_len: 512
