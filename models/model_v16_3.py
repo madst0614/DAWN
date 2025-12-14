@@ -225,15 +225,11 @@ class SharedNeurons(nn.Module):
         self.n_rv = n_rv
         self.n_knowledge = n_knowledge
 
-        # Feature pools (compression: d_model → rank)
-        self.fq_neurons = nn.Parameter(torch.zeros(n_fq, d_model, rank))
-        self.fk_neurons = nn.Parameter(torch.zeros(n_fk, d_model, rank))
-        self.fv_neurons = nn.Parameter(torch.zeros(n_fv, d_model, rank))
-
-        # Restore pools (expansion: rank → d_model)
-        self.rq_neurons = nn.Parameter(torch.zeros(n_rq, rank, d_model))
-        self.rk_neurons = nn.Parameter(torch.zeros(n_rk, rank, d_model))
-        self.rv_neurons = nn.Parameter(torch.zeros(n_rv, rank, d_model))
+        # Contiguous memory for GPU cache efficiency
+        # F group: [n_fq + n_fk + n_fv, d_model, rank]
+        self.f_neurons = nn.Parameter(torch.zeros(n_fq + n_fk + n_fv, d_model, rank))
+        # R group: [n_rq + n_rk + n_rv, rank, d_model]
+        self.r_neurons = nn.Parameter(torch.zeros(n_rq + n_rk + n_rv, rank, d_model))
 
         # Knowledge neurons
         self.knowledge_neurons_K = nn.Parameter(torch.zeros(n_knowledge, self.knowledge_rank))
@@ -241,19 +237,38 @@ class SharedNeurons(nn.Module):
 
         self._init_parameters()
 
+    # Properties for sliced access (contiguous memory)
+    @property
+    def fq_neurons(self):
+        return self.f_neurons[:self.n_fq]
+
+    @property
+    def fk_neurons(self):
+        return self.f_neurons[self.n_fq:self.n_fq + self.n_fk]
+
+    @property
+    def fv_neurons(self):
+        return self.f_neurons[self.n_fq + self.n_fk:]
+
+    @property
+    def rq_neurons(self):
+        return self.r_neurons[:self.n_rq]
+
+    @property
+    def rk_neurons(self):
+        return self.r_neurons[self.n_rq:self.n_rq + self.n_rk]
+
+    @property
+    def rv_neurons(self):
+        return self.r_neurons[self.n_rq + self.n_rk:]
+
     def _init_parameters(self):
-        for i in range(self.n_fq):
-            nn.init.orthogonal_(self.fq_neurons.data[i])
-        for i in range(self.n_fk):
-            nn.init.orthogonal_(self.fk_neurons.data[i])
-        for i in range(self.n_fv):
-            nn.init.orthogonal_(self.fv_neurons.data[i])
-        for i in range(self.n_rq):
-            nn.init.orthogonal_(self.rq_neurons.data[i])
-        for i in range(self.n_rk):
-            nn.init.orthogonal_(self.rk_neurons.data[i])
-        for i in range(self.n_rv):
-            nn.init.orthogonal_(self.rv_neurons.data[i])
+        # F group initialization
+        for i in range(self.n_fq + self.n_fk + self.n_fv):
+            nn.init.orthogonal_(self.f_neurons.data[i])
+        # R group initialization
+        for i in range(self.n_rq + self.n_rk + self.n_rv):
+            nn.init.orthogonal_(self.r_neurons.data[i])
         nn.init.normal_(self.knowledge_neurons_K, std=0.02)
         nn.init.normal_(self.knowledge_neurons_V, std=0.02)
 

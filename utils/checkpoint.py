@@ -239,6 +239,49 @@ def load_checkpoint_smart(
         del state_dict[scalar_key]
         print(f"  Note: Migrating scalar excitability_weight={old_w:.4f} → per-neuron vectors")
 
+    # v16.3 neuron parameter migration: separate → contiguous
+    # Migrate fq_neurons, fk_neurons, fv_neurons → f_neurons
+    # Migrate rq_neurons, rk_neurons, rv_neurons → r_neurons
+    def migrate_neurons_to_contiguous(state_dict, layer_prefix):
+        """Migrate separate neuron params to contiguous f_neurons/r_neurons"""
+        fq_key = f'{layer_prefix}.shared_neurons.fq_neurons'
+        fk_key = f'{layer_prefix}.shared_neurons.fk_neurons'
+        fv_key = f'{layer_prefix}.shared_neurons.fv_neurons'
+        rq_key = f'{layer_prefix}.shared_neurons.rq_neurons'
+        rk_key = f'{layer_prefix}.shared_neurons.rk_neurons'
+        rv_key = f'{layer_prefix}.shared_neurons.rv_neurons'
+        f_key = f'{layer_prefix}.shared_neurons.f_neurons'
+        r_key = f'{layer_prefix}.shared_neurons.r_neurons'
+
+        migrated = False
+        # Migrate F group
+        if fq_key in state_dict and fk_key in state_dict and fv_key in state_dict:
+            if f_key not in state_dict:
+                f_neurons = torch.cat([state_dict[fq_key], state_dict[fk_key], state_dict[fv_key]], dim=0)
+                state_dict[f_key] = f_neurons
+                del state_dict[fq_key], state_dict[fk_key], state_dict[fv_key]
+                migrated = True
+        # Migrate R group
+        if rq_key in state_dict and rk_key in state_dict and rv_key in state_dict:
+            if r_key not in state_dict:
+                r_neurons = torch.cat([state_dict[rq_key], state_dict[rk_key], state_dict[rv_key]], dim=0)
+                state_dict[r_key] = r_neurons
+                del state_dict[rq_key], state_dict[rk_key], state_dict[rv_key]
+                migrated = True
+        return migrated
+
+    # Check if model uses contiguous neurons (v16.3+)
+    model_uses_contiguous = any('shared_neurons.f_neurons' in k for k in model_state_keys)
+    ckpt_has_separate = any('shared_neurons.fq_neurons' in k for k in state_dict.keys())
+
+    if model_uses_contiguous and ckpt_has_separate:
+        migrated = False
+        for i in range(20):  # up to 20 layers
+            if migrate_neurons_to_contiguous(state_dict, f'layers.{i}'):
+                migrated = True
+        if migrated:
+            print("  Note: Migrated separate neuron params → contiguous f_neurons/r_neurons")
+
     # Load state dict
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
 
