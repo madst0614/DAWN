@@ -7,6 +7,7 @@ Version History:
   v16.2: Full Q/K Projection Separation - Q/K routing paths separated
   v16.3: Complete Q/K/V Pool Separation - FQ/FK/FV, RQ/RK/RV all independent
   v16.4: Shared Pool + Separate Routing - v16.3 optimized, Q/K shared pool with separate routing
+  v17: Unified Neuron Architecture - Knowledge도 Feature-Restore 패턴 사용
 
 ================================================================================
 HOW TO ADD A NEW VERSION (e.g., v16.5)
@@ -263,6 +264,44 @@ VERSION_REGISTRY = {
             f"  Knowledge: {args.get('n_knowledge')} (coarse={args.get('coarse_k', 16)} → fine={args.get('fine_k', 8)})",
             f"  Unified Router: d_space={args.get('d_space', 64)} + proj_all optimized",
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
+        ],
+    },
+    "17": {
+        "description": "Unified Neuron Architecture (Knowledge Feature-Restore)",
+        "aliases": ["17.0", "170"],
+        "module": "model_v17",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v", "n_knowledge",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature_qk": 8,
+            "top_k_feature_v": 3,
+            "top_k_restore_qk": 8,
+            "top_k_restore_v": 3,
+            "top_k_knowledge": 4,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "token_routing": False,
+            "use_ssm_context": True,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
+        },
+        "display_info": lambda args: [
+            f"DAWN v17: Unified Neuron Architecture",
+            f"  rank={args.get('rank', args.get('basis_rank'))}, knowledge_rank={args.get('knowledge_rank', 128)}",
+            f"  Feature_QK: {args.get('n_feature_qk')} (top-k={args.get('top_k_feature_qk', 8)}) - Q/K shared pool",
+            f"  Feature_V: {args.get('n_feature_v')} (top-k={args.get('top_k_feature_v', 3)})",
+            f"  Restore_QK: {args.get('n_restore_qk')} (top-k={args.get('top_k_restore_qk', 8)}) - Q/K shared pool",
+            f"  Restore_V: {args.get('n_restore_v')} (top-k={args.get('top_k_restore_v', 3)})",
+            f"  Knowledge: {args.get('n_knowledge')} (top-k={args.get('top_k_knowledge', 4)}) - Feature-Restore pattern",
+            f"  Unified Router: d_space={args.get('d_space', 64)}",
         ],
     },
 }

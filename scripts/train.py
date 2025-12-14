@@ -1047,24 +1047,32 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                     # Knowledge neuron usage stats
                     try:
-                        # Collect knowledge indices from all layers (2-stage retrieval)
-                        all_fine_idx = []
+                        # Collect knowledge indices from all layers
+                        all_k_idx = []
                         all_coarse_idx = []
+                        is_v17_style = False  # v17 uses top_k_knowledge, not coarse→fine
                         for layer_info in routing_infos:
+                            # v17: knowledge -> topk_indices (Feature-Restore pattern)
+                            know = layer_info.get('knowledge', {})
+                            topk_idx = know.get('topk_indices')
+                            if topk_idx is not None:
+                                all_k_idx.append(topk_idx.flatten())
+                                is_v17_style = True
+                            # v16.x: memory -> fine_indices, coarse_indices (2-stage retrieval)
                             mem = layer_info.get('memory', {})
                             fine_idx = mem.get('fine_indices')
                             coarse_idx = mem.get('coarse_indices')
                             if fine_idx is not None:
-                                all_fine_idx.append(fine_idx.flatten())
+                                all_k_idx.append(fine_idx.flatten())
                             if coarse_idx is not None:
                                 all_coarse_idx.append(coarse_idx.flatten())
                             # Backward compat: knowledge_indices
                             k_idx = mem.get('knowledge_indices')
                             if k_idx is not None:
-                                all_fine_idx.append(k_idx.flatten())
+                                all_k_idx.append(k_idx.flatten())
 
-                        if all_fine_idx:
-                            all_idx = torch.cat(all_fine_idx)
+                        if all_k_idx:
+                            all_idx = torch.cat(all_k_idx)
                             n_knowledge = base_model.n_knowledge if hasattr(base_model, 'n_knowledge') else 80
 
                             # Count usage per knowledge neuron
@@ -1082,8 +1090,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             # Gini
                             gini_K = _gini(usage_freq)
 
-                            # v15: coarse→fine ratio
-                            if all_coarse_idx:
+                            # v17: top_k_knowledge (Feature-Restore pattern)
+                            if is_v17_style:
+                                top_k_knowledge = base_model.top_k_knowledge if hasattr(base_model, 'top_k_knowledge') else 4
+                                unique_k = len(torch.unique(all_idx))
+                                print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f} | top_k={top_k_knowledge} (unique: {unique_k})")
+                            # v16.x: coarse→fine ratio (2-stage retrieval)
+                            elif all_coarse_idx:
                                 coarse_all = torch.cat(all_coarse_idx)
                                 coarse_unique = len(torch.unique(coarse_all))
                                 fine_unique = len(torch.unique(all_idx))
