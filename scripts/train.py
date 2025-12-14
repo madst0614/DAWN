@@ -37,6 +37,9 @@ import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
 warnings.filterwarnings('ignore', message='.*online softmax.*')
 
+# CUDA memory optimization - reduce fragmentation
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1131,6 +1134,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 filename=f'checkpoint_epoch{epoch}_step{step+1}.pt',
                 epoch_completed=False  # Mid-epoch checkpoint
             )
+            torch.cuda.empty_cache()
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "acc": f"{step_acc:.4f}",
@@ -2008,6 +2012,7 @@ def main():
 
         # Evaluate
         val_loss, val_acc = evaluate(model, val_loader, device, args, tokenizer)
+        torch.cuda.empty_cache()
 
         epoch_time = time.time() - epoch_start
 
@@ -2067,6 +2072,7 @@ def main():
             model, optimizer, epoch, val_loss, metrics, is_best=is_best,
             scheduler=scheduler, scaler=scaler, model_config=model_kwargs
         )
+        torch.cuda.empty_cache()
 
     print(f"\n{'='*60}")
     print(f"Training completed!")
