@@ -37,9 +37,6 @@ import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
 warnings.filterwarnings('ignore', message='.*online softmax.*')
 
-# CUDA memory optimization - reduce fragmentation
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
