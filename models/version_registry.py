@@ -1,17 +1,66 @@
 """
-DAWN Model Version Registry
+DAWN Model Version Registry - Single Source of Truth
 
-v16.0: Split Feature R/V (rank matrix) - Feature_R/V separate compression
-v16.1: Split Feature R/V + Langevin Excitability (adaptive dead neuron recovery)
-v16.2: Full Q/K Projection Separation - Q/K routing paths separated
-v16.3: Complete Q/K/V Pool Separation - FQ/FK/FV, RQ/RK/RV all independent
-v16.4: Shared Pool + Separate Routing - v16.3 optimized, Q/K shared pool with separate routing
+Version History:
+  v16.0: Split Feature R/V (rank matrix) - Feature_R/V separate compression
+  v16.1: Split Feature R/V + Langevin Excitability (adaptive dead neuron recovery)
+  v16.2: Full Q/K Projection Separation - Q/K routing paths separated
+  v16.3: Complete Q/K/V Pool Separation - FQ/FK/FV, RQ/RK/RV all independent
+  v16.4: Shared Pool + Separate Routing - v16.3 optimized, Q/K shared pool with separate routing
 
-To add a new version:
-1. Add entry to VERSION_REGISTRY below (with display_info lambda)
-2. Create model file in models/model_vX_Y.py
-3. Update models/__init__.py
-4. Create config in configs/train_config_vX_Y.yaml
+================================================================================
+HOW TO ADD A NEW VERSION (e.g., v16.5)
+================================================================================
+
+1. VERSION_REGISTRY 엔트리 추가 (이 파일)
+   ─────────────────────────────────────────
+   "16.5": {
+       "description": "Short description",
+       "aliases": ["165"],
+       "module": "model_v16_5",
+       "required_params": [
+           "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+           "your_required_param1", "your_required_param2", ...
+           "rank",
+       ],
+       "optional_params": {
+           "dropout": 0.1,
+           "your_optional_param": default_value,
+           ...
+       },
+       "display_info": lambda args: [
+           f"DAWN v16.5: Description",
+           f"  param1: {args.get('param1')}",
+           ...
+       ],
+   }
+
+2. 모델 파일 생성: models/model_v16_5.py
+   ─────────────────────────────────────────
+   - class DAWN(nn.Module) with __version__ = "16.5"
+   - __init__에서 VERSION_REGISTRY의 required_params + optional_params 받기
+
+3. models/__init__.py 업데이트
+   ─────────────────────────────────────────
+   - import 추가: from .model_v16_5 import DAWN as DAWN_v16_5
+   - __all__에 'DAWN_v16_5' 추가
+   - create_model_by_version()에 elif 추가
+   - (선택) 기본 DAWN = DAWN_v16_5로 변경
+
+4. Config 파일 생성 (선택): configs/train_config_v16_5_*.yaml
+   ─────────────────────────────────────────
+   model:
+     model_version: "16.5"
+     your_required_param1: value
+     your_optional_param: value
+     ...
+
+================================================================================
+train.py는 수정 불필요!
+  - build_args_config(): args에서 모든 버전 파라미터 자동 추출
+  - load_model_params_to_args(): YAML/checkpoint에서 args로 자동 로딩
+  - build_model_kwargs(): 버전별 필요 파라미터만 필터링
+================================================================================
 """
 
 from typing import Dict, Any, List
