@@ -520,21 +520,12 @@ class NeuronCircuit(nn.Module):
         self.out_dropout = nn.Dropout(dropout)
 
     def forward(self, x, feature_r_weights_Q, feature_r_weights_K, feature_v_weights, relational_weights_Q, relational_weights_K, value_weights, attention_mask=None):
-        """
-        Args:
-            x: [B, S, D]
-            feature_r_weights_Q: [B, N_FR] - Q compression weights
-            feature_r_weights_K: [B, N_FR] - K compression weights
-            feature_v_weights: [B, N_FV] - V compression weights
-            relational_weights_Q: [B, N_R] - Q expansion weights
-            relational_weights_K: [B, N_R] - K expansion weights
-            value_weights: [B, N_V] - V expansion weights
-        """
         B, S, D = x.shape
+        R = self.rank
         token_routing = feature_r_weights_Q.dim() == 3
 
         if token_routing:
-            # Token-level routing
+            # Token-level routing (유지 - 사용 안함)
             shared_feature_r_Q = torch.einsum('bsn,ndr->bsdr', feature_r_weights_Q,
                                                self.shared_neurons.feature_r_neurons)
             shared_feature_r_K = torch.einsum('bsn,ndr->bsdr', feature_r_weights_K,
@@ -556,30 +547,36 @@ class NeuronCircuit(nn.Module):
             K = torch.einsum('bsr,bsrd->bsd', h_r_K, shared_relational_K)
             V = torch.einsum('bsr,bsrd->bsd', h_v, shared_value)
         else:
-            # Batch-level routing (Q/K 스택 최적화)
-            # Feature_r: Q/K 스택해서 한번에
-            fr_weights_QK = torch.stack([feature_r_weights_Q, feature_r_weights_K], dim=1)  # [B, 2, N]
-            shared_fr_QK = torch.einsum('bkn,ndr->bkdr', fr_weights_QK, self.shared_neurons.feature_r_neurons)
-            shared_feature_r_Q, shared_feature_r_K = shared_fr_QK[:, 0], shared_fr_QK[:, 1]
+            # Batch-level routing - matmul 최적화
 
-            shared_feature_v = torch.einsum('bn,ndr->bdr', feature_v_weights,
-                                             self.shared_neurons.feature_v_neurons)
+            # Feature_R neurons: [N, D, R] → [N, D*R]
+            fr_flat = self.shared_neurons.feature_r_neurons.view(-1, D * R)
+            # Q/K weights @ flattened neurons → reshape
+            shared_fr_Q = (feature_r_weights_Q @ fr_flat).view(B, D, R)
+            shared_fr_K = (feature_r_weights_K @ fr_flat).view(B, D, R)
 
-            h_r_Q = torch.einsum('bsd,bdr->bsr', x, shared_feature_r_Q)
-            h_r_K = torch.einsum('bsd,bdr->bsr', x, shared_feature_r_K)
-            h_v = torch.einsum('bsd,bdr->bsr', x, shared_feature_v)
+            # Feature_V neurons
+            fv_flat = self.shared_neurons.feature_v_neurons.view(-1, D * R)
+            shared_fv = (feature_v_weights @ fv_flat).view(B, D, R)
 
-            # Relational: Q/K 스택해서 한번에
-            pool_R = self.shared_neurons.relational_neurons
-            pool_V = self.shared_neurons.value_neurons
-            rel_weights_QK = torch.stack([relational_weights_Q, relational_weights_K], dim=1)  # [B, 2, N]
-            shared_rel_QK = torch.einsum('bkn,nrd->bkrd', rel_weights_QK, pool_R)
-            shared_relational_Q, shared_relational_K = shared_rel_QK[:, 0], shared_rel_QK[:, 1]
-            shared_value = torch.einsum('bn,nrd->brd', value_weights, pool_V)
+            # Compression: bmm
+            h_r_Q = torch.bmm(x, shared_fr_Q)  # [B, S, R]
+            h_r_K = torch.bmm(x, shared_fr_K)
+            h_v = torch.bmm(x, shared_fv)
 
-            Q = torch.einsum('bsr,brd->bsd', h_r_Q, shared_relational_Q)
-            K = torch.einsum('bsr,brd->bsd', h_r_K, shared_relational_K)
-            V = torch.einsum('bsr,brd->bsd', h_v, shared_value)
+            # Relational neurons: [N, R, D] → [N, R*D]
+            rel_flat = self.shared_neurons.relational_neurons.view(-1, R * D)
+            shared_rel_Q = (relational_weights_Q @ rel_flat).view(B, R, D)
+            shared_rel_K = (relational_weights_K @ rel_flat).view(B, R, D)
+
+            # Value neurons
+            val_flat = self.shared_neurons.value_neurons.view(-1, R * D)
+            shared_val = (value_weights @ val_flat).view(B, R, D)
+
+            # Restoration: bmm
+            Q = torch.bmm(h_r_Q, shared_rel_Q)  # [B, S, D]
+            K = torch.bmm(h_r_K, shared_rel_K)
+            V = torch.bmm(h_v, shared_val)
 
         # Multi-head Attention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
