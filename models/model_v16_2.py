@@ -63,14 +63,8 @@ class UnifiedNeuronRouter(nn.Module):
         self.value_end = n_feature_r + n_feature_v + n_relational + n_value
         # knowledge는 value_end ~ total_neurons
 
-        # 공유 projection (feature_v, value, knowledge용)
-        self.proj = nn.Linear(d_model, d_space)
-        # Q/K 분리 projection (feature_r용)
-        self.proj_FR_Q = nn.Linear(d_model, d_space)
-        self.proj_FR_K = nn.Linear(d_model, d_space)
-        # Q/K 분리 projection (relational용)
-        self.proj_rel_Q = nn.Linear(d_model, d_space)
-        self.proj_rel_K = nn.Linear(d_model, d_space)
+        # 통합 projection (shared, FR_Q, FR_K, rel_Q, rel_K)
+        self.proj_all = nn.Linear(d_model, d_space * 5)
         self.dropout = nn.Dropout(dropout)
 
         # 통합 뉴런 임베딩 [total_neurons, d_space]
@@ -97,88 +91,29 @@ class UnifiedNeuronRouter(nn.Module):
         return torch.clamp(1.0 - usage_ema / self.tau, min=0.0, max=1.0)
 
     def get_logits(self, x, neuron_type):
-        """
-        x: [B, S, d_model]
-        neuron_type: 'feature_r_Q', 'feature_r_K', 'feature_v', 'relational_Q', 'relational_K', 'value', 'knowledge'
-        """
-        neuron_emb_norm = F.normalize(self.neuron_emb, dim=-1)
+        """knowledge 전용 (나머지는 get_all_logits 사용)"""
+        if neuron_type != 'knowledge':
+            raise ValueError(f"Use get_all_logits for {neuron_type}. get_logits is for 'knowledge' only.")
 
-        if neuron_type == 'feature_r_Q':
-            h_proj_Q = self.proj_FR_Q(x)
-            h_proj_Q = self.dropout(h_proj_Q)
-            fr_emb = neuron_emb_norm[:self.feature_r_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj_Q, fr_emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_feature_r)
-                logits = logits + excitability * self.excitability_weight
+        emb_norm = F.normalize(self.neuron_emb, dim=-1)
+        # knowledge는 shared projection 사용 → proj_all의 첫번째 chunk
+        h_shared = self.dropout(self.proj_all(x).chunk(5, dim=-1)[0])
+        knowledge_emb = emb_norm[self.value_end:]
 
-        elif neuron_type == 'feature_r_K':
-            h_proj_K = self.proj_FR_K(x)
-            h_proj_K = self.dropout(h_proj_K)
-            fr_emb = neuron_emb_norm[:self.feature_r_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj_K, fr_emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_feature_r)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'feature_v':
-            h_proj = self.proj(x)
-            h_proj = self.dropout(h_proj)
-            all_logits = torch.einsum('bsd,nd->bsn', h_proj, neuron_emb_norm)
-            logits = all_logits[..., self.feature_r_end:self.feature_v_end]
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_feature_v)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'relational_Q':
-            h_proj_Q = self.proj_rel_Q(x)
-            h_proj_Q = self.dropout(h_proj_Q)
-            rel_emb = neuron_emb_norm[self.feature_v_end:self.relational_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj_Q, rel_emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_relational)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'relational_K':
-            h_proj_K = self.proj_rel_K(x)
-            h_proj_K = self.dropout(h_proj_K)
-            rel_emb = neuron_emb_norm[self.feature_v_end:self.relational_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj_K, rel_emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_relational)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'value':
-            h_proj = self.proj(x)
-            h_proj = self.dropout(h_proj)
-            value_emb = neuron_emb_norm[self.relational_end:self.value_end]
-            logits = torch.einsum('bsd,nd->bsn', h_proj, value_emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_value)
-                logits = logits + excitability * self.excitability_weight
-
-        elif neuron_type == 'knowledge':
-            h_proj = self.proj(x)
-            h_proj = self.dropout(h_proj)
-            knowledge_emb = neuron_emb_norm[self.value_end:]
-            logits = torch.einsum('bsd,nd->bsn', h_proj, knowledge_emb)
-            if self.training:
-                excitability = self.get_excitability(self.usage_ema_knowledge)
-                logits = logits + excitability * self.excitability_weight
-
+        logits = torch.einsum('bsd,nd->bsn', h_shared, knowledge_emb)
+        if self.training:
+            excitability = self.get_excitability(self.usage_ema_knowledge)
+            logits = logits + excitability * self.excitability_weight
         return logits
 
     def get_all_logits(self, x):
-        """한번에 모든 logits 계산 (정규화 1번, projection 통합)"""
+        """한번에 모든 logits 계산 (통합 projection + chunk)"""
         # 뉴런 임베딩 정규화 (1번만)
         emb_norm = F.normalize(self.neuron_emb, dim=-1)
 
-        # 모든 projection 한번에
-        h_shared = self.dropout(self.proj(x))  # feature_v, value, knowledge 공용
-        h_FR_Q = self.dropout(self.proj_FR_Q(x))
-        h_FR_K = self.dropout(self.proj_FR_K(x))
-        h_rel_Q = self.dropout(self.proj_rel_Q(x))
-        h_rel_K = self.dropout(self.proj_rel_K(x))
+        # 통합 projection → chunk
+        all_proj = self.dropout(self.proj_all(x))  # [B, S, d_space * 5]
+        h_shared, h_FR_Q, h_FR_K, h_rel_Q, h_rel_K = all_proj.chunk(5, dim=-1)
 
         # 뉴런 임베딩 슬라이스 (view라 비용 없음)
         fr_emb = emb_norm[:self.feature_r_end]

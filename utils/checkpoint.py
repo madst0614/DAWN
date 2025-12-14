@@ -445,3 +445,72 @@ def load_optimizer_state(
             print(f"   Epoch: {start_epoch}, Step: {start_step}, Best val loss: {best_val_loss:.4f}")
 
         return start_epoch, best_val_loss, start_step
+
+
+# =============================================================================
+# v16.2 Projection Migration
+# =============================================================================
+
+def migrate_v16_2_proj_to_unified(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    기존 v16.2 체크포인트의 개별 projection을 통합 proj_all로 변환.
+
+    Before: proj, proj_FR_Q, proj_FR_K, proj_rel_Q, proj_rel_K (5개)
+    After: proj_all (1개, d_space * 5)
+    """
+    new_state = {}
+    migrated_routers = set()
+
+    for key, value in state_dict.items():
+        # neuron_router의 개별 proj 찾기
+        if 'neuron_router.proj.weight' in key and 'proj_all' not in key:
+            base = key.rsplit('neuron_router.proj.weight', 1)[0] + 'neuron_router.'
+
+            # 이미 처리한 router는 스킵
+            if base in migrated_routers:
+                continue
+            migrated_routers.add(base)
+
+            # 5개 weight 가져오기
+            proj_w = state_dict.get(base + 'proj.weight')
+            proj_FR_Q_w = state_dict.get(base + 'proj_FR_Q.weight')
+            proj_FR_K_w = state_dict.get(base + 'proj_FR_K.weight')
+            proj_rel_Q_w = state_dict.get(base + 'proj_rel_Q.weight')
+            proj_rel_K_w = state_dict.get(base + 'proj_rel_K.weight')
+
+            if all(w is not None for w in [proj_w, proj_FR_Q_w, proj_FR_K_w, proj_rel_Q_w, proj_rel_K_w]):
+                # [d_space, d_model] * 5 → [d_space*5, d_model]
+                combined_w = torch.cat([proj_w, proj_FR_Q_w, proj_FR_K_w, proj_rel_Q_w, proj_rel_K_w], dim=0)
+                new_state[base + 'proj_all.weight'] = combined_w
+
+                # bias도 처리
+                proj_b = state_dict.get(base + 'proj.bias')
+                proj_FR_Q_b = state_dict.get(base + 'proj_FR_Q.bias')
+                proj_FR_K_b = state_dict.get(base + 'proj_FR_K.bias')
+                proj_rel_Q_b = state_dict.get(base + 'proj_rel_Q.bias')
+                proj_rel_K_b = state_dict.get(base + 'proj_rel_K.bias')
+
+                if all(b is not None for b in [proj_b, proj_FR_Q_b, proj_FR_K_b, proj_rel_Q_b, proj_rel_K_b]):
+                    combined_b = torch.cat([proj_b, proj_FR_Q_b, proj_FR_K_b, proj_rel_Q_b, proj_rel_K_b], dim=0)
+                    new_state[base + 'proj_all.bias'] = combined_b
+            continue
+
+        # 개별 proj 키들은 스킵 (이미 합침)
+        if any(x in key for x in ['neuron_router.proj_FR_Q', 'neuron_router.proj_FR_K',
+                                   'neuron_router.proj_rel_Q', 'neuron_router.proj_rel_K']):
+            continue
+        if 'neuron_router.proj.bias' in key and 'proj_all' not in key:
+            continue
+
+        # 나머지는 그대로
+        new_state[key] = value
+
+    return new_state
+
+
+def needs_v16_2_migration(state_dict: Dict[str, torch.Tensor]) -> bool:
+    """v16.2 proj migration이 필요한지 확인"""
+    for key in state_dict.keys():
+        if 'neuron_router.proj.weight' in key and 'proj_all' not in key:
+            return True
+    return False
