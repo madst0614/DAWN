@@ -774,9 +774,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         optimizer.zero_grad()
 
-        # Mixed precision training
+        # Mixed precision training (disabled for pure fp32 test)
         if scaler is not None:
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', enabled=False):
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
