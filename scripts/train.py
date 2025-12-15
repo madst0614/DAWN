@@ -640,6 +640,57 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
             dead_K = (ema_K < 0.01).float().mean().item()
             lines.append(f"             Knowledge: Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f}")
 
+    # v17: Complete Q/K/V Pool Separation + Knowledge Feature/Restore Separation
+    elif hasattr(router, 'usage_ema_feature_q'):
+        ema_fq = router.usage_ema_feature_q
+        ema_fk = router.usage_ema_feature_k
+        ema_fv = router.usage_ema_feature_v
+        ema_rq = router.usage_ema_restore_q
+        ema_rk = router.usage_ema_restore_k
+        ema_rv = router.usage_ema_restore_v
+
+        # Active neuron counts
+        active_fq = (ema_fq > 0.01).sum().item()
+        active_fk = (ema_fk > 0.01).sum().item()
+        active_fv = (ema_fv > 0.01).sum().item()
+        active_rq = (ema_rq > 0.01).sum().item()
+        active_rk = (ema_rk > 0.01).sum().item()
+        active_rv = (ema_rv > 0.01).sum().item()
+        n_fq, n_fk, n_fv = ema_fq.numel(), ema_fk.numel(), ema_fv.numel()
+        n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
+
+        # Gini coefficients
+        gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
+        gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
+
+        # Dead neuron ratios (EMA < 0.01)
+        dead_fq = (ema_fq < 0.01).float().mean().item()
+        dead_fk = (ema_fk < 0.01).float().mean().item()
+        dead_fv = (ema_fv < 0.01).float().mean().item()
+        dead_rq = (ema_rq < 0.01).float().mean().item()
+        dead_rk = (ema_rk < 0.01).float().mean().item()
+        dead_rv = (ema_rv < 0.01).float().mean().item()
+
+        # Excitability
+        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
+
+        lines.append(f"         Excitability | w={exc_w:.4f} | Active FQ/FK/FV:{int(active_fq)}/{n_fq},{int(active_fk)}/{n_fk},{int(active_fv)}/{n_fv}")
+        lines.append(f"             Active RQ/RK/RV:{int(active_rq)}/{n_rq},{int(active_rk)}/{n_rk},{int(active_rv)}/{n_rv}")
+        lines.append(f"             Gini FQ/FK/FV: {gini_fq:.2f}/{gini_fk:.2f}/{gini_fv:.2f} | RQ/RK/RV: {gini_rq:.2f}/{gini_rk:.2f}/{gini_rv:.2f}")
+        lines.append(f"             Dead FQ/FK/FV: {dead_fq:.1%}/{dead_fk:.1%}/{dead_fv:.1%} | RQ/RK/RV: {dead_rq:.1%}/{dead_rk:.1%}/{dead_rv:.1%}")
+
+        # Knowledge neurons (Feature/Restore separated in v17)
+        if hasattr(router, 'usage_ema_feature_know'):
+            ema_FK = router.usage_ema_feature_know
+            ema_RK = router.usage_ema_restore_know
+            active_FK = (ema_FK > 0.01).sum().item()
+            active_RK = (ema_RK > 0.01).sum().item()
+            n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+            gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+            dead_FK = (ema_FK < 0.01).float().mean().item()
+            dead_RK = (ema_RK < 0.01).float().mean().item()
+            lines.append(f"             Knowledge F/R: Active {int(active_FK)}/{n_FK},{int(active_RK)}/{n_RK} | Dead:{dead_FK:.1%}/{dead_RK:.1%} | Gini:{gini_FK:.2f}/{gini_RK:.2f}")
+
     # v16.3: Complete Q/K/V Pool Separation
     elif hasattr(router, 'usage_ema_fq'):
         ema_fq = router.usage_ema_fq
@@ -1050,14 +1101,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         # Collect knowledge indices from all layers
                         all_k_idx = []
                         all_coarse_idx = []
-                        is_v17_style = False  # v17 uses top_k_knowledge, not coarse→fine
+                        is_v17_style = False  # v17 uses feature_know/restore_know separation
                         for layer_info in routing_infos:
-                            # v17: knowledge -> topk_indices (Feature-Restore pattern)
+                            # v17: knowledge -> feature_know_w, restore_know_w (Feature-Restore separation)
                             know = layer_info.get('knowledge', {})
+                            feature_know_w = know.get('feature_know_w')
+                            restore_know_w = know.get('restore_know_w')
+                            if feature_know_w is not None:
+                                is_v17_style = True
                             topk_idx = know.get('topk_indices')
                             if topk_idx is not None:
                                 all_k_idx.append(topk_idx.flatten())
-                                is_v17_style = True
                             # v16.x: memory -> fine_indices, coarse_indices (2-stage retrieval)
                             mem = layer_info.get('memory', {})
                             fine_idx = mem.get('fine_indices')
@@ -1071,7 +1125,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             if k_idx is not None:
                                 all_k_idx.append(k_idx.flatten())
 
-                        if all_k_idx:
+                        # v17: Feature-Restore separation - no indices, just weights
+                        if is_v17_style:
+                            n_feature_know = base_model.n_feature_know if hasattr(base_model, 'n_feature_know') else 24
+                            n_restore_know = base_model.n_restore_know if hasattr(base_model, 'n_restore_know') else 24
+                            top_k_fk = base_model.top_k_feature_know if hasattr(base_model, 'top_k_feature_know') else 4
+                            top_k_rk = base_model.top_k_restore_know if hasattr(base_model, 'top_k_restore_know') else 4
+                            print(f"         Knowledge: Feature {n_feature_know} (k={top_k_fk}) / Restore {n_restore_know} (k={top_k_rk})")
+                        elif all_k_idx:
                             all_idx = torch.cat(all_k_idx)
                             n_knowledge = base_model.n_knowledge if hasattr(base_model, 'n_knowledge') else 80
 
@@ -1090,13 +1151,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             # Gini
                             gini_K = _gini(usage_freq)
 
-                            # v17: top_k_knowledge (Feature-Restore pattern)
-                            if is_v17_style:
-                                top_k_knowledge = base_model.top_k_knowledge if hasattr(base_model, 'top_k_knowledge') else 4
-                                unique_k = len(torch.unique(all_idx))
-                                print(f"         Knowledge: Active {int(active_K)}/{n_knowledge} | Ent:{ent_ratio_K:.0f}% | Gini:{gini_K:.2f} | top_k={top_k_knowledge} (unique: {unique_k})")
                             # v16.x: coarse→fine ratio (2-stage retrieval)
-                            elif all_coarse_idx:
+                            if all_coarse_idx:
                                 coarse_all = torch.cat(all_coarse_idx)
                                 coarse_unique = len(torch.unique(coarse_all))
                                 fine_unique = len(torch.unique(all_idx))
