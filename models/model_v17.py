@@ -705,33 +705,27 @@ class KnowledgeCircuit(nn.Module):
         feature_know_w: [B, S, n_feature_know] - token-level sparse weights
         restore_know_w: [B, S, n_restore_know] - token-level sparse weights
         """
-        k_f = self.top_k_feature_know
-        k_r = self.top_k_restore_know
+        B, S, D = x.shape
+        chunk_size = 64  # 메모리 효율을 위해 S를 64씩 처리
 
-        # top-k indices + values
-        f_vals, f_idx = torch.topk(feature_know_w, k_f, dim=-1)  # [B, S, k_f]
-        r_vals, r_idx = torch.topk(restore_know_w, k_r, dim=-1)  # [B, S, k_r]
+        outputs = []
+        for start in range(0, S, chunk_size):
+            end = min(start + chunk_size, S)
+            x_chunk = x[:, start:end]  # [B, chunk, D]
+            f_w_chunk = feature_know_w[:, start:end]  # [B, chunk, n]
+            r_w_chunk = restore_know_w[:, start:end]  # [B, chunk, n]
 
-        # vmap으로 batch/seq 차원 처리
-        def feature_single(x_vec, idx_vec, val_vec):
-            # x_vec: [D], idx_vec: [k_f], val_vec: [k_f]
-            neurons = self.shared_neurons.feature_know[idx_vec]  # [k_f, D, R]
-            h_k = torch.einsum('d,kdr->kr', x_vec, neurons)  # [k_f, R]
-            return (h_k * val_vec.unsqueeze(-1)).sum(dim=0)  # [R]
+            # Feature (compression)
+            weighted_f = torch.einsum('bcn,ndr->bcdr', f_w_chunk, self.shared_neurons.feature_know)
+            h = torch.einsum('bcd,bcdr->bcr', x_chunk, weighted_f)
 
-        def restore_single(h_vec, idx_vec, val_vec):
-            # h_vec: [R], idx_vec: [k_r], val_vec: [k_r]
-            neurons = self.shared_neurons.restore_know[idx_vec]  # [k_r, R, D]
-            out_k = torch.einsum('r,krd->kd', h_vec, neurons)  # [k_r, D]
-            return (out_k * val_vec.unsqueeze(-1)).sum(dim=0)  # [D]
+            # Restore (restoration)
+            weighted_r = torch.einsum('bcn,nrd->bcrd', r_w_chunk, self.shared_neurons.restore_know)
+            out_chunk = torch.einsum('bcr,bcrd->bcd', h, weighted_r)
 
-        # vmap over batch and seq
-        feature_batched = torch.vmap(torch.vmap(feature_single))
-        restore_batched = torch.vmap(torch.vmap(restore_single))
+            outputs.append(out_chunk)
 
-        h = feature_batched(x, f_idx, f_vals)  # [B, S, R]
-        output = restore_batched(h, r_idx, r_vals)  # [B, S, D]
-
+        output = torch.cat(outputs, dim=1)
         return self.dropout(output)
 
 
