@@ -267,12 +267,13 @@ VERSION_REGISTRY = {
         ],
     },
     "17": {
-        "description": "v16.3 + Knowledge Feature-Restore (Q/K/V 완전 분리)",
+        "description": "v16.3 + Knowledge Feature-Restore 분리 라우팅",
         "aliases": ["17.0", "170"],
         "module": "model_v17",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_feature_q", "n_feature_k", "n_feature_v", "n_restore_q", "n_restore_k", "n_restore_v", "n_knowledge",
+            "n_feature_q", "n_feature_k", "n_feature_v", "n_restore_q", "n_restore_k", "n_restore_v",
+            "n_feature_know", "n_restore_know",
             "rank",
         ],
         "optional_params": {
@@ -284,7 +285,8 @@ VERSION_REGISTRY = {
             "top_k_restore_q": 8,
             "top_k_restore_k": 8,
             "top_k_restore_v": 3,
-            "top_k_knowledge": 4,
+            "top_k_feature_know": 4,
+            "top_k_restore_know": 4,
             "d_space": 64,
             "knowledge_rank": 128,
             "gradient_checkpointing": False,
@@ -296,11 +298,11 @@ VERSION_REGISTRY = {
             "excitability_decay_rate": 0.99995,
         },
         "display_info": lambda args: [
-            f"DAWN v17: Q/K/V Separated + Knowledge Feature-Restore",
+            f"DAWN v17: Q/K/V Separated + Knowledge Feature-Restore 분리",
             f"  rank={args.get('rank', args.get('basis_rank'))}, knowledge_rank={args.get('knowledge_rank', 128)}",
             f"  Feature_Q: {args.get('n_feature_q')} (k={args.get('top_k_feature_q', 8)}), Feature_K: {args.get('n_feature_k')} (k={args.get('top_k_feature_k', 8)}), Feature_V: {args.get('n_feature_v')} (k={args.get('top_k_feature_v', 3)})",
             f"  Restore_Q: {args.get('n_restore_q')} (k={args.get('top_k_restore_q', 8)}), Restore_K: {args.get('n_restore_k')} (k={args.get('top_k_restore_k', 8)}), Restore_V: {args.get('n_restore_v')} (k={args.get('top_k_restore_v', 3)})",
-            f"  Knowledge: {args.get('n_knowledge')} (top-k={args.get('top_k_knowledge', 4)}) - Feature-Restore",
+            f"  Feature_Know: {args.get('n_feature_know')} (k={args.get('top_k_feature_know', 4)}), Restore_Know: {args.get('n_restore_know')} (k={args.get('top_k_restore_know', 4)})",
         ],
     },
 

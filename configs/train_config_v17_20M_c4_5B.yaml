@@ -1,5 +1,5 @@
 # DAWN v17 Training Config - 20M Scale, 5B tokens
-# v16.3 + Knowledge Feature-Restore (Q/K/V 완전 분리)
+# v16.3 + Knowledge Feature-Restore 분리 라우팅 (8개 독립 뉴런 풀)
 
 data:
   base_dir: /content/drive/MyDrive/data
@@ -46,10 +46,12 @@ model:
   top_k_feature_v: 6
   top_k_restore_v: 6
 
-  # Knowledge - Feature-Restore pattern (NEW in v17)
-  n_knowledge: 24
+  # Knowledge - Feature-Restore 분리 라우팅 (NEW in v17)
+  n_feature_know: 24
+  n_restore_know: 24
   knowledge_rank: 128
-  top_k_knowledge: 4
+  top_k_feature_know: 4
+  top_k_restore_know: 4
 
   max_seq_len: 512
   dropout: 0.1
@@ -80,18 +82,19 @@ use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17_20M_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_v17_20M_c4_5B
 
-# v17 Architecture (v16.3 + Knowledge Feature-Restore)
+# v17 Architecture (v16.3 + Knowledge Feature-Restore 분리 라우팅)
+#   8개 독립 뉴런 풀:
+#
 #   Attention Circuit (Q/K/V 완전 분리):
 #   - Feature_Q=56 (k=16), Feature_K=56 (k=16), Feature_V=24 (k=6) -> 136 compression neurons
 #   - Restore_Q=56 (k=16), Restore_K=56 (k=16), Restore_V=24 (k=6) -> 136 restoration neurons
 #
-#   Knowledge Circuit (NEW: Feature-Restore pattern):
-#   - Knowledge=24 neurons (k=4) - Feature-Restore pattern
-#   - feature_know: [24, 384, 128] - compression
-#   - restore_know: [24, 128, 384] - restoration
+#   Knowledge Circuit (Feature-Restore 분리 라우팅):
+#   - Feature_Know=24 (k=4): [24, 384, 128] - 독립 compression 라우팅
+#   - Restore_Know=24 (k=4): [24, 128, 384] - 독립 restoration 라우팅
 #
 #   Routing paths:
-#   - Q: x -> Feature_Q -> h_q -> Restore_Q -> Q
-#   - K: x -> Feature_K -> h_k -> Restore_K -> K
-#   - V: x -> Feature_V -> h_v -> Restore_V -> V
-#   - Knowledge: x -> feature_know -> h -> restore_know -> output
+#   - Q: x -> proj_feature_q -> Feature_Q -> h_q -> proj_restore_q -> Restore_Q -> Q
+#   - K: x -> proj_feature_k -> Feature_K -> h_k -> proj_restore_k -> Restore_K -> K
+#   - V: x -> proj_feature_v -> Feature_V -> h_v -> proj_restore_v -> Restore_V -> V
+#   - Knowledge: x -> proj_feature_know -> Feature_Know -> h -> proj_restore_know -> Restore_Know -> output
