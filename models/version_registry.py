@@ -304,6 +304,25 @@ VERSION_REGISTRY = {
             f"  Unified Router: d_space={args.get('d_space', 64)}",
         ],
     },
+
+    # Baseline Transformer for fair comparison
+    "baseline": {
+        "description": "Vanilla Transformer Baseline",
+        "aliases": ["vanilla", "base"],
+        "module": "baseline_transformer",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+        ],
+        "optional_params": {
+            "d_ff": None,  # defaults to 4 * d_model if not specified
+            "dropout": 0.1,
+        },
+        "display_info": lambda args: [
+            f"Vanilla Transformer Baseline",
+            f"  d_model={args.get('d_model')}, n_layers={args.get('n_layers')}, n_heads={args.get('n_heads')}",
+            f"  d_ff={args.get('d_ff', args.get('d_model', 256) * 4)}",
+        ],
+    },
 }
 
 
