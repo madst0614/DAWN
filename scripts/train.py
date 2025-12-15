@@ -639,7 +639,19 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         lines.append(f"             Dead FQK/FV: {dead_fqk:.1%}/{dead_fv:.1%} | RQK/RV: {dead_rqk:.1%}/{dead_rv:.1%}")
 
         # Knowledge neurons (if available)
-        if hasattr(router, 'usage_ema_knowledge'):
+        if hasattr(router, 'usage_ema_feature_know'):
+            # v17.1: Feature/Restore separated knowledge
+            ema_FK = router.usage_ema_feature_know
+            ema_RK = router.usage_ema_restore_know
+            active_FK = (ema_FK > 0.01).sum().item()
+            active_RK = (ema_RK > 0.01).sum().item()
+            n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+            gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+            dead_FK = (ema_FK < 0.01).float().mean().item()
+            dead_RK = (ema_RK < 0.01).float().mean().item()
+            lines.append(f"             Knowledge F/R: Active {int(active_FK)}/{n_FK},{int(active_RK)}/{n_RK} | Dead:{dead_FK:.1%}/{dead_RK:.1%} | Gini:{gini_FK:.2f}/{gini_RK:.2f}")
+        elif hasattr(router, 'usage_ema_knowledge'):
+            # v16.4: single knowledge pool
             ema_K = router.usage_ema_knowledge
             active_K = (ema_K > 0.01).sum().item()
             n_K = ema_K.numel()
