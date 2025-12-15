@@ -1,5 +1,5 @@
 # DAWN v17 Training Config - 20M Scale, 5B tokens
-# Unified Neuron Architecture: Attention + Knowledge both use Feature-Restore pattern
+# v16.3 + Knowledge Feature-Restore (Q/K/V 완전 분리)
 
 data:
   base_dir: /content/drive/MyDrive/data
@@ -27,17 +27,26 @@ model:
   rank: 64
   state_dim: 64
 
-  # Attention (same as v16.4)
-  n_feature_qk: 96
-  top_k_feature_qk: 8
-  n_feature_v: 24
-  top_k_feature_v: 3
-  n_restore_qk: 96
-  top_k_restore_qk: 8
-  n_restore_v: 24
-  top_k_restore_v: 3
+  # Attention - Q/K/V 완전 분리 (v16.3 동일)
+  # Q compression/restoration
+  n_fq: 56
+  n_rq: 56
+  top_k_fq: 16
+  top_k_rq: 16
 
-  # Knowledge (NEW: Feature-Restore pattern)
+  # K compression/restoration
+  n_fk: 56
+  n_rk: 56
+  top_k_fk: 16
+  top_k_rk: 16
+
+  # V compression/restoration
+  n_fv: 24
+  n_rv: 24
+  top_k_fv: 6
+  top_k_rv: 6
+
+  # Knowledge - Feature-Restore pattern (NEW in v17)
   n_knowledge: 24
   knowledge_rank: 128
   top_k_knowledge: 4
@@ -71,18 +80,18 @@ use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17_20M_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_v17_20M_c4_5B
 
-# v17 Architecture (Unified Neuron Architecture)
-#   Attention Circuit:
-#   - Feature_QK=96 (k=8) - Q/K shared pool, separate routing
-#   - Feature_V=24 (k=3)
-#   - Restore_QK=96 (k=8) - Q/K shared pool, separate routing
-#   - Restore_V=24 (k=3)
+# v17 Architecture (v16.3 + Knowledge Feature-Restore)
+#   Attention Circuit (Q/K/V 완전 분리):
+#   - FQ=56 (k=16), FK=56 (k=16), FV=24 (k=6) -> 136 compression neurons
+#   - RQ=56 (k=16), RK=56 (k=16), RV=24 (k=6) -> 136 restoration neurons
 #
 #   Knowledge Circuit (NEW: Feature-Restore pattern):
 #   - Knowledge=24 neurons (k=4) - Feature-Restore pattern
-#   - Feature_Know: [24, 384, 128] - information extraction
-#   - Restore_Know: [24, 128, 384] - knowledge restoration
+#   - feature_know: [24, 384, 128] - compression
+#   - restore_know: [24, 128, 384] - restoration
 #
-#   Both circuits use same Feature-Restore pattern:
-#   - Attention: x -> Feature -> h -> Restore -> Q/K/V -> attention
-#   - Knowledge: x -> Feature_Know -> h -> Restore_Know -> knowledge output
+#   Routing paths:
+#   - Q: x -> FQ -> h_q -> RQ -> Q
+#   - K: x -> FK -> h_k -> RK -> K
+#   - V: x -> FV -> h_v -> RV -> V
+#   - Knowledge: x -> feature_know -> h -> restore_know -> output
