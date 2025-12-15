@@ -56,8 +56,22 @@ HOW TO ADD A NEW VERSION (e.g., v16.5)
      your_optional_param: value
      ...
 
+5. scripts/train.py 업데이트 (메이저 버전 변경 시 필수!)
+   ─────────────────────────────────────────
+   a) needs_routing_info() - 200 step마다 콘솔 로그 출력 조건
+      - is_v17_model() 같은 버전 체크 함수 추가
+      - needs_routing_info()에 or is_vXX_model(model) 추가
+
+   b) _get_router_log_lines() - Usage EMA 로깅
+      - router의 usage_ema_* 속성명이 변경되면 elif 브랜치 추가
+      - 예: usage_ema_fq (v16.3) → usage_ema_feature_q (v17)
+
+   c) get_routing_log_info() (이 파일 하단) - Entropy/Variance 로깅
+      - routing_info의 *_pref 키가 변경되면 elif 브랜치 추가
+      - 예: fq_pref (v16.3) → feature_q_pref (v17)
+
 ================================================================================
-train.py는 수정 불필요!
+train.py 파라미터 로딩은 자동!
   - build_args_config(): args에서 모든 버전 파라미터 자동 추출
   - load_model_params_to_args(): YAML/checkpoint에서 args로 자동 로딩
   - build_model_kwargs(): 버전별 필요 파라미터만 필터링
