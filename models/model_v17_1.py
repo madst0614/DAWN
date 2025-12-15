@@ -573,7 +573,7 @@ class KnowledgeCircuit(nn.Module):
     Note: AttentionCircuit은 batch-level (importance 가중 평균)
           KnowledgeCircuit은 token-level (토큰별 softmax/top-k)
 
-    x -> router selects knowledge neurons [B,S,n] (token-level top_k)
+    x -> router selects knowledge neurons [B,S,k] (token-level top_k)
       -> Feature_Know extracts info (d_model -> knowledge_rank)
       -> Restore_Know restores knowledge (knowledge_rank -> d_model)
     """
@@ -583,6 +583,7 @@ class KnowledgeCircuit(nn.Module):
         d_model: int,
         n_knowledge: int,
         knowledge_rank: int,
+        top_k_knowledge: int = 4,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -590,6 +591,7 @@ class KnowledgeCircuit(nn.Module):
         self.d_model = d_model
         self.n_knowledge = n_knowledge
         self.knowledge_rank = knowledge_rank
+        self.top_k_knowledge = top_k_knowledge
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, k_weights, attention_mask=None):
@@ -598,13 +600,22 @@ class KnowledgeCircuit(nn.Module):
             x: [B, S, D]
             k_weights: [B, S, n_knowledge] token-level sparse weights from router
         """
-        # Feature (compression): [B, S, n] × [n, D, R] → [B, S, D, R]
-        shared_feature = torch.einsum('bsn,ndr->bsdr', k_weights, self.shared_neurons.feature_know)
-        h = torch.einsum('bsd,bsdr->bsr', x, shared_feature)  # [B, S, R]
+        k = self.top_k_knowledge
 
-        # Restore (restoration): [B, S, n] × [n, R, D] → [B, S, R, D]
-        shared_restore = torch.einsum('bsn,nrd->bsrd', k_weights, self.shared_neurons.restore_know)
-        output = torch.einsum('bsr,bsrd->bsd', h, shared_restore)  # [B, S, D]
+        # 1. top-k indices + values 추출
+        k_vals, k_idx = torch.topk(k_weights, k, dim=-1)  # [B, S, k]
+
+        # 2. 선택된 뉴런만 gather
+        f_neurons = self.shared_neurons.feature_know[k_idx]  # [B, S, k, D, R]
+        r_neurons = self.shared_neurons.restore_know[k_idx]  # [B, S, k, R, D]
+
+        # 3. Feature (compression): weighted sum over k neurons
+        h = torch.einsum('bsd,bskdr->bskr', x, f_neurons)  # [B, S, k, R]
+        h = (h * k_vals.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
+
+        # 4. Restore (restoration): weighted sum over k neurons
+        out = torch.einsum('bsr,bskrd->bskd', h.unsqueeze(2).expand(-1, -1, k, -1), r_neurons)
+        output = (out * k_vals.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         return self.dropout(output)
 
@@ -619,12 +630,16 @@ class DAWNBlock(nn.Module):
         rank: int,
         n_knowledge: int,
         knowledge_rank: int = 128,
+        top_k_knowledge: int = 4,
         dropout: float = 0.1,
     ):
         super().__init__()
 
         self.attn = AttentionCircuit(shared_neurons, d_model, n_heads, rank, dropout)
-        self.knowledge = KnowledgeCircuit(shared_neurons, d_model, n_knowledge, knowledge_rank, dropout)
+        self.knowledge = KnowledgeCircuit(
+            shared_neurons, d_model, n_knowledge, knowledge_rank,
+            top_k_knowledge=top_k_knowledge, dropout=dropout
+        )
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -759,7 +774,7 @@ class DAWN(nn.Module):
             DAWNBlock(
                 shared_neurons=self.shared_neurons, d_model=d_model, n_heads=n_heads,
                 rank=rank, n_knowledge=n_knowledge, knowledge_rank=knowledge_rank,
-                dropout=dropout,
+                top_k_knowledge=top_k_knowledge, dropout=dropout,
             )
             for _ in range(n_layers)
         ])
