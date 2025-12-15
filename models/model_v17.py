@@ -619,12 +619,14 @@ class KnowledgeCircuit(nn.Module):
         d_model: int,
         n_knowledge: int,
         knowledge_rank: int,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
         self.n_knowledge = n_knowledge
         self.knowledge_rank = knowledge_rank
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, k_weights, attention_mask=None):
         """
@@ -646,6 +648,7 @@ class KnowledgeCircuit(nn.Module):
         shared_restore = (k_weights @ restore_flat).view(B, R, D)
 
         output = torch.bmm(h, shared_restore)  # [B, S, D]
+        output = self.dropout(output)
 
         return output
 
@@ -667,12 +670,12 @@ class DAWNBlock(nn.Module):
         self.attn = NeuronCircuit(shared_neurons, d_model, n_heads, rank, dropout)
         self.knowledge = KnowledgeCircuit(
             shared_neurons, d_model, n_knowledge,
-            knowledge_rank=knowledge_rank if knowledge_rank else 128
+            knowledge_rank=knowledge_rank if knowledge_rank else 128,
+            dropout=dropout
         )
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, importance, global_routers: GlobalRouters, attention_mask=None):
         normed_x = self.norm1(x)
@@ -685,7 +688,7 @@ class DAWNBlock(nn.Module):
         normed_x2 = self.norm2(x)
         k_weights, k_topk_idx = global_routers.get_knowledge_weights(normed_x2, importance, attention_mask)
         know_out = self.knowledge(normed_x2, k_weights, attention_mask)
-        x = x + self.dropout(know_out)
+        x = x + know_out
 
         attn_out_norm = attn_out.norm(dim=-1).mean().detach()
         know_out_norm = know_out.norm(dim=-1).mean().detach()
