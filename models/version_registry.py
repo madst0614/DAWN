@@ -7,7 +7,7 @@ Version History:
   v16.2: Full Q/K Projection Separation - Q/K routing paths separated
   v16.3: Complete Q/K/V Pool Separation - FQ/FK/FV, RQ/RK/RV all independent
   v16.4: Shared Pool + Separate Routing - v16.3 optimized, Q/K shared pool with separate routing
-  v17: Unified Neuron Architecture - Knowledge도 Feature-Restore 패턴 사용
+  v17: v16.3 + Knowledge Feature-Restore 분리 라우팅 (8개 독립 풀: FQ/FK/FV/RQ/RK/RV + Feature_Know/Restore_Know)
 
 ================================================================================
 HOW TO ADD A NEW VERSION (e.g., v16.5)
