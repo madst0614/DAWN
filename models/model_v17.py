@@ -705,24 +705,30 @@ class KnowledgeCircuit(nn.Module):
         feature_know_w: [B, S, n_feature_know] - token-level sparse weights
         restore_know_w: [B, S, n_restore_know] - token-level sparse weights
         """
+        B, S, D = x.shape
+        R = self.knowledge_rank
         k_f = self.top_k_feature_know
         k_r = self.top_k_restore_know
 
-        # 1. top-k indices + values 추출
+        # top-k indices + values
         f_vals, f_idx = torch.topk(feature_know_w, k_f, dim=-1)  # [B, S, k_f]
         r_vals, r_idx = torch.topk(restore_know_w, k_r, dim=-1)  # [B, S, k_r]
 
-        # 2. 선택된 뉴런만 gather
-        f_neurons = self.shared_neurons.feature_know[f_idx]  # [B, S, k_f, D, R]
-        r_neurons = self.shared_neurons.restore_know[r_idx]  # [B, S, k_r, R, D]
+        # Feature: 루프로 k개만 (메모리 절약)
+        h = torch.zeros(B, S, R, device=x.device, dtype=x.dtype)
+        for i in range(k_f):
+            idx = f_idx[:, :, i]  # [B, S]
+            w = f_vals[:, :, i:i+1]  # [B, S, 1]
+            neuron = self.shared_neurons.feature_know[idx]  # [B, S, D, R]
+            h = h + w.unsqueeze(-1) * torch.einsum('bsd,bsdr->bsr', x, neuron)
 
-        # 3. Feature (compression): weighted sum over k_f neurons
-        h = torch.einsum('bsd,bskdr->bskr', x, f_neurons)  # [B, S, k_f, R]
-        h = (h * f_vals.unsqueeze(-1)).sum(dim=2)  # [B, S, R]
-
-        # 4. Restore (restoration): weighted sum over k_r neurons
-        out = torch.einsum('bsr,bskrd->bskd', h.unsqueeze(2).expand(-1, -1, k_r, -1), r_neurons)
-        output = (out * r_vals.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
+        # Restore: 루프로 k개만
+        output = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
+        for i in range(k_r):
+            idx = r_idx[:, :, i]  # [B, S]
+            w = r_vals[:, :, i:i+1]  # [B, S, 1]
+            neuron = self.shared_neurons.restore_know[idx]  # [B, S, R, D]
+            output = output + w * torch.einsum('bsr,bsrd->bsd', h, neuron)
 
         return self.dropout(output)
 
