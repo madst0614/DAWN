@@ -272,18 +272,18 @@ VERSION_REGISTRY = {
         "module": "model_v17",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
-            "n_fq", "n_fk", "n_fv", "n_rq", "n_rk", "n_rv", "n_knowledge",
+            "n_feature_q", "n_feature_k", "n_feature_v", "n_restore_q", "n_restore_k", "n_restore_v", "n_knowledge",
             "rank",
         ],
         "optional_params": {
             "dropout": 0.1,
             "state_dim": 64,
-            "top_k_fq": 8,
-            "top_k_fk": 8,
-            "top_k_fv": 3,
-            "top_k_rq": 8,
-            "top_k_rk": 8,
-            "top_k_rv": 3,
+            "top_k_feature_q": 8,
+            "top_k_feature_k": 8,
+            "top_k_feature_v": 3,
+            "top_k_restore_q": 8,
+            "top_k_restore_k": 8,
+            "top_k_restore_v": 3,
             "top_k_knowledge": 4,
             "d_space": 64,
             "knowledge_rank": 128,
@@ -298,8 +298,8 @@ VERSION_REGISTRY = {
         "display_info": lambda args: [
             f"DAWN v17: Q/K/V Separated + Knowledge Feature-Restore",
             f"  rank={args.get('rank', args.get('basis_rank'))}, knowledge_rank={args.get('knowledge_rank', 128)}",
-            f"  FQ: {args.get('n_fq')} (k={args.get('top_k_fq', 8)}), FK: {args.get('n_fk')} (k={args.get('top_k_fk', 8)}), FV: {args.get('n_fv')} (k={args.get('top_k_fv', 3)})",
-            f"  RQ: {args.get('n_rq')} (k={args.get('top_k_rq', 8)}), RK: {args.get('n_rk')} (k={args.get('top_k_rk', 8)}), RV: {args.get('n_rv')} (k={args.get('top_k_rv', 3)})",
+            f"  Feature_Q: {args.get('n_feature_q')} (k={args.get('top_k_feature_q', 8)}), Feature_K: {args.get('n_feature_k')} (k={args.get('top_k_feature_k', 8)}), Feature_V: {args.get('n_feature_v')} (k={args.get('top_k_feature_v', 3)})",
+            f"  Restore_Q: {args.get('n_restore_q')} (k={args.get('top_k_restore_q', 8)}), Restore_K: {args.get('n_restore_k')} (k={args.get('top_k_restore_k', 8)}), Restore_V: {args.get('n_restore_v')} (k={args.get('top_k_restore_v', 3)})",
             f"  Knowledge: {args.get('n_knowledge')} (top-k={args.get('top_k_knowledge', 4)}) - Feature-Restore",
         ],
     },
@@ -601,7 +601,24 @@ def get_routing_log_info(routing_info: Dict[str, Any], calc_entropy_fn, calc_var
 
         return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': overlap_str, 'version': '16.4'}
 
-    # v16.3: Complete pool separation (fq_pref exists)
+    # v17: Complete pool separation with new naming (feature_q_pref exists)
+    elif attn.get('feature_q_pref') is not None:
+        prefs = {
+            'FQ': attn.get('feature_q_pref'),
+            'FK': attn.get('feature_k_pref'),
+            'FV': attn.get('feature_v_pref'),
+            'RQ': attn.get('restore_q_pref'),
+            'RK': attn.get('restore_k_pref'),
+            'RV': attn.get('restore_v_pref'),
+        }
+        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
+        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+
+        ent_str = f"Ent FQ/FK/FV/RQ/RK/RV:{ents['FQ']:.0f}/{ents['FK']:.0f}/{ents['FV']:.0f}/{ents['RQ']:.0f}/{ents['RK']:.0f}/{ents['RV']:.0f}"
+        var_str = f"TokVar:{vars_['FQ']:.4f}/{vars_['FK']:.4f}/{vars_['FV']:.4f}/{vars_['RQ']:.4f}/{vars_['RK']:.4f}/{vars_['RV']:.4f}"
+        return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': None, 'version': '17'}
+
+    # v16.3: Complete pool separation (fq_pref exists - legacy naming)
     elif attn.get('fq_pref') is not None:
         prefs = {
             'FQ': attn.get('fq_pref'),

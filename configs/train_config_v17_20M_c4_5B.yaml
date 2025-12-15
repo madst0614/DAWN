@@ -29,22 +29,22 @@ model:
 
   # Attention - Q/K/V 완전 분리 (v16.3 동일)
   # Q compression/restoration
-  n_fq: 56
-  n_rq: 56
-  top_k_fq: 16
-  top_k_rq: 16
+  n_feature_q: 56
+  n_restore_q: 56
+  top_k_feature_q: 16
+  top_k_restore_q: 16
 
   # K compression/restoration
-  n_fk: 56
-  n_rk: 56
-  top_k_fk: 16
-  top_k_rk: 16
+  n_feature_k: 56
+  n_restore_k: 56
+  top_k_feature_k: 16
+  top_k_restore_k: 16
 
   # V compression/restoration
-  n_fv: 24
-  n_rv: 24
-  top_k_fv: 6
-  top_k_rv: 6
+  n_feature_v: 24
+  n_restore_v: 24
+  top_k_feature_v: 6
+  top_k_restore_v: 6
 
   # Knowledge - Feature-Restore pattern (NEW in v17)
   n_knowledge: 24
@@ -82,8 +82,8 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17_20M_c4_5B
 
 # v17 Architecture (v16.3 + Knowledge Feature-Restore)
 #   Attention Circuit (Q/K/V 완전 분리):
-#   - FQ=56 (k=16), FK=56 (k=16), FV=24 (k=6) -> 136 compression neurons
-#   - RQ=56 (k=16), RK=56 (k=16), RV=24 (k=6) -> 136 restoration neurons
+#   - Feature_Q=56 (k=16), Feature_K=56 (k=16), Feature_V=24 (k=6) -> 136 compression neurons
+#   - Restore_Q=56 (k=16), Restore_K=56 (k=16), Restore_V=24 (k=6) -> 136 restoration neurons
 #
 #   Knowledge Circuit (NEW: Feature-Restore pattern):
 #   - Knowledge=24 neurons (k=4) - Feature-Restore pattern
@@ -91,7 +91,7 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17_20M_c4_5B
 #   - restore_know: [24, 128, 384] - restoration
 #
 #   Routing paths:
-#   - Q: x -> FQ -> h_q -> RQ -> Q
-#   - K: x -> FK -> h_k -> RK -> K
-#   - V: x -> FV -> h_v -> RV -> V
+#   - Q: x -> Feature_Q -> h_q -> Restore_Q -> Q
+#   - K: x -> Feature_K -> h_k -> Restore_K -> K
+#   - V: x -> Feature_V -> h_v -> Restore_V -> V
 #   - Knowledge: x -> feature_know -> h -> restore_know -> output
