@@ -644,9 +644,9 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 
         # v17.1 format (similar to v17 but with shared Q/K)
         lines.append(f"         [v17.1] Excitability w={exc_w:.4f}")
-        lines.append(f"             Feature_QK: {int(active_fqk)}/{n_fqk} (k={router.top_k_feature_qk}) | Feature_V: {int(active_fv)}/{n_fv} (k={router.top_k_feature_v})")
-        lines.append(f"             Restore_QK: {int(active_rqk)}/{n_rqk} (k={router.top_k_restore_qk}) | Restore_V: {int(active_rv)}/{n_rv} (k={router.top_k_restore_v})")
-        lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} (k={router.top_k_feature_know}) | Restore_Know: {int(active_RK)}/{n_RK} (k={router.top_k_restore_know})")
+        lines.append(f"             Feature_QK: {int(active_fqk)}/{n_fqk} | Feature_V: {int(active_fv)}/{n_fv}")
+        lines.append(f"             Restore_QK: {int(active_rqk)}/{n_rqk} | Restore_V: {int(active_rv)}/{n_rv}")
+        lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} | Restore_Know: {int(active_RK)}/{n_RK}")
         lines.append(f"             Dead: FQK={dead_fqk:.1%} FV={dead_fv:.1%} RQK={dead_rqk:.1%} RV={dead_rv:.1%} FK={dead_FK:.1%} RK={dead_RK:.1%}")
         lines.append(f"             Gini: FQK={gini_fqk:.2f} FV={gini_fv:.2f} RQK={gini_rqk:.2f} RV={gini_rv:.2f} FK={gini_FK:.2f} RK={gini_RK:.2f}")
 
