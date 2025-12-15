@@ -922,6 +922,20 @@ class DAWN(nn.Module):
             'knowledge_token_routing': self.knowledge_token_routing,
         }
 
+    def get_model_info(self):
+        """Return model architecture info for logging"""
+        return [
+            f"DAWN v{self.__version__}: Q/K Shared + Knowledge Feature-Restore",
+            f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
+            f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_qk}) - Q/K shared",
+            f"  Feature_V: {self.n_feature_v} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_v})",
+            f"  Restore_QK: {self.n_restore_qk} × {self.rank} × {self.d_model} (top-k={self.top_k_restore_qk}) - Q/K shared",
+            f"  Restore_V: {self.n_restore_v} × {self.rank} × {self.d_model} (top-k={self.top_k_restore_v})",
+            f"  Feature_Know: {self.n_feature_know} × {self.d_model} × {self.knowledge_rank} (top-k={self.top_k_feature_know})",
+            f"  Restore_Know: {self.n_restore_know} × {self.knowledge_rank} × {self.d_model} (top-k={self.top_k_restore_know})",
+            f"  Unified Router: d_space={self.d_space}",
+        ]
+
     def knowledge_diversity_loss(self):
         feat_know = self.shared_neurons.feature_know
         rest_know = self.shared_neurons.restore_know
