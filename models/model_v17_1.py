@@ -346,6 +346,7 @@ class GlobalRouters(nn.Module):
                  top_k_restore_qk: int = 8, top_k_restore_v: int = 8,
                  top_k_feature_know: int = 4, top_k_restore_know: int = 4,
                  d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False,
+                 knowledge_token_routing: bool = False,
                  excitability_tau: float = 1.5, excitability_ema_alpha: float = 0.01,
                  excitability_decay_rate: float = 0.99995):
         super().__init__()
@@ -363,6 +364,7 @@ class GlobalRouters(nn.Module):
         self.top_k_feature_know = top_k_feature_know
         self.top_k_restore_know = top_k_restore_know
         self.token_routing = token_routing
+        self.knowledge_token_routing = knowledge_token_routing
 
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
@@ -482,18 +484,22 @@ class GlobalRouters(nn.Module):
         return fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, routing_info, aux_loss
 
     def get_knowledge_weights(self, x, importance, attention_mask=None):
-        """Knowledge neuron routing - Batch-level Feature/Restore 분리 (v17처럼)"""
+        """Knowledge neuron routing - Feature/Restore 분리"""
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
         pref_f = F.softmax(logits_f, dim=-1)  # [B, S, n]
         pref_r = F.softmax(logits_r, dim=-1)  # [B, S, n]
 
-        # 배치별 (importance 가중 평균)
-        f_dense = torch.einsum('bs,bsn->bn', importance, pref_f)  # [B, n]
-        r_dense = torch.einsum('bs,bsn->bn', importance, pref_r)  # [B, n]
-
-        feature_know_w, _ = self._topk_sparsify(f_dense, self.top_k_feature_know)
-        restore_know_w, _ = self._topk_sparsify(r_dense, self.top_k_restore_know)
+        if self.knowledge_token_routing:
+            # Token-level: top-k per token
+            feature_know_w, _ = self._topk_sparsify(pref_f, self.top_k_feature_know)
+            restore_know_w, _ = self._topk_sparsify(pref_r, self.top_k_restore_know)
+        else:
+            # Batch-level (default)
+            f_dense = torch.einsum('bs,bsn->bn', importance, pref_f)  # [B, n]
+            r_dense = torch.einsum('bs,bsn->bn', importance, pref_r)  # [B, n]
+            feature_know_w, _ = self._topk_sparsify(f_dense, self.top_k_feature_know)
+            restore_know_w, _ = self._topk_sparsify(r_dense, self.top_k_restore_know)
 
         if self.training:
             self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
@@ -623,21 +629,31 @@ class KnowledgeCircuit(nn.Module):
     def forward(self, x, feature_know_w, restore_know_w, attention_mask=None):
         """
         x: [B, S, D]
-        feature_know_w: [B, n_feature_know] - batch-level sparse weights
-        restore_know_w: [B, n_restore_know] - batch-level sparse weights
+        feature_know_w: [B, n] (batch-level) or [B, S, n] (token-level)
+        restore_know_w: [B, n] (batch-level) or [B, S, n] (token-level)
         """
         B, S, D = x.shape
         R = self.knowledge_rank
+        token_routing = feature_know_w.dim() == 3
 
-        # Feature (compression): [B, n] @ [n, D*R] → [B, D, R]
-        f_flat = self.shared_neurons.feature_know.view(-1, D * R)
-        shared_f = (feature_know_w @ f_flat).view(B, D, R)
-        h = torch.bmm(x, shared_f)  # [B, S, R]
+        if token_routing:
+            # Token-level: [B, S, n] weights
+            shared_f = torch.einsum('bsn,ndr->bsdr', feature_know_w,
+                                    self.shared_neurons.feature_know)  # [B, S, D, R]
+            h = torch.einsum('bsd,bsdr->bsr', x, shared_f)  # [B, S, R]
 
-        # Restore (restoration): [B, n] @ [n, R*D] → [B, R, D]
-        r_flat = self.shared_neurons.restore_know.view(-1, R * D)
-        shared_r = (restore_know_w @ r_flat).view(B, R, D)
-        output = torch.bmm(h, shared_r)  # [B, S, D]
+            shared_r = torch.einsum('bsn,nrd->bsrd', restore_know_w,
+                                    self.shared_neurons.restore_know)  # [B, S, R, D]
+            output = torch.einsum('bsr,bsrd->bsd', h, shared_r)  # [B, S, D]
+        else:
+            # Batch-level: [B, n] weights (기존 코드)
+            f_flat = self.shared_neurons.feature_know.view(-1, D * R)
+            shared_f = (feature_know_w @ f_flat).view(B, D, R)
+            h = torch.bmm(x, shared_f)  # [B, S, R]
+
+            r_flat = self.shared_neurons.restore_know.view(-1, R * D)
+            shared_r = (restore_know_w @ r_flat).view(B, R, D)
+            output = torch.bmm(h, shared_r)  # [B, S, D]
 
         return self.dropout(output)
 
@@ -741,6 +757,7 @@ class DAWN(nn.Module):
         # Others
         dropout: float = 0.1,
         token_routing: bool = False,
+        knowledge_token_routing: bool = False,
         router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
         use_ssm_context: bool = True,
@@ -760,6 +777,7 @@ class DAWN(nn.Module):
         self.state_dim = state_dim
         self.d_space = d_space
         self.token_routing = token_routing
+        self.knowledge_token_routing = knowledge_token_routing
         self.router_dropout = router_dropout
         self.gradient_checkpointing = gradient_checkpointing
         self.use_ssm_context = use_ssm_context
@@ -810,6 +828,7 @@ class DAWN(nn.Module):
             top_k_restore_qk=top_k_restore_qk, top_k_restore_v=top_k_restore_v,
             top_k_feature_know=top_k_feature_know, top_k_restore_know=top_k_restore_know,
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing,
+            knowledge_token_routing=knowledge_token_routing,
             excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
             excitability_decay_rate=excitability_decay_rate
         )
@@ -892,6 +911,7 @@ class DAWN(nn.Module):
             'n_feature_know': self.n_feature_know, 'n_restore_know': self.n_restore_know,
             'top_k_feature_know': self.top_k_feature_know, 'top_k_restore_know': self.top_k_restore_know,
             'state_dim': self.state_dim, 'd_space': self.d_space,
+            'knowledge_token_routing': self.knowledge_token_routing,
         }
 
     def knowledge_diversity_loss(self):
