@@ -600,28 +600,30 @@ class KnowledgeCircuit(nn.Module):
             x: [B, S, D]
             k_weights: [B, S, n_knowledge] token-level sparse weights from router
         """
-        B, S, D = x.shape
-        R = self.knowledge_rank
         k = self.top_k_knowledge
 
         # top-k indices + values
         k_vals, k_idx = torch.topk(k_weights, k, dim=-1)  # [B, S, k]
 
-        # Feature: 루프로 k개만 (메모리 절약)
-        h = torch.zeros(B, S, R, device=x.device, dtype=x.dtype)
-        for i in range(k):
-            idx = k_idx[:, :, i]  # [B, S]
-            w = k_vals[:, :, i:i+1]  # [B, S, 1]
-            neuron = self.shared_neurons.feature_know[idx]  # [B, S, D, R]
-            h = h + w.unsqueeze(-1) * torch.einsum('bsd,bsdr->bsr', x, neuron)
+        # vmap으로 batch/seq 차원 처리
+        def feature_single(x_vec, idx_vec, val_vec):
+            # x_vec: [D], idx_vec: [k], val_vec: [k]
+            neurons = self.shared_neurons.feature_know[idx_vec]  # [k, D, R]
+            h_k = torch.einsum('d,kdr->kr', x_vec, neurons)  # [k, R]
+            return (h_k * val_vec.unsqueeze(-1)).sum(dim=0)  # [R]
 
-        # Restore: 루프로 k개만
-        output = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
-        for i in range(k):
-            idx = k_idx[:, :, i]  # [B, S]
-            w = k_vals[:, :, i:i+1]  # [B, S, 1]
-            neuron = self.shared_neurons.restore_know[idx]  # [B, S, R, D]
-            output = output + w * torch.einsum('bsr,bsrd->bsd', h, neuron)
+        def restore_single(h_vec, idx_vec, val_vec):
+            # h_vec: [R], idx_vec: [k], val_vec: [k]
+            neurons = self.shared_neurons.restore_know[idx_vec]  # [k, R, D]
+            out_k = torch.einsum('r,krd->kd', h_vec, neurons)  # [k, D]
+            return (out_k * val_vec.unsqueeze(-1)).sum(dim=0)  # [D]
+
+        # vmap over batch and seq
+        feature_batched = torch.vmap(torch.vmap(feature_single))
+        restore_batched = torch.vmap(torch.vmap(restore_single))
+
+        h = feature_batched(x, k_idx, k_vals)  # [B, S, R]
+        output = restore_batched(h, k_idx, k_vals)  # [B, S, D]
 
         return self.dropout(output)
 

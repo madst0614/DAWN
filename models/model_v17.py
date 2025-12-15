@@ -705,8 +705,6 @@ class KnowledgeCircuit(nn.Module):
         feature_know_w: [B, S, n_feature_know] - token-level sparse weights
         restore_know_w: [B, S, n_restore_know] - token-level sparse weights
         """
-        B, S, D = x.shape
-        R = self.knowledge_rank
         k_f = self.top_k_feature_know
         k_r = self.top_k_restore_know
 
@@ -714,21 +712,25 @@ class KnowledgeCircuit(nn.Module):
         f_vals, f_idx = torch.topk(feature_know_w, k_f, dim=-1)  # [B, S, k_f]
         r_vals, r_idx = torch.topk(restore_know_w, k_r, dim=-1)  # [B, S, k_r]
 
-        # Feature: 루프로 k개만 (메모리 절약)
-        h = torch.zeros(B, S, R, device=x.device, dtype=x.dtype)
-        for i in range(k_f):
-            idx = f_idx[:, :, i]  # [B, S]
-            w = f_vals[:, :, i:i+1]  # [B, S, 1]
-            neuron = self.shared_neurons.feature_know[idx]  # [B, S, D, R]
-            h = h + w.unsqueeze(-1) * torch.einsum('bsd,bsdr->bsr', x, neuron)
+        # vmap으로 batch/seq 차원 처리
+        def feature_single(x_vec, idx_vec, val_vec):
+            # x_vec: [D], idx_vec: [k_f], val_vec: [k_f]
+            neurons = self.shared_neurons.feature_know[idx_vec]  # [k_f, D, R]
+            h_k = torch.einsum('d,kdr->kr', x_vec, neurons)  # [k_f, R]
+            return (h_k * val_vec.unsqueeze(-1)).sum(dim=0)  # [R]
 
-        # Restore: 루프로 k개만
-        output = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
-        for i in range(k_r):
-            idx = r_idx[:, :, i]  # [B, S]
-            w = r_vals[:, :, i:i+1]  # [B, S, 1]
-            neuron = self.shared_neurons.restore_know[idx]  # [B, S, R, D]
-            output = output + w * torch.einsum('bsr,bsrd->bsd', h, neuron)
+        def restore_single(h_vec, idx_vec, val_vec):
+            # h_vec: [R], idx_vec: [k_r], val_vec: [k_r]
+            neurons = self.shared_neurons.restore_know[idx_vec]  # [k_r, R, D]
+            out_k = torch.einsum('r,krd->kd', h_vec, neurons)  # [k_r, D]
+            return (out_k * val_vec.unsqueeze(-1)).sum(dim=0)  # [D]
+
+        # vmap over batch and seq
+        feature_batched = torch.vmap(torch.vmap(feature_single))
+        restore_batched = torch.vmap(torch.vmap(restore_single))
+
+        h = feature_batched(x, f_idx, f_vals)  # [B, S, R]
+        output = restore_batched(h, r_idx, r_vals)  # [B, S, D]
 
         return self.dropout(output)
 
