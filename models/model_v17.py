@@ -542,18 +542,16 @@ class GlobalRouters(nn.Module):
         return feature_q_w, feature_k_w, feature_v_w, restore_q_w, restore_k_w, restore_v_w, routing_info, aux_loss
 
     def get_knowledge_weights(self, x, importance, attention_mask=None):
-        """Knowledge neuron routing - Feature/Restore 분리 (AttentionCircuit과 동일 패턴)"""
-        logits_feature_know, logits_restore_know = self.neuron_router.get_knowledge_logits(x)
+        """Knowledge neuron routing - Token-level Feature/Restore 분리"""
+        logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
-        pref_feature_know = F.softmax(logits_feature_know, dim=-1)
-        pref_restore_know = F.softmax(logits_restore_know, dim=-1)
+        # 토큰별 softmax
+        pref_f = F.softmax(logits_f, dim=-1)  # [B, S, n]
+        pref_r = F.softmax(logits_r, dim=-1)  # [B, S, n]
 
-        # Batch-level routing
-        feature_know_w_dense = torch.einsum('bs,bsn->bn', importance, pref_feature_know)
-        restore_know_w_dense = torch.einsum('bs,bsn->bn', importance, pref_restore_know)
-
-        feature_know_w, _ = self._topk_sparsify(feature_know_w_dense, self.top_k_feature_know)
-        restore_know_w, _ = self._topk_sparsify(restore_know_w_dense, self.top_k_restore_know)
+        # 토큰별 top-k
+        feature_know_w, _ = self._topk_sparsify(pref_f, self.top_k_feature_know)  # [B, S, n]
+        restore_know_w, _ = self._topk_sparsify(pref_r, self.top_k_restore_know)  # [B, S, n]
 
         if self.training:
             self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
@@ -671,11 +669,14 @@ class AttentionCircuit(nn.Module):
 
 class KnowledgeCircuit(nn.Module):
     """
-    v17 Knowledge Circuit: Feature-Restore 분리 라우팅
+    v17 Knowledge Circuit: Feature-Restore 분리 + 토큰별 라우팅
 
-    Flow (AttentionCircuit과 동일 패턴):
-    x -> feature_know_w selects feature_know neurons -> h (compression)
-      -> restore_know_w selects restore_know neurons -> output (restoration)
+    Note: AttentionCircuit은 batch-level (importance 가중 평균)
+          KnowledgeCircuit은 token-level (토큰별 softmax/top-k)
+
+    Flow:
+    x -> feature_know_w [B,S,n] selects feature_know neurons -> h (compression)
+      -> restore_know_w [B,S,n] selects restore_know neurons -> output (restoration)
     """
     def __init__(
         self,
@@ -697,28 +698,18 @@ class KnowledgeCircuit(nn.Module):
     def forward(self, x, feature_know_w, restore_know_w, attention_mask=None):
         """
         x: [B, S, D]
-        feature_know_w: [B, n_feature_know] - sparse weights for feature_know
-        restore_know_w: [B, n_restore_know] - sparse weights for restore_know
+        feature_know_w: [B, S, n_feature_know] - token-level sparse weights
+        restore_know_w: [B, S, n_restore_know] - token-level sparse weights
         """
-        B, S, D = x.shape
-        R = self.knowledge_rank
+        # Feature (compression): [B, S, n] × [n, D, R] → [B, S, D, R]
+        shared_feature = torch.einsum('bsn,ndr->bsdr', feature_know_w, self.shared_neurons.feature_know)
+        h = torch.einsum('bsd,bsdr->bsr', x, shared_feature)  # [B, S, R]
 
-        # Feature (compression) - batch-level, matmul optimized
-        # feature_know: [n_feature_know, d_model, knowledge_rank]
-        feature_flat = self.shared_neurons.feature_know.view(-1, D * R)
-        shared_feature = (feature_know_w @ feature_flat).view(B, D, R)
+        # Restore (restoration): [B, S, n] × [n, R, D] → [B, S, R, D]
+        shared_restore = torch.einsum('bsn,nrd->bsrd', restore_know_w, self.shared_neurons.restore_know)
+        output = torch.einsum('bsr,bsrd->bsd', h, shared_restore)  # [B, S, D]
 
-        h = torch.bmm(x, shared_feature)  # [B, S, R]
-
-        # Restore (restoration) - batch-level, matmul optimized
-        # restore_know: [n_restore_know, knowledge_rank, d_model]
-        restore_flat = self.shared_neurons.restore_know.view(-1, R * D)
-        shared_restore = (restore_know_w @ restore_flat).view(B, R, D)
-
-        output = torch.bmm(h, shared_restore)  # [B, S, D]
-        output = self.dropout(output)
-
-        return output
+        return self.dropout(output)
 
 
 class DAWNBlock(nn.Module):

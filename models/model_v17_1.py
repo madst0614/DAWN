@@ -455,13 +455,14 @@ class GlobalRouters(nn.Module):
         return fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, routing_info, aux_loss
 
     def get_knowledge_weights(self, x, importance, attention_mask=None):
-        """Get knowledge neuron weights using batch-level routing"""
+        """Get knowledge neuron weights using token-level routing"""
         k_logits = self.neuron_router.get_logits(x, 'knowledge')
-        k_pref = F.softmax(k_logits, dim=-1)
 
-        # Batch-level routing
-        k_weights_dense = torch.einsum('bs,bsn->bn', importance, k_pref)
-        k_weights, topk_idx = self._topk_sparsify(k_weights_dense, self.top_k_knowledge)
+        # 토큰별 softmax
+        k_pref = F.softmax(k_logits, dim=-1)  # [B, S, n]
+
+        # 토큰별 top-k
+        k_weights, topk_idx = self._topk_sparsify(k_pref, self.top_k_knowledge)  # [B, S, n]
 
         # Update usage
         if self.training:
@@ -567,9 +568,12 @@ class AttentionCircuit(nn.Module):
 
 class KnowledgeCircuit(nn.Module):
     """
-    v17 Knowledge Circuit: Feature-Restore pattern (NEW)
+    v17.1 Knowledge Circuit: Feature-Restore + 토큰별 라우팅
 
-    x -> router selects knowledge neurons (top_k)
+    Note: AttentionCircuit은 batch-level (importance 가중 평균)
+          KnowledgeCircuit은 token-level (토큰별 softmax/top-k)
+
+    x -> router selects knowledge neurons [B,S,n] (token-level top_k)
       -> Feature_Know extracts info (d_model -> knowledge_rank)
       -> Restore_Know restores knowledge (knowledge_rank -> d_model)
     """
@@ -592,28 +596,17 @@ class KnowledgeCircuit(nn.Module):
         """
         Args:
             x: [B, S, D]
-            k_weights: [B, n_knowledge] sparse weights from router
+            k_weights: [B, S, n_knowledge] token-level sparse weights from router
         """
-        B, S, D = x.shape
-        R = self.knowledge_rank
+        # Feature (compression): [B, S, n] × [n, D, R] → [B, S, D, R]
+        shared_feature = torch.einsum('bsn,ndr->bsdr', k_weights, self.shared_neurons.feature_know)
+        h = torch.einsum('bsd,bsdr->bsr', x, shared_feature)  # [B, S, R]
 
-        # Feature-Restore pattern (matmul optimized)
-        # Feature: [n_knowledge, d_model, knowledge_rank] -> [B, d_model, knowledge_rank]
-        feature_flat = self.shared_neurons.feature_know.view(-1, D * R)
-        shared_feature = (k_weights @ feature_flat).view(B, D, R)
+        # Restore (restoration): [B, S, n] × [n, R, D] → [B, S, R, D]
+        shared_restore = torch.einsum('bsn,nrd->bsrd', k_weights, self.shared_neurons.restore_know)
+        output = torch.einsum('bsr,bsrd->bsd', h, shared_restore)  # [B, S, D]
 
-        # Compress: x @ Feature -> h
-        h = torch.bmm(x, shared_feature)  # [B, S, R]
-
-        # Restore: [n_knowledge, knowledge_rank, d_model] -> [B, knowledge_rank, d_model]
-        restore_flat = self.shared_neurons.restore_know.view(-1, R * D)
-        shared_restore = (k_weights @ restore_flat).view(B, R, D)
-
-        # Expand: h @ Restore -> output
-        output = torch.bmm(h, shared_restore)  # [B, S, D]
-        output = self.dropout(output)
-
-        return output
+        return self.dropout(output)
 
 
 class DAWNBlock(nn.Module):
