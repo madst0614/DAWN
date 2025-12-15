@@ -923,16 +923,33 @@ class DAWN(nn.Module):
 
     def get_model_info(self):
         """Return model architecture info for logging"""
+        decay_rate = getattr(self.router.neuron_router, 'decay_rate', 'N/A')
         return [
             f"DAWN v{self.__version__}: Q/K Shared + Knowledge Feature-Restore",
+            f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_qk}) - Q/K shared",
+            f"  max_seq_len={self.max_seq_len}, state_dim={self.state_dim}, dropout={self.dropout}",
+            f"",
+            f"  [Attention - Q/K Shared Pool]",
+            f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_qk})",
             f"  Feature_V: {self.n_feature_v} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_v})",
-            f"  Restore_QK: {self.n_restore_qk} × {self.rank} × {self.d_model} (top-k={self.top_k_restore_qk}) - Q/K shared",
+            f"  Restore_QK: {self.n_restore_qk} × {self.rank} × {self.d_model} (top-k={self.top_k_restore_qk})",
             f"  Restore_V: {self.n_restore_v} × {self.rank} × {self.d_model} (top-k={self.top_k_restore_v})",
+            f"",
+            f"  [Knowledge - Feature-Restore]",
             f"  Feature_Know: {self.n_feature_know} × {self.d_model} × {self.knowledge_rank} (top-k={self.top_k_feature_know})",
             f"  Restore_Know: {self.n_restore_know} × {self.knowledge_rank} × {self.d_model} (top-k={self.top_k_restore_know})",
-            f"  Unified Router: d_space={self.d_space}",
+            f"",
+            f"  [Router]",
+            f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
+            f"  token_routing={self.token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
+            f"  use_ssm_context={self.use_ssm_context}",
+            f"",
+            f"  [Excitability]",
+            f"  tau={self.excitability_tau}, ema_alpha={self.excitability_ema_alpha}, decay_rate={decay_rate}",
+            f"",
+            f"  [Other]",
+            f"  gradient_checkpointing={self.gradient_checkpointing}",
         ]
 
     def knowledge_diversity_loss(self):
