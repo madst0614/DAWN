@@ -403,27 +403,68 @@ class GlobalRouters(nn.Module):
         )
 
     def _topk_sparsify(self, weights, k):
-        """Top-k sparsification with straight-through gradient"""
-        topk_val, topk_idx = torch.topk(weights, k, dim=-1)
-        sparse = torch.zeros_like(weights)
-        sparse.scatter_(-1, topk_idx, topk_val)
-        sparse = sparse - weights.detach() + weights  # STE
-        return sparse, topk_idx
+        """Top-k sparsification with renormalization"""
+        topk_vals, topk_idx = torch.topk(weights, k, dim=-1)
+        sparse_weights = torch.zeros_like(weights)
+        sparse_weights.scatter_(-1, topk_idx, topk_vals)
+        sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        return sparse_weights, topk_idx
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         """Get all 6 attention weights"""
         logits_feature_q, logits_feature_k, logits_feature_v, logits_restore_q, logits_restore_k, logits_restore_v = \
             self.neuron_router.get_all_logits(x)
 
+        pref_feature_q = F.softmax(logits_feature_q, dim=-1)
+        pref_feature_k = F.softmax(logits_feature_k, dim=-1)
+        pref_feature_v = F.softmax(logits_feature_v, dim=-1)
+        pref_restore_q = F.softmax(logits_restore_q, dim=-1)
+        pref_restore_k = F.softmax(logits_restore_k, dim=-1)
+        pref_restore_v = F.softmax(logits_restore_v, dim=-1)
+
+        # Compute aux_loss (load balancing)
+        aux_loss = 0.0
+        if self.training:
+            n_fq = self.neuron_router.n_feature_q
+            n_fk = self.neuron_router.n_feature_k
+            n_fv = self.neuron_router.n_feature_v
+            n_rq = self.neuron_router.n_restore_q
+            n_rk = self.neuron_router.n_restore_k
+            n_rv = self.neuron_router.n_restore_v
+
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(-1).float()
+                count = mask.sum() + 1e-8
+                usage_fq = (pref_feature_q * mask).sum(dim=(0, 1)) / count
+                usage_fk = (pref_feature_k * mask).sum(dim=(0, 1)) / count
+                usage_fv = (pref_feature_v * mask).sum(dim=(0, 1)) / count
+                usage_rq = (pref_restore_q * mask).sum(dim=(0, 1)) / count
+                usage_rk = (pref_restore_k * mask).sum(dim=(0, 1)) / count
+                usage_rv = (pref_restore_v * mask).sum(dim=(0, 1)) / count
+            else:
+                usage_fq = pref_feature_q.mean(dim=(0, 1))
+                usage_fk = pref_feature_k.mean(dim=(0, 1))
+                usage_fv = pref_feature_v.mean(dim=(0, 1))
+                usage_rq = pref_restore_q.mean(dim=(0, 1))
+                usage_rk = pref_restore_k.mean(dim=(0, 1))
+                usage_rv = pref_restore_v.mean(dim=(0, 1))
+
+            target_fq = 1.0 / n_fq
+            target_fk = 1.0 / n_fk
+            target_fv = 1.0 / n_fv
+            target_rq = 1.0 / n_rq
+            target_rk = 1.0 / n_rk
+            target_rv = 1.0 / n_rv
+
+            aux_loss += ((usage_fq - target_fq) ** 2).sum() * n_fq
+            aux_loss += ((usage_fk - target_fk) ** 2).sum() * n_fk
+            aux_loss += ((usage_fv - target_fv) ** 2).sum() * n_fv
+            aux_loss += ((usage_rq - target_rq) ** 2).sum() * n_rq
+            aux_loss += ((usage_rk - target_rk) ** 2).sum() * n_rk
+            aux_loss += ((usage_rv - target_rv) ** 2).sum() * n_rv
+
         if self.token_routing:
             # Token-level routing
-            pref_feature_q = F.softmax(logits_feature_q, dim=-1)
-            pref_feature_k = F.softmax(logits_feature_k, dim=-1)
-            pref_feature_v = F.softmax(logits_feature_v, dim=-1)
-            pref_restore_q = F.softmax(logits_restore_q, dim=-1)
-            pref_restore_k = F.softmax(logits_restore_k, dim=-1)
-            pref_restore_v = F.softmax(logits_restore_v, dim=-1)
-
             feature_q_w, _ = self._topk_sparsify(pref_feature_q, self.top_k_feature_q)
             feature_k_w, _ = self._topk_sparsify(pref_feature_k, self.top_k_feature_k)
             feature_v_w, _ = self._topk_sparsify(pref_feature_v, self.top_k_feature_v)
@@ -432,13 +473,6 @@ class GlobalRouters(nn.Module):
             restore_v_w, _ = self._topk_sparsify(pref_restore_v, self.top_k_restore_v)
         else:
             # Batch-level routing (default)
-            pref_feature_q = F.softmax(logits_feature_q, dim=-1)
-            pref_feature_k = F.softmax(logits_feature_k, dim=-1)
-            pref_feature_v = F.softmax(logits_feature_v, dim=-1)
-            pref_restore_q = F.softmax(logits_restore_q, dim=-1)
-            pref_restore_k = F.softmax(logits_restore_k, dim=-1)
-            pref_restore_v = F.softmax(logits_restore_v, dim=-1)
-
             # importance-weighted aggregation
             feature_q_w_dense = torch.einsum('bs,bsn->bn', importance, pref_feature_q)
             feature_k_w_dense = torch.einsum('bs,bsn->bn', importance, pref_feature_k)
@@ -479,7 +513,6 @@ class GlobalRouters(nn.Module):
             'ent_restore_q': entropy_pct(pref_restore_q), 'ent_restore_k': entropy_pct(pref_restore_k), 'ent_restore_v': entropy_pct(pref_restore_v),
         }
 
-        aux_loss = 0.0
         return feature_q_w, feature_k_w, feature_v_w, restore_q_w, restore_k_w, restore_v_w, routing_info, aux_loss
 
     def get_knowledge_weights(self, x, importance, attention_mask=None):
