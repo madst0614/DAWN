@@ -1,5 +1,5 @@
-# DAWN v16.3 Training Config - 20M Scale, 5B tokens
-# Complete Q/K/V Pool Separation
+# DAWN v16.4 Training Config - 20M Scale, 5B tokens
+# Shared Pool + Separate Routing (v16.3 optimized structure)
 
 data:
   base_dir: /content/drive/MyDrive/data
@@ -20,31 +20,29 @@ data:
   max_val_tokens: 2000000
 
 model:
-  model_version: "16.3"
+  model_version: "16.4"
   d_model: 384
   n_layers: 12
   n_heads: 6
   rank: 64
   state_dim: 64
 
-  # v16.3: Complete Pool Separation
-  # Q compression/restoration
-  n_fq: 56
-  n_rq: 56
-  top_k_fq: 16
-  top_k_rq: 16
+  # v16.4: Shared Pool + Separate Routing
+  # Feature_QK: Q/K compression shared pool (v16.3 FQ+FK 대응)
+  n_feature_qk: 96
+  top_k_feature_qk: 8
 
-  # K compression/restoration
-  n_fk: 56
-  n_rk: 56
-  top_k_fk: 16
-  top_k_rk: 16
+  # Feature_V: V compression
+  n_feature_v: 24
+  top_k_feature_v: 3
 
-  # V compression/restoration
-  n_fv: 24
-  n_rv: 24
-  top_k_fv: 6
-  top_k_rv: 6
+  # Restore_QK: Q/K restoration shared pool (v16.3 RQ+RK 대응)
+  n_restore_qk: 96
+  top_k_restore_qk: 8
+
+  # Restore_V: V restoration
+  n_restore_v: 24
+  top_k_restore_v: 3
 
   # Knowledge
   n_knowledge: 256
@@ -78,14 +76,16 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_3_20M_c4_5B
-log_dir: /content/drive/MyDrive/dawn/logs_v16_3_20M_c4_5B
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v16_4_20M_c4_5B
+log_dir: /content/drive/MyDrive/dawn/logs_v16_4_20M_c4_5B
 
-# v16.3 Architecture (Complete Q/K/V Pool Separation)
-#   - FQ=56 (k=16), FK=56 (k=16), FV=24 (k=6) -> 136 compression neurons
-#   - RQ=56 (k=16), RK=56 (k=16), RV=24 (k=6) -> 136 restoration neurons
+# v16.4 Architecture (Shared Pool + Separate Routing)
+#   - Feature_QK=96 (k=8) - Q/K shared pool, separate routing
+#   - Feature_V=24 (k=3) - V compression
+#   - Restore_QK=96 (k=8) - Q/K shared pool, separate routing
+#   - Restore_V=24 (k=3) - V restoration
 #   - Knowledge=256 (coarse=16 -> fine=8)
 #   Routing paths:
-#   - Q: x -> FQ -> h_q -> RQ -> Q
-#   - K: x -> FK -> h_k -> RK -> K
-#   - V: x -> FV -> h_v -> RV -> V
+#   - Q: x -> Feature_QK(Q routing) -> h_q -> Restore_QK(Q routing) -> Q
+#   - K: x -> Feature_QK(K routing) -> h_k -> Restore_QK(K routing) -> K
+#   - V: x -> Feature_V -> h_v -> Restore_V -> V

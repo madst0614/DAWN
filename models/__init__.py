@@ -21,6 +21,20 @@ v16.3: Complete Q/K/V Pool Separation
 - K path: x → FK → RK → K
 - V path: x → FV → RV → V
 
+v16.4: Shared Pool + Separate Routing (v16.3 optimized)
+- Q/K 공유 풀 + 분리 routing
+- Feature_QK, Feature_V (압축) + Restore_QK, Restore_V (복원)
+- proj_all 통합 + matmul/bmm 최적화
+
+v17: v16.3 + Knowledge Feature-Restore (Q/K/V 완전 분리)
+- Attention: Q/K/V 완전 분리 (v16.3 동일)
+- Knowledge: Feature-Restore pattern
+- coarse/fine 제거 -> top_k_knowledge
+
+v17.1: v16.4 + Knowledge Feature-Restore (Q/K 공유 풀)
+- Attention: Q/K 공유 풀 (v16.4 동일)
+- Knowledge: Feature-Restore pattern
+
 baseline: Vanilla Transformer for fair comparison
 """
 
@@ -36,8 +50,17 @@ from .model_v16_2 import DAWN as DAWN_v16_2
 # v16.3 - Complete Q/K/V Pool Separation
 from .model_v16_3 import DAWN as DAWN_v16_3
 
-# Default DAWN is v16.3 (latest)
-DAWN = DAWN_v16_3
+# v16.4 - Shared Pool + Separate Routing (v16.3 optimized)
+from .model_v16_4 import DAWN as DAWN_v16_4
+
+# v17 - v16.3 + Knowledge Feature-Restore (Q/K/V 완전 분리)
+from .model_v17 import DAWN as DAWN_v17
+
+# v17.1 - v16.4 + Knowledge Feature-Restore (Q/K 공유 풀)
+from .model_v17_1 import DAWN as DAWN_v17_1
+
+# Default DAWN is v17 (latest)
+DAWN = DAWN_v17
 
 # Baseline for comparison
 import sys
@@ -53,6 +76,8 @@ from .version_registry import (
     get_required_params,
     get_optional_params,
     build_model_kwargs,
+    build_args_config,
+    load_model_params_to_args,
     print_version_info,
     list_versions,
     get_all_versions_info,
@@ -66,6 +91,9 @@ __all__ = [
     'DAWN_v16_1',
     'DAWN_v16_2',
     'DAWN_v16_3',
+    'DAWN_v16_4',
+    'DAWN_v17',
+    'DAWN_v17_1',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -74,6 +102,8 @@ __all__ = [
     'get_required_params',
     'get_optional_params',
     'build_model_kwargs',
+    'build_args_config',
+    'load_model_params_to_args',
     'print_version_info',
     'list_versions',
     'get_all_versions_info',
@@ -81,14 +111,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "16.3"
+__version__ = "17"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "16.0", "16.1", "16.2", "16.3", or "baseline"
+        version: "16.0", "16.1", "16.2", "16.3", "16.4", "17", "17.1", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -107,6 +137,12 @@ def create_model_by_version(version, config):
         return DAWN_v16_2(**config)
     elif version == "16.3":
         return DAWN_v16_3(**config)
+    elif version == "16.4":
+        return DAWN_v16_4(**config)
+    elif version == "17":
+        return DAWN_v17(**config)
+    elif version == "17.1":
+        return DAWN_v17_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 16.0, 16.1, 16.2, 16.3, baseline")
+                        f"Supported versions: 16.0, 16.1, 16.2, 16.3, 16.4, 17, 17.1, baseline")

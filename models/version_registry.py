@@ -1,14 +1,81 @@
 """
-DAWN Model Version Registry
+DAWN Model Version Registry - Single Source of Truth
 
-v16.0: Split Feature R/V (rank matrix) - Feature_R/V separate compression
-v16.1: Split Feature R/V + Langevin Excitability (adaptive dead neuron recovery)
+Version History:
+  v16.0: Split Feature R/V (rank matrix) - Feature_R/V separate compression
+  v16.1: Split Feature R/V + Langevin Excitability (adaptive dead neuron recovery)
+  v16.2: Full Q/K Projection Separation - Q/K routing paths separated
+  v16.3: Complete Q/K/V Pool Separation - FQ/FK/FV, RQ/RK/RV all independent
+  v16.4: Shared Pool + Separate Routing - v16.3 optimized, Q/K shared pool with separate routing
+  v17: v16.3 + Knowledge Feature-Restore 분리 라우팅 (8개 독립 풀: FQ/FK/FV/RQ/RK/RV + Feature_Know/Restore_Know)
 
-To add a new version:
-1. Add entry to VERSION_REGISTRY below (with display_info lambda)
-2. Create model file in models/model_vX_Y.py
-3. Update models/__init__.py
-4. Create config in configs/train_config_vX_Y.yaml
+================================================================================
+HOW TO ADD A NEW VERSION (e.g., v16.5)
+================================================================================
+
+1. VERSION_REGISTRY 엔트리 추가 (이 파일)
+   ─────────────────────────────────────────
+   "16.5": {
+       "description": "Short description",
+       "aliases": ["165"],
+       "module": "model_v16_5",
+       "required_params": [
+           "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+           "your_required_param1", "your_required_param2", ...
+           "rank",
+       ],
+       "optional_params": {
+           "dropout": 0.1,
+           "your_optional_param": default_value,
+           ...
+       },
+       "display_info": lambda args: [
+           f"DAWN v16.5: Description",
+           f"  param1: {args.get('param1')}",
+           ...
+       ],
+   }
+
+2. 모델 파일 생성: models/model_v16_5.py
+   ─────────────────────────────────────────
+   - class DAWN(nn.Module) with __version__ = "16.5"
+   - __init__에서 VERSION_REGISTRY의 required_params + optional_params 받기
+
+3. models/__init__.py 업데이트
+   ─────────────────────────────────────────
+   - import 추가: from .model_v16_5 import DAWN as DAWN_v16_5
+   - __all__에 'DAWN_v16_5' 추가
+   - create_model_by_version()에 elif 추가
+   - (선택) 기본 DAWN = DAWN_v16_5로 변경
+
+4. Config 파일 생성 (선택): configs/train_config_v16_5_*.yaml
+   ─────────────────────────────────────────
+   model:
+     model_version: "16.5"
+     your_required_param1: value
+     your_optional_param: value
+     ...
+
+5. scripts/train.py 업데이트 (메이저 버전 변경 시 필수!)
+   ─────────────────────────────────────────
+   a) needs_routing_info() - 200 step마다 콘솔 로그 출력 조건
+      - is_v17_model() 같은 버전 체크 함수 추가
+      - needs_routing_info()에 or is_vXX_model(model) 추가
+
+   b) _get_router_log_lines() - Usage EMA 로깅
+      - router의 usage_ema_* 속성명이 변경되면 elif 브랜치 추가
+      - 예: usage_ema_fq (v16.3) → usage_ema_feature_q (v17)
+
+   c) get_routing_log_info() (이 파일 하단) - Entropy/Variance 로깅
+      - routing_info의 *_pref 키가 변경되면 elif 브랜치 추가
+      - 예: fq_pref (v16.3) → feature_q_pref (v17)
+
+================================================================================
+train.py 파라미터 로딩은 자동!
+  - build_args_config(): args에서 모든 버전 파라미터 자동 추출
+  - load_model_params_to_args(): YAML/checkpoint에서 args로 자동 로딩
+  - build_model_kwargs(): 버전별 필요 파라미터만 필터링
+================================================================================
 """
 
 from typing import Dict, Any, List
@@ -173,6 +240,145 @@ VERSION_REGISTRY = {
             f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
         ],
     },
+    "16.4": {
+        "description": "Shared Pool + Separate Routing (v16.3 optimized)",
+        "aliases": ["164"],
+        "module": "model_v16_4",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v", "n_knowledge",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature_qk": 8,
+            "top_k_feature_v": 3,
+            "top_k_restore_qk": 8,
+            "top_k_restore_v": 3,
+            "d_space": 64,
+            "coarse_k": 16,
+            "fine_k": 8,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "token_routing": False,
+            "use_ssm_context": True,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
+        },
+        "display_info": lambda args: [
+            f"DAWN v16.4: Shared Pool + Separate Routing",
+            f"  rank={args.get('rank', args.get('basis_rank'))}",
+            f"  Feature_QK: {args.get('n_feature_qk')} × {args.get('d_model')} × {args.get('rank')} (Q/K shared, top-k={args.get('top_k_feature_qk', 8)})",
+            f"  Feature_V: {args.get('n_feature_v')} × {args.get('d_model')} × {args.get('rank')} (top-k={args.get('top_k_feature_v', 3)})",
+            f"  Restore_QK: {args.get('n_restore_qk')} × {args.get('rank')} × {args.get('d_model')} (Q/K shared, top-k={args.get('top_k_restore_qk', 8)})",
+            f"  Restore_V: {args.get('n_restore_v')} × {args.get('rank')} × {args.get('d_model')} (top-k={args.get('top_k_restore_v', 3)})",
+            f"  Knowledge: {args.get('n_knowledge')} (coarse={args.get('coarse_k', 16)} → fine={args.get('fine_k', 8)})",
+            f"  Unified Router: d_space={args.get('d_space', 64)} + proj_all optimized",
+            f"  Selective SSM: state_dim={args.get('state_dim', 64)}",
+        ],
+    },
+    "17": {
+        "description": "v16.3 + Knowledge Feature-Restore 분리 라우팅",
+        "aliases": ["17.0", "170"],
+        "module": "model_v17",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_q", "n_feature_k", "n_feature_v", "n_restore_q", "n_restore_k", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature_q": 8,
+            "top_k_feature_k": 8,
+            "top_k_feature_v": 3,
+            "top_k_restore_q": 8,
+            "top_k_restore_k": 8,
+            "top_k_restore_v": 3,
+            "top_k_feature_know": 4,
+            "top_k_restore_know": 4,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "token_routing": False,
+            "use_ssm_context": True,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
+        },
+        "display_info": lambda args: [
+            f"DAWN v17: Q/K/V Separated + Knowledge Feature-Restore 분리",
+            f"  rank={args.get('rank', args.get('basis_rank'))}, knowledge_rank={args.get('knowledge_rank', 128)}",
+            f"  Feature_Q: {args.get('n_feature_q')} (k={args.get('top_k_feature_q', 8)}), Feature_K: {args.get('n_feature_k')} (k={args.get('top_k_feature_k', 8)}), Feature_V: {args.get('n_feature_v')} (k={args.get('top_k_feature_v', 3)})",
+            f"  Restore_Q: {args.get('n_restore_q')} (k={args.get('top_k_restore_q', 8)}), Restore_K: {args.get('n_restore_k')} (k={args.get('top_k_restore_k', 8)}), Restore_V: {args.get('n_restore_v')} (k={args.get('top_k_restore_v', 3)})",
+            f"  Feature_Know: {args.get('n_feature_know')} (k={args.get('top_k_feature_know', 4)}), Restore_Know: {args.get('n_restore_know')} (k={args.get('top_k_restore_know', 4)})",
+        ],
+    },
+
+    "17.1": {
+        "description": "v16.4 + Knowledge Feature-Restore (Q/K 공유 풀)",
+        "aliases": ["171"],
+        "module": "model_v17_1",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature_qk": 8,
+            "top_k_feature_v": 3,
+            "top_k_restore_qk": 8,
+            "top_k_restore_v": 3,
+            "top_k_feature_know": 4,
+            "top_k_restore_know": 4,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
+        },
+        "display_info": lambda args: [
+            f"DAWN v17.1: Q/K Shared + Knowledge Feature-Restore",
+            f"  rank={args.get('rank', args.get('basis_rank'))}, knowledge_rank={args.get('knowledge_rank', 128)}",
+            f"  Feature_QK: {args.get('n_feature_qk')} (top-k={args.get('top_k_feature_qk', 8)}) - Q/K shared pool",
+            f"  Feature_V: {args.get('n_feature_v')} (top-k={args.get('top_k_feature_v', 3)})",
+            f"  Restore_QK: {args.get('n_restore_qk')} (top-k={args.get('top_k_restore_qk', 8)}) - Q/K shared pool",
+            f"  Restore_V: {args.get('n_restore_v')} (top-k={args.get('top_k_restore_v', 3)})",
+            f"  Feature_Know: {args.get('n_feature_know')} (k={args.get('top_k_feature_know', 4)}), Restore_Know: {args.get('n_restore_know')} (k={args.get('top_k_restore_know', 4)})",
+        ],
+    },
+
+    # Baseline Transformer for fair comparison
+    "baseline": {
+        "description": "Vanilla Transformer Baseline",
+        "aliases": ["vanilla", "base"],
+        "module": "baseline_transformer",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+        ],
+        "optional_params": {
+            "d_ff": None,  # defaults to 4 * d_model if not specified
+            "dropout": 0.1,
+        },
+        "display_info": lambda args: [
+            f"Vanilla Transformer Baseline",
+            f"  d_model={args.get('d_model')}, n_layers={args.get('n_layers')}, n_heads={args.get('n_heads')}",
+            f"  d_ff={args.get('d_ff', args.get('d_model', 256) * 4)}",
+        ],
+    },
 }
 
 
@@ -225,6 +431,116 @@ def build_model_kwargs(version: str, config: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
+def load_model_params_to_args(args, config: Dict[str, Any]) -> None:
+    """Load model params from config dict to args object using VERSION_REGISTRY.
+
+    Updates args in-place with values from config, using VERSION_REGISTRY defaults.
+    This is the inverse of build_args_config - used for loading from YAML or checkpoint.
+
+    Args:
+        args: Namespace object to update
+        config: Config dict (from YAML or checkpoint)
+    """
+    # Collect all param names and defaults from all versions
+    all_params = {}
+
+    for version_info in VERSION_REGISTRY.values():
+        for param in version_info.get('required_params', []):
+            if param not in all_params:
+                all_params[param] = None
+        for param, default in version_info.get('optional_params', {}).items():
+            if param not in all_params:
+                all_params[param] = default
+
+    # Special mappings (config param name -> args attribute name)
+    special_mappings = {
+        'rank': 'basis_rank',  # config['rank'] -> args.basis_rank
+    }
+
+    for param, default in all_params.items():
+        # Skip vocab_size (set separately)
+        if param in ('vocab_size',):
+            continue
+
+        # Get args attribute name
+        args_attr = special_mappings.get(param, param)
+
+        # Get value from config with fallback to current args value, then default
+        current_value = getattr(args, args_attr, default)
+        value = config.get(param, current_value)
+
+        # Set on args
+        setattr(args, args_attr, value)
+
+        # Also set 'rank' if we set 'basis_rank' (keep them in sync)
+        if args_attr == 'basis_rank':
+            setattr(args, 'rank', value)
+
+
+def build_args_config(args, vocab_size: int) -> Dict[str, Any]:
+    """Build config dict from args object dynamically using VERSION_REGISTRY.
+
+    Extracts all params defined in any version's required_params and optional_params.
+    This is the single source of truth - no need to hardcode params in train.py.
+
+    Args:
+        args: Namespace object with model config attributes
+        vocab_size: Vocabulary size (usually from tokenizer)
+
+    Returns:
+        Config dict ready for build_model_kwargs()
+    """
+    # Collect all param names and defaults from all versions
+    all_params = {}  # param_name -> default_value
+
+    for version_info in VERSION_REGISTRY.values():
+        # Required params (no default, will use None)
+        for param in version_info.get('required_params', []):
+            if param not in all_params:
+                all_params[param] = None
+
+        # Optional params (with defaults)
+        for param, default in version_info.get('optional_params', {}).items():
+            if param not in all_params:
+                all_params[param] = default
+
+    # Build config from args
+    config = {'vocab_size': vocab_size}
+
+    # Special mappings (args attribute name -> config param name)
+    special_mappings = {
+        'basis_rank': 'rank',  # args.basis_rank -> config['rank']
+    }
+
+    for param, default in all_params.items():
+        # Check special mappings first
+        args_attr = None
+        for args_name, config_name in special_mappings.items():
+            if config_name == param:
+                args_attr = args_name
+                break
+
+        if args_attr is None:
+            args_attr = param
+
+        # Get value from args with default
+        if hasattr(args, args_attr):
+            value = getattr(args, args_attr)
+            # Handle None values for optional params
+            if value is None and default is not None:
+                value = default
+            config[param] = value
+        elif hasattr(args, param):
+            value = getattr(args, param)
+            if value is None and default is not None:
+                value = default
+            config[param] = value
+        elif default is not None:
+            config[param] = default
+
+    return config
+
+
 def print_version_info(version: str, args: Dict[str, Any]) -> None:
     """Print version-specific architecture information."""
     version = normalize_version(version)
@@ -270,8 +586,59 @@ def get_routing_log_info(routing_info: Dict[str, Any], calc_entropy_fn, calc_var
     """
     attn = routing_info.get('attention', routing_info)
 
-    # v16.3: Complete pool separation (fq_pref exists)
-    if attn.get('fq_pref') is not None:
+    # v16.4: Shared Pool + Separate Routing (fqk_q_pref exists)
+    if attn.get('fqk_q_pref') is not None:
+        prefs = {
+            'FQK_Q': attn.get('fqk_q_pref'),
+            'FQK_K': attn.get('fqk_k_pref'),
+            'FV': attn.get('fv_pref'),
+            'RQK_Q': attn.get('rqk_q_pref'),
+            'RQK_K': attn.get('rqk_k_pref'),
+            'RV': attn.get('rv_pref'),
+        }
+        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
+        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+
+        ent_str = f"Ent FQK_Q/K/FV/RQK_Q/K/RV:{ents['FQK_Q']:.0f}/{ents['FQK_K']:.0f}/{ents['FV']:.0f}/{ents['RQK_Q']:.0f}/{ents['RQK_K']:.0f}/{ents['RV']:.0f}"
+        var_str = f"TokVar:{vars_['FQK_Q']:.4f}/{vars_['FQK_K']:.4f}/{vars_['FV']:.4f}/{vars_['RQK_Q']:.4f}/{vars_['RQK_K']:.4f}/{vars_['RV']:.4f}"
+
+        # Q/K overlap ratio for shared pools
+        def calc_overlap(w_Q, w_K):
+            if w_Q is None or w_K is None:
+                return 0.0
+            overlap = ((w_Q > 0) & (w_K > 0)).float()
+            active_Q = (w_Q > 0).float().sum(-1)
+            return (overlap.sum(-1) / (active_Q + 1e-8)).mean().item()
+
+        w_FQK_Q = attn.get('fqk_weights_Q')
+        w_FQK_K = attn.get('fqk_weights_K')
+        w_RQK_Q = attn.get('rqk_weights_Q')
+        w_RQK_K = attn.get('rqk_weights_K')
+        overlap_FQK = calc_overlap(w_FQK_Q, w_FQK_K)
+        overlap_RQK = calc_overlap(w_RQK_Q, w_RQK_K)
+        overlap_str = f"Q/K Overlap FQK/RQK:{overlap_FQK:.2f}/{overlap_RQK:.2f}"
+
+        return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': overlap_str, 'version': '16.4'}
+
+    # v17: Complete pool separation with new naming (feature_q_pref exists)
+    elif attn.get('feature_q_pref') is not None:
+        prefs = {
+            'FQ': attn.get('feature_q_pref'),
+            'FK': attn.get('feature_k_pref'),
+            'FV': attn.get('feature_v_pref'),
+            'RQ': attn.get('restore_q_pref'),
+            'RK': attn.get('restore_k_pref'),
+            'RV': attn.get('restore_v_pref'),
+        }
+        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
+        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+
+        ent_str = f"Ent FQ/FK/FV/RQ/RK/RV:{ents['FQ']:.0f}/{ents['FK']:.0f}/{ents['FV']:.0f}/{ents['RQ']:.0f}/{ents['RK']:.0f}/{ents['RV']:.0f}"
+        var_str = f"TokVar:{vars_['FQ']:.4f}/{vars_['FK']:.4f}/{vars_['FV']:.4f}/{vars_['RQ']:.4f}/{vars_['RK']:.4f}/{vars_['RV']:.4f}"
+        return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': None, 'version': '17'}
+
+    # v16.3: Complete pool separation (fq_pref exists - legacy naming)
+    elif attn.get('fq_pref') is not None:
         prefs = {
             'FQ': attn.get('fq_pref'),
             'FK': attn.get('fk_pref'),

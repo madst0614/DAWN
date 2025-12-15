@@ -58,7 +58,7 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('medium')
 
-from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs, get_routing_log_info
+from models import create_model_by_version, print_version_info, normalize_version, build_model_kwargs, build_args_config, load_model_params_to_args, get_routing_log_info
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.checkpoint import load_checkpoint_smart, load_optimizer_state, strip_compile_prefix
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
@@ -578,9 +578,16 @@ def is_v16_model(model):
     return version.startswith('16.')
 
 
+def is_v17_model(model):
+    """Check if model is DAWN v17.x by version string"""
+    base_model = get_underlying_model(model)
+    version = getattr(base_model, '__version__', '')
+    return version.startswith('17')
+
+
 def needs_routing_info(model):
     """Check if model needs routing_info for excitability logging"""
-    return is_v16_model(model)
+    return is_v16_model(model) or is_v17_model(model)
 
 
 def _gini(x):
@@ -598,8 +605,146 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
+    # v17.1: Q/K Shared Pool + Knowledge Feature-Restore Separation
+    # (has both usage_ema_feature_qk AND usage_ema_feature_know)
+    if hasattr(router, 'usage_ema_feature_qk') and hasattr(router, 'usage_ema_feature_know'):
+        ema_fqk = router.usage_ema_feature_qk
+        ema_fv = router.usage_ema_feature_v
+        ema_rqk = router.usage_ema_restore_qk
+        ema_rv = router.usage_ema_restore_v
+        ema_FK = router.usage_ema_feature_know
+        ema_RK = router.usage_ema_restore_know
+
+        # Active neuron counts
+        active_fqk = (ema_fqk > 0.01).sum().item()
+        active_fv = (ema_fv > 0.01).sum().item()
+        active_rqk = (ema_rqk > 0.01).sum().item()
+        active_rv = (ema_rv > 0.01).sum().item()
+        active_FK = (ema_FK > 0.01).sum().item()
+        active_RK = (ema_RK > 0.01).sum().item()
+        n_fqk, n_fv = ema_fqk.numel(), ema_fv.numel()
+        n_rqk, n_rv = ema_rqk.numel(), ema_rv.numel()
+        n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+
+        # Gini coefficients
+        gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
+        gini_rqk, gini_rv = _gini(ema_rqk), _gini(ema_rv)
+        gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+
+        # Dead neuron ratios (EMA < 0.01)
+        dead_fqk = (ema_fqk < 0.01).float().mean().item()
+        dead_fv = (ema_fv < 0.01).float().mean().item()
+        dead_rqk = (ema_rqk < 0.01).float().mean().item()
+        dead_rv = (ema_rv < 0.01).float().mean().item()
+        dead_FK = (ema_FK < 0.01).float().mean().item()
+        dead_RK = (ema_RK < 0.01).float().mean().item()
+
+        # Excitability
+        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
+
+        # v17.1 format (similar to v17 but with shared Q/K)
+        lines.append(f"         [v17.1] Excitability w={exc_w:.4f}")
+        lines.append(f"             Feature_QK: {int(active_fqk)}/{n_fqk} | Feature_V: {int(active_fv)}/{n_fv}")
+        lines.append(f"             Restore_QK: {int(active_rqk)}/{n_rqk} | Restore_V: {int(active_rv)}/{n_rv}")
+        lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} | Restore_Know: {int(active_RK)}/{n_RK}")
+        lines.append(f"             Dead: FQK={dead_fqk:.1%} FV={dead_fv:.1%} RQK={dead_rqk:.1%} RV={dead_rv:.1%} FK={dead_FK:.1%} RK={dead_RK:.1%}")
+        lines.append(f"             Gini: FQK={gini_fqk:.2f} FV={gini_fv:.2f} RQK={gini_rqk:.2f} RV={gini_rv:.2f} FK={gini_FK:.2f} RK={gini_RK:.2f}")
+
+    # v16.4: Shared Pool + Separate Routing (no Knowledge F/R separation)
+    elif hasattr(router, 'usage_ema_feature_qk'):
+        ema_fqk = router.usage_ema_feature_qk
+        ema_fv = router.usage_ema_feature_v
+        ema_rqk = router.usage_ema_restore_qk
+        ema_rv = router.usage_ema_restore_v
+
+        # Active neuron counts
+        active_fqk = (ema_fqk > 0.01).sum().item()
+        active_fv = (ema_fv > 0.01).sum().item()
+        active_rqk = (ema_rqk > 0.01).sum().item()
+        active_rv = (ema_rv > 0.01).sum().item()
+        n_fqk, n_fv = ema_fqk.numel(), ema_fv.numel()
+        n_rqk, n_rv = ema_rqk.numel(), ema_rv.numel()
+
+        # Gini coefficients
+        gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
+        gini_rqk, gini_rv = _gini(ema_rqk), _gini(ema_rv)
+
+        # Dead neuron ratios (EMA < 0.01)
+        dead_fqk = (ema_fqk < 0.01).float().mean().item()
+        dead_fv = (ema_fv < 0.01).float().mean().item()
+        dead_rqk = (ema_rqk < 0.01).float().mean().item()
+        dead_rv = (ema_rv < 0.01).float().mean().item()
+
+        # Excitability
+        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
+
+        lines.append(f"         Excitability | w={exc_w:.4f} | Active FQK/FV:{int(active_fqk)}/{n_fqk},{int(active_fv)}/{n_fv}")
+        lines.append(f"             Active RQK/RV:{int(active_rqk)}/{n_rqk},{int(active_rv)}/{n_rv}")
+        lines.append(f"             Gini FQK/FV: {gini_fqk:.2f}/{gini_fv:.2f} | RQK/RV: {gini_rqk:.2f}/{gini_rv:.2f}")
+        lines.append(f"             Dead FQK/FV: {dead_fqk:.1%}/{dead_fv:.1%} | RQK/RV: {dead_rqk:.1%}/{dead_rv:.1%}")
+
+        # Knowledge neurons (single pool for v16.4)
+        if hasattr(router, 'usage_ema_knowledge'):
+            ema_K = router.usage_ema_knowledge
+            active_K = (ema_K > 0.01).sum().item()
+            n_K = ema_K.numel()
+            gini_K = _gini(ema_K)
+            dead_K = (ema_K < 0.01).float().mean().item()
+            lines.append(f"             Knowledge: Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f}")
+
+    # v17: Complete Q/K/V Pool Separation + Knowledge Feature/Restore Separation
+    elif hasattr(router, 'usage_ema_feature_q'):
+        ema_fq = router.usage_ema_feature_q
+        ema_fk = router.usage_ema_feature_k
+        ema_fv = router.usage_ema_feature_v
+        ema_rq = router.usage_ema_restore_q
+        ema_rk = router.usage_ema_restore_k
+        ema_rv = router.usage_ema_restore_v
+
+        # Active neuron counts
+        active_fq = (ema_fq > 0.01).sum().item()
+        active_fk = (ema_fk > 0.01).sum().item()
+        active_fv = (ema_fv > 0.01).sum().item()
+        active_rq = (ema_rq > 0.01).sum().item()
+        active_rk = (ema_rk > 0.01).sum().item()
+        active_rv = (ema_rv > 0.01).sum().item()
+        n_fq, n_fk, n_fv = ema_fq.numel(), ema_fk.numel(), ema_fv.numel()
+        n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
+
+        # Gini coefficients
+        gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
+        gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
+
+        # Dead neuron ratios (EMA < 0.01)
+        dead_fq = (ema_fq < 0.01).float().mean().item()
+        dead_fk = (ema_fk < 0.01).float().mean().item()
+        dead_fv = (ema_fv < 0.01).float().mean().item()
+        dead_rq = (ema_rq < 0.01).float().mean().item()
+        dead_rk = (ema_rk < 0.01).float().mean().item()
+        dead_rv = (ema_rv < 0.01).float().mean().item()
+
+        # Excitability
+        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
+
+        lines.append(f"         Excitability | w={exc_w:.4f} | Active FQ/FK/FV:{int(active_fq)}/{n_fq},{int(active_fk)}/{n_fk},{int(active_fv)}/{n_fv}")
+        lines.append(f"             Active RQ/RK/RV:{int(active_rq)}/{n_rq},{int(active_rk)}/{n_rk},{int(active_rv)}/{n_rv}")
+        lines.append(f"             Gini FQ/FK/FV: {gini_fq:.2f}/{gini_fk:.2f}/{gini_fv:.2f} | RQ/RK/RV: {gini_rq:.2f}/{gini_rk:.2f}/{gini_rv:.2f}")
+        lines.append(f"             Dead FQ/FK/FV: {dead_fq:.1%}/{dead_fk:.1%}/{dead_fv:.1%} | RQ/RK/RV: {dead_rq:.1%}/{dead_rk:.1%}/{dead_rv:.1%}")
+
+        # Knowledge neurons (Feature/Restore separated in v17)
+        if hasattr(router, 'usage_ema_feature_know'):
+            ema_FK = router.usage_ema_feature_know
+            ema_RK = router.usage_ema_restore_know
+            active_FK = (ema_FK > 0.01).sum().item()
+            active_RK = (ema_RK > 0.01).sum().item()
+            n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+            gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+            dead_FK = (ema_FK < 0.01).float().mean().item()
+            dead_RK = (ema_RK < 0.01).float().mean().item()
+            lines.append(f"             Knowledge F/R: Active {int(active_FK)}/{n_FK},{int(active_RK)}/{n_RK} | Dead:{dead_FK:.1%}/{dead_RK:.1%} | Gini:{gini_FK:.2f}/{gini_RK:.2f}")
+
     # v16.3: Complete Q/K/V Pool Separation
-    if hasattr(router, 'usage_ema_fq'):
+    elif hasattr(router, 'usage_ema_fq'):
         ema_fq = router.usage_ema_fq
         ema_fk = router.usage_ema_fk
         ema_fv = router.usage_ema_fv
@@ -885,8 +1030,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         # Update excitability (v16.1/v17: update_excitability_weight, v16.0: decay_excitability)
         router = None
-        if hasattr(base_model, 'router'):  # v17
-            router = base_model.router
+        if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+            router = base_model.router.neuron_router
         elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
             router = base_model.global_routers.neuron_router
 
@@ -950,11 +1095,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     var_str = log_info['var_str']
                     overlap_str = log_info['overlap_str']
 
-                    # Attention ratio (attn_out_norm vs mem_out_norm per layer)
+                    # Attention ratio (attn_out_norm vs mem/know_out_norm per layer)
                     attn_ratios = []
                     for layer_info in routing_infos:
                         attn_norm = layer_info.get('attn_out_norm')
-                        mem_norm = layer_info.get('mem_out_norm')
+                        # v16: mem_out_norm, v17: know_out_norm
+                        mem_norm = layer_info.get('mem_out_norm') or layer_info.get('know_out_norm')
                         if attn_norm is not None and mem_norm is not None:
                             ratio = (attn_norm / (attn_norm + mem_norm + 1e-8) * 100).item()
                             attn_ratios.append(f"{ratio:.0f}")
@@ -974,8 +1120,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                     # Usage EMA logging
                     router = None
-                    if hasattr(base_model, 'router'):  # v17
-                        router = base_model.router
+                    if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+                        router = base_model.router.neuron_router
                     elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                         router = base_model.global_routers.neuron_router
                     if router is not None:
@@ -1005,24 +1151,36 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                     # Knowledge neuron usage stats
                     try:
-                        # Collect knowledge indices from all layers (2-stage retrieval)
-                        all_fine_idx = []
+                        # Collect knowledge indices from all layers
+                        all_k_idx = []
                         all_coarse_idx = []
+                        is_v17_style = False  # v17 uses feature_know/restore_know separation
                         for layer_info in routing_infos:
+                            # v17: knowledge -> feature_know_w, restore_know_w (Feature-Restore separation)
+                            know = layer_info.get('knowledge', {})
+                            feature_know_w = know.get('feature_know_w')
+                            restore_know_w = know.get('restore_know_w')
+                            if feature_know_w is not None:
+                                is_v17_style = True
+                            topk_idx = know.get('topk_indices')
+                            if topk_idx is not None:
+                                all_k_idx.append(topk_idx.flatten())
+                            # v16.x: memory -> fine_indices, coarse_indices (2-stage retrieval)
                             mem = layer_info.get('memory', {})
                             fine_idx = mem.get('fine_indices')
                             coarse_idx = mem.get('coarse_indices')
                             if fine_idx is not None:
-                                all_fine_idx.append(fine_idx.flatten())
+                                all_k_idx.append(fine_idx.flatten())
                             if coarse_idx is not None:
                                 all_coarse_idx.append(coarse_idx.flatten())
                             # Backward compat: knowledge_indices
                             k_idx = mem.get('knowledge_indices')
                             if k_idx is not None:
-                                all_fine_idx.append(k_idx.flatten())
+                                all_k_idx.append(k_idx.flatten())
 
-                        if all_fine_idx:
-                            all_idx = torch.cat(all_fine_idx)
+                        # v17: Feature-Restore separation - usage stats in _get_router_log_lines()
+                        if all_k_idx and not is_v17_style:
+                            all_idx = torch.cat(all_k_idx)
                             n_knowledge = base_model.n_knowledge if hasattr(base_model, 'n_knowledge') else 80
 
                             # Count usage per knowledge neuron
@@ -1040,7 +1198,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             # Gini
                             gini_K = _gini(usage_freq)
 
-                            # v15: coarse→fine ratio
+                            # v16.x: coarse→fine ratio (2-stage retrieval)
                             if all_coarse_idx:
                                 coarse_all = torch.cat(all_coarse_idx)
                                 coarse_unique = len(torch.unique(coarse_all))
@@ -1079,8 +1237,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # Add router metrics (same format as console)
                 router = None
-                if hasattr(base_model, 'router'):  # v17
-                    router = base_model.router
+                if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+                    router = base_model.router.neuron_router
                 elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                     router = base_model.global_routers.neuron_router
                 if router is not None:
@@ -1452,29 +1610,8 @@ def main():
     args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
     args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
 
-    # v16.0/16.1/16.2 Split Feature R/V parameters
-    args.n_feature_r = cfg['model'].get('n_feature_r', 96)
-    args.n_feature_v = cfg['model'].get('n_feature_v', 24)
-    args.top_k_feature_r = cfg['model'].get('top_k_feature_r', 8)
-    args.top_k_feature_v = cfg['model'].get('top_k_feature_v', 8)
-    args.n_relational = cfg['model'].get('n_relational', 96)
-    args.n_value = cfg['model'].get('n_value', 16)
-    args.top_k_relational = cfg['model'].get('top_k_relational', 4)
-    args.top_k_value = cfg['model'].get('top_k_value', 6)
-
-    # v16.3 Complete Pool Separation parameters
-    args.n_fq = cfg['model'].get('n_fq', 32)
-    args.n_fk = cfg['model'].get('n_fk', 32)
-    args.n_fv = cfg['model'].get('n_fv', 24)
-    args.n_rq = cfg['model'].get('n_rq', 32)
-    args.n_rk = cfg['model'].get('n_rk', 32)
-    args.n_rv = cfg['model'].get('n_rv', 24)
-    args.top_k_fq = cfg['model'].get('top_k_fq', 8)
-    args.top_k_fk = cfg['model'].get('top_k_fk', 8)
-    args.top_k_fv = cfg['model'].get('top_k_fv', 3)
-    args.top_k_rq = cfg['model'].get('top_k_rq', 8)
-    args.top_k_rk = cfg['model'].get('top_k_rk', 8)
-    args.top_k_rv = cfg['model'].get('top_k_rv', 3)
+    # Load all version-specific model params from VERSION_REGISTRY
+    load_model_params_to_args(args, cfg['model'])
 
     # Training
     args.batch_size = cfg['training']['batch_size']
@@ -1657,29 +1794,8 @@ def main():
         args.basis_rank = args.rank  # Sync basis_rank with rank for model creation
         args.n_knowledge = checkpoint_config.get('n_knowledge', getattr(args, 'n_knowledge', 64))
 
-        # v16.0/16.1/16.2 architecture params (must match checkpoint)
-        args.n_feature_r = checkpoint_config.get('n_feature_r', getattr(args, 'n_feature_r', 96))
-        args.n_feature_v = checkpoint_config.get('n_feature_v', getattr(args, 'n_feature_v', 24))
-        args.n_relational = checkpoint_config.get('n_relational', getattr(args, 'n_relational', 96))
-        args.n_value = checkpoint_config.get('n_value', getattr(args, 'n_value', 16))
-        args.top_k_feature_r = checkpoint_config.get('top_k_feature_r', getattr(args, 'top_k_feature_r', 12))
-        args.top_k_feature_v = checkpoint_config.get('top_k_feature_v', getattr(args, 'top_k_feature_v', 3))
-        args.top_k_relational = checkpoint_config.get('top_k_relational', getattr(args, 'top_k_relational', 4))
-        args.top_k_value = checkpoint_config.get('top_k_value', getattr(args, 'top_k_value', 6))
-
-        # v16.3 architecture params (must match checkpoint)
-        args.n_fq = checkpoint_config.get('n_fq', getattr(args, 'n_fq', 32))
-        args.n_fk = checkpoint_config.get('n_fk', getattr(args, 'n_fk', 32))
-        args.n_fv = checkpoint_config.get('n_fv', getattr(args, 'n_fv', 24))
-        args.n_rq = checkpoint_config.get('n_rq', getattr(args, 'n_rq', 32))
-        args.n_rk = checkpoint_config.get('n_rk', getattr(args, 'n_rk', 32))
-        args.n_rv = checkpoint_config.get('n_rv', getattr(args, 'n_rv', 24))
-        args.top_k_fq = checkpoint_config.get('top_k_fq', getattr(args, 'top_k_fq', 8))
-        args.top_k_fk = checkpoint_config.get('top_k_fk', getattr(args, 'top_k_fk', 8))
-        args.top_k_fv = checkpoint_config.get('top_k_fv', getattr(args, 'top_k_fv', 3))
-        args.top_k_rq = checkpoint_config.get('top_k_rq', getattr(args, 'top_k_rq', 8))
-        args.top_k_rk = checkpoint_config.get('top_k_rk', getattr(args, 'top_k_rk', 8))
-        args.top_k_rv = checkpoint_config.get('top_k_rv', getattr(args, 'top_k_rv', 3))
+        # Load all version-specific architecture params from checkpoint (must match)
+        load_model_params_to_args(args, checkpoint_config)
 
         if checkpoint_training_config:
             # Training hyperparameters (only if not overridden by CLI)
@@ -1765,52 +1881,8 @@ def main():
     # Build model kwargs from args using version_registry
     model_version = getattr(args, 'model_version', '16.1')
 
-    # Build config dict from args for version_registry
-    args_config = {
-        'vocab_size': vocab_size,
-        'd_model': args.d_model,
-        'n_layers': args.n_layers,
-        'n_heads': args.n_heads,
-        'max_seq_len': args.max_seq_len,
-        'dropout': args.dropout,
-        'rank': args.basis_rank,
-        # v16.0/16.1/16.2 params
-        'n_feature_r': getattr(args, 'n_feature_r', 96),
-        'n_feature_v': getattr(args, 'n_feature_v', 24),
-        'n_relational': getattr(args, 'n_relational', 96),
-        'n_value': getattr(args, 'n_value', 16),
-        'top_k_feature_r': getattr(args, 'top_k_feature_r', 12),
-        'top_k_feature_v': getattr(args, 'top_k_feature_v', 3),
-        'top_k_relational': getattr(args, 'top_k_relational', 12),
-        'top_k_value': getattr(args, 'top_k_value', 3),
-        # v16.3 params (complete pool separation)
-        'n_fq': getattr(args, 'n_fq', 32),
-        'n_fk': getattr(args, 'n_fk', 32),
-        'n_fv': getattr(args, 'n_fv', 24),
-        'n_rq': getattr(args, 'n_rq', 32),
-        'n_rk': getattr(args, 'n_rk', 32),
-        'n_rv': getattr(args, 'n_rv', 24),
-        'top_k_fq': getattr(args, 'top_k_fq', 8),
-        'top_k_fk': getattr(args, 'top_k_fk', 8),
-        'top_k_fv': getattr(args, 'top_k_fv', 3),
-        'top_k_rq': getattr(args, 'top_k_rq', 8),
-        'top_k_rk': getattr(args, 'top_k_rk', 8),
-        'top_k_rv': getattr(args, 'top_k_rv', 3),
-        # Common params
-        'n_knowledge': args.n_knowledge,
-        'coarse_k': args.coarse_k,
-        'fine_k': args.fine_k,
-        'knowledge_rank': args.knowledge_rank or 128,
-        'state_dim': getattr(args, 'state_dim', 64),
-        'd_space': getattr(args, 'd_space', 64),
-        'router_dropout': getattr(args, 'router_dropout', 0.1),
-        'gradient_checkpointing': args.gradient_checkpointing,
-        'excitability_tau': getattr(args, 'excitability_tau', 1.5),
-        'excitability_ema_alpha': getattr(args, 'excitability_ema_alpha', 0.01),
-        'excitability_decay_rate': getattr(args, 'excitability_decay_rate', 0.99995),
-        'langevin_alpha': getattr(args, 'langevin_alpha', 0.0003),
-        'langevin_beta': getattr(args, 'langevin_beta', 0.0006),
-    }
+    # Build config dict dynamically from VERSION_REGISTRY (single source of truth)
+    args_config = build_args_config(args, vocab_size)
 
     # Use version_registry to build model_kwargs with correct params for version
     model_kwargs = build_model_kwargs(model_version, args_config)
@@ -1920,7 +1992,7 @@ def main():
     monitor = TrainingMonitor(str(log_dir))
 
     # Training log file (append mode if resuming)
-    training_log_file = checkpoint_dir / "training_log.txt"
+    training_log_file = log_dir / "training_log.txt"
 
     # Open in append mode if resuming, write mode if new
     log_mode = 'a' if latest_best_checkpoint else 'w'
