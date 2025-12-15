@@ -27,15 +27,15 @@ model:
   rank: 64
   state_dim: 64
 
-  # Attention - Q/K 공유 풀 (v16처럼 안정적)
-  n_feature_qk: 56
+  # Attention - Q/K 공유 풀
+  n_feature_qk: 120
   n_feature_v: 24
-  top_k_feature_qk: 16
+  top_k_feature_qk: 20
   top_k_feature_v: 6
 
-  n_restore_qk: 56
+  n_restore_qk: 120
   n_restore_v: 24
-  top_k_restore_qk: 16
+  top_k_restore_qk: 20
   top_k_restore_v: 6
 
   # Knowledge - Feature-Restore 패턴
@@ -76,10 +76,10 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_5B
 
 # v17.1 Architecture (Q/K 공유 + Knowledge Feature-Restore)
 #
-#   Attention Circuit (Q/K 공유 풀 - 안정적):
-#   - Feature_QK=56 (k=16): Q/K 공유 compression
+#   Attention Circuit (Q/K 공유 풀):
+#   - Feature_QK=120 (k=20): Q/K 공유 compression
 #   - Feature_V=24 (k=6): V compression
-#   - Restore_QK=56 (k=16): Q/K 공유 restoration
+#   - Restore_QK=120 (k=20): Q/K 공유 restoration
 #   - Restore_V=24 (k=6): V restoration
 #
 #   Knowledge Circuit (Feature-Restore 패턴):
