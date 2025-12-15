@@ -571,38 +571,56 @@ def get_all_versions_info() -> str:
     return "\n".join(lines)
 
 
-def get_routing_log_info(routing_info: Dict[str, Any], calc_entropy_fn, calc_var_fn) -> Dict[str, Any]:
+def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[str, Any]:
     """
     Extract routing log info based on routing_info structure.
     Auto-detects version from routing_info keys.
+    Computes AVERAGE entropy across all layers for better global view.
 
     Args:
-        routing_info: Layer 0 routing info from model forward
+        routing_infos: List of routing_info dicts from all layers, or single dict (legacy)
         calc_entropy_fn: Function to calculate entropy ratio (pref -> float)
         calc_var_fn: Function to calculate token variance (pref -> float)
 
     Returns:
         Dict with keys: 'ent_str', 'var_str', 'overlap_str', 'version'
     """
-    attn = routing_info.get('attention', routing_info)
+    # Support both list and single dict (backward compatibility)
+    if isinstance(routing_infos, dict):
+        routing_infos = [routing_infos]
 
-    # v16.4: Shared Pool + Separate Routing (fqk_q_pref exists)
-    if attn.get('fqk_q_pref') is not None:
-        prefs = {
-            'FQK_Q': attn.get('fqk_q_pref'),
-            'FQK_K': attn.get('fqk_k_pref'),
-            'FV': attn.get('fv_pref'),
-            'RQK_Q': attn.get('rqk_q_pref'),
-            'RQK_K': attn.get('rqk_k_pref'),
-            'RV': attn.get('rv_pref'),
-        }
-        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
-        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+    # Use first layer to detect version
+    attn0 = routing_infos[0].get('attention', routing_infos[0])
+
+    # v16.4 / v17.1: Shared Pool + Separate Routing (fqk_q_pref exists)
+    if attn0.get('fqk_q_pref') is not None:
+        # Collect entropy from all layers
+        all_ents = {k: [] for k in ['FQK_Q', 'FQK_K', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
+        all_vars = {k: [] for k in ['FQK_Q', 'FQK_K', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
+
+        for layer_info in routing_infos:
+            attn = layer_info.get('attention', layer_info)
+            prefs = {
+                'FQK_Q': attn.get('fqk_q_pref'),
+                'FQK_K': attn.get('fqk_k_pref'),
+                'FV': attn.get('fv_pref'),
+                'RQK_Q': attn.get('rqk_q_pref'),
+                'RQK_K': attn.get('rqk_k_pref'),
+                'RV': attn.get('rv_pref'),
+            }
+            for k, v in prefs.items():
+                if v is not None:
+                    all_ents[k].append(calc_entropy_fn(v))
+                    all_vars[k].append(calc_var_fn(v))
+
+        # Average across layers
+        ents = {k: sum(v)/len(v) if v else 0.0 for k, v in all_ents.items()}
+        vars_ = {k: sum(v)/len(v) if v else 0.0 for k, v in all_vars.items()}
 
         ent_str = f"Ent FQK_Q/K/FV/RQK_Q/K/RV:{ents['FQK_Q']:.0f}/{ents['FQK_K']:.0f}/{ents['FV']:.0f}/{ents['RQK_Q']:.0f}/{ents['RQK_K']:.0f}/{ents['RV']:.0f}"
         var_str = f"TokVar:{vars_['FQK_Q']:.4f}/{vars_['FQK_K']:.4f}/{vars_['FV']:.4f}/{vars_['RQK_Q']:.4f}/{vars_['RQK_K']:.4f}/{vars_['RV']:.4f}"
 
-        # Q/K overlap ratio for shared pools
+        # Q/K overlap ratio (use first layer for simplicity)
         def calc_overlap(w_Q, w_K):
             if w_Q is None or w_K is None:
                 return 0.0
@@ -610,10 +628,10 @@ def get_routing_log_info(routing_info: Dict[str, Any], calc_entropy_fn, calc_var
             active_Q = (w_Q > 0).float().sum(-1)
             return (overlap.sum(-1) / (active_Q + 1e-8)).mean().item()
 
-        w_FQK_Q = attn.get('fqk_weights_Q')
-        w_FQK_K = attn.get('fqk_weights_K')
-        w_RQK_Q = attn.get('rqk_weights_Q')
-        w_RQK_K = attn.get('rqk_weights_K')
+        w_FQK_Q = attn0.get('fqk_weights_Q')
+        w_FQK_K = attn0.get('fqk_weights_K')
+        w_RQK_Q = attn0.get('rqk_weights_Q')
+        w_RQK_K = attn0.get('rqk_weights_K')
         overlap_FQK = calc_overlap(w_FQK_Q, w_FQK_K)
         overlap_RQK = calc_overlap(w_RQK_Q, w_RQK_K)
         overlap_str = f"Q/K Overlap FQK/RQK:{overlap_FQK:.2f}/{overlap_RQK:.2f}"
@@ -621,56 +639,92 @@ def get_routing_log_info(routing_info: Dict[str, Any], calc_entropy_fn, calc_var
         return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': overlap_str, 'version': '16.4'}
 
     # v17: Complete pool separation with new naming (feature_q_pref exists)
-    elif attn.get('feature_q_pref') is not None:
-        prefs = {
-            'FQ': attn.get('feature_q_pref'),
-            'FK': attn.get('feature_k_pref'),
-            'FV': attn.get('feature_v_pref'),
-            'RQ': attn.get('restore_q_pref'),
-            'RK': attn.get('restore_k_pref'),
-            'RV': attn.get('restore_v_pref'),
-        }
-        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
-        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+    elif attn0.get('feature_q_pref') is not None:
+        # Collect entropy from all layers
+        all_ents = {k: [] for k in ['FQ', 'FK', 'FV', 'RQ', 'RK', 'RV']}
+        all_vars = {k: [] for k in ['FQ', 'FK', 'FV', 'RQ', 'RK', 'RV']}
+
+        for layer_info in routing_infos:
+            attn = layer_info.get('attention', layer_info)
+            prefs = {
+                'FQ': attn.get('feature_q_pref'),
+                'FK': attn.get('feature_k_pref'),
+                'FV': attn.get('feature_v_pref'),
+                'RQ': attn.get('restore_q_pref'),
+                'RK': attn.get('restore_k_pref'),
+                'RV': attn.get('restore_v_pref'),
+            }
+            for k, v in prefs.items():
+                if v is not None:
+                    all_ents[k].append(calc_entropy_fn(v))
+                    all_vars[k].append(calc_var_fn(v))
+
+        # Average across layers
+        ents = {k: sum(v)/len(v) if v else 0.0 for k, v in all_ents.items()}
+        vars_ = {k: sum(v)/len(v) if v else 0.0 for k, v in all_vars.items()}
 
         ent_str = f"Ent FQ/FK/FV/RQ/RK/RV:{ents['FQ']:.0f}/{ents['FK']:.0f}/{ents['FV']:.0f}/{ents['RQ']:.0f}/{ents['RK']:.0f}/{ents['RV']:.0f}"
         var_str = f"TokVar:{vars_['FQ']:.4f}/{vars_['FK']:.4f}/{vars_['FV']:.4f}/{vars_['RQ']:.4f}/{vars_['RK']:.4f}/{vars_['RV']:.4f}"
         return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': None, 'version': '17'}
 
     # v16.3: Complete pool separation (fq_pref exists - legacy naming)
-    elif attn.get('fq_pref') is not None:
-        prefs = {
-            'FQ': attn.get('fq_pref'),
-            'FK': attn.get('fk_pref'),
-            'FV': attn.get('fv_pref'),
-            'RQ': attn.get('rq_pref'),
-            'RK': attn.get('rk_pref'),
-            'RV': attn.get('rv_pref'),
-        }
-        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
-        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+    elif attn0.get('fq_pref') is not None:
+        # Collect entropy from all layers
+        all_ents = {k: [] for k in ['FQ', 'FK', 'FV', 'RQ', 'RK', 'RV']}
+        all_vars = {k: [] for k in ['FQ', 'FK', 'FV', 'RQ', 'RK', 'RV']}
+
+        for layer_info in routing_infos:
+            attn = layer_info.get('attention', layer_info)
+            prefs = {
+                'FQ': attn.get('fq_pref'),
+                'FK': attn.get('fk_pref'),
+                'FV': attn.get('fv_pref'),
+                'RQ': attn.get('rq_pref'),
+                'RK': attn.get('rk_pref'),
+                'RV': attn.get('rv_pref'),
+            }
+            for k, v in prefs.items():
+                if v is not None:
+                    all_ents[k].append(calc_entropy_fn(v))
+                    all_vars[k].append(calc_var_fn(v))
+
+        # Average across layers
+        ents = {k: sum(v)/len(v) if v else 0.0 for k, v in all_ents.items()}
+        vars_ = {k: sum(v)/len(v) if v else 0.0 for k, v in all_vars.items()}
 
         ent_str = f"Ent FQ/FK/FV/RQ/RK/RV:{ents['FQ']:.0f}/{ents['FK']:.0f}/{ents['FV']:.0f}/{ents['RQ']:.0f}/{ents['RK']:.0f}/{ents['RV']:.0f}"
         var_str = f"TokVar:{vars_['FQ']:.4f}/{vars_['FK']:.4f}/{vars_['FV']:.4f}/{vars_['RQ']:.4f}/{vars_['RK']:.4f}/{vars_['RV']:.4f}"
         return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': None, 'version': '16.3'}
 
     # v16.2: Q/K projection separation (feature_r_q_pref exists)
-    elif attn.get('feature_r_q_pref') is not None:
-        prefs = {
-            'FRQ': attn.get('feature_r_q_pref'),
-            'FRK': attn.get('feature_r_k_pref'),
-            'FV': attn.get('feature_v_pref'),
-            'RQ': attn.get('relational_q_pref'),
-            'RK': attn.get('relational_k_pref'),
-            'V': attn.get('value_pref'),
-        }
-        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
-        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+    elif attn0.get('feature_r_q_pref') is not None:
+        # Collect entropy from all layers
+        all_ents = {k: [] for k in ['FRQ', 'FRK', 'FV', 'RQ', 'RK', 'V']}
+        all_vars = {k: [] for k in ['FRQ', 'FRK', 'FV', 'RQ', 'RK', 'V']}
+
+        for layer_info in routing_infos:
+            attn = layer_info.get('attention', layer_info)
+            prefs = {
+                'FRQ': attn.get('feature_r_q_pref'),
+                'FRK': attn.get('feature_r_k_pref'),
+                'FV': attn.get('feature_v_pref'),
+                'RQ': attn.get('relational_q_pref'),
+                'RK': attn.get('relational_k_pref'),
+                'V': attn.get('value_pref'),
+            }
+            for k, v in prefs.items():
+                if v is not None:
+                    all_ents[k].append(calc_entropy_fn(v))
+                    all_vars[k].append(calc_var_fn(v))
+
+        # Average across layers
+        ents = {k: sum(v)/len(v) if v else 0.0 for k, v in all_ents.items()}
+        vars_ = {k: sum(v)/len(v) if v else 0.0 for k, v in all_vars.items()}
 
         ent_str = f"Ent FRQ/FRK/FV/RQ/RK/V:{ents['FRQ']:.0f}/{ents['FRK']:.0f}/{ents['FV']:.0f}/{ents['RQ']:.0f}/{ents['RK']:.0f}/{ents['V']:.0f}"
         var_str = f"TokVar:{vars_['FRQ']:.4f}/{vars_['FRK']:.4f}/{vars_['FV']:.4f}/{vars_['RQ']:.4f}/{vars_['RK']:.4f}/{vars_['V']:.4f}"
 
-        # Q/K overlap ratio
+        # Q/K overlap ratio (use first layer)
         def calc_overlap(w_Q, w_K):
             if w_Q is None or w_K is None:
                 return 0.0
@@ -678,10 +732,10 @@ def get_routing_log_info(routing_info: Dict[str, Any], calc_entropy_fn, calc_var
             active_Q = (w_Q > 0).float().sum(-1)
             return (overlap.sum(-1) / (active_Q + 1e-8)).mean().item()
 
-        w_FRQ = attn.get('feature_r_weights_Q')
-        w_FRK = attn.get('feature_r_weights_K')
-        w_RQ = attn.get('relational_weights_Q')
-        w_RK = attn.get('relational_weights_K')
+        w_FRQ = attn0.get('feature_r_weights_Q')
+        w_FRK = attn0.get('feature_r_weights_K')
+        w_RQ = attn0.get('relational_weights_Q')
+        w_RK = attn0.get('relational_weights_K')
         overlap_FR = calc_overlap(w_FRQ, w_FRK)
         overlap_R = calc_overlap(w_RQ, w_RK)
         overlap_str = f"Q/K Overlap FR/R:{overlap_FR:.2f}/{overlap_R:.2f}"
@@ -689,16 +743,28 @@ def get_routing_log_info(routing_info: Dict[str, Any], calc_entropy_fn, calc_var
         return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': overlap_str, 'version': '16.2'}
 
     # v16.0/16.1: Shared Q/K (feature_r_pref exists)
-    elif attn.get('feature_r_pref') is not None:
-        prefs = {
-            'FR': attn.get('feature_r_pref'),
-            'FV': attn.get('feature_v_pref'),
-            'RQ': attn.get('relational_q_pref'),
-            'RK': attn.get('relational_k_pref'),
-            'V': attn.get('value_pref'),
-        }
-        ents = {k: calc_entropy_fn(v) for k, v in prefs.items()}
-        vars_ = {k: calc_var_fn(v) for k, v in prefs.items()}
+    elif attn0.get('feature_r_pref') is not None:
+        # Collect entropy from all layers
+        all_ents = {k: [] for k in ['FR', 'FV', 'RQ', 'RK', 'V']}
+        all_vars = {k: [] for k in ['FR', 'FV', 'RQ', 'RK', 'V']}
+
+        for layer_info in routing_infos:
+            attn = layer_info.get('attention', layer_info)
+            prefs = {
+                'FR': attn.get('feature_r_pref'),
+                'FV': attn.get('feature_v_pref'),
+                'RQ': attn.get('relational_q_pref'),
+                'RK': attn.get('relational_k_pref'),
+                'V': attn.get('value_pref'),
+            }
+            for k, v in prefs.items():
+                if v is not None:
+                    all_ents[k].append(calc_entropy_fn(v))
+                    all_vars[k].append(calc_var_fn(v))
+
+        # Average across layers
+        ents = {k: sum(v)/len(v) if v else 0.0 for k, v in all_ents.items()}
+        vars_ = {k: sum(v)/len(v) if v else 0.0 for k, v in all_vars.items()}
 
         ent_str = f"Ent FR/FV/RQ/RK/V:{ents['FR']:.0f}/{ents['FV']:.0f}/{ents['RQ']:.0f}/{ents['RK']:.0f}/{ents['V']:.0f}"
         var_str = f"TokVar:{vars_['FR']:.4f}/{vars_['FV']:.4f}/{vars_['RQ']:.4f}/{vars_['RK']:.4f}/{vars_['V']:.4f}"

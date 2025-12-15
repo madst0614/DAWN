@@ -1090,7 +1090,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         return pref.var(dim=1).mean().item()
 
                     # Use version_registry for routing log info (auto-detects version)
-                    log_info = get_routing_log_info(routing_infos[0], calc_entropy_ratio, calc_token_var)
+                    # Pass all layers for average entropy calculation
+                    log_info = get_routing_log_info(routing_infos, calc_entropy_ratio, calc_token_var)
                     ent_str = log_info['ent_str']
                     var_str = log_info['var_str']
                     overlap_str = log_info['overlap_str']
