@@ -581,6 +581,12 @@ class AttentionCircuit(nn.Module):
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
+
+        # Causal mask (언어 모델링: 미래 토큰 못봄)
+        causal_mask = torch.triu(torch.ones(S, S, device=scores.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(causal_mask[None, None, :, :], float('-inf'))
+
+        # Padding mask (optional)
         if attention_mask is not None:
             mask = attention_mask[:, None, None, :]
             scores = scores.masked_fill(mask == 0, float('-inf'))
