@@ -21,10 +21,10 @@ data:
 
 model:
   model_version: "baseline"
-  d_model: 256
+  d_model: 304
   n_layers: 12
   n_heads: 4
-  d_ff: 1024
+  d_ff: 1216
   max_seq_len: 512
   dropout: 0.1
 
@@ -40,7 +40,7 @@ checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_baseline_22M_12L_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_baseline_22M_12L_c4_5B
 
 # 파라미터 계산:
-# Embedding: 50257 × 256 = 12.9M
-# Per layer: 256×256×4 (attn) + 256×1024×2 (ffn) = 0.26M + 0.52M = 0.78M
-# 12 layers: 0.78M × 12 = 9.4M
-# Total: ~22.3M ✓
+# Embedding: 30522 × 304 = 9.3M
+# Per layer: 304×304×4 (attn) + 304×1216×2 (ffn) = 0.37M + 0.74M = 1.1M
+# 12 layers: 1.1M × 12 = 13.2M
+# Total: ~22.5M ✓
