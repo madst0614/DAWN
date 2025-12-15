@@ -605,8 +605,53 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
-    # v16.4: Shared Pool + Separate Routing
-    if hasattr(router, 'usage_ema_feature_qk'):
+    # v17.1: Q/K Shared Pool + Knowledge Feature-Restore Separation
+    # (has both usage_ema_feature_qk AND usage_ema_feature_know)
+    if hasattr(router, 'usage_ema_feature_qk') and hasattr(router, 'usage_ema_feature_know'):
+        ema_fqk = router.usage_ema_feature_qk
+        ema_fv = router.usage_ema_feature_v
+        ema_rqk = router.usage_ema_restore_qk
+        ema_rv = router.usage_ema_restore_v
+        ema_FK = router.usage_ema_feature_know
+        ema_RK = router.usage_ema_restore_know
+
+        # Active neuron counts
+        active_fqk = (ema_fqk > 0.01).sum().item()
+        active_fv = (ema_fv > 0.01).sum().item()
+        active_rqk = (ema_rqk > 0.01).sum().item()
+        active_rv = (ema_rv > 0.01).sum().item()
+        active_FK = (ema_FK > 0.01).sum().item()
+        active_RK = (ema_RK > 0.01).sum().item()
+        n_fqk, n_fv = ema_fqk.numel(), ema_fv.numel()
+        n_rqk, n_rv = ema_rqk.numel(), ema_rv.numel()
+        n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+
+        # Gini coefficients
+        gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
+        gini_rqk, gini_rv = _gini(ema_rqk), _gini(ema_rv)
+        gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+
+        # Dead neuron ratios (EMA < 0.01)
+        dead_fqk = (ema_fqk < 0.01).float().mean().item()
+        dead_fv = (ema_fv < 0.01).float().mean().item()
+        dead_rqk = (ema_rqk < 0.01).float().mean().item()
+        dead_rv = (ema_rv < 0.01).float().mean().item()
+        dead_FK = (ema_FK < 0.01).float().mean().item()
+        dead_RK = (ema_RK < 0.01).float().mean().item()
+
+        # Excitability
+        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
+
+        # v17.1 format (similar to v17 but with shared Q/K)
+        lines.append(f"         [v17.1] Excitability w={exc_w:.4f}")
+        lines.append(f"             Feature_QK: {int(active_fqk)}/{n_fqk} (k={router.top_k_feature_qk}) | Feature_V: {int(active_fv)}/{n_fv} (k={router.top_k_feature_v})")
+        lines.append(f"             Restore_QK: {int(active_rqk)}/{n_rqk} (k={router.top_k_restore_qk}) | Restore_V: {int(active_rv)}/{n_rv} (k={router.top_k_restore_v})")
+        lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} (k={router.top_k_feature_know}) | Restore_Know: {int(active_RK)}/{n_RK} (k={router.top_k_restore_know})")
+        lines.append(f"             Dead: FQK={dead_fqk:.1%} FV={dead_fv:.1%} RQK={dead_rqk:.1%} RV={dead_rv:.1%} FK={dead_FK:.1%} RK={dead_RK:.1%}")
+        lines.append(f"             Gini: FQK={gini_fqk:.2f} FV={gini_fv:.2f} RQK={gini_rqk:.2f} RV={gini_rv:.2f} FK={gini_FK:.2f} RK={gini_RK:.2f}")
+
+    # v16.4: Shared Pool + Separate Routing (no Knowledge F/R separation)
+    elif hasattr(router, 'usage_ema_feature_qk'):
         ema_fqk = router.usage_ema_feature_qk
         ema_fv = router.usage_ema_feature_v
         ema_rqk = router.usage_ema_restore_qk
@@ -638,20 +683,8 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         lines.append(f"             Gini FQK/FV: {gini_fqk:.2f}/{gini_fv:.2f} | RQK/RV: {gini_rqk:.2f}/{gini_rv:.2f}")
         lines.append(f"             Dead FQK/FV: {dead_fqk:.1%}/{dead_fv:.1%} | RQK/RV: {dead_rqk:.1%}/{dead_rv:.1%}")
 
-        # Knowledge neurons (if available)
-        if hasattr(router, 'usage_ema_feature_know'):
-            # v17.1: Feature/Restore separated knowledge
-            ema_FK = router.usage_ema_feature_know
-            ema_RK = router.usage_ema_restore_know
-            active_FK = (ema_FK > 0.01).sum().item()
-            active_RK = (ema_RK > 0.01).sum().item()
-            n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
-            gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
-            dead_FK = (ema_FK < 0.01).float().mean().item()
-            dead_RK = (ema_RK < 0.01).float().mean().item()
-            lines.append(f"             Knowledge F/R: Active {int(active_FK)}/{n_FK},{int(active_RK)}/{n_RK} | Dead:{dead_FK:.1%}/{dead_RK:.1%} | Gini:{gini_FK:.2f}/{gini_RK:.2f}")
-        elif hasattr(router, 'usage_ema_knowledge'):
-            # v16.4: single knowledge pool
+        # Knowledge neurons (single pool for v16.4)
+        if hasattr(router, 'usage_ema_knowledge'):
             ema_K = router.usage_ema_knowledge
             active_K = (ema_K > 0.01).sum().item()
             n_K = ema_K.numel()
@@ -997,8 +1030,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         # Update excitability (v16.1/v17: update_excitability_weight, v16.0: decay_excitability)
         router = None
-        if hasattr(base_model, 'router'):  # v17
-            router = base_model.router
+        if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+            router = base_model.router.neuron_router
         elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
             router = base_model.global_routers.neuron_router
 
@@ -1087,8 +1120,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                     # Usage EMA logging
                     router = None
-                    if hasattr(base_model, 'router'):  # v17
-                        router = base_model.router
+                    if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+                        router = base_model.router.neuron_router
                     elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                         router = base_model.global_routers.neuron_router
                     if router is not None:
@@ -1204,8 +1237,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # Add router metrics (same format as console)
                 router = None
-                if hasattr(base_model, 'router'):  # v17
-                    router = base_model.router
+                if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+                    router = base_model.router.neuron_router
                 elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                     router = base_model.global_routers.neuron_router
                 if router is not None:
@@ -1959,7 +1992,7 @@ def main():
     monitor = TrainingMonitor(str(log_dir))
 
     # Training log file (append mode if resuming)
-    training_log_file = checkpoint_dir / "training_log.txt"
+    training_log_file = log_dir / "training_log.txt"
 
     # Open in append mode if resuming, write mode if new
     log_mode = 'a' if latest_best_checkpoint else 'w'
