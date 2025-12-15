@@ -455,14 +455,13 @@ class GlobalRouters(nn.Module):
         return fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, routing_info, aux_loss
 
     def get_knowledge_weights(self, x, importance, attention_mask=None):
-        """Get knowledge neuron weights using token-level routing"""
+        """Get knowledge neuron weights using batch-level routing (Attention과 동일 패턴)"""
         k_logits = self.neuron_router.get_logits(x, 'knowledge')
-
-        # 토큰별 softmax
         k_pref = F.softmax(k_logits, dim=-1)  # [B, S, n]
 
-        # 토큰별 top-k
-        k_weights, topk_idx = self._topk_sparsify(k_pref, self.top_k_knowledge)  # [B, S, n]
+        # 배치별 (importance 가중 평균)
+        k_dense = torch.einsum('bs,bsn->bn', importance, k_pref)  # [B, n]
+        k_weights, topk_idx = self._topk_sparsify(k_dense, self.top_k_knowledge)
 
         # Update usage
         if self.training:
@@ -568,12 +567,11 @@ class AttentionCircuit(nn.Module):
 
 class KnowledgeCircuit(nn.Module):
     """
-    v17.1 Knowledge Circuit: Feature-Restore + 토큰별 라우팅
+    v17.1 Knowledge Circuit: Feature-Restore (AttentionCircuit과 동일 패턴)
 
-    Note: AttentionCircuit은 batch-level (importance 가중 평균)
-          KnowledgeCircuit은 token-level (토큰별 softmax/top-k)
+    Routing: batch-level (importance 가중 평균) - Attention과 동일
 
-    x -> router selects knowledge neurons [B,S,k] (token-level top_k)
+    x -> router selects knowledge neurons [B,n] (batch-level top_k)
       -> Feature_Know extracts info (d_model -> knowledge_rank)
       -> Restore_Know restores knowledge (knowledge_rank -> d_model)
     """
@@ -598,28 +596,21 @@ class KnowledgeCircuit(nn.Module):
         """
         Args:
             x: [B, S, D]
-            k_weights: [B, S, n_knowledge] token-level sparse weights from router
+            k_weights: [B, n_knowledge] batch-level sparse weights from router
         """
         B, S, D = x.shape
-        chunk_size = 64  # 메모리 효율을 위해 S를 64씩 처리
+        R = self.knowledge_rank
 
-        outputs = []
-        for start in range(0, S, chunk_size):
-            end = min(start + chunk_size, S)
-            x_chunk = x[:, start:end]  # [B, chunk, D]
-            k_w_chunk = k_weights[:, start:end]  # [B, chunk, n]
+        # Feature (compression): [B, n] @ [n, D*R] → [B, D, R]
+        f_flat = self.shared_neurons.feature_know.view(-1, D * R)
+        shared_f = (k_weights @ f_flat).view(B, D, R)
+        h = torch.bmm(x, shared_f)  # [B, S, R]
 
-            # Feature (compression)
-            weighted_f = torch.einsum('bcn,ndr->bcdr', k_w_chunk, self.shared_neurons.feature_know)
-            h = torch.einsum('bcd,bcdr->bcr', x_chunk, weighted_f)
+        # Restore (restoration): [B, n] @ [n, R*D] → [B, R, D]
+        r_flat = self.shared_neurons.restore_know.view(-1, R * D)
+        shared_r = (k_weights @ r_flat).view(B, R, D)
+        output = torch.bmm(h, shared_r)  # [B, S, D]
 
-            # Restore (restoration)
-            weighted_r = torch.einsum('bcn,nrd->bcrd', k_w_chunk, self.shared_neurons.restore_know)
-            out_chunk = torch.einsum('bcr,bcrd->bcd', h, weighted_r)
-
-            outputs.append(out_chunk)
-
-        output = torch.cat(outputs, dim=1)
         return self.dropout(output)
 
 
