@@ -776,6 +776,7 @@ class DAWN(nn.Module):
         self.max_seq_len = max_seq_len
         self.state_dim = state_dim
         self.d_space = d_space
+        self.dropout_rate = dropout
         self.token_routing = token_routing
         self.knowledge_token_routing = knowledge_token_routing
         self.router_dropout = router_dropout
@@ -783,6 +784,7 @@ class DAWN(nn.Module):
         self.use_ssm_context = use_ssm_context
         self.excitability_tau = excitability_tau
         self.excitability_ema_alpha = excitability_ema_alpha
+        self.excitability_decay_rate = excitability_decay_rate
 
         # Q/K 공유 풀
         self.n_feature_qk = n_feature_qk
@@ -923,12 +925,11 @@ class DAWN(nn.Module):
 
     def get_model_info(self):
         """Return model architecture info for logging"""
-        decay_rate = getattr(self.router.neuron_router, 'decay_rate', 'N/A')
         return [
             f"DAWN v{self.__version__}: Q/K Shared + Knowledge Feature-Restore",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  max_seq_len={self.max_seq_len}, state_dim={self.state_dim}, dropout={self.dropout}",
+            f"  max_seq_len={self.max_seq_len}, state_dim={self.state_dim}, dropout={self.dropout_rate}",
             f"",
             f"  [Attention - Q/K Shared Pool]",
             f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_qk})",
@@ -946,7 +947,7 @@ class DAWN(nn.Module):
             f"  use_ssm_context={self.use_ssm_context}",
             f"",
             f"  [Excitability]",
-            f"  tau={self.excitability_tau}, ema_alpha={self.excitability_ema_alpha}, decay_rate={decay_rate}",
+            f"  tau={self.excitability_tau}, ema_alpha={self.excitability_ema_alpha}, decay_rate={self.excitability_decay_rate}",
             f"",
             f"  [Other]",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
