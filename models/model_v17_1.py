@@ -861,7 +861,7 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids, attention_mask=None, return_routing_info=False):
+    def forward(self, input_ids, labels=None, attention_mask=None, return_routing_info=False):
         B, S = input_ids.shape
         device = input_ids.device
 
@@ -892,6 +892,14 @@ class DAWN(nn.Module):
 
         if self.training:
             self.router.neuron_router.decay_excitability()
+
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous().long()
+            loss = F.cross_entropy(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1), ignore_index=-100)
+            if return_routing_info:
+                return loss, logits, routing_infos
+            return loss, logits
 
         if return_routing_info:
             return logits, routing_infos
