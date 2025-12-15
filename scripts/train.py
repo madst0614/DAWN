@@ -1050,11 +1050,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     var_str = log_info['var_str']
                     overlap_str = log_info['overlap_str']
 
-                    # Attention ratio (attn_out_norm vs mem_out_norm per layer)
+                    # Attention ratio (attn_out_norm vs mem/know_out_norm per layer)
                     attn_ratios = []
                     for layer_info in routing_infos:
                         attn_norm = layer_info.get('attn_out_norm')
-                        mem_norm = layer_info.get('mem_out_norm')
+                        # v16: mem_out_norm, v17: know_out_norm
+                        mem_norm = layer_info.get('mem_out_norm') or layer_info.get('know_out_norm')
                         if attn_norm is not None and mem_norm is not None:
                             ratio = (attn_norm / (attn_norm + mem_norm + 1e-8) * 100).item()
                             attn_ratios.append(f"{ratio:.0f}")
@@ -1132,14 +1133,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             if k_idx is not None:
                                 all_k_idx.append(k_idx.flatten())
 
-                        # v17: Feature-Restore separation - no indices, just weights
-                        if is_v17_style:
-                            n_feature_know = base_model.n_feature_know if hasattr(base_model, 'n_feature_know') else 24
-                            n_restore_know = base_model.n_restore_know if hasattr(base_model, 'n_restore_know') else 24
-                            top_k_fk = base_model.top_k_feature_know if hasattr(base_model, 'top_k_feature_know') else 4
-                            top_k_rk = base_model.top_k_restore_know if hasattr(base_model, 'top_k_restore_know') else 4
-                            print(f"         Knowledge: Feature {n_feature_know} (k={top_k_fk}) / Restore {n_restore_know} (k={top_k_rk})")
-                        elif all_k_idx:
+                        # v17: Feature-Restore separation - usage stats in _get_router_log_lines()
+                        if all_k_idx and not is_v17_style:
                             all_idx = torch.cat(all_k_idx)
                             n_knowledge = base_model.n_knowledge if hasattr(base_model, 'n_knowledge') else 80
 
