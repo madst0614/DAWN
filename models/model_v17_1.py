@@ -894,6 +894,61 @@ class DAWN(nn.Module):
             'state_dim': self.state_dim, 'd_space': self.d_space,
         }
 
+    def knowledge_diversity_loss(self):
+        feat_know = self.shared_neurons.feature_know
+        rest_know = self.shared_neurons.restore_know
+
+        feat_flat = feat_know.view(feat_know.size(0), -1)
+        feat_norm = F.normalize(feat_flat, dim=-1)
+        feat_sim = torch.matmul(feat_norm, feat_norm.T)
+        mask_f = ~torch.eye(feat_sim.size(0), dtype=torch.bool, device=feat_sim.device)
+        feat_loss = feat_sim[mask_f].abs().mean()
+
+        rest_flat = rest_know.view(rest_know.size(0), -1)
+        rest_norm = F.normalize(rest_flat, dim=-1)
+        rest_sim = torch.matmul(rest_norm, rest_norm.T)
+        mask_r = ~torch.eye(rest_sim.size(0), dtype=torch.bool, device=rest_sim.device)
+        rest_loss = rest_sim[mask_r].abs().mean()
+
+        return (feat_loss + rest_loss) / 2
+
+    def orthogonality_loss(self):
+        I = torch.eye(self.rank, device=self.shared_neurons.f_neurons.device).unsqueeze(0)
+
+        W_fqk = self.shared_neurons.feature_qk_neurons
+        WtW_fqk = torch.bmm(W_fqk.transpose(1, 2), W_fqk)
+        loss_fqk = ((WtW_fqk - I) ** 2).mean()
+
+        W_fv = self.shared_neurons.feature_v_neurons
+        WtW_fv = torch.bmm(W_fv.transpose(1, 2), W_fv)
+        loss_fv = ((WtW_fv - I) ** 2).mean()
+
+        W_rqk = self.shared_neurons.restore_qk_neurons
+        WWt_rqk = torch.bmm(W_rqk, W_rqk.transpose(1, 2))
+        loss_rqk = ((WWt_rqk - I) ** 2).mean()
+
+        W_rv = self.shared_neurons.restore_v_neurons
+        WWt_rv = torch.bmm(W_rv, W_rv.transpose(1, 2))
+        loss_rv = ((WWt_rv - I) ** 2).mean()
+
+        I_know = torch.eye(self.knowledge_rank, device=self.shared_neurons.feature_know.device).unsqueeze(0)
+
+        W_fknow = self.shared_neurons.feature_know
+        WtW_fknow = torch.bmm(W_fknow.transpose(1, 2), W_fknow)
+        loss_fknow = ((WtW_fknow - I_know) ** 2).mean()
+
+        W_rknow = self.shared_neurons.restore_know
+        WWt_rknow = torch.bmm(W_rknow, W_rknow.transpose(1, 2))
+        loss_rknow = ((WWt_rknow - I_know) ** 2).mean()
+
+        return (loss_fqk + loss_fv + loss_rqk + loss_rv + loss_fknow + loss_rknow) / 6
+
+    def get_auxiliary_losses(self):
+        return {
+            'orth_total': self.orthogonality_loss(),
+            'knowledge_div': self.knowledge_diversity_loss(),
+        }
+
     def __repr__(self):
         params = sum(p.numel() for p in self.parameters()) / 1e6
         attn_neurons = self.n_feature_qk + self.n_feature_v + self.n_restore_qk + self.n_restore_v
@@ -909,21 +964,3 @@ class DAWN(nn.Module):
             f"Restore={self.n_restore_know} (k={self.top_k_restore_know})\n"
             f"  Total neurons: {attn_neurons} (attn) + {know_neurons} (know) = {attn_neurons + know_neurons}"
         )
-
-
-def knowledge_diversity_loss(shared_neurons):
-    """Knowledge neurons 다양성 loss (F 변수명 충돌 방지)"""
-    feat_know = shared_neurons.feature_know
-    rest_know = shared_neurons.restore_know
-
-    feat_flat = feat_know.view(feat_know.size(0), -1)
-    feat_norm = F.normalize(feat_flat, dim=-1)
-    feat_sim = torch.matmul(feat_norm, feat_norm.T)
-    feat_loss = (feat_sim - torch.eye(feat_sim.size(0), device=feat_sim.device)).pow(2).mean()
-
-    rest_flat = rest_know.view(rest_know.size(0), -1)
-    rest_norm = F.normalize(rest_flat, dim=-1)
-    rest_sim = torch.matmul(rest_norm, rest_norm.T)
-    rest_loss = (rest_sim - torch.eye(rest_sim.size(0), device=rest_sim.device)).pow(2).mean()
-
-    return feat_loss + rest_loss
