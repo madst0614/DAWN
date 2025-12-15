@@ -278,62 +278,99 @@ class SharedNeurons(nn.Module):
 
 
 class GlobalSSM(nn.Module):
-    """Global SSM for importance scoring (same as v16.3)"""
+    """Global SSM for importance scoring - v16.3/v17.1과 동일"""
     def __init__(self, d_model, state_dim=64, return_context=True):
         super().__init__()
         self.d_model = d_model
         self.state_dim = state_dim
         self.return_context = return_context
 
-        self.delta_proj = nn.Linear(d_model, 1)
-        self.A = nn.Parameter(torch.randn(state_dim) * 0.1)
-        self.B_proj = nn.Linear(d_model, state_dim)
-        self.C_proj = nn.Linear(d_model, state_dim)
+        # v16.3/v17.1과 동일
+        self.A_log = nn.Parameter(torch.randn(d_model, state_dim) * 0.1)
+        self.W_delta = nn.Linear(d_model, d_model, bias=False)
+        self.W_B = nn.Linear(d_model, state_dim, bias=False)
+        self.W_C = nn.Linear(d_model, state_dim, bias=False)
 
-        self.importance_proj = nn.Linear(state_dim, 1)
-        if return_context:
-            self.context_proj = nn.Linear(state_dim, d_model)
+        self.ssm_norm = nn.LayerNorm(d_model)
+        self.context_proj = nn.Linear(d_model, d_model, bias=False)
+        self.context_scale = nn.Parameter(torch.tensor(0.1))
+        self.importance_proj = nn.Linear(d_model, d_model, bias=False)
+        self.importance_temperature = 0.5
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.W_delta.weight, std=0.02)
+        nn.init.normal_(self.W_B.weight, std=0.02)
+        nn.init.normal_(self.W_C.weight, std=0.02)
+        nn.init.normal_(self.context_proj.weight, std=0.02)
+        nn.init.normal_(self.importance_proj.weight, std=0.02)
 
     def forward(self, x, attention_mask=None):
         B, S, D = x.shape
-        device = x.device
 
-        delta = F.softplus(self.delta_proj(x).squeeze(-1))
-        B_t = self.B_proj(x)
-        C_t = self.C_proj(x)
+        delta = F.softplus(self.W_delta(x))
+        B_sel = self.W_B(x)
+        C_sel = self.W_C(x)
+        A = -torch.exp(self.A_log)
 
-        A_bar = torch.exp(-delta.unsqueeze(-1) * F.softplus(self.A))
+        if MAMBA_AVAILABLE:
+            dtype = x.dtype
+            x_mamba = x.transpose(1, 2).contiguous()
+            delta_mamba = delta.transpose(1, 2).contiguous()
+            B_mamba = B_sel.transpose(1, 2).contiguous().to(dtype)
+            C_mamba = C_sel.transpose(1, 2).contiguous().to(dtype)
+            A = A.to(dtype)
 
-        if MAMBA_AVAILABLE and x.is_cuda:
             y = selective_scan_fn(
-                x.transpose(1, 2).contiguous(),
-                delta.unsqueeze(1).expand(-1, D, -1).contiguous(),
-                A_bar.transpose(1, 2).contiguous(),
-                B_t.transpose(1, 2).contiguous(),
-                C_t.transpose(1, 2).contiguous(),
-                D=None,
-                z=None,
-                delta_bias=None,
-                delta_softplus=False,
-                return_last_state=False,
-            ).transpose(1, 2)
-            h = y
+                x_mamba, delta_mamba, A, B_mamba, C_mamba,
+                D=None, z=None, delta_bias=None,
+                delta_softplus=False, return_last_state=False
+            )
+            ssm_out = y.transpose(1, 2).contiguous()
         else:
-            h = torch.zeros(B, S, self.state_dim, device=device, dtype=x.dtype)
-            state = torch.zeros(B, self.state_dim, device=device, dtype=x.dtype)
-            for t in range(S):
-                state = A_bar[:, t] * state + B_t[:, t] * delta[:, t:t+1]
-                h[:, t] = state
+            ssm_out = self._slow_forward(x, delta, A, B_sel, C_sel)
 
-        raw_importance = self.importance_proj(h).squeeze(-1)
+        ssm_out = self.ssm_norm(ssm_out)
+
+        h_final = ssm_out[:, -1, :]
+        h_proj = self.importance_proj(h_final)
+        raw_importance = torch.einsum('bsd,bd->bs', x, h_proj)
+
         if attention_mask is not None:
-            raw_importance = raw_importance.masked_fill(attention_mask == 0, float('-inf'))
-        importance = F.softmax(raw_importance, dim=-1)
+            masked_importance = raw_importance.masked_fill(attention_mask == 0, float('-inf'))
+            importance = F.softmax(masked_importance / self.importance_temperature, dim=-1)
+        else:
+            importance = F.softmax(raw_importance / self.importance_temperature, dim=-1)
 
         if self.return_context:
-            context = self.context_proj(h)
-            return importance, context, raw_importance
-        return importance, None, raw_importance
+            context = self.context_proj(ssm_out) * self.context_scale
+        else:
+            context = None
+
+        return importance, context, raw_importance
+
+    def _slow_forward(self, x, delta, A, B_sel, C_sel):
+        B, S, D = x.shape
+        N = self.state_dim
+
+        h = torch.zeros(B, D, N, device=x.device, dtype=x.dtype)
+        outputs = []
+
+        for t in range(S):
+            delta_t = delta[:, t, :, None]
+            A_exp = A[None, :, :]
+            decay = torch.exp(delta_t * A_exp)
+
+            B_t = B_sel[:, t, None, :]
+            x_t = x[:, t, :, None]
+
+            h = h * decay + (delta_t * x_t) * B_t
+            C_t = C_sel[:, t, :]
+            y_t = torch.einsum('bdn,bn->bd', h, C_t)
+            outputs.append(y_t)
+
+        return torch.stack(outputs, dim=1)
 
 
 class GlobalRouters(nn.Module):
