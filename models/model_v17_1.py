@@ -890,8 +890,7 @@ class DAWN(nn.Module):
         x = self.norm(x)
         logits = self.lm_head(x)
 
-        if self.training:
-            self.router.neuron_router.decay_excitability()
+        # Note: decay_excitability() is called in train.py, not here
 
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
