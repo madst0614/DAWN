@@ -326,11 +326,19 @@ def load_single_file(filepath, max_length=128):
         else:
             raise ValueError(f"Unknown .pt format. Expected dict with 'tokens' or tensor, got {type(data)}")
 
+        # Ensure int64 dtype for embedding indexing
+        if tokens.dtype != torch.int64:
+            print(f"  Converting tokens from {tokens.dtype} to int64")
+            tokens = tokens.long()
+
         # Reshape flat 1D tokens to [N, seq_len]
         if tokens.dim() == 1:
             total_tokens = tokens.shape[0]
             num_sequences = total_tokens // max_length
-            tokens = tokens[:num_sequences * max_length]  # Trim to fit
+            discarded = total_tokens - (num_sequences * max_length)
+            if discarded > 0:
+                print(f"  Warning: Discarding {discarded:,} tokens ({discarded/total_tokens*100:.2f}%) that don't fit into sequences")
+            tokens = tokens[:num_sequences * max_length]
             tokens = tokens.view(num_sequences, max_length)
             print(f"  Reshaped flat tokens to {tokens.shape[0]:,} sequences of length {max_length}")
 

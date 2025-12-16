@@ -1069,10 +1069,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         total_correct += correct
         total_valid_tokens += valid_tokens
 
-        # Track total loss
+        # Track total loss (ce_loss only, for fair comparison with validation)
         batch_size, seq_len = input_ids.shape
         num_tokens = batch_size * seq_len
-        total_loss += loss.item() * num_tokens
+        total_loss += ce_loss.item() * num_tokens
         total_tokens += num_tokens
 
         num_batches += 1

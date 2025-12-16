@@ -1,0 +1,326 @@
+"""
+Embedding Analysis
+==================
+Analyze neuron embeddings in DAWN v17.1 models.
+
+Includes:
+- Intra-type similarity analysis
+- Cross-type similarity analysis
+- Clustering analysis
+- t-SNE/PCA visualization
+"""
+
+import os
+import numpy as np
+import torch
+from typing import Dict, Optional
+
+from .utils import (
+    NEURON_TYPES,
+    HAS_MATPLOTLIB, HAS_SKLEARN, plt, sns
+)
+
+if HAS_SKLEARN:
+    from sklearn.manifold import TSNE
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import KMeans
+
+
+class EmbeddingAnalyzer:
+    """Neuron embedding analyzer."""
+
+    def __init__(self, router):
+        """
+        Initialize analyzer.
+
+        Args:
+            router: NeuronRouter instance
+        """
+        self.router = router
+
+    def get_embeddings_by_type(self) -> Dict[str, np.ndarray]:
+        """
+        Extract embeddings grouped by neuron type.
+
+        Returns:
+            Dictionary mapping type name to embedding array
+        """
+        emb = self.router.neuron_emb.detach().cpu().numpy()
+
+        result = {}
+        offset = 0
+        for name, (display, _, n_attr, _) in NEURON_TYPES.items():
+            if hasattr(self.router, n_attr):
+                n = getattr(self.router, n_attr)
+                result[name] = emb[offset:offset + n]
+                offset += n
+
+        return result
+
+    def analyze_similarity(self, output_dir: Optional[str] = None) -> Dict:
+        """
+        Analyze intra-type similarity using cosine similarity.
+
+        Args:
+            output_dir: Directory for visualization output
+
+        Returns:
+            Dictionary with similarity statistics
+        """
+        embeddings = self.get_embeddings_by_type()
+        results = {}
+
+        for name, emb in embeddings.items():
+            if len(emb) < 2:
+                continue
+
+            # Normalize and compute similarity matrix
+            emb_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+            sim_matrix = emb_norm @ emb_norm.T
+
+            # Extract off-diagonal elements
+            n = sim_matrix.shape[0]
+            off_diag = sim_matrix[~np.eye(n, dtype=bool)]
+
+            display = NEURON_TYPES[name][0]
+            results[name] = {
+                'display': display,
+                'n_neurons': n,
+                'avg_similarity': float(off_diag.mean()),
+                'max_similarity': float(off_diag.max()),
+                'min_similarity': float(off_diag.min()),
+                'std_similarity': float(off_diag.std()),
+            }
+
+        # Visualization
+        if HAS_MATPLOTLIB and output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            self._visualize_similarity(embeddings, output_dir)
+            results['visualization'] = os.path.join(output_dir, 'similarity_heatmap.png')
+
+        return results
+
+    def _visualize_similarity(self, embeddings: Dict, output_dir: str):
+        """Generate similarity heatmap visualization."""
+        n_types = len(embeddings)
+        fig, axes = plt.subplots(1, n_types, figsize=(5 * n_types, 4))
+        if n_types == 1:
+            axes = [axes]
+
+        for ax, (name, emb) in zip(axes, embeddings.items()):
+            emb_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+            sim_matrix = emb_norm @ emb_norm.T
+            sns.heatmap(sim_matrix, ax=ax, cmap='coolwarm', vmin=-1, vmax=1)
+            ax.set_title(f'{NEURON_TYPES[name][0]} Similarity')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'similarity_heatmap.png'), dpi=150)
+        plt.close()
+
+    def analyze_cross_type_similarity(self) -> Dict:
+        """
+        Analyze similarity between neuron types using centroids.
+
+        Returns:
+            Dictionary with pairwise centroid similarities
+        """
+        embeddings = self.get_embeddings_by_type()
+
+        # Compute centroids
+        centroids = {}
+        for name, emb in embeddings.items():
+            centroids[name] = emb.mean(axis=0)
+
+        # Compute pairwise similarities
+        results = {}
+        names = list(centroids.keys())
+        for i, n1 in enumerate(names):
+            for n2 in names[i+1:]:
+                c1, c2 = centroids[n1], centroids[n2]
+                sim = np.dot(c1, c2) / (np.linalg.norm(c1) * np.linalg.norm(c2) + 1e-8)
+                key = f"{NEURON_TYPES[n1][0]}-{NEURON_TYPES[n2][0]}"
+                results[key] = float(sim)
+
+        return results
+
+    def analyze_clustering(self, n_clusters: int = 5, output_dir: Optional[str] = None) -> Dict:
+        """
+        Perform clustering analysis on neuron embeddings.
+
+        Args:
+            n_clusters: Number of clusters
+            output_dir: Directory for visualization output
+
+        Returns:
+            Dictionary with clustering results
+        """
+        if not HAS_SKLEARN:
+            return {'error': 'sklearn not available'}
+
+        results = {}
+        emb = self.router.neuron_emb.detach().cpu().numpy()
+
+        # Build boundaries for each type
+        boundaries = {}
+        offset = 0
+        for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
+            if hasattr(self.router, n_attr):
+                n = getattr(self.router, n_attr)
+                boundaries[name] = (offset, offset + n, ema_attr)
+                offset += n
+
+        # Cluster each type
+        for name, (start, end, ema_attr) in boundaries.items():
+            type_emb = emb[start:end]
+            n_neurons = type_emb.shape[0]
+
+            if n_neurons < n_clusters:
+                results[name] = {'error': f'Not enough neurons for {n_clusters} clusters'}
+                continue
+
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(type_emb)
+
+            cluster_stats = []
+            ema = getattr(self.router, ema_attr).cpu().numpy() if hasattr(self.router, ema_attr) else None
+
+            for c in range(n_clusters):
+                cluster_mask = labels == c
+                cluster_size = cluster_mask.sum()
+
+                if ema is not None:
+                    cluster_ema = ema[cluster_mask]
+                    cluster_stats.append({
+                        'cluster_id': c,
+                        'size': int(cluster_size),
+                        'avg_usage': float(cluster_ema.mean()),
+                        'max_usage': float(cluster_ema.max()),
+                        'min_usage': float(cluster_ema.min()),
+                        'active_count': int((cluster_ema > 0.01).sum()),
+                    })
+                else:
+                    cluster_stats.append({
+                        'cluster_id': c,
+                        'size': int(cluster_size),
+                    })
+
+            results[name] = {
+                'display': NEURON_TYPES[name][0],
+                'n_clusters': n_clusters,
+                'clusters': sorted(cluster_stats, key=lambda x: -x.get('avg_usage', 0)),
+                'labels': labels.tolist(),
+            }
+
+        # Visualization
+        if HAS_MATPLOTLIB and output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            self._visualize_clustering(emb, boundaries, results, output_dir)
+            results['visualization'] = os.path.join(output_dir, 'clustering.png')
+
+        return results
+
+    def _visualize_clustering(self, emb: np.ndarray, boundaries: Dict, results: Dict, output_dir: str):
+        """Generate clustering visualization."""
+        n_types = len([k for k in results if 'error' not in results.get(k, {})])
+        if n_types == 0:
+            return
+
+        fig, axes = plt.subplots(1, n_types, figsize=(6 * n_types, 5))
+        if n_types == 1:
+            axes = [axes]
+
+        ax_idx = 0
+        for name, (start, end, _) in boundaries.items():
+            if name not in results or 'error' in results[name]:
+                continue
+
+            type_emb = emb[start:end]
+            pca = PCA(n_components=2)
+            emb_2d = pca.fit_transform(type_emb)
+
+            labels = results[name]['labels']
+            axes[ax_idx].scatter(emb_2d[:, 0], emb_2d[:, 1], c=labels, cmap='tab10', alpha=0.6)
+            axes[ax_idx].set_title(f'{NEURON_TYPES[name][0]} Clusters')
+            ax_idx += 1
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'clustering.png'), dpi=150)
+        plt.close()
+
+    def visualize(self, output_dir: str) -> Optional[str]:
+        """
+        Generate t-SNE/PCA visualization of all embeddings.
+
+        Args:
+            output_dir: Directory for output
+
+        Returns:
+            Path to visualization or None
+        """
+        if not HAS_MATPLOTLIB or not HAS_SKLEARN:
+            return None
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        emb = self.router.neuron_emb.detach().cpu().numpy()
+
+        # Build labels and color map
+        labels = []
+        colors_map = {}
+        for name, (display, _, n_attr, color) in NEURON_TYPES.items():
+            if hasattr(self.router, n_attr):
+                n = getattr(self.router, n_attr)
+                labels.extend([display] * n)
+                colors_map[display] = color
+
+        # t-SNE
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(emb)-1))
+        emb_tsne = tsne.fit_transform(emb)
+
+        # PCA
+        pca = PCA(n_components=2)
+        emb_pca = pca.fit_transform(emb)
+
+        # Plot
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        for ax, data, title in [(axes[0], emb_tsne, 't-SNE'), (axes[1], emb_pca, 'PCA')]:
+            for t in set(labels):
+                mask = np.array([l == t for l in labels])
+                ax.scatter(data[mask, 0], data[mask, 1],
+                          c=colors_map.get(t, 'gray'), label=t, alpha=0.6, s=20)
+            ax.set_title(f'DAWN Neuron Embeddings ({title})')
+            ax.legend()
+
+        plt.tight_layout()
+        path = os.path.join(output_dir, 'dawn_embeddings.png')
+        plt.savefig(path, dpi=150)
+        plt.close()
+
+        return path
+
+    def run_all(self, output_dir: str = './embedding_analysis', n_clusters: int = 5) -> Dict:
+        """
+        Run all embedding analyses.
+
+        Args:
+            output_dir: Directory for outputs
+            n_clusters: Number of clusters for clustering analysis
+
+        Returns:
+            Combined results dictionary
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        results = {
+            'similarity': self.analyze_similarity(output_dir),
+            'cross_type_similarity': self.analyze_cross_type_similarity(),
+            'clustering': self.analyze_clustering(n_clusters, output_dir),
+        }
+
+        # Main visualization
+        viz_path = self.visualize(output_dir)
+        if viz_path:
+            results['visualization'] = viz_path
+
+        return results

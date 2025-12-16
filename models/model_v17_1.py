@@ -788,6 +788,22 @@ class DAWN(nn.Module):
     ):
         super().__init__()
 
+        # Validation checks
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        if top_k_feature_qk > n_feature_qk:
+            raise ValueError(f"top_k_feature_qk ({top_k_feature_qk}) cannot exceed n_feature_qk ({n_feature_qk})")
+        if top_k_feature_v > n_feature_v:
+            raise ValueError(f"top_k_feature_v ({top_k_feature_v}) cannot exceed n_feature_v ({n_feature_v})")
+        if top_k_restore_qk > n_restore_qk:
+            raise ValueError(f"top_k_restore_qk ({top_k_restore_qk}) cannot exceed n_restore_qk ({n_restore_qk})")
+        if top_k_restore_v > n_restore_v:
+            raise ValueError(f"top_k_restore_v ({top_k_restore_v}) cannot exceed n_restore_v ({n_restore_v})")
+        if top_k_feature_know > n_feature_know:
+            raise ValueError(f"top_k_feature_know ({top_k_feature_know}) cannot exceed n_feature_know ({n_feature_know})")
+        if top_k_restore_know > n_restore_know:
+            raise ValueError(f"top_k_restore_know ({top_k_restore_know}) cannot exceed n_restore_know ({n_restore_know})")
+
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_layers = n_layers
@@ -887,6 +903,10 @@ class DAWN(nn.Module):
     def forward(self, input_ids, labels=None, attention_mask=None, return_routing_info=False):
         B, S = input_ids.shape
         device = input_ids.device
+
+        # Validate sequence length
+        if S > self.max_seq_len:
+            raise ValueError(f"Sequence length {S} exceeds max_seq_len {self.max_seq_len}")
 
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
         x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
