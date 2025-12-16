@@ -50,6 +50,28 @@ def resolve_checkpoint_path(path):
     raise FileNotFoundError(f"No checkpoint found: {path}")
 
 
+def get_router(model):
+    """Get neuron router (version-agnostic)"""
+    if hasattr(model, 'router') and hasattr(model.router, 'neuron_router'):
+        return model.router.neuron_router
+    if hasattr(model, 'global_routers'):
+        return model.global_routers.neuron_router
+    return None
+
+
+def detect_version(router):
+    """Detect model version from router attributes"""
+    if router is None:
+        return 'unknown'
+    if hasattr(router, 'usage_ema_feature_qk'):
+        if hasattr(router, 'usage_ema_feature_know'):
+            return '17.1'
+        return '16.4'
+    elif hasattr(router, 'usage_ema_feature_r'):
+        return '16.0'
+    return 'unknown'
+
+
 def diagnose_usage_ema(model):
     """1. Usage EMA 분포 확인"""
     print(f"\n{'='*60}")
@@ -58,18 +80,36 @@ def diagnose_usage_ema(model):
 
     results = {}
 
-    if not hasattr(model, 'global_routers'):
-        print("  Model doesn't have global_routers")
+    router = get_router(model)
+    if router is None:
+        print("  No router found")
         return results
 
-    router = model.global_routers.neuron_router
+    version = detect_version(router)
+    print(f"  Detected version: {version}")
+    results['version'] = version
 
-    ema_list = [
-        ('FR', getattr(router, 'usage_ema_feature_r', None)),
-        ('FV', getattr(router, 'usage_ema_feature_v', None)),
-        ('R', getattr(router, 'usage_ema_relational', None)),
-        ('V', getattr(router, 'usage_ema_value', None)),
-    ]
+    # Version-specific EMA attributes
+    if version in ['16.4', '17.1']:
+        ema_list = [
+            ('FQK', getattr(router, 'usage_ema_feature_qk', None)),
+            ('FV', getattr(router, 'usage_ema_feature_v', None)),
+            ('RQK', getattr(router, 'usage_ema_restore_qk', None)),
+            ('RV', getattr(router, 'usage_ema_restore_v', None)),
+        ]
+        if version == '17.1':
+            ema_list.extend([
+                ('FK', getattr(router, 'usage_ema_feature_know', None)),
+                ('RK', getattr(router, 'usage_ema_restore_know', None)),
+            ])
+    else:
+        # v16.0/16.1
+        ema_list = [
+            ('FR', getattr(router, 'usage_ema_feature_r', None)),
+            ('FV', getattr(router, 'usage_ema_feature_v', None)),
+            ('R', getattr(router, 'usage_ema_relational', None)),
+            ('V', getattr(router, 'usage_ema_value', None)),
+        ]
 
     for name, ema in ema_list:
         if ema is None:
@@ -110,22 +150,47 @@ def diagnose_neuron_selection(model, dataloader, device, config, max_batches=20)
     print("2. Neuron Selection Frequency (from routing)")
     print(f"{'='*60}")
 
-    # Build topk_map from config
-    topk_map = {
-        'FR': config.get('top_k_feature_r', 8),
-        'FV': config.get('top_k_feature_v', 6),
-        'R': config.get('top_k_relational', 20),
-        'V': config.get('top_k_value', 4),
-    }
+    # Detect version
+    router = get_router(model)
+    version = detect_version(router)
+    print(f"  Detected version: {version}")
+
+    # Build topk_map and pref_key_map based on version
+    if version in ['16.4', '17.1']:
+        topk_map = {
+            'FQK_Q': config.get('top_k_feature_qk', 8),
+            'FQK_K': config.get('top_k_feature_qk', 8),
+            'FV': config.get('top_k_feature_v', 6),
+            'RQK_Q': config.get('top_k_restore_qk', 8),
+            'RQK_K': config.get('top_k_restore_qk', 8),
+            'RV': config.get('top_k_restore_v', 4),
+        }
+        pref_key_map = {
+            'FQK_Q': 'fqk_q_pref',
+            'FQK_K': 'fqk_k_pref',
+            'FV': 'fv_pref',
+            'RQK_Q': 'rqk_q_pref',
+            'RQK_K': 'rqk_k_pref',
+            'RV': 'rv_pref',
+        }
+    else:
+        # v16.0/16.1
+        topk_map = {
+            'FR': config.get('top_k_feature_r', 8),
+            'FV': config.get('top_k_feature_v', 6),
+            'R': config.get('top_k_relational', 20),
+            'V': config.get('top_k_value', 4),
+        }
+        pref_key_map = {
+            'FR': 'feature_r_pref',
+            'FV': 'feature_v_pref',
+            'R': 'relational_q_pref',
+            'V': 'value_pref',
+        }
+
     print(f"  Using top-k from config: {topk_map}")
 
-    neuron_counts = {
-        'FR': Counter(),
-        'FV': Counter(),
-        'R': Counter(),
-        'V': Counter(),
-    }
-
+    neuron_counts = {nt: Counter() for nt in topk_map.keys()}
     total_tokens = 0
 
     model.eval()
@@ -157,15 +222,9 @@ def diagnose_neuron_selection(model, dataloader, device, config, max_batches=20)
 
                 attn = layer_info['attention']
 
-                # Get preferences and find top-k selections
-                pref_map = {
-                    'FR': attn.get('feature_r_pref'),
-                    'FV': attn.get('feature_v_pref'),
-                    'R': attn.get('relational_q_pref'),
-                    'V': attn.get('value_pref'),
-                }
-
-                for nt, pref in pref_map.items():
+                # Get preferences and find top-k selections (version-aware)
+                for nt, pref_key in pref_key_map.items():
+                    pref = attn.get(pref_key)
                     if pref is None:
                         continue
                     k = min(topk_map.get(nt, 4), pref.shape[-1])
@@ -179,7 +238,7 @@ def diagnose_neuron_selection(model, dataloader, device, config, max_batches=20)
 
     print(f"\n  Analyzed {max_batches} batches, {total_tokens} tokens")
 
-    results = {'total_tokens': total_tokens}
+    results = {'total_tokens': total_tokens, 'version': version}
 
     for nt, counts in neuron_counts.items():
         if not counts:
@@ -325,6 +384,29 @@ def diagnose_neuron_roles(model, dataloader, tokenizer, device, target_neurons=N
     print("4. Neuron Role Analysis (Token Preference)")
     print(f"{'='*60}")
 
+    # Detect version
+    router = get_router(model)
+    version = detect_version(router)
+    print(f"  Detected version: {version}")
+
+    # Version-specific pref key map
+    if version in ['16.4', '17.1']:
+        pref_key_map = {
+            'FQK_Q': 'fqk_q_pref',
+            'FQK_K': 'fqk_k_pref',
+            'FV': 'fv_pref',
+            'RQK_Q': 'rqk_q_pref',
+            'RQK_K': 'rqk_k_pref',
+            'RV': 'rv_pref',
+        }
+    else:
+        pref_key_map = {
+            'FR': 'feature_r_pref',
+            'FV': 'feature_v_pref',
+            'R': 'relational_q_pref',
+            'V': 'value_pref',
+        }
+
     # Collect token preferences for each neuron
     # Structure: {neuron_type: {neuron_idx: [(token, score, context, pos)]}}
     neuron_token_data = defaultdict(lambda: defaultdict(list))
@@ -357,12 +439,8 @@ def diagnose_neuron_roles(model, dataloader, tokenizer, device, target_neurons=N
 
             attn = routing_infos[0]['attention']
 
-            pref_map = {
-                'FR': attn.get('feature_r_pref'),
-                'FV': attn.get('feature_v_pref'),
-                'R': attn.get('relational_q_pref'),
-                'V': attn.get('value_pref'),
-            }
+            # Build pref_map dynamically
+            pref_map = {nt: attn.get(pref_key) for nt, pref_key in pref_key_map.items()}
 
             # First pass: count selections to find top neurons
             for nt, pref in pref_map.items():
@@ -416,12 +494,8 @@ def diagnose_neuron_roles(model, dataloader, tokenizer, device, target_neurons=N
 
             attn = routing_infos[0]['attention']
 
-            pref_map = {
-                'FR': attn.get('feature_r_pref'),
-                'FV': attn.get('feature_v_pref'),
-                'R': attn.get('relational_q_pref'),
-                'V': attn.get('value_pref'),
-            }
+            # Build pref_map dynamically (same as first loop)
+            pref_map = {nt: attn.get(pref_key) for nt, pref_key in pref_key_map.items()}
 
             for nt, neuron_indices in target_neurons.items():
                 pref = pref_map.get(nt)
@@ -550,7 +624,7 @@ def diagnose_neuron_roles(model, dataloader, tokenizer, device, target_neurons=N
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DAWN v16 Routing Diagnostics")
+    parser = argparse.ArgumentParser(description="DAWN Routing Diagnostics (v16.x/v17.x)")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--val_data", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -569,23 +643,37 @@ def main():
     ckpt_path = resolve_checkpoint_path(args.checkpoint)
     print(f"Loading checkpoint: {ckpt_path}")
 
-    # Load model
-    try:
-        from models.model_v16 import DAWN
-    except ImportError:
-        from model_v16 import DAWN
-
+    # Load model (version-agnostic)
+    from models import create_model_by_version
     from transformers import BertTokenizer
 
     checkpoint = torch.load(ckpt_path, map_location=args.device)
-    config = checkpoint.get('config', {})
+    config = checkpoint.get('model_config', checkpoint.get('config', {}))
 
+    # Detect version
+    version = config.get('model_version', None)
+    if version is None:
+        path_str = str(ckpt_path).lower()
+        if 'v17.1' in path_str or 'v17_1' in path_str:
+            version = '17.1'
+        elif 'v17' in path_str:
+            version = '17.0'
+        elif 'v16.4' in path_str or 'v16_4' in path_str:
+            version = '16.4'
+        elif 'v16' in path_str:
+            version = '16.0'
+        else:
+            version = '16.0'
+
+    print(f"Model version: {version}")
     print(f"Model config: d_model={config.get('d_model')}, n_layers={config.get('n_layers')}")
 
-    model = DAWN(**config)
+    model = create_model_by_version(version, config)
 
-    # Load with strict=False to handle missing excitability_weight in old checkpoints
-    load_result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    # Load with strict=False to handle missing keys in old checkpoints
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    cleaned = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    load_result = model.load_state_dict(cleaned, strict=False)
     if load_result.missing_keys:
         print(f"  Note: Missing keys (using defaults): {load_result.missing_keys}")
 
