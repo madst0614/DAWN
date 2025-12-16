@@ -16,10 +16,7 @@ from .model_v17_1 import DAWN as DAWN_v17_1
 DAWN = DAWN_v17_1
 
 # Baseline for comparison
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from baseline_transformer import VanillaTransformer
+from .baseline_transformer import VanillaTransformer
 
 # Version registry
 from .version_registry import (
