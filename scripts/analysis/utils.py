@@ -380,14 +380,30 @@ def calc_entropy_ratio(probs: torch.Tensor) -> float:
     Calculate entropy as percentage of maximum.
 
     Args:
-        probs: Probability tensor
+        probs: Probability tensor (can be 1D, 2D, or 3D)
 
     Returns:
-        Entropy ratio (0-100)
+        Entropy ratio (0-100) as a scalar float
     """
     if probs.numel() == 0:
         return 0.0
-    ent = calc_entropy(probs.mean(dim=0) if probs.dim() > 1 else probs)
+
+    # Flatten to 2D: [batch, features] then average over batch
+    if probs.dim() == 1:
+        avg_probs = probs
+    elif probs.dim() == 2:
+        avg_probs = probs.mean(dim=0)
+    else:
+        # For 3D+ tensors, flatten all but last dim and average
+        avg_probs = probs.reshape(-1, probs.shape[-1]).mean(dim=0)
+
+    # Calculate entropy of the averaged distribution
+    ent = calc_entropy(avg_probs, dim=-1)
+
+    # Ensure ent is a scalar
+    if ent.dim() > 0:
+        ent = ent.mean()
+
     max_ent = np.log(probs.shape[-1])
     return float(ent / max_ent * 100) if max_ent > 0 else 0.0
 
