@@ -645,6 +645,7 @@ class KnowledgeCircuit(nn.Module):
         self.knowledge_rank = knowledge_rank
         self.top_k_feature_know = top_k_feature_know
         self.top_k_restore_know = top_k_restore_know
+        self.out_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, feature_know_w, restore_know_w, attention_mask=None):
@@ -676,6 +677,7 @@ class KnowledgeCircuit(nn.Module):
             shared_r = (restore_know_w @ r_flat).view(B, R, D)
             output = torch.bmm(h, shared_r)  # [B, S, D]
 
+        output = self.out_norm(output)
         return self.dropout(output)
 
 
