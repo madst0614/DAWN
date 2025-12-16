@@ -592,6 +592,7 @@ class SemanticAnalyzer:
         """
         Analyze routing patterns by part-of-speech across ALL layers.
         Uses spaCy pipe for batch processing.
+        Optimized with batch CPU transfers.
 
         Args:
             dataloader: DataLoader for input data
@@ -613,7 +614,7 @@ class SemanticAnalyzer:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
-                batch_size = input_ids.shape[0]
+                batch_size, seq_len = input_ids.shape
 
                 outputs = self.model(input_ids, return_routing_info=True)
                 routing_infos = get_routing_from_outputs(outputs)
@@ -621,32 +622,41 @@ class SemanticAnalyzer:
                 if routing_infos is None:
                     continue
 
+                # Move input_ids to CPU once for all processing
+                input_ids_cpu = input_ids.cpu()
+
                 # Decode all texts in batch
-                texts = [self.tokenizer.decode(input_ids[b], skip_special_tokens=True) for b in range(batch_size)]
+                texts = [self.tokenizer.decode(input_ids_cpu[b], skip_special_tokens=True) for b in range(batch_size)]
 
                 # Batch POS tagging with nlp.pipe()
                 docs = list(self.nlp.pipe(texts, batch_size=batch_size))
+
+                # Pre-convert all tokens for the batch
+                batch_tokens = [
+                    self.tokenizer.convert_ids_to_tokens(input_ids_cpu[b].tolist())
+                    for b in range(batch_size)
+                ]
 
                 # Process each layer
                 for layer_idx, layer_info in enumerate(routing_infos):
                     attn = layer_info.get('attention', {})
                     knowledge = layer_info.get('knowledge', {})
 
-                    # Combine routing
-                    all_routing = {}
+                    # Combine routing and move to CPU once per layer
+                    all_routing_cpu = {}
                     for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
                         w = attn.get(weight_key)
                         if w is not None:
-                            all_routing[f'L{layer_idx}/{key}'] = w
+                            all_routing_cpu[f'L{layer_idx}/{key}'] = w.cpu()
 
                     for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
                         w = knowledge.get(weight_key)
                         if w is not None:
-                            all_routing[f'L{layer_idx}/{key}'] = w
+                            all_routing_cpu[f'L{layer_idx}/{key}'] = w.cpu()
 
                     # Process each sequence
                     for b in range(batch_size):
-                        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b].cpu().tolist())
+                        tokens = batch_tokens[b]
                         doc = docs[b]
                         spacy_tokens = [(t.text.lower(), t.pos_) for t in doc]
 
@@ -659,12 +669,12 @@ class SemanticAnalyzer:
                             while spacy_idx < len(spacy_tokens):
                                 sp_token, sp_pos = spacy_tokens[spacy_idx]
                                 if token_clean in sp_token or sp_token in token_clean:
-                                    for routing_key, w in all_routing.items():
+                                    for routing_key, w in all_routing_cpu.items():
                                         if w is not None and w.dim() >= 2:
                                             if w.dim() == 3 and s < w.shape[1]:
-                                                pos_weights[f"{routing_key}/{sp_pos}"].append(w[b, s].cpu())
+                                                pos_weights[f"{routing_key}/{sp_pos}"].append(w[b, s])
                                             elif w.dim() == 2:
-                                                pos_weights[f"{routing_key}/{sp_pos}"].append(w[b].cpu())
+                                                pos_weights[f"{routing_key}/{sp_pos}"].append(w[b])
 
                                     pos_counts[sp_pos] += 1
                                     spacy_idx += 1
@@ -877,6 +887,8 @@ class SemanticAnalyzer:
         """
         Generate neuron-token activation heatmap data.
 
+        Optimized with GPU scatter_add for vectorized aggregation.
+
         Args:
             dataloader: DataLoader for input data
             max_batches: Maximum batches to process
@@ -885,7 +897,11 @@ class SemanticAnalyzer:
         Returns:
             Per-neuron top token activations
         """
-        neuron_tokens = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+        vocab_size = self.tokenizer.vocab_size
+
+        # {routing_key: tensor[vocab_size, N]}
+        token_neuron_sums = {}
+        neuron_sizes = {}  # Track N for each routing_key
 
         self.model.eval()
         with torch.no_grad():
@@ -894,6 +910,7 @@ class SemanticAnalyzer:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
+                B, S = input_ids.shape
 
                 outputs = self.model(input_ids, return_routing_info=True)
                 routing_infos = get_routing_from_outputs(outputs)
@@ -906,7 +923,6 @@ class SemanticAnalyzer:
                     knowledge = layer_info.get('knowledge', {})
 
                     routing_weights = {}
-                    seq_len = input_ids.shape[1]
 
                     for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
                         w = attn.get(weight_key)
@@ -914,8 +930,7 @@ class SemanticAnalyzer:
                             if w.dim() == 3:
                                 routing_weights[f'L{layer_idx}/{key}'] = w
                             elif w.dim() == 2:
-                                # Batch-level: expand [B,N] → [B,S,N]
-                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, seq_len, -1)
+                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, S, -1)
 
                     for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
                         w = knowledge.get(weight_key)
@@ -923,38 +938,80 @@ class SemanticAnalyzer:
                             if w.dim() == 3:
                                 routing_weights[f'L{layer_idx}/{key}'] = w
                             elif w.dim() == 2:
-                                # Batch-level: expand [B,N] → [B,S,N]
-                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, seq_len, -1)
+                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, S, -1)
 
+                    # Vectorized aggregation using scatter_add
                     for routing_key, weights in routing_weights.items():
                         B, S, N = weights.shape
 
-                        for b in range(B):
-                            tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b].cpu().tolist())
-                            for s, token in enumerate(tokens):
-                                if token.startswith('['):
-                                    continue
+                        # Initialize accumulator if needed
+                        if routing_key not in token_neuron_sums:
+                            token_neuron_sums[routing_key] = torch.zeros(
+                                vocab_size, N, device=self.device, dtype=torch.float32
+                            )
+                            neuron_sizes[routing_key] = N
 
-                                w = weights[b, s]
-                                active_neurons = (w > 0).nonzero().squeeze(-1)
+                        # Flatten: [B, S] -> [B*S]
+                        flat_token_ids = input_ids.view(-1)  # [B*S]
+                        flat_weights = weights.view(-1, N)    # [B*S, N]
 
-                                for neuron_id in active_neurons.tolist():
-                                    if isinstance(neuron_id, int):
-                                        neuron_tokens[routing_key][neuron_id][token] += w[neuron_id].item()
+                        # Mask special tokens ([CLS], [SEP], [PAD], etc.)
+                        # Token IDs 100-103 are typically special in BERT
+                        valid_mask = (flat_token_ids >= 104)  # Skip [UNK], [CLS], [SEP], [MASK], [PAD]
 
+                        if valid_mask.any():
+                            valid_ids = flat_token_ids[valid_mask]      # [valid_count]
+                            valid_weights = flat_weights[valid_mask]    # [valid_count, N]
+
+                            # scatter_add: accumulate weights by token_id
+                            # token_neuron_sums[routing_key][token_id, :] += valid_weights
+                            token_neuron_sums[routing_key].scatter_add_(
+                                0,
+                                valid_ids.unsqueeze(1).expand(-1, N),
+                                valid_weights
+                            )
+
+        # Convert to results format
         results = {}
-        for routing_key, neuron_data in neuron_tokens.items():
-            neuron_total = {n: sum(tokens.values()) for n, tokens in neuron_data.items()}
-            top_neurons = sorted(neuron_total.keys(), key=lambda x: -neuron_total[x])[:top_k_neurons]
+        for routing_key, sums in token_neuron_sums.items():
+            # Move to CPU for final processing
+            sums_cpu = sums.cpu()
+            N = neuron_sizes[routing_key]
 
-            results[routing_key] = {}
-            for neuron_id in top_neurons:
-                token_counts = neuron_data[neuron_id]
-                top_tokens = sorted(token_counts.items(), key=lambda x: -x[1])[:10]
-                results[routing_key][f'neuron_{neuron_id}'] = {
-                    'total_activation': neuron_total[neuron_id],
+            # Find top neurons by total activation
+            neuron_totals = sums_cpu.sum(dim=0)  # [N]
+            top_neuron_indices = neuron_totals.topk(min(top_k_neurons, N)).indices.tolist()
+
+            neuron_results = {}
+            for neuron_id in top_neuron_indices:
+                # Get top tokens for this neuron
+                neuron_activations = sums_cpu[:, neuron_id]  # [vocab_size]
+
+                # Find non-zero tokens
+                nonzero_mask = neuron_activations > 0
+                if nonzero_mask.sum() == 0:
+                    continue
+
+                nonzero_indices = nonzero_mask.nonzero().squeeze(-1)
+                nonzero_values = neuron_activations[nonzero_mask]
+
+                # Get top 10 tokens
+                top_k = min(10, len(nonzero_values))
+                top_values, top_local_idx = nonzero_values.topk(top_k)
+                top_token_ids = nonzero_indices[top_local_idx]
+
+                # Convert to token strings
+                top_tokens = {}
+                for tid, val in zip(top_token_ids.tolist(), top_values.tolist()):
+                    token = self.tokenizer.convert_ids_to_tokens([tid])[0]
+                    top_tokens[token] = val
+
+                neuron_results[neuron_id] = {
+                    'total_activation': float(neuron_totals[neuron_id]),
                     'top_tokens': top_tokens,
                 }
+
+            results[routing_key] = neuron_results
 
         return results
 

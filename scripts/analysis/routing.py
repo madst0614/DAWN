@@ -293,6 +293,7 @@ class RoutingAnalyzer:
     def analyze_qk_overlap(self, dataloader, n_batches: int = 50) -> Dict:
         """
         Analyze Q/K routing overlap (Jaccard similarity).
+        Optimized with vectorized tensor operations.
 
         Args:
             dataloader: DataLoader for input data
@@ -302,6 +303,42 @@ class RoutingAnalyzer:
             Dictionary with Q/K overlap statistics
         """
         overlap_data = {'fqk': [], 'rqk': []}
+
+        def compute_jaccard_batch(q_prefs, k_prefs, topk=8):
+            """Compute Jaccard similarity for batch using GPU tensors."""
+            N = q_prefs.shape[-1]
+            k = min(topk, N)
+
+            # Flatten if 3D: [B, S, N] -> [B*S, N]
+            if q_prefs.dim() == 3:
+                B, S, _ = q_prefs.shape
+                q_flat = q_prefs.view(-1, N)
+                k_flat = k_prefs.view(-1, N)
+            else:
+                q_flat = q_prefs
+                k_flat = k_prefs
+
+            # Get top-k indices
+            q_topk_idx = torch.topk(q_flat, k, dim=-1)[1]  # [B*S, k]
+            k_topk_idx = torch.topk(k_flat, k, dim=-1)[1]  # [B*S, k]
+
+            # Create one-hot masks
+            batch_size = q_flat.shape[0]
+            q_mask = torch.zeros(batch_size, N, device=q_prefs.device)
+            k_mask = torch.zeros(batch_size, N, device=k_prefs.device)
+
+            # Scatter to create binary masks
+            q_mask.scatter_(1, q_topk_idx, 1.0)
+            k_mask.scatter_(1, k_topk_idx, 1.0)
+
+            # Compute intersection and union
+            intersection = (q_mask * k_mask).sum(dim=-1)  # [B*S]
+            union = ((q_mask + k_mask) > 0).float().sum(dim=-1)  # [B*S]
+
+            # Jaccard = intersection / union
+            jaccard = intersection / (union + 1e-8)
+
+            return jaccard.cpu().tolist()
 
         self.model.eval()
         with torch.no_grad():
@@ -319,33 +356,17 @@ class RoutingAnalyzer:
                 for layer_info in routing_infos:
                     attn = layer_info.get('attention', {})
 
-                    # F-QK Q/K overlap
+                    # F-QK Q/K overlap - vectorized
                     fqk_q = attn.get('fqk_q_pref')
                     fqk_k = attn.get('fqk_k_pref')
                     if fqk_q is not None and fqk_k is not None:
-                        k = min(8, fqk_q.shape[-1])
-                        q_top = torch.topk(fqk_q, k, dim=-1)[1]
-                        k_top = torch.topk(fqk_k, k, dim=-1)[1]
+                        overlap_data['fqk'].extend(compute_jaccard_batch(fqk_q, fqk_k))
 
-                        for b in range(q_top.shape[0]):
-                            q_set = set(q_top[b].view(-1).cpu().tolist())
-                            k_set = set(k_top[b].view(-1).cpu().tolist())
-                            overlap = len(q_set & k_set) / len(q_set | k_set) if (q_set | k_set) else 0
-                            overlap_data['fqk'].append(overlap)
-
-                    # R-QK Q/K overlap
+                    # R-QK Q/K overlap - vectorized
                     rqk_q = attn.get('rqk_q_pref')
                     rqk_k = attn.get('rqk_k_pref')
                     if rqk_q is not None and rqk_k is not None:
-                        k = min(8, rqk_q.shape[-1])
-                        q_top = torch.topk(rqk_q, k, dim=-1)[1]
-                        k_top = torch.topk(rqk_k, k, dim=-1)[1]
-
-                        for b in range(q_top.shape[0]):
-                            q_set = set(q_top[b].view(-1).cpu().tolist())
-                            k_set = set(k_top[b].view(-1).cpu().tolist())
-                            overlap = len(q_set & k_set) / len(q_set | k_set) if (q_set | k_set) else 0
-                            overlap_data['rqk'].append(overlap)
+                        overlap_data['rqk'].extend(compute_jaccard_batch(rqk_q, rqk_k))
 
         results = {}
         for key in ['fqk', 'rqk']:

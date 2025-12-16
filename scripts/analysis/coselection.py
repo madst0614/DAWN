@@ -135,9 +135,9 @@ class CoselectionAnalyzer:
                     a_counts += selected_a.sum(dim=0)
                     b_counts += selected_b.sum(dim=0)
 
-                    # Co-occurrence: outer product per batch
-                    for b in range(B):
-                        co_matrix += torch.outer(selected_a[b], selected_b[b])
+                    # Co-occurrence: vectorized batch outer product sum
+                    # einsum('bi,bj->ij') = sum over batch of outer products
+                    co_matrix += torch.einsum('bi,bj->ij', selected_a, selected_b)
 
                     # Store back
                     layer_matrices[lidx] = (co_matrix, a_counts, b_counts)

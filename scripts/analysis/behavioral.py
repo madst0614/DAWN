@@ -195,6 +195,7 @@ class BehavioralAnalyzer:
         Run probing classifier for POS prediction across ALL layers.
 
         Uses routing weights to predict part-of-speech tags.
+        Optimized with vectorized tensor operations.
 
         Args:
             dataloader: DataLoader for input data
@@ -207,8 +208,8 @@ class BehavioralAnalyzer:
         if not HAS_SKLEARN:
             return {'error': 'sklearn not available'}
 
-        # {layer_key: {routing_key: [features]}}
-        X_data = defaultdict(lambda: defaultdict(list))
+        # {layer_key: {routing_key: tensor list}}
+        X_tensors = defaultdict(lambda: defaultdict(list))
         y_labels = defaultdict(list)
 
         self.model.eval()
@@ -218,6 +219,7 @@ class BehavioralAnalyzer:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
+                B, S = input_ids.shape
 
                 # Get attention mask if available
                 if isinstance(batch, dict):
@@ -233,6 +235,19 @@ class BehavioralAnalyzer:
                 except Exception:
                     continue
 
+                # Flatten mask for vectorized selection
+                flat_mask = attention_mask.view(-1).bool()  # [B*S]
+                valid_count = flat_mask.sum().item()
+
+                if valid_count == 0:
+                    continue
+
+                # Get valid token ids and compute POS labels once per batch
+                flat_input_ids = input_ids.view(-1)  # [B*S]
+                valid_token_ids = flat_input_ids[flat_mask].cpu().tolist()
+                valid_tokens = self.tokenizer.convert_ids_to_tokens(valid_token_ids)
+                batch_pos_labels = [simple_pos_tag(t) for t in valid_tokens]
+
                 # Process ALL layers
                 for lidx, layer_info in enumerate(routing_infos):
                     if layer_idx is not None and lidx != layer_idx:
@@ -242,48 +257,48 @@ class BehavioralAnalyzer:
                     attn = layer_info.get('attention', {})
                     knowledge = layer_info.get('knowledge', {})
 
-                    # Collect attention routing weights
+                    # Collect attention routing weights - vectorized
                     for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
                         if weight_key in attn:
                             w = attn[weight_key]
                             if w.dim() == 3:  # [B, S, N] token-level
-                                for b in range(w.shape[0]):
-                                    for s in range(w.shape[1]):
-                                        if attention_mask[b, s] == 0:
-                                            continue
-                                        X_data[layer_key][key].append(w[b, s].cpu().numpy())
+                                flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
                             elif w.dim() == 2:  # [B, N] batch-level
-                                for b in range(w.shape[0]):
-                                    for s in range(attention_mask.shape[1]):
-                                        if attention_mask[b, s] == 0:
-                                            continue
-                                        X_data[layer_key][key].append(w[b].cpu().numpy())
+                                # Expand and flatten
+                                expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
+                                flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            else:
+                                continue
+                            X_tensors[layer_key][key].append(valid_w.cpu())
 
-                    # Collect knowledge routing weights
+                    # Collect knowledge routing weights - vectorized
                     for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
                         if weight_key in knowledge:
                             w = knowledge[weight_key]
                             if w.dim() == 3:  # [B, S, N] token-level
-                                for b in range(w.shape[0]):
-                                    for s in range(w.shape[1]):
-                                        if attention_mask[b, s] == 0:
-                                            continue
-                                        X_data[layer_key][key].append(w[b, s].cpu().numpy())
+                                flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
                             elif w.dim() == 2:  # [B, N] batch-level
-                                for b in range(w.shape[0]):
-                                    for s in range(attention_mask.shape[1]):
-                                        if attention_mask[b, s] == 0:
-                                            continue
-                                        X_data[layer_key][key].append(w[b].cpu().numpy())
-
-                    # Collect POS labels for this layer
-                    for b in range(input_ids.shape[0]):
-                        for s in range(input_ids.shape[1]):
-                            if attention_mask[b, s] == 0:
+                                expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
+                                flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            else:
                                 continue
-                            token = self.tokenizer.decode([input_ids[b, s].item()])
-                            pos = simple_pos_tag(token)
-                            y_labels[layer_key].append(pos)
+                            X_tensors[layer_key][key].append(valid_w.cpu())
+
+                    # Add POS labels for this layer
+                    y_labels[layer_key].extend(batch_pos_labels)
+
+        # Convert tensors to numpy arrays
+        X_data = defaultdict(lambda: defaultdict(list))
+        for layer_key, routing_data in X_tensors.items():
+            for routing_key, tensor_list in routing_data.items():
+                if tensor_list:
+                    # Concatenate all tensors and convert to numpy
+                    combined = torch.cat(tensor_list, dim=0).numpy()
+                    X_data[layer_key][routing_key] = combined
 
         # Train and evaluate classifiers per layer/routing key
         results = {'per_layer': {}}
