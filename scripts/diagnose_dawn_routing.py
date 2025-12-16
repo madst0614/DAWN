@@ -85,7 +85,7 @@ NEURON_POOLS = {
         'display': 'FK',
         'ema_attr': 'usage_ema_feature_know',
         'n_attr': 'n_feature_know',
-        'pref_keys': ['fk_pref'],
+        'pref_keys': ['feature_know_w', 'fk_pref'],  # v17.1 uses feature_know_w
         'top_k_config': 'top_k_feature_know',
         'default_top_k': 8,
         'color': 'purple',
@@ -94,7 +94,7 @@ NEURON_POOLS = {
         'display': 'RK',
         'ema_attr': 'usage_ema_restore_know',
         'n_attr': 'n_restore_know',
-        'pref_keys': ['rk_pref'],
+        'pref_keys': ['restore_know_w', 'rk_pref'],  # v17.1 uses restore_know_w
         'top_k_config': 'top_k_restore_know',
         'default_top_k': 4,
         'color': 'cyan',
