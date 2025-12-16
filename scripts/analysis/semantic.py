@@ -951,9 +951,9 @@ class SemanticAnalyzer:
                             )
                             neuron_sizes[routing_key] = N
 
-                        # Flatten: [B, S] -> [B*S]
-                        flat_token_ids = input_ids.view(-1)  # [B*S]
-                        flat_weights = weights.view(-1, N)    # [B*S, N]
+                        # Flatten: [B, S] -> [B*S] (use reshape for non-contiguous tensors)
+                        flat_token_ids = input_ids.reshape(-1)  # [B*S]
+                        flat_weights = weights.reshape(-1, N)    # [B*S, N]
 
                         # Mask special tokens ([CLS], [SEP], [PAD], etc.)
                         # Token IDs 100-103 are typically special in BERT
