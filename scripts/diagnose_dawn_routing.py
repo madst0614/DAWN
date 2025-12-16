@@ -44,57 +44,64 @@ except ImportError:
 
 
 # DAWN v17.1 Neuron Pool Configuration
+# 'source': where to find the pref_keys in routing_info ('attention' or 'knowledge')
 NEURON_POOLS = {
     'feature_qk': {
-        'display': 'FQK',
+        'display': 'F-QK',
         'ema_attr': 'usage_ema_feature_qk',
         'n_attr': 'n_feature_qk',
         'pref_keys': ['fqk_q_pref', 'fqk_k_pref'],
+        'source': 'attention',
         'top_k_config': 'top_k_feature_qk',
         'default_top_k': 8,
         'color': 'red',
     },
     'feature_v': {
-        'display': 'FV',
+        'display': 'F-V',
         'ema_attr': 'usage_ema_feature_v',
         'n_attr': 'n_feature_v',
         'pref_keys': ['fv_pref'],
+        'source': 'attention',
         'top_k_config': 'top_k_feature_v',
         'default_top_k': 6,
         'color': 'orange',
     },
     'restore_qk': {
-        'display': 'RQK',
+        'display': 'R-QK',
         'ema_attr': 'usage_ema_restore_qk',
         'n_attr': 'n_restore_qk',
         'pref_keys': ['rqk_q_pref', 'rqk_k_pref'],
+        'source': 'attention',
         'top_k_config': 'top_k_restore_qk',
         'default_top_k': 8,
         'color': 'blue',
     },
     'restore_v': {
-        'display': 'RV',
+        'display': 'R-V',
         'ema_attr': 'usage_ema_restore_v',
         'n_attr': 'n_restore_v',
         'pref_keys': ['rv_pref'],
+        'source': 'attention',
         'top_k_config': 'top_k_restore_v',
         'default_top_k': 4,
         'color': 'green',
     },
     'feature_know': {
-        'display': 'FK',
+        'display': 'F-Know',
         'ema_attr': 'usage_ema_feature_know',
         'n_attr': 'n_feature_know',
-        'pref_keys': ['feature_know_w', 'fk_pref'],  # v17.1 uses feature_know_w
+        'pref_keys': ['feature_know_w'],
+        'source': 'knowledge',  # Knowledge pools are in 'knowledge' dict
         'top_k_config': 'top_k_feature_know',
         'default_top_k': 8,
         'color': 'purple',
     },
     'restore_know': {
-        'display': 'RK',
+        'display': 'R-Know',
         'ema_attr': 'usage_ema_restore_know',
         'n_attr': 'n_restore_know',
-        'pref_keys': ['restore_know_w', 'rk_pref'],  # v17.1 uses restore_know_w
+        'pref_keys': ['restore_know_w'],
+        'source': 'knowledge',  # Knowledge pools are in 'knowledge' dict
         'top_k_config': 'top_k_restore_know',
         'default_top_k': 4,
         'color': 'cyan',
@@ -305,13 +312,13 @@ class RoutingDiagnostics:
 
                 # Aggregate across all layers
                 for layer_info in routing_infos:
-                    attn = layer_info.get('attention', {})
-
                     for pool_name, pool_info in NEURON_POOLS.items():
+                        # Get the right source dict (attention or knowledge)
+                        source_dict = layer_info.get(pool_info['source'], {})
                         top_k = self.config.get(pool_info['top_k_config'], pool_info['default_top_k'])
 
                         for pref_key in pool_info['pref_keys']:
-                            pref = attn.get(pref_key)
+                            pref = source_dict.get(pref_key)
                             if pref is None:
                                 continue
 
@@ -394,11 +401,14 @@ class RoutingDiagnostics:
                     continue
 
                 # Use first layer for entropy analysis
-                attn = routing_infos[0].get('attention', {})
+                layer_info = routing_infos[0]
 
                 for pool_name, pool_info in NEURON_POOLS.items():
+                    # Get the right source dict (attention or knowledge)
+                    source_dict = layer_info.get(pool_info['source'], {})
+
                     for pref_key in pool_info['pref_keys']:
-                        pref = attn.get(pref_key)
+                        pref = source_dict.get(pref_key)
                         if pref is None:
                             continue
 
@@ -485,14 +495,15 @@ class RoutingDiagnostics:
                     continue
 
                 for layer_info in routing_infos:
-                    attn = layer_info.get('attention', {})
-
                     for pool_name, pool_info in NEURON_POOLS.items():
                         if pool_name not in activation_counts:
                             continue
 
+                        # Get the right source dict (attention or knowledge)
+                        source_dict = layer_info.get(pool_info['source'], {})
+
                         for pref_key in pool_info['pref_keys']:
-                            pref = attn.get(pref_key)
+                            pref = source_dict.get(pref_key)
                             if pref is None:
                                 continue
 
@@ -589,15 +600,18 @@ class RoutingDiagnostics:
                 except:
                     continue
 
-                attn = routing_infos[0].get('attention', {})
+                layer_info = routing_infos[0]
 
                 for pool_name, neuron_indices in target_neurons.items():
                     pool_info = NEURON_POOLS.get(pool_name)
                     if pool_info is None:
                         continue
 
+                    # Get the right source dict (attention or knowledge)
+                    source_dict = layer_info.get(pool_info['source'], {})
+
                     for pref_key in pool_info['pref_keys']:
-                        pref = attn.get(pref_key)
+                        pref = source_dict.get(pref_key)
                         if pref is None:
                             continue
 
