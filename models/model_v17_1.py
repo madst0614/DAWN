@@ -80,7 +80,11 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('excitability_weight', torch.tensor(1.0))
 
     def decay_excitability(self):
+        """Decay excitability weight (called from train.py each step)"""
         self.excitability_weight.mul_(self.decay_rate)
+
+    # Alias for train.py compatibility
+    update_excitability_weight = decay_excitability
 
     def get_excitability(self, usage_ema):
         return torch.clamp(1.0 - usage_ema / self.tau, min=0.0, max=1.0)

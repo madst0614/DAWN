@@ -1028,18 +1028,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Increment global step counter
         global_step += 1
 
-        # Update excitability (v16.1/v17: update_excitability_weight, v16.0: decay_excitability)
+        # Decay excitability weight each training step
+        # This happens here (not in model.forward) so inference doesn't trigger decay
+        # excitability_weight decays exponentially: w *= decay_rate (~0.99995)
         router = None
-        if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+        if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):
             router = base_model.router.neuron_router
-        elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
+        elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
             router = base_model.global_routers.neuron_router
 
         if router is not None:
             if hasattr(router, 'update_excitability_weight'):
-                router.update_excitability_weight()  # v16.1/v17 Langevin dynamics
+                router.update_excitability_weight()
             elif hasattr(router, 'decay_excitability'):
-                router.decay_excitability()  # v16.0 simple decay
+                router.decay_excitability()
 
         # Accuracy calculation (CLM: shifted)
         shift_logits = logits[:, :-1, :].contiguous()
