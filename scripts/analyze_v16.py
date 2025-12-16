@@ -1698,7 +1698,7 @@ def main():
         print("WEIGHT SVD ANALYSIS")
         print("="*60)
         for name, data in svd.items():
-            if name == 'visualization':
+            if name in ['visualization', 'version']:
                 continue
             print(f"\n{name}:")
             print(f"  Effective rank: {data['effective_rank']:.2f}")
@@ -1712,7 +1712,7 @@ def main():
         print("NEURON SIMILARITY")
         print("="*60)
         for name, data in sim.items():
-            if name == 'visualization':
+            if name in ['visualization', 'version']:
                 continue
             print(f"{name}: avg={data['avg_similarity']:.3f}, max={data['max_similarity']:.3f}")
         with open(os.path.join(args.output_dir, 'similarity.json'), 'w') as f:
