@@ -693,20 +693,17 @@ class V16Analyzer:
         if self.router is None:
             return {'error': 'No router found'}
 
-        results = {}
+        results = {'version': self.version}
         emb = self.router.neuron_emb.detach()  # [total, d_space]
 
-        # Boundaries
-        boundaries = {
-            'FR': (0, self.router.n_feature_r),
-            'FV': (self.router.n_feature_r, self.router.n_feature_r + self.router.n_feature_v),
-            'R': (self.router.n_feature_r + self.router.n_feature_v,
-                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational),
-            'V': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational,
-                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value),
-            'K': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value,
-                  self.router.total_neurons),
-        }
+        # Build version-aware boundaries
+        boundaries = {}
+        offset = 0
+        for name, _, n_attr in self.mapping['ema_attrs']:
+            if hasattr(self.router, n_attr):
+                n = getattr(self.router, n_attr)
+                boundaries[name.upper()] = (offset, offset + n)
+                offset += n
 
         for name, (start, end) in boundaries.items():
             type_emb = emb[start:end]
@@ -760,19 +757,12 @@ class V16Analyzer:
         if self.router is None:
             return {'error': 'No router found'}
 
-        # Track selected neurons
-        union_selected = {
-            'feature_r': set(),
-            'feature_v': set(),
-            'relational': set(),
-            'value': set(),
-        }
-        per_batch_counts = {
-            'feature_r': [],
-            'feature_v': [],
-            'relational': [],
-            'value': [],
-        }
+        # Build version-aware type mappings
+        weight_keys = self.mapping['weight_keys']  # e.g., {'fqk_q': 'fqk_weights_Q', ...}
+
+        # Track selected neurons (dynamically from mapping)
+        union_selected = {ntype: set() for ntype in weight_keys.keys()}
+        per_batch_counts = {ntype: [] for ntype in weight_keys.keys()}
 
         self.model.eval()
         with torch.no_grad():
@@ -797,13 +787,8 @@ class V16Analyzer:
                 except Exception as e:
                     continue
 
-                # Track selections for each neuron type
-                for ntype, weight_key in [
-                    ('feature_r', 'feature_r_weights'),
-                    ('feature_v', 'feature_v_weights'),
-                    ('relational', 'relational_weights_Q'),
-                    ('value', 'value_weights'),
-                ]:
+                # Track selections for each neuron type (version-aware)
+                for ntype, weight_key in weight_keys.items():
                     if weight_key in routing_info:
                         weights = routing_info[weight_key]
                         # weights: [B, S, N] - batch, seq, neurons
@@ -817,17 +802,35 @@ class V16Analyzer:
                             union_selected[ntype].update(selected.nonzero().flatten().tolist())
                             per_batch_counts[ntype].append(selected.sum().item())
 
+        # Build version-aware n_totals from ema_attrs
+        n_totals = {}
+        for name, _, n_attr in self.mapping['ema_attrs']:
+            if hasattr(self.router, n_attr):
+                n_totals[name] = getattr(self.router, n_attr)
+
+        # Map weight_keys types to ema_attrs types for n_total lookup
+        # e.g., 'fqk_q' -> 'feature_qk', 'rv' -> 'restore_v'
+        type_to_ema = {}
+        if self.version in ['16.4', '17.1']:
+            type_to_ema = {
+                'fqk_q': 'feature_qk', 'fqk_k': 'feature_qk',
+                'fv': 'feature_v',
+                'rqk_q': 'restore_qk', 'rqk_k': 'restore_qk',
+                'rv': 'restore_v',
+            }
+        else:
+            type_to_ema = {
+                'feature_r': 'feature_r', 'feature_v': 'feature_v',
+                'relational': 'relational', 'value': 'value',
+            }
+
         # Calculate results
-        results = {}
-        n_totals = {
-            'feature_r': self.router.n_feature_r,
-            'feature_v': self.router.n_feature_v,
-            'relational': self.router.n_relational,
-            'value': self.router.n_value,
-        }
+        results = {'version': self.version}
 
         for ntype in union_selected:
-            n_total = n_totals[ntype]
+            # Map weight type to ema type for n_total lookup
+            ema_type = type_to_ema.get(ntype, ntype)
+            n_total = n_totals.get(ema_type, 0)
             union_count = len(union_selected[ntype])
             batch_counts = per_batch_counts[ntype]
 
@@ -853,8 +856,11 @@ class V16Analyzer:
         # Summary
         total_union = sum(len(union_selected[k]) for k in union_selected)
         total_neurons = sum(n_totals.values())
+        # Get first available key for batch count
+        first_key = next(iter(per_batch_counts.keys()), None)
+        n_batches_done = len(per_batch_counts[first_key]) if first_key else 0
         results['summary'] = {
-            'n_batches_processed': min(n_batches, len(per_batch_counts['feature_r'])),
+            'n_batches_processed': min(n_batches, n_batches_done),
             'total_union_coverage': float(total_union / total_neurons) if total_neurons > 0 else 0,
             'interpretation': (
                 'High diversity_ratio (>2) = 많은 뉴런이 batch마다 다르게 선택됨\n'
@@ -1064,20 +1070,19 @@ class V16Analyzer:
         if self.router is None or not HAS_SKLEARN:
             return {'error': 'No router found or sklearn not available'}
 
-        results = {}
+        results = {'version': self.version}
         emb = self.router.neuron_emb.detach().cpu().numpy()
 
-        # Type boundaries
-        boundaries = {
-            'FR': (0, self.router.n_feature_r),
-            'FV': (self.router.n_feature_r, self.router.n_feature_r + self.router.n_feature_v),
-            'R': (self.router.n_feature_r + self.router.n_feature_v,
-                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational),
-            'V': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational,
-                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value),
-            'K': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value,
-                  self.router.total_neurons),
-        }
+        # Build version-aware boundaries and ema_attr mapping
+        boundaries = {}
+        ema_attr_map = {}
+        offset = 0
+        for name, ema_attr, n_attr in self.mapping['ema_attrs']:
+            if hasattr(self.router, n_attr):
+                n = getattr(self.router, n_attr)
+                boundaries[name.upper()] = (offset, offset + n)
+                ema_attr_map[name.upper()] = ema_attr
+                offset += n
 
         for name, (start, end) in boundaries.items():
             type_emb = emb[start:end]
@@ -1097,16 +1102,10 @@ class V16Analyzer:
                 cluster_mask = labels == c
                 cluster_size = cluster_mask.sum()
 
-                # Get usage EMA for this type
-                ema_attr = f'usage_ema_{name.lower()}' if name != 'FR' else 'usage_ema_feature_r'
-                if name == 'FV':
-                    ema_attr = 'usage_ema_feature_v'
-                elif name == 'R':
-                    ema_attr = 'usage_ema_relational'
-                elif name == 'V':
-                    ema_attr = 'usage_ema_value'
-                elif name == 'K':
-                    ema_attr = 'usage_ema_knowledge'
+                # Get usage EMA for this type (version-aware)
+                ema_attr = ema_attr_map.get(name)
+                if ema_attr is None or not hasattr(self.router, ema_attr):
+                    continue
 
                 ema = getattr(self.router, ema_attr).cpu().numpy()
                 cluster_ema = ema[cluster_mask]
@@ -1269,13 +1268,11 @@ class V16Analyzer:
         from sklearn.model_selection import train_test_split
         from sklearn.metrics import accuracy_score, classification_report
 
-        # Collect activations and labels
-        X_data = {
-            'feature_r': [],
-            'feature_v': [],
-            'relational': [],
-            'value': [],
-        }
+        # Version-aware weight keys
+        weight_keys = self.mapping['weight_keys']
+
+        # Collect activations and labels (dynamically from mapping)
+        X_data = {ntype: [] for ntype in weight_keys.keys()}
         y_labels = []
 
         self.model.eval()
@@ -1289,17 +1286,17 @@ class V16Analyzer:
 
                 try:
                     outputs = self.model(input_ids, attention_mask=attention_mask, return_routing_info=True)
-                    routing_info = outputs.get('routing_info', {})
+                    # Handle both old (dict) and new (tuple) output formats
+                    if isinstance(outputs, tuple) and len(outputs) == 2:
+                        routing_infos = outputs[1]
+                        routing_info = routing_infos[0].get('attention', {}) if routing_infos else {}
+                    else:
+                        routing_info = outputs.get('routing_info', {})
                 except:
                     continue
 
-                # Get routing weights
-                for ntype, key in [
-                    ('feature_r', 'feature_r_weights'),
-                    ('feature_v', 'feature_v_weights'),
-                    ('relational', 'relational_weights_Q'),
-                    ('value', 'value_weights'),
-                ]:
+                # Get routing weights (version-aware)
+                for ntype, key in weight_keys.items():
                     if key in routing_info:
                         w = routing_info[key]
                         if w.dim() == 3:  # [B, S, N]
@@ -1318,7 +1315,7 @@ class V16Analyzer:
                         pos = simple_pos_tag(token)
                         y_labels.append(pos)
 
-        results = {}
+        results = {'version': self.version}
 
         # Train probing classifier for each neuron type
         for ntype in X_data:
