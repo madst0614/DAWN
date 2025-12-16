@@ -1,0 +1,597 @@
+"""
+Routing Pattern Analysis
+=========================
+Analyze routing patterns in DAWN v17.1 models.
+
+Includes:
+- Routing entropy analysis
+- Selection frequency analysis
+- Selection diversity analysis
+- Q/K overlap analysis
+- Q/K usage pattern analysis (from analyze_dawn_qk.py)
+"""
+
+import os
+import numpy as np
+import torch
+import torch.nn.functional as F
+from typing import Dict, Optional
+from collections import Counter
+
+from .utils import (
+    NEURON_TYPES, ROUTING_KEYS, QK_POOLS,
+    calc_entropy_ratio, gini_coefficient,
+    get_batch_input_ids, get_routing_from_outputs,
+    HAS_MATPLOTLIB, HAS_TQDM, tqdm, plt
+)
+
+
+class RoutingAnalyzer:
+    """Routing pattern analyzer for DAWN v17.1."""
+
+    def __init__(self, model, router, device='cuda'):
+        """
+        Initialize analyzer.
+
+        Args:
+            model: DAWN model
+            router: NeuronRouter instance
+            device: Device for computation
+        """
+        self.model = model
+        self.router = router
+        self.device = device
+
+    def analyze_entropy(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze routing entropy across batches.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with entropy statistics per routing key
+        """
+        entropy_data = {name: [] for name in ROUTING_KEYS.keys()}
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Entropy')):
+                if i >= n_batches:
+                    break
+
+                input_ids = get_batch_input_ids(batch, self.device)
+                outputs = self.model(input_ids, return_routing_info=True)
+                routing_infos = get_routing_from_outputs(outputs)
+
+                if routing_infos is None:
+                    continue
+
+                for layer_info in routing_infos:
+                    attn = layer_info.get('attention', {})
+
+                    for key, (display, pref_key, _, _) in ROUTING_KEYS.items():
+                        pref = attn.get(pref_key)
+                        if pref is not None:
+                            ent = calc_entropy_ratio(pref)
+                            entropy_data[key].append(ent)
+
+        results = {}
+        for key, (display, _, _, pool) in ROUTING_KEYS.items():
+            if entropy_data[key]:
+                results[key] = {
+                    'display': display,
+                    'pool': pool,
+                    'mean_entropy': float(np.mean(entropy_data[key])),
+                    'std_entropy': float(np.std(entropy_data[key])),
+                    'min_entropy': float(np.min(entropy_data[key])),
+                    'max_entropy': float(np.max(entropy_data[key])),
+                }
+
+        return results
+
+    def analyze_selection_frequency(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze neuron selection frequency.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with selection frequency statistics
+        """
+        selection_counts = {name: Counter() for name in ROUTING_KEYS.keys()}
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Selection')):
+                if i >= n_batches:
+                    break
+
+                input_ids = get_batch_input_ids(batch, self.device)
+                outputs = self.model(input_ids, return_routing_info=True)
+                routing_infos = get_routing_from_outputs(outputs)
+
+                if routing_infos is None:
+                    continue
+
+                for layer_info in routing_infos:
+                    attn = layer_info.get('attention', {})
+
+                    for key, (_, pref_key, _, _) in ROUTING_KEYS.items():
+                        pref = attn.get(pref_key)
+                        if pref is None:
+                            continue
+
+                        k = min(8, pref.shape[-1])
+                        _, topk_idx = torch.topk(pref, k, dim=-1)
+                        flat_idx = topk_idx.view(-1).cpu().numpy()
+
+                        for idx in flat_idx:
+                            selection_counts[key][int(idx)] += 1
+
+        results = {}
+        for key, (display, _, _, pool) in ROUTING_KEYS.items():
+            counts = selection_counts[key]
+            if not counts:
+                continue
+
+            total = sum(counts.values())
+            top10 = counts.most_common(10)
+            unique = len(counts)
+
+            pool_info = NEURON_TYPES.get(pool, {})
+            n_attr = pool_info[2] if pool_info else None
+            n_total = getattr(self.router, n_attr, 0) if n_attr else 0
+
+            results[key] = {
+                'display': display,
+                'pool': pool,
+                'total_selections': total,
+                'unique_selected': unique,
+                'coverage': unique / n_total if n_total > 0 else 0,
+                'top10': [(idx, cnt, cnt/total) for idx, cnt in top10],
+                'concentration': sum(cnt for _, cnt in top10) / total if total > 0 else 0,
+            }
+
+        return results
+
+    def analyze_selection_diversity(self, dataloader, n_batches: int = 100) -> Dict:
+        """
+        Analyze selection diversity across batches.
+
+        Measures how many unique neurons are selected across the entire dataset
+        vs per-batch selection.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with diversity metrics
+        """
+        union_selected = {key: set() for key in ROUTING_KEYS.keys()}
+        per_batch_counts = {key: [] for key in ROUTING_KEYS.keys()}
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(dataloader, desc='Selection Diversity', total=n_batches)):
+                if i >= n_batches:
+                    break
+
+                input_ids = get_batch_input_ids(batch, self.device)
+
+                try:
+                    outputs = self.model(input_ids, return_routing_info=True)
+                    routing_infos = get_routing_from_outputs(outputs)
+                    if routing_infos is None:
+                        continue
+                    routing_info = routing_infos[0].get('attention', {})
+                except Exception:
+                    continue
+
+                for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                    if weight_key in routing_info:
+                        weights = routing_info[weight_key]
+                        if weights.dim() == 3:
+                            selected = (weights > 0).any(dim=0).any(dim=0).cpu()
+                            union_selected[key].update(selected.nonzero().flatten().tolist())
+                            per_batch_counts[key].append(selected.sum().item())
+                        elif weights.dim() == 2:
+                            selected = (weights > 0).any(dim=0).cpu()
+                            union_selected[key].update(selected.nonzero().flatten().tolist())
+                            per_batch_counts[key].append(selected.sum().item())
+
+        # Map routing keys to pool types
+        key_to_pool = {key: info[3] for key, info in ROUTING_KEYS.items()}
+
+        results = {}
+        for key in ROUTING_KEYS.keys():
+            pool = key_to_pool[key]
+            pool_info = NEURON_TYPES.get(pool, {})
+            n_attr = pool_info[2] if pool_info else None
+            n_total = getattr(self.router, n_attr, 0) if n_attr else 0
+
+            union_count = len(union_selected[key])
+            batch_counts = per_batch_counts[key]
+
+            if len(batch_counts) > 0:
+                per_batch_avg = np.mean(batch_counts)
+                per_batch_std = np.std(batch_counts)
+            else:
+                per_batch_avg = 0
+                per_batch_std = 0
+
+            results[key] = {
+                'display': ROUTING_KEYS[key][0],
+                'pool': pool,
+                'n_total': n_total,
+                'per_batch_avg': float(per_batch_avg),
+                'per_batch_std': float(per_batch_std),
+                'union_count': union_count,
+                'union_coverage': float(union_count / n_total) if n_total > 0 else 0,
+                'diversity_ratio': float(union_count / per_batch_avg) if per_batch_avg > 0 else 0,
+            }
+
+        total_union = sum(len(union_selected[k]) for k in union_selected)
+        total_neurons = sum(
+            getattr(self.router, NEURON_TYPES[ROUTING_KEYS[k][3]][2], 0)
+            for k in ROUTING_KEYS.keys()
+        )
+
+        results['summary'] = {
+            'n_batches_processed': min(n_batches, len(per_batch_counts[next(iter(per_batch_counts))])),
+            'total_union_coverage': float(total_union / total_neurons) if total_neurons > 0 else 0,
+            'interpretation': (
+                'High diversity_ratio (>2) = many neurons selected differently per batch\n'
+                'Low diversity_ratio (~1) = same neurons always selected'
+            )
+        }
+
+        return results
+
+    def analyze_qk_overlap(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze Q/K routing overlap (Jaccard similarity).
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with Q/K overlap statistics
+        """
+        overlap_data = {'fqk': [], 'rqk': []}
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Q/K Overlap')):
+                if i >= n_batches:
+                    break
+
+                input_ids = get_batch_input_ids(batch, self.device)
+                outputs = self.model(input_ids, return_routing_info=True)
+                routing_infos = get_routing_from_outputs(outputs)
+
+                if routing_infos is None:
+                    continue
+
+                for layer_info in routing_infos:
+                    attn = layer_info.get('attention', {})
+
+                    # F-QK Q/K overlap
+                    fqk_q = attn.get('fqk_q_pref')
+                    fqk_k = attn.get('fqk_k_pref')
+                    if fqk_q is not None and fqk_k is not None:
+                        k = min(8, fqk_q.shape[-1])
+                        q_top = torch.topk(fqk_q, k, dim=-1)[1]
+                        k_top = torch.topk(fqk_k, k, dim=-1)[1]
+
+                        for b in range(q_top.shape[0]):
+                            q_set = set(q_top[b].view(-1).cpu().tolist())
+                            k_set = set(k_top[b].view(-1).cpu().tolist())
+                            overlap = len(q_set & k_set) / len(q_set | k_set) if (q_set | k_set) else 0
+                            overlap_data['fqk'].append(overlap)
+
+                    # R-QK Q/K overlap
+                    rqk_q = attn.get('rqk_q_pref')
+                    rqk_k = attn.get('rqk_k_pref')
+                    if rqk_q is not None and rqk_k is not None:
+                        k = min(8, rqk_q.shape[-1])
+                        q_top = torch.topk(rqk_q, k, dim=-1)[1]
+                        k_top = torch.topk(rqk_k, k, dim=-1)[1]
+
+                        for b in range(q_top.shape[0]):
+                            q_set = set(q_top[b].view(-1).cpu().tolist())
+                            k_set = set(k_top[b].view(-1).cpu().tolist())
+                            overlap = len(q_set & k_set) / len(q_set | k_set) if (q_set | k_set) else 0
+                            overlap_data['rqk'].append(overlap)
+
+        results = {}
+        for key in ['fqk', 'rqk']:
+            if overlap_data[key]:
+                mean_overlap = np.mean(overlap_data[key])
+                results[key] = {
+                    'mean_overlap': float(mean_overlap),
+                    'std_overlap': float(np.std(overlap_data[key])),
+                    'interpretation': (
+                        'Q and K select similar neurons' if mean_overlap > 0.3
+                        else 'Q and K select different neurons'
+                    )
+                }
+
+        return results
+
+    def analyze_qk_usage(self, dataloader, n_batches: int = 100) -> Dict:
+        """
+        Analyze per-neuron Q/K selection counts.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with Q/K usage statistics
+        """
+        results = {}
+
+        for pool_name, pool_info in QK_POOLS.items():
+            n_neurons = getattr(self.router, pool_info['n_attr'], 0)
+            if n_neurons == 0:
+                continue
+
+            q_counts = torch.zeros(n_neurons, device=self.device)
+            k_counts = torch.zeros(n_neurons, device=self.device)
+            batch_overlaps = []
+
+            self.model.eval()
+            with torch.no_grad():
+                for i, batch in enumerate(tqdm(dataloader, desc=f'{pool_info["display"]} Q/K', total=n_batches)):
+                    if i >= n_batches:
+                        break
+
+                    input_ids = get_batch_input_ids(batch, self.device)
+
+                    try:
+                        outputs = self.model(input_ids, return_routing_info=True)
+                        routing_infos = get_routing_from_outputs(outputs)
+                        if routing_infos is None:
+                            continue
+                        attn = routing_infos[0].get('attention', {})
+                    except Exception:
+                        continue
+
+                    # Get Q/K weights
+                    w_q = attn.get(pool_info['q_weight'])
+                    w_k = attn.get(pool_info['k_weight'])
+
+                    if w_q is None or w_k is None:
+                        w_q = attn.get(pool_info['q_pref'])
+                        w_k = attn.get(pool_info['k_pref'])
+                        if w_q is None or w_k is None:
+                            continue
+
+                    # Count selections
+                    if w_q.dim() == 3:  # [B, S, N]
+                        selected_q = (w_q > 0).float().sum(dim=[0, 1])
+                        selected_k = (w_k > 0).float().sum(dim=[0, 1])
+                    else:  # [B, N]
+                        selected_q = (w_q > 0).float().sum(dim=0)
+                        selected_k = (w_k > 0).float().sum(dim=0)
+
+                    q_counts += selected_q
+                    k_counts += selected_k
+
+                    # Calculate batch overlap
+                    if w_q.dim() >= 2:
+                        overlap = ((w_q > 0) & (w_k > 0)).float()
+                        active_q = (w_q > 0).float().sum(-1)
+                        overlap_ratio = (overlap.sum(-1) / (active_q + 1e-8)).mean().item()
+                        batch_overlaps.append(overlap_ratio)
+
+            # Calculate statistics
+            q_np = q_counts.cpu().numpy()
+            k_np = k_counts.cpu().numpy()
+
+            # Correlation
+            if q_np.sum() > 0 and k_np.sum() > 0:
+                corr = float(np.corrcoef(q_np, k_np)[0, 1])
+            else:
+                corr = 0.0
+
+            # Specialization analysis
+            threshold = (q_np.sum() + k_np.sum()) / (2 * len(q_np)) * 0.1
+            q_only = int(((q_np > threshold) & (k_np < threshold)).sum())
+            k_only = int(((k_np > threshold) & (q_np < threshold)).sum())
+            shared = int(((q_np > threshold) & (k_np > threshold)).sum())
+            inactive = int(((q_np < threshold) & (k_np < threshold)).sum())
+
+            results[pool_name] = {
+                'display': pool_info['display'],
+                'n_neurons': n_neurons,
+                'q_counts': q_np.tolist(),
+                'k_counts': k_np.tolist(),
+                'correlation': corr,
+                'avg_overlap': float(np.mean(batch_overlaps)) if batch_overlaps else 0,
+                'std_overlap': float(np.std(batch_overlaps)) if batch_overlaps else 0,
+                'q_specialized': q_only,
+                'k_specialized': k_only,
+                'shared': shared,
+                'inactive': inactive,
+                'q_total': int(q_np.sum()),
+                'k_total': int(k_np.sum()),
+            }
+
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_qk_entropy(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze Q/K routing entropy patterns.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with entropy statistics
+        """
+        results = {}
+
+        for pool_name, pool_info in QK_POOLS.items():
+            q_entropy = []
+            k_entropy = []
+
+            self.model.eval()
+            with torch.no_grad():
+                for i, batch in enumerate(tqdm(dataloader, desc=f'{pool_info["display"]} Entropy', total=n_batches)):
+                    if i >= n_batches:
+                        break
+
+                    input_ids = get_batch_input_ids(batch, self.device)
+
+                    try:
+                        outputs = self.model(input_ids, return_routing_info=True)
+                        routing_infos = get_routing_from_outputs(outputs)
+                        if routing_infos is None:
+                            continue
+                        attn = routing_infos[0].get('attention', {})
+                    except Exception:
+                        continue
+
+                    # Get preference tensors
+                    pref_q = attn.get(pool_info['q_pref'])
+                    pref_k = attn.get(pool_info['k_pref'])
+
+                    if pref_q is not None:
+                        p = pref_q.mean(dim=0) if pref_q.dim() > 1 else pref_q
+                        p = p.clamp(min=1e-8)
+                        ent = -torch.sum(p * torch.log(p)).item()
+                        max_ent = np.log(pref_q.shape[-1])
+                        q_entropy.append(ent / max_ent * 100)
+
+                    if pref_k is not None:
+                        p = pref_k.mean(dim=0) if pref_k.dim() > 1 else pref_k
+                        p = p.clamp(min=1e-8)
+                        ent = -torch.sum(p * torch.log(p)).item()
+                        max_ent = np.log(pref_k.shape[-1])
+                        k_entropy.append(ent / max_ent * 100)
+
+            if q_entropy and k_entropy:
+                results[pool_name] = {
+                    'display': pool_info['display'],
+                    'q_entropy_mean': float(np.mean(q_entropy)),
+                    'q_entropy_std': float(np.std(q_entropy)),
+                    'k_entropy_mean': float(np.mean(k_entropy)),
+                    'k_entropy_std': float(np.std(k_entropy)),
+                    'entropy_diff': float(np.mean(q_entropy) - np.mean(k_entropy)),
+                }
+
+        return results
+
+    def visualize_qk_usage(self, usage_results: Dict, output_dir: str) -> Optional[str]:
+        """
+        Visualize Q/K usage patterns.
+
+        Args:
+            usage_results: Results from analyze_qk_usage()
+            output_dir: Directory for output
+
+        Returns:
+            Path to visualization or None
+        """
+        if not HAS_MATPLOTLIB:
+            return None
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        n_pools = len([k for k in usage_results if k not in ['n_batches']])
+        if n_pools == 0:
+            return None
+
+        fig, axes = plt.subplots(n_pools, 3, figsize=(18, 6 * n_pools))
+        if n_pools == 1:
+            axes = axes.reshape(1, -1)
+
+        row = 0
+        for pool_name, data in usage_results.items():
+            if pool_name == 'n_batches':
+                continue
+
+            q_counts = np.array(data['q_counts'])
+            k_counts = np.array(data['k_counts'])
+
+            # 1. Scatter: Q vs K
+            ax = axes[row, 0]
+            ax.scatter(q_counts, k_counts, alpha=0.6, s=30, c=QK_POOLS[pool_name]['color'])
+            max_val = max(q_counts.max(), k_counts.max())
+            ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='Q=K')
+            ax.set_xlabel('Q Selection Count')
+            ax.set_ylabel('K Selection Count')
+            ax.set_title(f'{data["display"]}: Q vs K Usage\n(corr={data["correlation"]:.3f})')
+            ax.legend()
+
+            # 2. Bar: Specialization
+            ax = axes[row, 1]
+            categories = ['Q-only', 'K-only', 'Shared', 'Inactive']
+            values = [data['q_specialized'], data['k_specialized'], data['shared'], data['inactive']]
+            colors = ['blue', 'orange', 'green', 'gray']
+            bars = ax.bar(categories, values, color=colors, alpha=0.7)
+            ax.set_ylabel('Neuron Count')
+            ax.set_title(f'{data["display"]}: Neuron Specialization')
+            for bar, val in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), str(val), ha='center', va='bottom')
+
+            # 3. Histogram: Q/(Q+K) ratio
+            ax = axes[row, 2]
+            total = q_counts + k_counts + 1e-8
+            q_ratio = q_counts / total
+            active_mask = (q_counts + k_counts) > 0
+            if active_mask.sum() > 0:
+                ax.hist(q_ratio[active_mask], bins=20, alpha=0.7, color='purple', edgecolor='black')
+            ax.axvline(x=0.5, color='red', linestyle='--', label='Q=K')
+            ax.set_xlabel('Q Ratio (Q / (Q+K))')
+            ax.set_ylabel('Neuron Count')
+            ax.set_title(f'{data["display"]}: Q/K Balance Distribution')
+            ax.legend()
+
+            row += 1
+
+        plt.tight_layout()
+        path = os.path.join(output_dir, 'qk_usage_analysis.png')
+        plt.savefig(path, dpi=150)
+        plt.close()
+
+        return path
+
+    def run_all(self, dataloader, output_dir: str = './routing_analysis', n_batches: int = 50) -> Dict:
+        """
+        Run all routing analyses.
+
+        Args:
+            dataloader: DataLoader for input data
+            output_dir: Directory for outputs
+            n_batches: Number of batches to process
+
+        Returns:
+            Combined results dictionary
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        results = {
+            'entropy': self.analyze_entropy(dataloader, n_batches),
+            'selection_frequency': self.analyze_selection_frequency(dataloader, n_batches),
+            'selection_diversity': self.analyze_selection_diversity(dataloader, n_batches * 2),
+            'qk_overlap': self.analyze_qk_overlap(dataloader, n_batches),
+            'qk_usage': self.analyze_qk_usage(dataloader, n_batches * 2),
+            'qk_entropy': self.analyze_qk_entropy(dataloader, n_batches),
+        }
+
+        # Visualizations
+        viz_path = self.visualize_qk_usage(results['qk_usage'], output_dir)
+        if viz_path:
+            results['qk_visualization'] = viz_path
+
+        return results
