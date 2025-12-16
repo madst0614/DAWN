@@ -2,7 +2,8 @@
 DAWN Model Version Registry - Single Source of Truth
 
 Supported Versions:
-  v17.1: Q/K Shared Pool + Knowledge Feature-Restore (recommended)
+  v17.2: Feature QK Unified + Restore Q/K Separate (recommended)
+  v17.1: Q/K Shared Pool + Knowledge Feature-Restore
   baseline: Vanilla Transformer for comparison
 """
 
@@ -11,6 +12,47 @@ import torch
 
 
 VERSION_REGISTRY = {
+    "17.2": {
+        "description": "Feature QK Unified + Restore Q/K Separate",
+        "aliases": ["172"],
+        "module": "model_v17_2",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "top_k_feature_qk": 8,
+            "top_k_feature_v": 3,
+            "top_k_restore_qk": 8,
+            "top_k_restore_v": 3,
+            "top_k_feature_know": 4,
+            "top_k_restore_know": 4,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+            "excitability_tau": 1.5,
+            "excitability_ema_alpha": 0.01,
+            "excitability_decay_rate": 0.99995,
+        },
+        "display_info": lambda args: [
+            f"DAWN v17.2: Feature QK Unified + Restore Q/K Separate",
+            f"  rank={args.get('rank', args.get('basis_rank'))}, knowledge_rank={args.get('knowledge_rank', 128)}",
+            f"  F-QK: {args.get('n_feature_qk')} (top-k={args.get('top_k_feature_qk', 8)}) - unified Q/K",
+            f"  F-V: {args.get('n_feature_v')} (top-k={args.get('top_k_feature_v', 3)})",
+            f"  R-QK: {args.get('n_restore_qk')} (top-k={args.get('top_k_restore_qk', 8)}) - separate Q/K",
+            f"  R-V: {args.get('n_restore_v')} (top-k={args.get('top_k_restore_v', 3)})",
+            f"  F-Know: {args.get('n_feature_know')} (k={args.get('top_k_feature_know', 4)}), R-Know: {args.get('n_restore_know')} (k={args.get('top_k_restore_know', 4)})",
+        ],
+    },
+
     "17.1": {
         "description": "Q/K Shared Pool + Knowledge Feature-Restore",
         "aliases": ["17", "171", "17.0"],
@@ -226,7 +268,7 @@ def get_all_versions_info() -> str:
 
 def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[str, Any]:
     """
-    Extract routing log info for v17.1.
+    Extract routing log info for v17.1/v17.2.
     Computes AVERAGE entropy across all layers.
     """
     if isinstance(routing_infos, dict):
@@ -234,8 +276,47 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
 
     attn0 = routing_infos[0].get('attention', routing_infos[0])
 
+    # v17.2: Feature QK Unified (fqk_pref exists, fqk_q_pref does not)
+    if attn0.get('fqk_pref') is not None:
+        all_ents = {k: [] for k in ['FQK', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
+        all_vars = {k: [] for k in ['FQK', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
+
+        for layer_info in routing_infos:
+            attn = layer_info.get('attention', layer_info)
+            prefs = {
+                'FQK': attn.get('fqk_pref'),
+                'FV': attn.get('fv_pref'),
+                'RQK_Q': attn.get('rqk_q_pref'),
+                'RQK_K': attn.get('rqk_k_pref'),
+                'RV': attn.get('rv_pref'),
+            }
+            for k, v in prefs.items():
+                if v is not None:
+                    all_ents[k].append(calc_entropy_fn(v))
+                    all_vars[k].append(calc_var_fn(v))
+
+        ents = {k: sum(v)/len(v) if v else 0.0 for k, v in all_ents.items()}
+        vars_ = {k: sum(v)/len(v) if v else 0.0 for k, v in all_vars.items()}
+
+        ent_str = f"Ent F-QK/F-V/R-QK_Q/K/R-V:{ents['FQK']:.0f}/{ents['FV']:.0f}/{ents['RQK_Q']:.0f}/{ents['RQK_K']:.0f}/{ents['RV']:.0f}"
+        var_str = f"TokVar:{vars_['FQK']:.4f}/{vars_['FV']:.4f}/{vars_['RQK_Q']:.4f}/{vars_['RQK_K']:.4f}/{vars_['RV']:.4f}"
+
+        def calc_overlap(w_Q, w_K):
+            if w_Q is None or w_K is None:
+                return 0.0
+            overlap = ((w_Q > 0) & (w_K > 0)).float()
+            active_Q = (w_Q > 0).float().sum(-1)
+            return (overlap.sum(-1) / (active_Q + 1e-8)).mean().item()
+
+        w_RQK_Q = attn0.get('rqk_weights_Q')
+        w_RQK_K = attn0.get('rqk_weights_K')
+        overlap_RQK = calc_overlap(w_RQK_Q, w_RQK_K)
+        overlap_str = f"Q/K Overlap R-QK:{overlap_RQK:.2f}"
+
+        return {'ent_str': ent_str, 'var_str': var_str, 'overlap_str': overlap_str, 'version': '17.2'}
+
     # v17.1: Shared Pool + Separate Routing (fqk_q_pref exists)
-    if attn0.get('fqk_q_pref') is not None:
+    elif attn0.get('fqk_q_pref') is not None:
         all_ents = {k: [] for k in ['FQK_Q', 'FQK_K', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
         all_vars = {k: [] for k in ['FQK_Q', 'FQK_K', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
 
