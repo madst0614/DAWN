@@ -59,8 +59,8 @@ from .model_v17 import DAWN as DAWN_v17
 # v17.1 - v16.4 + Knowledge Feature-Restore (Q/K 공유 풀)
 from .model_v17_1 import DAWN as DAWN_v17_1
 
-# Default DAWN is v17 (latest)
-DAWN = DAWN_v17
+# Default DAWN is v17.1 (latest)
+DAWN = DAWN_v17_1
 
 # Baseline for comparison
 import sys
@@ -111,7 +111,7 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "17"
+__version__ = "17.1"
 
 
 def create_model_by_version(version, config):

@@ -606,7 +606,7 @@ def main():
                         help='Path to checkpoint directory or best_model.pt file')
     parser.add_argument('--output_dir', type=str, default=None,
                         help='Output directory (default: {checkpoint_dir}/glue)')
-    parser.add_argument('--model_version', type=str, default='12.0',
+    parser.add_argument('--model_version', type=str, default='17.1',
                         help='DAWN model version')
     parser.add_argument('--collect_neurons', action='store_true',
                         help='Collect neuron activations during final eval')
