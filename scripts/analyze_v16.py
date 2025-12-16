@@ -1788,7 +1788,7 @@ def main():
         print("NEURON CLUSTERING")
         print("="*60)
         for name, data in clusters.items():
-            if name == 'visualization' or 'error' in str(data):
+            if name in ['visualization', 'version'] or not isinstance(data, dict) or 'error' in data:
                 continue
             print(f"\n{name}: {data['n_clusters']} clusters")
             for c in data.get('clusters', [])[:3]:
@@ -1815,6 +1815,8 @@ def main():
         print("PROBING CLASSIFIER")
         print("="*60)
         for ntype, data in probing.items():
+            if ntype == 'version' or not isinstance(data, dict):
+                continue
             if 'error' in data:
                 print(f"{ntype}: {data['error']}")
             else:
@@ -1830,7 +1832,7 @@ def main():
         print("="*60)
         print(f"Baseline loss: {ablation['baseline_loss']:.4f}")
         for ntype, results in ablation.items():
-            if ntype == 'baseline_loss':
+            if ntype in ['baseline_loss', 'version'] or not isinstance(results, list):
                 continue
             print(f"\n{ntype}:")
             for r in results:
