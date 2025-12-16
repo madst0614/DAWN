@@ -15,6 +15,7 @@ Includes:
 """
 
 import os
+import traceback
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -71,7 +72,7 @@ class CoselectionAnalyzer:
         if n_a == 0 or n_b == 0:
             return {'error': f'Empty pools: n_a={n_a}, n_b={n_b}'}
 
-        print(f"\n  {pair_info['name']}: {pool_a['display']}({n_a}) x {pool_b['display']}({n_b})")
+        print(f"\n  {pair_info['name']}: {pool_a['display']}({n_a}) x {pool_b['display']}({n_b})", flush=True)
 
         # Per-layer co-selection matrices
         layer_matrices = {}  # {layer_idx: (co_matrix, a_counts, b_counts)}
@@ -269,14 +270,16 @@ class CoselectionAnalyzer:
 
         return results
 
-    def analyze_subspace_diversity(self, pair_key: str) -> Dict:
+    def analyze_subspace_diversity(self, pair_key: str, max_neurons: int = 4096) -> Dict:
         """
         Analyze neuron subspace diversity within a pool.
 
         Measures how different the neurons are from each other.
+        Uses sampling for large pools to avoid O(n²) memory issues.
 
         Args:
             pair_key: Key from COSELECTION_PAIRS
+            max_neurons: Maximum neurons for full pairwise analysis (samples if larger)
 
         Returns:
             Diversity statistics per pool
@@ -298,17 +301,28 @@ class CoselectionAnalyzer:
             n_neurons = neurons.shape[0]
             display = pool_info['display']
 
-            print(f"\n  {display} Subspace Diversity ({n_neurons} neurons, shape={neurons.shape})")
+            # Sample if too large to avoid O(n²) memory issues
+            sampled = False
+            if n_neurons > max_neurons:
+                print(f"\n  {display} Subspace Diversity (sampling {max_neurons}/{n_neurons} neurons)", flush=True)
+                indices = torch.randperm(n_neurons, device=self.device)[:max_neurons]
+                neurons_sample = neurons[indices]
+                n_sample = max_neurons
+                sampled = True
+            else:
+                print(f"\n  {display} Subspace Diversity ({n_neurons} neurons, shape={neurons.shape})", flush=True)
+                neurons_sample = neurons
+                n_sample = n_neurons
 
             # Flatten each neuron
-            neurons_flat = neurons.view(n_neurons, -1)
+            neurons_flat = neurons_sample.reshape(n_sample, -1)
 
             # Pairwise cosine similarity
             neurons_norm = F.normalize(neurons_flat, dim=-1)
             sim_matrix = torch.mm(neurons_norm, neurons_norm.t())
 
             # Remove diagonal
-            mask = ~torch.eye(n_neurons, dtype=torch.bool, device=self.device)
+            mask = ~torch.eye(n_sample, dtype=torch.bool, device=self.device)
             sim_off_diag = sim_matrix[mask]
 
             avg_sim = sim_off_diag.mean().item()
@@ -318,17 +332,17 @@ class CoselectionAnalyzer:
 
             # Find most similar pairs
             sim_flat = sim_matrix.clone().view(-1)
-            for i in range(n_neurons):
-                sim_flat[i * n_neurons + i] = -2  # Exclude diagonal
+            for i in range(n_sample):
+                sim_flat[i * n_sample + i] = -2  # Exclude diagonal
 
-            top_k = min(10, n_neurons * (n_neurons - 1) // 2)
+            top_k = min(10, n_sample * (n_sample - 1) // 2)
             top_vals, top_idx = torch.topk(sim_flat, top_k)
 
             top_similar = []
             for i in range(top_k):
                 idx = top_idx[i].item()
-                n_i = idx // n_neurons
-                n_j = idx % n_neurons
+                n_i = idx // n_sample
+                n_j = idx % n_sample
                 top_similar.append((n_i, n_j, top_vals[i].item()))
 
             # Interpretation
@@ -341,6 +355,8 @@ class CoselectionAnalyzer:
 
             results[display] = {
                 'n_neurons': n_neurons,
+                'n_sampled': n_sample if sampled else n_neurons,
+                'sampled': sampled,
                 'mean_similarity': avg_sim,
                 'std_similarity': std_sim,
                 'min_similarity': min_sim,
@@ -349,8 +365,8 @@ class CoselectionAnalyzer:
                 'interpretation': interpretation,
             }
 
-            print(f"    Mean pairwise similarity: {avg_sim:.4f} +/- {std_sim:.4f}")
-            print(f"    Interpretation: {interpretation}")
+            print(f"    Mean pairwise similarity: {avg_sim:.4f} +/- {std_sim:.4f}", flush=True)
+            print(f"    Interpretation: {interpretation}", flush=True)
 
         return results
 
@@ -439,25 +455,40 @@ class CoselectionAnalyzer:
 
         all_results = {}
 
-        print("\n--- Analyzing Co-selection Patterns ---")
+        print("\n--- Analyzing Co-selection Patterns ---", flush=True)
         for pair_key in pairs_to_analyze:
             if pair_key not in COSELECTION_PAIRS:
-                print(f"  Skip unknown pair: {pair_key}")
+                print(f"  Skip unknown pair: {pair_key}", flush=True)
                 continue
 
-            # Co-selection analysis
-            cosel_results = self.analyze_coselection(dataloader, pair_key, n_batches)
-            if cosel_results:
-                all_results[pair_key] = cosel_results
+            try:
+                # Co-selection analysis
+                print(f"  Starting {pair_key} co-selection...", flush=True)
+                cosel_results = self.analyze_coselection(dataloader, pair_key, n_batches)
+                if cosel_results:
+                    all_results[pair_key] = cosel_results
+                print(f"  Completed {pair_key} co-selection.", flush=True)
 
-            # Subspace diversity
-            div_results = self.analyze_subspace_diversity(pair_key)
-            if div_results and pair_key in all_results:
-                all_results[pair_key]['subspace_diversity'] = div_results
+                # Subspace diversity
+                print(f"  Starting {pair_key} subspace diversity...", flush=True)
+                div_results = self.analyze_subspace_diversity(pair_key)
+                if div_results and pair_key in all_results:
+                    all_results[pair_key]['subspace_diversity'] = div_results
+                print(f"  Completed {pair_key} subspace diversity.", flush=True)
+
+            except Exception as e:
+                print(f"  ERROR in {pair_key}: {e}", flush=True)
+                traceback.print_exc()
+                all_results[pair_key] = {'error': str(e)}
 
         # Visualize
         if HAS_MATPLOTLIB:
-            print("\n--- Generating Visualizations ---")
-            self.visualize_coselection(all_results, output_dir)
+            print("\n--- Generating Visualizations ---", flush=True)
+            try:
+                self.visualize_coselection(all_results, output_dir)
+            except Exception as e:
+                print(f"  ERROR in visualization: {e}", flush=True)
+                traceback.print_exc()
 
+        print("--- Co-selection Analysis Complete ---", flush=True)
         return all_results

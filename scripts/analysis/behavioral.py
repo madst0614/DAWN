@@ -484,16 +484,38 @@ class BehavioralAnalyzer:
         Returns:
             Combined results dictionary
         """
+        import traceback
         os.makedirs(output_dir, exist_ok=True)
 
-        results = {
-            'trajectory': self.analyze_token_trajectory(dataloader, n_batches),
-            'probing': self.run_probing(dataloader, n_batches * 2),
-        }
+        results = {}
+
+        try:
+            print("  Running trajectory analysis...", flush=True)
+            results['trajectory'] = self.analyze_token_trajectory(dataloader, n_batches)
+            print("  Trajectory complete.", flush=True)
+        except Exception as e:
+            print(f"  ERROR in trajectory: {e}", flush=True)
+            traceback.print_exc()
+            results['trajectory'] = {'error': str(e)}
+
+        try:
+            print("  Running probing analysis...", flush=True)
+            results['probing'] = self.run_probing(dataloader, n_batches * 2)
+            print("  Probing complete.", flush=True)
+        except Exception as e:
+            print(f"  ERROR in probing: {e}", flush=True)
+            traceback.print_exc()
+            results['probing'] = {'error': str(e)}
 
         # Visualization
-        viz_path = self.visualize_trajectory(results['trajectory'], output_dir)
-        if viz_path:
-            results['trajectory_visualization'] = viz_path
+        try:
+            print("  Generating visualization...", flush=True)
+            viz_path = self.visualize_trajectory(results.get('trajectory', {}), output_dir)
+            if viz_path:
+                results['trajectory_visualization'] = viz_path
+            print("  Visualization complete.", flush=True)
+        except Exception as e:
+            print(f"  ERROR in visualization: {e}", flush=True)
+            traceback.print_exc()
 
         return results
