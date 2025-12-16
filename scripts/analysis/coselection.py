@@ -301,6 +301,9 @@ class CoselectionAnalyzer:
             n_neurons = neurons.shape[0]
             display = pool_info['display']
 
+            # Ensure neurons are on the correct device
+            neurons = neurons.to(self.device)
+
             # Sample if too large to avoid O(n²) memory issues
             sampled = False
             if n_neurons > max_neurons:
@@ -317,12 +320,12 @@ class CoselectionAnalyzer:
             # Flatten each neuron
             neurons_flat = neurons_sample.reshape(n_sample, -1)
 
-            # Pairwise cosine similarity
+            # Pairwise cosine similarity (all on GPU)
             neurons_norm = F.normalize(neurons_flat, dim=-1)
             sim_matrix = torch.mm(neurons_norm, neurons_norm.t())
 
-            # Remove diagonal
-            mask = ~torch.eye(n_sample, dtype=torch.bool, device=self.device)
+            # Remove diagonal (mask on same device as sim_matrix)
+            mask = ~torch.eye(n_sample, dtype=torch.bool, device=sim_matrix.device)
             sim_off_diag = sim_matrix[mask]
 
             avg_sim = sim_off_diag.mean().item()
