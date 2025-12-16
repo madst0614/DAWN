@@ -962,13 +962,14 @@ class SemanticAnalyzer:
     # Run All
     # ============================================================
 
-    def run_all(self, dataloader=None, output_dir: str = './semantic_analysis') -> Dict:
+    def run_all(self, dataloader=None, output_dir: str = './semantic_analysis', max_batches: int = 50) -> Dict:
         """
         Run all semantic analyses.
 
         Args:
             dataloader: DataLoader for input data (optional)
             output_dir: Directory for outputs
+            max_batches: Maximum batches for POS and heatmap analysis
 
         Returns:
             Combined results dictionary
@@ -989,11 +990,11 @@ class SemanticAnalyzer:
 
         # 3. POS Routing (requires dataloader, uses nlp.pipe)
         if dataloader is not None:
-            print("\n[3/4] Analyzing POS Routing Patterns (nlp.pipe)...")
-            results['pos_routing'] = self.analyze_pos_routing(dataloader)
+            print(f"\n[3/4] Analyzing POS Routing Patterns (max_batches={max_batches})...")
+            results['pos_routing'] = self.analyze_pos_routing(dataloader, max_batches=max_batches)
 
-            print("\n[4/4] Generating Neuron-Token Heatmap...")
-            results['neuron_heatmap'] = self.analyze_neuron_token_heatmap(dataloader)
+            print(f"\n[4/4] Generating Neuron-Token Heatmap (max_batches={max_batches})...")
+            results['neuron_heatmap'] = self.analyze_neuron_token_heatmap(dataloader, max_batches=max_batches)
         else:
             print("\n[3/4] Skipping POS analysis (no dataloader)")
             print("\n[4/4] Skipping heatmap (no dataloader)")

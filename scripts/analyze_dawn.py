@@ -229,13 +229,13 @@ class DAWNAnalyzer:
 
         return results
 
-    def run_semantic_analysis(self, dataloader=None, output_dir: str = None) -> Dict:
+    def run_semantic_analysis(self, dataloader=None, max_batches: int = 50, output_dir: str = None) -> Dict:
         """Semantic analysis (NEW)."""
         print("\n" + "="*60)
         print("SEMANTIC ANALYSIS")
         print("="*60)
 
-        results = self.semantic.run_all(dataloader, output_dir)
+        results = self.semantic.run_all(dataloader, output_dir, max_batches=max_batches)
 
         # Path similarity
         path_sim = results.get('path_similarity', {})
@@ -444,7 +444,7 @@ def main():
     elif args.mode == 'neuron':
         results = analyzer.analyze_single_neuron(args.neuron_id, args.neuron_type)
     elif args.mode == 'semantic':
-        results = analyzer.run_semantic_analysis(dataloader, args.output_dir)
+        results = analyzer.run_semantic_analysis(dataloader, args.max_batches, args.output_dir)
     elif args.mode == 'coselection':
         if dataloader is None:
             print("ERROR: --val_data required for coselection analysis")
