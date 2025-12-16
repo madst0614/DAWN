@@ -339,17 +339,17 @@ if __name__ == "__main__":
     input_ids = torch.randint(0, 30522, (batch_size, seq_len)).to(device)
     labels = torch.randint(0, 30522, (batch_size, seq_len)).to(device)
 
-    # Forward
+    # Forward (no labels)
     logits = baseline(input_ids)
     print(f"  Input: {input_ids.shape}")
     print(f"  Output: {logits.shape}")
 
-    # Loss
-    loss, loss_dict, _ = baseline.get_loss(input_ids, labels)
+    # Forward with labels (returns loss, logits)
+    loss, logits = baseline(input_ids, labels=labels)
     print(f"  Loss: {loss.item():.4f}")
 
-    # With return_activations (compatibility)
-    logits, activations = baseline(input_ids, return_activations=True)
-    print(f"  Activations: {activations} (empty for baseline)")
+    # With return_routing_info (compatibility with DAWN)
+    loss, logits, routing_info = baseline(input_ids, labels=labels, return_routing_info=True)
+    print(f"  Routing info: {routing_info} (empty for baseline)")
 
     print(f"\n✅ Baseline ready for training!")

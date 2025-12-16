@@ -438,6 +438,12 @@ class GlobalRouters(nn.Module):
                 'rqk_weights_Q': rqk_weights_Q.detach(),
                 'rqk_weights_K': rqk_weights_K.detach(),
                 'rv_weights': rv_weights.detach(),
+                'fqk_q_pref': fqk_pref_Q.detach(),
+                'fqk_k_pref': fqk_pref_K.detach(),
+                'fv_pref': fv_pref.detach(),
+                'rqk_q_pref': rqk_pref_Q.detach(),
+                'rqk_k_pref': rqk_pref_K.detach(),
+                'rv_pref': rv_pref.detach(),
                 'token_routing': True,
             }
         else:

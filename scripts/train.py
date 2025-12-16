@@ -1213,17 +1213,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     except Exception:
                         pass
 
-                    # Warning if collapse detected (check min entropy across router types)
-                    if attn.get('feature_r_pref') is not None:
-                        min_ent = min(ent_FR, ent_FV, ent_RQ, ent_RK, ent_V)
-                    else:
-                        min_ent = 100  # Unknown format, skip warning
-
-                    if min_ent < 30:
-                        print(f"  ⚠ WARNING: Router may be collapsing! (target: 60%)")
-                    elif min_ent > 80:
-                        print(f"  ⚠ WARNING: Router too uniform! (target: 60%)")
-
                 except Exception:
                     pass  # Skip if routing_infos format is different
 
@@ -1387,52 +1376,6 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
     return avg_loss, avg_acc
-
-
-def analyze_activations(model, input_ids, device):
-    """Dynamic Neuron Transformer activation pattern analysis (v6.0+)"""
-    model.eval()
-    base_model = get_underlying_model(model)
-
-    with torch.no_grad():
-        # v7.5/v7.6: use return_routing_info, v6.0: use return_activations
-        if is_v75_or_v76_model(model):
-            logits, routing_infos = model(input_ids, return_routing_info=True)
-            # Extract neuron_indices from routing_infos
-            all_selected = [info['neuron_indices'] for info in routing_infos]
-        else:
-            _, all_selected = model(input_ids, return_activations=True)
-
-    stats = {}
-    for layer_idx, selected_idx in enumerate(all_selected):
-        # selected_idx: [B, S, k]
-        unique_neurons = torch.unique(selected_idx).numel()
-
-        # Get total neurons from model
-        layer = base_model.layers[layer_idx]
-
-        # v7.5/v7.6: qkv_dynamic.n_neurons, v7.0: ffn.n_neurons, v6.0: router
-        if hasattr(layer, 'qkv_dynamic') and hasattr(layer.qkv_dynamic, 'n_neurons'):
-            total_neurons = layer.qkv_dynamic.n_neurons
-        elif hasattr(layer, 'ffn') and hasattr(layer.ffn, 'n_neurons'):
-            total_neurons = layer.ffn.n_neurons
-        elif hasattr(layer, 'router') and hasattr(layer.router, 'n_neurons'):
-            total_neurons = layer.router.n_neurons
-        elif hasattr(layer, 'neuron_router') and hasattr(layer.neuron_router, 'n_neurons'):
-            total_neurons = layer.neuron_router.n_neurons
-        else:
-            total_neurons = base_model.n_neurons
-
-        usage_ratio = unique_neurons / total_neurons
-
-        stats[f'layer_{layer_idx}'] = {
-            'unique_neurons': unique_neurons,
-            'total_neurons': total_neurons,
-            'usage_ratio': usage_ratio,
-            'k': selected_idx.shape[-1],
-        }
-
-    return stats
 
 
 def compute_training_metrics(model, neuron_indices, device):

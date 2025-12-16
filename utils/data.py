@@ -304,11 +304,10 @@ class CacheLoader:
     """
     Load cached datasets from pickle files.
 
-    Uses the cache system at /content/drive/MyDrive/data/
     Uses wikitext_5to1_texts.pkl which has train/validation already split 5:1
     """
 
-    CACHE_BASE_DIR = "/content/drive/MyDrive/data"
+    CACHE_BASE_DIR = os.environ.get('DAWN_DATA_DIR', './data')
 
     @staticmethod
     def load_texts(
@@ -822,8 +821,12 @@ def evaluate_mlm_batch(model, input_ids, tokenizer, device, config=None):
             input_ids=masked_input_ids,
             labels=labels
         )
-        loss = outputs['loss']
-        logits = outputs['logits']
+        # Handle both DAWN (tuple) and HuggingFace (dict) output formats
+        if isinstance(outputs, tuple):
+            loss, logits = outputs[0], outputs[1]
+        else:
+            loss = outputs['loss']
+            logits = outputs['logits']
 
         num_correct, num_valid = compute_mlm_accuracy(logits, labels)
 
