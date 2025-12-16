@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import Dict, Optional
-from collections import Counter
+from collections import Counter, defaultdict
 
 from .utils import (
     NEURON_TYPES, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS, QK_POOLS,
@@ -172,8 +172,9 @@ class RoutingAnalyzer:
         Returns:
             Dictionary with diversity metrics
         """
-        union_selected = {key: set() for key in ROUTING_KEYS.keys()}
-        per_batch_counts = {key: [] for key in ROUTING_KEYS.keys()}
+        # Use defaultdict for dynamic layer keys
+        union_selected = defaultdict(set)
+        per_batch_counts = defaultdict(list)
 
         self.model.eval()
         with torch.no_grad():
