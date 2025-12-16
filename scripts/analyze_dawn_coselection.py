@@ -587,7 +587,7 @@ class CoselectionAnalyzer:
             'mean_abs_alignment': avg_align,
             'max_abs_alignment': max_align,
             'top_aligned_pairs': top_aligned,
-            'alignment_matrix': alignment.cpu().numpy().tolist(),
+            'alignment_matrix': alignment.detach().cpu().numpy().tolist(),
         }
 
         print(f"    Mean |alignment|: {avg_align:.4f}")

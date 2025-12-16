@@ -129,15 +129,29 @@ def create_dataloader(data_path: str, tokenizer, batch_size: int = 32):
         import pandas as pd
         df = pd.read_parquet(data_path)
         texts = df['text'].tolist()[:10000]
+        dataset = TextDataset(texts, tokenizer)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False)
     elif data_path.endswith('.json'):
         with open(data_path) as f:
             data = json.load(f)
         texts = [d['text'] for d in data[:10000]]
+        dataset = TextDataset(texts, tokenizer)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    elif data_path.endswith('.pt'):
+        from torch.utils.data import TensorDataset
+        data = torch.load(data_path)
+        if isinstance(data, dict):
+            input_ids = data.get('input_ids', data.get('tokens'))
+        else:
+            input_ids = data
+        if input_ids.dim() == 1:
+            seq_len = 512
+            n_seqs = input_ids.shape[0] // seq_len
+            input_ids = input_ids[:n_seqs * seq_len].view(n_seqs, seq_len)
+        dataset = TensorDataset(input_ids[:10000])
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False)
     else:
         raise ValueError(f"Unsupported format: {data_path}")
-
-    dataset = TextDataset(texts, tokenizer)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
 
 class QKAnalyzer:
@@ -176,7 +190,13 @@ class QKAnalyzer:
                     if i >= n_batches:
                         break
 
-                    input_ids = batch['input_ids'].to(self.device)
+                    # Handle different batch formats
+                    if isinstance(batch, (list, tuple)):
+                        input_ids = batch[0].to(self.device)
+                    elif isinstance(batch, dict):
+                        input_ids = batch['input_ids'].to(self.device)
+                    else:
+                        input_ids = batch.to(self.device)
 
                     try:
                         outputs = self.model(input_ids, return_routing_info=True)
@@ -268,7 +288,13 @@ class QKAnalyzer:
                     if i >= n_batches:
                         break
 
-                    input_ids = batch['input_ids'].to(self.device)
+                    # Handle different batch formats
+                    if isinstance(batch, (list, tuple)):
+                        input_ids = batch[0].to(self.device)
+                    elif isinstance(batch, dict):
+                        input_ids = batch['input_ids'].to(self.device)
+                    else:
+                        input_ids = batch.to(self.device)
 
                     try:
                         outputs = self.model(input_ids, return_routing_info=True)
