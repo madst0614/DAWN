@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-DAWN v17.1 Analysis Suite
-========================
-v17.1 전용 분석 도구 - 깔끔하게 정리된 버전
+DAWN Model Analysis Suite
+=========================
+Analysis toolkit for the DAWN (Dynamic Attention and Weight Network) model.
 
-분석 카테고리:
-1. Usage Analysis    - EMA 분포, 활성/죽은 뉴런, 다양성
-2. Routing Analysis  - 라우팅 패턴, 엔트로피, 선택 빈도
-3. Embedding Analysis - 뉴런 임베딩, 유사도, 클러스터링
-4. Weight Analysis   - SVD, 뉴런 가중치 분석
-5. Behavioral Analysis - 토큰 궤적, 프로빙, 어블레이션
+Analysis Categories:
+1. Usage Analysis     - EMA distribution, active/dead neurons, diversity
+2. Routing Analysis   - Routing patterns, entropy, selection frequency
+3. Embedding Analysis - Neuron embeddings, similarity, clustering
 
 Usage:
-    python analyze_v17.py --checkpoint path/to/ckpt --mode all
-    python analyze_v17.py --checkpoint path/to/ckpt --mode usage
-    python analyze_v17.py --checkpoint path/to/ckpt --mode routing --val_data path/to/data
+    python analyze_dawn.py --checkpoint path/to/ckpt --mode all
+    python analyze_dawn.py --checkpoint path/to/ckpt --mode usage
+    python analyze_dawn.py --checkpoint path/to/ckpt --mode routing --val_data path/to/data
 """
 
 import sys
@@ -54,10 +52,10 @@ except ImportError:
 
 
 # ============================================================
-# v17.1 Neuron Types Configuration
+# DAWN Neuron Types Configuration
 # ============================================================
 
-V17_NEURON_TYPES = {
+NEURON_TYPES = {
     # (display_name, ema_attr, n_attr, color)
     'feature_qk':   ('FQK',  'usage_ema_feature_qk',   'n_feature_qk',   'red'),
     'feature_v':    ('FV',   'usage_ema_feature_v',    'n_feature_v',    'orange'),
@@ -67,7 +65,7 @@ V17_NEURON_TYPES = {
     'restore_know': ('RK',   'usage_ema_restore_know', 'n_restore_know', 'cyan'),
 }
 
-V17_ROUTING_KEYS = {
+ROUTING_KEYS = {
     # (display_name, pref_key, weight_key, pool_type)
     'fqk_q': ('FQK_Q', 'fqk_q_pref', 'fqk_weights_Q', 'feature_qk'),
     'fqk_k': ('FQK_K', 'fqk_k_pref', 'fqk_weights_K', 'feature_qk'),
@@ -195,7 +193,7 @@ class UsageAnalyzer:
         results = {}
         threshold = 0.01
 
-        for name, (display, ema_attr, n_attr, _) in V17_NEURON_TYPES.items():
+        for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
             if not hasattr(self.router, ema_attr):
                 continue
 
@@ -235,7 +233,7 @@ class UsageAnalyzer:
             'weight': weight,
         }
 
-        for name, (display, ema_attr, _, _) in V17_NEURON_TYPES.items():
+        for name, (display, ema_attr, _, _) in NEURON_TYPES.items():
             if not hasattr(self.router, ema_attr):
                 continue
 
@@ -257,7 +255,7 @@ class UsageAnalyzer:
         results = {}
         threshold = 0.01
 
-        for name, (display, ema_attr, n_attr, _) in V17_NEURON_TYPES.items():
+        for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
             if not hasattr(self.router, ema_attr):
                 continue
 
@@ -320,7 +318,7 @@ class UsageAnalyzer:
         dying_threshold = 0.05
         tau = self.router.tau
 
-        for name, (display, ema_attr, n_attr, _) in V17_NEURON_TYPES.items():
+        for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
             if not hasattr(self.router, ema_attr):
                 continue
 
@@ -374,7 +372,7 @@ class RoutingAnalyzer:
 
     def analyze_entropy(self, dataloader, n_batches: int = 50) -> Dict:
         """라우팅 엔트로피 분석"""
-        entropy_data = {name: [] for name in V17_ROUTING_KEYS.keys()}
+        entropy_data = {name: [] for name in ROUTING_KEYS.keys()}
 
         self.model.eval()
         with torch.no_grad():
@@ -394,14 +392,14 @@ class RoutingAnalyzer:
                 for layer_info in routing_infos:
                     attn = layer_info.get('attention', {})
 
-                    for key, (display, pref_key, _, _) in V17_ROUTING_KEYS.items():
+                    for key, (display, pref_key, _, _) in ROUTING_KEYS.items():
                         pref = attn.get(pref_key)
                         if pref is not None:
                             ent = calc_entropy_ratio(pref)
                             entropy_data[key].append(ent)
 
         results = {}
-        for key, (display, _, _, pool) in V17_ROUTING_KEYS.items():
+        for key, (display, _, _, pool) in ROUTING_KEYS.items():
             if entropy_data[key]:
                 results[key] = {
                     'display': display,
@@ -416,7 +414,7 @@ class RoutingAnalyzer:
 
     def analyze_selection_frequency(self, dataloader, n_batches: int = 50) -> Dict:
         """뉴런 선택 빈도 분석"""
-        selection_counts = {name: Counter() for name in V17_ROUTING_KEYS.keys()}
+        selection_counts = {name: Counter() for name in ROUTING_KEYS.keys()}
 
         self.model.eval()
         with torch.no_grad():
@@ -435,7 +433,7 @@ class RoutingAnalyzer:
                 for layer_info in routing_infos:
                     attn = layer_info.get('attention', {})
 
-                    for key, (_, pref_key, _, _) in V17_ROUTING_KEYS.items():
+                    for key, (_, pref_key, _, _) in ROUTING_KEYS.items():
                         pref = attn.get(pref_key)
                         if pref is None:
                             continue
@@ -449,7 +447,7 @@ class RoutingAnalyzer:
                             selection_counts[key][int(idx)] += 1
 
         results = {}
-        for key, (display, _, _, pool) in V17_ROUTING_KEYS.items():
+        for key, (display, _, _, pool) in ROUTING_KEYS.items():
             counts = selection_counts[key]
             if not counts:
                 continue
@@ -459,7 +457,7 @@ class RoutingAnalyzer:
             unique = len(counts)
 
             # Get pool size
-            pool_info = V17_NEURON_TYPES.get(pool, {})
+            pool_info = NEURON_TYPES.get(pool, {})
             n_attr = pool_info[2] if pool_info else None
             n_total = getattr(self.router, n_attr, 0) if n_attr else 0
 
@@ -553,7 +551,7 @@ class EmbeddingAnalyzer:
 
         result = {}
         offset = 0
-        for name, (display, _, n_attr, _) in V17_NEURON_TYPES.items():
+        for name, (display, _, n_attr, _) in NEURON_TYPES.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
                 result[name] = emb[offset:offset + n]
@@ -578,7 +576,7 @@ class EmbeddingAnalyzer:
             n = sim_matrix.shape[0]
             off_diag = sim_matrix[~np.eye(n, dtype=bool)]
 
-            display = V17_NEURON_TYPES[name][0]
+            display = NEURON_TYPES[name][0]
             results[name] = {
                 'display': display,
                 'n_neurons': n,
@@ -606,7 +604,7 @@ class EmbeddingAnalyzer:
             for n2 in names[i+1:]:
                 c1, c2 = centroids[n1], centroids[n2]
                 sim = np.dot(c1, c2) / (np.linalg.norm(c1) * np.linalg.norm(c2) + 1e-8)
-                key = f"{V17_NEURON_TYPES[n1][0]}-{V17_NEURON_TYPES[n2][0]}"
+                key = f"{NEURON_TYPES[n1][0]}-{NEURON_TYPES[n2][0]}"
                 results[key] = float(sim)
 
         return results
@@ -623,7 +621,7 @@ class EmbeddingAnalyzer:
         # Build labels
         labels = []
         colors_map = {}
-        for name, (display, _, n_attr, color) in V17_NEURON_TYPES.items():
+        for name, (display, _, n_attr, color) in NEURON_TYPES.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
                 labels.extend([display] * n)
@@ -644,11 +642,11 @@ class EmbeddingAnalyzer:
                 mask = np.array([l == t for l in labels])
                 ax.scatter(data[mask, 0], data[mask, 1],
                           c=colors_map.get(t, 'gray'), label=t, alpha=0.6, s=20)
-            ax.set_title(f'v17.1 Neuron Embeddings ({title})')
+            ax.set_title(f'DAWN Neuron Embeddings ({title})')
             ax.legend()
 
         plt.tight_layout()
-        path = os.path.join(output_dir, 'v17_embeddings.png')
+        path = os.path.join(output_dir, 'dawn_embeddings.png')
         plt.savefig(path, dpi=150)
         plt.close()
 
@@ -659,8 +657,8 @@ class EmbeddingAnalyzer:
 # Main Analyzer Class
 # ============================================================
 
-class V17Analyzer:
-    """v17.1 통합 분석기"""
+class DAWNAnalyzer:
+    """DAWN model integrated analyzer"""
 
     def __init__(self, model, tokenizer, device='cuda'):
         self.model = model
@@ -676,7 +674,7 @@ class V17Analyzer:
         self.embedding = EmbeddingAnalyzer(self.router)
         self.routing = RoutingAnalyzer(model, self.router, device)
 
-        print("V17 Analyzer initialized")
+        print("DAWN Analyzer initialized")
 
     def run_usage_analysis(self, output_dir: str = None) -> Dict:
         """Usage 분석 실행"""
@@ -772,7 +770,7 @@ class V17Analyzer:
 
         return results
 
-    def run_all(self, dataloader=None, output_dir: str = './v17_analysis') -> Dict:
+    def run_all(self, dataloader=None, output_dir: str = './dawn_analysis') -> Dict:
         """전체 분석 실행"""
         os.makedirs(output_dir, exist_ok=True)
 
@@ -785,7 +783,7 @@ class V17Analyzer:
             results['routing'] = self.run_routing_analysis(dataloader, output_dir=output_dir)
 
         # Save results
-        output_path = os.path.join(output_dir, 'v17_analysis.json')
+        output_path = os.path.join(output_dir, 'dawn_analysis.json')
         with open(output_path, 'w') as f:
             json.dump(convert_to_serializable(results), f, indent=2)
         print(f"\nResults saved to: {output_path}")
@@ -838,13 +836,13 @@ def create_dataloader(data_path: str, tokenizer, batch_size: int = 32):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='DAWN v17.1 Analysis Suite')
+    parser = argparse.ArgumentParser(description='DAWN Model Analysis Suite')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint')
     parser.add_argument('--mode', type=str, default='all',
                         choices=['all', 'usage', 'routing', 'embedding'],
                         help='Analysis mode')
     parser.add_argument('--val_data', type=str, default=None, help='Validation data (for routing analysis)')
-    parser.add_argument('--output_dir', type=str, default='./v17_analysis', help='Output directory')
+    parser.add_argument('--output_dir', type=str, default='./dawn_analysis', help='Output directory')
     parser.add_argument('--n_batches', type=int, default=50, help='Number of batches for routing analysis')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
@@ -856,7 +854,7 @@ def main():
     model, tokenizer, config = load_model(args.checkpoint, device)
 
     # Create analyzer
-    analyzer = V17Analyzer(model, tokenizer, device)
+    analyzer = DAWNAnalyzer(model, tokenizer, device)
 
     # Create dataloader if needed
     dataloader = None
@@ -879,7 +877,7 @@ def main():
         results = analyzer.run_embedding_analysis(args.output_dir)
 
     # Save results
-    output_path = os.path.join(args.output_dir, f'v17_{args.mode}.json')
+    output_path = os.path.join(args.output_dir, f'dawn_{args.mode}.json')
     with open(output_path, 'w') as f:
         json.dump(convert_to_serializable(results), f, indent=2)
 
