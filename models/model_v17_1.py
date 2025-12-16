@@ -594,22 +594,20 @@ class AttentionCircuit(nn.Module):
         K = K.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Use F.scaled_dot_product_attention for better gradient flow
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
+
+        # Causal mask (language modeling: cannot see future tokens)
+        causal_mask = torch.triu(torch.ones(S, S, device=scores.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(causal_mask[None, None, :, :], float('-inf'))
+
+        # Padding mask (optional)
         if attention_mask is not None:
-            causal_mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1)
-            pad_mask = (attention_mask == 0).view(B, 1, 1, S)
-            combined_mask = causal_mask.unsqueeze(0).unsqueeze(0) | pad_mask
-            attn_out = F.scaled_dot_product_attention(
-                Q, K, V,
-                attn_mask=~combined_mask,
-                dropout_p=self.attn_dropout.p if self.training else 0.0
-            )
-        else:
-            attn_out = F.scaled_dot_product_attention(
-                Q, K, V,
-                is_causal=True,
-                dropout_p=self.attn_dropout.p if self.training else 0.0
-            )
+            mask = attention_mask[:, None, None, :]
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        attn_out = torch.matmul(attn_weights, V)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
         output = self.expand_O(attn_out)
         output = self.out_dropout(output)
