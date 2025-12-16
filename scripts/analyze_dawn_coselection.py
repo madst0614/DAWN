@@ -39,54 +39,60 @@ except ImportError:
 # v17.1 Pool Pairs for Co-selection Analysis
 COSELECTION_PAIRS = {
     'fqk_rqk': {
-        'name': 'FQK-RQK (Q/K Processing)',
+        'name': 'F-QK / R-QK (Q/K Processing)',
         'pool_a': {
             'type': 'feature_qk',
-            'display': 'FQK',
+            'display': 'F-QK',
             'pref_key': 'fqk_q_pref',  # Use Q preference
+            'source': 'attention',
             'n_attr': 'n_feature_qk',
             'neuron_attr': 'feature_qk_neurons',
         },
         'pool_b': {
             'type': 'restore_qk',
-            'display': 'RQK',
+            'display': 'R-QK',
             'pref_key': 'rqk_q_pref',
+            'source': 'attention',
             'n_attr': 'n_restore_qk',
             'neuron_attr': 'restore_qk_neurons',
         },
     },
     'fv_rv': {
-        'name': 'FV-RV (Value Processing)',
+        'name': 'F-V / R-V (Value Processing)',
         'pool_a': {
             'type': 'feature_v',
-            'display': 'FV',
+            'display': 'F-V',
             'pref_key': 'fv_pref',
+            'source': 'attention',
             'n_attr': 'n_feature_v',
             'neuron_attr': 'feature_v_neurons',
         },
         'pool_b': {
             'type': 'restore_v',
-            'display': 'RV',
+            'display': 'R-V',
             'pref_key': 'rv_pref',
+            'source': 'attention',
             'n_attr': 'n_restore_v',
             'neuron_attr': 'restore_v_neurons',
         },
     },
     'fk_rk': {
-        'name': 'FK-RK (Knowledge Processing)',
+        'name': 'F-Know / R-Know (Knowledge Processing)',
         'pool_a': {
             'type': 'feature_know',
-            'display': 'FK',
-            'pref_key': 'fk_pref',
+            'display': 'F-Know',
+            'pref_key': 'feature_know_w',  # v17.1 uses feature_know_w
+            'source': 'knowledge',
             'n_attr': 'n_feature_know',
-            'neuron_attr': 'feature_know_neurons',
+            'neuron_attr': 'feature_know',
         },
         'pool_b': {
             'type': 'restore_know',
-            'display': 'RK',
-            'pref_key': 'rk_pref',
+            'display': 'R-Know',
+            'pref_key': 'restore_know_w',  # v17.1 uses restore_know_w
+            'source': 'knowledge',
             'n_attr': 'n_restore_know',
-            'neuron_attr': 'restore_know_neurons',
+            'neuron_attr': 'restore_know',
         },
     },
 }
@@ -263,13 +269,15 @@ class CoselectionAnalyzer:
                     routing_infos = outputs[-1]
                     if not routing_infos:
                         continue
-                    attn = routing_infos[0].get('attention', {})
+                    layer_info = routing_infos[0]
                 except Exception as e:
                     continue
 
-                # Get preferences
-                pref_a = attn.get(pool_a['pref_key'])
-                pref_b = attn.get(pool_b['pref_key'])
+                # Get preferences from the right source dict (attention or knowledge)
+                source_a = layer_info.get(pool_a.get('source', 'attention'), {})
+                source_b = layer_info.get(pool_b.get('source', 'attention'), {})
+                pref_a = source_a.get(pool_a['pref_key'])
+                pref_b = source_b.get(pool_b['pref_key'])
 
                 if pref_a is None or pref_b is None:
                     continue
