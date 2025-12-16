@@ -93,18 +93,20 @@ class BehavioralAnalyzer:
 
         return results
 
-    def analyze_token_trajectory(self, dataloader, n_batches: int = 20) -> Dict:
+    def analyze_token_trajectory(self, dataloader, n_batches: int = 20, layer_idx: int = None) -> Dict:
         """
-        Analyze how routing entropy changes across sequence positions.
+        Analyze how routing entropy changes across sequence positions for ALL layers.
 
         Args:
             dataloader: DataLoader for input data
             n_batches: Number of batches to process
+            layer_idx: Specific layer to analyze (None = aggregate all layers)
 
         Returns:
-            Dictionary with position-wise entropy statistics
+            Dictionary with position-wise entropy statistics per layer
         """
-        position_routing = defaultdict(lambda: defaultdict(list))
+        # {layer: {routing_key: {position: [entropy_values]}}}
+        layer_position_routing = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
         self.model.eval()
         with torch.no_grad():
@@ -119,23 +121,56 @@ class BehavioralAnalyzer:
                 if routing_infos is None:
                     continue
 
-                attn = routing_infos[0].get('attention', {})
-
-                for key, (_, pref_key, _, _) in ROUTING_KEYS.items():
-                    pref = attn.get(pref_key)
-                    if pref is None:
+                # Process ALL layers
+                for lidx, layer_info in enumerate(routing_infos):
+                    if layer_idx is not None and lidx != layer_idx:
                         continue
 
-                    if pref.dim() == 3:  # [B, S, N]
-                        for pos in range(min(pref.shape[1], 128)):
-                            ent = calc_entropy_ratio(pref[:, pos, :])
-                            position_routing[key][pos].append(ent)
+                    attn = layer_info.get('attention', {})
 
-        results = {}
+                    for key, (_, pref_key, _, _) in ROUTING_KEYS.items():
+                        pref = attn.get(pref_key)
+                        if pref is None:
+                            continue
+
+                        if pref.dim() == 3:  # [B, S, N]
+                            for pos in range(min(pref.shape[1], 128)):
+                                ent = calc_entropy_ratio(pref[:, pos, :])
+                                layer_position_routing[lidx][key][pos].append(ent)
+
+        # Build per-layer results
+        results = {'per_layer': {}}
+
+        # Aggregate data for overall results
+        aggregated_routing = defaultdict(lambda: defaultdict(list))
+
+        for lidx, position_routing in layer_position_routing.items():
+            layer_results = {}
+            for key in ROUTING_KEYS.keys():
+                if position_routing[key]:
+                    pos_avg = {}
+                    for pos, values in position_routing[key].items():
+                        pos_avg[pos] = float(np.mean(values))
+                        aggregated_routing[key][pos].extend(values)
+
+                    early_positions = [v for p, v in pos_avg.items() if p < 10]
+                    late_positions = [v for p, v in pos_avg.items() if p >= 10]
+
+                    layer_results[key] = {
+                        'display': ROUTING_KEYS[key][0],
+                        'position_entropy': pos_avg,
+                        'early_avg': float(np.mean(early_positions)) if early_positions else 0,
+                        'late_avg': float(np.mean(late_positions)) if late_positions else 0,
+                    }
+
+            if layer_results:
+                results['per_layer'][f'L{lidx}'] = layer_results
+
+        # Aggregated results (backward compatibility)
         for key in ROUTING_KEYS.keys():
-            if position_routing[key]:
+            if aggregated_routing[key]:
                 pos_avg = {}
-                for pos, values in position_routing[key].items():
+                for pos, values in aggregated_routing[key].items():
                     pos_avg[pos] = float(np.mean(values))
 
                 early_positions = [v for p, v in pos_avg.items() if p < 10]
@@ -148,6 +183,7 @@ class BehavioralAnalyzer:
                     'late_avg': float(np.mean(late_positions)) if late_positions else 0,
                 }
 
+        results['n_layers'] = len(layer_position_routing)
         return results
 
     def run_probing(self, dataloader, max_batches: int = 50, layer_idx: int = None) -> Dict:

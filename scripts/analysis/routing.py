@@ -362,13 +362,14 @@ class RoutingAnalyzer:
 
         return results
 
-    def analyze_qk_usage(self, dataloader, n_batches: int = 100) -> Dict:
+    def analyze_qk_usage(self, dataloader, n_batches: int = 100, layer_idx: int = None) -> Dict:
         """
-        Analyze per-neuron Q/K selection counts.
+        Analyze per-neuron Q/K selection counts across ALL layers.
 
         Args:
             dataloader: DataLoader for input data
             n_batches: Number of batches to process
+            layer_idx: Specific layer to analyze (None = aggregate all layers)
 
         Returns:
             Dictionary with Q/K usage statistics
@@ -380,9 +381,8 @@ class RoutingAnalyzer:
             if n_neurons == 0:
                 continue
 
-            q_counts = torch.zeros(n_neurons, device=self.device)
-            k_counts = torch.zeros(n_neurons, device=self.device)
-            batch_overlaps = []
+            # Per-layer counts: {lidx: (q_counts, k_counts, overlaps)}
+            layer_data = {}
 
             self.model.eval()
             with torch.no_grad():
@@ -397,41 +397,82 @@ class RoutingAnalyzer:
                         routing_infos = get_routing_from_outputs(outputs)
                         if routing_infos is None:
                             continue
-                        attn = routing_infos[0].get('attention', {})
                     except Exception:
                         continue
 
-                    # Get Q/K weights
-                    w_q = attn.get(pool_info['q_weight'])
-                    w_k = attn.get(pool_info['k_weight'])
-
-                    if w_q is None or w_k is None:
-                        w_q = attn.get(pool_info['q_pref'])
-                        w_k = attn.get(pool_info['k_pref'])
-                        if w_q is None or w_k is None:
+                    # Process ALL layers
+                    for lidx, layer_info in enumerate(routing_infos):
+                        if layer_idx is not None and lidx != layer_idx:
                             continue
 
-                    # Count selections
-                    if w_q.dim() == 3:  # [B, S, N]
-                        selected_q = (w_q > 0).float().sum(dim=[0, 1])
-                        selected_k = (w_k > 0).float().sum(dim=[0, 1])
-                    else:  # [B, N]
-                        selected_q = (w_q > 0).float().sum(dim=0)
-                        selected_k = (w_k > 0).float().sum(dim=0)
+                        attn = layer_info.get('attention', {})
 
-                    q_counts += selected_q
-                    k_counts += selected_k
+                        # Get Q/K weights
+                        w_q = attn.get(pool_info['q_weight'])
+                        w_k = attn.get(pool_info['k_weight'])
 
-                    # Calculate batch overlap
-                    if w_q.dim() >= 2:
-                        overlap = ((w_q > 0) & (w_k > 0)).float()
-                        active_q = (w_q > 0).float().sum(-1)
-                        overlap_ratio = (overlap.sum(-1) / (active_q + 1e-8)).mean().item()
-                        batch_overlaps.append(overlap_ratio)
+                        if w_q is None or w_k is None:
+                            w_q = attn.get(pool_info['q_pref'])
+                            w_k = attn.get(pool_info['k_pref'])
+                            if w_q is None or w_k is None:
+                                continue
 
-            # Calculate statistics
-            q_np = q_counts.cpu().numpy()
-            k_np = k_counts.cpu().numpy()
+                        # Initialize layer data if needed
+                        if lidx not in layer_data:
+                            layer_data[lidx] = (
+                                torch.zeros(n_neurons, device=self.device),
+                                torch.zeros(n_neurons, device=self.device),
+                                []
+                            )
+
+                        q_counts, k_counts, batch_overlaps = layer_data[lidx]
+
+                        # Count selections
+                        if w_q.dim() == 3:  # [B, S, N]
+                            selected_q = (w_q > 0).float().sum(dim=[0, 1])
+                            selected_k = (w_k > 0).float().sum(dim=[0, 1])
+                        else:  # [B, N]
+                            selected_q = (w_q > 0).float().sum(dim=0)
+                            selected_k = (w_k > 0).float().sum(dim=0)
+
+                        q_counts += selected_q
+                        k_counts += selected_k
+
+                        # Calculate batch overlap
+                        if w_q.dim() >= 2:
+                            overlap = ((w_q > 0) & (w_k > 0)).float()
+                            active_q = (w_q > 0).float().sum(-1)
+                            overlap_ratio = (overlap.sum(-1) / (active_q + 1e-8)).mean().item()
+                            batch_overlaps.append(overlap_ratio)
+
+                        layer_data[lidx] = (q_counts, k_counts, batch_overlaps)
+
+            # Aggregate across all layers
+            total_q = torch.zeros(n_neurons, device=self.device)
+            total_k = torch.zeros(n_neurons, device=self.device)
+            all_overlaps = []
+
+            per_layer_results = {}
+            for lidx, (q_counts, k_counts, batch_overlaps) in layer_data.items():
+                total_q += q_counts
+                total_k += k_counts
+                all_overlaps.extend(batch_overlaps)
+
+                # Per-layer stats
+                q_np = q_counts.cpu().numpy()
+                k_np = k_counts.cpu().numpy()
+                corr = float(np.corrcoef(q_np, k_np)[0, 1]) if q_np.sum() > 0 and k_np.sum() > 0 else 0.0
+
+                per_layer_results[f'L{lidx}'] = {
+                    'correlation': corr,
+                    'avg_overlap': float(np.mean(batch_overlaps)) if batch_overlaps else 0,
+                    'q_total': int(q_np.sum()),
+                    'k_total': int(k_np.sum()),
+                }
+
+            # Aggregated statistics
+            q_np = total_q.cpu().numpy()
+            k_np = total_k.cpu().numpy()
 
             # Correlation
             if q_np.sum() > 0 and k_np.sum() > 0:
@@ -449,17 +490,19 @@ class RoutingAnalyzer:
             results[pool_name] = {
                 'display': pool_info['display'],
                 'n_neurons': n_neurons,
+                'n_layers': len(layer_data),
                 'q_counts': q_np.tolist(),
                 'k_counts': k_np.tolist(),
                 'correlation': corr,
-                'avg_overlap': float(np.mean(batch_overlaps)) if batch_overlaps else 0,
-                'std_overlap': float(np.std(batch_overlaps)) if batch_overlaps else 0,
+                'avg_overlap': float(np.mean(all_overlaps)) if all_overlaps else 0,
+                'std_overlap': float(np.std(all_overlaps)) if all_overlaps else 0,
                 'q_specialized': q_only,
                 'k_specialized': k_only,
                 'shared': shared,
                 'inactive': inactive,
                 'q_total': int(q_np.sum()),
                 'k_total': int(k_np.sum()),
+                'per_layer': per_layer_results,
             }
 
         results['n_batches'] = n_batches
