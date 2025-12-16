@@ -269,7 +269,7 @@ class VanillaTransformer(nn.Module):
 # Parameter Comparison
 # ============================================
 def compare_params():
-    """DAWN vs Baseline 파라미터 비교"""
+    """DAWN vs Baseline parameter comparison"""
 
     vocab_size = 30522
     config = {
