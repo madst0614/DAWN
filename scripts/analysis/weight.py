@@ -23,18 +23,21 @@ from .utils import (
 class WeightAnalyzer:
     """Neuron weight matrix analyzer."""
 
-    def __init__(self, neurons):
+    def __init__(self, neurons, device='cuda'):
         """
         Initialize analyzer.
 
         Args:
             neurons: SharedNeurons instance from DAWN model
+            device: Device for computation
         """
         self.neurons = neurons
+        self.device = device
 
     def analyze_weight_svd(self, output_dir: Optional[str] = None) -> Dict:
         """
         Analyze neuron weights using SVD decomposition.
+        Optimized with GPU tensor operations.
 
         Computes:
         - Singular value distribution
@@ -57,25 +60,27 @@ class WeightAnalyzer:
             if not hasattr(self.neurons, attr):
                 continue
 
-            W = getattr(self.neurons, attr).detach().cpu()
+            # Keep on GPU for SVD
+            W = getattr(self.neurons, attr).detach().to(self.device)
             n_neurons = W.shape[0]
 
             # Flatten to 2D for SVD
             if W.dim() > 2:
-                W = W.view(n_neurons, -1)
+                W = W.reshape(n_neurons, -1)
 
             try:
+                # SVD on GPU
                 U, S, Vh = torch.linalg.svd(W, full_matrices=False)
             except Exception:
                 results[name] = {'error': 'SVD failed'}
                 continue
 
-            # Compute metrics
+            # Compute metrics on GPU
             S_normalized = S / S.sum()
             cumsum = torch.cumsum(S_normalized, dim=0)
-            effective_rank = float((S > S.max() * 0.01).sum())
-            var_top5 = float(cumsum[min(4, len(cumsum)-1)])
-            var_top10 = float(cumsum[min(9, len(cumsum)-1)])
+            effective_rank = float((S > S.max() * 0.01).sum().item())
+            var_top5 = float(cumsum[min(4, len(cumsum)-1)].item())
+            var_top10 = float(cumsum[min(9, len(cumsum)-1)].item())
 
             results[name] = {
                 'display': NEURON_TYPES.get(name, (name,))[0],
@@ -84,7 +89,7 @@ class WeightAnalyzer:
                 'effective_rank': effective_rank,
                 'var_explained_by_top5': var_top5,
                 'var_explained_by_top10': var_top10,
-                'top_singular_values': S[:10].tolist(),
+                'top_singular_values': S[:10].cpu().tolist(),
                 'condition_number': float(S[0] / S[-1]) if S[-1] > 0 else float('inf'),
             }
 
@@ -122,6 +127,7 @@ class WeightAnalyzer:
     def analyze_weight_norms(self) -> Dict:
         """
         Analyze weight matrix norms per neuron.
+        Optimized with GPU tensor operations.
 
         Returns:
             Dictionary with norm statistics
@@ -135,19 +141,20 @@ class WeightAnalyzer:
             if not hasattr(self.neurons, attr):
                 continue
 
-            W = getattr(self.neurons, attr).detach().cpu()
+            # Keep on GPU
+            W = getattr(self.neurons, attr).detach().to(self.device)
             n_neurons = W.shape[0]
 
-            # Compute per-neuron norms
-            norms = torch.norm(W.view(n_neurons, -1), dim=1)
+            # Compute per-neuron norms on GPU
+            norms = torch.norm(W.reshape(n_neurons, -1), dim=1)
 
             results[name] = {
                 'display': NEURON_TYPES.get(name, (name,))[0],
                 'n_neurons': n_neurons,
-                'mean_norm': float(norms.mean()),
-                'std_norm': float(norms.std()),
-                'min_norm': float(norms.min()),
-                'max_norm': float(norms.max()),
+                'mean_norm': float(norms.mean().item()),
+                'std_norm': float(norms.std().item()),
+                'min_norm': float(norms.min().item()),
+                'max_norm': float(norms.max().item()),
             }
 
         return results
@@ -155,6 +162,7 @@ class WeightAnalyzer:
     def analyze_weight_similarity(self) -> Dict:
         """
         Analyze pairwise similarity between neuron weight matrices.
+        Optimized with GPU tensor operations.
 
         Returns:
             Dictionary with similarity statistics
@@ -168,30 +176,31 @@ class WeightAnalyzer:
             if not hasattr(self.neurons, attr):
                 continue
 
-            W = getattr(self.neurons, attr).detach().cpu()
+            # Keep on GPU
+            W = getattr(self.neurons, attr).detach().to(self.device)
             n_neurons = W.shape[0]
 
             if n_neurons < 2:
                 continue
 
-            # Flatten and normalize
-            W_flat = W.view(n_neurons, -1)
+            # Flatten and normalize on GPU
+            W_flat = W.reshape(n_neurons, -1)
             W_norm = W_flat / (W_flat.norm(dim=1, keepdim=True) + 1e-8)
 
-            # Compute similarity matrix
-            sim = W_norm @ W_norm.T
+            # Compute similarity matrix on GPU
+            sim = torch.mm(W_norm, W_norm.t())
 
             # Extract off-diagonal
-            mask = ~torch.eye(n_neurons, dtype=torch.bool)
+            mask = ~torch.eye(n_neurons, dtype=torch.bool, device=self.device)
             off_diag = sim[mask]
 
             results[name] = {
                 'display': NEURON_TYPES.get(name, (name,))[0],
                 'n_neurons': n_neurons,
-                'mean_similarity': float(off_diag.mean()),
-                'std_similarity': float(off_diag.std()),
-                'max_similarity': float(off_diag.max()),
-                'min_similarity': float(off_diag.min()),
+                'mean_similarity': float(off_diag.mean().item()),
+                'std_similarity': float(off_diag.std().item()),
+                'max_similarity': float(off_diag.max().item()),
+                'min_similarity': float(off_diag.min().item()),
             }
 
         return results

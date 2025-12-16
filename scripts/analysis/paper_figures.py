@@ -59,8 +59,8 @@ class PaperFigureGenerator:
         # Initialize analyzers
         self.health = NeuronHealthAnalyzer(self.router)
         self.routing = RoutingAnalyzer(self.model, self.router, device)
-        self.embedding = EmbeddingAnalyzer(self.router)
-        self.weight = WeightAnalyzer(self.neurons)
+        self.embedding = EmbeddingAnalyzer(self.router, device)
+        self.weight = WeightAnalyzer(self.neurons, device)
         self.behavioral = BehavioralAnalyzer(self.model, self.router, self.tokenizer, device)
         self.semantic = SemanticAnalyzer(self.model, self.router, self.tokenizer, device)
         self.coselection = CoselectionAnalyzer(self.model, self.router, self.neurons, device)
