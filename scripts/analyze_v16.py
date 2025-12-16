@@ -879,12 +879,15 @@ class V16Analyzer:
         if self.router is None:
             return {'error': 'No router found'}
 
-        results = {}
+        results = {'version': self.version}
         threshold = 0.01
 
-        for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
-            ema = getattr(self.router, f'usage_ema_{name}')
-            n_total = getattr(self.router, f'n_{name}')
+        # Use version-aware ema_attrs
+        for name, ema_attr, n_attr in self.mapping['ema_attrs']:
+            if not hasattr(self.router, ema_attr):
+                continue
+            ema = getattr(self.router, ema_attr)
+            n_total = getattr(self.router, n_attr)
 
             # Active neurons
             active_mask = ema > threshold
@@ -938,13 +941,13 @@ class V16Analyzer:
                 'gini': float(gini),
             }
 
-        # Overall diversity score (weighted average)
-        weights = {'feature_r': 2, 'feature_v': 2, 'relational': 1.5, 'value': 1.5, 'knowledge': 1}
-        total_weight = sum(weights.values())
-        overall_diversity = sum(
-            results[name].get('normalized_entropy', 0) * weights[name]
-            for name in weights if name in results
-        ) / total_weight
+        # Overall diversity score (equal weight for all types present)
+        type_entropies = [
+            results[name].get('normalized_entropy', 0)
+            for name, _, _ in self.mapping['ema_attrs']
+            if name in results and isinstance(results[name], dict)
+        ]
+        overall_diversity = sum(type_entropies) / len(type_entropies) if type_entropies else 0
 
         results['overall'] = {
             'diversity_score': float(overall_diversity),
@@ -966,14 +969,17 @@ class V16Analyzer:
         if self.router is None:
             return {'error': 'No router found'}
 
-        results = {}
+        results = {'version': self.version}
         threshold = 0.01
         dying_threshold = 0.05  # 죽어가는 중
         tau = self.router.tau
 
-        for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
-            ema = getattr(self.router, f'usage_ema_{name}')
-            n_total = getattr(self.router, f'n_{name}')
+        # Use version-aware ema_attrs
+        for name, ema_attr, n_attr in self.mapping['ema_attrs']:
+            if not hasattr(self.router, ema_attr):
+                continue
+            ema = getattr(self.router, ema_attr)
+            n_total = getattr(self.router, n_attr)
 
             # Categories
             dead_mask = ema < threshold
@@ -1013,9 +1019,12 @@ class V16Analyzer:
         total_removable = sum(r['n_removable'] for r in results.values() if isinstance(r, dict))
         total_neurons = sum(r['n_total'] for r in results.values() if isinstance(r, dict))
 
+        # Get type names dynamically
+        type_names = [name for name, _, _ in self.mapping['ema_attrs'] if name in results]
+
         results['shrink_recommendation'] = {
             'total_removable': total_removable,
-            'shrink_ratio': float(total_removable / total_neurons),
+            'shrink_ratio': float(total_removable / total_neurons) if total_neurons > 0 else 0,
             'recommended_action': 'shrink' if total_removable > total_neurons * 0.2 else 'keep',
             'per_type': {
                 name: {
@@ -1023,8 +1032,7 @@ class V16Analyzer:
                     'recommended': results[name]['n_total'] - results[name]['n_removable'],
                     'remove': results[name]['n_removable'],
                 }
-                for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']
-                if name in results
+                for name in type_names
             }
         }
 
@@ -1032,25 +1040,34 @@ class V16Analyzer:
         if HAS_MATPLOTLIB and output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-            axes = axes.flatten()
+            n_types = len(type_names)
+            n_cols = 3
+            n_rows = (n_types + 1 + n_cols - 1) // n_cols  # +1 for summary
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
+            axes = axes.flatten() if n_rows > 1 else [axes] if n_types == 0 else list(axes)
 
             colors = ['green', 'yellow', 'red']
             labels = ['Active', 'Dying', 'Dead']
 
-            for ax, name in zip(axes[:5], ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']):
+            for ax, name in zip(axes[:n_types], type_names):
                 data = results[name]
                 sizes = [data['n_active'], data['n_dying'], data['n_dead']]
                 ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-                ax.set_title(f'{name}\n(removable: {data["n_removable"]})')
+                ax.set_title(f'{name.upper()}\n(removable: {data["n_removable"]})')
 
             # Summary bar
-            ax = axes[5]
-            names = ['FR', 'FV', 'R', 'V', 'K']
-            removable = [results[n]['n_removable'] for n in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']]
-            ax.bar(names, removable, color='red', alpha=0.7)
-            ax.set_title('Removable Neurons')
-            ax.set_ylabel('Count')
+            if n_types < len(axes):
+                ax = axes[n_types]
+                display_names = [n.upper()[:3] for n in type_names]
+                removable = [results[n]['n_removable'] for n in type_names]
+                ax.bar(display_names, removable, color='red', alpha=0.7)
+                ax.set_title('Removable Neurons')
+                ax.set_ylabel('Count')
+                ax.tick_params(axis='x', rotation=45)
+
+            # Hide unused axes
+            for i in range(n_types + 1, len(axes)):
+                axes[i].axis('off')
 
             plt.tight_layout()
             path = os.path.join(output_dir, 'dead_neurons.png')
@@ -1452,16 +1469,19 @@ class V16Analyzer:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        axes = axes.flatten()
+        # Build version-aware data list
+        color_palette = ['red', 'orange', 'blue', 'green', 'purple', 'cyan', 'magenta', 'brown']
+        data = []
+        for i, (name, ema_attr, _) in enumerate(self.mapping['ema_attrs']):
+            if hasattr(self.router, ema_attr):
+                ema = getattr(self.router, ema_attr)
+                data.append((name.upper(), ema, color_palette[i % len(color_palette)]))
 
-        data = [
-            ('Feature R', self.router.usage_ema_feature_r, 'red'),
-            ('Feature V', self.router.usage_ema_feature_v, 'orange'),
-            ('Relational', self.router.usage_ema_relational, 'blue'),
-            ('Value', self.router.usage_ema_value, 'green'),
-            ('Knowledge', self.router.usage_ema_knowledge, 'purple'),
-        ]
+        n_plots = len(data) + 1  # +1 for summary
+        n_cols = 3
+        n_rows = (n_plots + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
+        axes = axes.flatten() if n_rows > 1 else [axes] if n_plots == 1 else axes
 
         for ax, (name, ema, color) in zip(axes, data):
             values = ema.detach().cpu().numpy()
@@ -1477,14 +1497,20 @@ class V16Analyzer:
                     ha='right', va='top', fontsize=10)
 
         # Summary bar chart
-        ax = axes[5]
-        names = [d[0] for d in data]
-        active_ratios = [(d[1] > 0.01).float().mean().item() for d in data]
-        colors = [d[2] for d in data]
-        ax.bar(names, active_ratios, color=colors, alpha=0.7, edgecolor='black')
-        ax.set_title('Active Neuron Ratio by Type')
-        ax.set_ylabel('Active Ratio')
-        ax.set_ylim(0, 1)
+        if len(data) < len(axes):
+            ax = axes[len(data)]
+            names = [d[0] for d in data]
+            active_ratios = [(d[1] > 0.01).float().mean().item() for d in data]
+            colors = [d[2] for d in data]
+            ax.bar(names, active_ratios, color=colors, alpha=0.7, edgecolor='black')
+            ax.set_title('Active Neuron Ratio by Type')
+            ax.set_ylabel('Active Ratio')
+            ax.set_ylim(0, 1)
+            ax.tick_params(axis='x', rotation=45)
+
+        # Hide unused axes
+        for i in range(len(data) + 1, len(axes)):
+            axes[i].axis('off')
 
         plt.tight_layout()
         path = os.path.join(output_dir, 'usage_histogram.png')
