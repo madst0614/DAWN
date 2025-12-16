@@ -37,7 +37,7 @@ except ImportError:
 # v17.1 Q/K Routing Configuration
 QK_POOLS = {
     'feature_qk': {
-        'display': 'FQK',
+        'display': 'F-QK',
         'q_pref': 'fqk_q_pref',
         'k_pref': 'fqk_k_pref',
         'q_weight': 'fqk_weights_Q',
@@ -46,7 +46,7 @@ QK_POOLS = {
         'color': 'red',
     },
     'restore_qk': {
-        'display': 'RQK',
+        'display': 'R-QK',
         'q_pref': 'rqk_q_pref',
         'k_pref': 'rqk_k_pref',
         'q_weight': 'rqk_weights_Q',

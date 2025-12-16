@@ -70,22 +70,22 @@ except ImportError:
 
 NEURON_TYPES = {
     # (display_name, ema_attr, n_attr, color)
-    'feature_qk':   ('FQK',  'usage_ema_feature_qk',   'n_feature_qk',   'red'),
-    'feature_v':    ('FV',   'usage_ema_feature_v',    'n_feature_v',    'orange'),
-    'restore_qk':   ('RQK',  'usage_ema_restore_qk',   'n_restore_qk',   'blue'),
-    'restore_v':    ('RV',   'usage_ema_restore_v',    'n_restore_v',    'green'),
-    'feature_know': ('FK',   'usage_ema_feature_know', 'n_feature_know', 'purple'),
-    'restore_know': ('RK',   'usage_ema_restore_know', 'n_restore_know', 'cyan'),
+    'feature_qk':   ('F-QK',   'usage_ema_feature_qk',   'n_feature_qk',   'red'),
+    'feature_v':    ('F-V',    'usage_ema_feature_v',    'n_feature_v',    'orange'),
+    'restore_qk':   ('R-QK',   'usage_ema_restore_qk',   'n_restore_qk',   'blue'),
+    'restore_v':    ('R-V',    'usage_ema_restore_v',    'n_restore_v',    'green'),
+    'feature_know': ('F-Know', 'usage_ema_feature_know', 'n_feature_know', 'purple'),
+    'restore_know': ('R-Know', 'usage_ema_restore_know', 'n_restore_know', 'cyan'),
 }
 
 ROUTING_KEYS = {
     # (display_name, pref_key, weight_key, pool_type)
-    'fqk_q': ('FQK_Q', 'fqk_q_pref', 'fqk_weights_Q', 'feature_qk'),
-    'fqk_k': ('FQK_K', 'fqk_k_pref', 'fqk_weights_K', 'feature_qk'),
-    'fv':    ('FV',    'fv_pref',    'fv_weights',    'feature_v'),
-    'rqk_q': ('RQK_Q', 'rqk_q_pref', 'rqk_weights_Q', 'restore_qk'),
-    'rqk_k': ('RQK_K', 'rqk_k_pref', 'rqk_weights_K', 'restore_qk'),
-    'rv':    ('RV',    'rv_pref',    'rv_weights',    'restore_v'),
+    'fqk_q': ('F-QK_Q', 'fqk_q_pref', 'fqk_weights_Q', 'feature_qk'),
+    'fqk_k': ('F-QK_K', 'fqk_k_pref', 'fqk_weights_K', 'feature_qk'),
+    'fv':    ('F-V',    'fv_pref',    'fv_weights',    'feature_v'),
+    'rqk_q': ('R-QK_Q', 'rqk_q_pref', 'rqk_weights_Q', 'restore_qk'),
+    'rqk_k': ('R-QK_K', 'rqk_k_pref', 'rqk_weights_K', 'restore_qk'),
+    'rv':    ('R-V',    'rv_pref',    'rv_weights',    'restore_v'),
 }
 
 # Neuron attribute names for weight analysis

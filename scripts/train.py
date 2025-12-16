@@ -1563,7 +1563,7 @@ def main():
     args = Args()
 
     # Model (Dynamic Neuron Transformer)
-    args.model_version = cfg['model'].get('model_version', '17.0')  # Default to v17.0
+    args.model_version = cfg['model'].get('model_version', '17.1')  # Default to v17.1
     args.d_model = cfg['model'].get('d_model', 512)
     args.n_layers = cfg['model'].get('n_layers', 6)
     args.n_heads = cfg['model'].get('n_heads', 8)
@@ -1880,7 +1880,7 @@ def main():
     print(f"{'='*60}")
 
     # Build model kwargs from args using version_registry
-    model_version = getattr(args, 'model_version', '16.1')
+    model_version = getattr(args, 'model_version', '17.1')
 
     # Build config dict dynamically from VERSION_REGISTRY (single source of truth)
     args_config = build_args_config(args, vocab_size)
