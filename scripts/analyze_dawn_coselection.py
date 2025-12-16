@@ -706,7 +706,7 @@ def main():
     parser.add_argument('--val_data', required=True, help='Validation data path')
     parser.add_argument('--output_dir', default='./dawn_coselection', help='Output directory')
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--n_batches', type=int, default=50)
+    parser.add_argument('--max_batches', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--pairs', type=str, default='all',
                        help='Pairs to analyze: all, fqk_rqk, fv_rv, fk_rk')
@@ -742,7 +742,7 @@ def main():
             continue
 
         # Co-selection analysis
-        cosel_results = analyzer.analyze_coselection(dataloader, pair_key, args.n_batches)
+        cosel_results = analyzer.analyze_coselection(dataloader, pair_key, args.max_batches)
         if cosel_results:
             all_results[pair_key] = cosel_results
 
@@ -753,7 +753,7 @@ def main():
 
         # Cross-pool alignment (only if shared neurons exist)
         if shared is not None:
-            align_results = analyzer.analyze_cross_pool_alignment(pair_key, dataloader, args.n_batches // 2)
+            align_results = analyzer.analyze_cross_pool_alignment(pair_key, dataloader, args.max_batches // 2)
             if align_results:
                 all_results[pair_key]['alignment'] = align_results
 

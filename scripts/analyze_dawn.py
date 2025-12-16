@@ -1606,7 +1606,7 @@ def main():
                         help='Analysis mode')
     parser.add_argument('--val_data', type=str, default=None, help='Validation data path')
     parser.add_argument('--output_dir', type=str, default='./dawn_analysis', help='Output directory')
-    parser.add_argument('--n_batches', type=int, default=50, help='Number of batches')
+    parser.add_argument('--max_batches', type=int, default=50, help='Number of batches')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--n_clusters', type=int, default=5, help='Number of clusters')
     parser.add_argument('--neuron_type', type=str, default='feature_qk', help='Neuron type for single neuron analysis')
@@ -1634,7 +1634,7 @@ def main():
         if dataloader is None:
             print("ERROR: --val_data required for routing analysis")
             return
-        results = analyzer.run_routing_analysis(dataloader, args.n_batches, args.output_dir)
+        results = analyzer.run_routing_analysis(dataloader, args.max_batches, args.output_dir)
     elif args.mode == 'embedding':
         results = analyzer.run_embedding_analysis(args.output_dir)
     elif args.mode == 'weight_svd':
@@ -1645,17 +1645,17 @@ def main():
         if dataloader is None:
             print("ERROR: --val_data required for trajectory analysis")
             return
-        results = analyzer.run_trajectory_analysis(dataloader, args.n_batches, args.output_dir)
+        results = analyzer.run_trajectory_analysis(dataloader, args.max_batches, args.output_dir)
     elif args.mode == 'probing':
         if dataloader is None:
             print("ERROR: --val_data required for probing analysis")
             return
-        results = analyzer.run_probing_analysis(dataloader, args.n_batches, args.output_dir)
+        results = analyzer.run_probing_analysis(dataloader, args.max_batches, args.output_dir)
     elif args.mode == 'ablation':
         if dataloader is None:
             print("ERROR: --val_data required for ablation analysis")
             return
-        results = analyzer.run_ablation_analysis(dataloader, args.n_batches, args.output_dir)
+        results = analyzer.run_ablation_analysis(dataloader, args.max_batches, args.output_dir)
     elif args.mode == 'neuron':
         results = analyzer.analyze_single_neuron(args.neuron_id, args.neuron_type)
 

@@ -421,7 +421,7 @@ def main():
     parser.add_argument('--val_data', required=True, help='Validation data path')
     parser.add_argument('--output_dir', default='./dawn_qk_analysis', help='Output directory')
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--n_batches', type=int, default=100)
+    parser.add_argument('--max_batches', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=32)
 
     args = parser.parse_args()
@@ -441,10 +441,10 @@ def main():
 
     # Run analyses
     print("\n--- Analyzing Q/K Usage Patterns ---")
-    usage_results = analyzer.analyze_qk_usage(dataloader, args.n_batches)
+    usage_results = analyzer.analyze_qk_usage(dataloader, args.max_batches)
 
     print("\n--- Analyzing Q/K Entropy ---")
-    entropy_results = analyzer.analyze_qk_entropy(dataloader, args.n_batches // 2)
+    entropy_results = analyzer.analyze_qk_entropy(dataloader, args.max_batches // 2)
 
     # Print summary
     print_summary(usage_results, entropy_results)

@@ -734,7 +734,7 @@ def main():
     parser.add_argument('--val_data', required=True, help='Validation data path')
     parser.add_argument('--output_dir', default='./dawn_diagnostics', help='Output directory')
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--n_batches', type=int, default=30)
+    parser.add_argument('--max_batches', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--skip_roles', action='store_true', help='Skip neuron role analysis')
 
@@ -761,12 +761,12 @@ def main():
 
     # Run diagnostics
     all_results['usage_ema'] = diagnostics.diagnose_usage_ema()
-    all_results['selection'] = diagnostics.diagnose_neuron_selection(dataloader, args.n_batches)
-    all_results['entropy'] = diagnostics.diagnose_routing_entropy(dataloader, args.n_batches // 2)
-    all_results['dead_neurons'] = diagnostics.diagnose_dead_neurons(dataloader, args.n_batches)
+    all_results['selection'] = diagnostics.diagnose_neuron_selection(dataloader, args.max_batches)
+    all_results['entropy'] = diagnostics.diagnose_routing_entropy(dataloader, args.max_batches // 2)
+    all_results['dead_neurons'] = diagnostics.diagnose_dead_neurons(dataloader, args.max_batches)
 
     if not args.skip_roles:
-        all_results['neuron_roles'] = diagnostics.diagnose_neuron_roles(dataloader, n_batches=args.n_batches // 2)
+        all_results['neuron_roles'] = diagnostics.diagnose_neuron_roles(dataloader, n_batches=args.max_batches // 2)
 
     # Visualize
     if HAS_MATPLOTLIB:
