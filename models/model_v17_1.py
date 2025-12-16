@@ -66,10 +66,12 @@ class UnifiedNeuronRouter(nn.Module):
         # Unified neuron embeddings (std=0.02 is standard transformer initialization)
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
-        # Usage tracking (6 attention + 2 knowledge)
-        self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
+        # Usage tracking (Q/K separated for better excitability)
+        self.register_buffer('usage_ema_feature_q', torch.zeros(n_feature_qk))
+        self.register_buffer('usage_ema_feature_k', torch.zeros(n_feature_qk))
         self.register_buffer('usage_ema_feature_v', torch.zeros(n_feature_v))
-        self.register_buffer('usage_ema_restore_qk', torch.zeros(n_restore_qk))
+        self.register_buffer('usage_ema_restore_q', torch.zeros(n_restore_qk))
+        self.register_buffer('usage_ema_restore_k', torch.zeros(n_restore_qk))
         self.register_buffer('usage_ema_restore_v', torch.zeros(n_restore_v))
         self.register_buffer('usage_ema_feature_know', torch.zeros(n_feature_know))
         self.register_buffer('usage_ema_restore_know', torch.zeros(n_restore_know))
@@ -134,16 +136,18 @@ class UnifiedNeuronRouter(nn.Module):
 
         if self.training:
             w = self.excitability_weight
-            exc_fqk = self.get_excitability(self.usage_ema_feature_qk) * w
+            exc_fq = self.get_excitability(self.usage_ema_feature_q) * w
+            exc_fk = self.get_excitability(self.usage_ema_feature_k) * w
             exc_fv = self.get_excitability(self.usage_ema_feature_v) * w
-            exc_rqk = self.get_excitability(self.usage_ema_restore_qk) * w
+            exc_rq = self.get_excitability(self.usage_ema_restore_q) * w
+            exc_rk = self.get_excitability(self.usage_ema_restore_k) * w
             exc_rv = self.get_excitability(self.usage_ema_restore_v) * w
 
-            logits_fqk_Q = logits_fqk_Q + exc_fqk
-            logits_fqk_K = logits_fqk_K + exc_fqk
+            logits_fqk_Q = logits_fqk_Q + exc_fq
+            logits_fqk_K = logits_fqk_K + exc_fk
             logits_fv = logits_fv + exc_fv
-            logits_rqk_Q = logits_rqk_Q + exc_rqk
-            logits_rqk_K = logits_rqk_K + exc_rqk
+            logits_rqk_Q = logits_rqk_Q + exc_rq
+            logits_rqk_K = logits_rqk_K + exc_rk
             logits_rv = logits_rv + exc_rv
 
         return logits_fqk_Q, logits_fqk_K, logits_fv, logits_rqk_Q, logits_rqk_K, logits_rv
@@ -165,12 +169,16 @@ class UnifiedNeuronRouter(nn.Module):
             usage = (weights > 0).float().mean(dim=0)
 
         decay = 1 - self.ema_alpha
-        if neuron_type == 'feature_qk':
-            self.usage_ema_feature_qk.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        if neuron_type == 'feature_q':
+            self.usage_ema_feature_q.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        elif neuron_type == 'feature_k':
+            self.usage_ema_feature_k.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif neuron_type == 'feature_v':
             self.usage_ema_feature_v.mul_(decay).add_(usage, alpha=self.ema_alpha)
-        elif neuron_type == 'restore_qk':
-            self.usage_ema_restore_qk.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        elif neuron_type == 'restore_q':
+            self.usage_ema_restore_q.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        elif neuron_type == 'restore_k':
+            self.usage_ema_restore_k.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif neuron_type == 'restore_v':
             self.usage_ema_restore_v.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif neuron_type == 'feature_know':
@@ -486,13 +494,13 @@ class GlobalRouters(nn.Module):
                 'token_routing': False,
             }
 
-        # Update usage
+        # Update usage (Q/K separately for independent excitability)
         if self.training:
-            fqk_used = ((fqk_weights_Q > 0) | (fqk_weights_K > 0)).float()
-            self.neuron_router.update_usage(fqk_used, 'feature_qk', attention_mask)
+            self.neuron_router.update_usage(fqk_weights_Q, 'feature_q', attention_mask)
+            self.neuron_router.update_usage(fqk_weights_K, 'feature_k', attention_mask)
             self.neuron_router.update_usage(fv_weights, 'feature_v', attention_mask)
-            rqk_used = ((rqk_weights_Q > 0) | (rqk_weights_K > 0)).float()
-            self.neuron_router.update_usage(rqk_used, 'restore_qk', attention_mask)
+            self.neuron_router.update_usage(rqk_weights_Q, 'restore_q', attention_mask)
+            self.neuron_router.update_usage(rqk_weights_K, 'restore_k', attention_mask)
             self.neuron_router.update_usage(rv_weights, 'restore_v', attention_mask)
 
         return fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, routing_info, aux_loss
