@@ -183,7 +183,7 @@ def find_latest_checkpoint(path: str) -> str:
 
 
 def load_model(checkpoint_path: str, device: str = 'cuda'):
-    """Load v16 model from checkpoint (supports directory auto-discovery)"""
+    """Load model from checkpoint (supports v16.x and v17.x)"""
     from transformers import BertTokenizer
     from models import create_model_by_version
 
@@ -194,14 +194,26 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
 
-    # Detect version
-    path_str = str(checkpoint_path).lower()
-    if 'v16.1' in path_str or 'v16_1' in path_str:
-        version = '16.1'
-    elif 'v16' in path_str:
-        version = '16.0'
-    else:
-        version = config.get('model_version', '16.0')
+    # Detect version from config first, then path
+    version = config.get('model_version', None)
+    if version is None:
+        path_str = str(checkpoint_path).lower()
+        if 'v17.1' in path_str or 'v17_1' in path_str:
+            version = '17.1'
+        elif 'v17' in path_str:
+            version = '17.0'
+        elif 'v16.4' in path_str or 'v16_4' in path_str:
+            version = '16.4'
+        elif 'v16.3' in path_str or 'v16_3' in path_str:
+            version = '16.3'
+        elif 'v16.2' in path_str or 'v16_2' in path_str:
+            version = '16.2'
+        elif 'v16.1' in path_str or 'v16_1' in path_str:
+            version = '16.1'
+        elif 'v16' in path_str:
+            version = '16.0'
+        else:
+            version = '16.0'
 
     print(f"Loading model version: {version}")
     print(f"Config: {config}")
@@ -221,21 +233,148 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
 
 
 # ============================================================
-# V16 Analyzer Class
+# DAWN Analyzer Class (supports v16.x and v17.x)
 # ============================================================
 
 class V16Analyzer:
-    """v16 모델 분석기 - 모든 분석 기능 통합"""
+    """DAWN 모델 분석기 - v16.x, v17.x 모든 버전 지원"""
+
+    # Version-specific attribute mappings
+    VERSION_MAPPINGS = {
+        # v16.0/16.1: Original naming
+        '16.0': {
+            'ema_attrs': [
+                ('feature_r', 'usage_ema_feature_r', 'n_feature_r'),
+                ('feature_v', 'usage_ema_feature_v', 'n_feature_v'),
+                ('relational', 'usage_ema_relational', 'n_relational'),
+                ('value', 'usage_ema_value', 'n_value'),
+                ('knowledge', 'usage_ema_knowledge', 'n_knowledge'),
+            ],
+            'neuron_attrs': [
+                ('feature_r', 'feature_r_neurons'),
+                ('feature_v', 'feature_v_neurons'),
+                ('relational', 'relational_neurons'),
+                ('value', 'value_neurons'),
+            ],
+            'pref_keys': {
+                'feature_r': 'feature_r_pref',
+                'feature_v': 'feature_v_pref',
+                'relational': 'relational_q_pref',
+                'value': 'value_pref',
+            },
+            'weight_keys': {
+                'feature_r': 'feature_r_weights',
+                'feature_v': 'feature_v_weights',
+                'relational': 'relational_weights_Q',
+                'value': 'value_weights',
+            },
+        },
+        '16.1': None,  # Same as 16.0
+        # v16.4/v17.1: Shared QK pools
+        '16.4': {
+            'ema_attrs': [
+                ('feature_qk', 'usage_ema_feature_qk', 'n_feature_qk'),
+                ('feature_v', 'usage_ema_feature_v', 'n_feature_v'),
+                ('restore_qk', 'usage_ema_restore_qk', 'n_restore_qk'),
+                ('restore_v', 'usage_ema_restore_v', 'n_restore_v'),
+            ],
+            'neuron_attrs': [
+                ('feature_qk', 'feature_qk_neurons'),
+                ('feature_v', 'feature_v_neurons'),
+                ('restore_qk', 'restore_qk_neurons'),
+                ('restore_v', 'restore_v_neurons'),
+            ],
+            'pref_keys': {
+                'fqk_q': 'fqk_q_pref',
+                'fqk_k': 'fqk_k_pref',
+                'fv': 'fv_pref',
+                'rqk_q': 'rqk_q_pref',
+                'rqk_k': 'rqk_k_pref',
+                'rv': 'rv_pref',
+            },
+            'weight_keys': {
+                'fqk_q': 'fqk_weights_Q',
+                'fqk_k': 'fqk_weights_K',
+                'fv': 'fv_weights',
+                'rqk_q': 'rqk_weights_Q',
+                'rqk_k': 'rqk_weights_K',
+                'rv': 'rv_weights',
+            },
+        },
+        '17.1': {
+            'ema_attrs': [
+                ('feature_qk', 'usage_ema_feature_qk', 'n_feature_qk'),
+                ('feature_v', 'usage_ema_feature_v', 'n_feature_v'),
+                ('restore_qk', 'usage_ema_restore_qk', 'n_restore_qk'),
+                ('restore_v', 'usage_ema_restore_v', 'n_restore_v'),
+                ('feature_know', 'usage_ema_feature_know', 'n_feature_know'),
+                ('restore_know', 'usage_ema_restore_know', 'n_restore_know'),
+            ],
+            'neuron_attrs': [
+                ('feature_qk', 'feature_qk_neurons'),
+                ('feature_v', 'feature_v_neurons'),
+                ('restore_qk', 'restore_qk_neurons'),
+                ('restore_v', 'restore_v_neurons'),
+                ('feature_know', 'feature_know'),
+                ('restore_know', 'restore_know'),
+            ],
+            'pref_keys': {
+                'fqk_q': 'fqk_q_pref',
+                'fqk_k': 'fqk_k_pref',
+                'fv': 'fv_pref',
+                'rqk_q': 'rqk_q_pref',
+                'rqk_k': 'rqk_k_pref',
+                'rv': 'rv_pref',
+            },
+            'weight_keys': {
+                'fqk_q': 'fqk_weights_Q',
+                'fqk_k': 'fqk_weights_K',
+                'fv': 'fv_weights',
+                'rqk_q': 'rqk_weights_Q',
+                'rqk_k': 'rqk_weights_K',
+                'rv': 'rv_weights',
+            },
+        },
+    }
 
     def __init__(self, model, tokenizer, device='cuda'):
         self.model = get_underlying_model(model)
         self.tokenizer = tokenizer
         self.device = device
+        self.version = self._detect_version()
         self.router = self._get_router()
         self.neurons = self._get_neurons()
+        self.mapping = self._get_mapping()
+        print(f"Analyzer initialized for version: {self.version}")
+
+    def _detect_version(self):
+        """Detect model version from attributes"""
+        if hasattr(self.model, '__version__'):
+            return self.model.__version__
+        # Check router attributes to detect version
+        router = self._get_router()
+        if router:
+            if hasattr(router, 'usage_ema_feature_qk'):
+                # v16.4 or v17.1
+                if hasattr(router, 'usage_ema_feature_know'):
+                    return '17.1'
+                return '16.4'
+            elif hasattr(router, 'usage_ema_feature_r'):
+                return '16.0'
+        return '16.0'
+
+    def _get_mapping(self):
+        """Get version-specific attribute mapping"""
+        mapping = self.VERSION_MAPPINGS.get(self.version)
+        if mapping is None:
+            # Fall back to 16.0 for 16.1, etc.
+            mapping = self.VERSION_MAPPINGS.get('16.0')
+        return mapping
 
     def _get_router(self):
         """Get neuron router"""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'neuron_router'):
+            return self.model.router.neuron_router
         if hasattr(self.model, 'global_routers'):
             return self.model.global_routers.neuron_router
         return None
@@ -254,18 +393,14 @@ class V16Analyzer:
         if self.router is None:
             return {'error': 'No router found'}
 
-        results = {}
+        results = {'version': self.version}
         threshold = 0.01
 
-        for name, attr in [
-            ('feature_r', 'usage_ema_feature_r'),
-            ('feature_v', 'usage_ema_feature_v'),
-            ('relational', 'usage_ema_relational'),
-            ('value', 'usage_ema_value'),
-            ('knowledge', 'usage_ema_knowledge'),
-        ]:
-            ema = getattr(self.router, attr)
-            n_total = getattr(self.router, f'n_{name}')
+        for name, ema_attr, n_attr in self.mapping['ema_attrs']:
+            if not hasattr(self.router, ema_attr):
+                continue
+            ema = getattr(self.router, ema_attr)
+            n_total = getattr(self.router, n_attr)
             active = (ema > threshold).sum().item()
             results[name] = {
                 'total': n_total,
@@ -294,15 +429,18 @@ class V16Analyzer:
         weight = self.router.excitability_weight.item() if hasattr(self.router.excitability_weight, 'item') else self.router.excitability_weight
 
         results = {
+            'version': self.version,
             'tau': tau,
             'weight': weight,
             'langevin_alpha': getattr(self.router, 'langevin_alpha', 0),
             'langevin_beta': getattr(self.router, 'langevin_beta', 0),
         }
 
-        # Per-type excitability
-        for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
-            ema = getattr(self.router, f'usage_ema_{name}')
+        # Per-type excitability (version-aware)
+        for name, ema_attr, _ in self.mapping['ema_attrs']:
+            if not hasattr(self.router, ema_attr):
+                continue
+            ema = getattr(self.router, ema_attr)
             exc = torch.clamp(1.0 - ema / tau, min=0.0, max=1.0)
             results[f'{name}_excitability'] = {
                 'min': exc.min().item(),
@@ -322,31 +460,29 @@ class V16Analyzer:
 
         emb = self.router.neuron_emb.detach().cpu().numpy()
 
-        # Type labels
+        # Type labels (version-aware)
         labels = []
-        labels.extend(['FR'] * self.router.n_feature_r)
-        labels.extend(['FV'] * self.router.n_feature_v)
-        labels.extend(['R'] * self.router.n_relational)
-        labels.extend(['V'] * self.router.n_value)
-        labels.extend(['K'] * self.router.n_knowledge)
+        type_counts = {}
+        for name, _, n_attr in self.mapping['ema_attrs']:
+            if hasattr(self.router, n_attr):
+                n = getattr(self.router, n_attr)
+                labels.extend([name.upper()] * n)
+                type_counts[name.upper()] = n
 
         results = {
+            'version': self.version,
             'total_neurons': len(labels),
             'embedding_dim': emb.shape[1],
-            'type_counts': {
-                'FR': self.router.n_feature_r,
-                'FV': self.router.n_feature_v,
-                'R': self.router.n_relational,
-                'V': self.router.n_value,
-                'K': self.router.n_knowledge,
-            }
+            'type_counts': type_counts
         }
 
         # Cosine similarity between types
         type_centroids = {}
-        for t in ['FR', 'FV', 'R', 'V', 'K']:
+        unique_types = list(type_counts.keys())
+        for t in unique_types:
             mask = [l == t for l in labels]
-            type_centroids[t] = emb[mask].mean(axis=0)
+            if any(mask):
+                type_centroids[t] = emb[mask].mean(axis=0)
 
         sim_matrix = {}
         for t1 in type_centroids:
@@ -370,12 +506,15 @@ class V16Analyzer:
             emb_pca = pca.fit_transform(emb)
 
             fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-            colors = {'FR': 'red', 'FV': 'orange', 'R': 'blue', 'V': 'green', 'K': 'purple'}
+            # Dynamic colors for different versions
+            color_palette = ['red', 'orange', 'blue', 'green', 'purple', 'cyan', 'magenta', 'brown']
+            colors = {t: color_palette[i % len(color_palette)] for i, t in enumerate(unique_types)}
 
             for ax, data, title in [(axes[0], emb_2d, 't-SNE'), (axes[1], emb_pca, 'PCA')]:
-                for t in colors:
+                for t in unique_types:
                     mask = np.array([l == t for l in labels])
-                    ax.scatter(data[mask, 0], data[mask, 1], c=colors[t], label=t, alpha=0.6, s=20)
+                    if mask.any():
+                        ax.scatter(data[mask, 0], data[mask, 1], c=colors[t], label=t, alpha=0.6, s=20)
                 ax.set_title(f'Neuron Embeddings ({title})')
                 ax.legend()
 
@@ -394,15 +533,10 @@ class V16Analyzer:
         if self.neurons is None:
             return {'error': 'No shared neurons found'}
 
-        results = {}
+        results = {'version': self.version}
 
-        # Analyze each neuron type's weight matrix
-        weight_configs = [
-            ('feature_r', 'feature_r_neurons'),  # [n, d_model, rank]
-            ('feature_v', 'feature_v_neurons'),
-            ('relational', 'relational_neurons'),  # [n, rank, d_model]
-            ('value', 'value_neurons'),
-        ]
+        # Use version-specific neuron attributes
+        weight_configs = self.mapping['neuron_attrs']
 
         for name, attr in weight_configs:
             if not hasattr(self.neurons, attr):
@@ -559,20 +693,17 @@ class V16Analyzer:
         if self.router is None:
             return {'error': 'No router found'}
 
-        results = {}
+        results = {'version': self.version}
         emb = self.router.neuron_emb.detach()  # [total, d_space]
 
-        # Boundaries
-        boundaries = {
-            'FR': (0, self.router.n_feature_r),
-            'FV': (self.router.n_feature_r, self.router.n_feature_r + self.router.n_feature_v),
-            'R': (self.router.n_feature_r + self.router.n_feature_v,
-                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational),
-            'V': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational,
-                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value),
-            'K': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value,
-                  self.router.total_neurons),
-        }
+        # Build version-aware boundaries
+        boundaries = {}
+        offset = 0
+        for name, _, n_attr in self.mapping['ema_attrs']:
+            if hasattr(self.router, n_attr):
+                n = getattr(self.router, n_attr)
+                boundaries[name.upper()] = (offset, offset + n)
+                offset += n
 
         for name, (start, end) in boundaries.items():
             type_emb = emb[start:end]
@@ -626,19 +757,12 @@ class V16Analyzer:
         if self.router is None:
             return {'error': 'No router found'}
 
-        # Track selected neurons
-        union_selected = {
-            'feature_r': set(),
-            'feature_v': set(),
-            'relational': set(),
-            'value': set(),
-        }
-        per_batch_counts = {
-            'feature_r': [],
-            'feature_v': [],
-            'relational': [],
-            'value': [],
-        }
+        # Build version-aware type mappings
+        weight_keys = self.mapping['weight_keys']  # e.g., {'fqk_q': 'fqk_weights_Q', ...}
+
+        # Track selected neurons (dynamically from mapping)
+        union_selected = {ntype: set() for ntype in weight_keys.keys()}
+        per_batch_counts = {ntype: [] for ntype in weight_keys.keys()}
 
         self.model.eval()
         with torch.no_grad():
@@ -663,13 +787,8 @@ class V16Analyzer:
                 except Exception as e:
                     continue
 
-                # Track selections for each neuron type
-                for ntype, weight_key in [
-                    ('feature_r', 'feature_r_weights'),
-                    ('feature_v', 'feature_v_weights'),
-                    ('relational', 'relational_weights_Q'),
-                    ('value', 'value_weights'),
-                ]:
+                # Track selections for each neuron type (version-aware)
+                for ntype, weight_key in weight_keys.items():
                     if weight_key in routing_info:
                         weights = routing_info[weight_key]
                         # weights: [B, S, N] - batch, seq, neurons
@@ -683,17 +802,35 @@ class V16Analyzer:
                             union_selected[ntype].update(selected.nonzero().flatten().tolist())
                             per_batch_counts[ntype].append(selected.sum().item())
 
+        # Build version-aware n_totals from ema_attrs
+        n_totals = {}
+        for name, _, n_attr in self.mapping['ema_attrs']:
+            if hasattr(self.router, n_attr):
+                n_totals[name] = getattr(self.router, n_attr)
+
+        # Map weight_keys types to ema_attrs types for n_total lookup
+        # e.g., 'fqk_q' -> 'feature_qk', 'rv' -> 'restore_v'
+        type_to_ema = {}
+        if self.version in ['16.4', '17.1']:
+            type_to_ema = {
+                'fqk_q': 'feature_qk', 'fqk_k': 'feature_qk',
+                'fv': 'feature_v',
+                'rqk_q': 'restore_qk', 'rqk_k': 'restore_qk',
+                'rv': 'restore_v',
+            }
+        else:
+            type_to_ema = {
+                'feature_r': 'feature_r', 'feature_v': 'feature_v',
+                'relational': 'relational', 'value': 'value',
+            }
+
         # Calculate results
-        results = {}
-        n_totals = {
-            'feature_r': self.router.n_feature_r,
-            'feature_v': self.router.n_feature_v,
-            'relational': self.router.n_relational,
-            'value': self.router.n_value,
-        }
+        results = {'version': self.version}
 
         for ntype in union_selected:
-            n_total = n_totals[ntype]
+            # Map weight type to ema type for n_total lookup
+            ema_type = type_to_ema.get(ntype, ntype)
+            n_total = n_totals.get(ema_type, 0)
             union_count = len(union_selected[ntype])
             batch_counts = per_batch_counts[ntype]
 
@@ -719,8 +856,11 @@ class V16Analyzer:
         # Summary
         total_union = sum(len(union_selected[k]) for k in union_selected)
         total_neurons = sum(n_totals.values())
+        # Get first available key for batch count
+        first_key = next(iter(per_batch_counts.keys()), None)
+        n_batches_done = len(per_batch_counts[first_key]) if first_key else 0
         results['summary'] = {
-            'n_batches_processed': min(n_batches, len(per_batch_counts['feature_r'])),
+            'n_batches_processed': min(n_batches, n_batches_done),
             'total_union_coverage': float(total_union / total_neurons) if total_neurons > 0 else 0,
             'interpretation': (
                 'High diversity_ratio (>2) = 많은 뉴런이 batch마다 다르게 선택됨\n'
@@ -739,12 +879,15 @@ class V16Analyzer:
         if self.router is None:
             return {'error': 'No router found'}
 
-        results = {}
+        results = {'version': self.version}
         threshold = 0.01
 
-        for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
-            ema = getattr(self.router, f'usage_ema_{name}')
-            n_total = getattr(self.router, f'n_{name}')
+        # Use version-aware ema_attrs
+        for name, ema_attr, n_attr in self.mapping['ema_attrs']:
+            if not hasattr(self.router, ema_attr):
+                continue
+            ema = getattr(self.router, ema_attr)
+            n_total = getattr(self.router, n_attr)
 
             # Active neurons
             active_mask = ema > threshold
@@ -798,13 +941,13 @@ class V16Analyzer:
                 'gini': float(gini),
             }
 
-        # Overall diversity score (weighted average)
-        weights = {'feature_r': 2, 'feature_v': 2, 'relational': 1.5, 'value': 1.5, 'knowledge': 1}
-        total_weight = sum(weights.values())
-        overall_diversity = sum(
-            results[name].get('normalized_entropy', 0) * weights[name]
-            for name in weights if name in results
-        ) / total_weight
+        # Overall diversity score (equal weight for all types present)
+        type_entropies = [
+            results[name].get('normalized_entropy', 0)
+            for name, _, _ in self.mapping['ema_attrs']
+            if name in results and isinstance(results[name], dict)
+        ]
+        overall_diversity = sum(type_entropies) / len(type_entropies) if type_entropies else 0
 
         results['overall'] = {
             'diversity_score': float(overall_diversity),
@@ -826,14 +969,17 @@ class V16Analyzer:
         if self.router is None:
             return {'error': 'No router found'}
 
-        results = {}
+        results = {'version': self.version}
         threshold = 0.01
         dying_threshold = 0.05  # 죽어가는 중
         tau = self.router.tau
 
-        for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
-            ema = getattr(self.router, f'usage_ema_{name}')
-            n_total = getattr(self.router, f'n_{name}')
+        # Use version-aware ema_attrs
+        for name, ema_attr, n_attr in self.mapping['ema_attrs']:
+            if not hasattr(self.router, ema_attr):
+                continue
+            ema = getattr(self.router, ema_attr)
+            n_total = getattr(self.router, n_attr)
 
             # Categories
             dead_mask = ema < threshold
@@ -873,9 +1019,12 @@ class V16Analyzer:
         total_removable = sum(r['n_removable'] for r in results.values() if isinstance(r, dict))
         total_neurons = sum(r['n_total'] for r in results.values() if isinstance(r, dict))
 
+        # Get type names dynamically
+        type_names = [name for name, _, _ in self.mapping['ema_attrs'] if name in results]
+
         results['shrink_recommendation'] = {
             'total_removable': total_removable,
-            'shrink_ratio': float(total_removable / total_neurons),
+            'shrink_ratio': float(total_removable / total_neurons) if total_neurons > 0 else 0,
             'recommended_action': 'shrink' if total_removable > total_neurons * 0.2 else 'keep',
             'per_type': {
                 name: {
@@ -883,8 +1032,7 @@ class V16Analyzer:
                     'recommended': results[name]['n_total'] - results[name]['n_removable'],
                     'remove': results[name]['n_removable'],
                 }
-                for name in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']
-                if name in results
+                for name in type_names
             }
         }
 
@@ -892,25 +1040,34 @@ class V16Analyzer:
         if HAS_MATPLOTLIB and output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-            axes = axes.flatten()
+            n_types = len(type_names)
+            n_cols = 3
+            n_rows = (n_types + 1 + n_cols - 1) // n_cols  # +1 for summary
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
+            axes = axes.flatten() if n_rows > 1 else [axes] if n_types == 0 else list(axes)
 
             colors = ['green', 'yellow', 'red']
             labels = ['Active', 'Dying', 'Dead']
 
-            for ax, name in zip(axes[:5], ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']):
+            for ax, name in zip(axes[:n_types], type_names):
                 data = results[name]
                 sizes = [data['n_active'], data['n_dying'], data['n_dead']]
                 ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-                ax.set_title(f'{name}\n(removable: {data["n_removable"]})')
+                ax.set_title(f'{name.upper()}\n(removable: {data["n_removable"]})')
 
             # Summary bar
-            ax = axes[5]
-            names = ['FR', 'FV', 'R', 'V', 'K']
-            removable = [results[n]['n_removable'] for n in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']]
-            ax.bar(names, removable, color='red', alpha=0.7)
-            ax.set_title('Removable Neurons')
-            ax.set_ylabel('Count')
+            if n_types < len(axes):
+                ax = axes[n_types]
+                display_names = [n.upper()[:3] for n in type_names]
+                removable = [results[n]['n_removable'] for n in type_names]
+                ax.bar(display_names, removable, color='red', alpha=0.7)
+                ax.set_title('Removable Neurons')
+                ax.set_ylabel('Count')
+                ax.tick_params(axis='x', rotation=45)
+
+            # Hide unused axes
+            for i in range(n_types + 1, len(axes)):
+                axes[i].axis('off')
 
             plt.tight_layout()
             path = os.path.join(output_dir, 'dead_neurons.png')
@@ -930,20 +1087,19 @@ class V16Analyzer:
         if self.router is None or not HAS_SKLEARN:
             return {'error': 'No router found or sklearn not available'}
 
-        results = {}
+        results = {'version': self.version}
         emb = self.router.neuron_emb.detach().cpu().numpy()
 
-        # Type boundaries
-        boundaries = {
-            'FR': (0, self.router.n_feature_r),
-            'FV': (self.router.n_feature_r, self.router.n_feature_r + self.router.n_feature_v),
-            'R': (self.router.n_feature_r + self.router.n_feature_v,
-                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational),
-            'V': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational,
-                  self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value),
-            'K': (self.router.n_feature_r + self.router.n_feature_v + self.router.n_relational + self.router.n_value,
-                  self.router.total_neurons),
-        }
+        # Build version-aware boundaries and ema_attr mapping
+        boundaries = {}
+        ema_attr_map = {}
+        offset = 0
+        for name, ema_attr, n_attr in self.mapping['ema_attrs']:
+            if hasattr(self.router, n_attr):
+                n = getattr(self.router, n_attr)
+                boundaries[name.upper()] = (offset, offset + n)
+                ema_attr_map[name.upper()] = ema_attr
+                offset += n
 
         for name, (start, end) in boundaries.items():
             type_emb = emb[start:end]
@@ -963,16 +1119,10 @@ class V16Analyzer:
                 cluster_mask = labels == c
                 cluster_size = cluster_mask.sum()
 
-                # Get usage EMA for this type
-                ema_attr = f'usage_ema_{name.lower()}' if name != 'FR' else 'usage_ema_feature_r'
-                if name == 'FV':
-                    ema_attr = 'usage_ema_feature_v'
-                elif name == 'R':
-                    ema_attr = 'usage_ema_relational'
-                elif name == 'V':
-                    ema_attr = 'usage_ema_value'
-                elif name == 'K':
-                    ema_attr = 'usage_ema_knowledge'
+                # Get usage EMA for this type (version-aware)
+                ema_attr = ema_attr_map.get(name)
+                if ema_attr is None or not hasattr(self.router, ema_attr):
+                    continue
 
                 ema = getattr(self.router, ema_attr).cpu().numpy()
                 cluster_ema = ema[cluster_mask]
@@ -1135,13 +1285,11 @@ class V16Analyzer:
         from sklearn.model_selection import train_test_split
         from sklearn.metrics import accuracy_score, classification_report
 
-        # Collect activations and labels
-        X_data = {
-            'feature_r': [],
-            'feature_v': [],
-            'relational': [],
-            'value': [],
-        }
+        # Version-aware weight keys
+        weight_keys = self.mapping['weight_keys']
+
+        # Collect activations and labels (dynamically from mapping)
+        X_data = {ntype: [] for ntype in weight_keys.keys()}
         y_labels = []
 
         self.model.eval()
@@ -1155,17 +1303,17 @@ class V16Analyzer:
 
                 try:
                     outputs = self.model(input_ids, attention_mask=attention_mask, return_routing_info=True)
-                    routing_info = outputs.get('routing_info', {})
+                    # Handle both old (dict) and new (tuple) output formats
+                    if isinstance(outputs, tuple) and len(outputs) == 2:
+                        routing_infos = outputs[1]
+                        routing_info = routing_infos[0].get('attention', {}) if routing_infos else {}
+                    else:
+                        routing_info = outputs.get('routing_info', {})
                 except:
                     continue
 
-                # Get routing weights
-                for ntype, key in [
-                    ('feature_r', 'feature_r_weights'),
-                    ('feature_v', 'feature_v_weights'),
-                    ('relational', 'relational_weights_Q'),
-                    ('value', 'value_weights'),
-                ]:
+                # Get routing weights (version-aware)
+                for ntype, key in weight_keys.items():
                     if key in routing_info:
                         w = routing_info[key]
                         if w.dim() == 3:  # [B, S, N]
@@ -1184,7 +1332,7 @@ class V16Analyzer:
                         pos = simple_pos_tag(token)
                         y_labels.append(pos)
 
-        results = {}
+        results = {'version': self.version}
 
         # Train probing classifier for each neuron type
         for ntype in X_data:
@@ -1321,16 +1469,19 @@ class V16Analyzer:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        axes = axes.flatten()
+        # Build version-aware data list
+        color_palette = ['red', 'orange', 'blue', 'green', 'purple', 'cyan', 'magenta', 'brown']
+        data = []
+        for i, (name, ema_attr, _) in enumerate(self.mapping['ema_attrs']):
+            if hasattr(self.router, ema_attr):
+                ema = getattr(self.router, ema_attr)
+                data.append((name.upper(), ema, color_palette[i % len(color_palette)]))
 
-        data = [
-            ('Feature R', self.router.usage_ema_feature_r, 'red'),
-            ('Feature V', self.router.usage_ema_feature_v, 'orange'),
-            ('Relational', self.router.usage_ema_relational, 'blue'),
-            ('Value', self.router.usage_ema_value, 'green'),
-            ('Knowledge', self.router.usage_ema_knowledge, 'purple'),
-        ]
+        n_plots = len(data) + 1  # +1 for summary
+        n_cols = 3
+        n_rows = (n_plots + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
+        axes = axes.flatten() if n_rows > 1 else [axes] if n_plots == 1 else axes
 
         for ax, (name, ema, color) in zip(axes, data):
             values = ema.detach().cpu().numpy()
@@ -1346,14 +1497,20 @@ class V16Analyzer:
                     ha='right', va='top', fontsize=10)
 
         # Summary bar chart
-        ax = axes[5]
-        names = [d[0] for d in data]
-        active_ratios = [(d[1] > 0.01).float().mean().item() for d in data]
-        colors = [d[2] for d in data]
-        ax.bar(names, active_ratios, color=colors, alpha=0.7, edgecolor='black')
-        ax.set_title('Active Neuron Ratio by Type')
-        ax.set_ylabel('Active Ratio')
-        ax.set_ylim(0, 1)
+        if len(data) < len(axes):
+            ax = axes[len(data)]
+            names = [d[0] for d in data]
+            active_ratios = [(d[1] > 0.01).float().mean().item() for d in data]
+            colors = [d[2] for d in data]
+            ax.bar(names, active_ratios, color=colors, alpha=0.7, edgecolor='black')
+            ax.set_title('Active Neuron Ratio by Type')
+            ax.set_ylabel('Active Ratio')
+            ax.set_ylim(0, 1)
+            ax.tick_params(axis='x', rotation=45)
+
+        # Hide unused axes
+        for i in range(len(data) + 1, len(axes)):
+            axes[i].axis('off')
 
         plt.tight_layout()
         path = os.path.join(output_dir, 'usage_histogram.png')
@@ -1387,29 +1544,33 @@ class V16Analyzer:
 
 def print_usage_summary(usage: Dict):
     print("\n" + "="*60)
-    print("NEURON USAGE SUMMARY")
+    print(f"NEURON USAGE SUMMARY (v{usage.get('version', 'unknown')})")
     print("="*60)
-    print(f"{'Type':<12} {'Active':>8} {'Total':>8} {'Ratio':>8} {'Gini':>8} {'Mean':>10}")
-    print("-"*60)
-    for key in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
-        d = usage[key]
-        print(f"{key:<12} {d['active']:>8} {d['total']:>8} {d['ratio']:>8.2%} {d['gini']:>8.2f} {d['ema_stats']['mean']:>10.4f}")
+    print(f"{'Type':<15} {'Active':>8} {'Total':>8} {'Ratio':>8} {'Gini':>8} {'Mean':>10}")
+    print("-"*65)
+    # Dynamic keys - skip metadata keys
+    for key, d in usage.items():
+        if key == 'version' or not isinstance(d, dict) or 'active' not in d:
+            continue
+        print(f"{key:<15} {d['active']:>8} {d['total']:>8} {d['ratio']:>8.2%} {d['gini']:>8.2f} {d['ema_stats']['mean']:>10.4f}")
 
 
 def print_excitability_summary(exc: Dict):
     print("\n" + "="*60)
-    print("EXCITABILITY STATE")
+    print(f"EXCITABILITY STATE (v{exc.get('version', 'unknown')})")
     print("="*60)
     print(f"tau: {exc['tau']:.2f}")
     print(f"weight: {exc['weight']:.4f}")
     print(f"langevin_alpha: {exc.get('langevin_alpha', 'N/A')}")
     print(f"langevin_beta: {exc.get('langevin_beta', 'N/A')}")
     print()
-    print(f"{'Type':<12} {'Min':>8} {'Mean':>8} {'Max':>8}")
-    print("-"*40)
-    for key in ['feature_r', 'feature_v', 'relational', 'value', 'knowledge']:
-        d = exc[f'{key}_excitability']
-        print(f"{key:<12} {d['min']:>8.2f} {d['mean']:>8.2f} {d['max']:>8.2f}")
+    print(f"{'Type':<15} {'Min':>8} {'Mean':>8} {'Max':>8}")
+    print("-"*45)
+    # Dynamic keys - find all excitability entries
+    for key, d in exc.items():
+        if key.endswith('_excitability') and isinstance(d, dict):
+            name = key.replace('_excitability', '')
+            print(f"{name:<15} {d['min']:>8.2f} {d['mean']:>8.2f} {d['max']:>8.2f}")
 
 
 def print_neuron_summary(neuron: Dict):
@@ -1560,7 +1721,7 @@ def main():
         print("WEIGHT SVD ANALYSIS")
         print("="*60)
         for name, data in svd.items():
-            if name == 'visualization':
+            if name in ['visualization', 'version']:
                 continue
             print(f"\n{name}:")
             print(f"  Effective rank: {data['effective_rank']:.2f}")
@@ -1574,7 +1735,7 @@ def main():
         print("NEURON SIMILARITY")
         print("="*60)
         for name, data in sim.items():
-            if name == 'visualization':
+            if name in ['visualization', 'version']:
                 continue
             print(f"{name}: avg={data['avg_similarity']:.3f}, max={data['max_similarity']:.3f}")
         with open(os.path.join(args.output_dir, 'similarity.json'), 'w') as f:
@@ -1627,7 +1788,7 @@ def main():
         print("NEURON CLUSTERING")
         print("="*60)
         for name, data in clusters.items():
-            if name == 'visualization' or 'error' in str(data):
+            if name in ['visualization', 'version'] or not isinstance(data, dict) or 'error' in data:
                 continue
             print(f"\n{name}: {data['n_clusters']} clusters")
             for c in data.get('clusters', [])[:3]:
@@ -1654,6 +1815,8 @@ def main():
         print("PROBING CLASSIFIER")
         print("="*60)
         for ntype, data in probing.items():
+            if ntype == 'version' or not isinstance(data, dict):
+                continue
             if 'error' in data:
                 print(f"{ntype}: {data['error']}")
             else:
@@ -1669,7 +1832,7 @@ def main():
         print("="*60)
         print(f"Baseline loss: {ablation['baseline_loss']:.4f}")
         for ntype, results in ablation.items():
-            if ntype == 'baseline_loss':
+            if ntype in ['baseline_loss', 'version'] or not isinstance(results, list):
                 continue
             print(f"\n{ntype}:")
             for r in results:
