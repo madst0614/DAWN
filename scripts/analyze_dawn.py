@@ -348,12 +348,12 @@ class DAWNAnalyzer:
             'embedding': self.run_embedding_analysis(output_dir),
             'weight': self.run_weight_analysis(output_dir),
             'clustering': self.run_clustering_analysis(output_dir=output_dir),
-            'semantic': self.run_semantic_analysis(dataloader, output_dir),
+            'semantic': self.run_semantic_analysis(dataloader, n_batches, output_dir),
         }
 
         if dataloader:
             results['routing'] = self.run_routing_analysis(dataloader, n_batches, output_dir)
-            results['trajectory'] = self.run_trajectory_analysis(dataloader, output_dir=output_dir)
+            results['trajectory'] = self.run_trajectory_analysis(dataloader, n_batches, output_dir)
             results['coselection'] = self.run_coselection_analysis(dataloader, n_batches, output_dir)
 
         output_path = os.path.join(output_dir, 'dawn_analysis.json')

@@ -103,7 +103,7 @@ class PaperFigureGenerator:
         # 5. Semantic Analysis
         print("\n[5/8] Semantic Analysis...")
         sem_dir = os.path.join(output_dir, 'semantic')
-        all_results['semantic'] = self.semantic.run_all(self.dataloader, sem_dir)
+        all_results['semantic'] = self.semantic.run_all(self.dataloader, sem_dir, max_batches=n_batches)
 
         # Data-dependent analyses
         if self.dataloader is not None:
@@ -322,7 +322,7 @@ class PaperFigureGenerator:
 
         # Semantic (no dataloader needed for path similarity)
         print("4. Semantic Path Similarity...")
-        results['semantic'] = self.semantic.run_all(None, os.path.join(output_dir, 'semantic'))
+        results['semantic'] = self.semantic.run_all(None, os.path.join(output_dir, 'semantic'), max_batches=50)
 
         # Save
         save_results(results, os.path.join(output_dir, 'quick_results.json'))
