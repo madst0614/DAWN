@@ -17,7 +17,7 @@ from typing import Dict, Optional
 from collections import defaultdict
 
 from .utils import (
-    NEURON_TYPES, ROUTING_KEYS,
+    NEURON_TYPES, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
     calc_entropy_ratio, simple_pos_tag,
     get_batch_input_ids, get_routing_from_outputs,
     HAS_MATPLOTLIB, HAS_SKLEARN, HAS_TQDM, tqdm, plt
@@ -150,24 +150,26 @@ class BehavioralAnalyzer:
 
         return results
 
-    def run_probing(self, dataloader, max_batches: int = 50) -> Dict:
+    def run_probing(self, dataloader, max_batches: int = 50, layer_idx: int = None) -> Dict:
         """
-        Run probing classifier for POS prediction.
+        Run probing classifier for POS prediction across ALL layers.
 
         Uses routing weights to predict part-of-speech tags.
 
         Args:
             dataloader: DataLoader for input data
             max_batches: Maximum batches to process
+            layer_idx: Specific layer to analyze (None = all layers aggregated)
 
         Returns:
-            Dictionary with probing accuracy per routing key
+            Dictionary with probing accuracy per layer/routing key
         """
         if not HAS_SKLEARN:
             return {'error': 'sklearn not available'}
 
-        X_data = {key: [] for key in ROUTING_KEYS.keys()}
-        y_labels = []
+        # {layer_key: {routing_key: [features]}}
+        X_data = defaultdict(lambda: defaultdict(list))
+        y_labels = defaultdict(list)
 
         self.model.eval()
         with torch.no_grad():
@@ -188,58 +190,114 @@ class BehavioralAnalyzer:
                     routing_infos = get_routing_from_outputs(outputs)
                     if routing_infos is None:
                         continue
-                    routing_info = routing_infos[0].get('attention', {})
                 except Exception:
                     continue
 
-                # Collect routing weights
-                for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                    if weight_key in routing_info:
-                        w = routing_info[weight_key]
-                        if w.dim() == 3:  # [B, S, N]
-                            for b in range(w.shape[0]):
-                                for s in range(w.shape[1]):
-                                    if attention_mask[b, s] == 0:
-                                        continue
-                                    X_data[key].append(w[b, s].cpu().numpy())
+                # Process ALL layers
+                for lidx, layer_info in enumerate(routing_infos):
+                    if layer_idx is not None and lidx != layer_idx:
+                        continue
 
-                # Collect POS labels
-                for b in range(input_ids.shape[0]):
-                    for s in range(input_ids.shape[1]):
-                        if attention_mask[b, s] == 0:
-                            continue
-                        token = self.tokenizer.decode([input_ids[b, s].item()])
-                        pos = simple_pos_tag(token)
-                        y_labels.append(pos)
+                    layer_key = f'L{lidx}'
+                    attn = layer_info.get('attention', {})
+                    knowledge = layer_info.get('knowledge', {})
 
-        # Train and evaluate classifiers
-        results = {}
-        for key in X_data:
-            X = np.array(X_data[key])
-            y = np.array(y_labels[:len(X)])
+                    # Collect attention routing weights
+                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                        if weight_key in attn:
+                            w = attn[weight_key]
+                            if w.dim() == 3:  # [B, S, N]
+                                for b in range(w.shape[0]):
+                                    for s in range(w.shape[1]):
+                                        if attention_mask[b, s] == 0:
+                                            continue
+                                        X_data[layer_key][key].append(w[b, s].cpu().numpy())
 
-            if len(X) < 100 or len(np.unique(y)) < 2:
-                results[key] = {'error': 'Not enough data'}
-                continue
+                    # Collect knowledge routing weights
+                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                        if weight_key in knowledge:
+                            w = knowledge[weight_key]
+                            if w.dim() == 3:
+                                for b in range(w.shape[0]):
+                                    for s in range(w.shape[1]):
+                                        if attention_mask[b, s] == 0:
+                                            continue
+                                        X_data[layer_key][key].append(w[b, s].cpu().numpy())
+                            elif w.dim() == 2:
+                                # Knowledge routing may be [B, N]
+                                for b in range(w.shape[0]):
+                                    for s in range(attention_mask.shape[1]):
+                                        if attention_mask[b, s] == 0:
+                                            continue
+                                        X_data[layer_key][key].append(w[b].cpu().numpy())
 
-            try:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, test_size=0.2, random_state=42
-                )
+                    # Collect POS labels for this layer
+                    for b in range(input_ids.shape[0]):
+                        for s in range(input_ids.shape[1]):
+                            if attention_mask[b, s] == 0:
+                                continue
+                            token = self.tokenizer.decode([input_ids[b, s].item()])
+                            pos = simple_pos_tag(token)
+                            y_labels[layer_key].append(pos)
 
-                clf = LogisticRegression(max_iter=1000, random_state=42)
-                clf.fit(X_train, y_train)
-                y_pred = clf.predict(X_test)
+        # Train and evaluate classifiers per layer/routing key
+        results = {'per_layer': {}}
 
-                accuracy = accuracy_score(y_test, y_pred)
-                results[key] = {
-                    'display': ROUTING_KEYS[key][0],
-                    'accuracy': float(accuracy),
-                    'n_samples': len(X),
-                    'n_classes': len(np.unique(y)),
+        for layer_key in X_data.keys():
+            results['per_layer'][layer_key] = {}
+
+            for routing_key in X_data[layer_key].keys():
+                X = np.array(X_data[layer_key][routing_key])
+                y = np.array(y_labels[layer_key][:len(X)])
+
+                if len(X) < 100 or len(np.unique(y)) < 2:
+                    results['per_layer'][layer_key][routing_key] = {'error': 'Not enough data'}
+                    continue
+
+                try:
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X, y, test_size=0.2, random_state=42
+                    )
+
+                    clf = LogisticRegression(max_iter=1000, random_state=42)
+                    clf.fit(X_train, y_train)
+                    y_pred = clf.predict(X_test)
+
+                    accuracy = accuracy_score(y_test, y_pred)
+
+                    # Get display name
+                    if routing_key in ROUTING_KEYS:
+                        display = ROUTING_KEYS[routing_key][0]
+                    elif routing_key in KNOWLEDGE_ROUTING_KEYS:
+                        display = KNOWLEDGE_ROUTING_KEYS[routing_key][0]
+                    else:
+                        display = routing_key
+
+                    results['per_layer'][layer_key][routing_key] = {
+                        'display': f'{layer_key}/{display}',
+                        'accuracy': float(accuracy),
+                        'n_samples': len(X),
+                        'n_classes': len(np.unique(y)),
+                    }
+                except Exception as e:
+                    results['per_layer'][layer_key][routing_key] = {'error': str(e)}
+
+        # Summary: best accuracy per routing type across layers
+        results['summary'] = {}
+        all_routing_keys = set()
+        for layer_data in results['per_layer'].values():
+            all_routing_keys.update(layer_data.keys())
+
+        for rkey in all_routing_keys:
+            accuracies = []
+            for layer_key, layer_data in results['per_layer'].items():
+                if rkey in layer_data and 'accuracy' in layer_data[rkey]:
+                    accuracies.append(layer_data[rkey]['accuracy'])
+            if accuracies:
+                results['summary'][rkey] = {
+                    'max_accuracy': max(accuracies),
+                    'mean_accuracy': float(np.mean(accuracies)),
                 }
-            except Exception as e:
-                results[key] = {'error': str(e)}
 
         return results
 

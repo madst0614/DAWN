@@ -19,7 +19,7 @@ from typing import Dict, Optional
 from collections import Counter
 
 from .utils import (
-    NEURON_TYPES, ROUTING_KEYS, QK_POOLS,
+    NEURON_TYPES, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS, QK_POOLS,
     calc_entropy_ratio, gini_coefficient,
     get_batch_input_ids, get_routing_from_outputs,
     HAS_MATPLOTLIB, HAS_TQDM, tqdm, plt
@@ -188,34 +188,70 @@ class RoutingAnalyzer:
                     routing_infos = get_routing_from_outputs(outputs)
                     if routing_infos is None:
                         continue
-                    routing_info = routing_infos[0].get('attention', {})
                 except Exception:
                     continue
 
-                for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                    if weight_key in routing_info:
-                        weights = routing_info[weight_key]
-                        if weights.dim() == 3:
-                            selected = (weights > 0).any(dim=0).any(dim=0).cpu()
-                            union_selected[key].update(selected.nonzero().flatten().tolist())
-                            per_batch_counts[key].append(selected.sum().item())
-                        elif weights.dim() == 2:
-                            selected = (weights > 0).any(dim=0).cpu()
-                            union_selected[key].update(selected.nonzero().flatten().tolist())
-                            per_batch_counts[key].append(selected.sum().item())
+                # Process ALL layers
+                for layer_idx, layer_info in enumerate(routing_infos):
+                    attn = layer_info.get('attention', {})
+                    knowledge = layer_info.get('knowledge', {})
 
-        # Map routing keys to pool types
-        key_to_pool = {key: info[3] for key, info in ROUTING_KEYS.items()}
+                    # Attention routing
+                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                        layer_key = f'L{layer_idx}/{key}'
+                        if weight_key in attn:
+                            weights = attn[weight_key]
+                            if weights.dim() == 3:
+                                selected = (weights > 0).any(dim=0).any(dim=0).cpu()
+                                union_selected[layer_key].update(selected.nonzero().flatten().tolist())
+                                per_batch_counts[layer_key].append(selected.sum().item())
+                            elif weights.dim() == 2:
+                                selected = (weights > 0).any(dim=0).cpu()
+                                union_selected[layer_key].update(selected.nonzero().flatten().tolist())
+                                per_batch_counts[layer_key].append(selected.sum().item())
 
+                    # Knowledge routing
+                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                        layer_key = f'L{layer_idx}/{key}'
+                        if weight_key in knowledge:
+                            weights = knowledge[weight_key]
+                            if weights.dim() == 3:
+                                selected = (weights > 0).any(dim=0).any(dim=0).cpu()
+                                union_selected[layer_key].update(selected.nonzero().flatten().tolist())
+                                per_batch_counts[layer_key].append(selected.sum().item())
+                            elif weights.dim() == 2:
+                                selected = (weights > 0).any(dim=0).cpu()
+                                union_selected[layer_key].update(selected.nonzero().flatten().tolist())
+                                per_batch_counts[layer_key].append(selected.sum().item())
+
+        # Build results for all layer/key combinations
         results = {}
-        for key in ROUTING_KEYS.keys():
-            pool = key_to_pool[key]
+
+        for layer_key in union_selected.keys():
+            # Parse layer_key: L{layer_idx}/{routing_key}
+            parts = layer_key.split('/')
+            if len(parts) != 2:
+                continue
+
+            layer_str, routing_key = parts
+            layer_idx = int(layer_str[1:])
+
+            # Get pool info
+            if routing_key in ROUTING_KEYS:
+                pool = ROUTING_KEYS[routing_key][3]
+                display = f'{layer_str}/{ROUTING_KEYS[routing_key][0]}'
+            elif routing_key in KNOWLEDGE_ROUTING_KEYS:
+                pool = KNOWLEDGE_ROUTING_KEYS[routing_key][2]
+                display = f'{layer_str}/{KNOWLEDGE_ROUTING_KEYS[routing_key][0]}'
+            else:
+                continue
+
             pool_info = NEURON_TYPES.get(pool, {})
             n_attr = pool_info[2] if pool_info else None
             n_total = getattr(self.router, n_attr, 0) if n_attr else 0
 
-            union_count = len(union_selected[key])
-            batch_counts = per_batch_counts[key]
+            union_count = len(union_selected[layer_key])
+            batch_counts = per_batch_counts[layer_key]
 
             if len(batch_counts) > 0:
                 per_batch_avg = np.mean(batch_counts)
@@ -224,8 +260,9 @@ class RoutingAnalyzer:
                 per_batch_avg = 0
                 per_batch_std = 0
 
-            results[key] = {
-                'display': ROUTING_KEYS[key][0],
+            results[layer_key] = {
+                'display': display,
+                'layer': layer_idx,
                 'pool': pool,
                 'n_total': n_total,
                 'per_batch_avg': float(per_batch_avg),
@@ -236,14 +273,15 @@ class RoutingAnalyzer:
             }
 
         total_union = sum(len(union_selected[k]) for k in union_selected)
-        total_neurons = sum(
-            getattr(self.router, NEURON_TYPES[ROUTING_KEYS[k][3]][2], 0)
-            for k in ROUTING_KEYS.keys()
-        )
+        n_batches_processed = 0
+        if per_batch_counts:
+            first_key = next(iter(per_batch_counts))
+            n_batches_processed = len(per_batch_counts[first_key])
 
         results['summary'] = {
-            'n_batches_processed': min(n_batches, len(per_batch_counts[next(iter(per_batch_counts))])),
-            'total_union_coverage': float(total_union / total_neurons) if total_neurons > 0 else 0,
+            'n_batches_processed': min(n_batches, n_batches_processed),
+            'n_layers': len(set(k.split('/')[0] for k in union_selected.keys())),
+            'total_keys_analyzed': len(union_selected),
             'interpretation': (
                 'High diversity_ratio (>2) = many neurons selected differently per batch\n'
                 'Low diversity_ratio (~1) = same neurons always selected'
@@ -429,65 +467,98 @@ class RoutingAnalyzer:
 
     def analyze_qk_entropy(self, dataloader, n_batches: int = 50) -> Dict:
         """
-        Analyze Q/K routing entropy patterns.
+        Analyze Q/K routing entropy patterns across ALL layers.
 
         Args:
             dataloader: DataLoader for input data
             n_batches: Number of batches to process
 
         Returns:
-            Dictionary with entropy statistics
+            Dictionary with entropy statistics per layer
         """
-        results = {}
+        # {pool_name: {layer_idx: {'q': [], 'k': []}}}
+        layer_entropy = {pool: {} for pool in QK_POOLS.keys()}
 
-        for pool_name, pool_info in QK_POOLS.items():
-            q_entropy = []
-            k_entropy = []
+        self.model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(dataloader, desc='Q/K Entropy', total=n_batches)):
+                if i >= n_batches:
+                    break
 
-            self.model.eval()
-            with torch.no_grad():
-                for i, batch in enumerate(tqdm(dataloader, desc=f'{pool_info["display"]} Entropy', total=n_batches)):
-                    if i >= n_batches:
-                        break
+                input_ids = get_batch_input_ids(batch, self.device)
 
-                    input_ids = get_batch_input_ids(batch, self.device)
-
-                    try:
-                        outputs = self.model(input_ids, return_routing_info=True)
-                        routing_infos = get_routing_from_outputs(outputs)
-                        if routing_infos is None:
-                            continue
-                        attn = routing_infos[0].get('attention', {})
-                    except Exception:
+                try:
+                    outputs = self.model(input_ids, return_routing_info=True)
+                    routing_infos = get_routing_from_outputs(outputs)
+                    if routing_infos is None:
                         continue
+                except Exception:
+                    continue
 
-                    # Get preference tensors
-                    pref_q = attn.get(pool_info['q_pref'])
-                    pref_k = attn.get(pool_info['k_pref'])
+                # Process ALL layers
+                for layer_idx, layer_info in enumerate(routing_infos):
+                    attn = layer_info.get('attention', {})
 
-                    if pref_q is not None:
-                        p = pref_q.mean(dim=0) if pref_q.dim() > 1 else pref_q
-                        p = p.clamp(min=1e-8)
-                        ent = -torch.sum(p * torch.log(p)).item()
-                        max_ent = np.log(pref_q.shape[-1])
-                        q_entropy.append(ent / max_ent * 100)
+                    for pool_name, pool_info in QK_POOLS.items():
+                        if layer_idx not in layer_entropy[pool_name]:
+                            layer_entropy[pool_name][layer_idx] = {'q': [], 'k': []}
 
-                    if pref_k is not None:
-                        p = pref_k.mean(dim=0) if pref_k.dim() > 1 else pref_k
-                        p = p.clamp(min=1e-8)
-                        ent = -torch.sum(p * torch.log(p)).item()
-                        max_ent = np.log(pref_k.shape[-1])
-                        k_entropy.append(ent / max_ent * 100)
+                        pref_q = attn.get(pool_info['q_pref'])
+                        pref_k = attn.get(pool_info['k_pref'])
 
-            if q_entropy and k_entropy:
-                results[pool_name] = {
-                    'display': pool_info['display'],
-                    'q_entropy_mean': float(np.mean(q_entropy)),
-                    'q_entropy_std': float(np.std(q_entropy)),
-                    'k_entropy_mean': float(np.mean(k_entropy)),
-                    'k_entropy_std': float(np.std(k_entropy)),
-                    'entropy_diff': float(np.mean(q_entropy) - np.mean(k_entropy)),
+                        if pref_q is not None:
+                            p = pref_q.mean(dim=0) if pref_q.dim() > 1 else pref_q
+                            p = p.clamp(min=1e-8)
+                            ent = -torch.sum(p * torch.log(p)).item()
+                            max_ent = np.log(pref_q.shape[-1])
+                            layer_entropy[pool_name][layer_idx]['q'].append(ent / max_ent * 100)
+
+                        if pref_k is not None:
+                            p = pref_k.mean(dim=0) if pref_k.dim() > 1 else pref_k
+                            p = p.clamp(min=1e-8)
+                            ent = -torch.sum(p * torch.log(p)).item()
+                            max_ent = np.log(pref_k.shape[-1])
+                            layer_entropy[pool_name][layer_idx]['k'].append(ent / max_ent * 100)
+
+        # Build results
+        results = {}
+        for pool_name, pool_info in QK_POOLS.items():
+            pool_results = {}
+
+            for layer_idx, ent_data in layer_entropy[pool_name].items():
+                q_entropy = ent_data['q']
+                k_entropy = ent_data['k']
+
+                if q_entropy and k_entropy:
+                    pool_results[f'L{layer_idx}'] = {
+                        'q_entropy_mean': float(np.mean(q_entropy)),
+                        'q_entropy_std': float(np.std(q_entropy)),
+                        'k_entropy_mean': float(np.mean(k_entropy)),
+                        'k_entropy_std': float(np.std(k_entropy)),
+                        'entropy_diff': float(np.mean(q_entropy) - np.mean(k_entropy)),
+                    }
+
+            # Summary across layers
+            all_q = [v['q_entropy_mean'] for v in pool_results.values()]
+            all_k = [v['k_entropy_mean'] for v in pool_results.values()]
+
+            if all_q and all_k:
+                pool_results['summary'] = {
+                    'q_entropy_avg': float(np.mean(all_q)),
+                    'k_entropy_avg': float(np.mean(all_k)),
+                    'entropy_diff_avg': float(np.mean(all_q) - np.mean(all_k)),
                 }
+
+            results[pool_name] = {
+                'display': pool_info['display'],
+                'per_layer': pool_results,
+                # Keep backward compatibility
+                'q_entropy_mean': float(np.mean(all_q)) if all_q else 0,
+                'q_entropy_std': float(np.std(all_q)) if all_q else 0,
+                'k_entropy_mean': float(np.mean(all_k)) if all_k else 0,
+                'k_entropy_std': float(np.std(all_k)) if all_k else 0,
+                'entropy_diff': float(np.mean(all_q) - np.mean(all_k)) if all_q and all_k else 0,
+            }
 
         return results
 
