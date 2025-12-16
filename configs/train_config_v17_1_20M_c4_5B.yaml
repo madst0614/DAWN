@@ -1,5 +1,5 @@
 # DAWN v17.1 Training Config - 20M Scale, 5B tokens
-# Q/K 공유 풀 + Knowledge Feature-Restore 패턴
+# Q/K shared pool + Knowledge Feature-Restore pattern
 
 data:
   base_dir: /content/drive/MyDrive/data
@@ -27,7 +27,7 @@ model:
   rank: 64
   state_dim: 64
 
-  # Attention - Q/K 공유 풀
+  # Attention - Q/K shared pool
   n_feature_qk: 120
   n_feature_v: 24
   top_k_feature_qk: 20
@@ -38,7 +38,7 @@ model:
   top_k_restore_qk: 20
   top_k_restore_v: 6
 
-  # Knowledge - Feature-Restore 패턴
+  # Knowledge - Feature-Restore pattern
   n_feature_know: 24
   n_restore_know: 24
   knowledge_rank: 128
@@ -74,21 +74,21 @@ use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_5B
 
-# v17.1 Architecture (Q/K 공유 + Knowledge Feature-Restore)
+# v17.1 Architecture (Q/K shared + Knowledge Feature-Restore)
 #
-#   Attention Circuit (Q/K 공유 풀):
-#   - Feature_QK=120 (k=20): Q/K 공유 compression
+#   Attention Circuit (Q/K shared pool):
+#   - Feature_QK=120 (k=20): Q/K shared compression
 #   - Feature_V=24 (k=6): V compression
-#   - Restore_QK=120 (k=20): Q/K 공유 restoration
+#   - Restore_QK=120 (k=20): Q/K shared restoration
 #   - Restore_V=24 (k=6): V restoration
 #
-#   Knowledge Circuit (Feature-Restore 패턴):
+#   Knowledge Circuit (Feature-Restore pattern):
 #   - Feature_Know=24 (k=4): [24, 384, 128] compression
 #   - Restore_Know=24 (k=4): [24, 128, 384] restoration
 #   - batch-level routing (importance-weighted)
 #
 #   Routing paths:
 #   - Q: x -> Feature_QK -> h_qk -> Restore_QK -> Q
-#   - K: x -> Feature_QK -> h_qk -> Restore_QK -> K (같은 풀, 다른 routing)
+#   - K: x -> Feature_QK -> h_qk -> Restore_QK -> K (same pool, different routing)
 #   - V: x -> Feature_V -> h_v -> Restore_V -> V
 #   - Know: x -> Feature_Know -> h -> Restore_Know -> output

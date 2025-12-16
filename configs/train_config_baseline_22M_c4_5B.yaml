@@ -1,5 +1,5 @@
 # Vanilla Transformer Baseline - 22M Scale, 5B tokens
-# Goal: DAWN v16 22M vs Baseline 22M - 동등 파라미터 비교
+# Goal: DAWN v17.1 20M vs Baseline 22M - equal parameter comparison
 data:
   base_dir: /content/drive/MyDrive/data
   train_files:
@@ -38,5 +38,5 @@ training:
 use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_baseline_22M_c4_5B
 log_dir: /content/drive/MyDrive/dawn/logs_baseline_22M_c4_5B
-# 파라미터: ~22.3M
-# 표준 설정: d_ff=4×d_model, head_dim=64, Pre-LN, Weight tying
+# Parameters: ~22.3M
+# Standard config: d_ff=4×d_model, head_dim=64, Pre-LN, Weight tying

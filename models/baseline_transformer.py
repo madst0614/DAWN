@@ -269,16 +269,16 @@ class VanillaTransformer(nn.Module):
 # Parameter Comparison
 # ============================================
 def compare_params():
-    """DAWN vs Baseline parameter comparison"""
+    """DAWN vs Baseline parameter comparison (for testing only)"""
 
     vocab_size = 30522
     config = {
         'vocab_size': vocab_size,
-        'd_model': 256,
-        'd_ff': 1024,
-        'n_layers': 4,
-        'n_heads': 4,
-        'max_seq_len': 128,
+        'd_model': 384,
+        'd_ff': 1536,
+        'n_layers': 6,
+        'n_heads': 6,
+        'max_seq_len': 512,
         'dropout': 0.1,
     }
 
@@ -287,33 +287,17 @@ def compare_params():
     baseline_params = baseline.get_num_params()
 
     print("=" * 60)
-    print("Parameter Comparison")
+    print("Parameter Comparison (22M scale)")
     print("=" * 60)
 
-    print(f"\n📊 Vanilla Transformer (Baseline):")
+    print(f"\nVanilla Transformer (Baseline):")
     print(f"  Total: {baseline_params['total']:,}")
     print(f"  Embedding: {baseline_params['embedding']:,}")
     print(f"  Attention: {baseline_params['attention']:,}")
     print(f"  FFN: {baseline_params['ffn']:,}")
 
-    # DAWN estimates
-    print(f"\n📊 DAWN v7.0 (estimated):")
-    print(f"  Total: ~10,223,616")
-    print(f"  Basis (fixed): ~10M (not trained)")
-    print(f"  Recipe: ~8K")
-    print(f"  Router: ~800K")
-    print(f"  W_down: ~1M")
-
-    print(f"\n📊 DAWN v7.1 (estimated):")
-    print(f"  Total: ~9,174,020")
-    print(f"  Basis (fixed): ~10M (not trained)")
-    print(f"  Recipe: ~8K")
-    print(f"  Router: ~800K")
-    print(f"  W_down: 0 (removed!)")
-
-    print(f"\n📊 비교:")
-    print(f"  Baseline vs v7.0: {baseline_params['total'] - 10223616:+,}")
-    print(f"  Baseline vs v7.1: {baseline_params['total'] - 9174020:+,}")
+    # Note: For actual DAWN comparison, use DAWN model's get_num_params()
+    print(f"\nNote: Run DAWN model separately for accurate comparison")
 
     return baseline
 
