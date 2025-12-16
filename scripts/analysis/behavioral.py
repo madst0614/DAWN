@@ -133,9 +133,13 @@ class BehavioralAnalyzer:
                         if pref is None:
                             continue
 
-                        if pref.dim() == 3:  # [B, S, N]
+                        if pref.dim() == 3:  # [B, S, N] token-level
                             for pos in range(min(pref.shape[1], 128)):
                                 ent = calc_entropy_ratio(pref[:, pos, :])
+                                layer_position_routing[lidx][key][pos].append(ent)
+                        elif pref.dim() == 2:  # [B, N] batch-level - same for all positions
+                            ent = calc_entropy_ratio(pref)
+                            for pos in range(128):
                                 layer_position_routing[lidx][key][pos].append(ent)
 
         # Build per-layer results
@@ -242,25 +246,30 @@ class BehavioralAnalyzer:
                     for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
                         if weight_key in attn:
                             w = attn[weight_key]
-                            if w.dim() == 3:  # [B, S, N]
+                            if w.dim() == 3:  # [B, S, N] token-level
                                 for b in range(w.shape[0]):
                                     for s in range(w.shape[1]):
                                         if attention_mask[b, s] == 0:
                                             continue
                                         X_data[layer_key][key].append(w[b, s].cpu().numpy())
+                            elif w.dim() == 2:  # [B, N] batch-level
+                                for b in range(w.shape[0]):
+                                    for s in range(attention_mask.shape[1]):
+                                        if attention_mask[b, s] == 0:
+                                            continue
+                                        X_data[layer_key][key].append(w[b].cpu().numpy())
 
                     # Collect knowledge routing weights
                     for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
                         if weight_key in knowledge:
                             w = knowledge[weight_key]
-                            if w.dim() == 3:
+                            if w.dim() == 3:  # [B, S, N] token-level
                                 for b in range(w.shape[0]):
                                     for s in range(w.shape[1]):
                                         if attention_mask[b, s] == 0:
                                             continue
                                         X_data[layer_key][key].append(w[b, s].cpu().numpy())
-                            elif w.dim() == 2:
-                                # Knowledge routing may be [B, N]
+                            elif w.dim() == 2:  # [B, N] batch-level
                                 for b in range(w.shape[0]):
                                     for s in range(attention_mask.shape[1]):
                                         if attention_mask[b, s] == 0:

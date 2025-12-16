@@ -219,8 +219,14 @@ class SemanticAnalyzer:
                 attn = layer_info.get('attention', {})
                 for key, (display, pref_key, weight_key, pool) in ROUTING_KEYS.items():
                     weights = attn.get(weight_key)
-                    if weights is not None and weights.dim() == 3:
-                        w = weights[b, :seq_len]  # [S, N]
+                    if weights is not None:
+                        if weights.dim() == 3:
+                            w = weights[b, :seq_len]  # [B,S,N] → [S, N]
+                        elif weights.dim() == 2:
+                            # Batch-level routing: expand to token-level [N] → [S, N]
+                            w = weights[b].unsqueeze(0).expand(seq_len, -1)
+                        else:
+                            continue
                         result[layer_key][key] = w if keep_on_gpu else w.cpu()
 
                 # Knowledge routing
@@ -229,9 +235,10 @@ class SemanticAnalyzer:
                     weights = knowledge.get(weight_key)
                     if weights is not None:
                         if weights.dim() == 3:
-                            w = weights[b, :seq_len]
+                            w = weights[b, :seq_len]  # [B,S,N] → [S, N]
                         elif weights.dim() == 2:
-                            w = weights[b]
+                            # Batch-level routing: expand to token-level [N] → [S, N]
+                            w = weights[b].unsqueeze(0).expand(seq_len, -1)
                         else:
                             continue
                         result[layer_key][key] = w if keep_on_gpu else w.cpu()
@@ -899,15 +906,25 @@ class SemanticAnalyzer:
                     knowledge = layer_info.get('knowledge', {})
 
                     routing_weights = {}
+                    seq_len = input_ids.shape[1]
+
                     for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
                         w = attn.get(weight_key)
-                        if w is not None and w.dim() == 3:
-                            routing_weights[f'L{layer_idx}/{key}'] = w
+                        if w is not None:
+                            if w.dim() == 3:
+                                routing_weights[f'L{layer_idx}/{key}'] = w
+                            elif w.dim() == 2:
+                                # Batch-level: expand [B,N] → [B,S,N]
+                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, seq_len, -1)
 
                     for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
                         w = knowledge.get(weight_key)
-                        if w is not None and w.dim() == 3:
-                            routing_weights[f'L{layer_idx}/{key}'] = w
+                        if w is not None:
+                            if w.dim() == 3:
+                                routing_weights[f'L{layer_idx}/{key}'] = w
+                            elif w.dim() == 2:
+                                # Batch-level: expand [B,N] → [B,S,N]
+                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, seq_len, -1)
 
                     for routing_key, weights in routing_weights.items():
                         B, S, N = weights.shape
