@@ -63,14 +63,8 @@ class UnifiedNeuronRouter(nn.Module):
         self.proj_restore_know = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
-        # Separate embeddings for attention vs knowledge (prevents gradient competition)
-        n_attn = n_feature_qk + n_feature_v + n_restore_qk + n_restore_v
-        n_know = n_feature_know + n_restore_know
-        self.neuron_emb_attn = nn.Parameter(torch.randn(n_attn, d_space) * 0.02)
-        self.neuron_emb_know = nn.Parameter(torch.randn(n_know, d_space) * 0.02)
-
-        self.n_attn = n_attn
-        self.n_know = n_know
+        # Unified neuron embeddings (std=0.02 is standard transformer initialization)
+        self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
         # Usage tracking (6 attention + 2 knowledge)
         self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
@@ -84,11 +78,6 @@ class UnifiedNeuronRouter(nn.Module):
         self.tau = excitability_tau
         self.decay_rate = excitability_decay_rate
         self.register_buffer('excitability_weight', torch.tensor(1.0))
-
-    @property
-    def neuron_emb(self):
-        """Backward compatibility: concatenate attention + knowledge embeddings"""
-        return torch.cat([self.neuron_emb_attn, self.neuron_emb_know], dim=0)
 
     def decay_excitability(self):
         """Decay excitability weight (called from train.py each step)"""
@@ -105,17 +94,16 @@ class UnifiedNeuronRouter(nn.Module):
         Return 2 knowledge logits (feature_know, restore_know)
         x: [B, S, d_model]
         """
-        # Use separate knowledge embeddings (no gradient competition with attention)
-        emb_know_norm = F.normalize(self.neuron_emb_know, dim=-1)
+        emb_norm = F.normalize(self.neuron_emb, dim=-1)
 
-        # Feature_know: first n_feature_know neurons in knowledge embedding
+        # Feature_know
         h_feature_know = self.dropout(self.proj_feature_know(x))
-        emb_feature_know = emb_know_norm[:self.n_feature_know]
+        emb_feature_know = emb_norm[self.restore_v_end:self.feature_know_end]
         logits_feature_know = torch.einsum('bsd,nd->bsn', h_feature_know, emb_feature_know)
 
-        # Restore_know: remaining neurons in knowledge embedding
+        # Restore_know
         h_restore_know = self.dropout(self.proj_restore_know(x))
-        emb_restore_know = emb_know_norm[self.n_feature_know:]
+        emb_restore_know = emb_norm[self.feature_know_end:]
         logits_restore_know = torch.einsum('bsd,nd->bsn', h_restore_know, emb_restore_know)
 
         if self.training:
@@ -127,8 +115,7 @@ class UnifiedNeuronRouter(nn.Module):
 
     def get_all_logits(self, x):
         """6 attention logits at once"""
-        # Use separate attention embeddings (no gradient competition with knowledge)
-        emb_norm = F.normalize(self.neuron_emb_attn, dim=-1)
+        emb_norm = F.normalize(self.neuron_emb, dim=-1)
 
         all_proj = self.dropout(self.proj_all(x))
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = all_proj.chunk(6, dim=-1)
