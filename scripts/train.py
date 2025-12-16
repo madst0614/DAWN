@@ -2,26 +2,26 @@
 DAWN (Dynamic Architecture With Neurons) Training Script
 
 Usage:
-    # 기본 학습 (자동으로 최신 체크포인트 이어서 학습)
+    # Default training (auto-resume from latest checkpoint)
     python scripts/train.py
 
-    # 처음부터 새로 시작
+    # Start from scratch
     python scripts/train.py --from-scratch
 
-    # 특정 체크포인트 폴더에서 이어서 학습
+    # Resume from specific checkpoint folder
     python scripts/train.py --resume checkpoints/run_20240101_120000_1234
 
-    # 특정 .pt 파일에서 이어서 학습
+    # Resume from specific .pt file
     python scripts/train.py --resume /path/to/checkpoint_epoch1_step5000.pt
 
-    # 커스텀 config 파일 사용
+    # Use custom config file
     python scripts/train.py --config configs/my_config.yaml
 
 Checkpoint Options:
-    (기본)           - 자동으로 최신 best_model.pt 탐색 후 이어서 학습
-    --from-scratch   - 자동 탐색 비활성화, 처음부터 시작
-    --resume <폴더>  - 지정한 폴더의 best_model.pt에서 이어서 학습
-    --resume <파일>  - 지정한 .pt 파일에서 직접 이어서 학습
+    (default)        - Auto-search for latest best_model.pt and resume
+    --from-scratch   - Disable auto-search, start from scratch
+    --resume <folder> - Resume from best_model.pt in specified folder
+    --resume <file>   - Resume directly from specified .pt file
 """
 
 import sys
@@ -62,6 +62,19 @@ from models import create_model_by_version, print_version_info, normalize_versio
 from utils.training import CheckpointManager, TrainingMonitor, count_parameters, format_time
 from utils.checkpoint import load_checkpoint_smart, load_optimizer_state, strip_compile_prefix
 from utils.data import MLM_CONFIG, apply_mlm_masking, TextDataset, collate_fn_dynamic_padding, load_data, compute_mlm_accuracy
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+# Dead neuron threshold: neurons with usage EMA below this are considered "dead"
+# A value of 0.01 means the neuron is selected less than 1% of the time
+DEAD_NEURON_THRESHOLD = 0.01
+
+# Weight concentration warning threshold
+# If max routing weight > 0.8, the model is over-relying on a single neuron
+WEIGHT_CONCENTRATION_WARNING = 0.8
 
 
 # ============================================================
@@ -465,7 +478,7 @@ class DebugLogger:
                 self.log(f"  Normalized entropy: {entropy.item() / max_entropy:.4f}")
                 self.log(f"  Max weight (mean): {max_weight.item():.4f}")
 
-                if max_weight.item() > 0.8:
+                if max_weight.item() > WEIGHT_CONCENTRATION_WARNING:
                     self.log(f"  ⚠️  WARNING: Neuron weights too concentrated on single neuron!")
 
                 # W_O construction via neuron mixing
@@ -505,7 +518,7 @@ class DebugLogger:
                 self.log(f"  Normalized entropy: {entropy.item() / max_entropy:.4f}")
                 self.log(f"  Max weight (mean): {max_weight.item():.4f}")
 
-                if max_weight.item() > 0.8:
+                if max_weight.item() > WEIGHT_CONCENTRATION_WARNING:
                     self.log(f"  ⚠️  WARNING: Recipe too concentrated on single basis!")
 
                 # W_O singular values - handle v7.6 vs v7.7
@@ -631,13 +644,13 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         gini_rqk, gini_rv = _gini(ema_rqk), _gini(ema_rv)
         gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
 
-        # Dead neuron ratios (EMA < 0.01)
-        dead_fqk = (ema_fqk < 0.01).float().mean().item()
-        dead_fv = (ema_fv < 0.01).float().mean().item()
-        dead_rqk = (ema_rqk < 0.01).float().mean().item()
-        dead_rv = (ema_rv < 0.01).float().mean().item()
-        dead_FK = (ema_FK < 0.01).float().mean().item()
-        dead_RK = (ema_RK < 0.01).float().mean().item()
+        # Dead neuron ratios
+        dead_fqk = (ema_fqk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rqk = (ema_rqk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
 
         # Excitability
         exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
@@ -669,11 +682,11 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
         gini_rqk, gini_rv = _gini(ema_rqk), _gini(ema_rv)
 
-        # Dead neuron ratios (EMA < 0.01)
-        dead_fqk = (ema_fqk < 0.01).float().mean().item()
-        dead_fv = (ema_fv < 0.01).float().mean().item()
-        dead_rqk = (ema_rqk < 0.01).float().mean().item()
-        dead_rv = (ema_rv < 0.01).float().mean().item()
+        # Dead neuron ratios
+        dead_fqk = (ema_fqk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rqk = (ema_rqk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
 
         # Excitability
         exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
@@ -689,7 +702,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
             active_K = (ema_K > 0.01).sum().item()
             n_K = ema_K.numel()
             gini_K = _gini(ema_K)
-            dead_K = (ema_K < 0.01).float().mean().item()
+            dead_K = (ema_K < DEAD_NEURON_THRESHOLD).float().mean().item()
             lines.append(f"             Knowledge: Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f}")
 
     # v17: Complete Q/K/V Pool Separation + Knowledge Feature/Restore Separation
@@ -715,13 +728,13 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
         gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
 
-        # Dead neuron ratios (EMA < 0.01)
-        dead_fq = (ema_fq < 0.01).float().mean().item()
-        dead_fk = (ema_fk < 0.01).float().mean().item()
-        dead_fv = (ema_fv < 0.01).float().mean().item()
-        dead_rq = (ema_rq < 0.01).float().mean().item()
-        dead_rk = (ema_rk < 0.01).float().mean().item()
-        dead_rv = (ema_rv < 0.01).float().mean().item()
+        # Dead neuron ratios
+        dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
 
         # Excitability
         exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
@@ -739,8 +752,8 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
             active_RK = (ema_RK > 0.01).sum().item()
             n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
             gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
-            dead_FK = (ema_FK < 0.01).float().mean().item()
-            dead_RK = (ema_RK < 0.01).float().mean().item()
+            dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
+            dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
             lines.append(f"             Knowledge F/R: Active {int(active_FK)}/{n_FK},{int(active_RK)}/{n_RK} | Dead:{dead_FK:.1%}/{dead_RK:.1%} | Gini:{gini_FK:.2f}/{gini_RK:.2f}")
 
     # v16.3: Complete Q/K/V Pool Separation
@@ -766,13 +779,13 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
         gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
 
-        # Dead neuron ratios (EMA < 0.01)
-        dead_fq = (ema_fq < 0.01).float().mean().item()
-        dead_fk = (ema_fk < 0.01).float().mean().item()
-        dead_fv = (ema_fv < 0.01).float().mean().item()
-        dead_rq = (ema_rq < 0.01).float().mean().item()
-        dead_rk = (ema_rk < 0.01).float().mean().item()
-        dead_rv = (ema_rv < 0.01).float().mean().item()
+        # Dead neuron ratios
+        dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
 
         # Excitability
         exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
@@ -788,7 +801,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
             active_K = (ema_K > 0.01).sum().item()
             n_K = ema_K.numel()
             gini_K = _gini(ema_K)
-            dead_K = (ema_K < 0.01).float().mean().item()
+            dead_K = (ema_K < DEAD_NEURON_THRESHOLD).float().mean().item()
             lines.append(f"             Knowledge: Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f}")
 
     # v16.0/16.1/16.2: Split Feature R/V with Excitability
@@ -834,11 +847,11 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         min_exc_QK, max_exc_QK, mean_exc_QK = exc_QK.min().item(), exc_QK.max().item(), exc_QK.mean().item()
         min_exc_V, max_exc_V, mean_exc_V = exc_V.min().item(), exc_V.max().item(), exc_V.mean().item()
 
-        # Dead neuron ratios (EMA < 0.01)
-        dead_FR = (ema_QK < 0.01).float().mean().item()
-        dead_FV = (ema_V < 0.01).float().mean().item()
-        dead_R = (ema_R < 0.01).float().mean().item()
-        dead_Val = (ema_Val < 0.01).float().mean().item()
+        # Dead neuron ratios
+        dead_FR = (ema_QK < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_FV = (ema_V < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_R = (ema_R < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_Val = (ema_Val < DEAD_NEURON_THRESHOLD).float().mean().item()
 
         lines.append(f"         Excitability | τ={tau:.1f} | Active FR/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
         lines.append(f"             Gini FR/FV:{gini_QK:.2f}/{gini_V:.2f} R/V:{gini_R:.2f}/{gini_Val:.2f}")
@@ -851,7 +864,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
             active_K = (ema_K > 0.01).sum().item()
             n_K = ema_K.numel()
             gini_K = _gini(ema_K)
-            dead_K = (ema_K < 0.01).float().mean().item()
+            dead_K = (ema_K < DEAD_NEURON_THRESHOLD).float().mean().item()
 
             # K weight
             if hasattr(router, 'excitability_weight_k'):
