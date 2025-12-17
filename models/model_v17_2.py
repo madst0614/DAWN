@@ -36,8 +36,7 @@ class UnifiedNeuronRouter(nn.Module):
     """
     def __init__(self, d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
                  n_feature_know, n_restore_know,
-                 d_space=64, dropout=0.1, excitability_tau=1.5, excitability_ema_alpha=0.01,
-                 excitability_decay_rate=0.99995):
+                 d_space=64, dropout=0.1, **kwargs):
         super().__init__()
         self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
@@ -46,7 +45,7 @@ class UnifiedNeuronRouter(nn.Module):
         self.n_feature_know = n_feature_know
         self.n_restore_know = n_restore_know
         self.d_space = d_space
-        self.ema_alpha = excitability_ema_alpha
+        self.ema_alpha = kwargs.get('excitability_ema_alpha', 0.01)
 
         # 5 attention + 2 knowledge pools (Feature QK unified)
         total_neurons = (n_feature_qk + n_feature_v + n_restore_qk + n_restore_v +
@@ -70,7 +69,7 @@ class UnifiedNeuronRouter(nn.Module):
         # Unified neuron embeddings (std=0.02 is standard transformer initialization)
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
-        # Usage tracking (Feature QK unified, Restore Q/K separate)
+        # Usage tracking (for logging)
         self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
         self.register_buffer('usage_ema_feature_v', torch.zeros(n_feature_v))
         self.register_buffer('usage_ema_restore_q', torch.zeros(n_restore_qk))
@@ -78,21 +77,6 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('usage_ema_restore_v', torch.zeros(n_restore_v))
         self.register_buffer('usage_ema_feature_know', torch.zeros(n_feature_know))
         self.register_buffer('usage_ema_restore_know', torch.zeros(n_restore_know))
-
-        # Excitability
-        self.tau = excitability_tau
-        self.decay_rate = excitability_decay_rate
-        self.register_buffer('excitability_weight', torch.tensor(1.0))
-
-    def decay_excitability(self):
-        """Decay excitability weight (called from train.py each step)"""
-        self.excitability_weight.mul_(self.decay_rate)
-
-    # Alias for train.py compatibility
-    update_excitability_weight = decay_excitability
-
-    def get_excitability(self, usage_ema):
-        return torch.clamp(1.0 - usage_ema / self.tau, min=0.0, max=1.0)
 
     def get_knowledge_logits(self, x):
         """
@@ -110,11 +94,6 @@ class UnifiedNeuronRouter(nn.Module):
         h_restore_know = self.dropout(self.proj_restore_know(x))
         emb_restore_know = emb_norm[self.feature_know_end:]
         logits_restore_know = torch.einsum('bsd,nd->bsn', h_restore_know, emb_restore_know)
-
-        if self.training:
-            w = self.excitability_weight
-            logits_feature_know = logits_feature_know + self.get_excitability(self.usage_ema_feature_know) * w
-            logits_restore_know = logits_restore_know + self.get_excitability(self.usage_ema_restore_know) * w
 
         return logits_feature_know, logits_restore_know
 
@@ -135,20 +114,6 @@ class UnifiedNeuronRouter(nn.Module):
         logits_rqk_Q = torch.einsum('bsd,nd->bsn', h_rqk_Q, rqk_emb)
         logits_rqk_K = torch.einsum('bsd,nd->bsn', h_rqk_K, rqk_emb)
         logits_rv = torch.einsum('bsd,nd->bsn', h_rv, rv_emb)
-
-        if self.training:
-            w = self.excitability_weight
-            exc_fqk = self.get_excitability(self.usage_ema_feature_qk) * w
-            exc_fv = self.get_excitability(self.usage_ema_feature_v) * w
-            exc_rq = self.get_excitability(self.usage_ema_restore_q) * w
-            exc_rk = self.get_excitability(self.usage_ema_restore_k) * w
-            exc_rv = self.get_excitability(self.usage_ema_restore_v) * w
-
-            logits_fqk = logits_fqk + exc_fqk
-            logits_fv = logits_fv + exc_fv
-            logits_rqk_Q = logits_rqk_Q + exc_rq
-            logits_rqk_K = logits_rqk_K + exc_rk
-            logits_rv = logits_rv + exc_rv
 
         return logits_fqk, logits_fv, logits_rqk_Q, logits_rqk_K, logits_rv
 
@@ -352,7 +317,7 @@ class GlobalSSM(nn.Module):
 
 
 class GlobalRouters(nn.Module):
-    """v17.1 routing with shared Q/K pools + Knowledge Feature/Restore separation"""
+    """v17.2 routing with Feature QK unified + Knowledge Feature/Restore separation"""
     def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
                  n_restore_qk: int, n_restore_v: int,
                  n_feature_know: int, n_restore_know: int,
@@ -360,9 +325,7 @@ class GlobalRouters(nn.Module):
                  top_k_restore_qk: int = 8, top_k_restore_v: int = 8,
                  top_k_feature_know: int = 4, top_k_restore_know: int = 4,
                  d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False,
-                 knowledge_token_routing: bool = False,
-                 excitability_tau: float = 1.5, excitability_ema_alpha: float = 0.01,
-                 excitability_decay_rate: float = 0.99995):
+                 knowledge_token_routing: bool = False, **kwargs):
         super().__init__()
         self.d_model = d_model
         self.n_feature_qk = n_feature_qk
@@ -383,9 +346,7 @@ class GlobalRouters(nn.Module):
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
             n_feature_know, n_restore_know,
-            d_space=d_space, dropout=router_dropout,
-            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
-            excitability_decay_rate=excitability_decay_rate
+            d_space=d_space, dropout=router_dropout, **kwargs
         )
 
     def _topk_sparsify(self, weights, k):
@@ -783,9 +744,7 @@ class DAWN(nn.Module):
         router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
         use_ssm_context: bool = True,
-        excitability_tau: float = 1.5,
-        excitability_ema_alpha: float = 0.01,
-        excitability_decay_rate: float = 0.99995,
+        **kwargs,  # Accept but ignore excitability params for backward compatibility
     ):
         super().__init__()
 
@@ -820,9 +779,6 @@ class DAWN(nn.Module):
         self.router_dropout = router_dropout
         self.gradient_checkpointing = gradient_checkpointing
         self.use_ssm_context = use_ssm_context
-        self.excitability_tau = excitability_tau
-        self.excitability_ema_alpha = excitability_ema_alpha
-        self.excitability_decay_rate = excitability_decay_rate
 
         # Shared Q/K pool
         self.n_feature_qk = n_feature_qk
@@ -869,8 +825,6 @@ class DAWN(nn.Module):
             top_k_feature_know=top_k_feature_know, top_k_restore_know=top_k_restore_know,
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing,
             knowledge_token_routing=knowledge_token_routing,
-            excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
-            excitability_decay_rate=excitability_decay_rate
         )
 
         self.layers = nn.ModuleList([
@@ -987,9 +941,6 @@ class DAWN(nn.Module):
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
             f"  token_routing={self.token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
             f"  use_ssm_context={self.use_ssm_context}",
-            f"",
-            f"  [Excitability]",
-            f"  tau={self.excitability_tau}, ema_alpha={self.excitability_ema_alpha}, decay_rate={self.excitability_decay_rate}",
             f"",
             f"  [Other]",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
