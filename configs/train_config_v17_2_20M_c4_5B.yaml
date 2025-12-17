@@ -61,12 +61,12 @@ model:
 training:
   batch_size: 96
   num_epochs: 1
-  lr: 0.001
+  lr: 0.00055
   weight_decay: 0.1
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.01
+  load_balance_weight: 0.001
   entropy_weight: 0.0
   process_norm_weight: 0.0
 
