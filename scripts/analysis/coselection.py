@@ -15,6 +15,7 @@ Includes:
 """
 
 import os
+import traceback
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -45,7 +46,7 @@ class CoselectionAnalyzer:
         self.shared = shared_neurons
         self.device = device
 
-    def analyze_coselection(self, dataloader, pair_key: str, n_batches: int = 50) -> Dict:
+    def analyze_coselection(self, dataloader, pair_key: str, n_batches: int = 50, layer_idx: int = None) -> Dict:
         """
         Analyze co-selection patterns between two neuron pools.
 
@@ -53,9 +54,10 @@ class CoselectionAnalyzer:
             dataloader: DataLoader for input data
             pair_key: Key from COSELECTION_PAIRS (e.g., 'fqk_rqk')
             n_batches: Number of batches to process
+            layer_idx: Specific layer index to analyze (None = aggregate all layers)
 
         Returns:
-            Dictionary with co-selection matrix and statistics
+            Dictionary with co-selection matrix and statistics (per-layer if layer_idx is None)
         """
         pair_info = COSELECTION_PAIRS.get(pair_key)
         if pair_info is None:
@@ -70,12 +72,10 @@ class CoselectionAnalyzer:
         if n_a == 0 or n_b == 0:
             return {'error': f'Empty pools: n_a={n_a}, n_b={n_b}'}
 
-        print(f"\n  {pair_info['name']}: {pool_a['display']}({n_a}) x {pool_b['display']}({n_b})")
+        print(f"\n  {pair_info['name']}: {pool_a['display']}({n_a}) x {pool_b['display']}({n_b})", flush=True)
 
-        # Co-selection matrix
-        co_matrix = torch.zeros(n_a, n_b, device=self.device)
-        a_counts = torch.zeros(n_a, device=self.device)
-        b_counts = torch.zeros(n_b, device=self.device)
+        # Per-layer co-selection matrices
+        layer_matrices = {}  # {layer_idx: (co_matrix, a_counts, b_counts)}
         total_samples = 0
 
         self.model.eval()
@@ -93,48 +93,87 @@ class CoselectionAnalyzer:
                     routing_infos = get_routing_from_outputs(outputs)
                     if routing_infos is None:
                         continue
-                    layer_info = routing_infos[0]
                 except Exception:
                     continue
 
-                # Get preferences from appropriate source
-                source_a = layer_info.get(pool_a.get('source', 'attention'), {})
-                source_b = layer_info.get(pool_b.get('source', 'attention'), {})
-                pref_a = source_a.get(pool_a['pref_key'])
-                pref_b = source_b.get(pool_b['pref_key'])
+                # Process all layers (or specific layer)
+                for lidx, layer_info in enumerate(routing_infos):
+                    if layer_idx is not None and lidx != layer_idx:
+                        continue
 
-                if pref_a is None or pref_b is None:
-                    continue
+                    if lidx not in layer_matrices:
+                        layer_matrices[lidx] = (
+                            torch.zeros(n_a, n_b, device=self.device),
+                            torch.zeros(n_a, device=self.device),
+                            torch.zeros(n_b, device=self.device)
+                        )
 
-                # Handle different shapes: [B, S, N] or [B, N]
-                if pref_a.dim() == 3:
-                    pref_a = pref_a.mean(dim=1)
-                if pref_b.dim() == 3:
-                    pref_b = pref_b.mean(dim=1)
+                    co_matrix, a_counts, b_counts = layer_matrices[lidx]
 
-                # Binary selection (above uniform threshold)
-                thresh_a = 1.0 / n_a
-                thresh_b = 1.0 / n_b
+                    # Get preferences from appropriate source
+                    source_a = layer_info.get(pool_a.get('source', 'attention'), {})
+                    source_b = layer_info.get(pool_b.get('source', 'attention'), {})
+                    pref_a = source_a.get(pool_a['pref_key'])
+                    pref_b = source_b.get(pool_b['pref_key'])
 
-                selected_a = (pref_a > thresh_a).float()
-                selected_b = (pref_b > thresh_b).float()
+                    if pref_a is None or pref_b is None:
+                        continue
 
-                # Count individual selections
-                a_counts += selected_a.sum(dim=0)
-                b_counts += selected_b.sum(dim=0)
+                    # Handle different shapes: [B, S, N] or [B, N]
+                    if pref_a.dim() == 3:
+                        pref_a = pref_a.mean(dim=1)
+                    if pref_b.dim() == 3:
+                        pref_b = pref_b.mean(dim=1)
 
-                # Co-occurrence: outer product per batch
-                for b in range(B):
-                    co_matrix += torch.outer(selected_a[b], selected_b[b])
+                    # Binary selection (above uniform threshold)
+                    thresh_a = 1.0 / n_a
+                    thresh_b = 1.0 / n_b
 
-        # Analyze results
-        results = self._analyze_coselection_matrix(
-            co_matrix, a_counts, b_counts, n_a, n_b,
-            pool_a['display'], pool_b['display']
-        )
-        results['total_samples'] = total_samples
-        results['pair_name'] = pair_info['name']
-        results['co_matrix'] = co_matrix.cpu().numpy().tolist()
+                    selected_a = (pref_a > thresh_a).float()
+                    selected_b = (pref_b > thresh_b).float()
+
+                    # Count individual selections
+                    a_counts += selected_a.sum(dim=0)
+                    b_counts += selected_b.sum(dim=0)
+
+                    # Co-occurrence: vectorized batch outer product sum
+                    # einsum('bi,bj->ij') = sum over batch of outer products
+                    co_matrix += torch.einsum('bi,bj->ij', selected_a, selected_b)
+
+                    # Store back
+                    layer_matrices[lidx] = (co_matrix, a_counts, b_counts)
+
+        # Build results per layer
+        results = {
+            'pair_name': pair_info['name'],
+            'total_samples': total_samples,
+            'per_layer': {},
+        }
+
+        for lidx, (co_matrix, a_counts, b_counts) in layer_matrices.items():
+            layer_result = self._analyze_coselection_matrix(
+                co_matrix, a_counts, b_counts, n_a, n_b,
+                pool_a['display'], pool_b['display']
+            )
+            layer_result['co_matrix'] = co_matrix.cpu().numpy().tolist()
+            results['per_layer'][f'L{lidx}'] = layer_result
+
+        # Aggregate summary across layers
+        if layer_matrices:
+            total_co = sum(m[0] for m in layer_matrices.values())
+            total_a = sum(m[1] for m in layer_matrices.values())
+            total_b = sum(m[2] for m in layer_matrices.values())
+
+            results['aggregated'] = self._analyze_coselection_matrix(
+                total_co, total_a, total_b, n_a, n_b,
+                pool_a['display'], pool_b['display']
+            )
+            results['aggregated']['n_layers'] = len(layer_matrices)
+
+            # Backward compatibility: put aggregated at top level
+            for k, v in results['aggregated'].items():
+                if k not in results:
+                    results[k] = v
 
         return results
 
@@ -231,14 +270,16 @@ class CoselectionAnalyzer:
 
         return results
 
-    def analyze_subspace_diversity(self, pair_key: str) -> Dict:
+    def analyze_subspace_diversity(self, pair_key: str, max_neurons: int = 4096) -> Dict:
         """
         Analyze neuron subspace diversity within a pool.
 
         Measures how different the neurons are from each other.
+        Uses sampling for large pools to avoid O(n²) memory issues.
 
         Args:
             pair_key: Key from COSELECTION_PAIRS
+            max_neurons: Maximum neurons for full pairwise analysis (samples if larger)
 
         Returns:
             Diversity statistics per pool
@@ -260,17 +301,31 @@ class CoselectionAnalyzer:
             n_neurons = neurons.shape[0]
             display = pool_info['display']
 
-            print(f"\n  {display} Subspace Diversity ({n_neurons} neurons, shape={neurons.shape})")
+            # Ensure neurons are on the correct device
+            neurons = neurons.to(self.device)
+
+            # Sample if too large to avoid O(n²) memory issues
+            sampled = False
+            if n_neurons > max_neurons:
+                print(f"\n  {display} Subspace Diversity (sampling {max_neurons}/{n_neurons} neurons)", flush=True)
+                indices = torch.randperm(n_neurons, device=self.device)[:max_neurons]
+                neurons_sample = neurons[indices]
+                n_sample = max_neurons
+                sampled = True
+            else:
+                print(f"\n  {display} Subspace Diversity ({n_neurons} neurons, shape={neurons.shape})", flush=True)
+                neurons_sample = neurons
+                n_sample = n_neurons
 
             # Flatten each neuron
-            neurons_flat = neurons.view(n_neurons, -1)
+            neurons_flat = neurons_sample.reshape(n_sample, -1)
 
-            # Pairwise cosine similarity
+            # Pairwise cosine similarity (all on GPU)
             neurons_norm = F.normalize(neurons_flat, dim=-1)
             sim_matrix = torch.mm(neurons_norm, neurons_norm.t())
 
-            # Remove diagonal
-            mask = ~torch.eye(n_neurons, dtype=torch.bool, device=self.device)
+            # Remove diagonal (mask on same device as sim_matrix)
+            mask = ~torch.eye(n_sample, dtype=torch.bool, device=sim_matrix.device)
             sim_off_diag = sim_matrix[mask]
 
             avg_sim = sim_off_diag.mean().item()
@@ -280,17 +335,17 @@ class CoselectionAnalyzer:
 
             # Find most similar pairs
             sim_flat = sim_matrix.clone().view(-1)
-            for i in range(n_neurons):
-                sim_flat[i * n_neurons + i] = -2  # Exclude diagonal
+            for i in range(n_sample):
+                sim_flat[i * n_sample + i] = -2  # Exclude diagonal
 
-            top_k = min(10, n_neurons * (n_neurons - 1) // 2)
+            top_k = min(10, n_sample * (n_sample - 1) // 2)
             top_vals, top_idx = torch.topk(sim_flat, top_k)
 
             top_similar = []
             for i in range(top_k):
                 idx = top_idx[i].item()
-                n_i = idx // n_neurons
-                n_j = idx % n_neurons
+                n_i = idx // n_sample
+                n_j = idx % n_sample
                 top_similar.append((n_i, n_j, top_vals[i].item()))
 
             # Interpretation
@@ -303,6 +358,8 @@ class CoselectionAnalyzer:
 
             results[display] = {
                 'n_neurons': n_neurons,
+                'n_sampled': n_sample if sampled else n_neurons,
+                'sampled': sampled,
                 'mean_similarity': avg_sim,
                 'std_similarity': std_sim,
                 'min_similarity': min_sim,
@@ -311,8 +368,8 @@ class CoselectionAnalyzer:
                 'interpretation': interpretation,
             }
 
-            print(f"    Mean pairwise similarity: {avg_sim:.4f} +/- {std_sim:.4f}")
-            print(f"    Interpretation: {interpretation}")
+            print(f"    Mean pairwise similarity: {avg_sim:.4f} +/- {std_sim:.4f}", flush=True)
+            print(f"    Interpretation: {interpretation}", flush=True)
 
         return results
 
@@ -401,25 +458,40 @@ class CoselectionAnalyzer:
 
         all_results = {}
 
-        print("\n--- Analyzing Co-selection Patterns ---")
+        print("\n--- Analyzing Co-selection Patterns ---", flush=True)
         for pair_key in pairs_to_analyze:
             if pair_key not in COSELECTION_PAIRS:
-                print(f"  Skip unknown pair: {pair_key}")
+                print(f"  Skip unknown pair: {pair_key}", flush=True)
                 continue
 
-            # Co-selection analysis
-            cosel_results = self.analyze_coselection(dataloader, pair_key, n_batches)
-            if cosel_results:
-                all_results[pair_key] = cosel_results
+            try:
+                # Co-selection analysis
+                print(f"  Starting {pair_key} co-selection...", flush=True)
+                cosel_results = self.analyze_coselection(dataloader, pair_key, n_batches)
+                if cosel_results:
+                    all_results[pair_key] = cosel_results
+                print(f"  Completed {pair_key} co-selection.", flush=True)
 
-            # Subspace diversity
-            div_results = self.analyze_subspace_diversity(pair_key)
-            if div_results and pair_key in all_results:
-                all_results[pair_key]['subspace_diversity'] = div_results
+                # Subspace diversity
+                print(f"  Starting {pair_key} subspace diversity...", flush=True)
+                div_results = self.analyze_subspace_diversity(pair_key)
+                if div_results and pair_key in all_results:
+                    all_results[pair_key]['subspace_diversity'] = div_results
+                print(f"  Completed {pair_key} subspace diversity.", flush=True)
+
+            except Exception as e:
+                print(f"  ERROR in {pair_key}: {e}", flush=True)
+                traceback.print_exc()
+                all_results[pair_key] = {'error': str(e)}
 
         # Visualize
         if HAS_MATPLOTLIB:
-            print("\n--- Generating Visualizations ---")
-            self.visualize_coselection(all_results, output_dir)
+            print("\n--- Generating Visualizations ---", flush=True)
+            try:
+                self.visualize_coselection(all_results, output_dir)
+            except Exception as e:
+                print(f"  ERROR in visualization: {e}", flush=True)
+                traceback.print_exc()
 
+        print("--- Co-selection Analysis Complete ---", flush=True)
         return all_results

@@ -81,6 +81,24 @@ ROUTING_KEYS = {
     'rv':    ('R-V',    'rv_pref',    'rv_weights',    'restore_v'),
 }
 
+# Knowledge routing keys (separate from attention)
+KNOWLEDGE_ROUTING_KEYS = {
+    # (display_name, weight_key, pool_type)
+    'fknow': ('F-Know', 'feature_know_w', 'feature_know'),
+    'rknow': ('R-Know', 'restore_know_w', 'restore_know'),
+}
+
+# All routing keys combined
+ALL_ROUTING_KEYS = {**ROUTING_KEYS}
+for k, v in KNOWLEDGE_ROUTING_KEYS.items():
+    ALL_ROUTING_KEYS[k] = (v[0], None, v[1], v[2])  # (display, None, weight_key, pool_type)
+
+# Q/K pool keys (for overlap analysis)
+QK_POOLS = {
+    'fqk': ('feature_qk', 'fqk_q', 'fqk_k'),
+    'rqk': ('restore_qk', 'rqk_q', 'rqk_k'),
+}
+
 # Neuron attribute names for weight analysis
 NEURON_ATTRS = {
     'feature_qk': 'feature_qk_neurons',

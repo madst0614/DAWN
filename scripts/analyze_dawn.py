@@ -229,13 +229,13 @@ class DAWNAnalyzer:
 
         return results
 
-    def run_semantic_analysis(self, dataloader=None, output_dir: str = None) -> Dict:
+    def run_semantic_analysis(self, dataloader=None, max_batches: int = 50, output_dir: str = None) -> Dict:
         """Semantic analysis (NEW)."""
         print("\n" + "="*60)
         print("SEMANTIC ANALYSIS")
         print("="*60)
 
-        results = self.semantic.run_all(dataloader, output_dir)
+        results = self.semantic.run_all(dataloader, output_dir, max_batches=max_batches)
 
         # Path similarity
         path_sim = results.get('path_similarity', {})
@@ -348,12 +348,12 @@ class DAWNAnalyzer:
             'embedding': self.run_embedding_analysis(output_dir),
             'weight': self.run_weight_analysis(output_dir),
             'clustering': self.run_clustering_analysis(output_dir=output_dir),
-            'semantic': self.run_semantic_analysis(dataloader, output_dir),
+            'semantic': self.run_semantic_analysis(dataloader, n_batches, output_dir),
         }
 
         if dataloader:
             results['routing'] = self.run_routing_analysis(dataloader, n_batches, output_dir)
-            results['trajectory'] = self.run_trajectory_analysis(dataloader, output_dir=output_dir)
+            results['trajectory'] = self.run_trajectory_analysis(dataloader, n_batches, output_dir)
             results['coselection'] = self.run_coselection_analysis(dataloader, n_batches, output_dir)
 
         output_path = os.path.join(output_dir, 'dawn_analysis.json')
@@ -444,7 +444,7 @@ def main():
     elif args.mode == 'neuron':
         results = analyzer.analyze_single_neuron(args.neuron_id, args.neuron_type)
     elif args.mode == 'semantic':
-        results = analyzer.run_semantic_analysis(dataloader, args.output_dir)
+        results = analyzer.run_semantic_analysis(dataloader, args.max_batches, args.output_dir)
     elif args.mode == 'coselection':
         if dataloader is None:
             print("ERROR: --val_data required for coselection analysis")

@@ -45,6 +45,8 @@ from .utils import (
     # Constants
     NEURON_TYPES,
     ROUTING_KEYS,
+    KNOWLEDGE_ROUTING_KEYS,
+    ALL_ROUTING_KEYS,
     NEURON_ATTRS,
     COSELECTION_PAIRS,
     QK_POOLS,
@@ -84,6 +86,8 @@ __all__ = [
     # Constants
     'NEURON_TYPES',
     'ROUTING_KEYS',
+    'KNOWLEDGE_ROUTING_KEYS',
+    'ALL_ROUTING_KEYS',
     'NEURON_ATTRS',
     'COSELECTION_PAIRS',
     'QK_POOLS',

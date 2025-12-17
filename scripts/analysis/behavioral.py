@@ -17,7 +17,7 @@ from typing import Dict, Optional
 from collections import defaultdict
 
 from .utils import (
-    NEURON_TYPES, ROUTING_KEYS,
+    NEURON_TYPES, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
     calc_entropy_ratio, simple_pos_tag,
     get_batch_input_ids, get_routing_from_outputs,
     HAS_MATPLOTLIB, HAS_SKLEARN, HAS_TQDM, tqdm, plt
@@ -93,18 +93,20 @@ class BehavioralAnalyzer:
 
         return results
 
-    def analyze_token_trajectory(self, dataloader, n_batches: int = 20) -> Dict:
+    def analyze_token_trajectory(self, dataloader, n_batches: int = 20, layer_idx: int = None) -> Dict:
         """
-        Analyze how routing entropy changes across sequence positions.
+        Analyze how routing entropy changes across sequence positions for ALL layers.
 
         Args:
             dataloader: DataLoader for input data
             n_batches: Number of batches to process
+            layer_idx: Specific layer to analyze (None = aggregate all layers)
 
         Returns:
-            Dictionary with position-wise entropy statistics
+            Dictionary with position-wise entropy statistics per layer
         """
-        position_routing = defaultdict(lambda: defaultdict(list))
+        # {layer: {routing_key: {position: [entropy_values]}}}
+        layer_position_routing = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
         self.model.eval()
         with torch.no_grad():
@@ -119,23 +121,60 @@ class BehavioralAnalyzer:
                 if routing_infos is None:
                     continue
 
-                attn = routing_infos[0].get('attention', {})
-
-                for key, (_, pref_key, _, _) in ROUTING_KEYS.items():
-                    pref = attn.get(pref_key)
-                    if pref is None:
+                # Process ALL layers
+                for lidx, layer_info in enumerate(routing_infos):
+                    if layer_idx is not None and lidx != layer_idx:
                         continue
 
-                    if pref.dim() == 3:  # [B, S, N]
-                        for pos in range(min(pref.shape[1], 128)):
-                            ent = calc_entropy_ratio(pref[:, pos, :])
-                            position_routing[key][pos].append(ent)
+                    attn = layer_info.get('attention', {})
 
-        results = {}
+                    for key, (_, pref_key, _, _) in ROUTING_KEYS.items():
+                        pref = attn.get(pref_key)
+                        if pref is None:
+                            continue
+
+                        if pref.dim() == 3:  # [B, S, N] token-level
+                            for pos in range(min(pref.shape[1], 128)):
+                                ent = calc_entropy_ratio(pref[:, pos, :])
+                                layer_position_routing[lidx][key][pos].append(ent)
+                        elif pref.dim() == 2:  # [B, N] batch-level - same for all positions
+                            ent = calc_entropy_ratio(pref)
+                            for pos in range(128):
+                                layer_position_routing[lidx][key][pos].append(ent)
+
+        # Build per-layer results
+        results = {'per_layer': {}}
+
+        # Aggregate data for overall results
+        aggregated_routing = defaultdict(lambda: defaultdict(list))
+
+        for lidx, position_routing in layer_position_routing.items():
+            layer_results = {}
+            for key in ROUTING_KEYS.keys():
+                if position_routing[key]:
+                    pos_avg = {}
+                    for pos, values in position_routing[key].items():
+                        pos_avg[pos] = float(np.mean(values))
+                        aggregated_routing[key][pos].extend(values)
+
+                    early_positions = [v for p, v in pos_avg.items() if p < 10]
+                    late_positions = [v for p, v in pos_avg.items() if p >= 10]
+
+                    layer_results[key] = {
+                        'display': ROUTING_KEYS[key][0],
+                        'position_entropy': pos_avg,
+                        'early_avg': float(np.mean(early_positions)) if early_positions else 0,
+                        'late_avg': float(np.mean(late_positions)) if late_positions else 0,
+                    }
+
+            if layer_results:
+                results['per_layer'][f'L{lidx}'] = layer_results
+
+        # Aggregated results (backward compatibility)
         for key in ROUTING_KEYS.keys():
-            if position_routing[key]:
+            if aggregated_routing[key]:
                 pos_avg = {}
-                for pos, values in position_routing[key].items():
+                for pos, values in aggregated_routing[key].items():
                     pos_avg[pos] = float(np.mean(values))
 
                 early_positions = [v for p, v in pos_avg.items() if p < 10]
@@ -148,26 +187,30 @@ class BehavioralAnalyzer:
                     'late_avg': float(np.mean(late_positions)) if late_positions else 0,
                 }
 
+        results['n_layers'] = len(layer_position_routing)
         return results
 
-    def run_probing(self, dataloader, max_batches: int = 50) -> Dict:
+    def run_probing(self, dataloader, max_batches: int = 50, layer_idx: int = None) -> Dict:
         """
-        Run probing classifier for POS prediction.
+        Run probing classifier for POS prediction across ALL layers.
 
         Uses routing weights to predict part-of-speech tags.
+        Optimized with vectorized tensor operations.
 
         Args:
             dataloader: DataLoader for input data
             max_batches: Maximum batches to process
+            layer_idx: Specific layer to analyze (None = all layers aggregated)
 
         Returns:
-            Dictionary with probing accuracy per routing key
+            Dictionary with probing accuracy per layer/routing key
         """
         if not HAS_SKLEARN:
             return {'error': 'sklearn not available'}
 
-        X_data = {key: [] for key in ROUTING_KEYS.keys()}
-        y_labels = []
+        # {layer_key: {routing_key: tensor list}}
+        X_tensors = defaultdict(lambda: defaultdict(list))
+        y_labels = defaultdict(list)
 
         self.model.eval()
         with torch.no_grad():
@@ -176,6 +219,7 @@ class BehavioralAnalyzer:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
+                B, S = input_ids.shape
 
                 # Get attention mask if available
                 if isinstance(batch, dict):
@@ -188,58 +232,132 @@ class BehavioralAnalyzer:
                     routing_infos = get_routing_from_outputs(outputs)
                     if routing_infos is None:
                         continue
-                    routing_info = routing_infos[0].get('attention', {})
                 except Exception:
                     continue
 
-                # Collect routing weights
-                for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                    if weight_key in routing_info:
-                        w = routing_info[weight_key]
-                        if w.dim() == 3:  # [B, S, N]
-                            for b in range(w.shape[0]):
-                                for s in range(w.shape[1]):
-                                    if attention_mask[b, s] == 0:
-                                        continue
-                                    X_data[key].append(w[b, s].cpu().numpy())
+                # Flatten mask for vectorized selection
+                flat_mask = attention_mask.view(-1).bool()  # [B*S]
+                valid_count = flat_mask.sum().item()
 
-                # Collect POS labels
-                for b in range(input_ids.shape[0]):
-                    for s in range(input_ids.shape[1]):
-                        if attention_mask[b, s] == 0:
-                            continue
-                        token = self.tokenizer.decode([input_ids[b, s].item()])
-                        pos = simple_pos_tag(token)
-                        y_labels.append(pos)
+                if valid_count == 0:
+                    continue
 
-        # Train and evaluate classifiers
-        results = {}
-        for key in X_data:
-            X = np.array(X_data[key])
-            y = np.array(y_labels[:len(X)])
+                # Get valid token ids and compute POS labels once per batch
+                flat_input_ids = input_ids.view(-1)  # [B*S]
+                valid_token_ids = flat_input_ids[flat_mask].cpu().tolist()
+                valid_tokens = self.tokenizer.convert_ids_to_tokens(valid_token_ids)
+                batch_pos_labels = [simple_pos_tag(t) for t in valid_tokens]
 
-            if len(X) < 100 or len(np.unique(y)) < 2:
-                results[key] = {'error': 'Not enough data'}
-                continue
+                # Process ALL layers
+                for lidx, layer_info in enumerate(routing_infos):
+                    if layer_idx is not None and lidx != layer_idx:
+                        continue
 
-            try:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, test_size=0.2, random_state=42
-                )
+                    layer_key = f'L{lidx}'
+                    attn = layer_info.get('attention', {})
+                    knowledge = layer_info.get('knowledge', {})
 
-                clf = LogisticRegression(max_iter=1000, random_state=42)
-                clf.fit(X_train, y_train)
-                y_pred = clf.predict(X_test)
+                    # Collect attention routing weights - vectorized
+                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                        if weight_key in attn:
+                            w = attn[weight_key]
+                            if w.dim() == 3:  # [B, S, N] token-level
+                                flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            elif w.dim() == 2:  # [B, N] batch-level
+                                # Expand and flatten
+                                expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
+                                flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            else:
+                                continue
+                            X_tensors[layer_key][key].append(valid_w.cpu())
 
-                accuracy = accuracy_score(y_test, y_pred)
-                results[key] = {
-                    'display': ROUTING_KEYS[key][0],
-                    'accuracy': float(accuracy),
-                    'n_samples': len(X),
-                    'n_classes': len(np.unique(y)),
+                    # Collect knowledge routing weights - vectorized
+                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                        if weight_key in knowledge:
+                            w = knowledge[weight_key]
+                            if w.dim() == 3:  # [B, S, N] token-level
+                                flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            elif w.dim() == 2:  # [B, N] batch-level
+                                expanded = w.unsqueeze(1).expand(-1, S, -1)  # [B, S, N]
+                                flat_w = expanded.reshape(-1, w.shape[-1])  # [B*S, N]
+                                valid_w = flat_w[flat_mask]  # [valid_count, N]
+                            else:
+                                continue
+                            X_tensors[layer_key][key].append(valid_w.cpu())
+
+                    # Add POS labels for this layer
+                    y_labels[layer_key].extend(batch_pos_labels)
+
+        # Convert tensors to numpy arrays
+        X_data = defaultdict(lambda: defaultdict(list))
+        for layer_key, routing_data in X_tensors.items():
+            for routing_key, tensor_list in routing_data.items():
+                if tensor_list:
+                    # Concatenate all tensors and convert to numpy
+                    combined = torch.cat(tensor_list, dim=0).numpy()
+                    X_data[layer_key][routing_key] = combined
+
+        # Train and evaluate classifiers per layer/routing key
+        results = {'per_layer': {}}
+
+        for layer_key in X_data.keys():
+            results['per_layer'][layer_key] = {}
+
+            for routing_key in X_data[layer_key].keys():
+                X = np.array(X_data[layer_key][routing_key])
+                y = np.array(y_labels[layer_key][:len(X)])
+
+                if len(X) < 100 or len(np.unique(y)) < 2:
+                    results['per_layer'][layer_key][routing_key] = {'error': 'Not enough data'}
+                    continue
+
+                try:
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X, y, test_size=0.2, random_state=42
+                    )
+
+                    clf = LogisticRegression(max_iter=1000, random_state=42)
+                    clf.fit(X_train, y_train)
+                    y_pred = clf.predict(X_test)
+
+                    accuracy = accuracy_score(y_test, y_pred)
+
+                    # Get display name
+                    if routing_key in ROUTING_KEYS:
+                        display = ROUTING_KEYS[routing_key][0]
+                    elif routing_key in KNOWLEDGE_ROUTING_KEYS:
+                        display = KNOWLEDGE_ROUTING_KEYS[routing_key][0]
+                    else:
+                        display = routing_key
+
+                    results['per_layer'][layer_key][routing_key] = {
+                        'display': f'{layer_key}/{display}',
+                        'accuracy': float(accuracy),
+                        'n_samples': len(X),
+                        'n_classes': len(np.unique(y)),
+                    }
+                except Exception as e:
+                    results['per_layer'][layer_key][routing_key] = {'error': str(e)}
+
+        # Summary: best accuracy per routing type across layers
+        results['summary'] = {}
+        all_routing_keys = set()
+        for layer_data in results['per_layer'].values():
+            all_routing_keys.update(layer_data.keys())
+
+        for rkey in all_routing_keys:
+            accuracies = []
+            for layer_key, layer_data in results['per_layer'].items():
+                if rkey in layer_data and 'accuracy' in layer_data[rkey]:
+                    accuracies.append(layer_data[rkey]['accuracy'])
+            if accuracies:
+                results['summary'][rkey] = {
+                    'max_accuracy': max(accuracies),
+                    'mean_accuracy': float(np.mean(accuracies)),
                 }
-            except Exception as e:
-                results[key] = {'error': str(e)}
 
         return results
 
@@ -366,16 +484,38 @@ class BehavioralAnalyzer:
         Returns:
             Combined results dictionary
         """
+        import traceback
         os.makedirs(output_dir, exist_ok=True)
 
-        results = {
-            'trajectory': self.analyze_token_trajectory(dataloader, n_batches),
-            'probing': self.run_probing(dataloader, n_batches * 2),
-        }
+        results = {}
+
+        try:
+            print("  Running trajectory analysis...", flush=True)
+            results['trajectory'] = self.analyze_token_trajectory(dataloader, n_batches)
+            print("  Trajectory complete.", flush=True)
+        except Exception as e:
+            print(f"  ERROR in trajectory: {e}", flush=True)
+            traceback.print_exc()
+            results['trajectory'] = {'error': str(e)}
+
+        try:
+            print("  Running probing analysis...", flush=True)
+            results['probing'] = self.run_probing(dataloader, n_batches * 2)
+            print("  Probing complete.", flush=True)
+        except Exception as e:
+            print(f"  ERROR in probing: {e}", flush=True)
+            traceback.print_exc()
+            results['probing'] = {'error': str(e)}
 
         # Visualization
-        viz_path = self.visualize_trajectory(results['trajectory'], output_dir)
-        if viz_path:
-            results['trajectory_visualization'] = viz_path
+        try:
+            print("  Generating visualization...", flush=True)
+            viz_path = self.visualize_trajectory(results.get('trajectory', {}), output_dir)
+            if viz_path:
+                results['trajectory_visualization'] = viz_path
+            print("  Visualization complete.", flush=True)
+        except Exception as e:
+            print(f"  ERROR in visualization: {e}", flush=True)
+            traceback.print_exc()
 
         return results

@@ -1,15 +1,11 @@
 """
-DAWN v17.1: Unified Neuron Architecture (Q/K Shared + Knowledge Feature-Restore Separation)
+DAWN v16_4: Shared Pool + Separate Routing (v16.3 optimized structure)
 
-Both Attention and Knowledge use Feature-Restore neuron pattern:
-- AttentionCircuit: Feature_QK/V -> Restore_QK/V (Q/K shared pool)
-- KnowledgeCircuit: Feature_Know -> Restore_Know (separate routing like v17)
-
-Key changes from v16.4:
-- NeuronCircuit -> AttentionCircuit (rename)
-- NeuronMemory -> KnowledgeCircuit (Feature-Restore pattern)
-- Removed knowledge_encoder
-- Knowledge: Feature/Restore separate routing (like v17)
+v16.3 최적화 구조 기반 + v16.2 공유 풀 설계:
+- Feature_QK: Q/K 압축 공유 풀, 분리 routing
+- Feature_V: V 압축
+- Restore_QK: Q/K 복원 공유 풀, 분리 routing
+- Restore_V: V 복원
 """
 
 import math
@@ -28,10 +24,9 @@ except ImportError:
 
 class UnifiedNeuronRouter(nn.Module):
     """
-    v17.1: 6 attention projections + 2 knowledge projections (Feature/Restore separation)
+    v16.4 optimized: 6개 projection 통합 + knowledge 별도
     """
-    def __init__(self, d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
-                 n_feature_know, n_restore_know,
+    def __init__(self, d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v, n_knowledge,
                  d_space=64, dropout=0.1, excitability_tau=1.5, excitability_ema_alpha=0.01,
                  excitability_decay_rate=0.99995):
         super().__init__()
@@ -39,42 +34,33 @@ class UnifiedNeuronRouter(nn.Module):
         self.n_feature_v = n_feature_v
         self.n_restore_qk = n_restore_qk
         self.n_restore_v = n_restore_v
-        self.n_feature_know = n_feature_know
-        self.n_restore_know = n_restore_know
+        self.n_knowledge = n_knowledge
         self.d_space = d_space
         self.ema_alpha = excitability_ema_alpha
 
-        # 6 attention + 2 knowledge pools
-        total_neurons = (n_feature_qk + n_feature_v + n_restore_qk + n_restore_v +
-                        n_feature_know + n_restore_know)
+        total_neurons = n_feature_qk + n_feature_v + n_restore_qk + n_restore_v + n_knowledge
         self.total_neurons = total_neurons
 
-        # Index boundaries
+        # 인덱스 경계
         self.feature_qk_end = n_feature_qk
         self.feature_v_end = n_feature_qk + n_feature_v
         self.restore_qk_end = n_feature_qk + n_feature_v + n_restore_qk
         self.restore_v_end = n_feature_qk + n_feature_v + n_restore_qk + n_restore_v
-        self.feature_know_end = self.restore_v_end + n_feature_know
-        # restore_know: feature_know_end ~ total_neurons
 
-        # 6 attention projections + 2 knowledge projections
+        # v16.3 style: 6개 통합 + knowledge 별도
         self.proj_all = nn.Linear(d_model, d_space * 6)  # fqk_Q, fqk_K, fv, rqk_Q, rqk_K, rv
-        self.proj_feature_know = nn.Linear(d_model, d_space)
-        self.proj_restore_know = nn.Linear(d_model, d_space)
+        self.proj_knowledge = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
-        # Unified neuron embeddings (std=0.02 is standard transformer initialization)
+        # 통합 뉴런 임베딩
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
-        # Usage tracking (Q/K separated for better excitability)
-        self.register_buffer('usage_ema_feature_q', torch.zeros(n_feature_qk))
-        self.register_buffer('usage_ema_feature_k', torch.zeros(n_feature_qk))
+        # Usage tracking
+        self.register_buffer('usage_ema_feature_qk', torch.zeros(n_feature_qk))
         self.register_buffer('usage_ema_feature_v', torch.zeros(n_feature_v))
-        self.register_buffer('usage_ema_restore_q', torch.zeros(n_restore_qk))
-        self.register_buffer('usage_ema_restore_k', torch.zeros(n_restore_qk))
+        self.register_buffer('usage_ema_restore_qk', torch.zeros(n_restore_qk))
         self.register_buffer('usage_ema_restore_v', torch.zeros(n_restore_v))
-        self.register_buffer('usage_ema_feature_know', torch.zeros(n_feature_know))
-        self.register_buffer('usage_ema_restore_know', torch.zeros(n_restore_know))
+        self.register_buffer('usage_ema_knowledge', torch.zeros(n_knowledge))
 
         # Excitability
         self.tau = excitability_tau
@@ -82,51 +68,41 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('excitability_weight', torch.tensor(1.0))
 
     def decay_excitability(self):
-        """Decay excitability weight (called from train.py each step)"""
         self.excitability_weight.mul_(self.decay_rate)
-
-    # Alias for train.py compatibility
-    update_excitability_weight = decay_excitability
 
     def get_excitability(self, usage_ema):
         return torch.clamp(1.0 - usage_ema / self.tau, min=0.0, max=1.0)
 
-    def get_knowledge_logits(self, x):
-        """
-        Return 2 knowledge logits (feature_know, restore_know)
-        x: [B, S, d_model]
-        """
+    def get_logits(self, x, neuron_type):
+        """knowledge 전용"""
+        if neuron_type != 'knowledge':
+            raise ValueError(f"Use get_all_logits for {neuron_type}")
+
         emb_norm = F.normalize(self.neuron_emb, dim=-1)
+        h_proj = self.dropout(self.proj_knowledge(x))
+        knowledge_emb = emb_norm[self.restore_v_end:]
 
-        # Feature_know
-        h_feature_know = self.dropout(self.proj_feature_know(x))
-        emb_feature_know = emb_norm[self.restore_v_end:self.feature_know_end]
-        logits_feature_know = torch.einsum('bsd,nd->bsn', h_feature_know, emb_feature_know)
-
-        # Restore_know
-        h_restore_know = self.dropout(self.proj_restore_know(x))
-        emb_restore_know = emb_norm[self.feature_know_end:]
-        logits_restore_know = torch.einsum('bsd,nd->bsn', h_restore_know, emb_restore_know)
-
+        logits = torch.einsum('bsd,nd->bsn', h_proj, knowledge_emb)
         if self.training:
-            w = self.excitability_weight
-            logits_feature_know = logits_feature_know + self.get_excitability(self.usage_ema_feature_know) * w
-            logits_restore_know = logits_restore_know + self.get_excitability(self.usage_ema_restore_know) * w
-
-        return logits_feature_know, logits_restore_know
+            excitability = self.get_excitability(self.usage_ema_knowledge)
+            logits = logits + excitability * self.excitability_weight
+        return logits
 
     def get_all_logits(self, x):
-        """6 attention logits at once"""
+        """6개 logits 한번에 계산"""
         emb_norm = F.normalize(self.neuron_emb, dim=-1)
 
+        # 6개 projection 통합 → chunk
         all_proj = self.dropout(self.proj_all(x))
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = all_proj.chunk(6, dim=-1)
 
+        # 뉴런 임베딩 슬라이스
         fqk_emb = emb_norm[:self.feature_qk_end]
         fv_emb = emb_norm[self.feature_qk_end:self.feature_v_end]
         rqk_emb = emb_norm[self.feature_v_end:self.restore_qk_end]
         rv_emb = emb_norm[self.restore_qk_end:self.restore_v_end]
 
+        # Logits 계산
         logits_fqk_Q = torch.einsum('bsd,nd->bsn', h_fqk_Q, fqk_emb)
         logits_fqk_K = torch.einsum('bsd,nd->bsn', h_fqk_K, fqk_emb)
         logits_fv = torch.einsum('bsd,nd->bsn', h_fv, fv_emb)
@@ -134,20 +110,19 @@ class UnifiedNeuronRouter(nn.Module):
         logits_rqk_K = torch.einsum('bsd,nd->bsn', h_rqk_K, rqk_emb)
         logits_rv = torch.einsum('bsd,nd->bsn', h_rv, rv_emb)
 
+        # Excitability
         if self.training:
             w = self.excitability_weight
-            exc_fq = self.get_excitability(self.usage_ema_feature_q) * w
-            exc_fk = self.get_excitability(self.usage_ema_feature_k) * w
+            exc_fqk = self.get_excitability(self.usage_ema_feature_qk) * w
             exc_fv = self.get_excitability(self.usage_ema_feature_v) * w
-            exc_rq = self.get_excitability(self.usage_ema_restore_q) * w
-            exc_rk = self.get_excitability(self.usage_ema_restore_k) * w
+            exc_rqk = self.get_excitability(self.usage_ema_restore_qk) * w
             exc_rv = self.get_excitability(self.usage_ema_restore_v) * w
 
-            logits_fqk_Q = logits_fqk_Q + exc_fq
-            logits_fqk_K = logits_fqk_K + exc_fk
+            logits_fqk_Q = logits_fqk_Q + exc_fqk
+            logits_fqk_K = logits_fqk_K + exc_fqk
             logits_fv = logits_fv + exc_fv
-            logits_rqk_Q = logits_rqk_Q + exc_rq
-            logits_rqk_K = logits_rqk_K + exc_rk
+            logits_rqk_Q = logits_rqk_Q + exc_rqk
+            logits_rqk_K = logits_rqk_K + exc_rqk
             logits_rv = logits_rv + exc_rv
 
         return logits_fqk_Q, logits_fqk_K, logits_fv, logits_rqk_Q, logits_rqk_K, logits_rv
@@ -169,28 +144,21 @@ class UnifiedNeuronRouter(nn.Module):
             usage = (weights > 0).float().mean(dim=0)
 
         decay = 1 - self.ema_alpha
-        if neuron_type == 'feature_q':
-            self.usage_ema_feature_q.mul_(decay).add_(usage, alpha=self.ema_alpha)
-        elif neuron_type == 'feature_k':
-            self.usage_ema_feature_k.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        if neuron_type == 'feature_qk':
+            self.usage_ema_feature_qk.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif neuron_type == 'feature_v':
             self.usage_ema_feature_v.mul_(decay).add_(usage, alpha=self.ema_alpha)
-        elif neuron_type == 'restore_q':
-            self.usage_ema_restore_q.mul_(decay).add_(usage, alpha=self.ema_alpha)
-        elif neuron_type == 'restore_k':
-            self.usage_ema_restore_k.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        elif neuron_type == 'restore_qk':
+            self.usage_ema_restore_qk.mul_(decay).add_(usage, alpha=self.ema_alpha)
         elif neuron_type == 'restore_v':
             self.usage_ema_restore_v.mul_(decay).add_(usage, alpha=self.ema_alpha)
-        elif neuron_type == 'feature_know':
-            self.usage_ema_feature_know.mul_(decay).add_(usage, alpha=self.ema_alpha)
-        elif neuron_type == 'restore_know':
-            self.usage_ema_restore_know.mul_(decay).add_(usage, alpha=self.ema_alpha)
+        elif neuron_type == 'knowledge':
+            self.usage_ema_knowledge.mul_(decay).add_(usage, alpha=self.ema_alpha)
 
 
 class SharedNeurons(nn.Module):
     """
-    v17.1: Both Attention + Knowledge use Feature-Restore pattern
-    Knowledge uses Feature/Restore separate routing
+    v16.4 optimized: Contiguous memory allocation
     """
     def __init__(
         self,
@@ -200,28 +168,27 @@ class SharedNeurons(nn.Module):
         n_feature_v: int,
         n_restore_qk: int,
         n_restore_v: int,
-        n_feature_know: int,
-        n_restore_know: int,
-        knowledge_rank: int = 128,
+        n_knowledge: int,
+        knowledge_rank: int = None,
     ):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
-        self.knowledge_rank = knowledge_rank
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
         self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
         self.n_restore_qk = n_restore_qk
         self.n_restore_v = n_restore_v
-        self.n_feature_know = n_feature_know
-        self.n_restore_know = n_restore_know
+        self.n_knowledge = n_knowledge
 
-        # Attention neurons (contiguous memory)
+        # Contiguous memory for Feature (compression)
         self.f_neurons = nn.Parameter(torch.zeros(n_feature_qk + n_feature_v, d_model, rank))
+        # Contiguous memory for Restore (expansion)
         self.r_neurons = nn.Parameter(torch.zeros(n_restore_qk + n_restore_v, rank, d_model))
 
-        # Knowledge neurons: Feature-Restore pattern (separate routing)
-        self.feature_know = nn.Parameter(torch.zeros(n_feature_know, d_model, knowledge_rank))
-        self.restore_know = nn.Parameter(torch.zeros(n_restore_know, knowledge_rank, d_model))
+        # Knowledge neurons
+        self.knowledge_neurons_K = nn.Parameter(torch.zeros(n_knowledge, self.knowledge_rank))
+        self.knowledge_neurons_V = nn.Parameter(torch.zeros(n_knowledge, d_model))
 
         self._init_parameters()
 
@@ -242,27 +209,22 @@ class SharedNeurons(nn.Module):
         return self.r_neurons[self.n_restore_qk:]
 
     def _init_parameters(self):
-        # Attention neurons
         for i in range(self.n_feature_qk + self.n_feature_v):
             nn.init.orthogonal_(self.f_neurons.data[i])
         for i in range(self.n_restore_qk + self.n_restore_v):
             nn.init.orthogonal_(self.r_neurons.data[i])
-        # Knowledge neurons (orthogonal init)
-        for i in range(self.n_feature_know):
-            nn.init.orthogonal_(self.feature_know.data[i])
-        for i in range(self.n_restore_know):
-            nn.init.orthogonal_(self.restore_know.data[i])
+        nn.init.normal_(self.knowledge_neurons_K, std=0.02)
+        nn.init.normal_(self.knowledge_neurons_V, std=0.02)
 
 
 class GlobalSSM(nn.Module):
-    """Selective SSM (same as v16.4)"""
+    """Selective SSM (same as before)"""
     def __init__(self, d_model: int, state_dim: int, return_context: bool = True):
         super().__init__()
         self.d_model = d_model
         self.state_dim = state_dim
         self.return_context = return_context
 
-        # A_log initialization (small values for stable SSM dynamics)
         self.A_log = nn.Parameter(torch.randn(d_model, state_dim) * 0.1)
         self.W_delta = nn.Linear(d_model, d_model, bias=False)
         self.W_B = nn.Linear(d_model, state_dim, bias=False)
@@ -270,16 +232,13 @@ class GlobalSSM(nn.Module):
 
         self.ssm_norm = nn.LayerNorm(d_model)
         self.context_proj = nn.Linear(d_model, d_model, bias=False)
-        # Initial context scale (small to avoid disrupting early training)
         self.context_scale = nn.Parameter(torch.tensor(0.1))
         self.importance_proj = nn.Linear(d_model, d_model, bias=False)
-        # Temperature for importance softmax (lower = sharper distribution)
         self.importance_temperature = 0.5
 
         self._init_weights()
 
     def _init_weights(self):
-        # std=0.02 is standard transformer initialization (GPT-2, BERT)
         nn.init.normal_(self.W_delta.weight, std=0.02)
         nn.init.normal_(self.W_B.weight, std=0.02)
         nn.init.normal_(self.W_C.weight, std=0.02)
@@ -354,15 +313,12 @@ class GlobalSSM(nn.Module):
 
 
 class GlobalRouters(nn.Module):
-    """v17.1 routing with shared Q/K pools + Knowledge Feature/Restore separation"""
+    """v16.4 routing with shared pools"""
     def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
-                 n_restore_qk: int, n_restore_v: int,
-                 n_feature_know: int, n_restore_know: int,
+                 n_restore_qk: int, n_restore_v: int, n_knowledge: int,
                  top_k_feature_qk: int = 8, top_k_feature_v: int = 8,
                  top_k_restore_qk: int = 8, top_k_restore_v: int = 8,
-                 top_k_feature_know: int = 4, top_k_restore_know: int = 4,
                  d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False,
-                 knowledge_token_routing: bool = False,
                  excitability_tau: float = 1.5, excitability_ema_alpha: float = 0.01,
                  excitability_decay_rate: float = 0.99995):
         super().__init__()
@@ -371,20 +327,15 @@ class GlobalRouters(nn.Module):
         self.n_feature_v = n_feature_v
         self.n_restore_qk = n_restore_qk
         self.n_restore_v = n_restore_v
-        self.n_feature_know = n_feature_know
-        self.n_restore_know = n_restore_know
+        self.n_knowledge = n_knowledge
         self.top_k_feature_qk = top_k_feature_qk
         self.top_k_feature_v = top_k_feature_v
         self.top_k_restore_qk = top_k_restore_qk
         self.top_k_restore_v = top_k_restore_v
-        self.top_k_feature_know = top_k_feature_know
-        self.top_k_restore_know = top_k_restore_know
         self.token_routing = token_routing
-        self.knowledge_token_routing = knowledge_token_routing
 
         self.neuron_router = UnifiedNeuronRouter(
-            d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
-            n_feature_know, n_restore_know,
+            d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v, n_knowledge,
             d_space=d_space, dropout=router_dropout,
             excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
             excitability_decay_rate=excitability_decay_rate
@@ -408,6 +359,7 @@ class GlobalRouters(nn.Module):
         rqk_pref_K = F.softmax(rqk_logits_K, dim=-1)
         rv_pref = F.softmax(rv_logits, dim=-1)
 
+        # Aux loss
         aux_loss = 0.0
         if self.training:
             if attention_mask is not None:
@@ -454,12 +406,6 @@ class GlobalRouters(nn.Module):
                 'rqk_weights_Q': rqk_weights_Q.detach(),
                 'rqk_weights_K': rqk_weights_K.detach(),
                 'rv_weights': rv_weights.detach(),
-                'fqk_q_pref': fqk_pref_Q.detach(),
-                'fqk_k_pref': fqk_pref_K.detach(),
-                'fv_pref': fv_pref.detach(),
-                'rqk_q_pref': rqk_pref_Q.detach(),
-                'rqk_k_pref': rqk_pref_K.detach(),
-                'rv_pref': rv_pref.detach(),
                 'token_routing': True,
             }
         else:
@@ -494,44 +440,20 @@ class GlobalRouters(nn.Module):
                 'token_routing': False,
             }
 
-        # Update usage (Q/K separately for independent excitability)
+        # Update usage
         if self.training:
-            self.neuron_router.update_usage(fqk_weights_Q, 'feature_q', attention_mask)
-            self.neuron_router.update_usage(fqk_weights_K, 'feature_k', attention_mask)
+            fqk_used = ((fqk_weights_Q > 0) | (fqk_weights_K > 0)).float()
+            self.neuron_router.update_usage(fqk_used, 'feature_qk', attention_mask)
             self.neuron_router.update_usage(fv_weights, 'feature_v', attention_mask)
-            self.neuron_router.update_usage(rqk_weights_Q, 'restore_q', attention_mask)
-            self.neuron_router.update_usage(rqk_weights_K, 'restore_k', attention_mask)
+            rqk_used = ((rqk_weights_Q > 0) | (rqk_weights_K > 0)).float()
+            self.neuron_router.update_usage(rqk_used, 'restore_qk', attention_mask)
             self.neuron_router.update_usage(rv_weights, 'restore_v', attention_mask)
 
         return fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, routing_info, aux_loss
 
-    def get_knowledge_weights(self, x, importance, attention_mask=None):
-        """Knowledge neuron routing - Feature/Restore separation"""
-        logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
-        pref_f = F.softmax(logits_f, dim=-1)  # [B, S, n]
-        pref_r = F.softmax(logits_r, dim=-1)  # [B, S, n]
-
-        if self.knowledge_token_routing:
-            # Token-level: top-k per token
-            feature_know_w, _ = self._topk_sparsify(pref_f, self.top_k_feature_know)
-            restore_know_w, _ = self._topk_sparsify(pref_r, self.top_k_restore_know)
-        else:
-            # Batch-level (default)
-            f_dense = torch.einsum('bs,bsn->bn', importance, pref_f)  # [B, n]
-            r_dense = torch.einsum('bs,bsn->bn', importance, pref_r)  # [B, n]
-            feature_know_w, _ = self._topk_sparsify(f_dense, self.top_k_feature_know)
-            restore_know_w, _ = self._topk_sparsify(r_dense, self.top_k_restore_know)
-
-        if self.training:
-            self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
-            self.neuron_router.update_usage(restore_know_w, 'restore_know', attention_mask)
-
-        return feature_know_w, restore_know_w
-
-
-class AttentionCircuit(nn.Module):
-    """v17.1 attention circuit (shared Q/K pool)"""
+class NeuronCircuit(nn.Module):
+    """v16.4 attention with matmul optimization"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
@@ -597,127 +519,120 @@ class AttentionCircuit(nn.Module):
             K = torch.bmm(h_k, shared_rqk_K)
             V = torch.bmm(h_v, shared_rv)
 
-        # Multi-head attention
+        # Multi-head Attention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         K = K.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
-
-        # Causal mask (language modeling: cannot see future tokens)
-        causal_mask = torch.triu(torch.ones(S, S, device=scores.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(causal_mask[None, None, :, :], float('-inf'))
-
-        # Padding mask (optional)
         if attention_mask is not None:
-            mask = attention_mask[:, None, None, :]
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
+            causal_mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1)
+            pad_mask = (attention_mask == 0).view(B, 1, 1, S)
+            combined_mask = causal_mask.unsqueeze(0).unsqueeze(0) | pad_mask
+            attn_out = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=~combined_mask,
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                Q, K, V,
+                is_causal=True,
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.d_model)
 
-        attn_out = torch.matmul(attn_weights, V)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
         output = self.expand_O(attn_out)
         output = self.out_dropout(output)
 
-        # Returns (output, None) - second value is unused (kept for API compatibility)
         return output, None
 
 
-class KnowledgeCircuit(nn.Module):
-    """
-    v17.1 Knowledge Circuit: Feature-Restore separation (like v17)
-
-    Routing: batch-level (importance weighted average) - same as Attention
-
-    Flow:
-    x -> feature_know_w [B,n] selects feature_know neurons -> h (compression)
-      -> restore_know_w [B,n] selects restore_know neurons -> output (restoration)
-    """
+class NeuronMemory(nn.Module):
+    """2-stage knowledge retrieval"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
-        n_feature_know: int,
-        n_restore_know: int,
-        knowledge_rank: int,
-        top_k_feature_know: int = 4,
-        top_k_restore_know: int = 4,
-        dropout: float = 0.1,
+        n_knowledge: int,
+        knowledge_rank: int = None,
+        coarse_k: int = 20,
+        fine_k: int = 10,
     ):
         super().__init__()
         self.shared_neurons = shared_neurons
         self.d_model = d_model
-        self.n_feature_know = n_feature_know
-        self.n_restore_know = n_restore_know
-        self.knowledge_rank = knowledge_rank
-        self.top_k_feature_know = top_k_feature_know
-        self.top_k_restore_know = top_k_restore_know
-        self.dropout = nn.Dropout(dropout)
+        self.n_knowledge = n_knowledge
+        self.knowledge_rank = knowledge_rank if knowledge_rank is not None else 128
+        self.coarse_k = coarse_k
+        self.fine_k = fine_k
 
-    def forward(self, x, feature_know_w, restore_know_w, attention_mask=None):
-        """
-        x: [B, S, D]
-        feature_know_w: [B, n] (batch-level) or [B, S, n] (token-level)
-        restore_know_w: [B, n] (batch-level) or [B, S, n] (token-level)
-        """
+    def forward(self, x, router, knowledge_encoder, attention_mask=None):
         B, S, D = x.shape
-        R = self.knowledge_rank
-        token_routing = feature_know_w.dim() == 3
 
-        if token_routing:
-            # Token-level: [B, S, n] weights
-            shared_f = torch.einsum('bsn,ndr->bsdr', feature_know_w,
-                                    self.shared_neurons.feature_know)  # [B, S, D, R]
-            h = torch.einsum('bsd,bsdr->bsr', x, shared_f)  # [B, S, R]
+        k_logits = router.get_logits(x, 'knowledge')
+        coarse_scores, candidate_idx = torch.topk(k_logits, self.coarse_k, dim=-1)
 
-            shared_r = torch.einsum('bsn,nrd->bsrd', restore_know_w,
-                                    self.shared_neurons.restore_know)  # [B, S, R, D]
-            output = torch.einsum('bsr,bsrd->bsd', h, shared_r)  # [B, S, D]
-        else:
-            # Batch-level: [B, n] weights
-            f_flat = self.shared_neurons.feature_know.view(-1, D * R)
-            shared_f = (feature_know_w @ f_flat).view(B, D, R)
-            h = torch.bmm(x, shared_f)  # [B, S, R]
+        if self.training:
+            coarse_indicator = torch.zeros(B, S, self.n_knowledge, device=x.device)
+            coarse_indicator.scatter_(-1, candidate_idx, 1.0)
+            router.update_usage(coarse_indicator, 'knowledge', attention_mask)
+            del coarse_indicator
 
-            r_flat = self.shared_neurons.restore_know.view(-1, R * D)
-            shared_r = (restore_know_w @ r_flat).view(B, R, D)
-            output = torch.bmm(h, shared_r)  # [B, S, D]
+        query = knowledge_encoder(x)
 
-        return self.dropout(output)
+        K_all = self.shared_neurons.knowledge_neurons_K
+        V_all = self.shared_neurons.knowledge_neurons_V
+
+        K_candidates = K_all[candidate_idx]
+
+        fine_scores = torch.einsum('bsd,bscd->bsc', query, K_candidates) / math.sqrt(self.knowledge_rank)
+
+        fine_topk_scores, fine_topk_local_idx = torch.topk(fine_scores, self.fine_k, dim=-1)
+        fine_weights = F.softmax(fine_topk_scores, dim=-1)
+
+        fine_global_idx = candidate_idx.gather(-1, fine_topk_local_idx)
+
+        selected_V = V_all[fine_global_idx]
+
+        output = (selected_V * fine_weights.unsqueeze(-1)).sum(dim=2)
+
+        info = {
+            'coarse_indices': candidate_idx.detach(),
+            'coarse_scores': coarse_scores.detach(),
+            'fine_indices': fine_global_idx.detach(),
+            'fine_weights': fine_weights.detach(),
+        }
+
+        return output, info
 
 
 class DAWNBlock(nn.Module):
-    """DAWN v17.1 block: shared Q/K pool + Knowledge Feature-Restore separation"""
+    """DAWN v16.4 block"""
     def __init__(
         self,
         shared_neurons: SharedNeurons,
         d_model: int,
         n_heads: int,
         rank: int,
-        n_feature_know: int,
-        n_restore_know: int,
-        knowledge_rank: int = 128,
-        top_k_feature_know: int = 4,
-        top_k_restore_know: int = 4,
+        n_knowledge: int,
+        knowledge_rank: int = None,
+        coarse_k: int = 20,
+        fine_k: int = 10,
         dropout: float = 0.1,
     ):
         super().__init__()
 
-        self.attn = AttentionCircuit(shared_neurons, d_model, n_heads, rank, dropout)
-        self.knowledge = KnowledgeCircuit(
-            shared_neurons, d_model, n_feature_know, n_restore_know,
-            knowledge_rank=knowledge_rank,
-            top_k_feature_know=top_k_feature_know,
-            top_k_restore_know=top_k_restore_know,
-            dropout=dropout
+        self.attn = NeuronCircuit(shared_neurons, d_model, n_heads, rank, dropout)
+        self.memory = NeuronMemory(
+            shared_neurons, d_model, n_knowledge,
+            knowledge_rank=knowledge_rank, coarse_k=coarse_k, fine_k=fine_k
         )
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, importance, global_routers: GlobalRouters, attention_mask=None):
-        # Attention
+    def forward(self, x, importance, global_routers: GlobalRouters, knowledge_encoder, attention_mask=None):
         normed_x = self.norm1(x)
         fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, attn_routing, attn_aux_loss = \
             global_routers.get_attention_weights(normed_x, importance, attention_mask)
@@ -725,24 +640,15 @@ class DAWNBlock(nn.Module):
         attn_out, _ = self.attn(normed_x, fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, attention_mask)
         x = x + attn_out
 
-        # Knowledge
-        normed_x = self.norm2(x)
-        feature_know_w, restore_know_w = global_routers.get_knowledge_weights(normed_x, importance, attention_mask)
-        know_out = self.knowledge(normed_x, feature_know_w, restore_know_w, attention_mask)
-        x = x + know_out
-
-        # Routing info
-        attn_out_norm = attn_out.norm(dim=-1).mean().detach()
-        know_out_norm = know_out.norm(dim=-1).mean().detach()
+        normed_x2 = self.norm2(x)
+        mem_out, knowledge_info = self.memory(normed_x2, global_routers.neuron_router, knowledge_encoder, attention_mask)
+        x = x + self.dropout(mem_out)
 
         routing_info = {
-            'attention': attn_routing,
-            'knowledge': {
-                'feature_know_w': feature_know_w.detach(),
-                'restore_know_w': restore_know_w.detach(),
-            },
-            'attn_out_norm': attn_out_norm,
-            'know_out_norm': know_out_norm,
+            'attention': {**attn_routing},
+            'memory': {**{k: v.detach() for k, v in knowledge_info.items()}},
+            'attn_out_norm': attn_out.norm(dim=-1).mean().detach(),
+            'mem_out_norm': mem_out.norm(dim=-1).mean().detach(),
         }
 
         return x, routing_info, attn_aux_loss
@@ -750,67 +656,53 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v17.1: Q/K Shared Pool + Knowledge Feature-Restore Separation
+    DAWN v16.4: Shared Pool + Separate Routing (Optimized)
 
-    Architecture:
-    - Attention: Q/K shared pool (stable)
-    - Knowledge: Feature/Restore separate routing (like v17)
+    - Feature_QK: Q/K 압축 공유 풀, 분리 routing
+    - Feature_V: V 압축
+    - Restore_QK: Q/K 복원 공유 풀, 분리 routing
+    - Restore_V: V 복원
     """
-    __version__ = "17.1"
+    __version__ = "16.4"
 
     def __init__(
         self,
         vocab_size: int = 30000,
-        d_model: int = 320,
-        n_layers: int = 4,
-        n_heads: int = 8,
+        d_model: int = 384,
+        n_layers: int = 12,
+        n_heads: int = 6,
         rank: int = 64,
         max_seq_len: int = 512,
+        # Feature
+        n_feature_qk: int = 48,
+        n_feature_v: int = 24,
+        top_k_feature_qk: int = 8,
+        top_k_feature_v: int = 3,
+        # Restore
+        n_restore_qk: int = 48,
+        n_restore_v: int = 24,
+        top_k_restore_qk: int = 8,
+        top_k_restore_v: int = 3,
+        # Knowledge
+        n_knowledge: int = 256,
+        coarse_k: int = 16,
+        fine_k: int = 8,
+        knowledge_rank: int = 128,
+        # Other
         state_dim: int = 64,
         d_space: int = 64,
-        # Attention - shared Q/K pool
-        n_feature_qk: int = 56,
-        n_feature_v: int = 24,
-        top_k_feature_qk: int = 16,
-        top_k_feature_v: int = 6,
-        n_restore_qk: int = 56,
-        n_restore_v: int = 24,
-        top_k_restore_qk: int = 16,
-        top_k_restore_v: int = 6,
-        # Knowledge - Feature/Restore separation
-        n_feature_know: int = 24,
-        n_restore_know: int = 24,
-        top_k_feature_know: int = 4,
-        top_k_restore_know: int = 4,
-        knowledge_rank: int = 128,
-        # Others
         dropout: float = 0.1,
-        token_routing: bool = False,
-        knowledge_token_routing: bool = False,
         router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
+        token_routing: bool = False,
         use_ssm_context: bool = True,
+        # Excitability
         excitability_tau: float = 1.5,
         excitability_ema_alpha: float = 0.01,
         excitability_decay_rate: float = 0.99995,
+        **kwargs
     ):
         super().__init__()
-
-        # Validation checks
-        if d_model % n_heads != 0:
-            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
-        if top_k_feature_qk > n_feature_qk:
-            raise ValueError(f"top_k_feature_qk ({top_k_feature_qk}) cannot exceed n_feature_qk ({n_feature_qk})")
-        if top_k_feature_v > n_feature_v:
-            raise ValueError(f"top_k_feature_v ({top_k_feature_v}) cannot exceed n_feature_v ({n_feature_v})")
-        if top_k_restore_qk > n_restore_qk:
-            raise ValueError(f"top_k_restore_qk ({top_k_restore_qk}) cannot exceed n_restore_qk ({n_restore_qk})")
-        if top_k_restore_v > n_restore_v:
-            raise ValueError(f"top_k_restore_v ({top_k_restore_v}) cannot exceed n_restore_v ({n_restore_v})")
-        if top_k_feature_know > n_feature_know:
-            raise ValueError(f"top_k_feature_know ({top_k_feature_know}) cannot exceed n_feature_know ({n_feature_know})")
-        if top_k_restore_know > n_restore_know:
-            raise ValueError(f"top_k_restore_know ({top_k_restore_know}) cannot exceed n_restore_know ({n_restore_know})")
 
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -821,72 +713,54 @@ class DAWN(nn.Module):
         self.max_seq_len = max_seq_len
         self.state_dim = state_dim
         self.d_space = d_space
-        self.dropout_rate = dropout
         self.token_routing = token_routing
-        self.knowledge_token_routing = knowledge_token_routing
         self.router_dropout = router_dropout
         self.gradient_checkpointing = gradient_checkpointing
         self.use_ssm_context = use_ssm_context
         self.excitability_tau = excitability_tau
         self.excitability_ema_alpha = excitability_ema_alpha
-        self.excitability_decay_rate = excitability_decay_rate
 
-        # Shared Q/K pool
         self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
         self.top_k_feature_qk = top_k_feature_qk
         self.top_k_feature_v = top_k_feature_v
+
         self.n_restore_qk = n_restore_qk
         self.n_restore_v = n_restore_v
         self.top_k_restore_qk = top_k_restore_qk
         self.top_k_restore_v = top_k_restore_v
 
-        # Knowledge Feature/Restore separation
-        self.n_feature_know = n_feature_know
-        self.n_restore_know = n_restore_know
-        self.top_k_feature_know = top_k_feature_know
-        self.top_k_restore_know = top_k_restore_know
-
-        # v15 compat
-        self.n_feature = n_feature_qk
-        self.n_neurons = n_feature_qk
-        self.basis_rank = rank
+        self.n_knowledge = n_knowledge
+        self.coarse_k = coarse_k
+        self.fine_k = fine_k
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
-        self.emb_dropout = nn.Dropout(dropout)
-
-        self.global_ssm = GlobalSSM(d_model, state_dim, return_context=use_ssm_context)
 
         self.shared_neurons = SharedNeurons(
             d_model=d_model, rank=rank,
             n_feature_qk=n_feature_qk, n_feature_v=n_feature_v,
             n_restore_qk=n_restore_qk, n_restore_v=n_restore_v,
-            n_feature_know=n_feature_know, n_restore_know=n_restore_know,
-            knowledge_rank=knowledge_rank,
+            n_knowledge=n_knowledge, knowledge_rank=knowledge_rank,
         )
 
-        self.router = GlobalRouters(
-            d_model=d_model,
-            n_feature_qk=n_feature_qk, n_feature_v=n_feature_v,
-            n_restore_qk=n_restore_qk, n_restore_v=n_restore_v,
-            n_feature_know=n_feature_know, n_restore_know=n_restore_know,
-            top_k_feature_qk=top_k_feature_qk, top_k_feature_v=top_k_feature_v,
-            top_k_restore_qk=top_k_restore_qk, top_k_restore_v=top_k_restore_v,
-            top_k_feature_know=top_k_feature_know, top_k_restore_know=top_k_restore_know,
+        self.global_ssm = GlobalSSM(d_model, state_dim, return_context=use_ssm_context)
+
+        self.global_routers = GlobalRouters(
+            d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v, n_knowledge,
+            top_k_feature_qk, top_k_feature_v, top_k_restore_qk, top_k_restore_v,
             d_space=d_space, router_dropout=router_dropout, token_routing=token_routing,
-            knowledge_token_routing=knowledge_token_routing,
             excitability_tau=excitability_tau, excitability_ema_alpha=excitability_ema_alpha,
             excitability_decay_rate=excitability_decay_rate
         )
 
+        self.knowledge_encoder = nn.Linear(d_model, knowledge_rank, bias=False)
+
         self.layers = nn.ModuleList([
             DAWNBlock(
                 shared_neurons=self.shared_neurons, d_model=d_model, n_heads=n_heads,
-                rank=rank, n_feature_know=n_feature_know, n_restore_know=n_restore_know,
-                knowledge_rank=knowledge_rank,
-                top_k_feature_know=top_k_feature_know, top_k_restore_know=top_k_restore_know,
-                dropout=dropout,
+                rank=rank, n_knowledge=n_knowledge, knowledge_rank=knowledge_rank,
+                coarse_k=coarse_k, fine_k=fine_k, dropout=dropout,
             )
             for _ in range(n_layers)
         ])
@@ -902,46 +776,49 @@ class DAWN(nn.Module):
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                nn.init.normal_(module.weight, std=0.02)
                 if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
+                    nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                nn.init.normal_(module.weight, std=0.02)
 
     def forward(self, input_ids, labels=None, attention_mask=None, return_routing_info=False):
         B, S = input_ids.shape
         device = input_ids.device
 
-        # Validate sequence length
-        if S > self.max_seq_len:
-            raise ValueError(f"Sequence length {S} exceeds max_seq_len {self.max_seq_len}")
+        self.aux_loss = 0.0
 
-        positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-        x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
-
-        importance, context, raw_importance = self.global_ssm(x, attention_mask)
-        if context is not None:
-            x = x + context
+        positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+        x = self.token_emb(input_ids) + self.pos_emb(positions)
 
         routing_infos = []
-        total_aux_loss = 0.0
-
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x, routing_info, aux_loss = checkpoint(
-                    layer, x, importance, self.router, attention_mask,
+                importance, context, raw_importance = checkpoint(
+                    self.global_ssm, x, attention_mask, use_reentrant=False
+                )
+            else:
+                importance, context, raw_importance = self.global_ssm(x, attention_mask)
+            if context is not None:
+                x = x + context
+
+            if self.gradient_checkpointing and self.training:
+                x, routing_info, layer_aux_loss = checkpoint(
+                    layer, x, importance, self.global_routers, self.knowledge_encoder, attention_mask,
                     use_reentrant=False
                 )
             else:
-                x, routing_info, aux_loss = layer(x, importance, self.router, attention_mask)
-            routing_infos.append(routing_info)
-            total_aux_loss += aux_loss
+                x, routing_info, layer_aux_loss = layer(x, importance, self.global_routers, self.knowledge_encoder, attention_mask)
 
-        self.aux_loss = total_aux_loss
+            self.aux_loss = self.aux_loss + layer_aux_loss
+
+            if return_routing_info:
+                routing_info['importance'] = importance.detach()
+                routing_info['raw_importance'] = raw_importance.detach()
+                routing_infos.append(routing_info)
+
         x = self.norm(x)
         logits = self.lm_head(x)
-
-        # Note: decay_excitability() is called in train.py, not here
 
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
@@ -954,71 +831,6 @@ class DAWN(nn.Module):
         if return_routing_info:
             return logits, routing_infos
         return logits
-
-    def get_config(self):
-        return {
-            'model_version': self.__version__,
-            'vocab_size': self.vocab_size, 'd_model': self.d_model,
-            'n_layers': self.n_layers, 'n_heads': self.n_heads,
-            'rank': self.rank, 'knowledge_rank': self.knowledge_rank,
-            'max_seq_len': self.max_seq_len,
-            'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
-            'top_k_feature_qk': self.top_k_feature_qk, 'top_k_feature_v': self.top_k_feature_v,
-            'n_restore_qk': self.n_restore_qk, 'n_restore_v': self.n_restore_v,
-            'top_k_restore_qk': self.top_k_restore_qk, 'top_k_restore_v': self.top_k_restore_v,
-            'n_feature_know': self.n_feature_know, 'n_restore_know': self.n_restore_know,
-            'top_k_feature_know': self.top_k_feature_know, 'top_k_restore_know': self.top_k_restore_know,
-            'state_dim': self.state_dim, 'd_space': self.d_space,
-            'knowledge_token_routing': self.knowledge_token_routing,
-        }
-
-    def get_model_info(self):
-        """Return model architecture info for logging"""
-        return [
-            f"DAWN v{self.__version__}: Q/K Shared + Knowledge Feature-Restore",
-            f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
-            f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  max_seq_len={self.max_seq_len}, state_dim={self.state_dim}, dropout={self.dropout_rate}",
-            f"",
-            f"  [Attention - Q/K Shared Pool]",
-            f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_qk})",
-            f"  Feature_V: {self.n_feature_v} × {self.d_model} × {self.rank} (top-k={self.top_k_feature_v})",
-            f"  Restore_QK: {self.n_restore_qk} × {self.rank} × {self.d_model} (top-k={self.top_k_restore_qk})",
-            f"  Restore_V: {self.n_restore_v} × {self.rank} × {self.d_model} (top-k={self.top_k_restore_v})",
-            f"",
-            f"  [Knowledge - Feature-Restore]",
-            f"  Feature_Know: {self.n_feature_know} × {self.d_model} × {self.knowledge_rank} (top-k={self.top_k_feature_know})",
-            f"  Restore_Know: {self.n_restore_know} × {self.knowledge_rank} × {self.d_model} (top-k={self.top_k_restore_know})",
-            f"",
-            f"  [Router]",
-            f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
-            f"  token_routing={self.token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
-            f"  use_ssm_context={self.use_ssm_context}",
-            f"",
-            f"  [Excitability]",
-            f"  tau={self.excitability_tau}, ema_alpha={self.excitability_ema_alpha}, decay_rate={self.excitability_decay_rate}",
-            f"",
-            f"  [Other]",
-            f"  gradient_checkpointing={self.gradient_checkpointing}",
-        ]
-
-    def knowledge_diversity_loss(self):
-        feat_know = self.shared_neurons.feature_know
-        rest_know = self.shared_neurons.restore_know
-
-        feat_flat = feat_know.view(feat_know.size(0), -1)
-        feat_norm = F.normalize(feat_flat, dim=-1)
-        feat_sim = torch.matmul(feat_norm, feat_norm.T)
-        mask_f = ~torch.eye(feat_sim.size(0), dtype=torch.bool, device=feat_sim.device)
-        feat_loss = feat_sim[mask_f].abs().mean()
-
-        rest_flat = rest_know.view(rest_know.size(0), -1)
-        rest_norm = F.normalize(rest_flat, dim=-1)
-        rest_sim = torch.matmul(rest_norm, rest_norm.T)
-        mask_r = ~torch.eye(rest_sim.size(0), dtype=torch.bool, device=rest_sim.device)
-        rest_loss = rest_sim[mask_r].abs().mean()
-
-        return (feat_loss + rest_loss) / 2
 
     def orthogonality_loss(self):
         I = torch.eye(self.rank, device=self.shared_neurons.f_neurons.device).unsqueeze(0)
@@ -1039,17 +851,14 @@ class DAWN(nn.Module):
         WWt_rv = torch.bmm(W_rv, W_rv.transpose(1, 2))
         loss_rv = ((WWt_rv - I) ** 2).mean()
 
-        I_know = torch.eye(self.knowledge_rank, device=self.shared_neurons.feature_know.device).unsqueeze(0)
+        return (loss_fqk + loss_fv + loss_rqk + loss_rv) / 4
 
-        W_fknow = self.shared_neurons.feature_know
-        WtW_fknow = torch.bmm(W_fknow.transpose(1, 2), W_fknow)
-        loss_fknow = ((WtW_fknow - I_know) ** 2).mean()
-
-        W_rknow = self.shared_neurons.restore_know
-        WWt_rknow = torch.bmm(W_rknow, W_rknow.transpose(1, 2))
-        loss_rknow = ((WWt_rknow - I_know) ** 2).mean()
-
-        return (loss_fqk + loss_fv + loss_rqk + loss_rv + loss_fknow + loss_rknow) / 6
+    def knowledge_diversity_loss(self):
+        K = self.shared_neurons.knowledge_neurons_K
+        K_norm = F.normalize(K, dim=-1)
+        sim = K_norm @ K_norm.T
+        mask = ~torch.eye(self.n_knowledge, dtype=torch.bool, device=K.device)
+        return sim[mask].abs().mean()
 
     def get_auxiliary_losses(self):
         return {
@@ -1057,18 +866,36 @@ class DAWN(nn.Module):
             'knowledge_div': self.knowledge_diversity_loss(),
         }
 
-    def __repr__(self):
-        params = sum(p.numel() for p in self.parameters()) / 1e6
-        attn_neurons = self.n_feature_qk + self.n_feature_v + self.n_restore_qk + self.n_restore_v
-        know_neurons = self.n_feature_know + self.n_restore_know
-        return (
-            f"DAWN v{self.__version__}: Q/K Shared + Knowledge Feature-Restore\n"
-            f"  Params: {params:.1f}M\n"
-            f"  Attention: Feature_QK={self.n_feature_qk} (k={self.top_k_feature_qk}), "
-            f"Feature_V={self.n_feature_v} (k={self.top_k_feature_v})\n"
-            f"            Restore_QK={self.n_restore_qk} (k={self.top_k_restore_qk}), "
-            f"Restore_V={self.n_restore_v} (k={self.top_k_restore_v})\n"
-            f"  Knowledge: Feature={self.n_feature_know} (k={self.top_k_feature_know}), "
-            f"Restore={self.n_restore_know} (k={self.top_k_restore_know})\n"
-            f"  Total neurons: {attn_neurons} (attn) + {know_neurons} (know) = {attn_neurons + know_neurons}"
-        )
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def get_config(self):
+        return {
+            'model_version': self.__version__,
+            'vocab_size': self.vocab_size, 'd_model': self.d_model,
+            'n_layers': self.n_layers, 'n_heads': self.n_heads,
+            'rank': self.rank, 'knowledge_rank': self.knowledge_rank,
+            'max_seq_len': self.max_seq_len,
+            'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
+            'top_k_feature_qk': self.top_k_feature_qk, 'top_k_feature_v': self.top_k_feature_v,
+            'n_restore_qk': self.n_restore_qk, 'n_restore_v': self.n_restore_v,
+            'top_k_restore_qk': self.top_k_restore_qk, 'top_k_restore_v': self.top_k_restore_v,
+            'n_knowledge': self.n_knowledge,
+            'coarse_k': self.coarse_k, 'fine_k': self.fine_k,
+            'state_dim': self.state_dim, 'd_space': self.d_space,
+            'router_dropout': self.router_dropout,
+            'gradient_checkpointing': self.gradient_checkpointing,
+            'token_routing': self.token_routing,
+        }
+
+    def get_model_info(self):
+        return [
+            f"DAWN v{self.__version__}: Shared Pool + Separate Routing (Optimized)",
+            f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
+            f"  Feature_QK: {self.n_feature_qk} (top-k={self.top_k_feature_qk}) - Q/K shared pool, separate routing",
+            f"  Feature_V: {self.n_feature_v} (top-k={self.top_k_feature_v})",
+            f"  Restore_QK: {self.n_restore_qk} (top-k={self.top_k_restore_qk}) - Q/K shared pool, separate routing",
+            f"  Restore_V: {self.n_restore_v} (top-k={self.top_k_restore_v})",
+            f"  Knowledge: {self.n_knowledge} (coarse={self.coarse_k} -> fine={self.fine_k})",
+            f"  Router: d_space={self.d_space}, proj_all(6) + proj_knowledge(1)",
+        ]

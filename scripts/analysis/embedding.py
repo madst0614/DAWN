@@ -29,23 +29,30 @@ if HAS_SKLEARN:
 class EmbeddingAnalyzer:
     """Neuron embedding analyzer."""
 
-    def __init__(self, router):
+    def __init__(self, router, device='cuda'):
         """
         Initialize analyzer.
 
         Args:
             router: NeuronRouter instance
+            device: Device for computation
         """
         self.router = router
+        self.device = device
 
-    def get_embeddings_by_type(self) -> Dict[str, np.ndarray]:
+    def get_embeddings_by_type(self, as_tensor: bool = False) -> Dict[str, np.ndarray]:
         """
         Extract embeddings grouped by neuron type.
 
+        Args:
+            as_tensor: Return torch tensors on GPU instead of numpy arrays
+
         Returns:
-            Dictionary mapping type name to embedding array
+            Dictionary mapping type name to embedding array/tensor
         """
-        emb = self.router.neuron_emb.detach().cpu().numpy()
+        emb = self.router.neuron_emb.detach()
+        if not as_tensor:
+            emb = emb.cpu().numpy()
 
         result = {}
         offset = 0
@@ -60,6 +67,7 @@ class EmbeddingAnalyzer:
     def analyze_similarity(self, output_dir: Optional[str] = None) -> Dict:
         """
         Analyze intra-type similarity using cosine similarity.
+        Optimized with GPU tensor operations.
 
         Args:
             output_dir: Directory for visualization output
@@ -67,35 +75,41 @@ class EmbeddingAnalyzer:
         Returns:
             Dictionary with similarity statistics
         """
-        embeddings = self.get_embeddings_by_type()
+        # Get embeddings as GPU tensors
+        embeddings_gpu = self.get_embeddings_by_type(as_tensor=True)
         results = {}
 
-        for name, emb in embeddings.items():
+        for name, emb in embeddings_gpu.items():
             if len(emb) < 2:
                 continue
 
-            # Normalize and compute similarity matrix
-            emb_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
-            sim_matrix = emb_norm @ emb_norm.T
+            # Ensure on GPU
+            emb = emb.to(self.device)
+
+            # Normalize and compute similarity matrix on GPU
+            emb_norm = emb / (emb.norm(dim=1, keepdim=True) + 1e-8)
+            sim_matrix = torch.mm(emb_norm, emb_norm.t())
 
             # Extract off-diagonal elements
             n = sim_matrix.shape[0]
-            off_diag = sim_matrix[~np.eye(n, dtype=bool)]
+            mask = ~torch.eye(n, dtype=torch.bool, device=self.device)
+            off_diag = sim_matrix[mask]
 
             display = NEURON_TYPES[name][0]
             results[name] = {
                 'display': display,
                 'n_neurons': n,
-                'avg_similarity': float(off_diag.mean()),
-                'max_similarity': float(off_diag.max()),
-                'min_similarity': float(off_diag.min()),
-                'std_similarity': float(off_diag.std()),
+                'avg_similarity': float(off_diag.mean().item()),
+                'max_similarity': float(off_diag.max().item()),
+                'min_similarity': float(off_diag.min().item()),
+                'std_similarity': float(off_diag.std().item()),
             }
 
-        # Visualization
+        # Visualization (needs numpy)
         if HAS_MATPLOTLIB and output_dir:
             os.makedirs(output_dir, exist_ok=True)
-            self._visualize_similarity(embeddings, output_dir)
+            embeddings_np = self.get_embeddings_by_type(as_tensor=False)
+            self._visualize_similarity(embeddings_np, output_dir)
             results['visualization'] = os.path.join(output_dir, 'similarity_heatmap.png')
 
         return results
@@ -120,26 +134,28 @@ class EmbeddingAnalyzer:
     def analyze_cross_type_similarity(self) -> Dict:
         """
         Analyze similarity between neuron types using centroids.
+        Optimized with GPU tensor operations.
 
         Returns:
             Dictionary with pairwise centroid similarities
         """
-        embeddings = self.get_embeddings_by_type()
+        embeddings = self.get_embeddings_by_type(as_tensor=True)
 
-        # Compute centroids
+        # Compute centroids on GPU
         centroids = {}
         for name, emb in embeddings.items():
-            centroids[name] = emb.mean(axis=0)
+            emb = emb.to(self.device)
+            centroids[name] = emb.mean(dim=0)
 
-        # Compute pairwise similarities
+        # Compute pairwise similarities on GPU
         results = {}
         names = list(centroids.keys())
         for i, n1 in enumerate(names):
             for n2 in names[i+1:]:
                 c1, c2 = centroids[n1], centroids[n2]
-                sim = np.dot(c1, c2) / (np.linalg.norm(c1) * np.linalg.norm(c2) + 1e-8)
+                sim = torch.dot(c1, c2) / (c1.norm() * c2.norm() + 1e-8)
                 key = f"{NEURON_TYPES[n1][0]}-{NEURON_TYPES[n2][0]}"
-                results[key] = float(sim)
+                results[key] = float(sim.item())
 
         return results
 

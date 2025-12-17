@@ -8,11 +8,18 @@ This module validates the core claims of the DAWN paper:
 2. Neurons learn linguistic/semantic properties
 3. Context-dependent dynamic routing
 
-Includes:
-- Semantic path similarity analysis
-- POS-based routing analysis
-- Context-dependent routing analysis
-- Neuron-token activation heatmaps
+Key improvements (v2):
+- Collects routing from ALL layers (not just layer 0)
+- Includes Knowledge routing (critical for v17.1)
+- Sentence-level mean pooling for similarity (not position-wise truncate)
+- Entropy-based filtering for collapsed routing
+- Layer-wise and routing-type-wise reporting
+
+Performance optimizations (v3):
+- Batch processing for multiple texts (single forward pass)
+- GPU-based similarity computation
+- spaCy nlp.pipe() for batch POS tagging
+- Minimal CPU transfers
 """
 
 import os
@@ -25,6 +32,8 @@ from collections import defaultdict
 
 from .utils import (
     ROUTING_KEYS,
+    KNOWLEDGE_ROUTING_KEYS,
+    calc_entropy,
     convert_to_serializable,
     get_batch_input_ids, get_routing_from_outputs,
     HAS_TQDM, tqdm
@@ -35,6 +44,10 @@ try:
     HAS_SPACY = True
 except ImportError:
     HAS_SPACY = False
+
+
+# Minimum entropy ratio to consider routing as "healthy" (not collapsed)
+MIN_HEALTHY_ENTROPY = 10.0  # 10% of max entropy
 
 
 class SemanticAnalyzer:
@@ -63,115 +76,411 @@ class SemanticAnalyzer:
             except Exception:
                 pass
 
-    def get_routing_path(self, text: str) -> Dict[str, torch.Tensor]:
+        # Cache for routing paths (optional)
+        self._path_cache = {}
+        self._cache_enabled = True
+
+    def clear_cache(self):
+        """Clear routing path cache."""
+        self._path_cache = {}
+
+    # ============================================================
+    # Entropy Helpers
+    # ============================================================
+
+    def compute_routing_entropy(self, weights: torch.Tensor) -> float:
         """
-        Extract routing path for a given text.
+        Compute entropy of routing weights as percentage of maximum.
 
         Args:
-            text: Input text
+            weights: Routing weights tensor [*, N]
 
         Returns:
-            Dictionary mapping routing key to [seq_len, n_neurons] tensor
+            Entropy ratio (0-100)
         """
-        enc = self.tokenizer(text, return_tensors='pt', padding=True, truncation=True)
-        input_ids = enc['input_ids'].to(self.device)
+        if weights.numel() == 0:
+            return 0.0
 
+        # Flatten to [batch, neurons] and average
+        if weights.dim() == 1:
+            probs = weights
+        elif weights.dim() == 2:
+            probs = weights.mean(dim=0)
+        else:
+            probs = weights.reshape(-1, weights.shape[-1]).mean(dim=0)
+
+        # Normalize to probabilities
+        probs = probs.clamp(min=0)
+        total = probs.sum()
+        if total <= 0:
+            return 0.0
+        probs = probs / total
+
+        # Compute entropy
+        ent = calc_entropy(probs, dim=-1)
+        if ent.dim() > 0:
+            ent = ent.mean()
+
+        max_ent = math.log(weights.shape[-1])
+        return float(ent / max_ent * 100) if max_ent > 0 else 0.0
+
+    def get_healthy_routing_keys(self, routing_dict: Dict, min_entropy: float = MIN_HEALTHY_ENTROPY) -> List[str]:
+        """
+        Filter routing keys to only include non-collapsed ones.
+
+        Args:
+            routing_dict: Dictionary of routing weights
+            min_entropy: Minimum entropy threshold
+
+        Returns:
+            List of healthy routing keys
+        """
+        healthy = []
+        for key, weights in routing_dict.items():
+            if weights is None:
+                continue
+            ent = self.compute_routing_entropy(weights)
+            if ent >= min_entropy:
+                healthy.append(key)
+        return healthy
+
+    # ============================================================
+    # Routing Path Extraction - BATCH VERSION (OPTIMIZED)
+    # ============================================================
+
+    def get_routing_paths_batch(self, texts: List[str], keep_on_gpu: bool = True) -> List[Dict]:
+        """
+        Extract routing paths for multiple texts in a single forward pass.
+
+        Args:
+            texts: List of input texts
+            keep_on_gpu: Keep tensors on GPU (faster for subsequent operations)
+
+        Returns:
+            List of routing path dicts, one per text
+        """
+        if not texts:
+            return []
+
+        # Check cache
+        if self._cache_enabled:
+            cached_results = []
+            uncached_texts = []
+            uncached_indices = []
+
+            for i, text in enumerate(texts):
+                if text in self._path_cache:
+                    cached_results.append((i, self._path_cache[text]))
+                else:
+                    uncached_texts.append(text)
+                    uncached_indices.append(i)
+
+            if not uncached_texts:
+                # All cached
+                return [r for _, r in sorted(cached_results, key=lambda x: x[0])]
+        else:
+            uncached_texts = texts
+            uncached_indices = list(range(len(texts)))
+            cached_results = []
+
+        # Tokenize batch
+        enc = self.tokenizer(
+            uncached_texts,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=128
+        )
+        input_ids = enc['input_ids'].to(self.device)
+        attention_mask = enc.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
+
+        # Single forward pass
         self.model.eval()
         with torch.no_grad():
             outputs = self.model(input_ids, return_routing_info=True)
 
         routing_infos = get_routing_from_outputs(outputs)
-        if routing_infos is None:
-            return {}
+        if routing_infos is None or len(routing_infos) == 0:
+            return [{} for _ in texts]
 
-        # Extract first layer's attention routing
-        attn = routing_infos[0].get('attention', {})
+        batch_size = input_ids.shape[0]
+        results = []
 
-        paths = {}
-        for key, (display, pref_key, weight_key, pool) in ROUTING_KEYS.items():
-            weights = attn.get(weight_key)
-            if weights is not None:
-                # [B, S, N] -> [S, N]
-                if weights.dim() == 3:
-                    paths[key] = weights[0].cpu()
-                else:
-                    paths[key] = weights.cpu()
+        # Process each sample in batch
+        for b in range(batch_size):
+            result = {}
+            seq_len = attention_mask[b].sum().item()
 
-        return paths
+            for layer_idx, layer_info in enumerate(routing_infos):
+                layer_key = f'layer_{layer_idx}'
+                result[layer_key] = {}
 
-    def compute_path_similarity(self, path1: Dict, path2: Dict) -> Dict[str, Dict]:
+                # Attention routing
+                attn = layer_info.get('attention', {})
+                for key, (display, pref_key, weight_key, pool) in ROUTING_KEYS.items():
+                    weights = attn.get(weight_key)
+                    if weights is not None:
+                        if weights.dim() == 3:
+                            w = weights[b, :seq_len]  # [B,S,N] → [S, N]
+                        elif weights.dim() == 2:
+                            # Batch-level routing: expand to token-level [N] → [S, N]
+                            w = weights[b].unsqueeze(0).expand(seq_len, -1)
+                        else:
+                            continue
+                        result[layer_key][key] = w if keep_on_gpu else w.cpu()
+
+                # Knowledge routing
+                knowledge = layer_info.get('knowledge', {})
+                for key, (display, weight_key, pool) in KNOWLEDGE_ROUTING_KEYS.items():
+                    weights = knowledge.get(weight_key)
+                    if weights is not None:
+                        if weights.dim() == 3:
+                            w = weights[b, :seq_len]  # [B,S,N] → [S, N]
+                        elif weights.dim() == 2:
+                            # Batch-level routing: expand to token-level [N] → [S, N]
+                            w = weights[b].unsqueeze(0).expand(seq_len, -1)
+                        else:
+                            continue
+                        result[layer_key][key] = w if keep_on_gpu else w.cpu()
+
+            # Aggregated representation (GPU)
+            result['aggregated'] = self._aggregate_routing_path_gpu(result)
+            result['entropy'] = self._compute_path_entropy(result)
+
+            results.append(result)
+
+            # Cache
+            if self._cache_enabled and b < len(uncached_texts):
+                self._path_cache[uncached_texts[b]] = result
+
+        # Merge cached and new results
+        if cached_results:
+            final_results = [None] * len(texts)
+            for orig_idx, cached_result in cached_results:
+                final_results[orig_idx] = cached_result
+            for i, result in enumerate(results):
+                final_results[uncached_indices[i]] = result
+            return final_results
+
+        return results
+
+    def get_routing_path(self, text: str) -> Dict[str, Dict[str, torch.Tensor]]:
         """
-        Compute similarity between two routing paths.
+        Extract routing path for a single text.
+        Uses batch version internally.
+        """
+        results = self.get_routing_paths_batch([text], keep_on_gpu=False)
+        return results[0] if results else {}
+
+    def _aggregate_routing_path_gpu(self, layer_routing: Dict) -> Dict[str, torch.Tensor]:
+        """
+        Aggregate routing across all layers into sentence-level representation.
+        Keeps computation on GPU.
+        """
+        aggregated = defaultdict(list)
+
+        for layer_key, routing_dict in layer_routing.items():
+            if layer_key in ['aggregated', 'entropy']:
+                continue
+            for routing_key, weights in routing_dict.items():
+                if weights.dim() >= 1:
+                    pooled = weights.mean(dim=0) if weights.dim() > 1 else weights
+                    aggregated[routing_key].append(pooled)
+
+        result = {}
+        for key, layer_weights in aggregated.items():
+            if layer_weights:
+                stacked = torch.stack(layer_weights)
+                result[key] = stacked.mean(dim=0)
+
+        return result
+
+    def _compute_path_entropy(self, layer_routing: Dict) -> Dict[str, float]:
+        """Compute entropy for each routing key across all layers."""
+        entropy = {}
+
+        for layer_key, routing_dict in layer_routing.items():
+            if layer_key in ['aggregated', 'entropy']:
+                continue
+            for routing_key, weights in routing_dict.items():
+                full_key = f'{layer_key}/{routing_key}'
+                entropy[full_key] = self.compute_routing_entropy(weights)
+
+        return entropy
+
+    # ============================================================
+    # Path Similarity - GPU OPTIMIZED
+    # ============================================================
+
+    def compute_path_similarity_gpu(self, path1: Dict, path2: Dict,
+                                     use_entropy_weighting: bool = True) -> Dict:
+        """
+        Compute similarity between two routing paths on GPU.
 
         Args:
             path1: First routing path
             path2: Second routing path
+            use_entropy_weighting: Weight by entropy
 
         Returns:
-            Dictionary with cosine and Jaccard similarity per routing key
+            Dictionary with similarity metrics
         """
-        results = {}
+        results = {
+            'per_layer': {},
+            'per_routing_type': {},
+            'overall': {},
+        }
 
-        for key in path1.keys():
-            if key not in path2:
+        agg1 = path1.get('aggregated', {})
+        agg2 = path2.get('aggregated', {})
+        ent1 = path1.get('entropy', {})
+        ent2 = path2.get('entropy', {})
+
+        all_cosines = []
+        all_jaccards = []
+        all_weights = []
+
+        for key in agg1.keys():
+            if key not in agg2:
                 continue
 
-            p1, p2 = path1[key], path2[key]
+            p1, p2 = agg1[key], agg2[key]
 
-            # Truncate to minimum length
-            min_len = min(p1.shape[0], p2.shape[0])
-            p1, p2 = p1[:min_len], p2[:min_len]
+            # Ensure on same device
+            if p1.device != p2.device:
+                p2 = p2.to(p1.device)
 
-            # Cosine similarity (position-wise average)
-            p1_norm = p1 / (p1.norm(dim=-1, keepdim=True) + 1e-8)
-            p2_norm = p2 / (p2.norm(dim=-1, keepdim=True) + 1e-8)
-            cosine = (p1_norm * p2_norm).sum(dim=-1).mean().item()
+            # Cosine similarity (GPU)
+            p1_norm = F.normalize(p1.unsqueeze(0), dim=-1)
+            p2_norm = F.normalize(p2.unsqueeze(0), dim=-1)
+            cosine = float((p1_norm * p2_norm).sum())
 
             # Jaccard similarity (top-8 neurons)
             k = min(8, p1.shape[-1])
-            top1 = set(p1.sum(dim=0).topk(k)[1].tolist())
-            top2 = set(p2.sum(dim=0).topk(k)[1].tolist())
+            top1 = set(p1.topk(k)[1].cpu().tolist())
+            top2 = set(p2.topk(k)[1].cpu().tolist())
             jaccard = len(top1 & top2) / len(top1 | top2) if (top1 | top2) else 0
 
-            results[key] = {
+            results['per_routing_type'][key] = {
                 'cosine': cosine,
                 'jaccard': jaccard,
             }
 
+            # Entropy-based weighting
+            if use_entropy_weighting:
+                key_entropies = [v for k, v in {**ent1, **ent2}.items() if key in k]
+                avg_ent = np.mean(key_entropies) if key_entropies else 50.0
+                weight = min(avg_ent / 100.0, 1.0)
+            else:
+                weight = 1.0
+
+            all_cosines.append(cosine)
+            all_jaccards.append(jaccard)
+            all_weights.append(weight)
+
+        # Weighted average
+        if all_cosines:
+            weights_sum = sum(all_weights)
+            if weights_sum > 0:
+                results['overall']['cosine_weighted'] = sum(c * w for c, w in zip(all_cosines, all_weights)) / weights_sum
+                results['overall']['jaccard_weighted'] = sum(j * w for j, w in zip(all_jaccards, all_weights)) / weights_sum
+            results['overall']['cosine_mean'] = np.mean(all_cosines)
+            results['overall']['jaccard_mean'] = np.mean(all_jaccards)
+
+        # Per-layer similarity
+        for layer_key in path1.keys():
+            if layer_key in ['aggregated', 'entropy'] or layer_key not in path2:
+                continue
+
+            layer_cosines = []
+            for rkey in path1[layer_key].keys():
+                if rkey not in path2[layer_key]:
+                    continue
+
+                p1 = path1[layer_key][rkey].mean(dim=0)
+                p2 = path2[layer_key][rkey].mean(dim=0)
+
+                if p1.device != p2.device:
+                    p2 = p2.to(p1.device)
+
+                p1_norm = F.normalize(p1.unsqueeze(0), dim=-1)
+                p2_norm = F.normalize(p2.unsqueeze(0), dim=-1)
+                cosine = float((p1_norm * p2_norm).sum())
+                layer_cosines.append(cosine)
+
+            if layer_cosines:
+                results['per_layer'][layer_key] = {
+                    'cosine_mean': np.mean(layer_cosines),
+                }
+
         return results
+
+    # ============================================================
+    # Semantic Path Similarity Analysis - BATCH OPTIMIZED
+    # ============================================================
 
     def analyze_semantic_path_similarity(self, sentence_pairs: List[Tuple[str, str, str]]) -> Dict:
         """
         Compare routing similarity for semantically similar vs different sentence pairs.
-
-        This validates the core claim: similar meaning -> similar routing.
+        Uses batch processing for efficiency.
 
         Args:
-            sentence_pairs: List of (sent1, sent2, label) where label is 'similar' or 'different'
+            sentence_pairs: List of (sent1, sent2, label)
 
         Returns:
-            Statistics for similar vs different pairs with interpretation
+            Statistics for similar vs different pairs
         """
+        # Collect all unique sentences
+        all_sentences = []
+        sent_to_idx = {}
+        for sent1, sent2, _ in sentence_pairs:
+            for s in [sent1, sent2]:
+                if s not in sent_to_idx:
+                    sent_to_idx[s] = len(all_sentences)
+                    all_sentences.append(s)
+
+        # Batch process all sentences at once
+        print(f"  Processing {len(all_sentences)} unique sentences in batch...")
+        all_paths = self.get_routing_paths_batch(all_sentences, keep_on_gpu=True)
+
         similar_sims = []
         different_sims = []
+        layer_stats = defaultdict(lambda: {'similar': [], 'different': []})
+        routing_type_stats = defaultdict(lambda: {'similar': [], 'different': []})
 
-        for sent1, sent2, label in sentence_pairs:
-            path1 = self.get_routing_path(sent1)
-            path2 = self.get_routing_path(sent2)
+        for sent1, sent2, label in tqdm(sentence_pairs, desc='Computing similarities'):
+            path1 = all_paths[sent_to_idx[sent1]]
+            path2 = all_paths[sent_to_idx[sent2]]
 
             if not path1 or not path2:
                 continue
 
-            sim = self.compute_path_similarity(path1, path2)
+            sim = self.compute_path_similarity_gpu(path1, path2)
 
-            # Average across all routing keys
-            avg_cosine = np.mean([v['cosine'] for v in sim.values()])
-            avg_jaccard = np.mean([v['jaccard'] for v in sim.values()])
+            overall = sim.get('overall', {})
+            cos_w = overall.get('cosine_weighted', overall.get('cosine_mean', 0))
+            jac_w = overall.get('jaccard_weighted', overall.get('jaccard_mean', 0))
+
+            entry = {'cosine': cos_w, 'jaccard': jac_w}
 
             if label == 'similar':
-                similar_sims.append({'cosine': avg_cosine, 'jaccard': avg_jaccard})
+                similar_sims.append(entry)
             else:
-                different_sims.append({'cosine': avg_cosine, 'jaccard': avg_jaccard})
+                different_sims.append(entry)
+
+            for layer_key, layer_data in sim.get('per_layer', {}).items():
+                cos = layer_data.get('cosine_mean', 0)
+                if label == 'similar':
+                    layer_stats[layer_key]['similar'].append(cos)
+                else:
+                    layer_stats[layer_key]['different'].append(cos)
+
+            for rtype, rdata in sim.get('per_routing_type', {}).items():
+                cos = rdata.get('cosine', 0)
+                if label == 'similar':
+                    routing_type_stats[rtype]['similar'].append(cos)
+                else:
+                    routing_type_stats[rtype]['different'].append(cos)
 
         results = {
             'similar_pairs': {
@@ -188,6 +497,43 @@ class SemanticAnalyzer:
             },
         }
 
+        # Layer-wise analysis
+        results['per_layer'] = {}
+        for layer_key, stats in layer_stats.items():
+            sim_cos = np.mean(stats['similar']) if stats['similar'] else 0
+            diff_cos = np.mean(stats['different']) if stats['different'] else 0
+            results['per_layer'][layer_key] = {
+                'similar_cosine': sim_cos,
+                'different_cosine': diff_cos,
+                'gap': sim_cos - diff_cos,
+            }
+
+        # Routing-type analysis
+        results['per_routing_type'] = {}
+        attention_gaps = []
+        knowledge_gaps = []
+
+        for rtype, stats in routing_type_stats.items():
+            sim_cos = np.mean(stats['similar']) if stats['similar'] else 0
+            diff_cos = np.mean(stats['different']) if stats['different'] else 0
+            gap = sim_cos - diff_cos
+
+            results['per_routing_type'][rtype] = {
+                'similar_cosine': sim_cos,
+                'different_cosine': diff_cos,
+                'gap': gap,
+            }
+
+            if rtype in ['fknow', 'rknow']:
+                knowledge_gaps.append(gap)
+            else:
+                attention_gaps.append(gap)
+
+        results['routing_type_summary'] = {
+            'attention_avg_gap': np.mean(attention_gaps) if attention_gaps else 0,
+            'knowledge_avg_gap': np.mean(knowledge_gaps) if knowledge_gaps else 0,
+        }
+
         # Interpretation
         if similar_sims and different_sims:
             sim_cos = results['similar_pairs']['cosine_mean']
@@ -196,6 +542,8 @@ class SemanticAnalyzer:
 
             if gap > 0.1:
                 verdict = 'GOOD: Semantic similarity reflected in routing'
+            elif gap > 0.05:
+                verdict = 'MODERATE: Some semantic correlation in routing'
             elif gap > 0:
                 verdict = 'WEAK: Routing has slight semantic correlation'
             else:
@@ -203,7 +551,11 @@ class SemanticAnalyzer:
 
             results['interpretation'] = {
                 'similarity_gap': gap,
-                'verdict': verdict
+                'verdict': verdict,
+                'best_layer': max(results['per_layer'].items(),
+                                   key=lambda x: x[1]['gap'])[0] if results['per_layer'] else None,
+                'best_routing_type': max(results['per_routing_type'].items(),
+                                          key=lambda x: x[1]['gap'])[0] if results['per_routing_type'] else None,
             }
 
         return results
@@ -232,24 +584,26 @@ class SemanticAnalyzer:
             ("She cooked dinner for the family.", "Quantum entanglement is mysterious.", "different"),
         ]
 
+    # ============================================================
+    # POS Routing Analysis - BATCH OPTIMIZED with nlp.pipe()
+    # ============================================================
+
     def analyze_pos_routing(self, dataloader, max_batches: int = 50) -> Dict:
         """
-        Analyze routing patterns by part-of-speech.
-
-        Uses spaCy for POS tagging to see if different POS categories
-        activate different neurons.
+        Analyze routing patterns by part-of-speech across ALL layers.
+        Uses spaCy pipe for batch processing.
+        Optimized with batch CPU transfers.
 
         Args:
             dataloader: DataLoader for input data
             max_batches: Maximum batches to process
 
         Returns:
-            POS-wise routing statistics
+            POS-wise routing statistics with layer breakdown
         """
         if self.nlp is None:
             return {'error': 'spaCy not available. Install with: pip install spacy && python -m spacy download en_core_web_sm'}
 
-        # POS -> routing weights
         pos_weights = defaultdict(list)
         pos_counts = defaultdict(int)
 
@@ -260,6 +614,7 @@ class SemanticAnalyzer:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
+                batch_size, seq_len = input_ids.shape
 
                 outputs = self.model(input_ids, return_routing_info=True)
                 routing_infos = get_routing_from_outputs(outputs)
@@ -267,48 +622,73 @@ class SemanticAnalyzer:
                 if routing_infos is None:
                     continue
 
-                attn = routing_infos[0].get('attention', {})
+                # Move input_ids to CPU once for all processing
+                input_ids_cpu = input_ids.cpu()
 
-                # Process each sequence
-                for b in range(input_ids.shape[0]):
-                    tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b].cpu().tolist())
-                    text = self.tokenizer.decode(input_ids[b], skip_special_tokens=True)
+                # Decode all texts in batch
+                texts = [self.tokenizer.decode(input_ids_cpu[b], skip_special_tokens=True) for b in range(batch_size)]
 
-                    try:
-                        doc = self.nlp(text)
+                # Batch POS tagging with nlp.pipe()
+                docs = list(self.nlp.pipe(texts, batch_size=batch_size))
+
+                # Pre-convert all tokens for the batch
+                batch_tokens = [
+                    self.tokenizer.convert_ids_to_tokens(input_ids_cpu[b].tolist())
+                    for b in range(batch_size)
+                ]
+
+                # Process each layer
+                for layer_idx, layer_info in enumerate(routing_infos):
+                    attn = layer_info.get('attention', {})
+                    knowledge = layer_info.get('knowledge', {})
+
+                    # Combine routing and move to CPU once per layer
+                    all_routing_cpu = {}
+                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                        w = attn.get(weight_key)
+                        if w is not None:
+                            all_routing_cpu[f'L{layer_idx}/{key}'] = w.cpu()
+
+                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                        w = knowledge.get(weight_key)
+                        if w is not None:
+                            all_routing_cpu[f'L{layer_idx}/{key}'] = w.cpu()
+
+                    # Process each sequence
+                    for b in range(batch_size):
+                        tokens = batch_tokens[b]
+                        doc = docs[b]
                         spacy_tokens = [(t.text.lower(), t.pos_) for t in doc]
-                    except Exception:
-                        continue
 
-                    # Match tokens to POS
-                    spacy_idx = 0
-                    for s, token in enumerate(tokens):
-                        if token.startswith('[') or token.startswith('##'):
-                            continue
+                        spacy_idx = 0
+                        for s, token in enumerate(tokens):
+                            if token.startswith('[') or token.startswith('##'):
+                                continue
 
-                        token_clean = token.replace('##', '').lower()
-                        while spacy_idx < len(spacy_tokens):
-                            sp_token, sp_pos = spacy_tokens[spacy_idx]
-                            if token_clean in sp_token or sp_token in token_clean:
-                                # Match found - collect routing weights
-                                for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                                    w = attn.get(weight_key)
-                                    if w is not None and w.dim() >= 2:
-                                        if w.dim() == 3 and s < w.shape[1]:
-                                            pos_weights[f"{key}_{sp_pos}"].append(w[b, s].cpu())
-                                        elif w.dim() == 2:
-                                            pos_weights[f"{key}_{sp_pos}"].append(w[b].cpu())
+                            token_clean = token.replace('##', '').lower()
+                            while spacy_idx < len(spacy_tokens):
+                                sp_token, sp_pos = spacy_tokens[spacy_idx]
+                                if token_clean in sp_token or sp_token in token_clean:
+                                    for routing_key, w in all_routing_cpu.items():
+                                        if w is not None and w.dim() >= 2:
+                                            if w.dim() == 3 and s < w.shape[1]:
+                                                pos_weights[f"{routing_key}/{sp_pos}"].append(w[b, s])
+                                            elif w.dim() == 2:
+                                                pos_weights[f"{routing_key}/{sp_pos}"].append(w[b])
 
-                                pos_counts[sp_pos] += 1
+                                    pos_counts[sp_pos] += 1
+                                    spacy_idx += 1
+                                    break
                                 spacy_idx += 1
-                                break
-                            spacy_idx += 1
 
         # Analyze results
         results = {
             'pos_counts': dict(pos_counts),
             'routing_by_pos': {},
+            'layer_summary': {},
         }
+
+        layer_pos_patterns = defaultdict(lambda: defaultdict(list))
 
         for key_pos, weights in pos_weights.items():
             if len(weights) < 10:
@@ -317,33 +697,67 @@ class SemanticAnalyzer:
             stacked = torch.stack(weights)
             mean_w = stacked.mean(dim=0)
 
-            # Top activated neurons
             top_k = min(5, mean_w.shape[0])
             top_neurons = mean_w.topk(top_k)
+
+            entropy = self.compute_routing_entropy(stacked)
 
             results['routing_by_pos'][key_pos] = {
                 'count': len(weights),
                 'mean_activation': float(mean_w.mean()),
+                'entropy': entropy,
                 'top_neurons': [
                     (int(idx), float(val))
                     for idx, val in zip(top_neurons.indices.tolist(), top_neurons.values.tolist())
                 ],
             }
 
+            parts = key_pos.split('/')
+            if len(parts) >= 2:
+                layer = parts[0]
+                pos = parts[-1]
+                layer_pos_patterns[layer][pos].append(entropy)
+
+        for layer, pos_ents in layer_pos_patterns.items():
+            results['layer_summary'][layer] = {
+                pos: np.mean(ents) for pos, ents in pos_ents.items()
+            }
+
         return results
+
+    # ============================================================
+    # Context-Dependent Routing - BATCH OPTIMIZED
+    # ============================================================
 
     def analyze_context_dependent_routing(self, word_contexts: Dict[str, List[str]]) -> Dict:
         """
         Analyze if the same word has different routing in different contexts.
-
-        This validates context-dependent dynamic routing.
+        Uses batch processing.
 
         Args:
-            word_contexts: Dictionary mapping word to list of sentences containing it
+            word_contexts: Dictionary mapping word to list of sentences
 
         Returns:
             Per-word routing variance statistics
         """
+        # Collect all sentences
+        all_sentences = []
+        sent_to_word = {}  # sentence -> (word, position in word's list)
+
+        for word, sentences in word_contexts.items():
+            for i, sent in enumerate(sentences):
+                if sent not in sent_to_word:
+                    sent_to_word[sent] = []
+                    all_sentences.append(sent)
+                sent_to_word[sent].append((word, i))
+
+        # Batch process
+        if all_sentences:
+            all_paths = self.get_routing_paths_batch(all_sentences, keep_on_gpu=False)
+            sent_to_path = dict(zip(all_sentences, all_paths))
+        else:
+            sent_to_path = {}
+
         results = {}
 
         for word, sentences in word_contexts.items():
@@ -353,38 +767,47 @@ class SemanticAnalyzer:
             word_routings = []
 
             for sent in sentences:
-                # Find word position in tokenized sequence
                 tokens = self.tokenizer.tokenize(sent.lower())
                 word_lower = word.lower()
 
                 word_positions = []
                 for i, tok in enumerate(tokens):
                     if word_lower in tok or tok in word_lower:
-                        word_positions.append(i + 1)  # +1 for [CLS]
+                        word_positions.append(i + 1)
 
                 if not word_positions:
                     continue
 
-                # Get routing path
-                path = self.get_routing_path(sent)
+                path = sent_to_path.get(sent, {})
                 if not path:
                     continue
 
-                # Extract routing at word position
                 word_routing = {}
-                for key, weights in path.items():
-                    if weights.dim() >= 1:
-                        pos = word_positions[0]
-                        if pos < weights.shape[0]:
-                            word_routing[key] = weights[pos]
+                for layer_key, layer_routing in path.items():
+                    if layer_key in ['aggregated', 'entropy']:
+                        continue
 
-                if word_routing:
-                    word_routings.append(word_routing)
+                    for rkey, weights in layer_routing.items():
+                        if weights.dim() >= 1:
+                            pos = word_positions[0]
+                            if pos < weights.shape[0]:
+                                full_key = f'{layer_key}/{rkey}'
+                                if full_key not in word_routing:
+                                    word_routing[full_key] = []
+                                word_routing[full_key].append(weights[pos])
+
+                collapsed = {}
+                for full_key, weight_list in word_routing.items():
+                    if weight_list:
+                        stacked = torch.stack(weight_list)
+                        collapsed[full_key] = stacked.mean(dim=0)
+
+                if collapsed:
+                    word_routings.append(collapsed)
 
             if len(word_routings) < 2:
                 continue
 
-            # Compute routing variance across contexts
             variances = {}
             for key in word_routings[0].keys():
                 key_routings = [wr[key] for wr in word_routings if key in wr]
@@ -393,15 +816,21 @@ class SemanticAnalyzer:
                     variance = stacked.var(dim=0).mean().item()
                     variances[key] = variance
 
+            attn_vars = [v for k, v in variances.items() if 'fknow' not in k and 'rknow' not in k]
+            know_vars = [v for k, v in variances.items() if 'fknow' in k or 'rknow' in k]
+
             results[word] = {
                 'n_contexts': len(word_routings),
                 'routing_variance': variances,
                 'avg_variance': np.mean(list(variances.values())) if variances else 0,
+                'attention_variance': np.mean(attn_vars) if attn_vars else 0,
+                'knowledge_variance': np.mean(know_vars) if know_vars else 0,
             }
 
-        # Summary interpretation
         if results:
             avg_var = np.mean([r['avg_variance'] for r in results.values()])
+            attn_var = np.mean([r['attention_variance'] for r in results.values()])
+            know_var = np.mean([r['knowledge_variance'] for r in results.values()])
 
             if avg_var > 0.1:
                 interpretation = 'HIGH: Strong context-dependent routing'
@@ -412,7 +841,10 @@ class SemanticAnalyzer:
 
             results['summary'] = {
                 'overall_context_variance': avg_var,
-                'interpretation': interpretation
+                'attention_context_variance': attn_var,
+                'knowledge_context_variance': know_var,
+                'interpretation': interpretation,
+                'more_context_sensitive': 'knowledge' if know_var > attn_var else 'attention',
             }
 
         return results
@@ -446,12 +878,16 @@ class SemanticAnalyzer:
             ],
         }
 
+    # ============================================================
+    # Neuron-Token Heatmap
+    # ============================================================
+
     def analyze_neuron_token_heatmap(self, dataloader, max_batches: int = 30,
                                       top_k_neurons: int = 20) -> Dict:
         """
         Generate neuron-token activation heatmap data.
 
-        Shows which neurons activate for which token types.
+        Optimized with GPU scatter_add for vectorized aggregation.
 
         Args:
             dataloader: DataLoader for input data
@@ -461,7 +897,11 @@ class SemanticAnalyzer:
         Returns:
             Per-neuron top token activations
         """
-        neuron_tokens = defaultdict(lambda: defaultdict(float))
+        vocab_size = self.tokenizer.vocab_size
+
+        # {routing_key: tensor[vocab_size, N]}
+        token_neuron_sums = {}
+        neuron_sizes = {}  # Track N for each routing_key
 
         self.model.eval()
         with torch.no_grad():
@@ -470,6 +910,7 @@ class SemanticAnalyzer:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
+                B, S = input_ids.shape
 
                 outputs = self.model(input_ids, return_routing_info=True)
                 routing_infos = get_routing_from_outputs(outputs)
@@ -477,52 +918,115 @@ class SemanticAnalyzer:
                 if routing_infos is None:
                     continue
 
-                attn = routing_infos[0].get('attention', {})
+                for layer_idx, layer_info in enumerate(routing_infos):
+                    attn = layer_info.get('attention', {})
+                    knowledge = layer_info.get('knowledge', {})
 
-                # Use F-QK weights as representative
-                weights = attn.get('fqk_weights_Q')
-                if weights is None or weights.dim() != 3:
+                    routing_weights = {}
+
+                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                        w = attn.get(weight_key)
+                        if w is not None:
+                            if w.dim() == 3:
+                                routing_weights[f'L{layer_idx}/{key}'] = w
+                            elif w.dim() == 2:
+                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, S, -1)
+
+                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                        w = knowledge.get(weight_key)
+                        if w is not None:
+                            if w.dim() == 3:
+                                routing_weights[f'L{layer_idx}/{key}'] = w
+                            elif w.dim() == 2:
+                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, S, -1)
+
+                    # Vectorized aggregation using scatter_add
+                    for routing_key, weights in routing_weights.items():
+                        B, S, N = weights.shape
+
+                        # Initialize accumulator if needed
+                        if routing_key not in token_neuron_sums:
+                            token_neuron_sums[routing_key] = torch.zeros(
+                                vocab_size, N, device=self.device, dtype=torch.float32
+                            )
+                            neuron_sizes[routing_key] = N
+
+                        # Flatten: [B, S] -> [B*S] (use reshape for non-contiguous tensors)
+                        flat_token_ids = input_ids.reshape(-1)  # [B*S]
+                        flat_weights = weights.reshape(-1, N)    # [B*S, N]
+
+                        # Mask special tokens ([CLS], [SEP], [PAD], etc.)
+                        # Token IDs 100-103 are typically special in BERT
+                        valid_mask = (flat_token_ids >= 104)  # Skip [UNK], [CLS], [SEP], [MASK], [PAD]
+
+                        if valid_mask.any():
+                            valid_ids = flat_token_ids[valid_mask]      # [valid_count]
+                            valid_weights = flat_weights[valid_mask]    # [valid_count, N]
+
+                            # scatter_add: accumulate weights by token_id
+                            # token_neuron_sums[routing_key][token_id, :] += valid_weights
+                            token_neuron_sums[routing_key].scatter_add_(
+                                0,
+                                valid_ids.unsqueeze(1).expand(-1, N),
+                                valid_weights
+                            )
+
+        # Convert to results format
+        results = {}
+        for routing_key, sums in token_neuron_sums.items():
+            # Move to CPU for final processing
+            sums_cpu = sums.cpu()
+            N = neuron_sizes[routing_key]
+
+            # Find top neurons by total activation
+            neuron_totals = sums_cpu.sum(dim=0)  # [N]
+            top_neuron_indices = neuron_totals.topk(min(top_k_neurons, N)).indices.tolist()
+
+            neuron_results = {}
+            for neuron_id in top_neuron_indices:
+                # Get top tokens for this neuron
+                neuron_activations = sums_cpu[:, neuron_id]  # [vocab_size]
+
+                # Find non-zero tokens
+                nonzero_mask = neuron_activations > 0
+                if nonzero_mask.sum() == 0:
                     continue
 
-                B, S, N = weights.shape
+                nonzero_indices = nonzero_mask.nonzero().squeeze(-1)
+                nonzero_values = neuron_activations[nonzero_mask]
 
-                for b in range(B):
-                    tokens = self.tokenizer.convert_ids_to_tokens(input_ids[b].cpu().tolist())
-                    for s, token in enumerate(tokens):
-                        if token.startswith('['):
-                            continue
+                # Get top 10 tokens
+                top_k = min(10, len(nonzero_values))
+                top_values, top_local_idx = nonzero_values.topk(top_k)
+                top_token_ids = nonzero_indices[top_local_idx]
 
-                        # Active neurons at this position
-                        w = weights[b, s]
-                        active_neurons = (w > 0).nonzero().squeeze(-1)
+                # Convert to token strings
+                top_tokens = {}
+                for tid, val in zip(top_token_ids.tolist(), top_values.tolist()):
+                    token = self.tokenizer.convert_ids_to_tokens([tid])[0]
+                    top_tokens[token] = val
 
-                        for neuron_id in active_neurons.tolist():
-                            if isinstance(neuron_id, int):
-                                neuron_tokens[neuron_id][token] += w[neuron_id].item()
+                neuron_results[neuron_id] = {
+                    'total_activation': float(neuron_totals[neuron_id]),
+                    'top_tokens': top_tokens,
+                }
 
-        # Select top-k neurons by total activation
-        neuron_total_activation = {n: sum(tokens.values()) for n, tokens in neuron_tokens.items()}
-        top_neurons = sorted(neuron_total_activation.keys(),
-                            key=lambda x: -neuron_total_activation[x])[:top_k_neurons]
-
-        results = {}
-        for neuron_id in top_neurons:
-            token_counts = neuron_tokens[neuron_id]
-            top_tokens = sorted(token_counts.items(), key=lambda x: -x[1])[:10]
-            results[f'neuron_{neuron_id}'] = {
-                'total_activation': neuron_total_activation[neuron_id],
-                'top_tokens': top_tokens,
-            }
+            results[routing_key] = neuron_results
 
         return results
 
-    def run_all(self, dataloader=None, output_dir: str = './semantic_analysis') -> Dict:
+    # ============================================================
+    # Run All
+    # ============================================================
+
+    def run_all(self, dataloader=None, output_dir: str = './semantic_analysis', max_batches: int = 50) -> Dict:
         """
         Run all semantic analyses.
 
         Args:
-            dataloader: DataLoader for input data (optional, required for some analyses)
+            dataloader: DataLoader for input data (optional)
             output_dir: Directory for outputs
+            max_batches: Maximum batches for POS and heatmap analysis
 
         Returns:
             Combined results dictionary
@@ -531,26 +1035,29 @@ class SemanticAnalyzer:
 
         results = {}
 
-        # 1. Semantic Path Similarity
-        print("\n[1/4] Analyzing Semantic Path Similarity...")
+        # 1. Semantic Path Similarity (batch optimized)
+        print("\n[1/4] Analyzing Semantic Path Similarity (batch)...")
         pairs = self.get_default_sentence_pairs()
         results['path_similarity'] = self.analyze_semantic_path_similarity(pairs)
 
-        # 2. Context-dependent Routing
-        print("\n[2/4] Analyzing Context-dependent Routing...")
+        # 2. Context-dependent Routing (batch optimized)
+        print("\n[2/4] Analyzing Context-dependent Routing (batch)...")
         word_contexts = self.get_default_word_contexts()
         results['context_routing'] = self.analyze_context_dependent_routing(word_contexts)
 
-        # 3. POS Routing (requires dataloader)
+        # 3. POS Routing (requires dataloader, uses nlp.pipe)
         if dataloader is not None:
-            print("\n[3/4] Analyzing POS Routing Patterns...")
-            results['pos_routing'] = self.analyze_pos_routing(dataloader)
+            print(f"\n[3/4] Analyzing POS Routing Patterns (max_batches={max_batches})...")
+            results['pos_routing'] = self.analyze_pos_routing(dataloader, max_batches=max_batches)
 
-            print("\n[4/4] Generating Neuron-Token Heatmap...")
-            results['neuron_heatmap'] = self.analyze_neuron_token_heatmap(dataloader)
+            print(f"\n[4/4] Generating Neuron-Token Heatmap (max_batches={max_batches})...")
+            results['neuron_heatmap'] = self.analyze_neuron_token_heatmap(dataloader, max_batches=max_batches)
         else:
             print("\n[3/4] Skipping POS analysis (no dataloader)")
             print("\n[4/4] Skipping heatmap (no dataloader)")
+
+        # Clear cache to free memory
+        self.clear_cache()
 
         # Save results
         import json

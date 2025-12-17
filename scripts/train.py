@@ -618,12 +618,13 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
-    # v17.1: Q/K Shared Pool + Knowledge Feature-Restore Separation
-    # (has both usage_ema_feature_qk AND usage_ema_feature_know)
-    if hasattr(router, 'usage_ema_feature_qk') and hasattr(router, 'usage_ema_feature_know'):
+    # v17.2: Feature QK Unified + Restore Q/K Separate
+    # (has usage_ema_feature_qk AND usage_ema_restore_q AND usage_ema_feature_know)
+    if hasattr(router, 'usage_ema_feature_qk') and hasattr(router, 'usage_ema_restore_q') and hasattr(router, 'usage_ema_feature_know'):
         ema_fqk = router.usage_ema_feature_qk
         ema_fv = router.usage_ema_feature_v
-        ema_rqk = router.usage_ema_restore_qk
+        ema_rq = router.usage_ema_restore_q
+        ema_rk = router.usage_ema_restore_k
         ema_rv = router.usage_ema_restore_v
         ema_FK = router.usage_ema_feature_know
         ema_RK = router.usage_ema_restore_know
@@ -631,23 +632,25 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         # Active neuron counts
         active_fqk = (ema_fqk > 0.01).sum().item()
         active_fv = (ema_fv > 0.01).sum().item()
-        active_rqk = (ema_rqk > 0.01).sum().item()
+        active_rq = (ema_rq > 0.01).sum().item()
+        active_rk = (ema_rk > 0.01).sum().item()
         active_rv = (ema_rv > 0.01).sum().item()
         active_FK = (ema_FK > 0.01).sum().item()
         active_RK = (ema_RK > 0.01).sum().item()
         n_fqk, n_fv = ema_fqk.numel(), ema_fv.numel()
-        n_rqk, n_rv = ema_rqk.numel(), ema_rv.numel()
+        n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
         n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
 
         # Gini coefficients
         gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
-        gini_rqk, gini_rv = _gini(ema_rqk), _gini(ema_rv)
+        gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
         gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
 
         # Dead neuron ratios
         dead_fqk = (ema_fqk < DEAD_NEURON_THRESHOLD).float().mean().item()
         dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
-        dead_rqk = (ema_rqk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
         dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
         dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
         dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
@@ -655,13 +658,63 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         # Excitability
         exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
 
-        # v17.1 format (similar to v17 but with shared Q/K)
-        lines.append(f"         [v17.1] Excitability w={exc_w:.4f}")
+        # v17.2 format
+        lines.append(f"         [v17.2] Excitability w={exc_w:.4f}")
         lines.append(f"             Feature_QK: {int(active_fqk)}/{n_fqk} | Feature_V: {int(active_fv)}/{n_fv}")
-        lines.append(f"             Restore_QK: {int(active_rqk)}/{n_rqk} | Restore_V: {int(active_rv)}/{n_rv}")
+        lines.append(f"             Restore_Q: {int(active_rq)}/{n_rq} | Restore_K: {int(active_rk)}/{n_rk} | Restore_V: {int(active_rv)}/{n_rv}")
         lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} | Restore_Know: {int(active_RK)}/{n_RK}")
-        lines.append(f"             Dead: FQK={dead_fqk:.1%} FV={dead_fv:.1%} RQK={dead_rqk:.1%} RV={dead_rv:.1%} FK={dead_FK:.1%} RK={dead_RK:.1%}")
-        lines.append(f"             Gini: FQK={gini_fqk:.2f} FV={gini_fv:.2f} RQK={gini_rqk:.2f} RV={gini_rv:.2f} FK={gini_FK:.2f} RK={gini_RK:.2f}")
+        lines.append(f"             Dead: FQK={dead_fqk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FK={dead_FK:.1%} RK={dead_RK:.1%}")
+        lines.append(f"             Gini: FQK={gini_fqk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FK={gini_FK:.2f} RK={gini_RK:.2f}")
+
+    # v17.1: Q/K Separate Excitability (has usage_ema_feature_q, not usage_ema_feature_qk)
+    elif hasattr(router, 'usage_ema_feature_q') and hasattr(router, 'usage_ema_feature_know'):
+        ema_fq = router.usage_ema_feature_q
+        ema_fk = router.usage_ema_feature_k
+        ema_fv = router.usage_ema_feature_v
+        ema_rq = router.usage_ema_restore_q
+        ema_rk = router.usage_ema_restore_k
+        ema_rv = router.usage_ema_restore_v
+        ema_FK = router.usage_ema_feature_know
+        ema_RK = router.usage_ema_restore_know
+
+        # Active neuron counts
+        active_fq = (ema_fq > 0.01).sum().item()
+        active_fk = (ema_fk > 0.01).sum().item()
+        active_fv = (ema_fv > 0.01).sum().item()
+        active_rq = (ema_rq > 0.01).sum().item()
+        active_rk = (ema_rk > 0.01).sum().item()
+        active_rv = (ema_rv > 0.01).sum().item()
+        active_FK = (ema_FK > 0.01).sum().item()
+        active_RK = (ema_RK > 0.01).sum().item()
+        n_fq, n_fk, n_fv = ema_fq.numel(), ema_fk.numel(), ema_fv.numel()
+        n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
+        n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+
+        # Gini coefficients
+        gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
+        gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
+        gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+
+        # Dead neuron ratios
+        dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
+
+        # Excitability
+        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
+
+        # v17.1 format (Q/K separate)
+        lines.append(f"         [v17.1] Excitability w={exc_w:.4f}")
+        lines.append(f"             Feature_Q: {int(active_fq)}/{n_fq} | Feature_K: {int(active_fk)}/{n_fk} | Feature_V: {int(active_fv)}/{n_fv}")
+        lines.append(f"             Restore_Q: {int(active_rq)}/{n_rq} | Restore_K: {int(active_rk)}/{n_rk} | Restore_V: {int(active_rv)}/{n_rv}")
+        lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} | Restore_Know: {int(active_RK)}/{n_RK}")
+        lines.append(f"             Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
+        lines.append(f"             Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
 
     # v16.4: Shared Pool + Separate Routing (no Knowledge F/R separation)
     elif hasattr(router, 'usage_ema_feature_qk'):

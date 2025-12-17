@@ -1,6 +1,11 @@
 """
 DAWN Models Module
 
+v17.2: Feature QK Unified + Restore Q/K Separate (latest)
+- Feature stage: Q/K share single routing (fixes K entropy collapse)
+- Restore stage: Q/K have separate routing
+- Knowledge: Feature-Restore pattern
+
 v17.1: Q/K Shared Pool + Knowledge Feature-Restore
 - Attention: Q/K shared pool (Feature_QK, Feature_V, Restore_QK, Restore_V)
 - Knowledge: Feature-Restore pattern (Feature_Know, Restore_Know)
@@ -9,11 +14,14 @@ v17.1: Q/K Shared Pool + Knowledge Feature-Restore
 baseline: Vanilla Transformer for fair comparison
 """
 
+# v17.2 - Feature QK Unified + Restore Q/K Separate
+from .model_v17_2 import DAWN as DAWN_v17_2
+
 # v17.1 - Q/K Shared Pool + Knowledge Feature-Restore
 from .model_v17_1 import DAWN as DAWN_v17_1
 
-# Default DAWN is v17.1
-DAWN = DAWN_v17_1
+# Default DAWN is v17.2
+DAWN = DAWN_v17_2
 
 # Baseline for comparison
 from .baseline_transformer import VanillaTransformer
@@ -37,6 +45,7 @@ from .version_registry import (
 __all__ = [
     # Models
     'DAWN',
+    'DAWN_v17_2',
     'DAWN_v17_1',
     'VanillaTransformer',
     # Version utilities
@@ -55,14 +64,14 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "17.1"
+__version__ = "17.2"
 
 
 def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "17.1" or "baseline"
+        version: "17.2", "17.1", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -73,8 +82,10 @@ def create_model_by_version(version, config):
 
     version = normalize_version(version)
 
-    if version == "17.1":
+    if version == "17.2":
+        return DAWN_v17_2(**config)
+    elif version == "17.1":
         return DAWN_v17_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 17.1, baseline")
+                        f"Supported versions: 17.2, 17.1, baseline")
