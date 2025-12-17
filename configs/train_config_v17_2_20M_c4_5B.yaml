@@ -61,7 +61,7 @@ training:
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.001
+  load_balance_weight: 0.0001
   entropy_weight: 0.0
   process_norm_weight: 0.0
 
