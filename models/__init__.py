@@ -1,27 +1,27 @@
 """
 DAWN Models Module
 
-v17.2: Feature QK Unified + Restore Q/K Separate (latest)
-- Feature stage: Q/K share single routing (fixes K entropy collapse)
+v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
+- Attention: Q/K separate pools (Feature_Q/K/V, Restore_Q/K/V)
+- Knowledge: Feature-Restore pattern (Feature_Know, Restore_Know)
+- 8 neuron pools for fine-grained routing
+
+v17.2: Feature QK Unified + Restore Q/K Separate
+- Feature stage: Q/K share single routing
 - Restore stage: Q/K have separate routing
 - Knowledge: Feature-Restore pattern
-
-v17.1: Q/K Shared Pool + Knowledge Feature-Restore
-- Attention: Q/K shared pool (Feature_QK, Feature_V, Restore_QK, Restore_V)
-- Knowledge: Feature-Restore pattern (Feature_Know, Restore_Know)
-- 6 neuron pools total for efficient routing
 
 baseline: Vanilla Transformer for fair comparison
 """
 
+# v17.1 - Q/K Separate Pool + Knowledge Feature-Restore (default)
+from .model_v17_1 import DAWN as DAWN_v17_1
+
 # v17.2 - Feature QK Unified + Restore Q/K Separate
 from .model_v17_2 import DAWN as DAWN_v17_2
 
-# v17.1 - Q/K Shared Pool + Knowledge Feature-Restore
-from .model_v17_1 import DAWN as DAWN_v17_1
-
-# Default DAWN is v17.2
-DAWN = DAWN_v17_2
+# Default DAWN is v17.1
+DAWN = DAWN_v17_1
 
 # Baseline for comparison
 from .baseline_transformer import VanillaTransformer
@@ -64,7 +64,7 @@ __all__ = [
     'create_model_by_version',
 ]
 
-__version__ = "17.2"
+__version__ = "17.1"
 
 
 def create_model_by_version(version, config):

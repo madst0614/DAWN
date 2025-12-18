@@ -1706,7 +1706,7 @@ def main():
     # STEP 2: Print configuration summary (using updated args)
     # ============================================================
     print(f"\n{'='*60}")
-    model_version = getattr(args, 'model_version', '9.0')
+    model_version = getattr(args, 'model_version', '17.1')
     if model_version == 'baseline':
         print(f"Vanilla Transformer Baseline Training")
     else:
