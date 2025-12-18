@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""
+Checkpoint Comparison Analysis Script
+
+Compare multiple model checkpoints (Vanilla / DAWN) with:
+- Validation loss, perplexity, accuracy
+- Parameter count, FLOPs estimation
+- Model architecture info
+
+Usage:
+    python scripts/analyze_checkpoints.py \
+        --checkpoints path/to/ckpt1 path/to/ckpt2 ... \
+        --val_data path/to/val.pt \
+        --output results.csv
+
+Output:
+    - Table format (paper-ready)
+    - CSV file with detailed metrics
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import argparse
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+import csv
+import math
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+from models import create_model_by_version, normalize_version
+from utils.checkpoint import load_checkpoint_smart
+
+
+def count_parameters(model):
+    """Count total and trainable parameters"""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def estimate_flops(model, seq_len=512):
+    """
+    Estimate FLOPs for forward pass (per sequence).
+    Rough estimation based on model architecture.
+    """
+    d_model = getattr(model, 'd_model', 512)
+    n_layers = getattr(model, 'n_layers', 12)
+    vocab_size = getattr(model, 'vocab_size', 30000)
+
+    # Check if DAWN or Vanilla
+    if hasattr(model, 'shared_neurons'):
+        # DAWN model
+        rank = getattr(model, 'rank', 64)
+        top_k_qk = getattr(model, 'top_k_feature_qk', 20)
+        top_k_v = getattr(model, 'top_k_feature_v', 6)
+        knowledge_rank = getattr(model, 'knowledge_rank', 128)
+        top_k_know = getattr(model, 'top_k_feature_know', 4)
+
+        # Per layer FLOPs:
+        # Feature neurons: top_k * d_model * rank * seq_len (for Q, K, V)
+        # Restore neurons: top_k * rank * d_model * seq_len
+        # Attention: seq_len^2 * d_model
+        # Knowledge: top_k_know * d_model * knowledge_rank * seq_len * 2
+
+        attn_proj = 2 * (top_k_qk * 2 + top_k_v) * d_model * rank * seq_len
+        attn_scores = 2 * seq_len * seq_len * d_model
+        knowledge = 2 * 2 * top_k_know * d_model * knowledge_rank * seq_len
+
+        per_layer = attn_proj + attn_scores + knowledge
+    else:
+        # Vanilla transformer
+        d_ff = getattr(model, 'd_ff', 4 * d_model)
+
+        # QKV + O projections: 4 * d_model^2 * seq_len
+        # Attention scores: 2 * seq_len^2 * d_model
+        # FFN: 2 * d_model * d_ff * seq_len
+
+        per_layer = (
+            4 * d_model * d_model * seq_len +
+            2 * seq_len * seq_len * d_model +
+            2 * d_model * d_ff * seq_len
+        )
+
+    total_flops = n_layers * per_layer
+
+    # LM head
+    total_flops += seq_len * d_model * vocab_size
+
+    return total_flops
+
+
+def format_flops(flops):
+    """Format FLOPs"""
+    if flops >= 1e12:
+        return f"{flops/1e12:.2f}T"
+    elif flops >= 1e9:
+        return f"{flops/1e9:.2f}G"
+    elif flops >= 1e6:
+        return f"{flops/1e6:.2f}M"
+    return f"{flops:.0f}"
+
+
+def format_params(params):
+    """Format parameter count"""
+    if params >= 1e9:
+        return f"{params/1e9:.2f}B"
+    elif params >= 1e6:
+        return f"{params/1e6:.2f}M"
+    elif params >= 1e3:
+        return f"{params/1e3:.2f}K"
+    return f"{params}"
+
+
+def load_val_data(val_path, max_tokens=None):
+    """Load validation data from .pt file"""
+    print(f"Loading validation data: {val_path}")
+    data = torch.load(val_path)
+
+    if isinstance(data, dict):
+        tokens = data.get('input_ids', data.get('tokens', data.get('data', None)))
+    else:
+        tokens = data
+
+    if tokens is None:
+        raise ValueError(f"Could not find tokens in {val_path}")
+
+    # Flatten if needed
+    if tokens.dim() > 1:
+        tokens = tokens.view(-1)
+
+    if max_tokens and len(tokens) > max_tokens:
+        tokens = tokens[:max_tokens]
+
+    print(f"  Loaded {len(tokens):,} tokens")
+    return tokens
+
+
+def evaluate_model(model, val_tokens, batch_size=32, seq_len=512, device='cuda'):
+    """Run full validation"""
+    model.eval()
+    model.to(device)
+
+    total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
+
+    # Create sequences
+    n_tokens = len(val_tokens)
+    n_seqs = n_tokens // seq_len
+    if n_seqs == 0:
+        raise ValueError(f"Not enough tokens ({n_tokens}) for seq_len={seq_len}")
+
+    val_tokens = val_tokens[:n_seqs * seq_len].view(n_seqs, seq_len)
+    n_batches = (n_seqs + batch_size - 1) // batch_size
+
+    iterator = range(n_batches)
+    if HAS_TQDM:
+        iterator = tqdm(iterator, desc="Evaluating", leave=False)
+
+    with torch.no_grad():
+        for i in iterator:
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, n_seqs)
+            batch = val_tokens[start_idx:end_idx].to(device)
+
+            # Forward
+            output = model(batch)
+            if isinstance(output, tuple):
+                logits = output[0]
+            else:
+                logits = output
+
+            # Loss & accuracy
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = batch[:, 1:].contiguous()
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction='sum'
+            )
+
+            preds = shift_logits.argmax(dim=-1)
+            correct = (preds == shift_labels).sum().item()
+
+            total_loss += loss.item()
+            total_correct += correct
+            total_tokens += shift_labels.numel()
+
+    avg_loss = total_loss / total_tokens
+    accuracy = total_correct / total_tokens * 100
+    perplexity = math.exp(avg_loss) if avg_loss < 100 else float('inf')
+
+    return {
+        'loss': avg_loss,
+        'perplexity': perplexity,
+        'accuracy': accuracy,
+        'total_tokens': total_tokens
+    }
+
+
+def load_model_from_checkpoint(ckpt_path, device='cuda'):
+    """Load model from checkpoint"""
+    ckpt_path = Path(ckpt_path)
+
+    # Find checkpoint file
+    if ckpt_path.is_dir():
+        candidates = ['best_model.pt', 'checkpoint_best.pt', 'model.pt']
+        for c in candidates:
+            if (ckpt_path / c).exists():
+                ckpt_path = ckpt_path / c
+                break
+        else:
+            pt_files = list(ckpt_path.glob('*.pt'))
+            if pt_files:
+                ckpt_path = sorted(pt_files)[-1]
+            else:
+                raise FileNotFoundError(f"No checkpoint in {ckpt_path}")
+
+    print(f"  Loading: {ckpt_path.name}")
+
+    checkpoint = torch.load(ckpt_path, map_location=device)
+
+    # Get config
+    config = checkpoint.get('model_config', checkpoint.get('config', {}))
+    if not config:
+        raise ValueError(f"No model config in checkpoint")
+
+    # Create model
+    version = config.get('model_version', config.get('version', '17.1'))
+    version = normalize_version(version)
+
+    model = create_model_by_version(version, config)
+
+    # Load weights
+    state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
+
+    # Remove compiled prefix
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict, strict=False)
+    model.to(device)
+    model.eval()
+
+    return model, config, ckpt_path
+
+
+def get_model_info(model, ckpt_path, config):
+    """Extract model information"""
+    # Determine model type
+    if hasattr(model, 'shared_neurons'):
+        model_type = 'DAWN'
+        version = getattr(model, '__version__', config.get('model_version', 'N/A'))
+    else:
+        model_type = 'Vanilla'
+        version = 'N/A'
+
+    # Get name from path
+    name = ckpt_path.parent.name if ckpt_path.parent.name != 'checkpoints' else ckpt_path.stem
+
+    return {
+        'name': name,
+        'type': model_type,
+        'version': version,
+        'd_model': getattr(model, 'd_model', config.get('d_model', 'N/A')),
+        'n_layers': getattr(model, 'n_layers', config.get('n_layers', 'N/A')),
+        'n_heads': getattr(model, 'n_heads', config.get('n_heads', 'N/A')),
+    }
+
+
+def print_table(results, headers):
+    """Print markdown table"""
+    # Calculate column widths
+    col_widths = []
+    for h in headers:
+        max_len = len(h)
+        for r in results:
+            max_len = max(max_len, len(str(r.get(h, ''))))
+        col_widths.append(max_len + 2)
+
+    # Print
+    header_line = '|' + '|'.join(h.center(w) for h, w in zip(headers, col_widths)) + '|'
+    separator = '|' + '|'.join('-' * w for w in col_widths) + '|'
+
+    print(header_line)
+    print(separator)
+
+    for r in results:
+        values = [str(r.get(h, '')) for h in headers]
+        print('|' + '|'.join(v.center(w) for v, w in zip(values, col_widths)) + '|')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Checkpoint Comparison Analysis')
+    parser.add_argument('--checkpoints', nargs='+', required=True,
+                        help='Paths to checkpoint files/directories')
+    parser.add_argument('--val_data', type=str, required=True,
+                        help='Validation data path (.pt file)')
+    parser.add_argument('--output', type=str, default='results.csv',
+                        help='Output CSV file')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size')
+    parser.add_argument('--seq_len', type=int, default=512,
+                        help='Sequence length')
+    parser.add_argument('--max_val_tokens', type=int, default=2000000,
+                        help='Max validation tokens')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Device (cuda/cpu)')
+    parser.add_argument('--skip_eval', action='store_true',
+                        help='Skip evaluation, show model info only')
+
+    args = parser.parse_args()
+
+    # Device check
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA not available, using CPU")
+        args.device = 'cpu'
+
+    # Load validation data
+    val_tokens = None
+    if not args.skip_eval:
+        val_tokens = load_val_data(args.val_data, args.max_val_tokens)
+
+    # Analyze checkpoints
+    results = []
+
+    for ckpt_path in args.checkpoints:
+        print(f"\n{'='*60}")
+        print(f"Checkpoint: {ckpt_path}")
+        print('='*60)
+
+        try:
+            model, config, actual_path = load_model_from_checkpoint(ckpt_path, args.device)
+            info = get_model_info(model, actual_path, config)
+
+            total_params, _ = count_parameters(model)
+            flops = estimate_flops(model, args.seq_len)
+
+            if not args.skip_eval and val_tokens is not None:
+                metrics = evaluate_model(
+                    model, val_tokens,
+                    batch_size=args.batch_size,
+                    seq_len=args.seq_len,
+                    device=args.device
+                )
+            else:
+                metrics = {'loss': None, 'perplexity': None, 'accuracy': None}
+
+            result = {
+                'Model': info['name'],
+                'Type': info['type'],
+                'Params': format_params(total_params),
+                'Params_raw': total_params,
+                'FLOPs': format_flops(flops),
+                'FLOPs_raw': flops,
+                'd_model': info['d_model'],
+                'n_layers': info['n_layers'],
+                'Val Loss': f"{metrics['loss']:.4f}" if metrics['loss'] else 'N/A',
+                'PPL': f"{metrics['perplexity']:.1f}" if metrics['perplexity'] else 'N/A',
+                'Acc': f"{metrics['accuracy']:.1f}%" if metrics['accuracy'] else 'N/A',
+            }
+            results.append(result)
+
+            # Print summary
+            print(f"  Type: {info['type']} | d={info['d_model']}, L={info['n_layers']}")
+            print(f"  Params: {format_params(total_params)} | FLOPs: {format_flops(flops)}")
+            if metrics['loss']:
+                print(f"  Loss: {metrics['loss']:.4f} | PPL: {metrics['perplexity']:.1f} | Acc: {metrics['accuracy']:.1f}%")
+
+            del model
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            results.append({
+                'Model': Path(ckpt_path).name,
+                'Type': 'ERROR',
+                'Params': 'N/A',
+                'FLOPs': 'N/A',
+                'Val Loss': 'ERROR',
+                'PPL': 'ERROR',
+                'Acc': 'ERROR',
+            })
+
+    # Print final table
+    print(f"\n{'='*80}")
+    print("RESULTS (Paper-ready)")
+    print('='*80 + '\n')
+
+    headers = ['Model', 'Params', 'FLOPs', 'Val Loss', 'PPL', 'Acc']
+    print_table(results, headers)
+
+    # Save CSV
+    if args.output and results:
+        output_path = Path(args.output)
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer.writeheader()
+            writer.writerows(results)
+        print(f"\nSaved to: {output_path}")
+
+
+if __name__ == '__main__':
+    main()
