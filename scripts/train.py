@@ -51,6 +51,19 @@ from datetime import datetime
 import time
 import numpy as np
 import math
+import random
+
+
+def set_seed(seed):
+    """Set random seed for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 
 # Speed optimization: TF32 and cuDNN settings for Ampere+ GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -1567,6 +1580,12 @@ def main():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     cfg = load_config(config_path)
+
+    # Set random seed if specified
+    seed = cfg.get('seed', None)
+    if seed is not None:
+        set_seed(seed)
+        print(f"🎲 Random seed set to {seed}")
 
     # Create args namespace from config
     class Args:
