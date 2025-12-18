@@ -239,6 +239,13 @@ def load_checkpoint_smart(
         del state_dict[scalar_key]
         print(f"  Note: Migrating scalar excitability_weight={old_w:.4f} → per-neuron vectors")
 
+    # Remove deprecated excitability keys (v17.1+ no longer uses excitability)
+    excitability_keys_to_remove = [k for k in state_dict.keys() if 'excitability' in k]
+    if excitability_keys_to_remove:
+        for k in excitability_keys_to_remove:
+            del state_dict[k]
+        print(f"  Note: Removed {len(excitability_keys_to_remove)} deprecated excitability keys")
+
     # v16.3 neuron parameter migration: separate → contiguous
     # Migrate fq_neurons, fk_neurons, fv_neurons → f_neurons
     # Migrate rq_neurons, rk_neurons, rv_neurons → r_neurons
