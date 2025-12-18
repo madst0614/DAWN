@@ -863,9 +863,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         step = local_step + start_step
 
         input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
 
         # CLM: labels = input_ids (model does shift internally)
+        # Set padding positions to -100 so they're ignored in loss
         labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
 
         optimizer.zero_grad()
 
@@ -875,11 +878,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
-                # v10: DAWN model forward
+                # DAWN model forward
                 if load_balance_weight > 0 or entropy_weight > 0 or needs_routing_info(model):
-                    ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                    ce_loss, logits, routing_infos = model(input_ids, labels, attention_mask=attention_mask, return_routing_info=True)
                 else:
-                    ce_loss, logits = model(input_ids, labels)
+                    ce_loss, logits = model(input_ids, labels, attention_mask=attention_mask)
                     routing_infos = None
 
                 # Orthogonality loss
@@ -928,11 +931,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Non-AMP training (CPU or no CUDA)
             base_model = get_underlying_model(model)
 
-            # v10: DAWN model forward
+            # DAWN model forward
             if load_balance_weight > 0 or entropy_weight > 0 or needs_routing_info(model):
-                ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                ce_loss, logits, routing_infos = model(input_ids, labels, attention_mask=attention_mask, return_routing_info=True)
             else:
-                ce_loss, logits = model(input_ids, labels)
+                ce_loss, logits = model(input_ids, labels, attention_mask=attention_mask)
                 routing_infos = None
 
             # Orthogonality loss
@@ -1284,14 +1287,24 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
             if batch_idx >= max_batches:
                 break
             input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
 
             # CLM evaluation
-            logits = eval_model(input_ids)
+            logits = eval_model(input_ids, attention_mask=attention_mask)
+
+            # Create labels with padding masked
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
 
             # Shift for autoregressive loss
             B, S, V = logits.shape
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous().long()  # Ensure Long type for cross_entropy
+            shift_labels = labels[:, 1:].contiguous().long()  # Ensure Long type for cross_entropy
+
+            # Count valid (non-padding) tokens for proper averaging
+            valid_mask = (shift_labels != -100)
+            valid_tokens = valid_mask.sum().item()
+
             loss = F.cross_entropy(
                 shift_logits.view(-1, V),
                 shift_labels.view(-1),
@@ -1300,19 +1313,16 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
 
             # Accuracy calculation
             predictions = shift_logits.argmax(dim=-1)
-            valid_mask = (shift_labels != -100)
             correct_predictions = (predictions == shift_labels) & valid_mask
 
             correct = correct_predictions.sum().item()
-            valid_tokens = valid_mask.sum().item()
 
             total_correct += correct
             total_valid_tokens += valid_tokens
 
-            batch_size, seq_len = input_ids.shape
-            num_tokens = batch_size * seq_len
-            total_loss += loss.item() * num_tokens
-            total_tokens += num_tokens
+            # Use valid tokens for loss averaging
+            total_loss += loss.item() * valid_tokens
+            total_tokens += valid_tokens
 
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
