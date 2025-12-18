@@ -71,9 +71,10 @@ class BehavioralAnalyzer:
                 ema = getattr(self.router, ema_attr)
                 if neuron_id < len(ema):
                     results['usage_ema'] = float(ema[neuron_id])
-                    tau = self.router.tau
-                    exc = max(0, min(1, 1.0 - ema[neuron_id].item() / tau))
-                    results['excitability'] = float(exc)
+                    tau = getattr(self.router, 'tau', None)
+                    if tau is not None:
+                        exc = max(0, min(1, 1.0 - ema[neuron_id].item() / tau))
+                        results['excitability'] = float(exc)
 
         # Get embedding properties
         emb = self.router.neuron_emb.detach().cpu().numpy()

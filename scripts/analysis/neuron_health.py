@@ -83,9 +83,12 @@ class NeuronHealthAnalyzer:
         Higher excitability means the neuron is more likely to be selected.
 
         Returns:
-            Dictionary with excitability statistics
+            Dictionary with excitability statistics (empty if excitability not supported)
         """
-        tau = self.router.tau
+        tau = getattr(self.router, 'tau', None)
+        if tau is None:
+            return {'supported': False, 'message': 'Excitability not supported in this model version'}
+
         weight = getattr(self.router, 'excitability_weight', 0)
         if hasattr(weight, 'item'):
             weight = weight.item()
@@ -199,7 +202,7 @@ class NeuronHealthAnalyzer:
         results = {}
         threshold = 0.01
         dying_threshold = 0.05
-        tau = self.router.tau
+        tau = getattr(self.router, 'tau', None)
 
         for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
             if not hasattr(self.router, ema_attr):
@@ -207,16 +210,23 @@ class NeuronHealthAnalyzer:
 
             ema = getattr(self.router, ema_attr)
             n_total = getattr(self.router, n_attr)
-            exc = torch.clamp(1.0 - ema / tau, min=0.0, max=1.0)
 
             dead_mask = ema < threshold
             dying_mask = (ema >= threshold) & (ema < dying_threshold)
             active_mask = ema >= dying_threshold
 
-            # Revivable: dead but high excitability
-            revivable_mask = dead_mask & (exc > 0.8)
-            # Removable: dead and low excitability
-            removable_mask = dead_mask & (exc < 0.3)
+            # Excitability-based classification (only if tau exists)
+            if tau is not None:
+                exc = torch.clamp(1.0 - ema / tau, min=0.0, max=1.0)
+                # Revivable: dead but high excitability
+                revivable_mask = dead_mask & (exc > 0.8)
+                # Removable: dead and low excitability
+                removable_mask = dead_mask & (exc < 0.3)
+                n_revivable = int(revivable_mask.sum())
+                n_removable = int(removable_mask.sum())
+            else:
+                n_revivable = 0
+                n_removable = 0
 
             results[name] = {
                 'display': display,
@@ -224,12 +234,12 @@ class NeuronHealthAnalyzer:
                 'n_active': int(active_mask.sum()),
                 'n_dying': int(dying_mask.sum()),
                 'n_dead': int(dead_mask.sum()),
-                'n_revivable': int(revivable_mask.sum()),
-                'n_removable': int(removable_mask.sum()),
+                'n_revivable': n_revivable,
+                'n_removable': n_removable,
                 'dead_neuron_ids': dead_mask.nonzero().squeeze(-1).tolist()
                                    if dead_mask.sum() > 0 else [],
-                'removable_neuron_ids': removable_mask.nonzero().squeeze(-1).tolist()
-                                        if removable_mask.sum() > 0 else [],
+                'removable_neuron_ids': (removable_mask.nonzero().squeeze(-1).tolist()
+                                        if tau is not None and removable_mask.sum() > 0 else []),
             }
 
         # Calculate recommendations
