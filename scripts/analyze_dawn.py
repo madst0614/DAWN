@@ -17,7 +17,7 @@ For programmatic usage, prefer importing directly from `scripts.analysis`:
     )
 
 Analysis Categories:
-1. Usage Analysis       - EMA distribution, excitability, diversity, dead neurons
+1. Usage Analysis       - EMA distribution, diversity, dead neurons
 2. Routing Analysis     - Entropy, selection frequency, Q/K overlap, selection diversity
 3. Embedding Analysis   - Similarity, clustering, t-SNE/PCA visualization
 4. Weight Analysis      - SVD decomposition, effective rank
@@ -77,9 +77,6 @@ class UsageAnalyzer:
 
     def analyze_ema_distribution(self) -> Dict:
         return self._health.analyze_ema_distribution()
-
-    def analyze_excitability(self) -> Dict:
-        return self._health.analyze_excitability()
 
     def analyze_diversity(self) -> Dict:
         return self._health.analyze_diversity()
@@ -334,7 +331,6 @@ class DAWNAnalyzer:
         results = self.behavioral.analyze_single_neuron(neuron_id, neuron_type)
 
         print(f"Usage EMA: {results.get('usage_ema', 'N/A')}")
-        print(f"Excitability: {results.get('excitability', 'N/A')}")
         print(f"Embedding norm: {results.get('embedding_norm', 'N/A')}")
 
         return results
