@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Test extracted DAWN weights."""
 
+import argparse
 import torch
 from model import DAWN
+
+parser = argparse.ArgumentParser()
+parser.add_argument('weights', type=str, nargs='?', default='dawn_24m_weights.pt',
+                   help='Path to weights file (default: dawn_24m_weights.pt)')
+args = parser.parse_args()
 
 # 1. Config (v17.1)
 config = {
@@ -27,8 +33,9 @@ config = {
 }
 
 # 2. Load model
+print(f"Loading: {args.weights}")
 model = DAWN(**config)
-ckpt = torch.load('dawn_24m_weights.pt', map_location='cpu')
+ckpt = torch.load(args.weights, map_location='cpu')
 model.load_state_dict(ckpt['model_state_dict'])
 model.eval()
 
