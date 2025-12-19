@@ -6,13 +6,21 @@ Line plot comparing DAWN vs Vanilla training dynamics.
 Usage:
     # From checkpoint directories (will find training_log.txt):
     python figures/fig5_loss_curve.py \\
-        --checkpoints path/to/dawn_ckpt path/to/vanilla_ckpt \\
-        --labels "DAWN-24M" "Vanilla-22M"
+        --checkpoints path/to/dawn_ckpt path/to/vanilla_22m path/to/vanilla_108m \\
+        --labels "DAWN-24M" "Vanilla-22M" "Vanilla-108M"
+
+    # Example with actual run directories:
+    python figures/fig5_loss_curve.py \\
+        --checkpoints \\
+            logs_v17.1_20M_c4_5B/run_v17.1_20251217_172040_8948 \\
+            logs_baseline_22M_c4_5B/run_vbaseline_20251210_134902_4447 \\
+            logs_baseline_108M_c4_5B/run_vbaseline_20251216_220530_1907 \\
+        --labels "DAWN-24M" "Vanilla-22M" "Vanilla-108M"
 
     # From log files directly:
     python figures/fig5_loss_curve.py \\
-        --logs path/to/dawn/training_log.txt path/to/vanilla/training_log.txt \\
-        --labels "DAWN-24M" "Vanilla-22M"
+        --logs path/to/training_log.txt \\
+        --labels "DAWN-24M"
 
     # With demo data (for testing):
     python figures/fig5_loss_curve.py --demo
@@ -20,6 +28,10 @@ Usage:
 Output:
     figures/fig5_loss_curve.pdf
     figures/fig5_loss_curve.png
+
+Key message:
+    DAWN-24M converges faster than Vanilla-22M and achieves lower loss
+    than even Vanilla-108M (4.5x larger model).
 """
 
 import sys
@@ -39,17 +51,16 @@ plt.rcParams['axes.linewidth'] = 0.8
 plt.rcParams['axes.spines.top'] = False
 plt.rcParams['axes.spines.right'] = False
 
-# Colors (consistent with other figures)
-COLORS = [
-    '#4A90D9',  # Blue (DAWN)
-    '#7F8C8D',  # Gray (Vanilla)
-    '#2C3E50',  # Dark gray
-    '#E74C3C',  # Red
-    '#50C878',  # Green
-    '#9B59B6',  # Purple
-]
+# Colors and styles for specific models
+MODEL_STYLES = {
+    'DAWN-24M': {'color': '#4A90D9', 'linestyle': '-', 'linewidth': 2.5},
+    'Vanilla-22M': {'color': '#888888', 'linestyle': '--', 'linewidth': 2.0},
+    'Vanilla-108M': {'color': '#444444', 'linestyle': '-.', 'linewidth': 2.0},
+}
 
-LINE_STYLES = ['-', '--', '-.', ':', '-', '--']
+# Default colors for unknown models
+DEFAULT_COLORS = ['#4A90D9', '#888888', '#444444', '#E74C3C', '#50C878', '#9B59B6']
+DEFAULT_STYLES = ['-', '--', '-.', ':', '-', '--']
 
 
 def find_training_log(checkpoint_path: str) -> str:
@@ -335,9 +346,16 @@ Examples:
 
     # Plot each model
     for i, (label, (steps, losses)) in enumerate(data.items()):
-        color = COLORS[i % len(COLORS)]
-        linestyle = LINE_STYLES[i % len(LINE_STYLES)]
-        linewidth = 2.5 if i == 0 else 2.0  # First model (usually DAWN) is thicker
+        # Use predefined style if available, otherwise fallback to defaults
+        if label in MODEL_STYLES:
+            style = MODEL_STYLES[label]
+            color = style['color']
+            linestyle = style['linestyle']
+            linewidth = style['linewidth']
+        else:
+            color = DEFAULT_COLORS[i % len(DEFAULT_COLORS)]
+            linestyle = DEFAULT_STYLES[i % len(DEFAULT_STYLES)]
+            linewidth = 2.5 if i == 0 else 2.0
 
         ax.plot(steps, losses, linestyle=linestyle, color=color,
                 linewidth=linewidth, label=label)
@@ -380,23 +398,42 @@ Examples:
 
     # Add annotation for improvement if DAWN-like model exists
     dawn_label = None
-    vanilla_label = None
+    vanilla_22m_label = None
+    vanilla_108m_label = None
+
     for label in data.keys():
         if 'dawn' in label.lower():
             dawn_label = label
-        elif 'vanilla' in label.lower() and '22' in label:
-            vanilla_label = label
+        elif 'vanilla' in label.lower():
+            if '22' in label:
+                vanilla_22m_label = label
+            elif '108' in label:
+                vanilla_108m_label = label
 
-    if dawn_label and vanilla_label and len(data[dawn_label][0]) > 0:
+    # Annotate DAWN's advantage
+    if dawn_label and len(data[dawn_label][0]) > 0:
         dawn_final = data[dawn_label][1][-1]
-        vanilla_final = data[vanilla_label][1][-1]
-        if vanilla_final > dawn_final:
-            improvement = vanilla_final / dawn_final
-            ax.annotate(f'{improvement:.1f}× lower loss',
-                       xy=(data[dawn_label][0][-1], dawn_final),
-                       textcoords='offset points', xytext=(-70, 15),
-                       fontsize=8, color=COLORS[0], fontweight='bold',
-                       arrowprops=dict(arrowstyle='->', color=COLORS[0], lw=1))
+        dawn_color = MODEL_STYLES.get(dawn_label, {}).get('color', '#4A90D9')
+
+        # Show improvement over Vanilla-108M (the larger model)
+        if vanilla_108m_label and len(data[vanilla_108m_label][0]) > 0:
+            vanilla_108m_final = data[vanilla_108m_label][1][-1]
+            if vanilla_108m_final > dawn_final:
+                ax.annotate(f'Lower than 4.5× larger model',
+                           xy=(data[dawn_label][0][-1] * 0.85, dawn_final),
+                           textcoords='offset points', xytext=(-20, -25),
+                           fontsize=8, color=dawn_color, fontweight='bold',
+                           arrowprops=dict(arrowstyle='->', color=dawn_color, lw=1))
+        # Fallback: show improvement over Vanilla-22M
+        elif vanilla_22m_label and len(data[vanilla_22m_label][0]) > 0:
+            vanilla_22m_final = data[vanilla_22m_label][1][-1]
+            if vanilla_22m_final > dawn_final:
+                improvement = vanilla_22m_final / dawn_final
+                ax.annotate(f'{improvement:.1f}× lower loss',
+                           xy=(data[dawn_label][0][-1], dawn_final),
+                           textcoords='offset points', xytext=(-70, 15),
+                           fontsize=8, color=dawn_color, fontweight='bold',
+                           arrowprops=dict(arrowstyle='->', color=dawn_color, lw=1))
 
     plt.tight_layout()
 
