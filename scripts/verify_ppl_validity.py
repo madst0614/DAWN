@@ -171,12 +171,26 @@ def test_generation(model, tokenizer, device, prompts=None, max_new_tokens=30, t
                 for _ in range(max_new_tokens):
                     # Get model predictions
                     curr_input = torch.tensor([generated_ids], device=device)
+                    seq_len = curr_input.shape[1]
 
-                    # Limit sequence length
-                    if curr_input.shape[1] > model.max_seq_len:
-                        curr_input = curr_input[:, -model.max_seq_len:]
+                    # Pad to 512 for stable importance distribution (matches training)
+                    target_len = min(512, model.max_seq_len)
+                    if seq_len < target_len:
+                        pad_len = target_len - seq_len
+                        curr_input = F.pad(curr_input, (0, pad_len), value=tokenizer.pad_token_id)
+                        attention_mask = torch.ones(1, target_len, device=device)
+                        attention_mask[:, seq_len:] = 0
+                    else:
+                        # Limit sequence length
+                        if seq_len > model.max_seq_len:
+                            curr_input = curr_input[:, -model.max_seq_len:]
+                            seq_len = model.max_seq_len
+                        attention_mask = torch.ones(1, seq_len, device=device)
 
-                    logits = model(curr_input)
+                    logits = model(curr_input, attention_mask=attention_mask)
+
+                    # Use logits at last real token position (before padding)
+                    last_pos = seq_len - 1
 
                     # Check for NaN
                     if torch.isnan(logits).any():
@@ -184,8 +198,8 @@ def test_generation(model, tokenizer, device, prompts=None, max_new_tokens=30, t
                         results.append(("ERROR", "NaN in logits"))
                         break
 
-                    # Get next token probabilities (last position)
-                    next_token_logits = logits[0, -1, :] / temperature
+                    # Get next token probabilities (last real token position, not padding)
+                    next_token_logits = logits[0, last_pos, :] / temperature
                     probs = F.softmax(next_token_logits, dim=-1)
 
                     # Sample
