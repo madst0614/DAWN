@@ -50,7 +50,7 @@ model:
 
   max_seq_len: 512
   dropout: 0.1
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   d_space: 64
   router_dropout: 0.1
   attention_token_routing: true
@@ -58,7 +58,8 @@ model:
   use_ssm_context: false  # SSM not used with token routing
 
 training:
-  batch_size: 96
+  batch_size: 32
+  gradient_accumulation_steps: 3
   num_epochs: 1
   lr: 0.00055
   weight_decay: 0.1
@@ -78,7 +79,7 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_5B_seed2_token_routing
 #   Key differences from batch-level routing:
 #   - No SSM importance weighting (SSM skipped)
 #   - Each token routes independently
-#   - gradient_checkpointing=true for memory efficiency
+#   - gradient_accumulation for memory efficiency
 #
 #   Attention Circuit (per-token routing):
 #   - Feature_QK=120 (k=20): per-token Q/K compression
