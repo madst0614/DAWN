@@ -10,11 +10,15 @@ Usage:
 
     # Include training curves (requires checkpoint paths):
     python figures/generate_all.py \\
-        --dawn_ckpt path/to/dawn/checkpoints \\
-        --vanilla_ckpt path/to/vanilla/checkpoints
+        --dawn_ckpt path/to/dawn/run \\
+        --vanilla_22m_ckpt path/to/vanilla_22m/run \\
+        --vanilla_108m_ckpt path/to/vanilla_108m/run
 
     # Demo mode for all figures including loss curve:
     python figures/generate_all.py --demo
+
+    # Generate and zip for download:
+    python figures/generate_all.py --demo --zip
 
 Output:
     figures/fig1_architecture.pdf
@@ -27,6 +31,7 @@ Output:
 import subprocess
 import sys
 import os
+import zipfile
 from pathlib import Path
 
 # Get the figures directory
@@ -49,6 +54,19 @@ def run_script(script_name, extra_args=None):
     return result.returncode == 0
 
 
+def create_zip():
+    """Create zip file of all generated figures."""
+    zip_path = PROJECT_ROOT / 'dawn_figures.zip'
+
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for ext in ['*.png', '*.pdf']:
+            for f in FIGURES_DIR.glob(ext):
+                zf.write(f, f.name)
+
+    print(f"\nCreated: {zip_path}")
+    return zip_path
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
@@ -59,24 +77,32 @@ Examples:
     # Basic figures only:
     python figures/generate_all.py
 
-    # All figures with training curves:
+    # All figures with training curves (3 models):
     python figures/generate_all.py \\
-        --dawn_ckpt /content/drive/MyDrive/dawn/checkpoints_v17.1_20M \\
-        --vanilla_ckpt /content/drive/MyDrive/dawn/checkpoints_baseline_22M
+        --dawn_ckpt /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_5B/run_v17.1_20251217_172040_8948 \\
+        --vanilla_22m_ckpt /content/drive/MyDrive/dawn/logs_baseline_22M_c4_5B/run_vbaseline_20251210_134902_4447 \\
+        --vanilla_108m_ckpt /content/drive/MyDrive/dawn/logs_baseline_125M_c4_5B/run_vbaseline_20251216_220530_1907
 
     # Demo mode (synthetic data for loss curves):
     python figures/generate_all.py --demo
+
+    # Generate and zip for download:
+    python figures/generate_all.py --demo --zip
         """
     )
 
     parser.add_argument('--dawn_ckpt', type=str,
-                       help='DAWN checkpoint directory (for fig5)')
-    parser.add_argument('--vanilla_ckpt', type=str,
-                       help='Vanilla checkpoint directory (for fig5)')
+                       help='DAWN checkpoint/log directory (for fig5)')
+    parser.add_argument('--vanilla_22m_ckpt', type=str,
+                       help='Vanilla-22M checkpoint/log directory (for fig5)')
+    parser.add_argument('--vanilla_108m_ckpt', type=str,
+                       help='Vanilla-108M checkpoint/log directory (for fig5)')
     parser.add_argument('--demo', action='store_true',
                        help='Use demo data for fig5 loss curves')
     parser.add_argument('--skip', nargs='+', default=[],
                        help='Skip specific figures (e.g., --skip fig1 fig2)')
+    parser.add_argument('--zip', action='store_true',
+                       help='Create zip file of all figures after generation')
 
     args = parser.parse_args()
 
@@ -105,7 +131,7 @@ Examples:
     if 'fig5' not in args.skip:
         if args.demo:
             results['fig5'] = run_script('fig5_loss_curve.py', ['--demo'])
-        elif args.dawn_ckpt or args.vanilla_ckpt:
+        elif args.dawn_ckpt or args.vanilla_22m_ckpt or args.vanilla_108m_ckpt:
             fig5_args = []
             ckpts = []
             labels = []
@@ -113,9 +139,12 @@ Examples:
             if args.dawn_ckpt:
                 ckpts.append(args.dawn_ckpt)
                 labels.append('DAWN-24M')
-            if args.vanilla_ckpt:
-                ckpts.append(args.vanilla_ckpt)
+            if args.vanilla_22m_ckpt:
+                ckpts.append(args.vanilla_22m_ckpt)
                 labels.append('Vanilla-22M')
+            if args.vanilla_108m_ckpt:
+                ckpts.append(args.vanilla_108m_ckpt)
+                labels.append('Vanilla-108M')
 
             if ckpts:
                 fig5_args.extend(['--checkpoints'] + ckpts)
@@ -144,6 +173,13 @@ Examples:
     for f in sorted(FIGURES_DIR.glob('*.pdf')):
         size = f.stat().st_size / 1024
         print(f"  {f.name} ({size:.1f} KB)")
+
+    # Create zip if requested
+    if args.zip:
+        zip_path = create_zip()
+        print(f"\nTo download in Colab:")
+        print(f"  from google.colab import files")
+        print(f"  files.download('{zip_path}')")
 
     return 0 if success_count == total_count else 1
 
