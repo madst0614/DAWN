@@ -400,12 +400,13 @@ class GlobalRouters(nn.Module):
             aux_loss += ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
 
         if self.attention_token_routing:
-            fqk_weights_Q = fqk_pref_Q
-            fqk_weights_K = fqk_pref_K
-            fv_weights = fv_pref
-            rqk_weights_Q = rqk_pref_Q
-            rqk_weights_K = rqk_pref_K
-            rv_weights = rv_pref
+            # Token-level routing with top-k sparsification
+            fqk_weights_Q, _ = self._topk_sparsify(fqk_pref_Q, self.top_k_feature_qk)
+            fqk_weights_K, _ = self._topk_sparsify(fqk_pref_K, self.top_k_feature_qk)
+            fv_weights, _ = self._topk_sparsify(fv_pref, self.top_k_feature_v)
+            rqk_weights_Q, _ = self._topk_sparsify(rqk_pref_Q, self.top_k_restore_qk)
+            rqk_weights_K, _ = self._topk_sparsify(rqk_pref_K, self.top_k_restore_qk)
+            rv_weights, _ = self._topk_sparsify(rv_pref, self.top_k_restore_v)
 
             routing_info = {
                 'fqk_weights_Q': fqk_weights_Q.detach(),
