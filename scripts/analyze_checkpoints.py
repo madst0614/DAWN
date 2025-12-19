@@ -235,7 +235,17 @@ def load_model_from_checkpoint(ckpt_path, device='cuda'):
         raise ValueError(f"No model config in checkpoint")
 
     # Create model
-    version = config.get('model_version', config.get('version', '17.1'))
+    version = config.get('model_version', config.get('version', None))
+
+    # Auto-detect baseline if no version specified
+    if version is None:
+        # Check if it's a baseline model (has d_ff but no DAWN-specific keys)
+        dawn_keys = ['n_feature_qk', 'n_feature_v', 'n_restore_qk', 'rank']
+        if any(k in config for k in dawn_keys):
+            version = '17.1'
+        else:
+            version = 'baseline'
+
     version = normalize_version(version)
 
     model = create_model_by_version(version, config)
