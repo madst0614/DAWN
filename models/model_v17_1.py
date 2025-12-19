@@ -276,9 +276,10 @@ class GlobalSSM(nn.Module):
 
         ssm_out = self.ssm_norm(ssm_out)
 
-        h_final = ssm_out[:, -1, :]
-        h_proj = self.importance_proj(h_final)
-        raw_importance = torch.einsum('bsd,bd->bs', x, h_proj)
+        # Position-wise importance (no future leakage)
+        # Each position's importance uses only SSM output up to that position
+        h_proj = self.importance_proj(ssm_out)  # [B, S, D]
+        raw_importance = (x * h_proj).sum(dim=-1)  # [B, S]
 
         if attention_mask is not None:
             masked_importance = raw_importance.masked_fill(attention_mask == 0, float('-inf'))
