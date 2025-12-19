@@ -58,8 +58,8 @@ config = {
 
 # 2. Load model
 model = DAWN(**config)
-weights = torch.load('dawn_24m_weights.pt', map_location='cpu')
-model.load_state_dict(weights)
+ckpt = torch.load('dawn_24m_weights.pt', map_location='cpu')
+model.load_state_dict(ckpt)  # state_dict directly
 model.eval()
 
 # 3. Forward pass

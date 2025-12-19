@@ -95,7 +95,11 @@ def main():
     print(f"Loading model from {args.weights}")
     model = DAWN(**CONFIG)
     ckpt = torch.load(args.weights, map_location='cpu')
-    model.load_state_dict(ckpt['model_state_dict'])
+    # Handle both formats: direct state_dict or wrapped in 'model_state_dict'
+    if 'model_state_dict' in ckpt:
+        model.load_state_dict(ckpt['model_state_dict'])
+    else:
+        model.load_state_dict(ckpt)
     model = model.to(args.device)
     model.eval()
 
