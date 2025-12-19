@@ -1,6 +1,7 @@
 # DAWN: Dynamic Architecture With Neurons
 
-[![Paper](https://img.shields.io/badge/Paper-Zenodo-blue)](https://doi.org/10.5281/zenodo.XXXXXXX)
+[![Paper](https://img.shields.io/badge/Paper-Zenodo-blue)](https://zenodo.org/records/17986495)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17986495.svg)](https://doi.org/10.5281/zenodo.17986495)
 
 DAWN replaces static weight matrices with dynamic routing over shared neuron pools, achieving 4× better perplexity than vanilla Transformers with 4.5× fewer parameters.
 
@@ -34,7 +35,6 @@ pip install -r requirements.txt
 import torch
 from models import DAWN
 
-# 1. Config (v17.1)
 config = {
     'vocab_size': 30522,
     'd_model': 384,
@@ -42,6 +42,8 @@ config = {
     'n_heads': 6,
     'rank': 64,
     'knowledge_rank': 128,
+    'max_seq_len': 512,
+    'state_dim': 64,
     'n_feature_qk': 120,
     'n_feature_v': 24,
     'n_restore_qk': 120,
@@ -54,19 +56,15 @@ config = {
     'top_k_restore_v': 6,
     'top_k_feature_know': 4,
     'top_k_restore_know': 4,
+    'd_space': 64,
+    'dropout': 0.1,
+    'router_dropout': 0.1,
 }
 
-# 2. Load model
 model = DAWN(**config)
-ckpt = torch.load('dawn_24m_weights.pt', map_location='cpu')
-model.load_state_dict(ckpt)  # state_dict directly
+weights = torch.load('dawn_24m_weights.pt', map_location='cpu')
+model.load_state_dict(weights)
 model.eval()
-
-# 3. Forward pass
-dummy_input = torch.randint(0, 1000, (1, 64))
-with torch.no_grad():
-    output = model(dummy_input)
-print(f"Output shape: {output.shape}")  # [1, 64, 30522]
 ```
 
 ### Training
@@ -77,21 +75,21 @@ python train.py
 
 ## Checkpoints
 
-Download pretrained weights from [Zenodo](https://doi.org/10.5281/zenodo.XXXXXXX):
+Download pretrained weights from [Zenodo](https://zenodo.org/records/17986495):
 
 | Model | Params | PPL | Download |
 |-------|--------|-----|----------|
-| DAWN-24M | 23.9M | 8.4 | [weights](https://doi.org/10.5281/zenodo.XXXXXXX) |
+| DAWN-24M | 23.9M | 8.4 | [weights](https://zenodo.org/records/17986495) |
 
 ## Citation
 
 ```bibtex
 @misc{choi2025dawn,
   title={DAWN: Dynamic Architecture With Neurons},
-  author={Seungho Choi},
+  author={Choi, Seungho},
   year={2025},
-  howpublished={Zenodo},
-  doi={10.5281/zenodo.XXXXXXX}
+  doi={10.5281/zenodo.17986495},
+  url={https://zenodo.org/records/17986495}
 }
 ```
 
