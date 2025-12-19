@@ -1,7 +1,8 @@
-# DAWN v17.1 Training Config - 20M Scale, 5B tokens (Seed 4)
+# DAWN v17.1 Training Config - 20M Scale, 5B tokens (Seed 2, Token Routing)
 # Q/K shared pool + Knowledge Feature-Restore pattern
+# Token-level routing for both attention and knowledge (no SSM importance)
 
-seed: 4
+seed: 2
 
 data:
   base_dir: /content/drive/MyDrive/data
@@ -49,12 +50,12 @@ model:
 
   max_seq_len: 512
   dropout: 0.1
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   d_space: 64
   router_dropout: 0.1
-  attention_token_routing: false
-  knowledge_token_routing: false
-  use_ssm_context: true
+  attention_token_routing: true
+  knowledge_token_routing: true
+  use_ssm_context: false  # SSM not used with token routing
 
 training:
   batch_size: 96
@@ -69,5 +70,22 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_5B_seed4
-log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_5B_seed4
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_5B_seed2_token_routing
+log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_5B_seed2_token_routing
+
+# v17.1 Token Routing Architecture
+#
+#   Key differences from batch-level routing:
+#   - No SSM importance weighting (SSM skipped)
+#   - Each token routes independently
+#   - gradient_checkpointing=true for memory efficiency
+#
+#   Attention Circuit (per-token routing):
+#   - Feature_QK=120 (k=20): per-token Q/K compression
+#   - Feature_V=24 (k=6): per-token V compression
+#   - Restore_QK=120 (k=20): per-token Q/K restoration
+#   - Restore_V=24 (k=6): per-token V restoration
+#
+#   Knowledge Circuit (per-token routing):
+#   - Feature_Know=24 (k=4): per-token compression
+#   - Restore_Know=24 (k=4): per-token restoration
