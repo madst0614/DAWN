@@ -11,11 +11,11 @@ Usage:
     # Include fig5 with demo data:
     python figures/generate_all.py --demo
 
-    # Include fig5 with actual log files:
+    # Include fig5 with checkpoint directories (auto-find training_log.txt):
     python figures/generate_all.py \\
-        --dawn_log path/to/dawn/training_log.txt \\
-        --vanilla_22m_log path/to/vanilla_22m/training_log.txt \\
-        --vanilla_108m_log path/to/vanilla_108m/training_log.txt
+        --dawn path/to/dawn/checkpoints/run_xxx \\
+        --vanilla_22m path/to/vanilla_22m/checkpoints/run_xxx \\
+        --vanilla_108m path/to/vanilla_108m/checkpoints/run_xxx
 
     # Generate and zip for download:
     python figures/generate_all.py --demo --zip
@@ -25,7 +25,7 @@ Output:
     figures/fig2_feature_restore.pdf
     figures/fig3_param_efficiency.pdf
     figures/fig4_routing_stats.pdf
-    figures/fig5_loss_curve.pdf (if --demo or log paths provided)
+    figures/fig5_loss_curve.pdf (if --demo or checkpoint paths provided)
 """
 
 import subprocess
@@ -49,7 +49,7 @@ def run_script(script_name, extra_args=None):
     print(f"\n{'='*60}")
     print(f"Running: {script_name}")
     if extra_args:
-        print(f"Args: {' '.join(extra_args)}")
+        print(f"Args: {' '.join(extra_args[:6])}...")  # Truncate long args
     print('='*60)
 
     result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
@@ -82,24 +82,24 @@ Examples:
     # All figures with demo loss curves:
     python figures/generate_all.py --demo
 
-    # All figures with actual training logs:
+    # All figures with checkpoint directories:
     python figures/generate_all.py \\
-        --dawn_log /content/drive/MyDrive/dawn/logs_v17.1/training_log.txt \\
-        --vanilla_22m_log /content/drive/MyDrive/dawn/logs_baseline_22M/training_log.txt \\
-        --vanilla_108m_log /content/drive/MyDrive/dawn/logs_baseline_125M/training_log.txt
+        --dawn /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_5B/run_v17.1_20251217_172040_8948 \\
+        --vanilla_22m /content/drive/MyDrive/dawn/checkpoints_baseline_22M_c4_5B/run_vbaseline_20251210_134902_4447 \\
+        --vanilla_108m /content/drive/MyDrive/dawn/checkpoints_baseline_125M_c4_5B/run_vbaseline_20251216_220530_1907
 
     # Generate and zip:
     python figures/generate_all.py --demo --zip
         """
     )
 
-    # Fig5 options - direct log file paths
-    parser.add_argument('--dawn_log', type=str,
-                       help='DAWN training_log.txt path (for fig5)')
-    parser.add_argument('--vanilla_22m_log', type=str,
-                       help='Vanilla-22M training_log.txt path (for fig5)')
-    parser.add_argument('--vanilla_108m_log', type=str,
-                       help='Vanilla-108M training_log.txt path (for fig5)')
+    # Fig5 options - checkpoint directories (auto-find training_log.txt)
+    parser.add_argument('--dawn', type=str,
+                       help='DAWN run directory (will auto-find training_log.txt)')
+    parser.add_argument('--vanilla_22m', type=str,
+                       help='Vanilla-22M run directory')
+    parser.add_argument('--vanilla_108m', type=str,
+                       help='Vanilla-108M run directory')
     parser.add_argument('--demo', action='store_true',
                        help='Use demo data for fig5 loss curves')
 
@@ -140,22 +140,22 @@ Examples:
 
         if args.demo:
             fig5_args.append('--demo')
-        elif args.dawn_log or args.vanilla_22m_log or args.vanilla_108m_log:
-            logs = []
+        elif args.dawn or args.vanilla_22m or args.vanilla_108m:
+            ckpts = []
             labels = []
 
-            if args.dawn_log:
-                logs.append(args.dawn_log)
+            if args.dawn:
+                ckpts.append(args.dawn)
                 labels.append('DAWN-24M')
-            if args.vanilla_22m_log:
-                logs.append(args.vanilla_22m_log)
+            if args.vanilla_22m:
+                ckpts.append(args.vanilla_22m)
                 labels.append('Vanilla-22M')
-            if args.vanilla_108m_log:
-                logs.append(args.vanilla_108m_log)
+            if args.vanilla_108m:
+                ckpts.append(args.vanilla_108m)
                 labels.append('Vanilla-108M')
 
-            if logs:
-                fig5_args.extend(['--logs'] + logs)
+            if ckpts:
+                fig5_args.extend(['--checkpoints'] + ckpts)
                 fig5_args.extend(['--labels'] + labels)
 
         if args.no_annotations:
@@ -164,7 +164,7 @@ Examples:
         if fig5_args:
             results['fig5'] = run_script('fig5_loss_curve.py', fig5_args)
         else:
-            print("\n[fig5] Skipped: No --demo or log paths provided")
+            print("\n[fig5] Skipped: No --demo or checkpoint paths provided")
 
     # Summary
     print(f"\n{'='*60}")
