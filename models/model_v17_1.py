@@ -437,12 +437,20 @@ class GlobalRouters(nn.Module):
             imp = importance.unsqueeze(-1)  # [B, S, 1]
             cumsum_imp = torch.cumsum(importance, dim=1).unsqueeze(-1) + 1e-8  # [B, S, 1]
 
-            fqk_weights_Q = torch.cumsum(imp * fqk_pref_Q, dim=1) / cumsum_imp  # [B, S, N]
-            fqk_weights_K = torch.cumsum(imp * fqk_pref_K, dim=1) / cumsum_imp
-            fv_weights = torch.cumsum(imp * fv_pref, dim=1) / cumsum_imp
-            rqk_weights_Q = torch.cumsum(imp * rqk_pref_Q, dim=1) / cumsum_imp
-            rqk_weights_K = torch.cumsum(imp * rqk_pref_K, dim=1) / cumsum_imp
-            rv_weights = torch.cumsum(imp * rv_pref, dim=1) / cumsum_imp
+            fqk_weights_Q_soft = torch.cumsum(imp * fqk_pref_Q, dim=1) / cumsum_imp  # [B, S, N]
+            fqk_weights_K_soft = torch.cumsum(imp * fqk_pref_K, dim=1) / cumsum_imp
+            fv_weights_soft = torch.cumsum(imp * fv_pref, dim=1) / cumsum_imp
+            rqk_weights_Q_soft = torch.cumsum(imp * rqk_pref_Q, dim=1) / cumsum_imp
+            rqk_weights_K_soft = torch.cumsum(imp * rqk_pref_K, dim=1) / cumsum_imp
+            rv_weights_soft = torch.cumsum(imp * rv_pref, dim=1) / cumsum_imp
+
+            # Apply top-k sparsification
+            fqk_weights_Q, _ = self._topk_sparsify(fqk_weights_Q_soft, self.top_k_feature_qk)
+            fqk_weights_K, _ = self._topk_sparsify(fqk_weights_K_soft, self.top_k_feature_qk)
+            fv_weights, _ = self._topk_sparsify(fv_weights_soft, self.top_k_feature_v)
+            rqk_weights_Q, _ = self._topk_sparsify(rqk_weights_Q_soft, self.top_k_restore_qk)
+            rqk_weights_K, _ = self._topk_sparsify(rqk_weights_K_soft, self.top_k_restore_qk)
+            rv_weights, _ = self._topk_sparsify(rv_weights_soft, self.top_k_restore_v)
 
             routing_info = {
                 'fqk_weights_Q': fqk_weights_Q.detach(),
