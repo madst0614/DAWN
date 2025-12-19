@@ -1,12 +1,11 @@
 """
 Neuron Health Analysis
 =======================
-Analyze neuron health status in DAWN v17.1 models.
+Analyze neuron health status in DAWN v17 models.
 
 Includes:
 - EMA distribution analysis
 - Dead/Active neuron ratio
-- Excitability state analysis
 - Diversity metrics (Gini, entropy)
 - Visualization utilities
 """
@@ -71,47 +70,6 @@ class NeuronHealthAnalyzer:
                     'std': float(ema.std()),
                     'median': float(ema.median()),
                 }
-            }
-
-        return results
-
-    def analyze_excitability(self) -> Dict:
-        """
-        Analyze excitability state of neurons.
-
-        Excitability = 1 - EMA/tau, clamped to [0, 1]
-        Higher excitability means the neuron is more likely to be selected.
-
-        Returns:
-            Dictionary with excitability statistics
-        """
-        tau = self.router.tau
-        weight = getattr(self.router, 'excitability_weight', 0)
-        if hasattr(weight, 'item'):
-            weight = weight.item()
-
-        results = {
-            'tau': tau,
-            'weight': weight,
-            'langevin_alpha': getattr(self.router, 'langevin_alpha', 0),
-            'langevin_beta': getattr(self.router, 'langevin_beta', 0),
-        }
-
-        for name, (display, ema_attr, _, _) in NEURON_TYPES.items():
-            if not hasattr(self.router, ema_attr):
-                continue
-
-            ema = getattr(self.router, ema_attr)
-            exc = torch.clamp(1.0 - ema / tau, min=0.0, max=1.0)
-
-            results[name] = {
-                'display': display,
-                'min': float(exc.min()),
-                'max': float(exc.max()),
-                'mean': float(exc.mean()),
-                'std': float(exc.std()),
-                'high_exc_count': int((exc > 0.8).sum()),
-                'low_exc_count': int((exc < 0.2).sum()),
             }
 
         return results
@@ -199,7 +157,6 @@ class NeuronHealthAnalyzer:
         results = {}
         threshold = 0.01
         dying_threshold = 0.05
-        tau = self.router.tau
 
         for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
             if not hasattr(self.router, ema_attr):
@@ -207,16 +164,10 @@ class NeuronHealthAnalyzer:
 
             ema = getattr(self.router, ema_attr)
             n_total = getattr(self.router, n_attr)
-            exc = torch.clamp(1.0 - ema / tau, min=0.0, max=1.0)
 
             dead_mask = ema < threshold
             dying_mask = (ema >= threshold) & (ema < dying_threshold)
             active_mask = ema >= dying_threshold
-
-            # Revivable: dead but high excitability
-            revivable_mask = dead_mask & (exc > 0.8)
-            # Removable: dead and low excitability
-            removable_mask = dead_mask & (exc < 0.3)
 
             results[name] = {
                 'display': display,
@@ -224,12 +175,8 @@ class NeuronHealthAnalyzer:
                 'n_active': int(active_mask.sum()),
                 'n_dying': int(dying_mask.sum()),
                 'n_dead': int(dead_mask.sum()),
-                'n_revivable': int(revivable_mask.sum()),
-                'n_removable': int(removable_mask.sum()),
                 'dead_neuron_ids': dead_mask.nonzero().squeeze(-1).tolist()
                                    if dead_mask.sum() > 0 else [],
-                'removable_neuron_ids': removable_mask.nonzero().squeeze(-1).tolist()
-                                        if removable_mask.sum() > 0 else [],
             }
 
         # Calculate recommendations
@@ -238,18 +185,18 @@ class NeuronHealthAnalyzer:
             if isinstance(results[name], dict) and 'n_total' in results[name]
         ]
 
-        total_removable = sum(results[n]['n_removable'] for n in type_names)
+        total_dead = sum(results[n]['n_dead'] for n in type_names)
         total_neurons = sum(results[n]['n_total'] for n in type_names)
 
-        results['recommendation'] = {
-            'total_removable': total_removable,
-            'shrink_ratio': total_removable / total_neurons if total_neurons > 0 else 0,
-            'action': 'shrink' if total_removable > total_neurons * 0.2 else 'keep',
+        results['summary'] = {
+            'total_dead': total_dead,
+            'total_neurons': total_neurons,
+            'dead_ratio': total_dead / total_neurons if total_neurons > 0 else 0,
             'per_type': {
                 name: {
-                    'current': results[name]['n_total'],
-                    'recommended': results[name]['n_total'] - results[name]['n_removable'],
-                    'remove': results[name]['n_removable'],
+                    'total': results[name]['n_total'],
+                    'active': results[name]['n_active'],
+                    'dead': results[name]['n_dead'],
                 }
                 for name in type_names
             }
@@ -374,7 +321,6 @@ class NeuronHealthAnalyzer:
 
         results = {
             'ema_distribution': self.analyze_ema_distribution(),
-            'excitability': self.analyze_excitability(),
             'diversity': self.analyze_diversity(),
             'dead_neurons': self.analyze_dead_neurons(output_dir),
         }

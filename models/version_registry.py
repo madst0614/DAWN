@@ -2,8 +2,8 @@
 DAWN Model Version Registry - Single Source of Truth
 
 Supported Versions:
-  v17.2: Feature QK Unified + Restore Q/K Separate (recommended)
-  v17.1: Q/K Shared Pool + Knowledge Feature-Restore
+  v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
+  v17.2: Feature QK Unified + Restore Q/K Separate
   baseline: Vanilla Transformer for comparison
 """
 
@@ -38,9 +38,6 @@ VERSION_REGISTRY = {
             "token_routing": False,
             "knowledge_token_routing": False,
             "use_ssm_context": True,
-            "excitability_tau": 1.5,
-            "excitability_ema_alpha": 0.01,
-            "excitability_decay_rate": 0.99995,
         },
         "display_info": lambda args: [
             f"DAWN v17.2: Feature QK Unified + Restore Q/K Separate",
@@ -79,12 +76,9 @@ VERSION_REGISTRY = {
             "token_routing": False,
             "knowledge_token_routing": False,
             "use_ssm_context": True,
-            "excitability_tau": 1.5,
-            "excitability_ema_alpha": 0.01,
-            "excitability_decay_rate": 0.99995,
         },
         "display_info": lambda args: [
-            f"DAWN v17.1: Q/K Shared + Knowledge Feature-Restore",
+            f"DAWN v17.1: Q/K Separate + Knowledge Feature-Restore",
             f"  rank={args.get('rank', args.get('basis_rank'))}, knowledge_rank={args.get('knowledge_rank', 128)}",
             f"  F-QK: {args.get('n_feature_qk')} (top-k={args.get('top_k_feature_qk', 8)}) - Q/K shared pool",
             f"  F-V: {args.get('n_feature_v')} (top-k={args.get('top_k_feature_v', 3)})",

@@ -51,6 +51,19 @@ from datetime import datetime
 import time
 import numpy as np
 import math
+import random
+
+
+def set_seed(seed):
+    """Set random seed for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 
 # Speed optimization: TF32 and cuDNN settings for Ampere+ GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -599,7 +612,7 @@ def is_v17_model(model):
 
 
 def needs_routing_info(model):
-    """Check if model needs routing_info for excitability logging"""
+    """Check if model needs routing_info for usage logging"""
     return is_v16_model(model) or is_v17_model(model)
 
 
@@ -655,18 +668,15 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
         dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
 
-        # Excitability
-        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
-
         # v17.2 format
-        lines.append(f"         [v17.2] Excitability w={exc_w:.4f}")
+        lines.append(f"         [v17.2] Neuron Usage")
         lines.append(f"             Feature_QK: {int(active_fqk)}/{n_fqk} | Feature_V: {int(active_fv)}/{n_fv}")
         lines.append(f"             Restore_Q: {int(active_rq)}/{n_rq} | Restore_K: {int(active_rk)}/{n_rk} | Restore_V: {int(active_rv)}/{n_rv}")
         lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} | Restore_Know: {int(active_RK)}/{n_RK}")
         lines.append(f"             Dead: FQK={dead_fqk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FK={dead_FK:.1%} RK={dead_RK:.1%}")
         lines.append(f"             Gini: FQK={gini_fqk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FK={gini_FK:.2f} RK={gini_RK:.2f}")
 
-    # v17.1: Q/K Separate Excitability (has usage_ema_feature_q, not usage_ema_feature_qk)
+    # v17.1: Q/K Separate (has usage_ema_feature_q, not usage_ema_feature_qk)
     elif hasattr(router, 'usage_ema_feature_q') and hasattr(router, 'usage_ema_feature_know'):
         ema_fq = router.usage_ema_feature_q
         ema_fk = router.usage_ema_feature_k
@@ -705,60 +715,15 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
         dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
 
-        # Excitability
-        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
-
         # v17.1 format (Q/K separate)
-        lines.append(f"         [v17.1] Excitability w={exc_w:.4f}")
+        lines.append(f"         [v17.1] Neuron Usage")
         lines.append(f"             Feature_Q: {int(active_fq)}/{n_fq} | Feature_K: {int(active_fk)}/{n_fk} | Feature_V: {int(active_fv)}/{n_fv}")
         lines.append(f"             Restore_Q: {int(active_rq)}/{n_rq} | Restore_K: {int(active_rk)}/{n_rk} | Restore_V: {int(active_rv)}/{n_rv}")
         lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} | Restore_Know: {int(active_RK)}/{n_RK}")
         lines.append(f"             Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
         lines.append(f"             Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
 
-    # v16.4: Shared Pool + Separate Routing (no Knowledge F/R separation)
-    elif hasattr(router, 'usage_ema_feature_qk'):
-        ema_fqk = router.usage_ema_feature_qk
-        ema_fv = router.usage_ema_feature_v
-        ema_rqk = router.usage_ema_restore_qk
-        ema_rv = router.usage_ema_restore_v
-
-        # Active neuron counts
-        active_fqk = (ema_fqk > 0.01).sum().item()
-        active_fv = (ema_fv > 0.01).sum().item()
-        active_rqk = (ema_rqk > 0.01).sum().item()
-        active_rv = (ema_rv > 0.01).sum().item()
-        n_fqk, n_fv = ema_fqk.numel(), ema_fv.numel()
-        n_rqk, n_rv = ema_rqk.numel(), ema_rv.numel()
-
-        # Gini coefficients
-        gini_fqk, gini_fv = _gini(ema_fqk), _gini(ema_fv)
-        gini_rqk, gini_rv = _gini(ema_rqk), _gini(ema_rv)
-
-        # Dead neuron ratios
-        dead_fqk = (ema_fqk < DEAD_NEURON_THRESHOLD).float().mean().item()
-        dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
-        dead_rqk = (ema_rqk < DEAD_NEURON_THRESHOLD).float().mean().item()
-        dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
-
-        # Excitability
-        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
-
-        lines.append(f"         Excitability | w={exc_w:.4f} | Active FQK/FV:{int(active_fqk)}/{n_fqk},{int(active_fv)}/{n_fv}")
-        lines.append(f"             Active RQK/RV:{int(active_rqk)}/{n_rqk},{int(active_rv)}/{n_rv}")
-        lines.append(f"             Gini FQK/FV: {gini_fqk:.2f}/{gini_fv:.2f} | RQK/RV: {gini_rqk:.2f}/{gini_rv:.2f}")
-        lines.append(f"             Dead FQK/FV: {dead_fqk:.1%}/{dead_fv:.1%} | RQK/RV: {dead_rqk:.1%}/{dead_rv:.1%}")
-
-        # Knowledge neurons (single pool for v16.4)
-        if hasattr(router, 'usage_ema_knowledge'):
-            ema_K = router.usage_ema_knowledge
-            active_K = (ema_K > 0.01).sum().item()
-            n_K = ema_K.numel()
-            gini_K = _gini(ema_K)
-            dead_K = (ema_K < DEAD_NEURON_THRESHOLD).float().mean().item()
-            lines.append(f"             Knowledge: Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f}")
-
-    # v17: Complete Q/K/V Pool Separation + Knowledge Feature/Restore Separation
+    # v17 fallback: Q/K/V separate without knowledge tracking
     elif hasattr(router, 'usage_ema_feature_q'):
         ema_fq = router.usage_ema_feature_q
         ema_fk = router.usage_ema_feature_k
@@ -789,10 +754,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
         dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
 
-        # Excitability
-        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
-
-        lines.append(f"         Excitability | w={exc_w:.4f} | Active FQ/FK/FV:{int(active_fq)}/{n_fq},{int(active_fk)}/{n_fk},{int(active_fv)}/{n_fv}")
+        lines.append(f"         Neuron Usage | Active FQ/FK/FV:{int(active_fq)}/{n_fq},{int(active_fk)}/{n_fk},{int(active_fv)}/{n_fv}")
         lines.append(f"             Active RQ/RK/RV:{int(active_rq)}/{n_rq},{int(active_rk)}/{n_rk},{int(active_rv)}/{n_rv}")
         lines.append(f"             Gini FQ/FK/FV: {gini_fq:.2f}/{gini_fk:.2f}/{gini_fv:.2f} | RQ/RK/RV: {gini_rq:.2f}/{gini_rk:.2f}/{gini_rv:.2f}")
         lines.append(f"             Dead FQ/FK/FV: {dead_fq:.1%}/{dead_fk:.1%}/{dead_fv:.1%} | RQ/RK/RV: {dead_rq:.1%}/{dead_rk:.1%}/{dead_rv:.1%}")
@@ -840,10 +802,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
         dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
 
-        # Excitability
-        exc_w = router.excitability_weight.item() if hasattr(router, 'excitability_weight') else 1.0
-
-        lines.append(f"         Excitability | w={exc_w:.4f} | Active FQ/FK/FV:{int(active_fq)}/{n_fq},{int(active_fk)}/{n_fk},{int(active_fv)}/{n_fv}")
+        lines.append(f"         Neuron Usage | Active FQ/FK/FV:{int(active_fq)}/{n_fq},{int(active_fk)}/{n_fk},{int(active_fv)}/{n_fv}")
         lines.append(f"             Active RQ/RK/RV:{int(active_rq)}/{n_rq},{int(active_rk)}/{n_rk},{int(active_rv)}/{n_rv}")
         lines.append(f"             Gini FQ/FK/FV: {gini_fq:.2f}/{gini_fk:.2f}/{gini_fv:.2f} | RQ/RK/RV: {gini_rq:.2f}/{gini_rk:.2f}/{gini_rv:.2f}")
         lines.append(f"             Dead FQ/FK/FV: {dead_fq:.1%}/{dead_fk:.1%}/{dead_fv:.1%} | RQ/RK/RV: {dead_rq:.1%}/{dead_rk:.1%}/{dead_rv:.1%}")
@@ -856,77 +815,6 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
             gini_K = _gini(ema_K)
             dead_K = (ema_K < DEAD_NEURON_THRESHOLD).float().mean().item()
             lines.append(f"             Knowledge: Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f}")
-
-    # v16.0/16.1/16.2: Split Feature R/V with Excitability
-    elif hasattr(router, 'usage_ema_feature_r'):
-        ema_QK = router.usage_ema_feature_r
-        ema_V = router.usage_ema_feature_v
-        ema_R = router.usage_ema_relational
-        ema_Val = router.usage_ema_value
-
-        # Active neuron counts
-        active_QK = (ema_QK > 0.01).sum().item()
-        active_V = (ema_V > 0.01).sum().item()
-        active_R = (ema_R > 0.01).sum().item()
-        active_Val = (ema_Val > 0.01).sum().item()
-        n_QK, n_V, n_R, n_Val = ema_QK.numel(), ema_V.numel(), ema_R.numel(), ema_Val.numel()
-
-        # Gini coefficients
-        gini_QK, gini_V = _gini(ema_QK), _gini(ema_V)
-        gini_R, gini_Val = _gini(ema_R), _gini(ema_Val)
-
-        # Excitability
-        tau = router.tau if hasattr(router, 'tau') else 1.5
-
-        # Per-neuron excitability weights (v16.1)
-        if hasattr(router, 'excitability_weight_fr'):
-            w_fr = router.excitability_weight_fr
-            w_fv = router.excitability_weight_fv
-            w_r = router.excitability_weight_r
-            w_v = router.excitability_weight_v
-            w_fr_stats = f"[{w_fr.min().item():.2f},{w_fr.mean().item():.2f},{w_fr.max().item():.2f}]"
-            w_fv_stats = f"[{w_fv.min().item():.2f},{w_fv.mean().item():.2f},{w_fv.max().item():.2f}]"
-            w_r_stats = f"[{w_r.min().item():.2f},{w_r.mean().item():.2f},{w_r.max().item():.2f}]"
-            w_v_stats = f"[{w_v.min().item():.2f},{w_v.mean().item():.2f},{w_v.max().item():.2f}]"
-        else:
-            # Old scalar weight (backwards compat)
-            weight = router.excitability_weight.item() if hasattr(router, 'excitability_weight') and hasattr(router.excitability_weight, 'item') else 1.0
-            w_fr_stats = w_fv_stats = w_r_stats = w_v_stats = f"{weight:.3f}"
-
-        exc_QK = torch.clamp(1.0 - ema_QK / tau, min=0.0, max=1.0)
-        exc_V = torch.clamp(1.0 - ema_V / tau, min=0.0, max=1.0)
-
-        # Excitability distribution (usage-based)
-        min_exc_QK, max_exc_QK, mean_exc_QK = exc_QK.min().item(), exc_QK.max().item(), exc_QK.mean().item()
-        min_exc_V, max_exc_V, mean_exc_V = exc_V.min().item(), exc_V.max().item(), exc_V.mean().item()
-
-        # Dead neuron ratios
-        dead_FR = (ema_QK < DEAD_NEURON_THRESHOLD).float().mean().item()
-        dead_FV = (ema_V < DEAD_NEURON_THRESHOLD).float().mean().item()
-        dead_R = (ema_R < DEAD_NEURON_THRESHOLD).float().mean().item()
-        dead_Val = (ema_Val < DEAD_NEURON_THRESHOLD).float().mean().item()
-
-        lines.append(f"         Excitability | τ={tau:.1f} | Active FR/FV:{int(active_QK)}/{n_QK},{int(active_V)}/{n_V} R/V:{int(active_R)}/{n_R},{int(active_Val)}/{n_Val}")
-        lines.append(f"             Gini FR/FV:{gini_QK:.2f}/{gini_V:.2f} R/V:{gini_R:.2f}/{gini_Val:.2f}")
-        lines.append(f"             Dead FR/FV/R/V: {dead_FR:.2%}/{dead_FV:.2%}/{dead_R:.2%}/{dead_Val:.2%}")
-        lines.append(f"             Weight FR:{w_fr_stats} FV:{w_fv_stats} R:{w_r_stats} V:{w_v_stats}")
-
-        # Knowledge neurons (if available)
-        if hasattr(router, 'usage_ema_knowledge'):
-            ema_K = router.usage_ema_knowledge
-            active_K = (ema_K > 0.01).sum().item()
-            n_K = ema_K.numel()
-            gini_K = _gini(ema_K)
-            dead_K = (ema_K < DEAD_NEURON_THRESHOLD).float().mean().item()
-
-            # K weight
-            if hasattr(router, 'excitability_weight_k'):
-                w_k = router.excitability_weight_k
-                w_k_stats = f"[{w_k.min().item():.2f},{w_k.mean().item():.2f},{w_k.max().item():.2f}]"
-            else:
-                w_k_stats = w_fr_stats  # fallback
-
-            lines.append(f"             Knowledge (K): Active {int(active_K)}/{n_K} | Dead:{dead_K:.1%} | Gini:{gini_K:.2f} | W:{w_k_stats}")
 
     return lines
 
@@ -975,9 +863,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         step = local_step + start_step
 
         input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
 
         # CLM: labels = input_ids (model does shift internally)
+        # Set padding positions to -100 so they're ignored in loss
         labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
 
         optimizer.zero_grad()
 
@@ -987,11 +878,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
 
-                # v10: DAWN model forward
+                # DAWN model forward
                 if load_balance_weight > 0 or entropy_weight > 0 or needs_routing_info(model):
-                    ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                    ce_loss, logits, routing_infos = model(input_ids, labels, attention_mask=attention_mask, return_routing_info=True)
                 else:
-                    ce_loss, logits = model(input_ids, labels)
+                    ce_loss, logits = model(input_ids, labels, attention_mask=attention_mask)
                     routing_infos = None
 
                 # Orthogonality loss
@@ -1040,11 +931,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Non-AMP training (CPU or no CUDA)
             base_model = get_underlying_model(model)
 
-            # v10: DAWN model forward
+            # DAWN model forward
             if load_balance_weight > 0 or entropy_weight > 0 or needs_routing_info(model):
-                ce_loss, logits, routing_infos = model(input_ids, labels, return_routing_info=True)
+                ce_loss, logits, routing_infos = model(input_ids, labels, attention_mask=attention_mask, return_routing_info=True)
             else:
-                ce_loss, logits = model(input_ids, labels)
+                ce_loss, logits = model(input_ids, labels, attention_mask=attention_mask)
                 routing_infos = None
 
             # Orthogonality loss
@@ -1093,21 +984,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         # Increment global step counter
         global_step += 1
-
-        # Decay excitability weight each training step
-        # This happens here (not in model.forward) so inference doesn't trigger decay
-        # excitability_weight decays exponentially: w *= decay_rate (~0.99995)
-        router = None
-        if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):
-            router = base_model.router.neuron_router
-        elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
-            router = base_model.global_routers.neuron_router
-
-        if router is not None:
-            if hasattr(router, 'update_excitability_weight'):
-                router.update_excitability_weight()
-            elif hasattr(router, 'decay_excitability'):
-                router.decay_excitability()
 
         # Accuracy calculation (CLM: shifted)
         shift_logits = logits[:, :-1, :].contiguous()
@@ -1411,14 +1287,24 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
             if batch_idx >= max_batches:
                 break
             input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
 
             # CLM evaluation
-            logits = eval_model(input_ids)
+            logits = eval_model(input_ids, attention_mask=attention_mask)
+
+            # Create labels with padding masked
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
 
             # Shift for autoregressive loss
             B, S, V = logits.shape
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous().long()  # Ensure Long type for cross_entropy
+            shift_labels = labels[:, 1:].contiguous().long()  # Ensure Long type for cross_entropy
+
+            # Count valid (non-padding) tokens for proper averaging
+            valid_mask = (shift_labels != -100)
+            valid_tokens = valid_mask.sum().item()
+
             loss = F.cross_entropy(
                 shift_logits.view(-1, V),
                 shift_labels.view(-1),
@@ -1427,19 +1313,16 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
 
             # Accuracy calculation
             predictions = shift_logits.argmax(dim=-1)
-            valid_mask = (shift_labels != -100)
             correct_predictions = (predictions == shift_labels) & valid_mask
 
             correct = correct_predictions.sum().item()
-            valid_tokens = valid_mask.sum().item()
 
             total_correct += correct
             total_valid_tokens += valid_tokens
 
-            batch_size, seq_len = input_ids.shape
-            num_tokens = batch_size * seq_len
-            total_loss += loss.item() * num_tokens
-            total_tokens += num_tokens
+            # Use valid tokens for loss averaging
+            total_loss += loss.item() * valid_tokens
+            total_tokens += valid_tokens
 
     avg_loss = total_loss / total_tokens
     avg_acc = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
@@ -1568,6 +1451,12 @@ def main():
 
     cfg = load_config(config_path)
 
+    # Set random seed if specified
+    seed = cfg.get('seed', None)
+    if seed is not None:
+        set_seed(seed)
+        print(f"🎲 Random seed set to {seed}")
+
     # Create args namespace from config
     class Args:
         pass
@@ -1616,11 +1505,6 @@ def main():
     # Unified router parameters
     args.d_space = cfg['model'].get('d_space', 64)
     args.router_dropout = cfg['model'].get('router_dropout', 0.1)
-    args.excitability_tau = cfg['model'].get('excitability_tau', 1.5)
-    args.excitability_ema_alpha = cfg['model'].get('excitability_ema_alpha', 0.01)
-    args.excitability_decay_rate = cfg['model'].get('excitability_decay_rate', 0.99995)
-    args.langevin_alpha = cfg['model'].get('langevin_alpha', 0.0003)
-    args.langevin_beta = cfg['model'].get('langevin_beta', 0.0006)
 
     # Load all version-specific model params from VERSION_REGISTRY
     load_model_params_to_args(args, cfg['model'])
@@ -1832,7 +1716,7 @@ def main():
     # STEP 2: Print configuration summary (using updated args)
     # ============================================================
     print(f"\n{'='*60}")
-    model_version = getattr(args, 'model_version', '9.0')
+    model_version = getattr(args, 'model_version', '17.1')
     if model_version == 'baseline':
         print(f"Vanilla Transformer Baseline Training")
     else:
@@ -1920,10 +1804,6 @@ def main():
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Number of layers: {args.n_layers}")
-    if hasattr(args, 'excitability_tau'):
-        print(f"  Excitability: tau={args.excitability_tau}, ema_alpha={args.excitability_ema_alpha}")
-    if hasattr(args, 'langevin_alpha') and model_version == '16.1':
-        print(f"  Langevin: α={args.langevin_alpha}, β={args.langevin_beta}")
 
     # Optimizer
     optimizer = torch.optim.AdamW(

@@ -1,5 +1,7 @@
-# DAWN v17.2 Training Config - 20M Scale, 5B tokens
-# Feature QK unified + Restore Q/K separate
+# DAWN v17.1 Training Config - 20M Scale, 5B tokens (Seed 4)
+# Q/K shared pool + Knowledge Feature-Restore pattern
+
+seed: 4
 
 data:
   base_dir: /content/drive/MyDrive/data
@@ -20,14 +22,14 @@ data:
   max_val_tokens: 2000000
 
 model:
-  model_version: "17.2"
+  model_version: "17.1"
   d_model: 384
   n_layers: 12
   n_heads: 6
   rank: 64
   state_dim: 64
 
-  # Attention - Feature QK unified, Restore Q/K separate
+  # Attention - Q/K shared pool
   n_feature_qk: 120
   n_feature_v: 24
   top_k_feature_qk: 20
@@ -66,26 +68,5 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.2_20M_c4_5B
-log_dir: /content/drive/MyDrive/dawn/logs_v17.2_20M_c4_5B
-
-# v17.2 Architecture (Feature QK Unified + Restore Q/K Separate)
-#
-#   Motivation: v17.1 Feature_K entropy collapsed to 0
-#   Solution: Unify Feature routing for Q/K, separate only Restore
-#
-#   Attention Circuit:
-#   - Feature_QK=120 (k=20): unified compression for Q and K
-#   - Feature_V=24 (k=6): V compression
-#   - Restore_QK=120 (k=20): separate Q/K restoration
-#   - Restore_V=24 (k=6): V restoration
-#
-#   Knowledge Circuit (unchanged):
-#   - Feature_Know=24 (k=4): [24, 384, 128] compression
-#   - Restore_Know=24 (k=4): [24, 128, 384] restoration
-#
-#   Routing paths:
-#   - Q: x -> Feature_QK -> h_qk -> Restore_Q -> Q
-#   - K: x -> Feature_QK -> h_qk -> Restore_K -> K (shared feature, separate restore)
-#   - V: x -> Feature_V -> h_v -> Restore_V -> V
-#   - Know: x -> Feature_Know -> h -> Restore_Know -> output
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_5B_seed4
+log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_5B_seed4
