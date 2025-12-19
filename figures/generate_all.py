@@ -5,17 +5,17 @@ Generate All Paper Figures
 Single command to generate all figures for the DAWN paper.
 
 Usage:
-    # Generate all figures (architecture, pathway, efficiency, routing):
+    # Generate fig1-4 only:
     python figures/generate_all.py
 
-    # Include training curves (requires checkpoint paths):
-    python figures/generate_all.py \\
-        --dawn_ckpt path/to/dawn/run \\
-        --vanilla_22m_ckpt path/to/vanilla_22m/run \\
-        --vanilla_108m_ckpt path/to/vanilla_108m/run
-
-    # Demo mode for all figures including loss curve:
+    # Include fig5 with demo data:
     python figures/generate_all.py --demo
+
+    # Include fig5 with actual log files:
+    python figures/generate_all.py \\
+        --dawn_log path/to/dawn/training_log.txt \\
+        --vanilla_22m_log path/to/vanilla_22m/training_log.txt \\
+        --vanilla_108m_log path/to/vanilla_108m/training_log.txt
 
     # Generate and zip for download:
     python figures/generate_all.py --demo --zip
@@ -25,7 +25,7 @@ Output:
     figures/fig2_feature_restore.pdf
     figures/fig3_param_efficiency.pdf
     figures/fig4_routing_stats.pdf
-    figures/fig5_loss_curve.pdf (if --demo or checkpoint paths provided)
+    figures/fig5_loss_curve.pdf (if --demo or log paths provided)
 """
 
 import subprocess
@@ -48,6 +48,8 @@ def run_script(script_name, extra_args=None):
 
     print(f"\n{'='*60}")
     print(f"Running: {script_name}")
+    if extra_args:
+        print(f"Args: {' '.join(extra_args)}")
     print('='*60)
 
     result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
@@ -74,35 +76,40 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic figures only:
+    # Basic figures only (fig1-4):
     python figures/generate_all.py
 
-    # All figures with training curves (3 models):
-    python figures/generate_all.py \\
-        --dawn_ckpt /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_5B/run_v17.1_20251217_172040_8948 \\
-        --vanilla_22m_ckpt /content/drive/MyDrive/dawn/logs_baseline_22M_c4_5B/run_vbaseline_20251210_134902_4447 \\
-        --vanilla_108m_ckpt /content/drive/MyDrive/dawn/logs_baseline_125M_c4_5B/run_vbaseline_20251216_220530_1907
-
-    # Demo mode (synthetic data for loss curves):
+    # All figures with demo loss curves:
     python figures/generate_all.py --demo
 
-    # Generate and zip for download:
+    # All figures with actual training logs:
+    python figures/generate_all.py \\
+        --dawn_log /content/drive/MyDrive/dawn/logs_v17.1/training_log.txt \\
+        --vanilla_22m_log /content/drive/MyDrive/dawn/logs_baseline_22M/training_log.txt \\
+        --vanilla_108m_log /content/drive/MyDrive/dawn/logs_baseline_125M/training_log.txt
+
+    # Generate and zip:
     python figures/generate_all.py --demo --zip
         """
     )
 
-    parser.add_argument('--dawn_ckpt', type=str,
-                       help='DAWN checkpoint/log directory (for fig5)')
-    parser.add_argument('--vanilla_22m_ckpt', type=str,
-                       help='Vanilla-22M checkpoint/log directory (for fig5)')
-    parser.add_argument('--vanilla_108m_ckpt', type=str,
-                       help='Vanilla-108M checkpoint/log directory (for fig5)')
+    # Fig5 options - direct log file paths
+    parser.add_argument('--dawn_log', type=str,
+                       help='DAWN training_log.txt path (for fig5)')
+    parser.add_argument('--vanilla_22m_log', type=str,
+                       help='Vanilla-22M training_log.txt path (for fig5)')
+    parser.add_argument('--vanilla_108m_log', type=str,
+                       help='Vanilla-108M training_log.txt path (for fig5)')
     parser.add_argument('--demo', action='store_true',
                        help='Use demo data for fig5 loss curves')
+
+    # General options
     parser.add_argument('--skip', nargs='+', default=[],
                        help='Skip specific figures (e.g., --skip fig1 fig2)')
     parser.add_argument('--zip', action='store_true',
                        help='Create zip file of all figures after generation')
+    parser.add_argument('--no_annotations', action='store_true',
+                       help='Disable annotations on fig5')
 
     args = parser.parse_args()
 
@@ -129,29 +136,35 @@ Examples:
 
     # Figure 5: Loss Curves (optional)
     if 'fig5' not in args.skip:
+        fig5_args = []
+
         if args.demo:
-            results['fig5'] = run_script('fig5_loss_curve.py', ['--demo'])
-        elif args.dawn_ckpt or args.vanilla_22m_ckpt or args.vanilla_108m_ckpt:
-            fig5_args = []
-            ckpts = []
+            fig5_args.append('--demo')
+        elif args.dawn_log or args.vanilla_22m_log or args.vanilla_108m_log:
+            logs = []
             labels = []
 
-            if args.dawn_ckpt:
-                ckpts.append(args.dawn_ckpt)
+            if args.dawn_log:
+                logs.append(args.dawn_log)
                 labels.append('DAWN-24M')
-            if args.vanilla_22m_ckpt:
-                ckpts.append(args.vanilla_22m_ckpt)
+            if args.vanilla_22m_log:
+                logs.append(args.vanilla_22m_log)
                 labels.append('Vanilla-22M')
-            if args.vanilla_108m_ckpt:
-                ckpts.append(args.vanilla_108m_ckpt)
+            if args.vanilla_108m_log:
+                logs.append(args.vanilla_108m_log)
                 labels.append('Vanilla-108M')
 
-            if ckpts:
-                fig5_args.extend(['--checkpoints'] + ckpts)
+            if logs:
+                fig5_args.extend(['--logs'] + logs)
                 fig5_args.extend(['--labels'] + labels)
-                results['fig5'] = run_script('fig5_loss_curve.py', fig5_args)
+
+        if args.no_annotations:
+            fig5_args.append('--no_annotations')
+
+        if fig5_args:
+            results['fig5'] = run_script('fig5_loss_curve.py', fig5_args)
         else:
-            print("\n[fig5] Skipped: No checkpoint paths or --demo flag provided")
+            print("\n[fig5] Skipped: No --demo or log paths provided")
 
     # Summary
     print(f"\n{'='*60}")
