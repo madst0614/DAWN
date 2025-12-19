@@ -355,7 +355,7 @@ def main():
     model = model.to(args.device)
 
     # Use batch-level routing (same as training) + 512 padding for stable importance
-    model.router.token_routing = False
+    model.router.attention_token_routing = False
     model.router.knowledge_token_routing = False
 
     model.eval()

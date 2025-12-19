@@ -325,7 +325,7 @@ class GlobalRouters(nn.Module):
                  top_k_feature_qk: int = 8, top_k_feature_v: int = 8,
                  top_k_restore_qk: int = 8, top_k_restore_v: int = 8,
                  top_k_feature_know: int = 4, top_k_restore_know: int = 4,
-                 d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False,
+                 d_space: int = 64, router_dropout: float = 0.1, attention_token_routing: bool = False,
                  knowledge_token_routing: bool = False, **kwargs):
         super().__init__()
         self.d_model = d_model
@@ -341,7 +341,7 @@ class GlobalRouters(nn.Module):
         self.top_k_restore_v = top_k_restore_v
         self.top_k_feature_know = top_k_feature_know
         self.top_k_restore_know = top_k_restore_know
-        self.token_routing = token_routing
+        self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
 
         self.neuron_router = UnifiedNeuronRouter(
@@ -399,7 +399,7 @@ class GlobalRouters(nn.Module):
             aux_loss += ((usage_rqk_K - target_rqk) ** 2).sum() * self.n_restore_qk
             aux_loss += ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
 
-        if self.token_routing:
+        if self.attention_token_routing:
             fqk_weights_Q = fqk_pref_Q
             fqk_weights_K = fqk_pref_K
             fv_weights = fv_pref
@@ -745,7 +745,7 @@ class DAWN(nn.Module):
         knowledge_rank: int = 128,
         # Others
         dropout: float = 0.1,
-        token_routing: bool = False,
+        attention_token_routing: bool = False,
         knowledge_token_routing: bool = False,
         router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
@@ -780,7 +780,7 @@ class DAWN(nn.Module):
         self.state_dim = state_dim
         self.d_space = d_space
         self.dropout_rate = dropout
-        self.token_routing = token_routing
+        self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
         self.router_dropout = router_dropout
         self.gradient_checkpointing = gradient_checkpointing
@@ -829,7 +829,7 @@ class DAWN(nn.Module):
             top_k_feature_qk=top_k_feature_qk, top_k_feature_v=top_k_feature_v,
             top_k_restore_qk=top_k_restore_qk, top_k_restore_v=top_k_restore_v,
             top_k_feature_know=top_k_feature_know, top_k_restore_know=top_k_restore_know,
-            d_space=d_space, router_dropout=router_dropout, token_routing=token_routing,
+            d_space=d_space, router_dropout=router_dropout, attention_token_routing=attention_token_routing,
             knowledge_token_routing=knowledge_token_routing,
         )
 
@@ -872,9 +872,14 @@ class DAWN(nn.Module):
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
         x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
 
-        importance, context, raw_importance = self.global_ssm(x, attention_mask)
-        if context is not None:
-            x = x + context
+        # SSM only needed for batch-level routing (importance weighting)
+        if self.attention_token_routing:
+            importance = None
+            context = None
+        else:
+            importance, context, raw_importance = self.global_ssm(x, attention_mask)
+            if context is not None:
+                x = x + context
 
         routing_infos = []
         total_aux_loss = 0.0
@@ -945,7 +950,7 @@ class DAWN(nn.Module):
             f"",
             f"  [Router]",
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
-            f"  token_routing={self.token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
+            f"  attention_token_routing={self.attention_token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
             f"  use_ssm_context={self.use_ssm_context}",
             f"",
             f"  [Other]",
