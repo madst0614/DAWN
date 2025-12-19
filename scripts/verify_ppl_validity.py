@@ -339,6 +339,11 @@ def main():
         model.load_state_dict(ckpt)
 
     model = model.to(args.device)
+
+    # Enable token-level routing for generation (important for inference quality)
+    model.router.token_routing = True
+    model.router.knowledge_token_routing = True
+
     model.eval()
 
     param_count = sum(p.numel() for p in model.parameters()) / 1e6
