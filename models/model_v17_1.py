@@ -387,11 +387,13 @@ class GlobalRouters(nn.Module):
             d_space=d_space, dropout=router_dropout, **kwargs
         )
 
-    def _topk_select(self, weights, k):
-        """Index-based selection - returns normalized vals and indices only (no sparse matrix)"""
+    def _topk_sparsify(self, weights, k):
+        """Apply top-k sparsification with normalization"""
         topk_vals, topk_idx = torch.topk(weights, k, dim=-1)
-        topk_vals = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-8)
-        return topk_vals, topk_idx
+        sparse_weights = torch.zeros_like(weights)
+        sparse_weights.scatter_(-1, topk_idx, topk_vals)
+        sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        return sparse_weights, topk_idx
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         (fqk_logits_Q, fqk_logits_K, fv_logits,
@@ -436,34 +438,21 @@ class GlobalRouters(nn.Module):
             aux_loss += ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
 
         if self.attention_token_routing:
-            # Token-level routing with index-based selection (no sparse matrix)
-            fqk_vals_Q, fqk_idx_Q = self._topk_select(fqk_pref_Q, self.top_k_feature_qk)
-            fqk_vals_K, fqk_idx_K = self._topk_select(fqk_pref_K, self.top_k_feature_qk)
-            fv_vals, fv_idx = self._topk_select(fv_pref, self.top_k_feature_v)
-            rqk_vals_Q, rqk_idx_Q = self._topk_select(rqk_pref_Q, self.top_k_restore_qk)
-            rqk_vals_K, rqk_idx_K = self._topk_select(rqk_pref_K, self.top_k_restore_qk)
-            rv_vals, rv_idx = self._topk_select(rv_pref, self.top_k_restore_v)
-
-            # Pack as dict for gather-based attention circuit
-            attn_routing = {
-                'fqk_Q': (fqk_vals_Q, fqk_idx_Q),
-                'fqk_K': (fqk_vals_K, fqk_idx_K),
-                'fv': (fv_vals, fv_idx),
-                'rqk_Q': (rqk_vals_Q, rqk_idx_Q),
-                'rqk_K': (rqk_vals_K, rqk_idx_K),
-                'rv': (rv_vals, rv_idx),
-                'token_routing': True,
-            }
+            # Token-level routing: apply top-k sparsification per token
+            fqk_weights_Q, _ = self._topk_sparsify(fqk_pref_Q, self.top_k_feature_qk)
+            fqk_weights_K, _ = self._topk_sparsify(fqk_pref_K, self.top_k_feature_qk)
+            fv_weights, _ = self._topk_sparsify(fv_pref, self.top_k_feature_v)
+            rqk_weights_Q, _ = self._topk_sparsify(rqk_pref_Q, self.top_k_restore_qk)
+            rqk_weights_K, _ = self._topk_sparsify(rqk_pref_K, self.top_k_restore_qk)
+            rv_weights, _ = self._topk_sparsify(rv_pref, self.top_k_restore_v)
 
             routing_info = {
-                'fqk_weights_Q': fqk_vals_Q.detach(),  # [B, S, k] for logging
-                'fqk_weights_K': fqk_vals_K.detach(),
-                'fv_weights': fv_vals.detach(),
-                'rqk_weights_Q': rqk_vals_Q.detach(),
-                'rqk_weights_K': rqk_vals_K.detach(),
-                'rv_weights': rv_vals.detach(),
-                'fqk_idx_Q': fqk_idx_Q.detach(),
-                'fqk_idx_K': fqk_idx_K.detach(),
+                'fqk_weights_Q': fqk_weights_Q.detach(),
+                'fqk_weights_K': fqk_weights_K.detach(),
+                'fv_weights': fv_weights.detach(),
+                'rqk_weights_Q': rqk_weights_Q.detach(),
+                'rqk_weights_K': rqk_weights_K.detach(),
+                'rv_weights': rv_weights.detach(),
                 'fqk_q_pref': fqk_pref_Q.detach(),
                 'fqk_k_pref': fqk_pref_K.detach(),
                 'fv_pref': fv_pref.detach(),
@@ -474,7 +463,6 @@ class GlobalRouters(nn.Module):
             }
         else:
             # Causal cumulative routing: position t uses importance[0:t+1] weighted average
-            # This ensures no future information leakage while using context
             B, S = importance.shape
 
             imp = importance.unsqueeze(-1)  # [B, S, 1]
@@ -485,51 +473,33 @@ class GlobalRouters(nn.Module):
             fqk_pref_stacked = torch.stack([fqk_pref_Q, fqk_pref_K], dim=0)  # [2, B, S, N]
             fqk_weighted = imp.unsqueeze(0) * fqk_pref_stacked  # [2, B, S, N]
             fqk_cumsum = torch.cumsum(fqk_weighted, dim=2) / cumsum_imp.unsqueeze(0)  # [2, B, S, N]
+            fqk_weights_Q_soft, fqk_weights_K_soft = fqk_cumsum[0], fqk_cumsum[1]
 
             # Restore_QK (N=n_restore_qk): Q, K
             rqk_pref_stacked = torch.stack([rqk_pref_Q, rqk_pref_K], dim=0)
             rqk_weighted = imp.unsqueeze(0) * rqk_pref_stacked
             rqk_cumsum = torch.cumsum(rqk_weighted, dim=2) / cumsum_imp.unsqueeze(0)
+            rqk_weights_Q_soft, rqk_weights_K_soft = rqk_cumsum[0], rqk_cumsum[1]
 
             # V neurons (different N, can't batch together)
-            fv_soft = torch.cumsum(imp * fv_pref, dim=1) / cumsum_imp
-            rv_soft = torch.cumsum(imp * rv_pref, dim=1) / cumsum_imp
+            fv_weights_soft = torch.cumsum(imp * fv_pref, dim=1) / cumsum_imp
+            rv_weights_soft = torch.cumsum(imp * rv_pref, dim=1) / cumsum_imp
 
-            # Batched top-k: same k together (6→3 operations)
-            # Feature_QK: [2, B, S, N] -> [2, B, S, k]
-            fqk_vals, fqk_idx = torch.topk(fqk_cumsum, self.top_k_feature_qk, dim=-1)
-            fqk_vals = fqk_vals / (fqk_vals.sum(dim=-1, keepdim=True) + 1e-8)
-            fqk_vals_Q, fqk_vals_K = fqk_vals[0], fqk_vals[1]
-            fqk_idx_Q, fqk_idx_K = fqk_idx[0], fqk_idx[1]
-
-            # Restore_QK: [2, B, S, N] -> [2, B, S, k]
-            rqk_vals, rqk_idx = torch.topk(rqk_cumsum, self.top_k_restore_qk, dim=-1)
-            rqk_vals = rqk_vals / (rqk_vals.sum(dim=-1, keepdim=True) + 1e-8)
-            rqk_vals_Q, rqk_vals_K = rqk_vals[0], rqk_vals[1]
-            rqk_idx_Q, rqk_idx_K = rqk_idx[0], rqk_idx[1]
-
-            # V neurons (individual)
-            fv_vals, fv_idx = self._topk_select(fv_soft, self.top_k_feature_v)
-            rv_vals, rv_idx = self._topk_select(rv_soft, self.top_k_restore_v)
-
-            # Return unified dict format (same as token-level)
-            attn_routing = {
-                'fqk_Q': (fqk_vals_Q, fqk_idx_Q),
-                'fqk_K': (fqk_vals_K, fqk_idx_K),
-                'fv': (fv_vals, fv_idx),
-                'rqk_Q': (rqk_vals_Q, rqk_idx_Q),
-                'rqk_K': (rqk_vals_K, rqk_idx_K),
-                'rv': (rv_vals, rv_idx),
-                'token_routing': False,  # Batch-level routing
-            }
+            # Apply top-k sparsification
+            fqk_weights_Q, _ = self._topk_sparsify(fqk_weights_Q_soft, self.top_k_feature_qk)
+            fqk_weights_K, _ = self._topk_sparsify(fqk_weights_K_soft, self.top_k_feature_qk)
+            fv_weights, _ = self._topk_sparsify(fv_weights_soft, self.top_k_feature_v)
+            rqk_weights_Q, _ = self._topk_sparsify(rqk_weights_Q_soft, self.top_k_restore_qk)
+            rqk_weights_K, _ = self._topk_sparsify(rqk_weights_K_soft, self.top_k_restore_qk)
+            rv_weights, _ = self._topk_sparsify(rv_weights_soft, self.top_k_restore_v)
 
             routing_info = {
-                'fqk_vals_Q': fqk_vals_Q.detach(),
-                'fqk_vals_K': fqk_vals_K.detach(),
-                'fv_vals': fv_vals.detach(),
-                'rqk_vals_Q': rqk_vals_Q.detach(),
-                'rqk_vals_K': rqk_vals_K.detach(),
-                'rv_vals': rv_vals.detach(),
+                'fqk_weights_Q': fqk_weights_Q.detach(),
+                'fqk_weights_K': fqk_weights_K.detach(),
+                'fv_weights': fv_weights.detach(),
+                'rqk_weights_Q': rqk_weights_Q.detach(),
+                'rqk_weights_K': rqk_weights_K.detach(),
+                'rv_weights': rv_weights.detach(),
                 'fqk_q_pref': fqk_pref_Q.detach(),
                 'fqk_k_pref': fqk_pref_K.detach(),
                 'fv_pref': fv_pref.detach(),
@@ -539,17 +509,15 @@ class GlobalRouters(nn.Module):
             }
 
         # Update usage (Q/K separately for independent excitability)
-        # Both token-level and batch-level now use index-based format
         if self.training:
-            self.neuron_router.update_usage(fqk_vals_Q, 'feature_q', attention_mask, fqk_idx_Q)
-            self.neuron_router.update_usage(fqk_vals_K, 'feature_k', attention_mask, fqk_idx_K)
-            self.neuron_router.update_usage(fv_vals, 'feature_v', attention_mask, fv_idx)
-            self.neuron_router.update_usage(rqk_vals_Q, 'restore_q', attention_mask, rqk_idx_Q)
-            self.neuron_router.update_usage(rqk_vals_K, 'restore_k', attention_mask, rqk_idx_K)
-            self.neuron_router.update_usage(rv_vals, 'restore_v', attention_mask, rv_idx)
+            self.neuron_router.update_usage(fqk_weights_Q, 'feature_q', attention_mask)
+            self.neuron_router.update_usage(fqk_weights_K, 'feature_k', attention_mask)
+            self.neuron_router.update_usage(fv_weights, 'feature_v', attention_mask)
+            self.neuron_router.update_usage(rqk_weights_Q, 'restore_q', attention_mask)
+            self.neuron_router.update_usage(rqk_weights_K, 'restore_k', attention_mask)
+            self.neuron_router.update_usage(rv_weights, 'restore_v', attention_mask)
 
-        # Both modes return unified dict format
-        return attn_routing, routing_info, aux_loss
+        return fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, routing_info, aux_loss
 
     def get_knowledge_weights(self, x, importance, attention_mask=None):
         """Knowledge neuron routing - Feature/Restore separation"""
@@ -559,9 +527,9 @@ class GlobalRouters(nn.Module):
         pref_r = F.softmax(logits_r, dim=-1)  # [B, S, n]
 
         if self.knowledge_token_routing:
-            # Token-level: index-based selection (no sparse matrix)
-            feat_vals, feat_idx = self._topk_select(pref_f, self.top_k_feature_know)
-            rest_vals, rest_idx = self._topk_select(pref_r, self.top_k_restore_know)
+            # Token-level: apply top-k sparsification per token
+            feature_know_w, _ = self._topk_sparsify(pref_f, self.top_k_feature_know)
+            restore_know_w, _ = self._topk_sparsify(pref_r, self.top_k_restore_know)
         else:
             # Causal cumulative routing with batched operations
             imp = importance.unsqueeze(-1)  # [B, S, 1]
@@ -571,26 +539,17 @@ class GlobalRouters(nn.Module):
             pref_stacked = torch.stack([pref_f, pref_r], dim=0)  # [2, B, S, N]
             pref_weighted = imp.unsqueeze(0) * pref_stacked  # [2, B, S, N]
             pref_cumsum = torch.cumsum(pref_weighted, dim=2) / cumsum_imp.unsqueeze(0)  # [2, B, S, N]
+            feature_know_soft, restore_know_soft = pref_cumsum[0], pref_cumsum[1]
 
-            # Batched top-k (2→1 operation) - same k for feature and restore
-            k = self.top_k_feature_know  # Assumes top_k_feature_know == top_k_restore_know
-            vals, idx = torch.topk(pref_cumsum, k, dim=-1)  # [2, B, S, k]
-            vals = vals / (vals.sum(dim=-1, keepdim=True) + 1e-8)
-            feat_vals, rest_vals = vals[0], vals[1]
-            feat_idx, rest_idx = idx[0], idx[1]
-
-        # Unified dict format for both modes
-        know_routing = {
-            'feature': (feat_vals, feat_idx),
-            'restore': (rest_vals, rest_idx),
-            'token_routing': self.knowledge_token_routing,
-        }
+            # Apply top-k sparsification
+            feature_know_w, _ = self._topk_sparsify(feature_know_soft, self.top_k_feature_know)
+            restore_know_w, _ = self._topk_sparsify(restore_know_soft, self.top_k_restore_know)
 
         if self.training:
-            self.neuron_router.update_usage(feat_vals, 'feature_know', attention_mask, feat_idx)
-            self.neuron_router.update_usage(rest_vals, 'restore_know', attention_mask, rest_idx)
+            self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
+            self.neuron_router.update_usage(restore_know_w, 'restore_know', attention_mask)
 
-        return know_routing
+        return feature_know_w, restore_know_w
 
 
 class AttentionCircuit(nn.Module):
@@ -614,61 +573,44 @@ class AttentionCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, routing, attention_mask=None):
+    def forward(self, x, fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, attention_mask=None):
         """
-        Unified API: forward(x, attn_routing_dict, attention_mask=...)
-        routing: dict with 'fqk_Q', 'fqk_K', 'fv', 'rqk_Q', 'rqk_K', 'rv' keys
-                 each value is (vals, idx) tuple for index-based gather
+        Args:
+            x: [B, S, D] input
+            fqk_weights_Q/K: [B, S, N] sparse weights for feature Q/K neurons
+            fv_weights: [B, S, N] sparse weights for feature V neurons
+            rqk_weights_Q/K: [B, S, N] sparse weights for restore Q/K neurons
+            rv_weights: [B, S, N] sparse weights for restore V neurons
         """
         B, S, D = x.shape
         R = self.rank
 
-        # Unpack routing
-        fqk_vals_Q, fqk_idx_Q = routing['fqk_Q']
-        fqk_vals_K, fqk_idx_K = routing['fqk_K']
-        fv_vals, fv_idx = routing['fv']
-        rqk_vals_Q, rqk_idx_Q = routing['rqk_Q']
-        rqk_vals_K, rqk_idx_K = routing['rqk_K']
-        rv_vals, rv_idx = routing['rv']
+        # Get neuron counts from weight shapes
+        N_fqk = fqk_weights_Q.shape[2]
+        N_fv = fv_weights.shape[2]
+        N_rqk = rqk_weights_Q.shape[2]
+        N_rv = rv_weights.shape[2]
 
-        # Feature QK neurons: gather k neurons, weighted sum
-        fqk_neurons = self.shared_neurons.feature_qk_neurons  # [N, D, R]
-        k_fqk = fqk_idx_Q.shape[-1]
+        # Feature neurons: sparse matmul
+        fqk_flat = self.shared_neurons.feature_qk_neurons.view(N_fqk, D * R)
+        shared_fqk_Q = (fqk_weights_Q.view(B * S, N_fqk) @ fqk_flat).view(B, S, D, R)
+        shared_fqk_K = (fqk_weights_K.view(B * S, N_fqk) @ fqk_flat).view(B, S, D, R)
 
-        # Gather and weighted sum for Q
-        selected_fqk_Q = fqk_neurons[fqk_idx_Q.view(-1)].view(B, S, k_fqk, D, R)
-        shared_fqk_Q = (selected_fqk_Q * fqk_vals_Q.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)  # [B, S, D, R]
-
-        # Gather and weighted sum for K
-        selected_fqk_K = fqk_neurons[fqk_idx_K.view(-1)].view(B, S, k_fqk, D, R)
-        shared_fqk_K = (selected_fqk_K * fqk_vals_K.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
-
-        # Feature V neurons
-        fv_neurons = self.shared_neurons.feature_v_neurons  # [N, D, R]
-        k_fv = fv_idx.shape[-1]
-        selected_fv = fv_neurons[fv_idx.view(-1)].view(B, S, k_fv, D, R)
-        shared_fv = (selected_fv * fv_vals.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+        fv_flat = self.shared_neurons.feature_v_neurons.view(N_fv, D * R)
+        shared_fv = (fv_weights.view(B * S, N_fv) @ fv_flat).view(B, S, D, R)
 
         # x @ shared: einsum for efficiency
         h_q = torch.einsum('bsd,bsdr->bsr', x, shared_fqk_Q)
         h_k = torch.einsum('bsd,bsdr->bsr', x, shared_fqk_K)
         h_v = torch.einsum('bsd,bsdr->bsr', x, shared_fv)
 
-        # Restore QK neurons
-        rqk_neurons = self.shared_neurons.restore_qk_neurons  # [N, R, D]
-        k_rqk = rqk_idx_Q.shape[-1]
+        # Restore neurons: sparse matmul
+        rqk_flat = self.shared_neurons.restore_qk_neurons.view(N_rqk, R * D)
+        shared_rqk_Q = (rqk_weights_Q.view(B * S, N_rqk) @ rqk_flat).view(B, S, R, D)
+        shared_rqk_K = (rqk_weights_K.view(B * S, N_rqk) @ rqk_flat).view(B, S, R, D)
 
-        selected_rqk_Q = rqk_neurons[rqk_idx_Q.view(-1)].view(B, S, k_rqk, R, D)
-        shared_rqk_Q = (selected_rqk_Q * rqk_vals_Q.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
-
-        selected_rqk_K = rqk_neurons[rqk_idx_K.view(-1)].view(B, S, k_rqk, R, D)
-        shared_rqk_K = (selected_rqk_K * rqk_vals_K.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
-
-        # Restore V neurons
-        rv_neurons = self.shared_neurons.restore_v_neurons  # [N, R, D]
-        k_rv = rv_idx.shape[-1]
-        selected_rv = rv_neurons[rv_idx.view(-1)].view(B, S, k_rv, R, D)
-        shared_rv = (selected_rv * rv_vals.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+        rv_flat = self.shared_neurons.restore_v_neurons.view(N_rv, R * D)
+        shared_rv = (rv_weights.view(B * S, N_rv) @ rv_flat).view(B, S, R, D)
 
         # h @ shared: einsum
         Q = torch.einsum('bsr,bsrd->bsd', h_q, shared_rqk_Q)
@@ -727,34 +669,28 @@ class KnowledgeCircuit(nn.Module):
         self.top_k_restore_know = top_k_restore_know
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, routing, attention_mask=None):
+    def forward(self, x, feature_know_w, restore_know_w, attention_mask=None):
         """
-        Unified API: forward(x, know_routing_dict, attention_mask=...)
-        routing: dict with 'feature' and 'restore' keys
-                 each value is (vals, idx) tuple for index-based gather
+        Args:
+            x: [B, S, D] input
+            feature_know_w: [B, S, N] sparse weights for feature neurons
+            restore_know_w: [B, S, N] sparse weights for restore neurons
         """
         B, S, D = x.shape
         R = self.knowledge_rank
 
-        feat_vals, feat_idx = routing['feature']
-        rest_vals, rest_idx = routing['restore']
+        # Get neuron counts from weight shapes
+        N_f = feature_know_w.shape[2]
+        N_r = restore_know_w.shape[2]
 
-        # Feature neurons: gather and weighted sum
-        feat_neurons = self.shared_neurons.feature_know  # [N, D, R]
-        k_f = feat_idx.shape[-1]
-        selected_f = feat_neurons[feat_idx.view(-1)].view(B, S, k_f, D, R)
-        shared_f = (selected_f * feat_vals.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)  # [B, S, D, R]
-
-        # x @ shared_f: einsum
+        # Feature neurons: sparse matmul
+        f_flat = self.shared_neurons.feature_know.view(N_f, D * R)
+        shared_f = (feature_know_w.view(B * S, N_f) @ f_flat).view(B, S, D, R)
         h = torch.einsum('bsd,bsdr->bsr', x, shared_f)
 
-        # Restore neurons: gather and weighted sum
-        rest_neurons = self.shared_neurons.restore_know  # [N, R, D]
-        k_r = rest_idx.shape[-1]
-        selected_r = rest_neurons[rest_idx.view(-1)].view(B, S, k_r, R, D)
-        shared_r = (selected_r * rest_vals.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)  # [B, S, R, D]
-
-        # h @ shared_r: einsum
+        # Restore neurons: sparse matmul
+        r_flat = self.shared_neurons.restore_know.view(N_r, R * D)
+        shared_r = (restore_know_w.view(B * S, N_r) @ r_flat).view(B, S, R, D)
         output = torch.einsum('bsr,bsrd->bsd', h, shared_r)
 
         return self.dropout(output)
@@ -790,20 +726,21 @@ class DAWNBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x, importance, global_routers: GlobalRouters, attention_mask=None):
-        # Attention - unified dict API
+        # Attention
         normed_x = self.norm1(x)
-        attn_routing, attn_info, attn_aux_loss = global_routers.get_attention_weights(normed_x, importance, attention_mask)
-        attn_out, _ = self.attn(normed_x, attn_routing, attention_mask=attention_mask)
+        fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, attn_info, attn_aux_loss = global_routers.get_attention_weights(
+            normed_x, importance, attention_mask
+        )
+        attn_out, _ = self.attn(normed_x, fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, attention_mask)
         x = x + attn_out
 
-        # Knowledge - unified dict API
+        # Knowledge
         normed_x = self.norm2(x)
-        know_routing = global_routers.get_knowledge_weights(normed_x, importance, attention_mask)
-        know_out = self.knowledge(normed_x, know_routing, attention_mask=attention_mask)
+        feature_know_w, restore_know_w = global_routers.get_knowledge_weights(normed_x, importance, attention_mask)
+        know_out = self.knowledge(normed_x, feature_know_w, restore_know_w, attention_mask)
         know_info = {
-            'feature_know_vals': know_routing['feature'][0].detach(),
-            'restore_know_vals': know_routing['restore'][0].detach(),
-            'token_routing': know_routing.get('token_routing', False),
+            'feature_know_w': feature_know_w.detach(),
+            'restore_know_w': restore_know_w.detach(),
         }
         x = x + know_out
 
