@@ -294,6 +294,8 @@ Examples:
                        help='Use log scale for y-axis')
     parser.add_argument('--title', type=str, default=None,
                        help='Figure title (optional)')
+    parser.add_argument('--no_annotations', action='store_true',
+                       help='Disable annotations (clean plot with legend only)')
 
     args = parser.parse_args()
 
@@ -416,44 +418,21 @@ Examples:
     # Legend
     ax.legend(loc='upper right', fontsize=9, framealpha=0.95)
 
-    # Add annotation for improvement if DAWN-like model exists
-    dawn_label = None
-    vanilla_22m_label = None
-    vanilla_108m_label = None
+    # Clean annotation: show final loss values at line endpoints (optional)
+    if not getattr(args, 'no_annotations', False):
+        for label, (steps, losses) in data.items():
+            if steps and losses:
+                final_step = steps[-1]
+                final_loss = losses[-1]
+                style = MODEL_STYLES.get(label, {})
+                color = style.get('color', DEFAULT_COLORS[0])
 
-    for label in data.keys():
-        if 'dawn' in label.lower():
-            dawn_label = label
-        elif 'vanilla' in label.lower():
-            if '22' in label:
-                vanilla_22m_label = label
-            elif '108' in label:
-                vanilla_108m_label = label
-
-    # Annotate DAWN's advantage
-    if dawn_label and len(data[dawn_label][0]) > 0:
-        dawn_final = data[dawn_label][1][-1]
-        dawn_color = MODEL_STYLES.get(dawn_label, {}).get('color', '#4A90D9')
-
-        # Show improvement over Vanilla-108M (the larger model)
-        if vanilla_108m_label and len(data[vanilla_108m_label][0]) > 0:
-            vanilla_108m_final = data[vanilla_108m_label][1][-1]
-            if vanilla_108m_final > dawn_final:
-                ax.annotate(f'Lower than 4.5× larger model',
-                           xy=(data[dawn_label][0][-1] * 0.85, dawn_final),
-                           textcoords='offset points', xytext=(-20, -25),
-                           fontsize=8, color=dawn_color, fontweight='bold',
-                           arrowprops=dict(arrowstyle='->', color=dawn_color, lw=1))
-        # Fallback: show improvement over Vanilla-22M
-        elif vanilla_22m_label and len(data[vanilla_22m_label][0]) > 0:
-            vanilla_22m_final = data[vanilla_22m_label][1][-1]
-            if vanilla_22m_final > dawn_final:
-                improvement = vanilla_22m_final / dawn_final
-                ax.annotate(f'{improvement:.1f}× lower loss',
-                           xy=(data[dawn_label][0][-1], dawn_final),
-                           textcoords='offset points', xytext=(-70, 15),
-                           fontsize=8, color=dawn_color, fontweight='bold',
-                           arrowprops=dict(arrowstyle='->', color=dawn_color, lw=1))
+                # Small text showing final loss at end of line
+                ax.annotate(f'{final_loss:.2f}',
+                           xy=(final_step, final_loss),
+                           textcoords='offset points',
+                           xytext=(5, 0),
+                           fontsize=7, color=color, va='center')
 
     plt.tight_layout()
 
