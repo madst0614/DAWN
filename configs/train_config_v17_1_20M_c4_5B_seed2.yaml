@@ -49,7 +49,7 @@ model:
 
   max_seq_len: 512
   dropout: 0.1
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   d_space: 64
   router_dropout: 0.1
   attention_token_routing: false
@@ -57,7 +57,8 @@ model:
   use_ssm_context: true
 
 training:
-  batch_size: 128
+  batch_size: 32
+  gradient_accumulation_steps: 4
   num_epochs: 1
   lr: 0.00073
   weight_decay: 0.1
