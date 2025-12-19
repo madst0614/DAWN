@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Validate DAWN weights on C4 validation set (streaming)."""
+"""Validate DAWN weights on C4 validation set (streaming).
+
+Uses same data processing as training:
+- Concatenate all tokens into flat stream (no special tokens)
+- Reshape to [N, seq_len] sequences
+- No padding within sequences
+"""
 
 import argparse
 import sys
@@ -8,9 +14,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import BertTokenizer
 from tqdm import tqdm
 import math
 
@@ -46,33 +52,28 @@ def validate(model, dataloader, device, max_batches=200):
     total_tokens = 0
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating", total=max_batches)):
+        for batch_idx, (input_ids,) in enumerate(tqdm(dataloader, desc="Evaluating", total=max_batches)):
             if batch_idx >= max_batches:
                 break
 
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
+            input_ids = input_ids.to(device)
+            # No padding in this data → attention_mask is all 1s
+            attention_mask = torch.ones_like(input_ids)
 
-            # CLM evaluation (same as training)
+            # CLM evaluation
             logits = model(input_ids, attention_mask=attention_mask)
 
-            # Create labels with padding masked
-            labels = input_ids.clone()
-            labels[attention_mask == 0] = -100
-
-            # Shift for autoregressive loss
+            # Shift for autoregressive loss (no padding to mask)
             B, S, V = logits.shape
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous().long()
+            shift_labels = input_ids[:, 1:].contiguous().long()
 
-            # Count valid tokens
-            valid_mask = (shift_labels != -100)
-            valid_tokens = valid_mask.sum().item()
+            # All tokens are valid (no padding)
+            valid_tokens = shift_labels.numel()
 
             loss = torch.nn.functional.cross_entropy(
                 shift_logits.view(-1, V),
-                shift_labels.view(-1),
-                ignore_index=-100
+                shift_labels.view(-1)
             )
 
             total_loss += loss.item() * valid_tokens
@@ -83,40 +84,12 @@ def validate(model, dataloader, device, max_batches=200):
     return avg_loss, ppl
 
 
-def collate_fn(batch, tokenizer, max_seq_len=512):
-    """Collate with FIXED padding to max_seq_len (same as training)"""
-    input_ids_list = []
-    attention_mask_list = []
-
-    for sample in batch:
-        input_ids = sample['input_ids']
-        attention_mask = sample['attention_mask']
-        seq_len = len(input_ids)
-
-        # Pad to fixed length
-        if seq_len < max_seq_len:
-            padding_len = max_seq_len - seq_len
-            input_ids = torch.cat([input_ids, torch.full((padding_len,), tokenizer.pad_token_id, dtype=torch.long)])
-            attention_mask = torch.cat([attention_mask, torch.zeros(padding_len, dtype=torch.long)])
-        elif seq_len > max_seq_len:
-            input_ids = input_ids[:max_seq_len]
-            attention_mask = attention_mask[:max_seq_len]
-
-        input_ids_list.append(input_ids)
-        attention_mask_list.append(attention_mask)
-
-    return {
-        'input_ids': torch.stack(input_ids_list),
-        'attention_mask': torch.stack(attention_mask_list)
-    }
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('weights', type=str, help='Path to weights file')
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--max_batches', type=int, default=200,
-                       help='Max batches to evaluate (default: 200, same as training)')
+                       help='Max batches to evaluate (default: 200)')
     parser.add_argument('--seq_len', type=int, default=512)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
@@ -136,39 +109,42 @@ def main():
 
     # Load tokenizer (same as training: bert-base-uncased)
     print("Loading tokenizer (bert-base-uncased)...")
-    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
-    # Load C4 validation (streaming)
+    # Calculate how many tokens we need
+    target_tokens = args.max_batches * args.batch_size * args.seq_len
+    print(f"Target tokens: {target_tokens:,}")
+
+    # Load C4 validation (streaming) - same as prepare_val_data.py
     print("Loading C4 validation set (streaming)...")
     dataset = load_dataset('allenai/c4', 'en', split='validation', streaming=True)
 
-    # Collect samples (enough for max_batches)
-    max_samples = args.max_batches * args.batch_size
-    samples = []
-    print(f"Tokenizing {max_samples} samples...")
+    # Collect tokens - SAME as training data prep
+    all_tokens = []
+    pbar = tqdm(total=target_tokens, desc="Tokenizing", unit="tok", unit_scale=True)
 
-    for i, example in enumerate(tqdm(dataset, total=max_samples, desc="Loading")):
-        if i >= max_samples:
+    for example in dataset:
+        # Same as prepare_val_data.py: encode without special tokens
+        tokens = tokenizer.encode(example['text'], add_special_tokens=False)
+        all_tokens.extend(tokens)
+        pbar.update(len(tokens))
+
+        if len(all_tokens) >= target_tokens:
             break
 
-        # Tokenize (NO padding here - will be done in collate)
-        tokens = tokenizer(
-            example['text'],
-            truncation=True,
-            max_length=args.seq_len,
-            return_tensors='pt'
-        )
-        samples.append({
-            'input_ids': tokens['input_ids'].squeeze(0),
-            'attention_mask': tokens['attention_mask'].squeeze(0)
-        })
+    pbar.close()
 
-    print(f"Loaded {len(samples)} samples")
+    # Trim and reshape - same as training
+    all_tokens = all_tokens[:target_tokens]
+    num_seqs = len(all_tokens) // args.seq_len
+    tokens_tensor = torch.tensor(all_tokens[:num_seqs * args.seq_len], dtype=torch.long)
+    tokens_tensor = tokens_tensor.view(num_seqs, args.seq_len)
 
-    # Create dataloader with fixed padding collate
-    from functools import partial
-    collate = partial(collate_fn, tokenizer=tokenizer, max_seq_len=args.seq_len)
-    dataloader = DataLoader(samples, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    print(f"Prepared {num_seqs} sequences of length {args.seq_len}")
+
+    # Create dataloader
+    dataset = TensorDataset(tokens_tensor)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
     # Validate
     avg_loss, ppl = validate(model, dataloader, args.device, args.max_batches)
