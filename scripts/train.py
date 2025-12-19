@@ -858,6 +858,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     # Use total_epoch_steps for progress bar if provided (shows full epoch progress when resuming)
     pbar_total = total_epoch_steps if total_epoch_steps else len(dataloader)
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]", initial=start_step, total=pbar_total)
+    # Gradient accumulation
+    accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
+
     for local_step, batch in enumerate(pbar):
         # Calculate actual step (for logging and checkpointing)
         step = local_step + start_step
@@ -870,7 +873,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         labels = input_ids.clone()
         labels[attention_mask == 0] = -100
 
-        optimizer.zero_grad()
+        # Zero grad only at the start of accumulation
+        if local_step % accumulation_steps == 0:
+            optimizer.zero_grad()
 
         # Mixed precision training
         if scaler is not None:
@@ -915,18 +920,21 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
                     raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
-            scaler.scale(loss).backward()
+            # Scale loss for accumulation and backward
+            scaler.scale(loss / accumulation_steps).backward()
 
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Only update optimizer on accumulation boundary
+            if (local_step + 1) % accumulation_steps == 0:
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            # Debug: Log gradient flow at specific steps
-            if debug_logger and debug_logger.should_log_epoch(epoch) and step in debug_log_steps:
-                debug_logger.log_post_backward(model, epoch, step)
+                # Debug: Log gradient flow at specific steps
+                if debug_logger and debug_logger.should_log_epoch(epoch) and step in debug_log_steps:
+                    debug_logger.log_post_backward(model, epoch, step)
 
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.step(optimizer)
+                scaler.update()
         else:
             # Non-AMP training (CPU or no CUDA)
             base_model = get_underlying_model(model)
@@ -968,22 +976,27 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
                 raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
-            loss.backward()
+            # Scale loss for accumulation and backward
+            (loss / accumulation_steps).backward()
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Only update optimizer on accumulation boundary
+            if (local_step + 1) % accumulation_steps == 0:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            # Debug: Log gradient flow at specific steps
-            if debug_logger and debug_logger.should_log_epoch(epoch) and step in debug_log_steps:
-                debug_logger.log_post_backward(model, epoch, step)
+                # Debug: Log gradient flow at specific steps
+                if debug_logger and debug_logger.should_log_epoch(epoch) and step in debug_log_steps:
+                    debug_logger.log_post_backward(model, epoch, step)
 
-            optimizer.step()
+                optimizer.step()
 
-        if scheduler is not None:
-            scheduler.step()
+        # Scheduler and global step increment only on accumulation boundary
+        if (local_step + 1) % accumulation_steps == 0:
+            if scheduler is not None:
+                scheduler.step()
 
-        # Increment global step counter
-        global_step += 1
+            # Increment global step counter (optimizer step basis)
+            global_step += 1
 
         # Accuracy calculation (CLM: shifted)
         shift_logits = logits[:, :-1, :].contiguous()
@@ -1539,6 +1552,7 @@ def main():
     args.diversity_weight = cfg['training'].get('diversity_weight', 0.0)  # v7.0: recipe diversity
     args.load_balance_weight = cfg['training'].get('load_balance_weight', 0.0)  # v7.0: load balance
     args.entropy_weight = cfg['training'].get('entropy_weight', 0.0)  # router entropy loss
+    args.gradient_accumulation_steps = cfg['training'].get('gradient_accumulation_steps', 1)  # gradient accumulation
 
     # Other
     args.use_amp = cfg.get('use_amp', True)
@@ -1735,7 +1749,11 @@ def main():
     else:
         print(f"Standard FFN: d_ff={args.d_ff}")
 
-    print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    if args.gradient_accumulation_steps > 1:
+        print(f"Training: batch={args.batch_size} x {args.gradient_accumulation_steps} (effective={effective_batch_size}), epochs={args.num_epochs}, lr={args.lr}")
+    else:
+        print(f"Training: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
     # Regularization summary
     reg_parts = []
