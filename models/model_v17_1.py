@@ -423,20 +423,25 @@ class GlobalRouters(nn.Module):
                 'token_routing': True,
             }
         else:
-            # Batch-level routing
-            fqk_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, fqk_pref_Q)
-            fqk_weights_K_dense = torch.einsum('bs,bsn->bn', importance, fqk_pref_K)
-            fv_weights_dense = torch.einsum('bs,bsn->bn', importance, fv_pref)
-            rqk_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, rqk_pref_Q)
-            rqk_weights_K_dense = torch.einsum('bs,bsn->bn', importance, rqk_pref_K)
-            rv_weights_dense = torch.einsum('bs,bsn->bn', importance, rv_pref)
+            # Causal cumulative routing: position t uses importance[0:t+1] weighted average
+            # This ensures no future information leakage while using context
+            B, S = importance.shape
 
-            fqk_weights_Q, _ = self._topk_sparsify(fqk_weights_Q_dense, self.top_k_feature_qk)
-            fqk_weights_K, _ = self._topk_sparsify(fqk_weights_K_dense, self.top_k_feature_qk)
-            fv_weights, _ = self._topk_sparsify(fv_weights_dense, self.top_k_feature_v)
-            rqk_weights_Q, _ = self._topk_sparsify(rqk_weights_Q_dense, self.top_k_restore_qk)
-            rqk_weights_K, _ = self._topk_sparsify(rqk_weights_K_dense, self.top_k_restore_qk)
-            rv_weights, _ = self._topk_sparsify(rv_weights_dense, self.top_k_restore_v)
+            # Compute causal cumulative importance-weighted routing
+            # weighted_pref[t] = importance[t] * pref[t]
+            # cumsum_weighted[t] = sum(weighted_pref[0:t+1])
+            # cumsum_importance[t] = sum(importance[0:t+1])
+            # causal_routing[t] = cumsum_weighted[t] / cumsum_importance[t]
+
+            imp = importance.unsqueeze(-1)  # [B, S, 1]
+            cumsum_imp = torch.cumsum(importance, dim=1).unsqueeze(-1) + 1e-8  # [B, S, 1]
+
+            fqk_weights_Q = torch.cumsum(imp * fqk_pref_Q, dim=1) / cumsum_imp  # [B, S, N]
+            fqk_weights_K = torch.cumsum(imp * fqk_pref_K, dim=1) / cumsum_imp
+            fv_weights = torch.cumsum(imp * fv_pref, dim=1) / cumsum_imp
+            rqk_weights_Q = torch.cumsum(imp * rqk_pref_Q, dim=1) / cumsum_imp
+            rqk_weights_K = torch.cumsum(imp * rqk_pref_K, dim=1) / cumsum_imp
+            rv_weights = torch.cumsum(imp * rv_pref, dim=1) / cumsum_imp
 
             routing_info = {
                 'fqk_weights_Q': fqk_weights_Q.detach(),
@@ -451,7 +456,7 @@ class GlobalRouters(nn.Module):
                 'rqk_q_pref': rqk_pref_Q.detach(),
                 'rqk_k_pref': rqk_pref_K.detach(),
                 'rv_pref': rv_pref.detach(),
-                'token_routing': False,
+                'token_routing': True,  # Now returns [B, S, N] like token routing
             }
 
         # Update usage (Q/K separately for independent excitability)
@@ -477,11 +482,12 @@ class GlobalRouters(nn.Module):
             feature_know_w, _ = self._topk_sparsify(pref_f, self.top_k_feature_know)
             restore_know_w, _ = self._topk_sparsify(pref_r, self.top_k_restore_know)
         else:
-            # Batch-level (default)
-            f_dense = torch.einsum('bs,bsn->bn', importance, pref_f)  # [B, n]
-            r_dense = torch.einsum('bs,bsn->bn', importance, pref_r)  # [B, n]
-            feature_know_w, _ = self._topk_sparsify(f_dense, self.top_k_feature_know)
-            restore_know_w, _ = self._topk_sparsify(r_dense, self.top_k_restore_know)
+            # Causal cumulative routing (same as attention)
+            imp = importance.unsqueeze(-1)  # [B, S, 1]
+            cumsum_imp = torch.cumsum(importance, dim=1).unsqueeze(-1) + 1e-8  # [B, S, 1]
+
+            feature_know_w = torch.cumsum(imp * pref_f, dim=1) / cumsum_imp  # [B, S, N]
+            restore_know_w = torch.cumsum(imp * pref_r, dim=1) / cumsum_imp  # [B, S, N]
 
         if self.training:
             self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
