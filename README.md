@@ -34,11 +34,39 @@ pip install -r requirements.txt
 import torch
 from model import DAWN
 
-# Load model
-config = {...}  # see configs/dawn_v17.1.yaml
+# 1. Config (v17.1)
+config = {
+    'vocab_size': 30522,
+    'd_model': 384,
+    'n_layers': 12,
+    'n_heads': 6,
+    'rank': 64,
+    'knowledge_rank': 128,
+    'n_feature_qk': 120,
+    'n_feature_v': 24,
+    'n_restore_qk': 120,
+    'n_restore_v': 24,
+    'n_feature_know': 24,
+    'n_restore_know': 24,
+    'top_k_feature_qk': 20,
+    'top_k_feature_v': 6,
+    'top_k_restore_qk': 20,
+    'top_k_restore_v': 6,
+    'top_k_feature_know': 4,
+    'top_k_restore_know': 4,
+}
+
+# 2. Load model
 model = DAWN(**config)
-model.load_state_dict(torch.load("dawn_24m_weights.pt"))
+ckpt = torch.load('dawn_24m_weights.pt', map_location='cpu')
+model.load_state_dict(ckpt['model_state_dict'])
 model.eval()
+
+# 3. Forward pass
+dummy_input = torch.randint(0, 1000, (1, 64))
+with torch.no_grad():
+    output = model(dummy_input)
+print(f"Output shape: {output.shape}")  # [1, 64, 30522]
 ```
 
 ### Training
