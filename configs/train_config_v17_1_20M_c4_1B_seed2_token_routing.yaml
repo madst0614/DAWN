@@ -1,4 +1,4 @@
-# DAWN v17.1 Training Config - 20M Scale, 5B tokens (Seed 2, Token Routing)
+# DAWN v17.1 Training Config - 20M Scale, 1B tokens (Seed 2, Token Routing)
 # Q/K shared pool + Knowledge Feature-Restore pattern
 # Token-level routing for both attention and knowledge (no SSM importance)
 
@@ -19,7 +19,7 @@ data:
     - train/c4/c4_raw_009.pt
   val_files:
     - val/c4/c4_val_50M.pt
-  max_train_tokens: 5000000000
+  max_train_tokens: 1000000000
   max_val_tokens: 2000000
 
 model:
@@ -71,8 +71,8 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_5B_seed2_token_routing
-log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_5B_seed2_token_routing
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_1B_seed2_token_routing
+log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_1B_seed2_token_routing
 
 # v17.1 Token Routing Architecture
 #
