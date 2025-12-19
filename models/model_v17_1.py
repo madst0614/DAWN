@@ -523,22 +523,37 @@ class AttentionCircuit(nn.Module):
         token_routing = fqk_weights_Q.dim() == 3
 
         if token_routing:
-            # Token-level routing
-            shared_fqk_Q = torch.einsum('bsn,ndr->bsdr', fqk_weights_Q, self.shared_neurons.feature_qk_neurons)
-            shared_fqk_K = torch.einsum('bsn,ndr->bsdr', fqk_weights_K, self.shared_neurons.feature_qk_neurons)
-            shared_fv = torch.einsum('bsn,ndr->bsdr', fv_weights, self.shared_neurons.feature_v_neurons)
+            # Token-level routing - matmul optimized
+            N_fqk = fqk_weights_Q.shape[2]
+            N_fv = fv_weights.shape[2]
+            N_rqk = rqk_weights_Q.shape[2]
+            N_rv = rv_weights.shape[2]
 
-            h_q = torch.einsum('bsd,bsdr->bsr', x, shared_fqk_Q)
-            h_k = torch.einsum('bsd,bsdr->bsr', x, shared_fqk_K)
-            h_v = torch.einsum('bsd,bsdr->bsr', x, shared_fv)
+            # Feature neurons: [B, S, N] @ [N, D*R] -> [B, S, D, R]
+            fqk_flat = self.shared_neurons.feature_qk_neurons.view(N_fqk, D * R)
+            shared_fqk_Q = (fqk_weights_Q.view(B * S, N_fqk) @ fqk_flat).view(B, S, D, R)
+            shared_fqk_K = (fqk_weights_K.view(B * S, N_fqk) @ fqk_flat).view(B, S, D, R)
 
-            shared_rqk_Q = torch.einsum('bsn,nrd->bsrd', rqk_weights_Q, self.shared_neurons.restore_qk_neurons)
-            shared_rqk_K = torch.einsum('bsn,nrd->bsrd', rqk_weights_K, self.shared_neurons.restore_qk_neurons)
-            shared_rv = torch.einsum('bsn,nrd->bsrd', rv_weights, self.shared_neurons.restore_v_neurons)
+            fv_flat = self.shared_neurons.feature_v_neurons.view(N_fv, D * R)
+            shared_fv = (fv_weights.view(B * S, N_fv) @ fv_flat).view(B, S, D, R)
 
-            Q = torch.einsum('bsr,bsrd->bsd', h_q, shared_rqk_Q)
-            K = torch.einsum('bsr,bsrd->bsd', h_k, shared_rqk_K)
-            V = torch.einsum('bsr,bsrd->bsd', h_v, shared_rv)
+            # x @ shared: [B*S, 1, D] @ [B*S, D, R] -> [B, S, R]
+            h_q = (x.view(B * S, 1, D) @ shared_fqk_Q.view(B * S, D, R)).view(B, S, R)
+            h_k = (x.view(B * S, 1, D) @ shared_fqk_K.view(B * S, D, R)).view(B, S, R)
+            h_v = (x.view(B * S, 1, D) @ shared_fv.view(B * S, D, R)).view(B, S, R)
+
+            # Restore neurons: [B, S, N] @ [N, R*D] -> [B, S, R, D]
+            rqk_flat = self.shared_neurons.restore_qk_neurons.view(N_rqk, R * D)
+            shared_rqk_Q = (rqk_weights_Q.view(B * S, N_rqk) @ rqk_flat).view(B, S, R, D)
+            shared_rqk_K = (rqk_weights_K.view(B * S, N_rqk) @ rqk_flat).view(B, S, R, D)
+
+            rv_flat = self.shared_neurons.restore_v_neurons.view(N_rv, R * D)
+            shared_rv = (rv_weights.view(B * S, N_rv) @ rv_flat).view(B, S, R, D)
+
+            # h @ shared: [B*S, 1, R] @ [B*S, R, D] -> [B, S, D]
+            Q = (h_q.view(B * S, 1, R) @ shared_rqk_Q.view(B * S, R, D)).view(B, S, D)
+            K = (h_k.view(B * S, 1, R) @ shared_rqk_K.view(B * S, R, D)).view(B, S, D)
+            V = (h_v.view(B * S, 1, R) @ shared_rv.view(B * S, R, D)).view(B, S, D)
         else:
             # Batch-level routing - matmul optimized
             fqk_flat = self.shared_neurons.feature_qk_neurons.view(-1, D * R)
@@ -632,14 +647,23 @@ class KnowledgeCircuit(nn.Module):
         token_routing = feature_know_w.dim() == 3
 
         if token_routing:
-            # Token-level: [B, S, n] weights
-            shared_f = torch.einsum('bsn,ndr->bsdr', feature_know_w,
-                                    self.shared_neurons.feature_know)  # [B, S, D, R]
-            h = torch.einsum('bsd,bsdr->bsr', x, shared_f)  # [B, S, R]
+            # Token-level: [B, S, n] weights - matmul optimized
+            N_f = feature_know_w.shape[2]
+            N_r = restore_know_w.shape[2]
 
-            shared_r = torch.einsum('bsn,nrd->bsrd', restore_know_w,
-                                    self.shared_neurons.restore_know)  # [B, S, R, D]
-            output = torch.einsum('bsr,bsrd->bsd', h, shared_r)  # [B, S, D]
+            # Feature: [B*S, N] @ [N, D*R] -> [B, S, D, R]
+            f_flat = self.shared_neurons.feature_know.view(N_f, D * R)
+            shared_f = (feature_know_w.view(B * S, N_f) @ f_flat).view(B, S, D, R)
+
+            # x @ shared_f: [B*S, 1, D] @ [B*S, D, R] -> [B, S, R]
+            h = (x.view(B * S, 1, D) @ shared_f.view(B * S, D, R)).view(B, S, R)
+
+            # Restore: [B*S, N] @ [N, R*D] -> [B, S, R, D]
+            r_flat = self.shared_neurons.restore_know.view(N_r, R * D)
+            shared_r = (restore_know_w.view(B * S, N_r) @ r_flat).view(B, S, R, D)
+
+            # h @ shared_r: [B*S, 1, R] @ [B*S, R, D] -> [B, S, D]
+            output = (h.view(B * S, 1, R) @ shared_r.view(B * S, R, D)).view(B, S, D)
         else:
             # Batch-level: [B, n] weights
             f_flat = self.shared_neurons.feature_know.view(-1, D * R)
