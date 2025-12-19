@@ -63,15 +63,15 @@ DEFAULT_COLORS = ['#4A90D9', '#888888', '#444444', '#E74C3C', '#50C878', '#9B59B
 DEFAULT_STYLES = ['-', '--', '-.', ':', '-', '--']
 
 
-def find_training_log(checkpoint_path: str) -> str:
+def find_training_log(checkpoint_path: str, verbose: bool = True) -> str:
     """
     Find training_log.txt from checkpoint path.
 
     Searches in order:
     1. Same directory as checkpoint
-    2. Parent directory (if checkpoint is in checkpoints/)
-    3. Sibling logs directory
-    4. Parent's sibling logs directory
+    2. Parent directory
+    3. Recursive search in directory
+    4. Common log file patterns
     """
     ckpt_path = Path(checkpoint_path)
 
@@ -81,12 +81,14 @@ def find_training_log(checkpoint_path: str) -> str:
     else:
         ckpt_dir = ckpt_path
 
-    # Search patterns
+    # Search patterns - prioritized list
     search_paths = [
         ckpt_dir / 'training_log.txt',
+        ckpt_dir / 'training.log',
+        ckpt_dir / 'train_log.txt',
+        ckpt_dir / 'log.txt',
         ckpt_dir.parent / 'training_log.txt',
-        ckpt_dir.parent / 'logs' / 'training_log.txt',
-        ckpt_dir.with_name(ckpt_dir.name.replace('checkpoints', 'logs')) / 'training_log.txt',
+        ckpt_dir.parent / 'training.log',
     ]
 
     # Also try finding by replacing 'checkpoints' with 'logs' in path
@@ -95,9 +97,27 @@ def find_training_log(checkpoint_path: str) -> str:
         log_path = ckpt_str.replace('checkpoint', 'log').replace('Checkpoint', 'Log')
         search_paths.append(Path(log_path) / 'training_log.txt')
 
+    # Check explicit paths first
     for path in search_paths:
         if path.exists():
             return str(path)
+
+    # Try glob search in directory
+    if ckpt_dir.exists():
+        for pattern in ['**/training_log.txt', '**/training*.log', '**/*log*.txt']:
+            matches = list(ckpt_dir.glob(pattern))
+            if matches:
+                return str(matches[0])
+
+    # Debug: print what we searched
+    if verbose:
+        print(f"  Searched paths for {ckpt_path.name}:")
+        for p in search_paths[:4]:
+            exists = "✓" if p.exists() else "✗"
+            print(f"    {exists} {p}")
+        if ckpt_dir.exists():
+            files = list(ckpt_dir.iterdir())[:10]
+            print(f"  Files in directory: {[f.name for f in files]}")
 
     return None
 
