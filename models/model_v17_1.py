@@ -115,48 +115,11 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits_fqk_Q, logits_fqk_K, logits_fv, logits_rqk_Q, logits_rqk_K, logits_rv
 
-    def _get_n_neurons(self, neuron_type):
-        """Get total number of neurons for a given type"""
-        if neuron_type in ('feature_q', 'feature_k'):
-            return self.n_feature_qk
-        elif neuron_type == 'feature_v':
-            return self.n_feature_v
-        elif neuron_type in ('restore_q', 'restore_k'):
-            return self.n_restore_qk
-        elif neuron_type == 'restore_v':
-            return self.n_restore_v
-        elif neuron_type == 'feature_know':
-            return self.n_feature_know
-        elif neuron_type == 'restore_know':
-            return self.n_restore_know
-        else:
-            raise ValueError(f"Unknown neuron type: {neuron_type}")
-
-    def update_usage(self, weights, neuron_type, attention_mask=None, indices=None):
+    def update_usage(self, weights, neuron_type, attention_mask=None):
         if not self.training:
             return
 
-        if indices is not None:
-            # Index-based: vals=[B, S, k], idx=[B, S, k]
-            # Count unique neurons selected per position
-            B, S, k = indices.shape
-            n_neurons = self._get_n_neurons(neuron_type)
-
-            # Create usage count via scatter_add
-            usage_count = torch.zeros(n_neurons, device=indices.device, dtype=torch.float)
-            ones = torch.ones_like(indices, dtype=torch.float)
-            if attention_mask is not None:
-                mask = attention_mask.unsqueeze(-1).float()  # [B, S, 1]
-                ones = ones * mask
-            usage_count.scatter_add_(0, indices.view(-1), ones.view(-1))
-
-            if attention_mask is not None:
-                count = attention_mask.sum() * k + 1e-8
-            else:
-                count = B * S * k
-            usage = usage_count / count
-
-        elif weights.dim() == 3:
+        if weights.dim() == 3:
             active = (weights > 0).float()
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(-1).float()
