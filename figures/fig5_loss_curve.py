@@ -294,8 +294,8 @@ Examples:
                        help='Use log scale for y-axis')
     parser.add_argument('--title', type=str, default=None,
                        help='Figure title (optional)')
-    parser.add_argument('--no_annotations', action='store_true',
-                       help='Disable annotations (clean plot with legend only)')
+    parser.add_argument('--show_annotations', action='store_true',
+                       help='Show final loss values at line endpoints')
 
     args = parser.parse_args()
 
@@ -419,7 +419,7 @@ Examples:
     ax.legend(loc='upper right', fontsize=9, framealpha=0.95)
 
     # Clean annotation: show final loss values at line endpoints (optional)
-    if not getattr(args, 'no_annotations', False):
+    if getattr(args, 'show_annotations', False):
         for label, (steps, losses) in data.items():
             if steps and losses:
                 final_step = steps[-1]

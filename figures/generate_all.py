@@ -108,8 +108,8 @@ Examples:
                        help='Skip specific figures (e.g., --skip fig1 fig2)')
     parser.add_argument('--zip', action='store_true',
                        help='Create zip file of all figures after generation')
-    parser.add_argument('--no_annotations', action='store_true',
-                       help='Disable annotations on fig5')
+    parser.add_argument('--show_annotations', action='store_true',
+                       help='Show final loss values on fig5')
 
     args = parser.parse_args()
 
@@ -158,8 +158,8 @@ Examples:
                 fig5_args.extend(['--checkpoints'] + ckpts)
                 fig5_args.extend(['--labels'] + labels)
 
-        if args.no_annotations:
-            fig5_args.append('--no_annotations')
+        if args.show_annotations:
+            fig5_args.append('--show_annotations')
 
         if fig5_args:
             results['fig5'] = run_script('fig5_loss_curve.py', fig5_args)
