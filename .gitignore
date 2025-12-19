@@ -44,7 +44,6 @@ ENV/
 htmlcov/
 
 # Output
-*.png
 *.jpg
 *.pdf
 logs/
