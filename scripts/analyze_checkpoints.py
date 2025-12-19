@@ -180,7 +180,7 @@ def evaluate_model(model, val_tokens, batch_size=32, seq_len=512, device='cuda')
 
             # Loss & accuracy
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = batch[:, 1:].contiguous()
+            shift_labels = batch[:, 1:].contiguous().long()  # Ensure Long type for cross_entropy
 
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
