@@ -49,24 +49,30 @@ def validate(model, dataloader, device):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
 
-            # Forward
-            logits = model(input_ids)
+            # Forward (pass attention_mask like training)
+            logits = model(input_ids, attention_mask=attention_mask)
+
+            # Create labels with padding masked (like training)
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
 
             # Shift for causal LM loss
             shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous()
-            shift_mask = attention_mask[:, 1:].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
 
-            # Cross entropy
-            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
-                           shift_labels.view(-1))
-            loss = loss.view(shift_labels.size())
+            # Valid tokens (non-padding)
+            valid_mask = (shift_labels != -100)
+            valid_tokens = valid_mask.sum().item()
 
-            # Mask padding
-            masked_loss = loss * shift_mask
-            total_loss += masked_loss.sum().item()
-            total_tokens += shift_mask.sum().item()
+            # Cross entropy with ignore_index
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100
+            )
+
+            total_loss += loss.item() * valid_tokens
+            total_tokens += valid_tokens
 
     avg_loss = total_loss / total_tokens
     ppl = math.exp(avg_loss)
