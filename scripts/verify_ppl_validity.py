@@ -354,9 +354,9 @@ def main():
 
     model = model.to(args.device)
 
-    # Enable token-level routing for generation (important for inference quality)
-    model.router.token_routing = True
-    model.router.knowledge_token_routing = True
+    # Use batch-level routing (same as training) + 512 padding for stable importance
+    model.router.token_routing = False
+    model.router.knowledge_token_routing = False
 
     model.eval()
 
