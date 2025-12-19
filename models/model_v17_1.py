@@ -878,8 +878,9 @@ class DAWN(nn.Module):
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
         x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
 
-        # SSM only needed for batch-level routing (importance weighting)
-        if self.attention_token_routing:
+        # SSM only skipped when BOTH attention and knowledge use token routing
+        # Otherwise at least one needs importance for causal cumulative routing
+        if self.attention_token_routing and self.knowledge_token_routing:
             importance = None
             context = None
         else:
