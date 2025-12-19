@@ -2,8 +2,14 @@
 """Test extracted DAWN weights."""
 
 import argparse
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import torch
-from model import DAWN
+from models import DAWN
 
 parser = argparse.ArgumentParser()
 parser.add_argument('weights', type=str, nargs='?', default='dawn_24m_weights.pt',

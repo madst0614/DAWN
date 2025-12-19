@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 ```python
 import torch
-from model import DAWN
+from models import DAWN
 
 # 1. Config (v17.1)
 config = {
