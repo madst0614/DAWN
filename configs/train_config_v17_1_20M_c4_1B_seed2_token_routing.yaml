@@ -58,10 +58,9 @@ model:
   use_ssm_context: false  # SSM not used with token routing
 
 training:
-  batch_size: 32
-  gradient_accumulation_steps: 3
+  batch_size: 128
   num_epochs: 1
-  lr: 0.00055
+  lr: 0.00065
   weight_decay: 0.1
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
