@@ -1,4 +1,4 @@
-# DAWN v17.1 Training Config - 20M Scale, 1B tokens (Seed 2, Token Routing, V Expand 4)
+# DAWN v17.1 Training Config - 20M Scale, 1B tokens (Seed 2, Token Routing, V Expand 5)
 # Q/K shared pool + Knowledge Feature-Restore pattern
 # Token-level routing for both attention and knowledge (no SSM importance)
 # QK=64(k=6), V=80(k=6), Knowledge=92(k=6), knowledge_rank=64, d_space=256
@@ -52,7 +52,7 @@ model:
   max_seq_len: 512
   dropout: 0.1
   gradient_checkpointing: true
-  d_space: 64
+  d_space: 256
   router_dropout: 0.1
   attention_token_routing: true
   knowledge_token_routing: true
@@ -71,15 +71,13 @@ training:
   process_norm_weight: 0.0
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_1B_seed2_token_routing_v_expand4
-log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_1B_seed2_token_routing_v_expand4
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_1B_seed2_token_routing_v_expand5
+log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_1B_seed2_token_routing_v_expand5
 
-# v17.1 Token Routing V-Expand4 Architecture
+# v17.1 Token Routing V-Expand5 Architecture
 #
-#   Changes from base token routing:
-#   - QK reduced: 120→64 (k=6)
-#   - V expanded: 24→80 (k=6)
-#   - Knowledge expanded: 24→92 (k=6), rank: 128→64
+#   Changes from V-Expand4:
+#   - d_space expanded: 64→256 (router dimension)
 #
 #   Attention Circuit (per-token routing):
 #   - Feature_QK=64 (k=6): per-token Q/K compression
