@@ -1,7 +1,7 @@
 # DAWN v17.1 Training Config - 20M Scale, 1B tokens (Seed 2, Token Routing, V Expand 5)
 # Q/K shared pool + Knowledge Feature-Restore pattern
 # Token-level routing for both attention and knowledge (no SSM importance)
-# QK=64(k=6), V=80(k=6), Knowledge=92(k=6), knowledge_rank=64, d_space=256
+# QK=64(k=6), V=120(k=6), Knowledge=120(k=6), knowledge_rank=64, d_space=256
 
 seed: 2
 
@@ -31,20 +31,20 @@ model:
   rank: 64
   state_dim: 64
 
-  # Attention - Q/K shared pool (QK=64 k=6, V=80 k=6)
+  # Attention - Q/K shared pool (QK=64 k=6, V=120 k=6)
   n_feature_qk: 64
-  n_feature_v: 80
+  n_feature_v: 120
   top_k_feature_qk: 6
   top_k_feature_v: 6
 
   n_restore_qk: 64
-  n_restore_v: 80
+  n_restore_v: 120
   top_k_restore_qk: 6
   top_k_restore_v: 6
 
   # Knowledge - Feature-Restore pattern (expanded, rank=64)
-  n_feature_know: 92
-  n_restore_know: 92
+  n_feature_know: 120
+  n_restore_know: 120
   knowledge_rank: 64
   top_k_feature_know: 6
   top_k_restore_know: 6
@@ -81,10 +81,10 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17.1_20M_c4_1B_seed2_token_routing_v_
 #
 #   Attention Circuit (per-token routing):
 #   - Feature_QK=64 (k=6): per-token Q/K compression
-#   - Feature_V=80 (k=6): per-token V compression
+#   - Feature_V=120 (k=6): per-token V compression
 #   - Restore_QK=64 (k=6): per-token Q/K restoration
-#   - Restore_V=80 (k=6): per-token V restoration
+#   - Restore_V=120 (k=6): per-token V restoration
 #
 #   Knowledge Circuit (per-token routing):
-#   - Feature_Know=92 (k=6): per-token compression
-#   - Restore_Know=92 (k=6): per-token restoration
+#   - Feature_Know=120 (k=6): per-token compression
+#   - Restore_Know=120 (k=6): per-token restoration
