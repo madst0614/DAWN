@@ -3,10 +3,11 @@
 DAWN Generation Test Script
 
 Loads model config from checkpoint, no separate config file needed.
+Supports multiple checkpoints and directory paths.
 
 Usage:
     python scripts/generate_samples.py \
-        --checkpoint /path/to/checkpoint \
+        --checkpoints /path/to/ckpt1 /path/to/ckpt2 \
         --val_data /path/to/val_data.pt \
         --output generation_results.txt
 """
@@ -14,6 +15,7 @@ Usage:
 import argparse
 import sys
 import os
+from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -23,10 +25,36 @@ from transformers import BertTokenizer
 from models import create_model_by_version, normalize_version
 
 
+def find_checkpoint_file(ckpt_path):
+    """Find checkpoint file from path (handles directories)"""
+    ckpt_path = Path(ckpt_path)
+
+    if ckpt_path.is_file():
+        return ckpt_path
+
+    if ckpt_path.is_dir():
+        # Look for common checkpoint names
+        candidates = ['best_model.pt', 'checkpoint_best.pt', 'model.pt', 'latest.pt']
+        for name in candidates:
+            if (ckpt_path / name).exists():
+                return ckpt_path / name
+
+        # Fall back to any .pt file
+        pt_files = list(ckpt_path.glob('*.pt'))
+        if pt_files:
+            return sorted(pt_files)[-1]  # Most recent
+
+    raise FileNotFoundError(f"No checkpoint found in {ckpt_path}")
+
+
 def load_model(checkpoint_path):
     """Load model from checkpoint (uses model_config from checkpoint)"""
+    # Find actual checkpoint file
+    ckpt_file = find_checkpoint_file(checkpoint_path)
+    print(f"  Loading: {ckpt_file.name}")
+
     # Load checkpoint
-    ckpt = torch.load(checkpoint_path, map_location='cpu')
+    ckpt = torch.load(ckpt_file, map_location='cpu')
 
     # Get config from checkpoint
     model_config = ckpt.get('model_config', ckpt.get('config', {}))
@@ -56,7 +84,15 @@ def load_model(checkpoint_path):
     model = create_model_by_version(version, model_config)
 
     model.load_state_dict(state_dict)
-    return model, version
+
+    # Get model name from path
+    ckpt_path = Path(checkpoint_path)
+    if ckpt_path.is_dir():
+        name = ckpt_path.name
+    else:
+        name = ckpt_path.parent.name
+
+    return model, version, name
 
 
 def generate_text(model, tokenizer, prompt, max_new_tokens=30, temperature=0.8, top_k=50, device='cuda'):
@@ -120,16 +156,19 @@ def continuation_test(model, tokenizer, val_tokens, sample_indices, context_len=
     return results
 
 
-def compute_perplexity(model, val_tokens, num_seqs=10, device='cuda'):
+def compute_perplexity(model, val_tokens, num_seqs=50, seq_len=512, device='cuda'):
     """Compute perplexity on validation data"""
     model.eval()
     total_loss = 0
     total_tokens = 0
 
+    # Get vocab size from model
+    vocab_size = model.token_emb.weight.shape[0]
+
     with torch.no_grad():
         for i in range(num_seqs):
-            start = i * 512
-            seq = val_tokens[start:start+512].unsqueeze(0).to(device)
+            start = i * seq_len
+            seq = val_tokens[start:start+seq_len].unsqueeze(0).to(device)
 
             output = model(seq, attention_mask=None)
             logits = output[0] if isinstance(output, tuple) else output
@@ -137,9 +176,9 @@ def compute_perplexity(model, val_tokens, num_seqs=10, device='cuda'):
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = seq[:, 1:].contiguous()
 
-            loss = F.cross_entropy(shift_logits.view(-1, 30522), shift_labels.view(-1))
-            total_loss += loss.item() * 511
-            total_tokens += 511
+            loss = F.cross_entropy(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+            total_loss += loss.item() * (seq_len - 1)
+            total_tokens += (seq_len - 1)
 
     avg_loss = total_loss / total_tokens
     ppl = torch.exp(torch.tensor(avg_loss)).item()
@@ -147,80 +186,128 @@ def compute_perplexity(model, val_tokens, num_seqs=10, device='cuda'):
     return avg_loss, ppl
 
 
+def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda'):
+    """Test a single checkpoint and return results"""
+    results = {}
+
+    # Load model
+    model, version, name = load_model(ckpt_path)
+    model = model.to(device)
+    model.eval()
+
+    results['name'] = name
+    results['version'] = version
+    results['path'] = str(ckpt_path)
+
+    # 1. Free generation
+    prompts = [
+        "The weather today is",
+        "Scientists discovered that",
+        "The capital of France is",
+    ]
+    results['generations'] = []
+    for prompt in prompts:
+        output = generate_text(model, tokenizer, prompt, max_new_tokens=30, device=device)
+        results['generations'].append({'prompt': prompt, 'output': output})
+
+    # 2. C4 continuation
+    sample_indices = [100, 500, 1000]
+    cont_results = continuation_test(model, tokenizer, val_tokens, sample_indices, device=device)
+    results['continuation'] = cont_results
+    results['avg_match'] = sum(r['token_match'] for r in cont_results) / (len(sample_indices) * 30)
+
+    # 3. Perplexity
+    avg_loss, ppl = compute_perplexity(model, val_tokens, num_seqs=50, device=device)
+    results['loss'] = avg_loss
+    results['ppl'] = ppl
+
+    # Cleanup
+    del model
+    torch.cuda.empty_cache()
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description='DAWN Generation Test')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
+    parser.add_argument('--checkpoints', nargs='+', required=True, help='Paths to checkpoints')
     parser.add_argument('--val_data', type=str, required=True, help='Path to validation data')
     parser.add_argument('--output', type=str, default='generation_results.txt', help='Output file')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
     args = parser.parse_args()
 
-    # Load model
-    print(f"Loading model from {args.checkpoint}")
-    model, version = load_model(args.checkpoint)
-    model = model.to(args.device)
-    model.eval()
+    # Device check
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA not available, using CPU")
+        args.device = 'cpu'
 
     # Load tokenizer
+    print("Loading tokenizer...")
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
     # Load validation data
     print(f"Loading validation data from {args.val_data}")
     val_data = torch.load(args.val_data, map_location='cpu')
-    val_tokens = val_data['tokens'].long()
+    if isinstance(val_data, dict):
+        val_tokens = val_data.get('tokens', val_data.get('input_ids', None))
+    else:
+        val_tokens = val_data
+    val_tokens = val_tokens.long().view(-1)
 
-    # Output
+    # Test each checkpoint
+    all_results = []
     output_lines = []
-    output_lines.append("=" * 70)
-    output_lines.append(f"DAWN Generation Test - {version}")
-    output_lines.append(f"Checkpoint: {args.checkpoint}")
-    output_lines.append("=" * 70)
 
-    # 1. Free generation
-    output_lines.append("\n[FREE GENERATION]")
-    prompts = [
-        "The weather today is",
-        "Scientists discovered that",
-        "The capital of France is",
-        "Once upon a time",
-        "In the year 2050",
-    ]
+    for ckpt_path in args.checkpoints:
+        print(f"\n{'='*60}")
+        print(f"Testing: {ckpt_path}")
+        print('='*60)
 
-    for prompt in prompts:
-        output = generate_text(model, tokenizer, prompt, max_new_tokens=30, device=args.device)
-        output_lines.append(f"\nPrompt: '{prompt}'")
-        output_lines.append(f"Output: {output}")
+        try:
+            results = test_single_checkpoint(ckpt_path, tokenizer, val_tokens, args.device)
+            all_results.append(results)
 
-    # 2. C4 continuation
+            # Format output
+            output_lines.append("=" * 70)
+            output_lines.append(f"Model: {results['name']} ({results['version']})")
+            output_lines.append(f"Path: {results['path']}")
+            output_lines.append("=" * 70)
+
+            output_lines.append("\n[FREE GENERATION]")
+            for gen in results['generations']:
+                output_lines.append(f"\nPrompt: '{gen['prompt']}'")
+                output_lines.append(f"Output: {gen['output']}")
+
+            output_lines.append("\n" + "-" * 50)
+            output_lines.append("[C4 CONTINUATION]")
+            for r in results['continuation']:
+                output_lines.append(f"\n[Sample {r['sample_idx']}]")
+                output_lines.append(f"Actual:    {r['actual'][:60]}...")
+                output_lines.append(f"Generated: {r['generated'][:60]}...")
+                output_lines.append(f"Match: {r['token_match']}/30 ({r['match_rate']*100:.1f}%)")
+
+            output_lines.append(f"\nAvg Match: {results['avg_match']*100:.1f}%")
+            output_lines.append(f"Loss: {results['loss']:.4f} | PPL: {results['ppl']:.2f}")
+            output_lines.append("")
+
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            output_lines.append(f"ERROR for {ckpt_path}: {e}\n")
+
+    # Summary table
     output_lines.append("\n" + "=" * 70)
-    output_lines.append("[C4 CONTINUATION TEST]")
-
-    sample_indices = [100, 500, 1000, 2000, 5000]
-    results = continuation_test(model, tokenizer, val_tokens, sample_indices, device=args.device)
-
-    total_match = 0
-    for r in results:
-        output_lines.append(f"\n[Sample {r['sample_idx']}]")
-        output_lines.append(f"Context: ...{r['context']}")
-        output_lines.append(f"Actual:    {r['actual'][:80]}...")
-        output_lines.append(f"Generated: {r['generated'][:80]}...")
-        output_lines.append(f"Token match: {r['token_match']}/30 ({r['match_rate']*100:.1f}%)")
-        total_match += r['token_match']
-
-    avg_match = total_match / (len(sample_indices) * 30)
-    output_lines.append(f"\nAverage token match: {avg_match*100:.1f}%")
-
-    # 3. Perplexity
-    output_lines.append("\n" + "=" * 70)
-    output_lines.append("[PERPLEXITY CHECK]")
-
-    avg_loss, ppl = compute_perplexity(model, val_tokens, num_seqs=50, device=args.device)
-    output_lines.append(f"Avg Loss: {avg_loss:.4f}")
-    output_lines.append(f"Perplexity: {ppl:.2f}")
+    output_lines.append("SUMMARY")
+    output_lines.append("=" * 70)
+    output_lines.append(f"{'Model':<50} {'PPL':>8} {'Match':>8}")
+    output_lines.append("-" * 70)
+    for r in all_results:
+        output_lines.append(f"{r['name']:<50} {r['ppl']:>8.2f} {r['avg_match']*100:>7.1f}%")
 
     # Write output
     output_text = "\n".join(output_lines)
-    print(output_text)
+    print("\n" + output_text)
 
     with open(args.output, 'w') as f:
         f.write(output_text)
