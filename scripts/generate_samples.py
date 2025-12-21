@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 DAWN Generation Test Script
+
+Loads model config from checkpoint, no separate config file needed.
+
 Usage:
     python scripts/generate_samples.py \
         --checkpoint /path/to/checkpoint \
-        --config /path/to/config.yaml \
         --val_data /path/to/val_data.pt \
         --output generation_results.txt
 """
@@ -16,29 +18,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn.functional as F
-import yaml
 from transformers import BertTokenizer
 
-from models import create_model_by_version, normalize_version, build_model_kwargs
+from models import create_model_by_version, normalize_version
 
 
-def load_model(checkpoint_path, config_path):
-    """Load model from checkpoint and config"""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+def load_model(checkpoint_path):
+    """Load model from checkpoint (uses model_config from checkpoint)"""
+    # Load checkpoint
+    ckpt = torch.load(checkpoint_path, map_location='cpu')
 
-    model_config = config['model']
+    # Get config from checkpoint
+    model_config = ckpt.get('model_config', ckpt.get('config', {}))
+    if not model_config:
+        raise ValueError("No model_config found in checkpoint")
+
     version = model_config.get('model_version', 'baseline')
     version = normalize_version(version)
 
-    # Build model kwargs using version registry
-    model_kwargs = build_model_kwargs(version, model_config)
-
-    # Create model
-    model = create_model_by_version(version, model_kwargs)
+    # Create model using checkpoint's config
+    model = create_model_by_version(version, model_config)
 
     # Load weights
-    ckpt = torch.load(checkpoint_path, map_location='cpu')
     if 'model_state_dict' in ckpt:
         state_dict = ckpt['model_state_dict']
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
@@ -140,7 +141,6 @@ def compute_perplexity(model, val_tokens, num_seqs=10, device='cuda'):
 def main():
     parser = argparse.ArgumentParser(description='DAWN Generation Test')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
-    parser.add_argument('--config', type=str, required=True, help='Path to config yaml')
     parser.add_argument('--val_data', type=str, required=True, help='Path to validation data')
     parser.add_argument('--output', type=str, default='generation_results.txt', help='Output file')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
@@ -148,7 +148,7 @@ def main():
 
     # Load model
     print(f"Loading model from {args.checkpoint}")
-    model, version = load_model(args.checkpoint, args.config)
+    model, version = load_model(args.checkpoint)
     model = model.to(args.device)
     model.eval()
 
