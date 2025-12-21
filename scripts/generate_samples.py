@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import yaml
 from transformers import BertTokenizer
 
-from models import DAWN, TransformerLM
+from models import create_model_by_version, normalize_version, build_model_kwargs
 
 
 def load_model(checkpoint_path, config_path):
@@ -29,43 +29,13 @@ def load_model(checkpoint_path, config_path):
 
     model_config = config['model']
     version = model_config.get('model_version', 'baseline')
+    version = normalize_version(version)
 
-    if version == 'baseline':
-        model = TransformerLM(
-            vocab_size=30522,
-            d_model=model_config['d_model'],
-            n_layers=model_config['n_layers'],
-            n_heads=model_config['n_heads'],
-            d_ff=model_config.get('d_ff', model_config['d_model'] * 4),
-            max_seq_len=model_config.get('max_seq_len', 512),
-            dropout=model_config.get('dropout', 0.1),
-        )
-    else:
-        model = DAWN(
-            vocab_size=30522,
-            d_model=model_config['d_model'],
-            n_layers=model_config['n_layers'],
-            n_heads=model_config['n_heads'],
-            rank=model_config.get('rank', 64),
-            knowledge_rank=model_config.get('knowledge_rank', 64),
-            d_space=model_config.get('d_space', 64),
-            n_feature_qk=model_config.get('n_feature_qk', 64),
-            n_feature_v=model_config.get('n_feature_v', 64),
-            n_restore_qk=model_config.get('n_restore_qk', 64),
-            n_restore_v=model_config.get('n_restore_v', 64),
-            n_feature_know=model_config.get('n_feature_know', 64),
-            n_restore_know=model_config.get('n_restore_know', 64),
-            top_k_feature_qk=model_config.get('top_k_feature_qk', 6),
-            top_k_feature_v=model_config.get('top_k_feature_v', 6),
-            top_k_restore_qk=model_config.get('top_k_restore_qk', 6),
-            top_k_restore_v=model_config.get('top_k_restore_v', 6),
-            top_k_feature_know=model_config.get('top_k_feature_know', 6),
-            top_k_restore_know=model_config.get('top_k_restore_know', 6),
-            max_seq_len=model_config.get('max_seq_len', 512),
-            dropout=model_config.get('dropout', 0.1),
-            attention_token_routing=model_config.get('attention_token_routing', True),
-            knowledge_token_routing=model_config.get('knowledge_token_routing', True),
-        )
+    # Build model kwargs using version registry
+    model_kwargs = build_model_kwargs(version, model_config)
+
+    # Create model
+    model = create_model_by_version(version, model_kwargs)
 
     # Load weights
     ckpt = torch.load(checkpoint_path, map_location='cpu')
@@ -86,7 +56,8 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=30, temperature=0.8, 
 
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            logits = model(generated, attention_mask=None)
+            output = model(generated, attention_mask=None)
+            logits = output[0] if isinstance(output, tuple) else output
             next_token_logits = logits[:, -1, :] / temperature
 
             if top_k > 0:
@@ -117,7 +88,8 @@ def continuation_test(model, tokenizer, val_tokens, sample_indices, context_len=
         with torch.no_grad():
             generated = context_tokens.clone()
             for _ in range(gen_len):
-                logits = model(generated, attention_mask=None)
+                output = model(generated, attention_mask=None)
+                logits = output[0] if isinstance(output, tuple) else output
                 next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 generated = torch.cat([generated, next_token], dim=1)
 
@@ -149,7 +121,8 @@ def compute_perplexity(model, val_tokens, num_seqs=10, device='cuda'):
             start = i * 512
             seq = val_tokens[start:start+512].unsqueeze(0).to(device)
 
-            logits = model(seq, attention_mask=None)
+            output = model(seq, attention_mask=None)
+            logits = output[0] if isinstance(output, tuple) else output
 
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = seq[:, 1:].contiguous()
