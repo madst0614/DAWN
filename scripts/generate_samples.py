@@ -33,18 +33,27 @@ def load_model(checkpoint_path):
     if not model_config:
         raise ValueError("No model_config found in checkpoint")
 
-    version = model_config.get('model_version', 'baseline')
-    version = normalize_version(version)
-
-    # Create model using checkpoint's config
-    model = create_model_by_version(version, model_config)
-
-    # Load weights
+    # Get state_dict first for auto-detection
     if 'model_state_dict' in ckpt:
         state_dict = ckpt['model_state_dict']
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
     else:
         state_dict = ckpt
+
+    # Auto-detect version from state_dict keys if not in config
+    version = model_config.get('model_version', None)
+    if version is None:
+        # Check for DAWN-specific keys
+        dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
+        if any(k in state_dict for k in dawn_keys):
+            version = '17.1'  # Default DAWN version
+        else:
+            version = 'baseline'
+
+    version = normalize_version(version)
+
+    # Create model using checkpoint's config
+    model = create_model_by_version(version, model_config)
 
     model.load_state_dict(state_dict)
     return model, version
