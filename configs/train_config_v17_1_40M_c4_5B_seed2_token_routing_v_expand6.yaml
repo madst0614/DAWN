@@ -1,7 +1,7 @@
 # DAWN v17.1 Training Config - 40M Scale, 5B tokens (Seed 2, Token Routing, V Expand 6)
 # Q/K shared pool + Knowledge Feature-Restore pattern
 # Token-level routing for both attention and knowledge (no SSM importance)
-# QK=64(k=12), V=256(k=12), Knowledge=128(k=12), knowledge_rank=64, d_space=256
+# QK=64(k=12), V=264(k=12), Knowledge=160(k=12), knowledge_rank=64, d_space=256
 
 seed: 2
 
@@ -31,20 +31,20 @@ model:
   rank: 64
   state_dim: 64
 
-  # Attention - Q/K shared pool (QK=64 k=12, V=256 k=12)
+  # Attention - Q/K shared pool (QK=64 k=12, V=264 k=12)
   n_feature_qk: 64
-  n_feature_v: 256
+  n_feature_v: 264
   top_k_feature_qk: 12
   top_k_feature_v: 12
 
   n_restore_qk: 64
-  n_restore_v: 256
+  n_restore_v: 264
   top_k_restore_qk: 12
   top_k_restore_v: 12
 
   # Knowledge - Feature-Restore pattern (rank=64)
-  n_feature_know: 128
-  n_restore_know: 128
+  n_feature_know: 160
+  n_restore_know: 160
   knowledge_rank: 64
   top_k_feature_know: 12
   top_k_restore_know: 12
@@ -66,7 +66,7 @@ training:
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.00001
+  load_balance_weight: 0.00002
   entropy_weight: 0.0
   process_norm_weight: 0.0
 
@@ -78,15 +78,15 @@ log_dir: /content/drive/MyDrive/dawn/logs_v17.1_40M_c4_5B_seed2_token_routing_v_
 #
 #   Changes from V-Expand4:
 #   - QK: 64, top-k increased: 6→12
-#   - V expanded: 80→256, top-k increased: 6→12
-#   - Knowledge: 92→128, top-k increased: 6→12
+#   - V expanded: 80→264, top-k increased: 6→12
+#   - Knowledge: 92→160, top-k increased: 6→12
 #
 #   Attention Circuit (per-token routing):
 #   - Feature_QK=64 (k=12): per-token Q/K compression
-#   - Feature_V=256 (k=12): per-token V compression
+#   - Feature_V=264 (k=12): per-token V compression
 #   - Restore_QK=64 (k=12): per-token Q/K restoration
-#   - Restore_V=256 (k=12): per-token V restoration
+#   - Restore_V=264 (k=12): per-token V restoration
 #
 #   Knowledge Circuit (per-token routing):
-#   - Feature_Know=128 (k=12): per-token compression
-#   - Restore_Know=128 (k=12): per-token restoration
+#   - Feature_Know=160 (k=12): per-token compression
+#   - Restore_Know=160 (k=12): per-token restoration
