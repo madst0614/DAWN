@@ -323,6 +323,160 @@ def analyze_common_neurons(
     return results
 
 
+def analyze_token_neurons(
+    analyzer: 'GenerationRoutingAnalyzer',
+    prompt: str,
+    target_token: str,
+    iterations: int = 50,
+    pool_type: str = 'fv',
+    max_new_tokens: int = 30,
+    temperature: float = 1.0,
+    top_k: int = 50,
+    verbose: bool = True,
+) -> Dict:
+    """
+    Run multiple generations and analyze neurons activated for a specific token.
+
+    Args:
+        analyzer: GenerationRoutingAnalyzer instance
+        prompt: Input prompt
+        target_token: Token to search for (e.g., "paris")
+        iterations: Number of generation runs
+        pool_type: Neuron pool to analyze
+        max_new_tokens: Max tokens per generation
+        temperature: Sampling temperature
+        top_k: Top-k sampling
+        verbose: Print progress
+
+    Returns:
+        Dictionary with analysis results
+    """
+    target_lower = target_token.strip().lower()
+    indices_key = f'{pool_type}_indices'
+
+    # Collect runs where target token appears
+    matching_runs = []
+    all_runs = []
+
+    if verbose:
+        print(f"\nRunning {iterations} generations...")
+        print(f"Target token: '{target_token}'")
+        print(f"Pool: {pool_type.upper()}")
+        print("-" * 50)
+
+    for i in range(iterations):
+        routing_log = analyzer.generate_with_routing(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        all_runs.append(routing_log)
+
+        # Check if target token appears
+        tokens = routing_log.get('tokens', [])
+        indices_list = routing_log.get(indices_key, [])
+
+        for j, token in enumerate(tokens):
+            if target_lower in token.strip().lower():
+                # Found target token
+                if j < len(indices_list):
+                    matching_runs.append({
+                        'run_idx': i,
+                        'token_idx': j,
+                        'token': token,
+                        'indices': indices_list[j],
+                        'generated_text': routing_log['full_text'],
+                    })
+                break
+
+        if verbose and (i + 1) % 10 == 0:
+            print(f"  [{i+1}/{iterations}] Found '{target_token}' in {len(matching_runs)} runs")
+
+    # Analyze common neurons
+    n_matching = len(matching_runs)
+    n_total = iterations
+
+    if verbose:
+        print(f"\n{'='*50}")
+        print(f"RESULTS: '{target_token}' appeared in {n_matching}/{n_total} runs")
+        print('='*50)
+
+    if n_matching == 0:
+        return {
+            'target_token': target_token,
+            'prompt': prompt,
+            'pool_type': pool_type,
+            'iterations': iterations,
+            'matching_runs': 0,
+            'total_runs': iterations,
+            'common_neurons_100': [],
+            'neuron_frequencies': [],
+            'matching_run_details': [],
+        }
+
+    # Count neuron frequencies across matching runs
+    neuron_counter = Counter()
+    for run in matching_runs:
+        neuron_counter.update(run['indices'])
+
+    # Find neurons that appear in ALL matching runs (100%)
+    common_neurons_100 = [
+        neuron for neuron, count in neuron_counter.items()
+        if count == n_matching
+    ]
+
+    # Neurons with frequency >= 80%
+    common_neurons_80 = [
+        neuron for neuron, count in neuron_counter.items()
+        if count >= n_matching * 0.8
+    ]
+
+    # Neurons with frequency >= 50%
+    common_neurons_50 = [
+        neuron for neuron, count in neuron_counter.items()
+        if count >= n_matching * 0.5
+    ]
+
+    # Build frequency list
+    neuron_frequencies = [
+        {'neuron': neuron, 'count': count, 'percentage': count / n_matching * 100}
+        for neuron, count in neuron_counter.most_common()
+    ]
+
+    if verbose:
+        print(f"\n100% common neurons ({len(common_neurons_100)}): {sorted(common_neurons_100)[:20]}")
+        print(f" 80%+ common neurons ({len(common_neurons_80)}): {sorted(common_neurons_80)[:20]}")
+        print(f" 50%+ common neurons ({len(common_neurons_50)}): {sorted(common_neurons_50)[:20]}")
+
+        print(f"\nTop 15 neurons by frequency:")
+        for nf in neuron_frequencies[:15]:
+            bar = '█' * int(nf['percentage'] / 5)
+            print(f"  Neuron {nf['neuron']:4d}: {nf['count']:3d}/{n_matching} ({nf['percentage']:5.1f}%) {bar}")
+
+        # Show sample generations
+        print(f"\nSample generations with '{target_token}':")
+        for run in matching_runs[:3]:
+            print(f"  Run {run['run_idx']}: {run['generated_text'][:80]}...")
+
+    return {
+        'target_token': target_token,
+        'prompt': prompt,
+        'pool_type': pool_type,
+        'layer': analyzer.target_layer,
+        'iterations': iterations,
+        'matching_runs': n_matching,
+        'total_runs': n_total,
+        'match_rate': n_matching / n_total,
+        'common_neurons_100': sorted(common_neurons_100),
+        'common_neurons_80': sorted(common_neurons_80),
+        'common_neurons_50': sorted(common_neurons_50),
+        'neuron_frequencies': neuron_frequencies,
+        'matching_run_details': matching_runs,
+        'unique_neurons_total': len(neuron_counter),
+    }
+
+
 def plot_routing_heatmap(
     routing_log: Dict,
     pool_type: str = 'fv',
@@ -505,6 +659,11 @@ Examples:
 
   # Analyze specific layer only (e.g., last layer = 11)
   python scripts/analysis/routing_analysis.py --checkpoint checkpoint.pt --layer 11
+
+  # Token neuron analysis: run N iterations, find common neurons for target token
+  python scripts/analysis/routing_analysis.py --checkpoint checkpoint.pt \\
+      --prompt "The capital of France is" --target_token "paris" \\
+      --iterations 50 --layer 11 --pool fv
         """
     )
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -532,6 +691,10 @@ Examples:
                         help='Skip plotting (useful for headless environments)')
     parser.add_argument('--layer', type=int, default=None,
                         help='Specific layer to analyze (e.g., 11 for last layer). Default: all layers')
+    parser.add_argument('--target_token', type=str, default=None,
+                        help='Target token for iterative analysis (e.g., "paris")')
+    parser.add_argument('--iterations', type=int, default=50,
+                        help='Number of iterations for target_token analysis (default: 50)')
     args = parser.parse_args()
 
     # Default prompts if none provided
@@ -578,6 +741,60 @@ Examples:
     if args.layer is not None:
         print(f"Analyzing layer {args.layer} only")
 
+    # TARGET TOKEN MODE: iterative analysis
+    if args.target_token is not None:
+        if args.prompt is None:
+            print("ERROR: --prompt is required when using --target_token")
+            return
+
+        # Use top_k=50 by default for target_token mode (need sampling variance)
+        top_k = args.top_k if args.top_k > 0 else 50
+
+        print(f"\n{'='*70}")
+        print("TARGET TOKEN ANALYSIS MODE")
+        print('='*70)
+
+        result = analyze_token_neurons(
+            analyzer=analyzer,
+            prompt=args.prompt,
+            target_token=args.target_token,
+            iterations=args.iterations,
+            pool_type=args.pool,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=top_k,
+            verbose=True,
+        )
+
+        # Save results
+        output_file = os.path.join(
+            args.output,
+            f'token_analysis_{args.target_token}_{args.pool}_layer{args.layer or "all"}.json'
+        )
+        os.makedirs(args.output, exist_ok=True)
+
+        # Remove non-serializable items
+        save_result = {k: v for k, v in result.items() if k != 'matching_run_details'}
+        save_result['matching_run_samples'] = result['matching_run_details'][:10]  # Save first 10
+
+        with open(output_file, 'w') as f:
+            json.dump(save_result, f, indent=2, ensure_ascii=False)
+        print(f"\nResults saved to: {output_file}")
+
+        # Summary
+        print(f"\n{'='*70}")
+        print("SUMMARY")
+        print('='*70)
+        print(f"  Target token: '{args.target_token}'")
+        print(f"  Match rate: {result['matching_runs']}/{result['total_runs']} ({result['match_rate']*100:.1f}%)")
+        print(f"  Pool: {args.pool.upper()}")
+        print(f"  Layer: {args.layer if args.layer is not None else 'all'}")
+        print(f"  100% common neurons: {len(result['common_neurons_100'])}")
+        print(f"   80%+ neurons: {len(result['common_neurons_80'])}")
+        print(f"   50%+ neurons: {len(result['common_neurons_50'])}")
+        return
+
+    # NORMAL MODE: single/multiple prompt analysis
     # Determine pools to analyze
     if args.all_pools:
         pools = ['fv', 'rv', 'fqk_q', 'fqk_k', 'fknow', 'rknow']

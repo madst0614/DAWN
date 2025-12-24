@@ -76,6 +76,7 @@ from .paper_figures import PaperFigureGenerator
 from .routing_analysis import (
     GenerationRoutingAnalyzer,
     analyze_common_neurons,
+    analyze_token_neurons,
     plot_routing_heatmap,
     plot_routing_comparison,
 )
@@ -124,6 +125,7 @@ __all__ = [
     # Routing analysis
     'GenerationRoutingAnalyzer',
     'analyze_common_neurons',
+    'analyze_token_neurons',
     'plot_routing_heatmap',
     'plot_routing_comparison',
 ]
