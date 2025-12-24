@@ -1,0 +1,790 @@
+#!/usr/bin/env python3
+"""
+POS-based Neuron Analysis for DAWN
+===================================
+Analyze neuron specialization by Part-of-Speech tags.
+
+Uses Universal Dependencies English Web Treebank to show that
+different POS categories activate different neurons.
+
+Usage:
+    python scripts/analysis/pos_neuron_analysis.py \
+        --checkpoint path/to/checkpoint \
+        --layer 11 \
+        --pool fv \
+        --output pos_analysis/ \
+        --bf16
+"""
+
+import sys
+import os
+from pathlib import Path
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import argparse
+import json
+from typing import Dict, List, Optional, Tuple, Set
+from collections import Counter, defaultdict
+from tqdm import tqdm
+
+# Handle both module import and standalone execution
+try:
+    from .utils import (
+        load_model, get_router,
+        ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
+        HAS_MATPLOTLIB, plt
+    )
+except ImportError:
+    from scripts.analysis.utils import (
+        load_model, get_router,
+        ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
+        HAS_MATPLOTLIB, plt
+    )
+
+if HAS_MATPLOTLIB:
+    import seaborn as sns
+    from scipy.cluster import hierarchy
+    from scipy.spatial.distance import pdist
+
+# Universal POS tags (UPOS)
+UPOS_TAGS = [
+    'ADJ',    # adjective
+    'ADP',    # adposition
+    'ADV',    # adverb
+    'AUX',    # auxiliary
+    'CCONJ',  # coordinating conjunction
+    'DET',    # determiner
+    'INTJ',   # interjection
+    'NOUN',   # noun
+    'NUM',    # numeral
+    'PART',   # particle
+    'PRON',   # pronoun
+    'PROPN',  # proper noun
+    'PUNCT',  # punctuation
+    'SCONJ',  # subordinating conjunction
+    'SYM',    # symbol
+    'VERB',   # verb
+    'X',      # other
+]
+
+# Simplified POS groups for cleaner visualization
+POS_GROUPS = {
+    'Content Words': ['NOUN', 'VERB', 'ADJ', 'ADV', 'PROPN'],
+    'Function Words': ['DET', 'ADP', 'AUX', 'PRON', 'CCONJ', 'SCONJ', 'PART'],
+    'Other': ['NUM', 'PUNCT', 'SYM', 'INTJ', 'X'],
+}
+
+
+class POSNeuronAnalyzer:
+    """Analyze neuron activations by POS tags."""
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        device: str = 'cuda',
+        target_layer: int = None,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.target_layer = target_layer
+        self.model.eval()
+
+        # Storage for analysis
+        self.pos_neuron_counts = defaultdict(lambda: defaultdict(int))
+        self.pos_total_tokens = defaultdict(int)
+        self.layer_pos_neurons = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+
+    def load_ud_dataset(self, split: str = 'train', max_sentences: int = None):
+        """Load Universal Dependencies English Web Treebank."""
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise ImportError("Please install datasets: pip install datasets")
+
+        print(f"Loading UD English Web Treebank ({split})...")
+        dataset = load_dataset("universal_dependencies", "en_ewt", split=split, trust_remote_code=True)
+
+        if max_sentences:
+            dataset = dataset.select(range(min(max_sentences, len(dataset))))
+
+        print(f"Loaded {len(dataset)} sentences")
+        return dataset
+
+    def align_tokens(
+        self,
+        ud_tokens: List[str],
+        ud_pos: List[str],
+    ) -> List[Tuple[str, str, List[int]]]:
+        """
+        Align UD tokens with DAWN tokenizer tokens.
+
+        Returns list of (ud_token, pos_tag, dawn_token_ids)
+        """
+        aligned = []
+        text = ' '.join(ud_tokens)
+
+        # Tokenize full text
+        dawn_tokens = self.tokenizer.encode(text, add_special_tokens=False)
+
+        # Try to align by reconstructing
+        current_pos = 0
+        for ud_token, pos in zip(ud_tokens, ud_pos):
+            # Find how many DAWN tokens cover this UD token
+            target_text = ud_token
+            matched_ids = []
+
+            # Greedy matching
+            temp_text = ""
+            while current_pos < len(dawn_tokens):
+                token_id = dawn_tokens[current_pos]
+                token_text = self.tokenizer.decode([token_id])
+                temp_text += token_text
+                matched_ids.append(token_id)
+                current_pos += 1
+
+                # Check if we've covered the UD token
+                if target_text.lower() in temp_text.lower().replace(' ', ''):
+                    break
+                if len(temp_text.replace(' ', '')) >= len(target_text) * 2:
+                    # Went too far, stop
+                    break
+
+            if matched_ids:
+                aligned.append((ud_token, pos, matched_ids))
+
+        return aligned
+
+    def extract_routing_for_tokens(
+        self,
+        token_ids: List[int],
+        pool_type: str = 'fv',
+    ) -> Dict[int, List[int]]:
+        """
+        Get routing indices for each token position.
+
+        Returns: {position: [neuron_indices]}
+        """
+        input_ids = torch.tensor([token_ids], device=self.device)
+
+        with torch.no_grad():
+            outputs = self.model(input_ids, return_routing_info=True)
+
+        if isinstance(outputs, tuple) and len(outputs) >= 2:
+            routing_infos = outputs[1]
+        else:
+            return {}
+
+        # Map pool_type to routing key
+        pool_key_map = {
+            'fv': 'fv_weights',
+            'rv': 'rv_weights',
+            'fqk_q': 'fqk_weights_Q',
+            'fqk_k': 'fqk_weights_K',
+            'rqk_q': 'rqk_weights_Q',
+            'rqk_k': 'rqk_weights_K',
+            'fknow': 'feature_know_w',
+            'rknow': 'restore_know_w',
+        }
+        weight_key = pool_key_map.get(pool_type, 'fv_weights')
+
+        # Collect per-position neuron indices
+        position_neurons = defaultdict(set)
+        seq_len = input_ids.shape[1]
+
+        for layer_idx, layer_info in enumerate(routing_infos):
+            # Skip if not target layer
+            if self.target_layer is not None and layer_idx != self.target_layer:
+                continue
+
+            # Get weights from attention or knowledge
+            attn = layer_info.get('attention', layer_info)
+            know = layer_info.get('knowledge', {})
+
+            weights = attn.get(weight_key) or know.get(weight_key)
+
+            if weights is not None:
+                # weights: [B, T, N]
+                for pos in range(seq_len):
+                    w = weights[0, pos]  # [N]
+                    active_neurons = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    position_neurons[pos].update(active_neurons)
+
+        return {pos: list(neurons) for pos, neurons in position_neurons.items()}
+
+    def analyze_sentence(
+        self,
+        ud_tokens: List[str],
+        ud_pos: List[str],
+        pool_type: str = 'fv',
+    ):
+        """Analyze a single sentence and update statistics."""
+        # Align tokens
+        aligned = self.align_tokens(ud_tokens, ud_pos)
+        if not aligned:
+            return
+
+        # Flatten token IDs for model input
+        all_token_ids = []
+        token_pos_map = []  # Maps each position to (ud_token, pos)
+
+        for ud_token, pos, dawn_ids in aligned:
+            for tid in dawn_ids:
+                all_token_ids.append(tid)
+                token_pos_map.append((ud_token, pos))
+
+        if not all_token_ids:
+            return
+
+        # Get routing for all positions
+        position_neurons = self.extract_routing_for_tokens(all_token_ids, pool_type)
+
+        # Update statistics
+        for pos_idx, (ud_token, pos) in enumerate(token_pos_map):
+            neurons = position_neurons.get(pos_idx, [])
+
+            self.pos_total_tokens[pos] += 1
+
+            for neuron in neurons:
+                self.pos_neuron_counts[pos][neuron] += 1
+
+    def analyze_dataset(
+        self,
+        dataset,
+        pool_type: str = 'fv',
+        max_sentences: int = None,
+        batch_size: int = 1,
+    ):
+        """Analyze full dataset."""
+        n_sentences = min(len(dataset), max_sentences) if max_sentences else len(dataset)
+
+        print(f"\nAnalyzing {n_sentences} sentences...")
+        print(f"Pool: {pool_type.upper()}")
+        print(f"Layer: {self.target_layer if self.target_layer is not None else 'all'}")
+
+        for i in tqdm(range(n_sentences), desc="Processing"):
+            example = dataset[i]
+            tokens = example['tokens']
+            pos_tags = example['upos']
+
+            try:
+                self.analyze_sentence(tokens, pos_tags, pool_type)
+            except Exception as e:
+                # Skip problematic sentences
+                continue
+
+    def get_results(self) -> Dict:
+        """Compile analysis results."""
+        # Per-POS neuron frequency
+        pos_neuron_freq = {}
+        for pos in UPOS_TAGS:
+            if self.pos_total_tokens[pos] > 0:
+                neuron_counts = self.pos_neuron_counts[pos]
+                total = self.pos_total_tokens[pos]
+
+                # Normalize by token count
+                freq = {
+                    neuron: count / total
+                    for neuron, count in neuron_counts.items()
+                }
+                pos_neuron_freq[pos] = freq
+
+        # Top neurons per POS
+        top_neurons_per_pos = {}
+        for pos, freq in pos_neuron_freq.items():
+            sorted_neurons = sorted(freq.items(), key=lambda x: -x[1])[:20]
+            top_neurons_per_pos[pos] = sorted_neurons
+
+        # Find POS-specific neurons (high in one POS, low in others)
+        all_neurons = set()
+        for freq in pos_neuron_freq.values():
+            all_neurons.update(freq.keys())
+
+        neuron_specificity = {}
+        for neuron in all_neurons:
+            scores = []
+            for pos in UPOS_TAGS:
+                if pos in pos_neuron_freq:
+                    scores.append((pos, pos_neuron_freq[pos].get(neuron, 0)))
+
+            if scores:
+                scores.sort(key=lambda x: -x[1])
+                top_pos, top_score = scores[0]
+                if len(scores) > 1:
+                    second_score = scores[1][1]
+                    specificity = top_score / (second_score + 1e-6)
+                else:
+                    specificity = float('inf')
+
+                if top_score > 0.1:  # At least 10% activation
+                    neuron_specificity[neuron] = {
+                        'top_pos': top_pos,
+                        'top_score': top_score,
+                        'specificity': min(specificity, 100),
+                    }
+
+        # POS overlap matrix
+        overlap_matrix = {}
+        for pos1 in UPOS_TAGS:
+            if pos1 not in pos_neuron_freq:
+                continue
+            neurons1 = set(n for n, f in pos_neuron_freq[pos1].items() if f > 0.1)
+
+            for pos2 in UPOS_TAGS:
+                if pos2 not in pos_neuron_freq:
+                    continue
+                neurons2 = set(n for n, f in pos_neuron_freq[pos2].items() if f > 0.1)
+
+                if neurons1 and neurons2:
+                    overlap = len(neurons1 & neurons2)
+                    union = len(neurons1 | neurons2)
+                    jaccard = overlap / union if union > 0 else 0
+                    overlap_matrix[f"{pos1}-{pos2}"] = jaccard
+
+        return {
+            'pos_token_counts': dict(self.pos_total_tokens),
+            'pos_neuron_freq': {
+                pos: {str(k): v for k, v in freq.items()}
+                for pos, freq in pos_neuron_freq.items()
+            },
+            'top_neurons_per_pos': {
+                pos: [(int(n), f) for n, f in neurons]
+                for pos, neurons in top_neurons_per_pos.items()
+            },
+            'neuron_specificity': {
+                str(k): v for k, v in sorted(
+                    neuron_specificity.items(),
+                    key=lambda x: -x[1]['specificity']
+                )[:50]
+            },
+            'overlap_matrix': overlap_matrix,
+            'total_neurons_seen': len(all_neurons),
+        }
+
+
+def plot_pos_heatmap(
+    results: Dict,
+    output_path: str = None,
+    figsize: Tuple[int, int] = (16, 10),
+):
+    """Plot POS x Neuron activation heatmap."""
+    if not HAS_MATPLOTLIB:
+        print("matplotlib not available")
+        return
+
+    pos_neuron_freq = results['pos_neuron_freq']
+
+    # Get all neurons and sort by total activation
+    all_neurons = set()
+    for freq in pos_neuron_freq.values():
+        all_neurons.update(int(n) for n in freq.keys())
+
+    # Filter to top neurons
+    neuron_total = defaultdict(float)
+    for freq in pos_neuron_freq.values():
+        for n, f in freq.items():
+            neuron_total[int(n)] += f
+
+    top_neurons = sorted(neuron_total.keys(), key=lambda n: -neuron_total[n])[:100]
+
+    # Build matrix
+    pos_list = [p for p in UPOS_TAGS if p in pos_neuron_freq]
+    matrix = np.zeros((len(pos_list), len(top_neurons)))
+
+    for i, pos in enumerate(pos_list):
+        for j, neuron in enumerate(top_neurons):
+            matrix[i, j] = pos_neuron_freq[pos].get(str(neuron), 0)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sns.heatmap(
+        matrix,
+        xticklabels=[str(n) for n in top_neurons],
+        yticklabels=pos_list,
+        cmap='YlOrRd',
+        ax=ax,
+        cbar_kws={'label': 'Activation Frequency'}
+    )
+
+    ax.set_xlabel('Neuron Index')
+    ax.set_ylabel('POS Tag')
+    ax.set_title('Neuron Activation by Part-of-Speech')
+
+    # Rotate x labels
+    plt.xticks(rotation=90, fontsize=6)
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        return output_path
+    else:
+        plt.show()
+
+
+def plot_pos_clustering(
+    results: Dict,
+    output_path: str = None,
+    figsize: Tuple[int, int] = (12, 8),
+):
+    """Plot POS clustering based on neuron activation similarity."""
+    if not HAS_MATPLOTLIB:
+        print("matplotlib not available")
+        return
+
+    pos_neuron_freq = results['pos_neuron_freq']
+
+    # Get all neurons
+    all_neurons = set()
+    for freq in pos_neuron_freq.values():
+        all_neurons.update(int(n) for n in freq.keys())
+    all_neurons = sorted(all_neurons)
+
+    # Build feature vectors
+    pos_list = [p for p in UPOS_TAGS if p in pos_neuron_freq]
+    vectors = np.zeros((len(pos_list), len(all_neurons)))
+
+    for i, pos in enumerate(pos_list):
+        for j, neuron in enumerate(all_neurons):
+            vectors[i, j] = pos_neuron_freq[pos].get(str(neuron), 0)
+
+    # Compute distances and cluster
+    if len(pos_list) < 2:
+        print("Not enough POS tags for clustering")
+        return
+
+    distances = pdist(vectors, metric='cosine')
+    linkage = hierarchy.linkage(distances, method='ward')
+
+    # Plot dendrogram
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # Dendrogram
+    hierarchy.dendrogram(
+        linkage,
+        labels=pos_list,
+        orientation='left',
+        ax=axes[0]
+    )
+    axes[0].set_title('POS Clustering by Neuron Patterns')
+    axes[0].set_xlabel('Distance')
+
+    # Similarity heatmap
+    similarity = 1 - pdist(vectors, metric='cosine')
+    sim_matrix = np.zeros((len(pos_list), len(pos_list)))
+    idx = 0
+    for i in range(len(pos_list)):
+        for j in range(i + 1, len(pos_list)):
+            sim_matrix[i, j] = similarity[idx]
+            sim_matrix[j, i] = similarity[idx]
+            idx += 1
+        sim_matrix[i, i] = 1.0
+
+    sns.heatmap(
+        sim_matrix,
+        xticklabels=pos_list,
+        yticklabels=pos_list,
+        cmap='RdYlGn',
+        vmin=0, vmax=1,
+        annot=True, fmt='.2f',
+        ax=axes[1]
+    )
+    axes[1].set_title('POS Similarity (Cosine)')
+
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        return output_path
+    else:
+        plt.show()
+
+
+def plot_top_neurons_by_pos(
+    results: Dict,
+    output_path: str = None,
+    figsize: Tuple[int, int] = (14, 10),
+):
+    """Plot top neurons for each POS."""
+    if not HAS_MATPLOTLIB:
+        print("matplotlib not available")
+        return
+
+    top_neurons = results['top_neurons_per_pos']
+    pos_list = [p for p in UPOS_TAGS if p in top_neurons]
+
+    n_cols = 4
+    n_rows = (len(pos_list) + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes = axes.flatten()
+
+    for i, pos in enumerate(pos_list):
+        neurons = top_neurons[pos][:10]
+        if neurons:
+            neuron_ids = [n[0] for n in neurons]
+            freqs = [n[1] for n in neurons]
+
+            axes[i].barh(range(len(neurons)), freqs, color='steelblue')
+            axes[i].set_yticks(range(len(neurons)))
+            axes[i].set_yticklabels([f'N{n}' for n in neuron_ids])
+            axes[i].set_title(pos)
+            axes[i].set_xlabel('Freq')
+            axes[i].invert_yaxis()
+
+    # Hide unused subplots
+    for i in range(len(pos_list), len(axes)):
+        axes[i].axis('off')
+
+    plt.suptitle('Top 10 Neurons per POS Tag', fontsize=14)
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        return output_path
+    else:
+        plt.show()
+
+
+def plot_specificity(
+    results: Dict,
+    output_path: str = None,
+    figsize: Tuple[int, int] = (12, 6),
+):
+    """Plot neuron specificity - neurons specialized for specific POS."""
+    if not HAS_MATPLOTLIB:
+        print("matplotlib not available")
+        return
+
+    specificity = results['neuron_specificity']
+    if not specificity:
+        print("No specific neurons found")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # Top specific neurons
+    items = list(specificity.items())[:20]
+    neurons = [int(n) for n, _ in items]
+    scores = [s['specificity'] for _, s in items]
+    pos_tags = [s['top_pos'] for _, s in items]
+
+    colors = plt.cm.tab20(np.linspace(0, 1, len(set(pos_tags))))
+    pos_color_map = {pos: colors[i] for i, pos in enumerate(set(pos_tags))}
+
+    axes[0].barh(
+        range(len(neurons)),
+        scores,
+        color=[pos_color_map[p] for p in pos_tags]
+    )
+    axes[0].set_yticks(range(len(neurons)))
+    axes[0].set_yticklabels([f'N{n} ({p})' for n, p in zip(neurons, pos_tags)])
+    axes[0].set_xlabel('Specificity Score')
+    axes[0].set_title('Most POS-Specific Neurons')
+    axes[0].invert_yaxis()
+
+    # POS-specific neuron counts
+    pos_specific_counts = defaultdict(int)
+    for _, s in specificity.items():
+        pos_specific_counts[s['top_pos']] += 1
+
+    pos_sorted = sorted(pos_specific_counts.items(), key=lambda x: -x[1])
+    axes[1].barh(
+        range(len(pos_sorted)),
+        [c for _, c in pos_sorted],
+        color='coral'
+    )
+    axes[1].set_yticks(range(len(pos_sorted)))
+    axes[1].set_yticklabels([p for p, _ in pos_sorted])
+    axes[1].set_xlabel('Number of Specific Neurons')
+    axes[1].set_title('Specialized Neurons per POS')
+    axes[1].invert_yaxis()
+
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        return output_path
+    else:
+        plt.show()
+
+
+def print_results(results: Dict):
+    """Print analysis results."""
+    print("\n" + "=" * 70)
+    print("POS NEURON ANALYSIS RESULTS")
+    print("=" * 70)
+
+    # Token counts
+    print("\nToken counts by POS:")
+    for pos, count in sorted(results['pos_token_counts'].items(), key=lambda x: -x[1]):
+        print(f"  {pos:8s}: {count:6d}")
+
+    print(f"\nTotal unique neurons: {results['total_neurons_seen']}")
+
+    # Top neurons per POS
+    print("\n" + "-" * 50)
+    print("Top 5 neurons per POS:")
+    print("-" * 50)
+    for pos in UPOS_TAGS:
+        if pos in results['top_neurons_per_pos']:
+            neurons = results['top_neurons_per_pos'][pos][:5]
+            neuron_str = ', '.join([f"N{n}({f:.2f})" for n, f in neurons])
+            print(f"  {pos:8s}: {neuron_str}")
+
+    # Specific neurons
+    print("\n" + "-" * 50)
+    print("Most POS-Specific Neurons:")
+    print("-" * 50)
+    for neuron, info in list(results['neuron_specificity'].items())[:10]:
+        print(f"  Neuron {neuron:4s}: {info['top_pos']:8s} (score={info['top_score']:.2f}, specificity={info['specificity']:.1f}x)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='POS-based Neuron Analysis for DAWN',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic analysis
+  python scripts/analysis/pos_neuron_analysis.py --checkpoint checkpoint.pt
+
+  # Specific layer and pool
+  python scripts/analysis/pos_neuron_analysis.py --checkpoint checkpoint.pt --layer 11 --pool fv
+
+  # With optimizations
+  python scripts/analysis/pos_neuron_analysis.py --checkpoint checkpoint.pt --bf16 --max_sentences 1000
+        """
+    )
+    parser.add_argument('--checkpoint', type=str, required=True,
+                        help='Path to checkpoint file or directory')
+    parser.add_argument('--output', type=str, default='pos_analysis',
+                        help='Output directory (default: pos_analysis)')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Device (default: cuda)')
+    parser.add_argument('--pool', type=str, default='fv',
+                        choices=['fv', 'rv', 'fqk_q', 'fqk_k', 'rqk_q', 'rqk_k', 'fknow', 'rknow'],
+                        help='Pool type to analyze (default: fv)')
+    parser.add_argument('--layer', type=int, default=None,
+                        help='Specific layer to analyze (default: all)')
+    parser.add_argument('--max_sentences', type=int, default=2000,
+                        help='Maximum sentences to analyze (default: 2000)')
+    parser.add_argument('--split', type=str, default='train',
+                        help='Dataset split (default: train)')
+    parser.add_argument('--bf16', action='store_true',
+                        help='Use bfloat16 precision')
+    parser.add_argument('--compile', action='store_true',
+                        help='Use torch.compile')
+    parser.add_argument('--no-plot', action='store_true',
+                        help='Skip plotting')
+    args = parser.parse_args()
+
+    # Device check
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA not available, using CPU")
+        args.device = 'cpu'
+
+    # Find checkpoint
+    ckpt_path = Path(args.checkpoint)
+    if ckpt_path.is_dir():
+        candidates = (
+            list(ckpt_path.glob('*best*.pt')) +
+            list(ckpt_path.glob('**/*best*.pt')) +
+            list(ckpt_path.glob('*.pt')) +
+            list(ckpt_path.glob('**/*.pt'))
+        )
+        candidates = [c for c in candidates if 'optimizer' not in c.name.lower()]
+        if not candidates:
+            print(f"No checkpoint found in {ckpt_path}")
+            return
+        best_candidates = [c for c in candidates if 'best' in c.name.lower()]
+        ckpt_path = best_candidates[0] if best_candidates else candidates[0]
+        print(f"Using checkpoint: {ckpt_path}")
+
+    # Load model
+    print(f"\n{'='*70}")
+    print(f"Loading model from {ckpt_path}")
+    print('='*70)
+    model, tokenizer, config = load_model(str(ckpt_path), args.device)
+    model = model.to(args.device)
+    model.eval()
+
+    # Apply optimizations
+    if args.bf16:
+        print("Using bfloat16 precision")
+        model = model.to(torch.bfloat16)
+
+    if args.compile:
+        if hasattr(torch, 'compile'):
+            print("Applying torch.compile...")
+            model = torch.compile(model, mode='reduce-overhead')
+
+    # Create analyzer
+    analyzer = POSNeuronAnalyzer(
+        model, tokenizer, args.device,
+        target_layer=args.layer
+    )
+
+    # Load dataset
+    dataset = analyzer.load_ud_dataset(args.split, args.max_sentences)
+
+    # Run analysis
+    analyzer.analyze_dataset(dataset, args.pool, args.max_sentences)
+
+    # Get results
+    results = analyzer.get_results()
+
+    # Print results
+    print_results(results)
+
+    # Save results
+    os.makedirs(args.output, exist_ok=True)
+    output_file = os.path.join(args.output, f'pos_analysis_{args.pool}_layer{args.layer or "all"}.json')
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to: {output_file}")
+
+    # Plotting
+    if not args.no_plot and HAS_MATPLOTLIB:
+        print("\nGenerating plots...")
+
+        heatmap_path = os.path.join(args.output, 'pos_neuron_heatmap.png')
+        plot_pos_heatmap(results, heatmap_path)
+        print(f"  Saved: {heatmap_path}")
+
+        cluster_path = os.path.join(args.output, 'pos_clustering.png')
+        plot_pos_clustering(results, cluster_path)
+        print(f"  Saved: {cluster_path}")
+
+        top_path = os.path.join(args.output, 'top_neurons_by_pos.png')
+        plot_top_neurons_by_pos(results, top_path)
+        print(f"  Saved: {top_path}")
+
+        spec_path = os.path.join(args.output, 'neuron_specificity.png')
+        plot_specificity(results, spec_path)
+        print(f"  Saved: {spec_path}")
+
+    # Summary
+    print(f"\n{'='*70}")
+    print("SUMMARY")
+    print('='*70)
+    print(f"  Sentences analyzed: {args.max_sentences}")
+    print(f"  Pool: {args.pool.upper()}")
+    print(f"  Layer: {args.layer if args.layer is not None else 'all'}")
+    print(f"  Total unique neurons: {results['total_neurons_seen']}")
+    print(f"  Output directory: {args.output}")
+
+
+if __name__ == '__main__':
+    main()
