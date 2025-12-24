@@ -40,7 +40,8 @@ try:
         HAS_MATPLOTLIB, plt
     )
 except ImportError:
-    from utils import (
+    # Standalone execution - use explicit path
+    from scripts.analysis.utils import (
         load_model, get_router,
         ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
         HAS_MATPLOTLIB, plt
