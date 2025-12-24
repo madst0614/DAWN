@@ -716,12 +716,21 @@ Examples:
     # Find checkpoint file
     ckpt_path = Path(args.checkpoint)
     if ckpt_path.is_dir():
-        # Find best checkpoint in directory
-        candidates = list(ckpt_path.glob('*best*.pt')) + list(ckpt_path.glob('*.pt'))
+        # Find best checkpoint in directory (search recursively)
+        candidates = (
+            list(ckpt_path.glob('*best*.pt')) +
+            list(ckpt_path.glob('**/*best*.pt')) +
+            list(ckpt_path.glob('*.pt')) +
+            list(ckpt_path.glob('**/*.pt'))
+        )
+        # Filter out optimizer checkpoints
+        candidates = [c for c in candidates if 'optimizer' not in c.name.lower()]
         if not candidates:
             print(f"No checkpoint found in {ckpt_path}")
             return
-        ckpt_path = candidates[0]
+        # Prefer 'best' checkpoints
+        best_candidates = [c for c in candidates if 'best' in c.name.lower()]
+        ckpt_path = best_candidates[0] if best_candidates else candidates[0]
         print(f"Using checkpoint: {ckpt_path}")
 
     # Load model
