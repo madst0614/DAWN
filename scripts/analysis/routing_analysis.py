@@ -54,7 +54,7 @@ if HAS_MATPLOTLIB:
 class GenerationRoutingAnalyzer:
     """Analyze routing patterns during text generation."""
 
-    def __init__(self, model, tokenizer, device='cuda'):
+    def __init__(self, model, tokenizer, device='cuda', target_layer: int = None):
         """
         Initialize analyzer.
 
@@ -62,10 +62,12 @@ class GenerationRoutingAnalyzer:
             model: DAWN model
             tokenizer: Tokenizer for text encoding/decoding
             device: Device for computation
+            target_layer: Specific layer to analyze (None = all layers)
         """
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
+        self.target_layer = target_layer
         self.model.eval()
 
     def generate_with_routing(
@@ -159,7 +161,7 @@ class GenerationRoutingAnalyzer:
 
     def _extract_routing_indices(self, routing_infos: List[Dict], routing_logs: Dict):
         """Extract routing indices from routing_infos for the last token."""
-        # Aggregate across layers (using last layer or mean)
+        # Aggregate across layers (or specific layer if target_layer is set)
         fv_indices_all = []
         rv_indices_all = []
         fqk_q_indices_all = []
@@ -172,7 +174,16 @@ class GenerationRoutingAnalyzer:
         fv_weights_last = None
         rv_weights_last = None
 
-        for layer_info in routing_infos:
+        # Filter layers if target_layer is specified
+        if self.target_layer is not None:
+            if 0 <= self.target_layer < len(routing_infos):
+                layers_to_process = [(self.target_layer, routing_infos[self.target_layer])]
+            else:
+                layers_to_process = []
+        else:
+            layers_to_process = enumerate(routing_infos)
+
+        for layer_idx, layer_info in layers_to_process:
             attn = layer_info.get('attention', layer_info)
             know = layer_info.get('knowledge', {})
 
@@ -491,6 +502,9 @@ Examples:
 
   # Full analysis with all pools
   python scripts/analysis/routing_analysis.py --checkpoint checkpoint.pt --all-pools
+
+  # Analyze specific layer only (e.g., last layer = 11)
+  python scripts/analysis/routing_analysis.py --checkpoint checkpoint.pt --layer 11
         """
     )
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -516,6 +530,8 @@ Examples:
                         help='Top-k sampling, 0=greedy (default: 0)')
     parser.add_argument('--no-plot', action='store_true',
                         help='Skip plotting (useful for headless environments)')
+    parser.add_argument('--layer', type=int, default=None,
+                        help='Specific layer to analyze (e.g., 11 for last layer). Default: all layers')
     args = parser.parse_args()
 
     # Default prompts if none provided
@@ -557,7 +573,10 @@ Examples:
     os.makedirs(args.output, exist_ok=True)
 
     # Create analyzer
-    analyzer = GenerationRoutingAnalyzer(model, tokenizer, args.device)
+    analyzer = GenerationRoutingAnalyzer(model, tokenizer, args.device, target_layer=args.layer)
+
+    if args.layer is not None:
+        print(f"Analyzing layer {args.layer} only")
 
     # Determine pools to analyze
     if args.all_pools:
@@ -647,6 +666,7 @@ Examples:
     print('='*70)
     print(f"  Prompts analyzed: {len(args.prompts)}")
     print(f"  Pools analyzed: {pools}")
+    print(f"  Layer: {args.layer if args.layer is not None else 'all'}")
     print(f"  Output directory: {args.output}")
     print(f"  Max tokens per generation: {args.max_tokens}")
 
