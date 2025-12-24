@@ -209,7 +209,7 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
         Tuple of (model, tokenizer, config)
     """
     from models import create_model_by_version
-    from transformers import BertTokenizer
+    from transformers import BertTokenizerFast
 
     path = Path(checkpoint_path)
     if path.is_dir():
@@ -237,7 +237,7 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
     model.to(device)
     model.eval()
 
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
     return model, tokenizer, config
 
 
