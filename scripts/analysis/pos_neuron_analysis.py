@@ -217,38 +217,65 @@ class POSNeuronAnalyzer:
 
         text = text.rstrip()  # remove trailing space
 
-        # Tokenize with DAWN tokenizer
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        # Try to use offset_mapping if tokenizer supports it
+        try:
+            encoding = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+                return_tensors=None,
+            )
+            token_ids = encoding['input_ids']
+            offset_mapping = encoding['offset_mapping']
 
-        if not token_ids:
-            return [], []
+            if not token_ids:
+                return [], []
 
-        # Build character position for each token by decoding incrementally
-        dawn_pos_tags = []
-        char_cursor = 0
+            # Map each token to POS using offset_mapping
+            dawn_pos_tags = []
+            for start, end in offset_mapping:
+                # Find which UD token this span overlaps with
+                assigned_pos = 'X'
+                for ud_start, ud_end, pos in ud_char_spans:
+                    # Check overlap
+                    if start < ud_end and end > ud_start:
+                        assigned_pos = pos
+                        break
+                dawn_pos_tags.append(assigned_pos)
 
-        for i, tid in enumerate(token_ids):
-            # Decode this single token
-            token_text = self.tokenizer.decode([tid])
+            return dawn_pos_tags, token_ids
 
-            # Skip leading space in token text for position matching
-            token_text_stripped = token_text.lstrip()
-            if token_text != token_text_stripped:
-                char_cursor += len(token_text) - len(token_text_stripped)
+        except (TypeError, KeyError):
+            # Fallback: tokenizer doesn't support offset_mapping
+            # Use simple sequential mapping
+            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
 
-            # Find which UD token this position belongs to
-            assigned_pos = 'X'  # default
-            for start, end, pos in ud_char_spans:
-                if start <= char_cursor < end:
-                    assigned_pos = pos
-                    break
+            if not token_ids:
+                return [], []
 
-            dawn_pos_tags.append(assigned_pos)
+            # Simple approach: assign each token to the UD token at same index
+            # (works reasonably for 1:1 or close mappings)
+            dawn_pos_tags = []
+            ud_idx = 0
+            decoded_so_far = ""
 
-            # Move cursor forward
-            char_cursor += len(token_text_stripped)
+            for tid in token_ids:
+                token_text = self.tokenizer.decode([tid])
+                decoded_so_far += token_text
 
-        return dawn_pos_tags, token_ids
+                # Find current position in original text
+                # by counting how many UD tokens we've passed
+                char_count = 0
+                assigned_pos = 'X'
+                for i, (ud_start, ud_end, pos) in enumerate(ud_char_spans):
+                    char_count = ud_end + 1  # +1 for space
+                    if len(decoded_so_far.strip()) <= char_count:
+                        assigned_pos = pos
+                        break
+
+                dawn_pos_tags.append(assigned_pos)
+
+            return dawn_pos_tags, token_ids
 
     def extract_routing_for_tokens(
         self,
@@ -296,7 +323,9 @@ class POSNeuronAnalyzer:
             attn = layer_info.get('attention', layer_info)
             know = layer_info.get('knowledge', {})
 
-            weights = attn.get(weight_key) or know.get(weight_key)
+            weights = attn.get(weight_key)
+            if weights is None:
+                weights = know.get(weight_key)
 
             if weights is not None:
                 # weights: [B, T, N]
