@@ -700,6 +700,10 @@ Examples:
                         help='Target token for iterative analysis (e.g., "paris")')
     parser.add_argument('--iterations', type=int, default=50,
                         help='Number of iterations for target_token analysis (default: 50)')
+    parser.add_argument('--bf16', action='store_true',
+                        help='Use bfloat16 precision (faster on A100/H100)')
+    parser.add_argument('--compile', action='store_true',
+                        help='Use torch.compile for faster inference (PyTorch 2.0+)')
     args = parser.parse_args()
 
     # Default prompts if none provided
@@ -745,6 +749,18 @@ Examples:
     model, tokenizer, config = load_model(str(ckpt_path), args.device)
     model = model.to(args.device)
     model.eval()
+
+    # Apply optimizations for A100/H100
+    if args.bf16:
+        print("Using bfloat16 precision")
+        model = model.to(torch.bfloat16)
+
+    if args.compile:
+        if hasattr(torch, 'compile'):
+            print("Applying torch.compile optimization...")
+            model = torch.compile(model, mode='reduce-overhead')
+        else:
+            print("Warning: torch.compile not available (requires PyTorch 2.0+)")
 
     # Create output directory
     os.makedirs(args.output, exist_ok=True)
