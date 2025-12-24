@@ -102,20 +102,96 @@ class POSNeuronAnalyzer:
         self.pos_total_tokens = defaultdict(int)
         self.layer_pos_neurons = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 
-    def load_ud_dataset(self, split: str = 'train', max_sentences: int = None):
-        """Load Universal Dependencies English Web Treebank."""
-        try:
-            from datasets import load_dataset
-        except ImportError:
-            raise ImportError("Please install datasets: pip install datasets")
+    def load_ud_dataset(self, split: str = 'train', max_sentences: int = None, data_path: str = None):
+        """
+        Load Universal Dependencies English Web Treebank.
 
-        print(f"Loading UD English Web Treebank ({split})...")
-        dataset = load_dataset("universal_dependencies", "en_ewt", split=split, trust_remote_code=True)
+        Uses conllu file parsing (HuggingFace datasets no longer supports UD).
+
+        Args:
+            split: 'train', 'dev', or 'test'
+            max_sentences: Maximum sentences to load
+            data_path: Path to local conllu file (optional)
+        """
+        # URL for UD English EWT
+        ud_urls = {
+            'train': 'https://raw.githubusercontent.com/UniversalDependencies/UD_English-EWT/master/en_ewt-ud-train.conllu',
+            'dev': 'https://raw.githubusercontent.com/UniversalDependencies/UD_English-EWT/master/en_ewt-ud-dev.conllu',
+            'test': 'https://raw.githubusercontent.com/UniversalDependencies/UD_English-EWT/master/en_ewt-ud-test.conllu',
+        }
+
+        # Try to import conllu
+        try:
+            import conllu
+        except ImportError:
+            raise ImportError("Please install conllu: pip install conllu")
+
+        # Load data
+        if data_path and os.path.exists(data_path):
+            print(f"Loading from local file: {data_path}")
+            with open(data_path, 'r', encoding='utf-8') as f:
+                data = f.read()
+        else:
+            import urllib.request
+            url = ud_urls.get(split, ud_urls['train'])
+            print(f"Downloading UD English EWT ({split})...")
+            print(f"URL: {url}")
+
+            try:
+                with urllib.request.urlopen(url) as response:
+                    data = response.read().decode('utf-8')
+            except Exception as e:
+                print(f"Download failed: {e}")
+                print("\nTrying alternative: NLTK treebank...")
+                return self._load_nltk_treebank(max_sentences)
+
+        # Parse conllu
+        print("Parsing conllu data...")
+        sentences = conllu.parse(data)
 
         if max_sentences:
-            dataset = dataset.select(range(min(max_sentences, len(dataset))))
+            sentences = sentences[:max_sentences]
+
+        # Convert to our format
+        dataset = []
+        for sent in sentences:
+            tokens = [token['form'] for token in sent]
+            upos = [token['upos'] for token in sent]
+            dataset.append({'tokens': tokens, 'upos': upos})
 
         print(f"Loaded {len(dataset)} sentences")
+        return dataset
+
+    def _load_nltk_treebank(self, max_sentences: int = None):
+        """Fallback: Load NLTK treebank with universal tagset."""
+        try:
+            import nltk
+            nltk.download('treebank', quiet=True)
+            nltk.download('universal_tagset', quiet=True)
+            from nltk.corpus import treebank
+        except ImportError:
+            raise ImportError("Please install nltk: pip install nltk")
+
+        print("Loading NLTK treebank...")
+
+        # Map NLTK universal tags to UPOS
+        nltk_to_upos = {
+            'NOUN': 'NOUN', 'VERB': 'VERB', 'ADJ': 'ADJ', 'ADV': 'ADV',
+            'ADP': 'ADP', 'DET': 'DET', 'PRON': 'PRON', 'NUM': 'NUM',
+            'CONJ': 'CCONJ', 'PRT': 'PART', '.': 'PUNCT', 'X': 'X',
+        }
+
+        sentences = treebank.tagged_sents(tagset='universal')
+        if max_sentences:
+            sentences = sentences[:max_sentences]
+
+        dataset = []
+        for sent in sentences:
+            tokens = [word for word, tag in sent]
+            upos = [nltk_to_upos.get(tag, 'X') for word, tag in sent]
+            dataset.append({'tokens': tokens, 'upos': upos})
+
+        print(f"Loaded {len(dataset)} sentences from NLTK treebank")
         return dataset
 
     def align_tokens(
@@ -682,6 +758,8 @@ Examples:
                         help='Maximum sentences to analyze (default: 2000)')
     parser.add_argument('--split', type=str, default='train',
                         help='Dataset split (default: train)')
+    parser.add_argument('--data_path', type=str, default=None,
+                        help='Path to local conllu file (optional, downloads if not provided)')
     parser.add_argument('--bf16', action='store_true',
                         help='Use bfloat16 precision')
     parser.add_argument('--compile', action='store_true',
@@ -737,7 +815,7 @@ Examples:
     )
 
     # Load dataset
-    dataset = analyzer.load_ud_dataset(args.split, args.max_sentences)
+    dataset = analyzer.load_ud_dataset(args.split, args.max_sentences, args.data_path)
 
     # Run analysis
     analyzer.analyze_dataset(dataset, args.pool, args.max_sentences)
