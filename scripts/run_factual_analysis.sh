@@ -7,6 +7,8 @@ OUTPUT_DIR=${2:-"routing_analysis/factual"}
 ITERATIONS=${3:-100}
 LAYER=${4:-11}
 POOL=${5:-"fv"}
+USE_BF16=${6:-"true"}
+USE_COMPILE=${7:-"false"}
 
 echo "========================================"
 echo "Factual Knowledge Neuron Analysis"
@@ -16,7 +18,18 @@ echo "Output: $OUTPUT_DIR"
 echo "Iterations: $ITERATIONS"
 echo "Layer: $LAYER"
 echo "Pool: $POOL"
+echo "BF16: $USE_BF16"
+echo "Compile: $USE_COMPILE"
 echo "========================================"
+
+# Build optimization flags
+OPT_FLAGS=""
+if [ "$USE_BF16" = "true" ]; then
+    OPT_FLAGS="$OPT_FLAGS --bf16"
+fi
+if [ "$USE_COMPILE" = "true" ]; then
+    OPT_FLAGS="$OPT_FLAGS --compile"
+fi
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -90,6 +103,7 @@ for i in "${!PROMPTS[@]}"; do
             --top_k 50 \
             --temperature 1.0 \
             --output "$OUTPUT_DIR" \
+            $OPT_FLAGS \
             2>&1 | tee "$OUTPUT_DIR/${NAME}_${T}.log"
 
         # Rename output file to match our naming convention
