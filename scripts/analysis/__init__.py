@@ -73,6 +73,12 @@ from .behavioral import BehavioralAnalyzer
 from .semantic import SemanticAnalyzer
 from .coselection import CoselectionAnalyzer
 from .paper_figures import PaperFigureGenerator
+from .routing_analysis import (
+    GenerationRoutingAnalyzer,
+    analyze_common_neurons,
+    plot_routing_heatmap,
+    plot_routing_comparison,
+)
 
 
 __all__ = [
@@ -114,6 +120,12 @@ __all__ = [
     'SemanticAnalyzer',
     'CoselectionAnalyzer',
     'PaperFigureGenerator',
+
+    # Routing analysis
+    'GenerationRoutingAnalyzer',
+    'analyze_common_neurons',
+    'plot_routing_heatmap',
+    'plot_routing_comparison',
 ]
 
 __version__ = '1.0.0'
