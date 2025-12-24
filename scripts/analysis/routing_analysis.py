@@ -28,14 +28,23 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import argparse
+import json
 from typing import Dict, List, Optional, Tuple
 from collections import Counter, defaultdict
 
-from .utils import (
-    load_model, get_router,
-    ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
-    HAS_MATPLOTLIB, plt
-)
+# Handle both module import and standalone execution
+try:
+    from .utils import (
+        load_model, get_router,
+        ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
+        HAS_MATPLOTLIB, plt
+    )
+except ImportError:
+    from utils import (
+        load_model, get_router,
+        ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
+        HAS_MATPLOTLIB, plt
+    )
 
 if HAS_MATPLOTLIB:
     import seaborn as sns
@@ -465,76 +474,180 @@ def plot_routing_comparison(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='DAWN Routing Analysis for Generation')
+    parser = argparse.ArgumentParser(
+        description='DAWN Routing Analysis for Generation',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single prompt analysis
+  python scripts/analysis/routing_analysis.py --checkpoint checkpoint.pt --prompt "The capital of France is"
+
+  # Multiple prompts with comparison
+  python scripts/analysis/routing_analysis.py --checkpoint checkpoint.pt --prompts "Hello world" "The sky is" "Once upon a time"
+
+  # Analyze specific pool type
+  python scripts/analysis/routing_analysis.py --checkpoint checkpoint.pt --pool fknow --prompt "The meaning of life is"
+
+  # Full analysis with all pools
+  python scripts/analysis/routing_analysis.py --checkpoint checkpoint.pt --all-pools
+        """
+    )
     parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to checkpoint')
-    parser.add_argument('--prompt', type=str, default="The capital of France is",
-                        help='Prompt for generation')
+                        help='Path to checkpoint file or directory')
+    parser.add_argument('--prompt', type=str, default=None,
+                        help='Single prompt for generation')
+    parser.add_argument('--prompts', type=str, nargs='+', default=None,
+                        help='Multiple prompts for comparison analysis')
     parser.add_argument('--max_tokens', type=int, default=30,
-                        help='Max tokens to generate')
+                        help='Max tokens to generate (default: 30)')
     parser.add_argument('--output', type=str, default='routing_analysis',
-                        help='Output directory')
+                        help='Output directory (default: routing_analysis)')
     parser.add_argument('--device', type=str, default='cuda',
-                        help='Device')
+                        help='Device (default: cuda)')
     parser.add_argument('--pool', type=str, default='fv',
                         choices=['fv', 'rv', 'fqk_q', 'fqk_k', 'rqk_q', 'rqk_k', 'fknow', 'rknow'],
-                        help='Pool type to analyze')
+                        help='Pool type to analyze (default: fv)')
+    parser.add_argument('--all-pools', action='store_true',
+                        help='Analyze all pool types')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                        help='Sampling temperature (default: 1.0)')
+    parser.add_argument('--top_k', type=int, default=0,
+                        help='Top-k sampling, 0=greedy (default: 0)')
+    parser.add_argument('--no-plot', action='store_true',
+                        help='Skip plotting (useful for headless environments)')
     args = parser.parse_args()
+
+    # Default prompts if none provided
+    if args.prompt is None and args.prompts is None:
+        args.prompts = [
+            "The capital of France is",
+            "The meaning of life is",
+            "Once upon a time, there was a",
+            "def fibonacci(n):",
+        ]
+    elif args.prompt is not None:
+        args.prompts = [args.prompt]
 
     # Device check
     if args.device == 'cuda' and not torch.cuda.is_available():
         print("CUDA not available, using CPU")
         args.device = 'cpu'
 
+    # Find checkpoint file
+    ckpt_path = Path(args.checkpoint)
+    if ckpt_path.is_dir():
+        # Find best checkpoint in directory
+        candidates = list(ckpt_path.glob('*best*.pt')) + list(ckpt_path.glob('*.pt'))
+        if not candidates:
+            print(f"No checkpoint found in {ckpt_path}")
+            return
+        ckpt_path = candidates[0]
+        print(f"Using checkpoint: {ckpt_path}")
+
     # Load model
-    print(f"Loading model from {args.checkpoint}")
-    model, tokenizer, config = load_model(args.checkpoint, args.device)
+    print(f"\n{'='*70}")
+    print(f"Loading model from {ckpt_path}")
+    print('='*70)
+    model, tokenizer, config = load_model(str(ckpt_path), args.device)
     model = model.to(args.device)
     model.eval()
-
-    # Create analyzer
-    analyzer = GenerationRoutingAnalyzer(model, tokenizer, args.device)
-
-    # Generate with routing
-    print(f"\nGenerating with prompt: '{args.prompt}'")
-    routing_log = analyzer.generate_with_routing(
-        args.prompt,
-        max_new_tokens=args.max_tokens,
-    )
-
-    # Print results
-    print(f"\nGenerated text:")
-    print(routing_log['full_text'])
-
-    print(f"\n{'='*60}")
-    print(f"Routing Analysis ({args.pool.upper()})")
-    print('='*60)
-
-    indices_key = f'{args.pool}_indices'
-    for i, (token, indices) in enumerate(zip(routing_log['tokens'], routing_log.get(indices_key, []))):
-        print(f"[{i:2d}] '{token:15s}' -> {len(indices):2d} neurons: {indices[:10]}{'...' if len(indices) > 10 else ''}")
 
     # Create output directory
     os.makedirs(args.output, exist_ok=True)
 
-    # Plot heatmap
-    heatmap_path = os.path.join(args.output, f'heatmap_{args.pool}.png')
-    plot_routing_heatmap(routing_log, args.pool, heatmap_path)
-    print(f"\nHeatmap saved to: {heatmap_path}")
+    # Create analyzer
+    analyzer = GenerationRoutingAnalyzer(model, tokenizer, args.device)
 
-    # Analyze common neurons
-    common_analysis = analyze_common_neurons([routing_log], pool_type=args.pool)
-    print(f"\nTop neurons: {common_analysis['top_neurons'][:10]}")
+    # Determine pools to analyze
+    if args.all_pools:
+        pools = ['fv', 'rv', 'fqk_q', 'fqk_k', 'fknow', 'rknow']
+    else:
+        pools = [args.pool]
 
-    # Save routing log
-    import json
+    # Collect all routing logs
+    all_routing_logs = []
 
-    # Convert tensors to lists for JSON serialization
-    save_log = {k: v for k, v in routing_log.items() if not k.endswith('_weights')}
-    log_path = os.path.join(args.output, 'routing_log.json')
-    with open(log_path, 'w') as f:
-        json.dump(save_log, f, indent=2)
-    print(f"Routing log saved to: {log_path}")
+    print(f"\n{'='*70}")
+    print("GENERATION WITH ROUTING ANALYSIS")
+    print('='*70)
+
+    for i, prompt in enumerate(args.prompts):
+        print(f"\n[Prompt {i+1}/{len(args.prompts)}] '{prompt}'")
+        print('-'*50)
+
+        routing_log = analyzer.generate_with_routing(
+            prompt,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
+        all_routing_logs.append(routing_log)
+
+        # Print generated text
+        print(f"Generated: {routing_log['full_text']}")
+
+        # Print routing info for primary pool
+        print(f"\nRouting ({args.pool.upper()}):")
+        indices_key = f'{args.pool}_indices'
+        for j, (token, indices) in enumerate(zip(routing_log['tokens'], routing_log.get(indices_key, []))):
+            truncated = indices[:8]
+            suffix = f'... (+{len(indices)-8})' if len(indices) > 8 else ''
+            print(f"  [{j:2d}] '{token:12s}' -> {len(indices):2d} neurons: {truncated}{suffix}")
+
+    # Comparison analysis
+    if len(all_routing_logs) > 1:
+        print(f"\n{'='*70}")
+        print("COMMON NEURON ANALYSIS")
+        print('='*70)
+
+        for pool in pools:
+            common = analyze_common_neurons(all_routing_logs, pool_type=pool)
+            print(f"\n[{pool.upper()}] Unique neurons: {common['unique_neurons_used']}, "
+                  f"Total tokens: {common['total_tokens_analyzed']}")
+            print(f"  Top 10 neurons: {common['top_neurons'][:10]}")
+
+    # Plotting
+    if not args.no_plot and HAS_MATPLOTLIB:
+        print(f"\n{'='*70}")
+        print("GENERATING PLOTS")
+        print('='*70)
+
+        for pool in pools:
+            # Individual heatmaps
+            for i, routing_log in enumerate(all_routing_logs):
+                prompt_slug = routing_log['prompt'][:20].replace(' ', '_').replace('/', '_')
+                heatmap_path = os.path.join(args.output, f'heatmap_{pool}_{i}_{prompt_slug}.png')
+                plot_routing_heatmap(routing_log, pool, heatmap_path)
+                print(f"  Saved: {heatmap_path}")
+
+            # Comparison plot (if multiple prompts)
+            if len(all_routing_logs) > 1:
+                compare_path = os.path.join(args.output, f'comparison_{pool}.png')
+                plot_routing_comparison(all_routing_logs, pool, compare_path)
+                print(f"  Saved: {compare_path}")
+
+    # Save routing logs
+    print(f"\n{'='*70}")
+    print("SAVING RESULTS")
+    print('='*70)
+
+    for i, routing_log in enumerate(all_routing_logs):
+        # Remove tensor weights for JSON serialization
+        save_log = {k: v for k, v in routing_log.items() if not k.endswith('_weights')}
+        prompt_slug = routing_log['prompt'][:20].replace(' ', '_').replace('/', '_')
+        log_path = os.path.join(args.output, f'routing_log_{i}_{prompt_slug}.json')
+        with open(log_path, 'w') as f:
+            json.dump(save_log, f, indent=2, ensure_ascii=False)
+        print(f"  Saved: {log_path}")
+
+    # Summary
+    print(f"\n{'='*70}")
+    print("SUMMARY")
+    print('='*70)
+    print(f"  Prompts analyzed: {len(args.prompts)}")
+    print(f"  Pools analyzed: {pools}")
+    print(f"  Output directory: {args.output}")
+    print(f"  Max tokens per generation: {args.max_tokens}")
 
 
 if __name__ == '__main__':
