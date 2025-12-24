@@ -407,12 +407,17 @@ def analyze_token_neurons(
             'target_token': target_token,
             'prompt': prompt,
             'pool_type': pool_type,
+            'layer': analyzer.target_layer,
             'iterations': iterations,
             'matching_runs': 0,
             'total_runs': iterations,
+            'match_rate': 0.0,
             'common_neurons_100': [],
+            'common_neurons_80': [],
+            'common_neurons_50': [],
             'neuron_frequencies': [],
             'matching_run_details': [],
+            'unique_neurons_total': 0,
         }
 
     # Count neuron frequencies across matching runs
