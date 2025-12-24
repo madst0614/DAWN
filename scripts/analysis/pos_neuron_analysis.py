@@ -194,49 +194,61 @@ class POSNeuronAnalyzer:
         print(f"Loaded {len(dataset)} sentences from NLTK treebank")
         return dataset
 
-    def align_tokens(
+    def get_pos_for_tokens(
         self,
         ud_tokens: List[str],
         ud_pos: List[str],
-    ) -> List[Tuple[str, str, List[int]]]:
+    ) -> Tuple[List[str], List[int]]:
         """
-        Align UD tokens with DAWN tokenizer tokens.
+        Map DAWN tokenizer tokens to POS tags using character spans.
 
-        Returns list of (ud_token, pos_tag, dawn_token_ids)
+        Returns: (list of POS tags, list of token IDs)
         """
-        aligned = []
-        text = ' '.join(ud_tokens)
+        # Build text and character spans for each UD token
+        text = ""
+        ud_char_spans = []  # [(start, end, pos), ...]
 
-        # Tokenize full text
-        dawn_tokens = self.tokenizer.encode(text, add_special_tokens=False)
-
-        # Try to align by reconstructing
-        current_pos = 0
         for ud_token, pos in zip(ud_tokens, ud_pos):
-            # Find how many DAWN tokens cover this UD token
-            target_text = ud_token
-            matched_ids = []
+            start = len(text)
+            text += ud_token
+            end = len(text)
+            ud_char_spans.append((start, end, pos))
+            text += " "  # space between tokens
 
-            # Greedy matching
-            temp_text = ""
-            while current_pos < len(dawn_tokens):
-                token_id = dawn_tokens[current_pos]
-                token_text = self.tokenizer.decode([token_id])
-                temp_text += token_text
-                matched_ids.append(token_id)
-                current_pos += 1
+        text = text.rstrip()  # remove trailing space
 
-                # Check if we've covered the UD token
-                if target_text.lower() in temp_text.lower().replace(' ', ''):
+        # Tokenize with DAWN tokenizer
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+
+        if not token_ids:
+            return [], []
+
+        # Build character position for each token by decoding incrementally
+        dawn_pos_tags = []
+        char_cursor = 0
+
+        for i, tid in enumerate(token_ids):
+            # Decode this single token
+            token_text = self.tokenizer.decode([tid])
+
+            # Skip leading space in token text for position matching
+            token_text_stripped = token_text.lstrip()
+            if token_text != token_text_stripped:
+                char_cursor += len(token_text) - len(token_text_stripped)
+
+            # Find which UD token this position belongs to
+            assigned_pos = 'X'  # default
+            for start, end, pos in ud_char_spans:
+                if start <= char_cursor < end:
+                    assigned_pos = pos
                     break
-                if len(temp_text.replace(' ', '')) >= len(target_text) * 2:
-                    # Went too far, stop
-                    break
 
-            if matched_ids:
-                aligned.append((ud_token, pos, matched_ids))
+            dawn_pos_tags.append(assigned_pos)
 
-        return aligned
+            # Move cursor forward
+            char_cursor += len(token_text_stripped)
+
+        return dawn_pos_tags, token_ids
 
     def extract_routing_for_tokens(
         self,
@@ -300,30 +312,31 @@ class POSNeuronAnalyzer:
         ud_tokens: List[str],
         ud_pos: List[str],
         pool_type: str = 'fv',
+        debug: bool = False,
     ):
         """Analyze a single sentence and update statistics."""
-        # Align tokens
-        aligned = self.align_tokens(ud_tokens, ud_pos)
-        if not aligned:
+        try:
+            pos_tags, token_ids = self.get_pos_for_tokens(ud_tokens, ud_pos)
+        except Exception as e:
+            if debug:
+                print(f"Alignment error: {e}")
             return
 
-        # Flatten token IDs for model input
-        all_token_ids = []
-        token_pos_map = []  # Maps each position to (ud_token, pos)
-
-        for ud_token, pos, dawn_ids in aligned:
-            for tid in dawn_ids:
-                all_token_ids.append(tid)
-                token_pos_map.append((ud_token, pos))
-
-        if not all_token_ids:
+        if not token_ids:
             return
+
+        if debug:
+            text = ' '.join(ud_tokens)
+            print(f"\nSentence: {text[:60]}...")
+            for i, (tid, pos) in enumerate(zip(token_ids, pos_tags)):
+                token_text = self.tokenizer.decode([tid])
+                print(f"  [{i}] '{token_text}' -> {pos}")
 
         # Get routing for all positions
-        position_neurons = self.extract_routing_for_tokens(all_token_ids, pool_type)
+        position_neurons = self.extract_routing_for_tokens(token_ids, pool_type)
 
         # Update statistics
-        for pos_idx, (ud_token, pos) in enumerate(token_pos_map):
+        for pos_idx, pos in enumerate(pos_tags):
             neurons = position_neurons.get(pos_idx, [])
 
             self.pos_total_tokens[pos] += 1
@@ -336,7 +349,7 @@ class POSNeuronAnalyzer:
         dataset,
         pool_type: str = 'fv',
         max_sentences: int = None,
-        batch_size: int = 1,
+        debug: bool = False,
     ):
         """Analyze full dataset."""
         n_sentences = min(len(dataset), max_sentences) if max_sentences else len(dataset)
@@ -345,16 +358,32 @@ class POSNeuronAnalyzer:
         print(f"Pool: {pool_type.upper()}")
         print(f"Layer: {self.target_layer if self.target_layer is not None else 'all'}")
 
+        # Debug first 3 sentences
+        if debug:
+            print("\n[DEBUG] First 3 sentences alignment:")
+            for i in range(min(3, n_sentences)):
+                example = dataset[i]
+                self.analyze_sentence(
+                    example['tokens'], example['upos'], pool_type, debug=True
+                )
+
         for i in tqdm(range(n_sentences), desc="Processing"):
             example = dataset[i]
             tokens = example['tokens']
             pos_tags = example['upos']
 
             try:
-                self.analyze_sentence(tokens, pos_tags, pool_type)
+                self.analyze_sentence(tokens, pos_tags, pool_type, debug=False)
             except Exception as e:
-                # Skip problematic sentences
                 continue
+
+            # Print progress stats every 500 sentences
+            if (i + 1) % 500 == 0:
+                total_tokens = sum(self.pos_total_tokens.values())
+                total_neurons = sum(
+                    len(neurons) for neurons in self.pos_neuron_counts.values()
+                )
+                tqdm.write(f"  Progress: {total_tokens} tokens, {total_neurons} neuron activations")
 
     def get_results(self) -> Dict:
         """Compile analysis results."""
@@ -766,6 +795,8 @@ Examples:
                         help='Use torch.compile')
     parser.add_argument('--no-plot', action='store_true',
                         help='Skip plotting')
+    parser.add_argument('--debug', action='store_true',
+                        help='Debug mode: show token alignment for first few sentences')
     args = parser.parse_args()
 
     # Device check
@@ -818,7 +849,7 @@ Examples:
     dataset = analyzer.load_ud_dataset(args.split, args.max_sentences, args.data_path)
 
     # Run analysis
-    analyzer.analyze_dataset(dataset, args.pool, args.max_sentences)
+    analyzer.analyze_dataset(dataset, args.pool, args.max_sentences, debug=args.debug)
 
     # Get results
     results = analyzer.get_results()
