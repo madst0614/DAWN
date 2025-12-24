@@ -199,16 +199,54 @@ def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda'):
     results['version'] = version
     results['path'] = str(ckpt_path)
 
-    # 1. Free generation
-    prompts = [
-        "The weather today is",
-        "Scientists discovered that",
-        "The capital of France is",
-    ]
-    results['generations'] = []
-    for prompt in prompts:
-        output = generate_text(model, tokenizer, prompt, max_new_tokens=30, device=device)
-        results['generations'].append({'prompt': prompt, 'output': output})
+    # 1. Free generation - organized by category
+    prompts = {
+        'factual': [
+            "The president of the United States is",
+            "The largest ocean on Earth is",
+            "Einstein developed the theory of",
+            "The speed of light is",
+            "World War 2 ended in",
+        ],
+        'common_sense': [
+            "If you drop a glass, it will",
+            "Fire is hot, ice is",
+            "Birds can fly, fish can",
+            "At night, the sky is",
+            "When you are hungry, you",
+        ],
+        'narrative': [
+            "Once upon a time, there was a",
+            "She walked into the room and",
+            "The detective found a clue that",
+            "After years of training, he finally",
+        ],
+        'technical': [
+            "def fibonacci(n):",
+            "SELECT * FROM",
+            "The mitochondria is the",
+            "H2O is composed of",
+        ],
+        'conversational': [
+            "Hey, how are you",
+            "I think the best way to",
+            "In my opinion,",
+            "The problem with this approach is",
+        ],
+        'ambiguous': [
+            "The best thing about",
+            "I never thought that",
+            "It was a dark and",
+            "The reason why",
+        ],
+    }
+
+    results['generations'] = {}
+    for category, prompt_list in prompts.items():
+        results['generations'][category] = []
+        for prompt in prompt_list:
+            output = generate_text(model, tokenizer, prompt, max_new_tokens=30, device=device)
+            results['generations'][category].append({'prompt': prompt, 'output': output})
 
     # 2. C4 continuation
     sample_indices = [100, 500, 1000]
@@ -274,9 +312,11 @@ def main():
             output_lines.append("=" * 70)
 
             output_lines.append("\n[FREE GENERATION]")
-            for gen in results['generations']:
-                output_lines.append(f"\nPrompt: '{gen['prompt']}'")
-                output_lines.append(f"Output: {gen['output']}")
+            for category, gens in results['generations'].items():
+                output_lines.append(f"\n--- {category.upper()} ---")
+                for gen in gens:
+                    output_lines.append(f"Prompt: '{gen['prompt']}'")
+                    output_lines.append(f"  → {gen['output']}")
 
             output_lines.append("\n" + "-" * 50)
             output_lines.append("[C4 CONTINUATION]")
