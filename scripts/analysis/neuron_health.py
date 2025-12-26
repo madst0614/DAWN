@@ -175,6 +175,7 @@ class NeuronHealthAnalyzer:
                 'n_active': int(active_mask.sum()),
                 'n_dying': int(dying_mask.sum()),
                 'n_dead': int(dead_mask.sum()),
+                'n_removable': int(dead_mask.sum()),  # Dead neurons can be removed
                 'dead_neuron_ids': dead_mask.nonzero().squeeze(-1).tolist()
                                    if dead_mask.sum() > 0 else [],
             }

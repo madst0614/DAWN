@@ -82,11 +82,10 @@ Examples:
     # All figures with demo loss curves:
     python figures/generate_all.py --demo
 
-    # All figures with checkpoint directories:
+    # All figures with checkpoint directories (40M scale):
     python figures/generate_all.py \\
-        --dawn /content/drive/MyDrive/dawn/checkpoints_v17.1_20M_c4_5B/run_v17.1_20251217_172040_8948 \\
-        --vanilla_22m /content/drive/MyDrive/dawn/checkpoints_baseline_22M_c4_5B/run_vbaseline_20251210_134902_4447 \\
-        --vanilla_108m /content/drive/MyDrive/dawn/checkpoints_baseline_125M_c4_5B/run_vbaseline_20251216_220530_1907
+        --dawn /content/drive/MyDrive/dawn/checkpoints_v17.1_40M_c4_5B/run_xxx \\
+        --vanilla_40m /content/drive/MyDrive/dawn/checkpoints_baseline_40M_c4_5B/run_xxx
 
     # Generate and zip:
     python figures/generate_all.py --demo --zip
@@ -96,6 +95,8 @@ Examples:
     # Fig5 options - checkpoint directories (auto-find training_log.txt)
     parser.add_argument('--dawn', type=str,
                        help='DAWN run directory (will auto-find training_log.txt)')
+    parser.add_argument('--vanilla_40m', type=str,
+                       help='Vanilla-40M run directory')
     parser.add_argument('--vanilla_22m', type=str,
                        help='Vanilla-22M run directory')
     parser.add_argument('--vanilla_108m', type=str,
@@ -140,13 +141,16 @@ Examples:
 
         if args.demo:
             fig5_args.append('--demo')
-        elif args.dawn or args.vanilla_22m or args.vanilla_108m:
+        elif args.dawn or args.vanilla_40m or args.vanilla_22m or args.vanilla_108m:
             ckpts = []
             labels = []
 
             if args.dawn:
                 ckpts.append(args.dawn)
-                labels.append('DAWN-24M')
+                labels.append('DAWN-40M')
+            if args.vanilla_40m:
+                ckpts.append(args.vanilla_40m)
+                labels.append('Vanilla-40M')
             if args.vanilla_22m:
                 ckpts.append(args.vanilla_22m)
                 labels.append('Vanilla-22M')

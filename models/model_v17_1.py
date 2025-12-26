@@ -276,9 +276,10 @@ class GlobalSSM(nn.Module):
 
         ssm_out = self.ssm_norm(ssm_out)
 
-        h_final = ssm_out[:, -1, :]
-        h_proj = self.importance_proj(h_final)
-        raw_importance = torch.einsum('bsd,bd->bs', x, h_proj)
+        # Position-wise importance (no future leakage)
+        # Each position's importance uses only SSM output up to that position
+        h_proj = self.importance_proj(ssm_out)  # [B, S, D]
+        raw_importance = (x * h_proj).sum(dim=-1)  # [B, S]
 
         if attention_mask is not None:
             masked_importance = raw_importance.masked_fill(attention_mask == 0, float('-inf'))
@@ -324,7 +325,7 @@ class GlobalRouters(nn.Module):
                  top_k_feature_qk: int = 8, top_k_feature_v: int = 8,
                  top_k_restore_qk: int = 8, top_k_restore_v: int = 8,
                  top_k_feature_know: int = 4, top_k_restore_know: int = 4,
-                 d_space: int = 64, router_dropout: float = 0.1, token_routing: bool = False,
+                 d_space: int = 64, router_dropout: float = 0.1, attention_token_routing: bool = False,
                  knowledge_token_routing: bool = False, **kwargs):
         super().__init__()
         self.d_model = d_model
@@ -340,7 +341,7 @@ class GlobalRouters(nn.Module):
         self.top_k_restore_v = top_k_restore_v
         self.top_k_feature_know = top_k_feature_know
         self.top_k_restore_know = top_k_restore_know
-        self.token_routing = token_routing
+        self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
 
         self.neuron_router = UnifiedNeuronRouter(
@@ -350,6 +351,7 @@ class GlobalRouters(nn.Module):
         )
 
     def _topk_sparsify(self, weights, k):
+        """Apply top-k sparsification with normalization"""
         topk_vals, topk_idx = torch.topk(weights, k, dim=-1)
         sparse_weights = torch.zeros_like(weights)
         sparse_weights.scatter_(-1, topk_idx, topk_vals)
@@ -398,13 +400,14 @@ class GlobalRouters(nn.Module):
             aux_loss += ((usage_rqk_K - target_rqk) ** 2).sum() * self.n_restore_qk
             aux_loss += ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
 
-        if self.token_routing:
-            fqk_weights_Q = fqk_pref_Q
-            fqk_weights_K = fqk_pref_K
-            fv_weights = fv_pref
-            rqk_weights_Q = rqk_pref_Q
-            rqk_weights_K = rqk_pref_K
-            rv_weights = rv_pref
+        if self.attention_token_routing:
+            # Token-level routing: apply top-k sparsification per token
+            fqk_weights_Q, _ = self._topk_sparsify(fqk_pref_Q, self.top_k_feature_qk)
+            fqk_weights_K, _ = self._topk_sparsify(fqk_pref_K, self.top_k_feature_qk)
+            fv_weights, _ = self._topk_sparsify(fv_pref, self.top_k_feature_v)
+            rqk_weights_Q, _ = self._topk_sparsify(rqk_pref_Q, self.top_k_restore_qk)
+            rqk_weights_K, _ = self._topk_sparsify(rqk_pref_K, self.top_k_restore_qk)
+            rv_weights, _ = self._topk_sparsify(rv_pref, self.top_k_restore_v)
 
             routing_info = {
                 'fqk_weights_Q': fqk_weights_Q.detach(),
@@ -422,20 +425,36 @@ class GlobalRouters(nn.Module):
                 'token_routing': True,
             }
         else:
-            # Batch-level routing
-            fqk_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, fqk_pref_Q)
-            fqk_weights_K_dense = torch.einsum('bs,bsn->bn', importance, fqk_pref_K)
-            fv_weights_dense = torch.einsum('bs,bsn->bn', importance, fv_pref)
-            rqk_weights_Q_dense = torch.einsum('bs,bsn->bn', importance, rqk_pref_Q)
-            rqk_weights_K_dense = torch.einsum('bs,bsn->bn', importance, rqk_pref_K)
-            rv_weights_dense = torch.einsum('bs,bsn->bn', importance, rv_pref)
+            # Causal cumulative routing: position t uses importance[0:t+1] weighted average
+            B, S = importance.shape
 
-            fqk_weights_Q, _ = self._topk_sparsify(fqk_weights_Q_dense, self.top_k_feature_qk)
-            fqk_weights_K, _ = self._topk_sparsify(fqk_weights_K_dense, self.top_k_feature_qk)
-            fv_weights, _ = self._topk_sparsify(fv_weights_dense, self.top_k_feature_v)
-            rqk_weights_Q, _ = self._topk_sparsify(rqk_weights_Q_dense, self.top_k_restore_qk)
-            rqk_weights_K, _ = self._topk_sparsify(rqk_weights_K_dense, self.top_k_restore_qk)
-            rv_weights, _ = self._topk_sparsify(rv_weights_dense, self.top_k_restore_v)
+            imp = importance.unsqueeze(-1)  # [B, S, 1]
+            cumsum_imp = torch.cumsum(importance, dim=1).unsqueeze(-1) + 1e-8  # [B, S, 1]
+
+            # Batched cumsum: same N size together (6→3 operations)
+            # Feature_QK (N=n_feature_qk): Q, K
+            fqk_pref_stacked = torch.stack([fqk_pref_Q, fqk_pref_K], dim=0)  # [2, B, S, N]
+            fqk_weighted = imp.unsqueeze(0) * fqk_pref_stacked  # [2, B, S, N]
+            fqk_cumsum = torch.cumsum(fqk_weighted, dim=2) / cumsum_imp.unsqueeze(0)  # [2, B, S, N]
+            fqk_weights_Q_soft, fqk_weights_K_soft = fqk_cumsum[0], fqk_cumsum[1]
+
+            # Restore_QK (N=n_restore_qk): Q, K
+            rqk_pref_stacked = torch.stack([rqk_pref_Q, rqk_pref_K], dim=0)
+            rqk_weighted = imp.unsqueeze(0) * rqk_pref_stacked
+            rqk_cumsum = torch.cumsum(rqk_weighted, dim=2) / cumsum_imp.unsqueeze(0)
+            rqk_weights_Q_soft, rqk_weights_K_soft = rqk_cumsum[0], rqk_cumsum[1]
+
+            # V neurons (different N, can't batch together)
+            fv_weights_soft = torch.cumsum(imp * fv_pref, dim=1) / cumsum_imp
+            rv_weights_soft = torch.cumsum(imp * rv_pref, dim=1) / cumsum_imp
+
+            # Apply top-k sparsification
+            fqk_weights_Q, _ = self._topk_sparsify(fqk_weights_Q_soft, self.top_k_feature_qk)
+            fqk_weights_K, _ = self._topk_sparsify(fqk_weights_K_soft, self.top_k_feature_qk)
+            fv_weights, _ = self._topk_sparsify(fv_weights_soft, self.top_k_feature_v)
+            rqk_weights_Q, _ = self._topk_sparsify(rqk_weights_Q_soft, self.top_k_restore_qk)
+            rqk_weights_K, _ = self._topk_sparsify(rqk_weights_K_soft, self.top_k_restore_qk)
+            rv_weights, _ = self._topk_sparsify(rv_weights_soft, self.top_k_restore_v)
 
             routing_info = {
                 'fqk_weights_Q': fqk_weights_Q.detach(),
@@ -450,7 +469,6 @@ class GlobalRouters(nn.Module):
                 'rqk_q_pref': rqk_pref_Q.detach(),
                 'rqk_k_pref': rqk_pref_K.detach(),
                 'rv_pref': rv_pref.detach(),
-                'token_routing': False,
             }
 
         # Update usage (Q/K separately for independent excitability)
@@ -472,15 +490,23 @@ class GlobalRouters(nn.Module):
         pref_r = F.softmax(logits_r, dim=-1)  # [B, S, n]
 
         if self.knowledge_token_routing:
-            # Token-level: top-k per token
+            # Token-level: apply top-k sparsification per token
             feature_know_w, _ = self._topk_sparsify(pref_f, self.top_k_feature_know)
             restore_know_w, _ = self._topk_sparsify(pref_r, self.top_k_restore_know)
         else:
-            # Batch-level (default)
-            f_dense = torch.einsum('bs,bsn->bn', importance, pref_f)  # [B, n]
-            r_dense = torch.einsum('bs,bsn->bn', importance, pref_r)  # [B, n]
-            feature_know_w, _ = self._topk_sparsify(f_dense, self.top_k_feature_know)
-            restore_know_w, _ = self._topk_sparsify(r_dense, self.top_k_restore_know)
+            # Causal cumulative routing with batched operations
+            imp = importance.unsqueeze(-1)  # [B, S, 1]
+            cumsum_imp = torch.cumsum(importance, dim=1).unsqueeze(-1) + 1e-8  # [B, S, 1]
+
+            # Batched cumsum (2→1 operation)
+            pref_stacked = torch.stack([pref_f, pref_r], dim=0)  # [2, B, S, N]
+            pref_weighted = imp.unsqueeze(0) * pref_stacked  # [2, B, S, N]
+            pref_cumsum = torch.cumsum(pref_weighted, dim=2) / cumsum_imp.unsqueeze(0)  # [2, B, S, N]
+            feature_know_soft, restore_know_soft = pref_cumsum[0], pref_cumsum[1]
+
+            # Apply top-k sparsification
+            feature_know_w, _ = self._topk_sparsify(feature_know_soft, self.top_k_feature_know)
+            restore_know_w, _ = self._topk_sparsify(restore_know_soft, self.top_k_restore_know)
 
         if self.training:
             self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
@@ -511,70 +537,62 @@ class AttentionCircuit(nn.Module):
         self.out_dropout = nn.Dropout(dropout)
 
     def forward(self, x, fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, attention_mask=None):
+        """
+        Args:
+            x: [B, S, D] input
+            fqk_weights_Q/K: [B, S, N] sparse weights for feature Q/K neurons
+            fv_weights: [B, S, N] sparse weights for feature V neurons
+            rqk_weights_Q/K: [B, S, N] sparse weights for restore Q/K neurons
+            rv_weights: [B, S, N] sparse weights for restore V neurons
+        """
         B, S, D = x.shape
         R = self.rank
-        token_routing = fqk_weights_Q.dim() == 3
 
-        if token_routing:
-            # Token-level routing
-            shared_fqk_Q = torch.einsum('bsn,ndr->bsdr', fqk_weights_Q, self.shared_neurons.feature_qk_neurons)
-            shared_fqk_K = torch.einsum('bsn,ndr->bsdr', fqk_weights_K, self.shared_neurons.feature_qk_neurons)
-            shared_fv = torch.einsum('bsn,ndr->bsdr', fv_weights, self.shared_neurons.feature_v_neurons)
+        # Get neuron counts from weight shapes
+        N_fqk = fqk_weights_Q.shape[2]
+        N_fv = fv_weights.shape[2]
+        N_rqk = rqk_weights_Q.shape[2]
+        N_rv = rv_weights.shape[2]
 
-            h_q = torch.einsum('bsd,bsdr->bsr', x, shared_fqk_Q)
-            h_k = torch.einsum('bsd,bsdr->bsr', x, shared_fqk_K)
-            h_v = torch.einsum('bsd,bsdr->bsr', x, shared_fv)
+        # Feature neurons: sparse matmul
+        fqk_flat = self.shared_neurons.feature_qk_neurons.view(N_fqk, D * R)
+        shared_fqk_Q = (fqk_weights_Q.view(B * S, N_fqk) @ fqk_flat).view(B, S, D, R)
+        shared_fqk_K = (fqk_weights_K.view(B * S, N_fqk) @ fqk_flat).view(B, S, D, R)
 
-            shared_rqk_Q = torch.einsum('bsn,nrd->bsrd', rqk_weights_Q, self.shared_neurons.restore_qk_neurons)
-            shared_rqk_K = torch.einsum('bsn,nrd->bsrd', rqk_weights_K, self.shared_neurons.restore_qk_neurons)
-            shared_rv = torch.einsum('bsn,nrd->bsrd', rv_weights, self.shared_neurons.restore_v_neurons)
+        fv_flat = self.shared_neurons.feature_v_neurons.view(N_fv, D * R)
+        shared_fv = (fv_weights.view(B * S, N_fv) @ fv_flat).view(B, S, D, R)
 
-            Q = torch.einsum('bsr,bsrd->bsd', h_q, shared_rqk_Q)
-            K = torch.einsum('bsr,bsrd->bsd', h_k, shared_rqk_K)
-            V = torch.einsum('bsr,bsrd->bsd', h_v, shared_rv)
-        else:
-            # Batch-level routing - matmul optimized
-            fqk_flat = self.shared_neurons.feature_qk_neurons.view(-1, D * R)
-            shared_fqk_Q = (fqk_weights_Q @ fqk_flat).view(B, D, R)
-            shared_fqk_K = (fqk_weights_K @ fqk_flat).view(B, D, R)
+        # x @ shared: einsum for efficiency
+        h_q = torch.einsum('bsd,bsdr->bsr', x, shared_fqk_Q)
+        h_k = torch.einsum('bsd,bsdr->bsr', x, shared_fqk_K)
+        h_v = torch.einsum('bsd,bsdr->bsr', x, shared_fv)
 
-            fv_flat = self.shared_neurons.feature_v_neurons.view(-1, D * R)
-            shared_fv = (fv_weights @ fv_flat).view(B, D, R)
+        # Restore neurons: sparse matmul
+        rqk_flat = self.shared_neurons.restore_qk_neurons.view(N_rqk, R * D)
+        shared_rqk_Q = (rqk_weights_Q.view(B * S, N_rqk) @ rqk_flat).view(B, S, R, D)
+        shared_rqk_K = (rqk_weights_K.view(B * S, N_rqk) @ rqk_flat).view(B, S, R, D)
 
-            h_q = torch.bmm(x, shared_fqk_Q)
-            h_k = torch.bmm(x, shared_fqk_K)
-            h_v = torch.bmm(x, shared_fv)
+        rv_flat = self.shared_neurons.restore_v_neurons.view(N_rv, R * D)
+        shared_rv = (rv_weights.view(B * S, N_rv) @ rv_flat).view(B, S, R, D)
 
-            rqk_flat = self.shared_neurons.restore_qk_neurons.view(-1, R * D)
-            shared_rqk_Q = (rqk_weights_Q @ rqk_flat).view(B, R, D)
-            shared_rqk_K = (rqk_weights_K @ rqk_flat).view(B, R, D)
-
-            rv_flat = self.shared_neurons.restore_v_neurons.view(-1, R * D)
-            shared_rv = (rv_weights @ rv_flat).view(B, R, D)
-
-            Q = torch.bmm(h_q, shared_rqk_Q)
-            K = torch.bmm(h_k, shared_rqk_K)
-            V = torch.bmm(h_v, shared_rv)
+        # h @ shared: einsum
+        Q = torch.einsum('bsr,bsrd->bsd', h_q, shared_rqk_Q)
+        K = torch.einsum('bsr,bsrd->bsd', h_k, shared_rqk_K)
+        V = torch.einsum('bsr,bsrd->bsd', h_v, shared_rv)
 
         # Multi-head attention
         Q = Q.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         K = K.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         V = V.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
-
-        # Causal mask (language modeling: cannot see future tokens)
-        causal_mask = torch.triu(torch.ones(S, S, device=scores.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(causal_mask[None, None, :, :], float('-inf'))
-
-        # Padding mask (optional)
-        if attention_mask is not None:
-            mask = attention_mask[:, None, None, :]
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        attn_out = torch.matmul(attn_weights, V)
+        # FlashAttention (PyTorch 2.0+)
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(
+            Q, K, V,
+            attn_mask=None,
+            is_causal=True,
+            dropout_p=dropout_p,
+        )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
         output = self.expand_O(attn_out)
         output = self.out_dropout(output)
@@ -616,32 +634,27 @@ class KnowledgeCircuit(nn.Module):
 
     def forward(self, x, feature_know_w, restore_know_w, attention_mask=None):
         """
-        x: [B, S, D]
-        feature_know_w: [B, n] (batch-level) or [B, S, n] (token-level)
-        restore_know_w: [B, n] (batch-level) or [B, S, n] (token-level)
+        Args:
+            x: [B, S, D] input
+            feature_know_w: [B, S, N] sparse weights for feature neurons
+            restore_know_w: [B, S, N] sparse weights for restore neurons
         """
         B, S, D = x.shape
         R = self.knowledge_rank
-        token_routing = feature_know_w.dim() == 3
 
-        if token_routing:
-            # Token-level: [B, S, n] weights
-            shared_f = torch.einsum('bsn,ndr->bsdr', feature_know_w,
-                                    self.shared_neurons.feature_know)  # [B, S, D, R]
-            h = torch.einsum('bsd,bsdr->bsr', x, shared_f)  # [B, S, R]
+        # Get neuron counts from weight shapes
+        N_f = feature_know_w.shape[2]
+        N_r = restore_know_w.shape[2]
 
-            shared_r = torch.einsum('bsn,nrd->bsrd', restore_know_w,
-                                    self.shared_neurons.restore_know)  # [B, S, R, D]
-            output = torch.einsum('bsr,bsrd->bsd', h, shared_r)  # [B, S, D]
-        else:
-            # Batch-level: [B, n] weights
-            f_flat = self.shared_neurons.feature_know.view(-1, D * R)
-            shared_f = (feature_know_w @ f_flat).view(B, D, R)
-            h = torch.bmm(x, shared_f)  # [B, S, R]
+        # Feature neurons: sparse matmul
+        f_flat = self.shared_neurons.feature_know.view(N_f, D * R)
+        shared_f = (feature_know_w.view(B * S, N_f) @ f_flat).view(B, S, D, R)
+        h = torch.einsum('bsd,bsdr->bsr', x, shared_f)
 
-            r_flat = self.shared_neurons.restore_know.view(-1, R * D)
-            shared_r = (restore_know_w @ r_flat).view(B, R, D)
-            output = torch.bmm(h, shared_r)  # [B, S, D]
+        # Restore neurons: sparse matmul
+        r_flat = self.shared_neurons.restore_know.view(N_r, R * D)
+        shared_r = (restore_know_w.view(B * S, N_r) @ r_flat).view(B, S, R, D)
+        output = torch.einsum('bsr,bsrd->bsd', h, shared_r)
 
         return self.dropout(output)
 
@@ -678,9 +691,9 @@ class DAWNBlock(nn.Module):
     def forward(self, x, importance, global_routers: GlobalRouters, attention_mask=None):
         # Attention
         normed_x = self.norm1(x)
-        fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, attn_routing, attn_aux_loss = \
-            global_routers.get_attention_weights(normed_x, importance, attention_mask)
-
+        fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, attn_info, attn_aux_loss = global_routers.get_attention_weights(
+            normed_x, importance, attention_mask
+        )
         attn_out, _ = self.attn(normed_x, fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, attention_mask)
         x = x + attn_out
 
@@ -688,6 +701,10 @@ class DAWNBlock(nn.Module):
         normed_x = self.norm2(x)
         feature_know_w, restore_know_w = global_routers.get_knowledge_weights(normed_x, importance, attention_mask)
         know_out = self.knowledge(normed_x, feature_know_w, restore_know_w, attention_mask)
+        know_info = {
+            'feature_know_w': feature_know_w.detach(),
+            'restore_know_w': restore_know_w.detach(),
+        }
         x = x + know_out
 
         # Routing info
@@ -695,11 +712,8 @@ class DAWNBlock(nn.Module):
         know_out_norm = know_out.norm(dim=-1).mean().detach()
 
         routing_info = {
-            'attention': attn_routing,
-            'knowledge': {
-                'feature_know_w': feature_know_w.detach(),
-                'restore_know_w': restore_know_w.detach(),
-            },
+            'attention': attn_info,
+            'knowledge': know_info,
             'attn_out_norm': attn_out_norm,
             'know_out_norm': know_out_norm,
         }
@@ -744,7 +758,7 @@ class DAWN(nn.Module):
         knowledge_rank: int = 128,
         # Others
         dropout: float = 0.1,
-        token_routing: bool = False,
+        attention_token_routing: bool = False,
         knowledge_token_routing: bool = False,
         router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
@@ -779,7 +793,7 @@ class DAWN(nn.Module):
         self.state_dim = state_dim
         self.d_space = d_space
         self.dropout_rate = dropout
-        self.token_routing = token_routing
+        self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
         self.router_dropout = router_dropout
         self.gradient_checkpointing = gradient_checkpointing
@@ -828,7 +842,7 @@ class DAWN(nn.Module):
             top_k_feature_qk=top_k_feature_qk, top_k_feature_v=top_k_feature_v,
             top_k_restore_qk=top_k_restore_qk, top_k_restore_v=top_k_restore_v,
             top_k_feature_know=top_k_feature_know, top_k_restore_know=top_k_restore_know,
-            d_space=d_space, router_dropout=router_dropout, token_routing=token_routing,
+            d_space=d_space, router_dropout=router_dropout, attention_token_routing=attention_token_routing,
             knowledge_token_routing=knowledge_token_routing,
         )
 
@@ -871,9 +885,17 @@ class DAWN(nn.Module):
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
         x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
 
-        importance, context, raw_importance = self.global_ssm(x, attention_mask)
-        if context is not None:
-            x = x + context
+        # SSM only skipped when BOTH attention and knowledge use token routing
+        # Otherwise at least one needs importance for causal cumulative routing
+        if self.attention_token_routing and self.knowledge_token_routing:
+            importance = None
+            context = None
+        else:
+            importance, context, raw_importance = self.global_ssm(x, attention_mask)
+            if context is not None:
+                if attention_mask is not None:
+                    context = context * attention_mask.unsqueeze(-1)
+                x = x + context
 
         routing_infos = []
         total_aux_loss = 0.0
@@ -944,7 +966,7 @@ class DAWN(nn.Module):
             f"",
             f"  [Router]",
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
-            f"  token_routing={self.token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
+            f"  attention_token_routing={self.attention_token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
             f"  use_ssm_context={self.use_ssm_context}",
             f"",
             f"  [Other]",

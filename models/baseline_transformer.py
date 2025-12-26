@@ -58,7 +58,7 @@ class StandardAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.o_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
         B, S, D = x.shape
 
         # Project: [B, S, D] -> [B, n_heads, S, d_head]
@@ -66,24 +66,14 @@ class StandardAttention(nn.Module):
         k = self.k_proj(x).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x).view(B, S, self.n_heads, self.d_head).transpose(1, 2)
 
-        # FlashAttention via scaled_dot_product_attention
-        # mask: [B, 1, S, S] with 1=attend, 0=mask -> convert to boolean
-        if mask is not None:
-            # Convert to boolean mask (True = mask out, False = attend)
-            attn_mask = (mask == 0)  # [B, 1, S, S]
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=False,  # We provide explicit mask
-            )
-        else:
-            # Pure causal attention (FlashAttention optimized path)
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=True,
-            )
+        # Always use is_causal=True for FlashAttention optimized path
+        # This matches DAWN's implementation - causal masking handled by PyTorch
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True,
+        )
 
         # Output: [B, n_heads, S, d_head] -> [B, S, D]
         out = out.transpose(1, 2).contiguous().view(B, S, D)
@@ -105,10 +95,10 @@ class TransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, mask=None):
-        # Attention with residual
+    def forward(self, x):
+        # Attention with residual (causal masking handled internally)
         normed = self.norm1(x)
-        x = x + self.dropout(self.attn(normed, mask))
+        x = x + self.dropout(self.attn(normed))
 
         # FFN with residual
         normed = self.norm2(x)
@@ -193,19 +183,9 @@ class VanillaTransformer(nn.Module):
         x = self.token_emb(input_ids) + self.pos_emb(pos)
         x = self.dropout(x)
 
-        # Causal mask + Pad mask
-        if attention_mask is not None:
-            # Combine causal mask with pad mask
-            causal_mask = torch.tril(torch.ones(S, S, device=input_ids.device))
-            pad_mask = attention_mask.unsqueeze(1).unsqueeze(2).float()  # [B, 1, 1, S]
-            mask = causal_mask.unsqueeze(0) * pad_mask  # [B, 1, S, S]
-        else:
-            # No pad mask -> let StandardAttention use is_causal=True
-            mask = None
-
-        # Layers
+        # Layers - attention uses is_causal=True internally (no mask needed)
         for layer in self.layers:
-            x = layer(x, mask)
+            x = layer(x)
 
         # Output
         x = self.norm(x)
