@@ -22,7 +22,7 @@ DAWN replaces static weight matrices with dynamic subspace composition over shar
 
 ## Architecture
 
-![DAWN Architecture](assets/fig1_architecture.png)
+![DAWN Architecture](assets/fig1_architecture.jpg)
 
 ## Installation
 
