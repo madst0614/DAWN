@@ -455,19 +455,15 @@ class GlobalRouters(nn.Module):
             # Scatter weights back to original positions
             path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
 
-            # Normalize within path (only non-zero entries)
-            path_sum = path_weights.sum(dim=-1, keepdim=True) + 1e-8
-            path_weights = path_weights / path_sum
-
             path_weights_list.append(path_weights)
 
         # Ensure at least one path
         if len(path_weights_list) == 0:
-            # Fallback: uniform weights over top-rank neurons
+            # Fallback: use original weights for top-rank neurons
             _, top_indices = torch.topk(scores, min(rank, N), dim=-1)
             fallback_weights = torch.zeros_like(weights)
-            fallback_weights.scatter_(dim=-1, index=top_indices,
-                                      src=torch.ones_like(top_indices, dtype=weights.dtype) / min(rank, N))
+            top_w = torch.gather(weights, dim=-1, index=top_indices)
+            fallback_weights.scatter_(dim=-1, index=top_indices, src=top_w)
             path_weights_list.append(fallback_weights)
 
         return path_weights_list
