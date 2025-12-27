@@ -2,6 +2,7 @@
 DAWN Model Version Registry - Single Source of Truth
 
 Supported Versions:
+  v18.0: Adaptive Threshold Multi-Path Routing (rank=16, max_paths=4)
   v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
   v17.2: Feature QK Unified + Restore Q/K Separate
   baseline: Vanilla Transformer for comparison
@@ -12,6 +13,42 @@ import torch
 
 
 VERSION_REGISTRY = {
+    "18.0": {
+        "description": "Adaptive Threshold Multi-Path Routing",
+        "aliases": ["18", "180"],
+        "module": "model_v18",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "max_paths": 4,
+            "threshold_temp": 1.0,
+            "tau_reg_lambda": 0.01,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "attention_token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+        },
+        "display_info": lambda args: [
+            f"DAWN v18.0: Adaptive Threshold Multi-Path Routing",
+            f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}",
+            f"  threshold_temp={args.get('threshold_temp', 1.0)}, tau_reg_lambda={args.get('tau_reg_lambda', 0.01)}",
+            f"  F-QK: {args.get('n_feature_qk')} - Q/K shared pool",
+            f"  F-V: {args.get('n_feature_v')}",
+            f"  R-QK: {args.get('n_restore_qk')} - Q/K shared pool",
+            f"  R-V: {args.get('n_restore_v')}",
+            f"  F-Know: {args.get('n_feature_know')}, R-Know: {args.get('n_restore_know')}",
+        ],
+    },
+
     "17.2": {
         "description": "Feature QK Unified + Restore Q/K Separate",
         "aliases": ["172"],
@@ -262,7 +299,7 @@ def get_all_versions_info() -> str:
 
 def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[str, Any]:
     """
-    Extract routing log info for v17.1/v17.2.
+    Extract routing log info for v17.1/v17.2/v18.0.
     Computes AVERAGE entropy across all layers.
     """
     if isinstance(routing_infos, dict):
@@ -270,8 +307,47 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
 
     attn0 = routing_infos[0].get('attention', routing_infos[0])
 
+    # v18.0: Adaptive Threshold Multi-Path (has n_paths_* keys)
+    if attn0.get('n_paths_fqk_Q') is not None:
+        all_ents = {k: [] for k in ['FQK_Q', 'FQK_K', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
+        all_vars = {k: [] for k in ['FQK_Q', 'FQK_K', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
+
+        for layer_info in routing_infos:
+            attn = layer_info.get('attention', layer_info)
+            prefs = {
+                'FQK_Q': attn.get('fqk_q_pref'),
+                'FQK_K': attn.get('fqk_k_pref'),
+                'FV': attn.get('fv_pref'),
+                'RQK_Q': attn.get('rqk_q_pref'),
+                'RQK_K': attn.get('rqk_k_pref'),
+                'RV': attn.get('rv_pref'),
+            }
+            for k, v in prefs.items():
+                if v is not None:
+                    all_ents[k].append(calc_entropy_fn(v))
+                    all_vars[k].append(calc_var_fn(v))
+
+        ents = {k: sum(v)/len(v) if v else 0.0 for k, v in all_ents.items()}
+        vars_ = {k: sum(v)/len(v) if v else 0.0 for k, v in all_vars.items()}
+
+        ent_str = f"Ent F-QK_Q/K/F-V/R-QK_Q/K/R-V:{ents['FQK_Q']:.0f}/{ents['FQK_K']:.0f}/{ents['FV']:.0f}/{ents['RQK_Q']:.0f}/{ents['RQK_K']:.0f}/{ents['RV']:.0f}"
+        var_str = f"TokVar:{vars_['FQK_Q']:.4f}/{vars_['FQK_K']:.4f}/{vars_['FV']:.4f}/{vars_['RQK_Q']:.4f}/{vars_['RQK_K']:.4f}/{vars_['RV']:.4f}"
+
+        # v18 specific: path counts and tau values
+        n_paths = f"Paths FQK:{attn0.get('n_paths_fqk_Q', 0)}/{attn0.get('n_paths_fqk_K', 0)} FV:{attn0.get('n_paths_fv', 0)} RQK:{attn0.get('n_paths_rqk_Q', 0)}/{attn0.get('n_paths_rqk_K', 0)} RV:{attn0.get('n_paths_rv', 0)}"
+        tau_str = f"Tau FQK:{attn0.get('tau_fqk', 0):.3f} FV:{attn0.get('tau_fv', 0):.3f} RQK:{attn0.get('tau_rqk', 0):.3f} RV:{attn0.get('tau_rv', 0):.3f}"
+
+        return {
+            'ent_str': ent_str,
+            'var_str': var_str,
+            'overlap_str': None,
+            'paths_str': n_paths,
+            'tau_str': tau_str,
+            'version': '18.0'
+        }
+
     # v17.2: Feature QK Unified (fqk_pref exists, fqk_q_pref does not)
-    if attn0.get('fqk_pref') is not None:
+    elif attn0.get('fqk_pref') is not None:
         all_ents = {k: [] for k in ['FQK', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
         all_vars = {k: [] for k in ['FQK', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
 
