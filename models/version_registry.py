@@ -17,7 +17,7 @@ VERSION_REGISTRY = {
     "18.1": {
         "description": "Soft Mask + Learnable Tau",
         "aliases": ["181"],
-        "module": "model_v18",
+        "module": "model_v18_1",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
             "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
@@ -81,11 +81,6 @@ VERSION_REGISTRY = {
             "attention_token_routing": False,
             "knowledge_token_routing": False,
             "use_ssm_context": True,
-            # v18.1 specific (defaults for v18.0)
-            "use_soft_mask": False,
-            "learnable_tau": False,
-            "soft_mask_temp": 1.0,
-            "soft_mask_penalty": 100.0,
         },
         "display_info": lambda args: [
             f"DAWN v18.0: Fixed Threshold Multi-Path Routing",

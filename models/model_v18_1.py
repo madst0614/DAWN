@@ -1,22 +1,23 @@
 """
-DAWN v18.0: Fixed Threshold Multi-Path Routing
+DAWN v18.1: Soft Mask + Learnable Tau Routing
 
 Key Concept:
-- Reduced rank (16) with fixed threshold (tau) for neuron selection
-- Selected neurons are chunked by rank and processed as parallel paths
-- Q, K, V generation uses multi-path aggregation; attention operation unchanged
+- Based on v18.0 with differentiable threshold selection
+- Soft mask: sigmoid((score - tau) / temp) instead of hard threshold
+- Learnable tau: separate nn.Parameter for each neuron type
+- Penalty-based masking: low-score neurons get penalty instead of -inf
 
-Changes from v17.1:
-- rank: 64 → 16 (reduced for multi-path chunking)
-- top-k sparsification → fixed threshold selection (configurable via fixed_tau)
-- Single path → Multi-path (1~max_paths) parallel processing
-- Batched einsum optimization for 45% memory savings, 1.57x throughput
+Changes from v18.0:
+- Hard mask (score > tau) → Soft mask (sigmoid((score - tau) / temp))
+- Fixed tau → Learnable tau (nn.Parameter for each pool)
+- -inf masking → Penalty-based masking (-soft_mask_penalty)
+- Gradients flow through all neurons (differentiable routing)
 
 Architecture:
-- UnifiedNeuronRouter: fixed tau (no learnable threshold projections)
-- GlobalRouters: _threshold_select + _chunk_to_paths instead of _topk_sparsify
-- AttentionCircuit: Multi-path Q, K, V aggregation (batched einsum)
-- KnowledgeCircuit: Multi-path aggregation (batched einsum)
+- UnifiedNeuronRouter: same as v18.0
+- GlobalRouters: soft mask + learnable tau parameters
+- AttentionCircuit: same as v18.0 (multi-path Q, K, V aggregation)
+- KnowledgeCircuit: same as v18.0 (multi-path aggregation)
 """
 
 import math
@@ -348,14 +349,18 @@ class GlobalSSM(nn.Module):
 class GlobalRouters(nn.Module):
     """
     v18.0: Fixed threshold + softmax multi-path routing
+    v18.1: Soft mask + softmax with learnable tau (when use_soft_mask=True)
 
-    Key features:
+    v18.0 uses:
     1. Fixed threshold (tau) for initial neuron filtering
     2. Minimum/maximum neuron guarantees (path_min_k, path_max_k * max_paths)
     3. Masked softmax for differentiable weighting
     4. Chunking into multiple paths by score ranking
 
-    Note: For soft mask + learnable tau, use model_v18_1.py instead.
+    v18.1 adds:
+    1. Soft mask: sigmoid((score - tau) / temp) instead of hard threshold
+    2. Learnable tau: tau becomes nn.Parameter
+    3. Penalty-based masking: low-score neurons get penalty instead of -inf
     """
     def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
                  n_restore_qk: int, n_restore_v: int,
@@ -1072,24 +1077,22 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v18.0: Fixed Threshold Multi-Path Routing
+    DAWN v18.1: Soft Mask + Learnable Tau Routing
 
     Key Features:
-    - Reduced rank (16) for chunked multi-path processing
-    - Fixed threshold (tau) + masked softmax for neuron selection
-    - Minimum/maximum neuron guarantees (path_min_k, path_max_k * max_paths)
-    - Multi-path (1~max_paths) parallel processing with path-wise Q,K,V aggregation
-    - Attention operation unchanged (scaled_dot_product_attention)
+    - Based on v18.0 multi-path routing
+    - Soft mask: sigmoid((score - tau) / temp) for differentiable threshold
+    - Learnable tau: separate nn.Parameter for each neuron type
+    - Penalty-based masking: low-score neurons get penalty instead of -inf
+    - Gradients flow through all neurons (differentiable routing)
 
     Architecture:
-    - UnifiedNeuronRouter: fixed tau (no learnable threshold projections)
-    - GlobalRouters: _threshold_select + _chunk_to_paths with masked softmax
-    - AttentionCircuit: Multi-path Q,K,V summation
-    - KnowledgeCircuit: Multi-path summation
-
-    Note: For soft mask + learnable tau, use model_v18_1.py instead.
+    - UnifiedNeuronRouter: same as v18.0
+    - GlobalRouters: soft mask + learnable tau parameters
+    - AttentionCircuit: Multi-path Q,K,V summation (same as v18.0)
+    - KnowledgeCircuit: Multi-path summation (same as v18.0)
     """
-    __version__ = "18.0"
+    __version__ = "18.1"
 
     def __init__(
         self,
@@ -1106,9 +1109,9 @@ class DAWN(nn.Module):
         fixed_tau: float = 0.0,
         path_min_k: int = 8,
         path_max_k: int = 16,
-        # v18.1: Soft mask parameters
-        use_soft_mask: bool = False,
-        learnable_tau: bool = False,
+        # v18.1: Soft mask parameters (defaults for v18.1)
+        use_soft_mask: bool = True,
+        learnable_tau: bool = True,
         soft_mask_temp: float = 1.0,
         soft_mask_penalty: float = 100.0,
         # Attention - shared Q/K pool
@@ -1157,7 +1160,7 @@ class DAWN(nn.Module):
         self.path_min_k = path_min_k
         self.path_max_k = path_max_k
 
-        # v18.1 compatibility (for loading v18.1 checkpoints, use model_v18_1.py)
+        # v18.1 specific
         self.use_soft_mask = use_soft_mask
         self.learnable_tau = learnable_tau
         self.soft_mask_temp = soft_mask_temp
@@ -1311,23 +1314,24 @@ class DAWN(nn.Module):
     def get_model_info(self):
         """Return model architecture info for logging"""
         return [
-            f"DAWN v{self.__version__}: Fixed Threshold Multi-Path Routing",
+            f"DAWN v{self.__version__}: Soft Mask + Learnable Tau Routing",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
             f"  max_paths={self.max_paths}, fixed_tau={self.fixed_tau}, path_min_k={self.path_min_k}, path_max_k={self.path_max_k}",
+            f"  soft_mask_temp={self.soft_mask_temp}, soft_mask_penalty={self.soft_mask_penalty}",
             f"  max_seq_len={self.max_seq_len}, state_dim={self.state_dim}, dropout={self.dropout_rate}",
             f"",
-            f"  [Attention - Q/K Shared Pool] (fixed threshold, max_paths={self.max_paths})",
+            f"  [Attention - Q/K Shared Pool] (soft mask + learnable tau, max_paths={self.max_paths})",
             f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank}",
             f"  Feature_V: {self.n_feature_v} × {self.d_model} × {self.rank}",
             f"  Restore_QK: {self.n_restore_qk} × {self.rank} × {self.d_model}",
             f"  Restore_V: {self.n_restore_v} × {self.rank} × {self.d_model}",
             f"",
-            f"  [Knowledge - Feature-Restore] (fixed threshold, max_paths={self.max_paths})",
+            f"  [Knowledge - Feature-Restore] (soft mask + learnable tau, max_paths={self.max_paths})",
             f"  Feature_Know: {self.n_feature_know} × {self.d_model} × {self.knowledge_rank}",
             f"  Restore_Know: {self.n_restore_know} × {self.knowledge_rank} × {self.d_model}",
             f"",
-            f"  [Router - Fixed Threshold]",
+            f"  [Router - Soft Mask + Learnable Tau]",
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
             f"  attention_token_routing={self.attention_token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
             f"  use_ssm_context={self.use_ssm_context}",
@@ -1396,9 +1400,10 @@ class DAWN(nn.Module):
         attn_neurons = self.n_feature_qk + self.n_feature_v + self.n_restore_qk + self.n_restore_v
         know_neurons = self.n_feature_know + self.n_restore_know
         return (
-            f"DAWN v{self.__version__}: Fixed Threshold Multi-Path\n"
+            f"DAWN v{self.__version__}: Soft Mask + Learnable Tau\n"
             f"  Params: {params:.1f}M\n"
             f"  rank={self.rank}, max_paths={self.max_paths}, path_min_k={self.path_min_k}, path_max_k={self.path_max_k}\n"
+            f"  soft_mask_temp={self.soft_mask_temp}, soft_mask_penalty={self.soft_mask_penalty}\n"
             f"  Attention: Feature_QK={self.n_feature_qk}, Feature_V={self.n_feature_v}\n"
             f"            Restore_QK={self.n_restore_qk}, Restore_V={self.n_restore_v}\n"
             f"  Knowledge: Feature={self.n_feature_know}, Restore={self.n_restore_know}\n"
