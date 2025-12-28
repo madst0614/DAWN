@@ -566,16 +566,6 @@ class GlobalRouters(nn.Module):
             'rv': rv_paths,
         }
 
-        # Soft weights for tau regularization
-        soft_weights = {
-            'fqk_soft_Q': fqk_soft_Q,
-            'fqk_soft_K': fqk_soft_K,
-            'fv_soft': fv_soft,
-            'rqk_soft_Q': rqk_soft_Q,
-            'rqk_soft_K': rqk_soft_K,
-            'rv_soft': rv_soft,
-        }
-
         routing_info = {
             # Actual active paths (non-zero path tensors)
             'n_paths_fqk_Q': sum(1 for p in fqk_paths_Q if p.abs().sum() > 0),
@@ -629,7 +619,7 @@ class GlobalRouters(nn.Module):
             self.neuron_router.update_usage(combined_rqk_K, 'restore_k', attention_mask)
             self.neuron_router.update_usage(combined_rv, 'restore_v', attention_mask)
 
-        return path_weights, soft_weights, routing_info, aux_loss
+        return path_weights, routing_info, aux_loss
 
     def get_knowledge_weights(self, x, importance, attention_mask=None):
         """
@@ -658,11 +648,6 @@ class GlobalRouters(nn.Module):
             self.neuron_router.update_usage(combined_f, 'feature_know', attention_mask)
             self.neuron_router.update_usage(combined_r, 'restore_know', attention_mask)
 
-        soft_weights = {
-            'feature_know_soft': f_soft,
-            'restore_know_soft': r_soft,
-        }
-
         know_info = {
             'n_paths_feature': sum(1 for p in f_paths if p.abs().sum() > 0),
             'n_paths_restore': sum(1 for p in r_paths if p.abs().sum() > 0),
@@ -676,7 +661,7 @@ class GlobalRouters(nn.Module):
             'activation_restore': r_soft.detach().mean().item(),
         }
 
-        return f_paths, r_paths, soft_weights, know_info
+        return f_paths, r_paths, know_info
 
 
 class AttentionCircuit(nn.Module):
@@ -900,7 +885,7 @@ class DAWNBlock(nn.Module):
     def forward(self, x, importance, global_routers: GlobalRouters, attention_mask=None):
         # Attention
         normed_x = self.norm1(x)
-        path_weights, soft_weights_attn, attn_info, attn_aux_loss = global_routers.get_attention_weights(
+        path_weights, attn_info, attn_aux_loss = global_routers.get_attention_weights(
             normed_x, importance, attention_mask
         )
         attn_out, _ = self.attn(normed_x, path_weights, attention_mask)
@@ -908,14 +893,11 @@ class DAWNBlock(nn.Module):
 
         # Knowledge
         normed_x = self.norm2(x)
-        feature_paths, restore_paths, soft_weights_know, know_info = global_routers.get_knowledge_weights(
+        feature_paths, restore_paths, know_info = global_routers.get_knowledge_weights(
             normed_x, importance, attention_mask
         )
         know_out = self.knowledge(normed_x, feature_paths, restore_paths, attention_mask)
         x = x + know_out
-
-        # Collect soft weights for tau regularization
-        all_soft_weights = {**soft_weights_attn, **soft_weights_know}
 
         # Routing info
         attn_out_norm = attn_out.norm(dim=-1).mean().detach()
@@ -926,7 +908,6 @@ class DAWNBlock(nn.Module):
             'knowledge': know_info,
             'attn_out_norm': attn_out_norm,
             'know_out_norm': know_out_norm,
-            'soft_weights': all_soft_weights,
         }
 
         return x, routing_info, attn_aux_loss
