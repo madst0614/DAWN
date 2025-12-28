@@ -1197,6 +1197,19 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         ema_FK = router.usage_ema_feature_know
                         ema_RK = router.usage_ema_restore_know
 
+                        # Active neuron counts (EMA > 0.01)
+                        active_fq = (ema_fq > 0.01).sum().item()
+                        active_fk = (ema_fk > 0.01).sum().item()
+                        active_fv = (ema_fv > 0.01).sum().item()
+                        active_rq = (ema_rq > 0.01).sum().item()
+                        active_rk = (ema_rk > 0.01).sum().item()
+                        active_rv = (ema_rv > 0.01).sum().item()
+                        active_FK = (ema_FK > 0.01).sum().item()
+                        active_RK = (ema_RK > 0.01).sum().item()
+                        n_fq, n_fk, n_fv = ema_fq.numel(), ema_fk.numel(), ema_fv.numel()
+                        n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
+                        n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+
                         avg_fq, avg_fk, avg_fv = ema_fq.mean().item(), ema_fk.mean().item(), ema_fv.mean().item()
                         avg_rq, avg_rk, avg_rv = ema_rq.mean().item(), ema_rk.mean().item(), ema_rv.mean().item()
                         avg_FK, avg_RK = ema_FK.mean().item(), ema_RK.mean().item()
@@ -1214,7 +1227,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
                         dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
 
-                        print(f"          AvgWeight: FQ={avg_fq:.3f} FK={avg_fk:.3f} FV={avg_fv:.3f} RQ={avg_rq:.3f} RK={avg_rk:.3f} RV={avg_rv:.3f} FKnow={avg_FK:.3f} RKnow={avg_RK:.3f}")
+                        print(f"          Usage: FQ={int(active_fq)}/{n_fq} FK={int(active_fk)}/{n_fk} FV={int(active_fv)}/{n_fv} | RQ={int(active_rq)}/{n_rq} RK={int(active_rk)}/{n_rk} RV={int(active_rv)}/{n_rv}")
+                        print(f"          Know: F={int(active_FK)}/{n_FK} R={int(active_RK)}/{n_RK} | AvgW: FQ={avg_fq:.3f} FK={avg_fk:.3f} FV={avg_fv:.3f} RQ={avg_rq:.3f} RK={avg_rk:.3f} RV={avg_rv:.3f}")
                         print(f"          Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
                         print(f"          Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
 

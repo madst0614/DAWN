@@ -630,13 +630,15 @@ class GlobalRouters(nn.Module):
         }
 
         # Update usage with combined weights from all paths
+        # Note: Each neuron appears in at most one path (chunked by rank), so sum without division
+        # STE outputs 0 or 1, so combined weight = 1 if selected, 0 if not
         if self.training:
-            combined_fqk_Q = sum(fqk_paths_Q) / len(fqk_paths_Q)
-            combined_fqk_K = sum(fqk_paths_K) / len(fqk_paths_K)
-            combined_fv = sum(fv_paths) / len(fv_paths)
-            combined_rqk_Q = sum(rqk_paths_Q) / len(rqk_paths_Q)
-            combined_rqk_K = sum(rqk_paths_K) / len(rqk_paths_K)
-            combined_rv = sum(rv_paths) / len(rv_paths)
+            combined_fqk_Q = sum(fqk_paths_Q)  # [B, S, N] with 0 or 1
+            combined_fqk_K = sum(fqk_paths_K)
+            combined_fv = sum(fv_paths)
+            combined_rqk_Q = sum(rqk_paths_Q)
+            combined_rqk_K = sum(rqk_paths_K)
+            combined_rv = sum(rv_paths)
 
             self.neuron_router.update_usage(combined_fqk_Q, 'feature_q', attention_mask)
             self.neuron_router.update_usage(combined_fqk_K, 'feature_k', attention_mask)
@@ -669,8 +671,8 @@ class GlobalRouters(nn.Module):
         r_paths = self._chunk_to_paths(r_soft, logits_r, self.rank, self.max_paths)
 
         if self.training:
-            combined_f = sum(f_paths) / len(f_paths)
-            combined_r = sum(r_paths) / len(r_paths)
+            combined_f = sum(f_paths)  # No division - each neuron in at most one path
+            combined_r = sum(r_paths)
             self.neuron_router.update_usage(combined_f, 'feature_know', attention_mask)
             self.neuron_router.update_usage(combined_r, 'restore_know', attention_mask)
 
