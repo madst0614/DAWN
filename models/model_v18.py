@@ -584,15 +584,15 @@ class GlobalRouters(nn.Module):
             'n_paths_rqk_Q': sum(1 for p in rqk_paths_Q if p.abs().sum() > 0),
             'n_paths_rqk_K': sum(1 for p in rqk_paths_K if p.abs().sum() > 0),
             'n_paths_rv': sum(1 for p in rv_paths if p.abs().sum() > 0),
-            # tau mean and std
-            'tau_fqk_mean': tau_fqk.detach().mean().item(),
-            'tau_fqk_std': tau_fqk.detach().std().item(),
-            'tau_fv_mean': tau_fv.detach().mean().item(),
-            'tau_fv_std': tau_fv.detach().std().item(),
-            'tau_rqk_mean': tau_rqk.detach().mean().item(),
-            'tau_rqk_std': tau_rqk.detach().std().item(),
-            'tau_rv_mean': tau_rv.detach().mean().item(),
-            'tau_rv_std': tau_rv.detach().std().item(),
+            # tau (fixed scalar)
+            'tau_fqk_mean': tau_fqk,
+            'tau_fqk_std': 0.0,
+            'tau_fv_mean': tau_fv,
+            'tau_fv_std': 0.0,
+            'tau_rqk_mean': tau_rqk,
+            'tau_rqk_std': 0.0,
+            'tau_rv_mean': tau_rv,
+            'tau_rv_std': 0.0,
             # Activation ratio (soft weights mean)
             'activation_fqk_Q': fqk_soft_Q.detach().mean().item(),
             'activation_fqk_K': fqk_soft_K.detach().mean().item(),
@@ -666,11 +666,11 @@ class GlobalRouters(nn.Module):
         know_info = {
             'n_paths_feature': sum(1 for p in f_paths if p.abs().sum() > 0),
             'n_paths_restore': sum(1 for p in r_paths if p.abs().sum() > 0),
-            # tau mean and std
-            'tau_feature_mean': tau_f.detach().mean().item(),
-            'tau_feature_std': tau_f.detach().std().item(),
-            'tau_restore_mean': tau_r.detach().mean().item(),
-            'tau_restore_std': tau_r.detach().std().item(),
+            # tau (fixed scalar)
+            'tau_feature_mean': tau_f,
+            'tau_feature_std': 0.0,
+            'tau_restore_mean': tau_r,
+            'tau_restore_std': 0.0,
             # Activation ratio
             'activation_feature': f_soft.detach().mean().item(),
             'activation_restore': r_soft.detach().mean().item(),
