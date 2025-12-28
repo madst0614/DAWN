@@ -24,19 +24,19 @@ model:
   # Attention - Q/K shared pool
   n_feature_qk: 64
   n_feature_v: 264
-  top_k_feature_qk: 48
-  top_k_feature_v: 48
+  top_k_feature_qk: 16
+  top_k_feature_v: 24
   n_restore_qk: 64
   n_restore_v: 264
-  top_k_restore_qk: 48
-  top_k_restore_v: 48
+  top_k_restore_qk: 16
+  top_k_restore_v: 24
 
   # Knowledge - Feature-Restore pattern
   n_feature_know: 160
   n_restore_know: 160
   knowledge_rank: 16
-  top_k_feature_know: 48
-  top_k_restore_know: 48
+  top_k_feature_know: 16
+  top_k_restore_know: 16
 
   max_seq_len: 512
   dropout: 0.1
