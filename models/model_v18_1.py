@@ -611,10 +611,15 @@ class GlobalRouters(nn.Module):
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
 
         # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
-        tau_fqk = self.get_tau(x, 'fqk')
-        tau_fv = self.get_tau(x, 'fv')
-        tau_rqk = self.get_tau(x, 'rqk')
-        tau_rv = self.get_tau(x, 'rv')
+        # Compute tau_proj once to avoid multiple forward passes
+        if self.learnable_tau:
+            tau_all = self.tau_proj(x)  # [B, S, 6] - compute once
+            tau_fqk = tau_all[..., 0:1]
+            tau_fv = tau_all[..., 1:2]
+            tau_rqk = tau_all[..., 2:3]
+            tau_rv = tau_all[..., 3:4]
+        else:
+            tau_fqk = tau_fv = tau_rqk = tau_rv = self.fixed_tau
 
         # Apply threshold selection (returns weights, mask, and soft_mask for v18.1)
         fqk_weights_Q, fqk_mask_Q, fqk_soft_Q = self._threshold_select(
@@ -780,8 +785,13 @@ class GlobalRouters(nn.Module):
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
         # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
-        tau_f = self.get_tau(x, 'feature_know')
-        tau_r = self.get_tau(x, 'restore_know')
+        # Compute tau_proj once (reuse from attention if possible, but separate for clarity)
+        if self.learnable_tau:
+            tau_all = self.tau_proj(x)  # [B, S, 6] - compute once
+            tau_f = tau_all[..., 4:5]
+            tau_r = tau_all[..., 5:6]
+        else:
+            tau_f = tau_r = self.fixed_tau
 
         # Apply threshold selection (returns weights, mask, and soft_mask for v18.1)
         f_weights, f_mask, f_soft = self._threshold_select(
