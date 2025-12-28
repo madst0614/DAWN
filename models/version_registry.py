@@ -2,7 +2,7 @@
 DAWN Model Version Registry - Single Source of Truth
 
 Supported Versions:
-  v18.0: Adaptive Threshold Multi-Path Routing (rank=16, max_paths=4)
+  v18.0: Fixed Threshold Multi-Path Routing (rank=16, max_paths=4, fixed_tau=0.0)
   v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
   v17.2: Feature QK Unified + Restore Q/K Separate
   baseline: Vanilla Transformer for comparison
@@ -14,7 +14,7 @@ import torch
 
 VERSION_REGISTRY = {
     "18.0": {
-        "description": "Adaptive Threshold Multi-Path Routing",
+        "description": "Fixed Threshold Multi-Path Routing",
         "aliases": ["18", "180"],
         "module": "model_v18",
         "required_params": [
@@ -28,7 +28,7 @@ VERSION_REGISTRY = {
             "state_dim": 64,
             "max_paths": 4,
             "threshold_temp": 1.0,
-            "tau_reg_lambda": 0.01,
+            "fixed_tau": 0.0,
             "d_space": 64,
             "knowledge_rank": 128,
             "gradient_checkpointing": False,
@@ -38,9 +38,9 @@ VERSION_REGISTRY = {
             "use_ssm_context": True,
         },
         "display_info": lambda args: [
-            f"DAWN v18.0: Adaptive Threshold Multi-Path Routing",
+            f"DAWN v18.0: Fixed Threshold Multi-Path Routing",
             f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}",
-            f"  threshold_temp={args.get('threshold_temp', 1.0)}, tau_reg_lambda={args.get('tau_reg_lambda', 0.01)}",
+            f"  threshold_temp={args.get('threshold_temp', 1.0)}, fixed_tau={args.get('fixed_tau', 0.0)}",
             f"  F-QK: {args.get('n_feature_qk')} - Q/K shared pool",
             f"  F-V: {args.get('n_feature_v')}",
             f"  R-QK: {args.get('n_restore_qk')} - Q/K shared pool",

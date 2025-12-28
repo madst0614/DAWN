@@ -1,21 +1,19 @@
 """
-DAWN v18.0: Adaptive Threshold Multi-Path Routing
+DAWN v18.0: Fixed Threshold Multi-Path Routing
 
 Key Concept:
-- Reduced rank (16) with adaptive per-token threshold for variable neuron selection
+- Reduced rank (16) with fixed threshold (tau) for neuron selection
 - Selected neurons are chunked by rank and processed as parallel paths
 - Q, K, V generation uses multi-path aggregation; attention operation unchanged
 
 Changes from v17.1:
 - rank: 64 → 16 (reduced for multi-path chunking)
-- top-k sparsification → adaptive threshold selection
+- top-k sparsification → fixed threshold selection (configurable via fixed_tau)
 - Single path → Multi-path (1~max_paths) parallel processing
-- Added: threshold_proj for each neuron pool
-- Added: tau_regularization_loss for controlling activation ratio
 - Batched einsum optimization for 45% memory savings, 1.57x throughput
 
 Architecture:
-- UnifiedNeuronRouter: 6 threshold projections added
+- UnifiedNeuronRouter: fixed tau (no learnable threshold projections)
 - GlobalRouters: _threshold_select + _chunk_to_paths instead of _topk_sparsify
 - AttentionCircuit: Multi-path Q, K, V aggregation (batched einsum)
 - KnowledgeCircuit: Multi-path aggregation (batched einsum)
@@ -37,12 +35,12 @@ except ImportError:
 
 class UnifiedNeuronRouter(nn.Module):
     """
-    v18.0: 6 attention projections + 2 knowledge projections + 6 threshold projections
-    Per-token adaptive threshold for variable neuron selection
+    v18.0: 6 attention projections + 2 knowledge projections
+    Fixed threshold (tau) for neuron selection
     """
     def __init__(self, d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
                  n_feature_know, n_restore_know,
-                 d_space=64, dropout=0.1, **kwargs):
+                 d_space=64, dropout=0.1, fixed_tau=0.0, **kwargs):
         super().__init__()
         self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
@@ -51,6 +49,7 @@ class UnifiedNeuronRouter(nn.Module):
         self.n_feature_know = n_feature_know
         self.n_restore_know = n_restore_know
         self.d_space = d_space
+        self.fixed_tau = fixed_tau
         self.ema_alpha = kwargs.get('excitability_ema_alpha', 0.01)
 
         # 6 attention + 2 knowledge pools
@@ -72,22 +71,6 @@ class UnifiedNeuronRouter(nn.Module):
         self.proj_restore_know = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
-        # v18: Per-pool threshold projections (output: scalar per token)
-        self.threshold_proj_fqk = nn.Linear(d_model, 1)
-        self.threshold_proj_fv = nn.Linear(d_model, 1)
-        self.threshold_proj_rqk = nn.Linear(d_model, 1)
-        self.threshold_proj_rv = nn.Linear(d_model, 1)
-        self.threshold_proj_feature_know = nn.Linear(d_model, 1)
-        self.threshold_proj_restore_know = nn.Linear(d_model, 1)
-
-        # Initialize threshold projections to output ~-1.0 (more neurons pass initially)
-        # With tau=-1, most neurons with score>-1 will be selected
-        for proj in [self.threshold_proj_fqk, self.threshold_proj_fv,
-                     self.threshold_proj_rqk, self.threshold_proj_rv,
-                     self.threshold_proj_feature_know, self.threshold_proj_restore_know]:
-            nn.init.zeros_(proj.weight)
-            nn.init.constant_(proj.bias, -1.0)
-
         # Unified neuron embeddings (std=0.02 is standard transformer initialization)
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
@@ -103,17 +86,17 @@ class UnifiedNeuronRouter(nn.Module):
 
     def get_thresholds(self, x):
         """
-        Get per-token thresholds for each neuron pool
+        Return fixed tau for all pools (no learnable threshold)
         x: [B, S, d_model]
-        Returns: dict of [B, S, 1] thresholds
+        Returns: dict of scalar thresholds
         """
         return {
-            'fqk': self.threshold_proj_fqk(x),      # [B, S, 1]
-            'fv': self.threshold_proj_fv(x),        # [B, S, 1]
-            'rqk': self.threshold_proj_rqk(x),      # [B, S, 1]
-            'rv': self.threshold_proj_rv(x),        # [B, S, 1]
-            'feature_know': self.threshold_proj_feature_know(x),  # [B, S, 1]
-            'restore_know': self.threshold_proj_restore_know(x),  # [B, S, 1]
+            'fqk': self.fixed_tau,
+            'fv': self.fixed_tau,
+            'rqk': self.fixed_tau,
+            'rv': self.fixed_tau,
+            'feature_know': self.fixed_tau,
+            'restore_know': self.fixed_tau,
         }
 
     def get_knowledge_logits(self, x):
@@ -364,10 +347,10 @@ class GlobalSSM(nn.Module):
 
 class GlobalRouters(nn.Module):
     """
-    v18.0: Adaptive threshold + multi-path routing
+    v18.0: Fixed threshold + multi-path routing
 
-    Instead of top-k sparsification, uses:
-    1. Per-token adaptive threshold (learned)
+    Uses:
+    1. Fixed threshold (tau) for neuron selection
     2. Soft sigmoid weights for neurons above threshold
     3. Chunking into multiple paths by score ranking
     """
@@ -377,6 +360,7 @@ class GlobalRouters(nn.Module):
                  rank: int = 16,
                  max_paths: int = 4,
                  threshold_temp: float = 1.0,
+                 fixed_tau: float = 0.0,
                  d_space: int = 64, router_dropout: float = 0.1,
                  attention_token_routing: bool = False,
                  knowledge_token_routing: bool = False, **kwargs):
@@ -391,13 +375,14 @@ class GlobalRouters(nn.Module):
         self.rank = rank
         self.max_paths = max_paths
         self.threshold_temp = threshold_temp
+        self.fixed_tau = fixed_tau
         self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
 
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
             n_feature_know, n_restore_know,
-            d_space=d_space, dropout=router_dropout, **kwargs
+            d_space=d_space, dropout=router_dropout, fixed_tau=fixed_tau, **kwargs
         )
 
     def _threshold_select(self, scores, tau, temp=1.0):
@@ -978,7 +963,7 @@ class DAWN(nn.Module):
         # v18: Multi-path parameters
         max_paths: int = 4,
         threshold_temp: float = 1.0,
-        tau_reg_lambda: float = 0.01,
+        fixed_tau: float = 0.0,
         # Attention - shared Q/K pool
         n_feature_qk: int = 56,
         n_feature_v: int = 24,
@@ -1022,7 +1007,7 @@ class DAWN(nn.Module):
         # v18 specific
         self.max_paths = max_paths
         self.threshold_temp = threshold_temp
-        self.tau_reg_lambda = tau_reg_lambda
+        self.fixed_tau = fixed_tau
 
         # Neuron counts
         self.n_feature_qk = n_feature_qk
@@ -1059,6 +1044,7 @@ class DAWN(nn.Module):
             rank=rank,
             max_paths=max_paths,
             threshold_temp=threshold_temp,
+            fixed_tau=fixed_tau,
             d_space=d_space, router_dropout=router_dropout,
             attention_token_routing=attention_token_routing,
             knowledge_token_routing=knowledge_token_routing,
@@ -1079,9 +1065,6 @@ class DAWN(nn.Module):
         self.lm_head.weight = self.token_emb.weight
 
         self.aux_loss = 0.0
-
-        # v18: Store soft weights for tau regularization
-        self.last_soft_weights = []
 
         self._init_weights()
 
@@ -1119,9 +1102,6 @@ class DAWN(nn.Module):
         routing_infos = []
         total_aux_loss = 0.0
 
-        # Clear soft weights for this forward pass
-        self.last_soft_weights = []
-
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 x, routing_info, aux_loss = checkpoint(
@@ -1133,10 +1113,6 @@ class DAWN(nn.Module):
 
             routing_infos.append(routing_info)
             total_aux_loss += aux_loss
-
-            # Collect soft weights for tau regularization
-            if 'soft_weights' in routing_info:
-                self.last_soft_weights.append(routing_info['soft_weights'])
 
         self.aux_loss = total_aux_loss
         x = self.norm(x)
@@ -1163,7 +1139,7 @@ class DAWN(nn.Module):
             'max_seq_len': self.max_seq_len,
             'max_paths': self.max_paths,
             'threshold_temp': self.threshold_temp,
-            'tau_reg_lambda': self.tau_reg_lambda,
+            'fixed_tau': self.fixed_tau,
             'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
             'n_restore_qk': self.n_restore_qk, 'n_restore_v': self.n_restore_v,
             'n_feature_know': self.n_feature_know, 'n_restore_know': self.n_restore_know,
@@ -1177,8 +1153,7 @@ class DAWN(nn.Module):
             f"DAWN v{self.__version__}: Adaptive Threshold Multi-Path Routing",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  max_paths={self.max_paths}, threshold_temp={self.threshold_temp}",
-            f"  tau_reg_lambda={self.tau_reg_lambda}",
+            f"  max_paths={self.max_paths}, threshold_temp={self.threshold_temp}, fixed_tau={self.fixed_tau}",
             f"  max_seq_len={self.max_seq_len}, state_dim={self.state_dim}, dropout={self.dropout_rate}",
             f"",
             f"  [Attention - Q/K Shared Pool] (adaptive threshold, max_paths={self.max_paths})",
@@ -1199,50 +1174,6 @@ class DAWN(nn.Module):
             f"  [Other]",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
         ]
-
-    def tau_regularization_loss(self):
-        """
-        Bidirectional tau regularization: penalize deviation from target activation ratio.
-        Target = rank / pool_size (expect ~1 rank's worth of neurons active per token).
-
-        This prevents:
-        - Too high activation (wastes capacity, reduces specialization)
-        - Too low activation (dead neurons, gradient vanishing)
-        """
-        if not self.last_soft_weights:
-            return torch.tensor(0.0, device=next(self.parameters()).device)
-
-        # Per-pool targets based on rank / pool_size
-        targets = {
-            # Attention pools
-            'fqk_soft_Q': self.rank / self.n_feature_qk,   # 16/64 = 0.25
-            'fqk_soft_K': self.rank / self.n_feature_qk,
-            'fv_soft': self.rank / self.n_feature_v,       # 16/264 = 0.06
-            'rqk_soft_Q': self.rank / self.n_restore_qk,
-            'rqk_soft_K': self.rank / self.n_restore_qk,
-            'rv_soft': self.rank / self.n_restore_v,
-            # Knowledge pools (use knowledge_rank)
-            'feature_know_soft': self.knowledge_rank / self.n_feature_know,
-            'restore_know_soft': self.knowledge_rank / self.n_restore_know,
-        }
-
-        total_loss = 0.0
-        count = 0
-
-        for layer_weights in self.last_soft_weights:
-            for key, weights in layer_weights.items():
-                if weights is not None and key in targets:
-                    target = targets[key]
-                    activation = weights.mean()
-                    # Bidirectional: penalize deviation from target
-                    total_loss += (activation - target) ** 2
-                    count += 1
-
-        if count == 0:
-            return torch.tensor(0.0, device=next(self.parameters()).device)
-
-        avg_loss = total_loss / count
-        return avg_loss * self.tau_reg_lambda
 
     def knowledge_diversity_loss(self):
         feat_know = self.shared_neurons.feature_know
@@ -1297,7 +1228,6 @@ class DAWN(nn.Module):
         return {
             'orth_total': self.orthogonality_loss(),
             'knowledge_div': self.knowledge_diversity_loss(),
-            'tau_reg': self.tau_regularization_loss(),
         }
 
     def __repr__(self):
