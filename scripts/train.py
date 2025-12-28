@@ -611,9 +611,16 @@ def is_v17_model(model):
     return version.startswith('17')
 
 
+def is_v18_model(model):
+    """Check if model is DAWN v18.x by version string"""
+    base_model = get_underlying_model(model)
+    version = getattr(base_model, '__version__', '')
+    return version.startswith('18')
+
+
 def needs_routing_info(model):
     """Check if model needs routing_info for usage logging"""
-    return is_v16_model(model) or is_v17_model(model)
+    return is_v16_model(model) or is_v17_model(model) or is_v18_model(model)
 
 
 def _gini(x):

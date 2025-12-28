@@ -559,14 +559,18 @@ class GlobalRouters(nn.Module):
             'rv': rv_paths,
         }
 
+        # Helper: average paths used per token (sum of fraction of tokens using each path)
+        def avg_paths_per_token(paths):
+            return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
+
         routing_info = {
-            # Active paths (non-zero)
-            'n_paths_fqk_Q': sum(1 for p in fqk_paths_Q if p.abs().sum() > 0),
-            'n_paths_fqk_K': sum(1 for p in fqk_paths_K if p.abs().sum() > 0),
-            'n_paths_fv': sum(1 for p in fv_paths if p.abs().sum() > 0),
-            'n_paths_rqk_Q': sum(1 for p in rqk_paths_Q if p.abs().sum() > 0),
-            'n_paths_rqk_K': sum(1 for p in rqk_paths_K if p.abs().sum() > 0),
-            'n_paths_rv': sum(1 for p in rv_paths if p.abs().sum() > 0),
+            # Average paths used per token
+            'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
+            'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
+            'n_paths_fv': avg_paths_per_token(fv_paths),
+            'n_paths_rqk_Q': avg_paths_per_token(rqk_paths_Q),
+            'n_paths_rqk_K': avg_paths_per_token(rqk_paths_K),
+            'n_paths_rv': avg_paths_per_token(rv_paths),
             # tau (fixed scalar)
             'tau_fqk_mean': tau_fqk,
             'tau_fqk_std': 0.0,
@@ -623,9 +627,13 @@ class GlobalRouters(nn.Module):
             self.neuron_router.update_usage(f_mask.float(), 'feature_know', attention_mask)
             self.neuron_router.update_usage(r_mask.float(), 'restore_know', attention_mask)
 
+        # Helper: average paths used per token
+        def avg_paths_per_token(paths):
+            return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
+
         know_info = {
-            'n_paths_feature': sum(1 for p in f_paths if p.abs().sum() > 0),
-            'n_paths_restore': sum(1 for p in r_paths if p.abs().sum() > 0),
+            'n_paths_feature': avg_paths_per_token(f_paths),
+            'n_paths_restore': avg_paths_per_token(r_paths),
             # tau (fixed scalar)
             'tau_feature_mean': tau_f,
             'tau_feature_std': 0.0,
