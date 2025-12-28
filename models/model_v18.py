@@ -616,6 +616,14 @@ class GlobalRouters(nn.Module):
             'activation_rqk_K': rqk_soft_K.detach().mean().item(),
             'activation_rv': rv_soft.detach().mean().item(),
             'token_routing': self.attention_token_routing,
+            # Soft weights for entropy calculation (normalized to pseudo-probability)
+            # Use softmax over logits for proper entropy computation
+            'fqk_q_pref': F.softmax(fqk_logits_Q.detach(), dim=-1),
+            'fqk_k_pref': F.softmax(fqk_logits_K.detach(), dim=-1),
+            'fv_pref': F.softmax(fv_logits.detach(), dim=-1),
+            'rqk_q_pref': F.softmax(rqk_logits_Q.detach(), dim=-1),
+            'rqk_k_pref': F.softmax(rqk_logits_K.detach(), dim=-1),
+            'rv_pref': F.softmax(rv_logits.detach(), dim=-1),
         }
 
         # Update usage with combined weights from all paths
@@ -1194,26 +1202,47 @@ class DAWN(nn.Module):
 
     def tau_regularization_loss(self):
         """
-        Penalize high activation ratio to prevent too many neurons being activated.
-        Uses soft weights (sigmoid outputs) from the last forward pass.
+        Bidirectional tau regularization: penalize deviation from target activation ratio.
+        Target = rank / pool_size (expect ~1 rank's worth of neurons active per token).
+
+        This prevents:
+        - Too high activation (wastes capacity, reduces specialization)
+        - Too low activation (dead neurons, gradient vanishing)
         """
         if not self.last_soft_weights:
             return torch.tensor(0.0, device=next(self.parameters()).device)
 
-        total_activation = 0.0
+        # Per-pool targets based on rank / pool_size
+        targets = {
+            # Attention pools
+            'fqk_soft_Q': self.rank / self.n_feature_qk,   # 16/64 = 0.25
+            'fqk_soft_K': self.rank / self.n_feature_qk,
+            'fv_soft': self.rank / self.n_feature_v,       # 16/264 = 0.06
+            'rqk_soft_Q': self.rank / self.n_restore_qk,
+            'rqk_soft_K': self.rank / self.n_restore_qk,
+            'rv_soft': self.rank / self.n_restore_v,
+            # Knowledge pools (use knowledge_rank)
+            'feature_know_soft': self.knowledge_rank / self.n_feature_know,
+            'restore_know_soft': self.knowledge_rank / self.n_restore_know,
+        }
+
+        total_loss = 0.0
         count = 0
 
         for layer_weights in self.last_soft_weights:
             for key, weights in layer_weights.items():
-                if weights is not None:
-                    total_activation += weights.mean()
+                if weights is not None and key in targets:
+                    target = targets[key]
+                    activation = weights.mean()
+                    # Bidirectional: penalize deviation from target
+                    total_loss += (activation - target) ** 2
                     count += 1
 
         if count == 0:
             return torch.tensor(0.0, device=next(self.parameters()).device)
 
-        avg_activation = total_activation / count
-        return avg_activation * self.tau_reg_lambda
+        avg_loss = total_loss / count
+        return avg_loss * self.tau_reg_lambda
 
     def knowledge_diversity_loss(self):
         feat_know = self.shared_neurons.feature_know
