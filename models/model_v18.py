@@ -156,20 +156,25 @@ class UnifiedNeuronRouter(nn.Module):
         return logits_fqk_Q, logits_fqk_K, logits_fv, logits_rqk_Q, logits_rqk_K, logits_rv
 
     def update_usage(self, weights, neuron_type, attention_mask=None):
+        """
+        Update usage EMA for neuron tracking.
+        v18 uses soft weights (sigmoid outputs 0~1), so we use the actual weight values
+        as usage intensity, not binary active/inactive.
+        """
         if not self.training:
             return
 
         if weights.dim() == 3:
-            active = (weights > 0).float()
+            # Use actual soft weight values (not binary) for v18
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(-1).float()
-                active = active * mask
+                weights_masked = weights * mask
                 count = mask.sum() + 1e-8
-                usage = active.sum(dim=[0, 1]) / count
+                usage = weights_masked.sum(dim=[0, 1]) / count
             else:
-                usage = active.mean(dim=[0, 1])
+                usage = weights.mean(dim=[0, 1])
         else:
-            usage = (weights > 0).float().mean(dim=0)
+            usage = weights.mean(dim=0)
 
         decay = 1 - self.ema_alpha
         if neuron_type == 'feature_q':

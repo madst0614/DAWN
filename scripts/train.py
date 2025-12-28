@@ -631,9 +631,64 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
     """
     lines = []
 
+    # v18.0: Adaptive Threshold Multi-Path Routing
+    # Detected by: global_routers has max_paths attribute (v18 specific)
+    # v18 uses soft weights (sigmoid 0~1), EMA tracks average weight intensity
+    if global_routers is not None and hasattr(global_routers, 'max_paths'):
+        ema_fq = router.usage_ema_feature_q
+        ema_fk = router.usage_ema_feature_k
+        ema_fv = router.usage_ema_feature_v
+        ema_rq = router.usage_ema_restore_q
+        ema_rk = router.usage_ema_restore_k
+        ema_rv = router.usage_ema_restore_v
+        ema_FK = router.usage_ema_feature_know
+        ema_RK = router.usage_ema_restore_know
+
+        # For v18 soft weights: "active" = average weight > 0.01 (not fully suppressed)
+        active_fq = (ema_fq > 0.01).sum().item()
+        active_fk = (ema_fk > 0.01).sum().item()
+        active_fv = (ema_fv > 0.01).sum().item()
+        active_rq = (ema_rq > 0.01).sum().item()
+        active_rk = (ema_rk > 0.01).sum().item()
+        active_rv = (ema_rv > 0.01).sum().item()
+        active_FK = (ema_FK > 0.01).sum().item()
+        active_RK = (ema_RK > 0.01).sum().item()
+        n_fq, n_fk, n_fv = ema_fq.numel(), ema_fk.numel(), ema_fv.numel()
+        n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
+        n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+
+        # Gini coefficients
+        gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
+        gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
+        gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+
+        # Dead neuron ratios (average weight < 0.01)
+        dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
+        dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
+
+        # Average weight intensity (v18 specific: soft weights have meaningful magnitude)
+        avg_fq, avg_fk, avg_fv = ema_fq.mean().item(), ema_fk.mean().item(), ema_fv.mean().item()
+        avg_rq, avg_rk, avg_rv = ema_rq.mean().item(), ema_rk.mean().item(), ema_rv.mean().item()
+        avg_FK, avg_RK = ema_FK.mean().item(), ema_RK.mean().item()
+
+        # v18.0 format (multi-path, soft weights)
+        lines.append(f"         [v18.0] Neuron Usage (soft weights)")
+        lines.append(f"             Feature_Q: {int(active_fq)}/{n_fq} | Feature_K: {int(active_fk)}/{n_fk} | Feature_V: {int(active_fv)}/{n_fv}")
+        lines.append(f"             Restore_Q: {int(active_rq)}/{n_rq} | Restore_K: {int(active_rk)}/{n_rk} | Restore_V: {int(active_rv)}/{n_rv}")
+        lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} | Restore_Know: {int(active_RK)}/{n_RK}")
+        lines.append(f"             AvgWeight: FQ={avg_fq:.3f} FK={avg_fk:.3f} FV={avg_fv:.3f} RQ={avg_rq:.3f} RK={avg_rk:.3f} RV={avg_rv:.3f} FK={avg_FK:.3f} RK={avg_RK:.3f}")
+        lines.append(f"             Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
+        lines.append(f"             Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
+
     # v17.2: Feature QK Unified + Restore Q/K Separate
     # (has usage_ema_feature_qk AND usage_ema_restore_q AND usage_ema_feature_know)
-    if hasattr(router, 'usage_ema_feature_qk') and hasattr(router, 'usage_ema_restore_q') and hasattr(router, 'usage_ema_feature_know'):
+    elif hasattr(router, 'usage_ema_feature_qk') and hasattr(router, 'usage_ema_restore_q') and hasattr(router, 'usage_ema_feature_know'):
         ema_fqk = router.usage_ema_feature_qk
         ema_fv = router.usage_ema_feature_v
         ema_rq = router.usage_ema_restore_q
@@ -1137,12 +1192,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                     # Usage EMA logging
                     router = None
-                    if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+                    global_routers = None
+                    if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1/v18
                         router = base_model.router.neuron_router
+                        global_routers = base_model.router  # For v18 detection (has max_paths)
                     elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                         router = base_model.global_routers.neuron_router
                     if router is not None:
-                        for line in _get_router_log_lines(router, global_step, total_steps):
+                        for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
                             print(line)
 
                     # Importance entropy logging (from routing preferences)
@@ -1294,12 +1351,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                 # Add router metrics (same format as console)
                 router = None
-                if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+                global_routers = None
+                if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1/v18
                     router = base_model.router.neuron_router
+                    global_routers = base_model.router  # For v18 detection (has max_paths)
                 elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                     router = base_model.global_routers.neuron_router
                 if router is not None:
-                    for line in _get_router_log_lines(router, global_step, total_steps):
+                    for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
                         f.write(line + "\n")
 
             # Collect neuron metrics
