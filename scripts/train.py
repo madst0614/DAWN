@@ -1150,7 +1150,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     model_version = getattr(base_model, '__version__', '')
                     if model_version.startswith('18'):
                         # v18.0: Fixed threshold multi-path logging
-                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str}")
+                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | Attn:{attn_str}")
 
                         # Paths (average across layers)
                         n_fqk_Q = sum(ri.get('attention', ri).get('n_paths_fqk_Q', 0) for ri in routing_infos) / len(routing_infos)
