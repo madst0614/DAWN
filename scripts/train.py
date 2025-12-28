@@ -1185,22 +1185,56 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         if hasattr(base_model, 'tau_regularization_loss'):
                             tau_reg = base_model.tau_regularization_loss().item()
                             print(f"          tau_reg_loss: {tau_reg:.4f}")
+
+                        # v18 Neuron Usage (integrated here, not in _get_router_log_lines)
+                        router = base_model.router.neuron_router
+                        ema_fq = router.usage_ema_feature_q
+                        ema_fk = router.usage_ema_feature_k
+                        ema_fv = router.usage_ema_feature_v
+                        ema_rq = router.usage_ema_restore_q
+                        ema_rk = router.usage_ema_restore_k
+                        ema_rv = router.usage_ema_restore_v
+                        ema_FK = router.usage_ema_feature_know
+                        ema_RK = router.usage_ema_restore_know
+
+                        avg_fq, avg_fk, avg_fv = ema_fq.mean().item(), ema_fk.mean().item(), ema_fv.mean().item()
+                        avg_rq, avg_rk, avg_rv = ema_rq.mean().item(), ema_rk.mean().item(), ema_rv.mean().item()
+                        avg_FK, avg_RK = ema_FK.mean().item(), ema_RK.mean().item()
+
+                        gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
+                        gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
+                        gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+
+                        dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
+                        dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
+                        dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
+                        dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
+                        dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
+                        dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
+                        dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
+                        dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
+
+                        print(f"          AvgWeight: FQ={avg_fq:.3f} FK={avg_fk:.3f} FV={avg_fv:.3f} RQ={avg_rq:.3f} RK={avg_rk:.3f} RV={avg_rv:.3f} FKnow={avg_FK:.3f} RKnow={avg_RK:.3f}")
+                        print(f"          Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
+                        print(f"          Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
+
                     elif overlap_str:
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
                     else:
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
 
-                    # Usage EMA logging
-                    router = None
-                    global_routers = None
-                    if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1/v18
-                        router = base_model.router.neuron_router
-                        global_routers = base_model.router  # For v18 detection (has max_paths)
-                    elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
-                        router = base_model.global_routers.neuron_router
-                    if router is not None:
-                        for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
-                            print(line)
+                    # Usage EMA logging (skip for v18, already printed above)
+                    if not (hasattr(base_model, 'router') and hasattr(base_model.router, 'max_paths')):
+                        router = None
+                        global_routers = None
+                        if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
+                            router = base_model.router.neuron_router
+                            global_routers = base_model.router
+                        elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
+                            router = base_model.global_routers.neuron_router
+                        if router is not None:
+                            for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
+                                print(line)
 
                     # Importance entropy logging (from routing preferences)
                     try:

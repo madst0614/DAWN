@@ -603,12 +603,13 @@ class GlobalRouters(nn.Module):
             'rqk_q_pref': rqk_pref_Q.detach(),
             'rqk_k_pref': rqk_pref_K.detach(),
             'rv_pref': rv_pref.detach(),
-            'n_paths_fqk_Q': len(fqk_paths_Q),
-            'n_paths_fqk_K': len(fqk_paths_K),
-            'n_paths_fv': len(fv_paths),
-            'n_paths_rqk_Q': len(rqk_paths_Q),
-            'n_paths_rqk_K': len(rqk_paths_K),
-            'n_paths_rv': len(rv_paths),
+            # Actual active paths (non-zero path tensors)
+            'n_paths_fqk_Q': sum(1 for p in fqk_paths_Q if p.abs().sum() > 0),
+            'n_paths_fqk_K': sum(1 for p in fqk_paths_K if p.abs().sum() > 0),
+            'n_paths_fv': sum(1 for p in fv_paths if p.abs().sum() > 0),
+            'n_paths_rqk_Q': sum(1 for p in rqk_paths_Q if p.abs().sum() > 0),
+            'n_paths_rqk_K': sum(1 for p in rqk_paths_K if p.abs().sum() > 0),
+            'n_paths_rv': sum(1 for p in rv_paths if p.abs().sum() > 0),
             # tau mean and std
             'tau_fqk_mean': tau_fqk.detach().mean().item(),
             'tau_fqk_std': tau_fqk.detach().std().item(),
@@ -679,8 +680,8 @@ class GlobalRouters(nn.Module):
         }
 
         know_info = {
-            'n_paths_feature': len(f_paths),
-            'n_paths_restore': len(r_paths),
+            'n_paths_feature': sum(1 for p in f_paths if p.abs().sum() > 0),
+            'n_paths_restore': sum(1 for p in r_paths if p.abs().sum() > 0),
             # tau mean and std
             'tau_feature_mean': tau_f.detach().mean().item(),
             'tau_feature_std': tau_f.detach().std().item(),
