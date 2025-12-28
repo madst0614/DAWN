@@ -747,39 +747,19 @@ class AttentionCircuit(nn.Module):
         """
         B, S, D = x.shape
 
-        # Get path lists
-        fqk_paths_Q = path_weights['fqk_Q']
-        fqk_paths_K = path_weights['fqk_K']
-        fv_paths = path_weights['fv']
-        rqk_paths_Q = path_weights['rqk_Q']
-        rqk_paths_K = path_weights['rqk_K']
-        rv_paths = path_weights['rv']
+        # Combine path weights (linear operation - sum paths first, compute once)
+        combined_fqk_Q = sum(path_weights['fqk_Q'])
+        combined_fqk_K = sum(path_weights['fqk_K'])
+        combined_fv = sum(path_weights['fv'])
+        combined_rqk_Q = sum(path_weights['rqk_Q'])
+        combined_rqk_K = sum(path_weights['rqk_K'])
+        combined_rv = sum(path_weights['rv'])
 
-        # Number of paths (use max across all)
-        n_paths = max(len(fqk_paths_Q), len(fqk_paths_K), len(fv_paths),
-                      len(rqk_paths_Q), len(rqk_paths_K), len(rv_paths))
-
-        # Aggregate Q, K, V from all paths
-        Q_total = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
-        K_total = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
-        V_total = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
-
-        for p in range(n_paths):
-            # Get weights for this path (use last if path list is shorter)
-            fqk_w_Q = fqk_paths_Q[min(p, len(fqk_paths_Q) - 1)]
-            fqk_w_K = fqk_paths_K[min(p, len(fqk_paths_K) - 1)]
-            fv_w = fv_paths[min(p, len(fv_paths) - 1)]
-            rqk_w_Q = rqk_paths_Q[min(p, len(rqk_paths_Q) - 1)]
-            rqk_w_K = rqk_paths_K[min(p, len(rqk_paths_K) - 1)]
-            rv_w = rv_paths[min(p, len(rv_paths) - 1)]
-
-            Q_path, K_path, V_path = self._process_single_path(
-                x, fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w
-            )
-
-            Q_total = Q_total + Q_path
-            K_total = K_total + K_path
-            V_total = V_total + V_path
+        # Single computation with combined weights
+        Q_total, K_total, V_total = self._process_single_path(
+            x, combined_fqk_Q, combined_fqk_K, combined_fv,
+            combined_rqk_Q, combined_rqk_K, combined_rv
+        )
 
         # Multi-head attention
         Q = Q_total.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -847,20 +827,14 @@ class KnowledgeCircuit(nn.Module):
             feature_paths: list of [B, S, N] weights
             restore_paths: list of [B, S, N] weights
         """
-        B, S, D = x.shape
+        # Combine path weights (linear operation - sum paths first, compute once)
+        combined_feature = sum(feature_paths)
+        combined_restore = sum(restore_paths)
 
-        n_paths = max(len(feature_paths), len(restore_paths))
+        # Single computation with combined weights
+        output = self._process_single_path(x, combined_feature, combined_restore)
 
-        output_total = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
-
-        for p in range(n_paths):
-            feature_w = feature_paths[min(p, len(feature_paths) - 1)]
-            restore_w = restore_paths[min(p, len(restore_paths) - 1)]
-
-            output_path = self._process_single_path(x, feature_w, restore_w)
-            output_total = output_total + output_path
-
-        return self.dropout(output_total)
+        return self.dropout(output)
 
 
 class DAWNBlock(nn.Module):
