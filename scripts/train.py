@@ -1253,6 +1253,26 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         print(f"          Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
                         print(f"          Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
 
+                        # v18.1 specific: learnable tau and soft mask
+                        if model_version.startswith('18.1'):
+                            # Tau values from learnable parameters
+                            tau_vals = base_model.router.get_all_tau_values()
+                            if tau_vals:
+                                print(f"          Tau: fqk={tau_vals['fqk']:.3f} fv={tau_vals['fv']:.3f} rqk={tau_vals['rqk']:.3f} rv={tau_vals['rv']:.3f} kF={tau_vals['feature_know']:.3f} kR={tau_vals['restore_know']:.3f}")
+
+                            # Soft mask mean values (from first routing info)
+                            if routing_infos and routing_infos[0].get('use_soft_mask'):
+                                ri0 = routing_infos[0]
+                                attn = ri0.get('attention', ri0)
+                                know = ri0.get('knowledge', ri0)
+                                sm_fqk = attn.get('soft_mask_fqk_Q_mean', 0)
+                                sm_fv = attn.get('soft_mask_fv_mean', 0)
+                                sm_rqk = attn.get('soft_mask_rqk_Q_mean', 0)
+                                sm_rv = attn.get('soft_mask_rv_mean', 0)
+                                sm_kf = know.get('soft_mask_feature_mean', 0)
+                                sm_kr = know.get('soft_mask_restore_mean', 0)
+                                print(f"          SoftMask: fqk={sm_fqk:.2f} fv={sm_fv:.2f} rqk={sm_rqk:.2f} rv={sm_rv:.2f} kF={sm_kf:.2f} kR={sm_kr:.2f}")
+
                     elif overlap_str:
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
                     else:
@@ -1409,6 +1429,24 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                                 score_rv_mean = sum(ri.get('attention', ri).get('score_rv_mean', 0) for ri in routing_infos_log) / len(routing_infos_log)
                                 score_rv_std = sum(ri.get('attention', ri).get('score_rv_std', 0) for ri in routing_infos_log) / len(routing_infos_log)
                                 f.write(f"  Score: fqk={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f}\n")
+
+                                # v18.1 specific: tau and soft mask
+                                if model_version.startswith('18.1'):
+                                    tau_vals = base_model.router.get_all_tau_values()
+                                    if tau_vals:
+                                        f.write(f"  Tau: fqk={tau_vals['fqk']:.3f} fv={tau_vals['fv']:.3f} rqk={tau_vals['rqk']:.3f} rv={tau_vals['rv']:.3f} kF={tau_vals['feature_know']:.3f} kR={tau_vals['restore_know']:.3f}\n")
+
+                                    if routing_infos_log and routing_infos_log[0].get('use_soft_mask'):
+                                        ri0 = routing_infos_log[0]
+                                        attn = ri0.get('attention', ri0)
+                                        know = ri0.get('knowledge', ri0)
+                                        sm_fqk = attn.get('soft_mask_fqk_Q_mean', 0)
+                                        sm_fv = attn.get('soft_mask_fv_mean', 0)
+                                        sm_rqk = attn.get('soft_mask_rqk_Q_mean', 0)
+                                        sm_rv = attn.get('soft_mask_rv_mean', 0)
+                                        sm_kf = know.get('soft_mask_feature_mean', 0)
+                                        sm_kr = know.get('soft_mask_restore_mean', 0)
+                                        f.write(f"  SoftMask: fqk={sm_fqk:.2f} fv={sm_fv:.2f} rqk={sm_rqk:.2f} rv={sm_rv:.2f} kF={sm_kf:.2f} kR={sm_kr:.2f}\n")
                         model.train()
                     except Exception:
                         pass

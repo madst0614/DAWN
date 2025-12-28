@@ -348,12 +348,18 @@ class GlobalSSM(nn.Module):
 class GlobalRouters(nn.Module):
     """
     v18.0: Fixed threshold + softmax multi-path routing
+    v18.1: Soft mask + softmax with learnable tau (when use_soft_mask=True)
 
-    Uses:
+    v18.0 uses:
     1. Fixed threshold (tau) for initial neuron filtering
     2. Minimum/maximum neuron guarantees (path_min_k, path_max_k * max_paths)
     3. Masked softmax for differentiable weighting
     4. Chunking into multiple paths by score ranking
+
+    v18.1 adds:
+    1. Soft mask: sigmoid((score - tau) / temp) instead of hard threshold
+    2. Learnable tau: tau becomes nn.Parameter
+    3. Penalty-based masking: low-score neurons get penalty instead of -inf
     """
     def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
                  n_restore_qk: int, n_restore_v: int,
@@ -365,7 +371,13 @@ class GlobalRouters(nn.Module):
                  path_max_k: int = 16,
                  d_space: int = 64, router_dropout: float = 0.1,
                  attention_token_routing: bool = False,
-                 knowledge_token_routing: bool = False, **kwargs):
+                 knowledge_token_routing: bool = False,
+                 # v18.1 parameters
+                 use_soft_mask: bool = False,
+                 learnable_tau: bool = False,
+                 soft_mask_temp: float = 1.0,
+                 soft_mask_penalty: float = 100.0,
+                 **kwargs):
         super().__init__()
         self.d_model = d_model
         self.n_feature_qk = n_feature_qk
@@ -382,19 +394,94 @@ class GlobalRouters(nn.Module):
         self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
 
+        # v18.1 parameters
+        self.use_soft_mask = use_soft_mask
+        self.learnable_tau = learnable_tau
+        self.soft_mask_temp = soft_mask_temp
+        self.soft_mask_penalty = soft_mask_penalty
+
+        # Learnable tau parameters (v18.1)
+        if learnable_tau:
+            # Separate tau for each neuron type
+            self.tau_fqk = nn.Parameter(torch.tensor(fixed_tau))
+            self.tau_fv = nn.Parameter(torch.tensor(fixed_tau))
+            self.tau_rqk = nn.Parameter(torch.tensor(fixed_tau))
+            self.tau_rv = nn.Parameter(torch.tensor(fixed_tau))
+            self.tau_feature_know = nn.Parameter(torch.tensor(fixed_tau))
+            self.tau_restore_know = nn.Parameter(torch.tensor(fixed_tau))
+
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
             n_feature_know, n_restore_know,
             d_space=d_space, dropout=router_dropout, fixed_tau=fixed_tau, **kwargs
         )
 
+    def get_tau(self, tau_type: str):
+        """Get tau value (learnable or fixed)"""
+        if self.learnable_tau:
+            tau_map = {
+                'fqk': self.tau_fqk,
+                'fv': self.tau_fv,
+                'rqk': self.tau_rqk,
+                'rv': self.tau_rv,
+                'feature_know': self.tau_feature_know,
+                'restore_know': self.tau_restore_know,
+            }
+            return tau_map.get(tau_type, self.fixed_tau)
+        else:
+            return self.fixed_tau
+
+    def get_tau_reg_loss(self):
+        """
+        Compute tau regularization loss (v18.1 only).
+        Prevents tau from going too extreme.
+        Returns 0 if learnable_tau=False.
+        """
+        if not self.learnable_tau:
+            return 0.0
+
+        # L2 regularization on tau values
+        tau_reg = (
+            self.tau_fqk ** 2 +
+            self.tau_fv ** 2 +
+            self.tau_rqk ** 2 +
+            self.tau_rv ** 2 +
+            self.tau_feature_know ** 2 +
+            self.tau_restore_know ** 2
+        )
+        return tau_reg
+
+    def get_all_tau_values(self):
+        """Get all tau values as a dict (for logging)"""
+        if self.learnable_tau:
+            return {
+                'tau_fqk': self.tau_fqk.item(),
+                'tau_fv': self.tau_fv.item(),
+                'tau_rqk': self.tau_rqk.item(),
+                'tau_rv': self.tau_rv.item(),
+                'tau_feature_know': self.tau_feature_know.item(),
+                'tau_restore_know': self.tau_restore_know.item(),
+            }
+        else:
+            return {
+                'tau_fqk': self.fixed_tau,
+                'tau_fv': self.fixed_tau,
+                'tau_rqk': self.fixed_tau,
+                'tau_rv': self.fixed_tau,
+                'tau_feature_know': self.fixed_tau,
+                'tau_restore_know': self.fixed_tau,
+            }
+
     def _threshold_select(self, scores, tau, path_min_k, path_max_k, max_paths):
         """
         Apply threshold selection with min/max guarantees and masked softmax.
 
+        v18.0: Hard mask (scores > tau)
+        v18.1: Soft mask (sigmoid((scores - tau) / temp)) with penalty
+
         Args:
             scores: [B, S, N] neuron scores
-            tau: scalar threshold
+            tau: scalar or tensor threshold
             path_min_k: minimum neurons to select
             path_max_k: max neurons per path
             max_paths: maximum number of paths
@@ -402,30 +489,65 @@ class GlobalRouters(nn.Module):
         Returns:
             weights: [B, S, N] softmax weights (masked)
             mask: [B, S, N] boolean mask of selected neurons
+            soft_mask: [B, S, N] soft mask values (v18.1 only, None for v18.0)
         """
         B, S, N = scores.shape
 
-        # 1. Threshold mask
-        mask = scores > tau
+        if self.use_soft_mask:
+            # v18.1: Soft mask approach
+            # 1. Compute soft mask using sigmoid
+            soft_mask = torch.sigmoid((scores - tau) / self.soft_mask_temp)
 
-        # 2. Ensure minimum path_min_k neurons
-        if path_min_k > 0:
-            topk_vals, topk_idx = scores.topk(min(path_min_k, N), dim=-1)
-            min_mask = torch.zeros_like(mask).scatter_(-1, topk_idx, True)
-            mask = mask | min_mask
+            # 2. Apply penalty to low-confidence neurons
+            penalty = (1 - soft_mask) * (-self.soft_mask_penalty)
+            masked_scores = scores + penalty
 
-        # 3. Cap at path_max_k * max_paths neurons
-        max_neurons = path_max_k * max_paths
-        if max_neurons < N:
-            topk_vals, topk_idx = scores.topk(max_neurons, dim=-1)
-            max_mask = torch.zeros_like(mask).scatter_(-1, topk_idx, True)
-            mask = mask & max_mask
+            # 3. Ensure minimum path_min_k neurons (boost top-k scores)
+            if path_min_k > 0:
+                topk_vals, topk_idx = scores.topk(min(path_min_k, N), dim=-1)
+                # Remove penalty for top-k neurons
+                penalty_relief = torch.zeros_like(scores).scatter_(-1, topk_idx, self.soft_mask_penalty)
+                masked_scores = masked_scores + penalty_relief
 
-        # 4. Masked softmax
-        masked_scores = scores.masked_fill(~mask, float('-inf'))
-        weights = F.softmax(masked_scores, dim=-1)
+            # 4. Cap at path_max_k * max_paths neurons (apply strong penalty to rest)
+            max_neurons = path_max_k * max_paths
+            if max_neurons < N:
+                # Get indices of neurons to keep
+                _, topk_idx = scores.topk(max_neurons, dim=-1)
+                keep_mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, topk_idx, True)
+                # Apply very strong penalty to neurons outside top max_neurons
+                masked_scores = masked_scores.masked_fill(~keep_mask, float('-inf'))
 
-        return weights, mask
+            # 5. Softmax
+            weights = F.softmax(masked_scores, dim=-1)
+
+            # Hard mask for logging (soft_mask > 0.5)
+            mask = soft_mask > 0.5
+
+            return weights, mask, soft_mask
+        else:
+            # v18.0: Hard mask approach
+            # 1. Threshold mask
+            mask = scores > tau
+
+            # 2. Ensure minimum path_min_k neurons
+            if path_min_k > 0:
+                topk_vals, topk_idx = scores.topk(min(path_min_k, N), dim=-1)
+                min_mask = torch.zeros_like(mask).scatter_(-1, topk_idx, True)
+                mask = mask | min_mask
+
+            # 3. Cap at path_max_k * max_paths neurons
+            max_neurons = path_max_k * max_paths
+            if max_neurons < N:
+                topk_vals, topk_idx = scores.topk(max_neurons, dim=-1)
+                max_mask = torch.zeros_like(mask).scatter_(-1, topk_idx, True)
+                mask = mask & max_mask
+
+            # 4. Masked softmax
+            masked_scores = scores.masked_fill(~mask, float('-inf'))
+            weights = F.softmax(masked_scores, dim=-1)
+
+            return weights, mask, None
 
     def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
         """
@@ -479,6 +601,7 @@ class GlobalRouters(nn.Module):
     def get_attention_weights(self, x, importance, attention_mask=None):
         """
         v18.0: Threshold + masked softmax multi-path routing for attention
+        v18.1: Soft mask + learnable tau (when use_soft_mask=True)
 
         Returns:
             path_weights_dict: dict with lists of path weights for each neuron type
@@ -488,25 +611,24 @@ class GlobalRouters(nn.Module):
         (fqk_logits_Q, fqk_logits_K, fv_logits,
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
 
-        # Get thresholds (fixed scalars)
-        thresholds = self.neuron_router.get_thresholds(x)
-        tau_fqk = thresholds['fqk']
-        tau_fv = thresholds['fv']
-        tau_rqk = thresholds['rqk']
-        tau_rv = thresholds['rv']
+        # Get thresholds (v18.0: fixed, v18.1: learnable)
+        tau_fqk = self.get_tau('fqk')
+        tau_fv = self.get_tau('fv')
+        tau_rqk = self.get_tau('rqk')
+        tau_rv = self.get_tau('rv')
 
-        # Apply threshold selection (returns weights and mask)
-        fqk_weights_Q, fqk_mask_Q = self._threshold_select(
+        # Apply threshold selection (returns weights, mask, and soft_mask for v18.1)
+        fqk_weights_Q, fqk_mask_Q, fqk_soft_Q = self._threshold_select(
             fqk_logits_Q, tau_fqk, self.path_min_k, self.path_max_k, self.max_paths)
-        fqk_weights_K, fqk_mask_K = self._threshold_select(
+        fqk_weights_K, fqk_mask_K, fqk_soft_K = self._threshold_select(
             fqk_logits_K, tau_fqk, self.path_min_k, self.path_max_k, self.max_paths)
-        fv_weights, fv_mask = self._threshold_select(
+        fv_weights, fv_mask, fv_soft = self._threshold_select(
             fv_logits, tau_fv, self.path_min_k, self.path_max_k, self.max_paths)
-        rqk_weights_Q, rqk_mask_Q = self._threshold_select(
+        rqk_weights_Q, rqk_mask_Q, rqk_soft_Q = self._threshold_select(
             rqk_logits_Q, tau_rqk, self.path_min_k, self.path_max_k, self.max_paths)
-        rqk_weights_K, rqk_mask_K = self._threshold_select(
+        rqk_weights_K, rqk_mask_K, rqk_soft_K = self._threshold_select(
             rqk_logits_K, tau_rqk, self.path_min_k, self.path_max_k, self.max_paths)
-        rv_weights, rv_mask = self._threshold_select(
+        rv_weights, rv_mask, rv_soft = self._threshold_select(
             rv_logits, tau_rv, self.path_min_k, self.path_max_k, self.max_paths)
 
         # Chunk to paths
@@ -579,6 +701,10 @@ class GlobalRouters(nn.Module):
             overlap = (intersection / max_count).mean().item()
             return overlap
 
+        # Helper: get tau value as Python float
+        def tau_to_float(tau):
+            return tau.item() if torch.is_tensor(tau) else tau
+
         routing_info = {
             # Average paths used per token
             'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
@@ -610,13 +736,24 @@ class GlobalRouters(nn.Module):
             'score_rqk_K_std': rqk_logits_K.std().item(),
             'score_rv_mean': rv_logits.mean().item(),
             'score_rv_std': rv_logits.std().item(),
-            # tau (fixed scalar)
-            'tau_fqk': tau_fqk,
-            'tau_fv': tau_fv,
-            'tau_rqk': tau_rqk,
-            'tau_rv': tau_rv,
+            # tau (v18.0: fixed scalar, v18.1: learnable parameter)
+            'tau_fqk': tau_to_float(tau_fqk),
+            'tau_fv': tau_to_float(tau_fv),
+            'tau_rqk': tau_to_float(tau_rqk),
+            'tau_rv': tau_to_float(tau_rv),
+            'learnable_tau': self.learnable_tau,
+            'use_soft_mask': self.use_soft_mask,
             'token_routing': self.attention_token_routing,
         }
+
+        # Add soft mask activation mean (v18.1 only)
+        if self.use_soft_mask:
+            routing_info['soft_mask_fqk_Q'] = fqk_soft_Q.mean().item()
+            routing_info['soft_mask_fqk_K'] = fqk_soft_K.mean().item()
+            routing_info['soft_mask_fv'] = fv_soft.mean().item()
+            routing_info['soft_mask_rqk_Q'] = rqk_soft_Q.mean().item()
+            routing_info['soft_mask_rqk_K'] = rqk_soft_K.mean().item()
+            routing_info['soft_mask_rv'] = rv_soft.mean().item()
 
         # Update usage with mask (binary selection)
         if self.training:
@@ -632,18 +769,18 @@ class GlobalRouters(nn.Module):
     def get_knowledge_weights(self, x, importance, attention_mask=None):
         """
         v18.0: Threshold + masked softmax multi-path routing for knowledge
+        v18.1: Soft mask + learnable tau (when use_soft_mask=True)
         """
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
-        # Get thresholds (fixed scalars)
-        thresholds = self.neuron_router.get_thresholds(x)
-        tau_f = thresholds['feature_know']
-        tau_r = thresholds['restore_know']
+        # Get thresholds (v18.0: fixed, v18.1: learnable)
+        tau_f = self.get_tau('feature_know')
+        tau_r = self.get_tau('restore_know')
 
-        # Apply threshold selection (returns weights and mask)
-        f_weights, f_mask = self._threshold_select(
+        # Apply threshold selection (returns weights, mask, and soft_mask for v18.1)
+        f_weights, f_mask, f_soft = self._threshold_select(
             logits_f, tau_f, self.path_min_k, self.path_max_k, self.max_paths)
-        r_weights, r_mask = self._threshold_select(
+        r_weights, r_mask, r_soft = self._threshold_select(
             logits_r, tau_r, self.path_min_k, self.path_max_k, self.max_paths)
 
         # Chunk to paths
@@ -663,6 +800,10 @@ class GlobalRouters(nn.Module):
         def avg_selected_per_token(mask):
             return mask.float().sum(dim=-1).mean().item()
 
+        # Helper: get tau value as Python float
+        def tau_to_float(tau):
+            return tau.item() if torch.is_tensor(tau) else tau
+
         know_info = {
             'n_paths_feature': avg_paths_per_token(f_paths),
             'n_paths_restore': avg_paths_per_token(r_paths),
@@ -674,10 +815,15 @@ class GlobalRouters(nn.Module):
             'score_feature_std': logits_f.std().item(),
             'score_restore_mean': logits_r.mean().item(),
             'score_restore_std': logits_r.std().item(),
-            # tau (fixed scalar)
-            'tau_feature': tau_f,
-            'tau_restore': tau_r,
+            # tau (v18.0: fixed scalar, v18.1: learnable parameter)
+            'tau_feature': tau_to_float(tau_f),
+            'tau_restore': tau_to_float(tau_r),
         }
+
+        # Add soft mask activation mean (v18.1 only)
+        if self.use_soft_mask:
+            know_info['soft_mask_feature'] = f_soft.mean().item()
+            know_info['soft_mask_restore'] = r_soft.mean().item()
 
         return f_paths, r_paths, know_info
 
@@ -931,6 +1077,7 @@ class DAWNBlock(nn.Module):
 class DAWN(nn.Module):
     """
     DAWN v18.0: Fixed Threshold Multi-Path Routing
+    DAWN v18.1: Soft Mask + Learnable Tau (when use_soft_mask=True)
 
     Key Features:
     - Reduced rank (16) for chunked multi-path processing
@@ -939,13 +1086,18 @@ class DAWN(nn.Module):
     - Multi-path (1~max_paths) parallel processing with path-wise Q,K,V aggregation
     - Attention operation unchanged (scaled_dot_product_attention)
 
+    v18.1 adds:
+    - Soft mask: sigmoid((score - tau) / temp) instead of hard threshold
+    - Learnable tau: tau becomes nn.Parameter
+    - Penalty-based masking: low-score neurons get penalty instead of -inf
+
     Architecture:
     - UnifiedNeuronRouter: fixed tau (no learnable threshold projections)
     - GlobalRouters: _threshold_select + _chunk_to_paths with masked softmax
     - AttentionCircuit: Multi-path Q,K,V summation
     - KnowledgeCircuit: Multi-path summation
     """
-    __version__ = "18.0"
+    __version__ = "18.0"  # Updated dynamically based on use_soft_mask
 
     def __init__(
         self,
@@ -962,6 +1114,11 @@ class DAWN(nn.Module):
         fixed_tau: float = 0.0,
         path_min_k: int = 8,
         path_max_k: int = 16,
+        # v18.1: Soft mask parameters
+        use_soft_mask: bool = False,
+        learnable_tau: bool = False,
+        soft_mask_temp: float = 1.0,
+        soft_mask_penalty: float = 100.0,
         # Attention - shared Q/K pool
         n_feature_qk: int = 56,
         n_feature_v: int = 24,
@@ -1008,6 +1165,16 @@ class DAWN(nn.Module):
         self.path_min_k = path_min_k
         self.path_max_k = path_max_k
 
+        # v18.1 specific
+        self.use_soft_mask = use_soft_mask
+        self.learnable_tau = learnable_tau
+        self.soft_mask_temp = soft_mask_temp
+        self.soft_mask_penalty = soft_mask_penalty
+
+        # Update version based on soft mask
+        if use_soft_mask:
+            self.__version__ = "18.1"
+
         # Neuron counts
         self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
@@ -1048,6 +1215,11 @@ class DAWN(nn.Module):
             d_space=d_space, router_dropout=router_dropout,
             attention_token_routing=attention_token_routing,
             knowledge_token_routing=knowledge_token_routing,
+            # v18.1 parameters
+            use_soft_mask=use_soft_mask,
+            learnable_tau=learnable_tau,
+            soft_mask_temp=soft_mask_temp,
+            soft_mask_penalty=soft_mask_penalty,
         )
 
         self.layers = nn.ModuleList([
