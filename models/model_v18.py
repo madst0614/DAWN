@@ -436,8 +436,9 @@ class GlobalRouters(nn.Module):
             max_paths: maximum number of paths
 
         Returns:
-            path_weights_list: list of [B, S, N] weights (length 1~max_paths)
-            Each path contains weights for top-k neurons in that chunk
+            path_weights_list: list of [B, S, N] weights (always length max_paths)
+            Each path contains weights for top-k neurons in that chunk.
+            Unused paths are zero-filled for consistent tensor operations.
         """
         B, S, N = scores.shape
         device = scores.device
@@ -459,33 +460,30 @@ class GlobalRouters(nn.Module):
 
         path_weights_list = []
 
-        for p in range(n_paths):
-            start_idx = p * rank
-            end_idx = min((p + 1) * rank, N)
+        for p in range(max_paths):  # Always iterate max_paths times
+            if p < n_paths:
+                start_idx = p * rank
+                end_idx = min((p + 1) * rank, N)
 
-            if start_idx >= N:
-                break
+                if start_idx >= N:
+                    # No more neurons to process, add zero path
+                    path_weights_list.append(torch.zeros_like(weights))
+                    continue
 
-            # Create path weights: only neurons in this chunk get their weights
-            path_weights = torch.zeros_like(weights)
+                # Create path weights: only neurons in this chunk get their weights
+                path_weights = torch.zeros_like(weights)
 
-            # Get indices for this path's neurons
-            path_indices = sorted_indices[:, :, start_idx:end_idx]  # [B, S, chunk_size]
-            path_w = sorted_weights[:, :, start_idx:end_idx]  # [B, S, chunk_size]
+                # Get indices for this path's neurons
+                path_indices = sorted_indices[:, :, start_idx:end_idx]  # [B, S, chunk_size]
+                path_w = sorted_weights[:, :, start_idx:end_idx]  # [B, S, chunk_size]
 
-            # Scatter weights back to original positions
-            path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
+                # Scatter weights back to original positions
+                path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
 
-            path_weights_list.append(path_weights)
-
-        # Ensure at least one path
-        if len(path_weights_list) == 0:
-            # Fallback: use original weights for top-rank neurons
-            _, top_indices = torch.topk(scores, min(rank, N), dim=-1)
-            fallback_weights = torch.zeros_like(weights)
-            top_w = torch.gather(weights, dim=-1, index=top_indices)
-            fallback_weights.scatter_(dim=-1, index=top_indices, src=top_w)
-            path_weights_list.append(fallback_weights)
+                path_weights_list.append(path_weights)
+            else:
+                # Pad with zero weights for unused paths
+                path_weights_list.append(torch.zeros_like(weights))
 
         return path_weights_list
 
