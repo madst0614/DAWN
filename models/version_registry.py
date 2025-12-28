@@ -308,42 +308,30 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
 
     attn0 = routing_infos[0].get('attention', routing_infos[0])
 
-    # v18.0: Adaptive Threshold Multi-Path (has n_paths_* keys)
+    # v18.0: Fixed Threshold Multi-Path (has n_paths_* keys)
+    # Note: v18 doesn't store _pref tensors to avoid memory leaks
+    # Uses activation ratios instead of entropy/variance
     if attn0.get('n_paths_fqk_Q') is not None:
-        all_ents = {k: [] for k in ['FQK_Q', 'FQK_K', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
-        all_vars = {k: [] for k in ['FQK_Q', 'FQK_K', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
+        # Activation ratios (fraction of neurons selected)
+        act_fqk_Q = attn0.get('activation_fqk_Q', 0)
+        act_fqk_K = attn0.get('activation_fqk_K', 0)
+        act_fv = attn0.get('activation_fv', 0)
+        act_rqk_Q = attn0.get('activation_rqk_Q', 0)
+        act_rqk_K = attn0.get('activation_rqk_K', 0)
+        act_rv = attn0.get('activation_rv', 0)
 
-        for layer_info in routing_infos:
-            attn = layer_info.get('attention', layer_info)
-            prefs = {
-                'FQK_Q': attn.get('fqk_q_pref'),
-                'FQK_K': attn.get('fqk_k_pref'),
-                'FV': attn.get('fv_pref'),
-                'RQK_Q': attn.get('rqk_q_pref'),
-                'RQK_K': attn.get('rqk_k_pref'),
-                'RV': attn.get('rv_pref'),
-            }
-            for k, v in prefs.items():
-                if v is not None:
-                    all_ents[k].append(calc_entropy_fn(v))
-                    all_vars[k].append(calc_var_fn(v))
+        # Format activation string (percentage of neurons activated)
+        act_str = f"Act F-QK:{act_fqk_Q:.1%}/{act_fqk_K:.1%} FV:{act_fv:.1%} R-QK:{act_rqk_Q:.1%}/{act_rqk_K:.1%} RV:{act_rv:.1%}"
 
-        ents = {k: sum(v)/len(v) if v else 0.0 for k, v in all_ents.items()}
-        vars_ = {k: sum(v)/len(v) if v else 0.0 for k, v in all_vars.items()}
-
-        ent_str = f"Ent F-QK_Q/K/F-V/R-QK_Q/K/R-V:{ents['FQK_Q']:.0f}/{ents['FQK_K']:.0f}/{ents['FV']:.0f}/{ents['RQK_Q']:.0f}/{ents['RQK_K']:.0f}/{ents['RV']:.0f}"
-        var_str = f"TokVar:{vars_['FQK_Q']:.4f}/{vars_['FQK_K']:.4f}/{vars_['FV']:.4f}/{vars_['RQK_Q']:.4f}/{vars_['RQK_K']:.4f}/{vars_['RV']:.4f}"
-
-        # v18 specific: path counts and tau values
+        # v18 specific: path counts
         n_paths = f"Paths FQK:{attn0.get('n_paths_fqk_Q', 0)}/{attn0.get('n_paths_fqk_K', 0)} FV:{attn0.get('n_paths_fv', 0)} RQK:{attn0.get('n_paths_rqk_Q', 0)}/{attn0.get('n_paths_rqk_K', 0)} RV:{attn0.get('n_paths_rv', 0)}"
-        tau_str = f"Tau FQK:{attn0.get('tau_fqk_mean', 0):.3f} FV:{attn0.get('tau_fv_mean', 0):.3f} RQK:{attn0.get('tau_rqk_mean', 0):.3f} RV:{attn0.get('tau_rv_mean', 0):.3f}"
 
         return {
-            'ent_str': ent_str,
-            'var_str': var_str,
+            'ent_str': act_str,  # Use activation instead of entropy for v18
+            'var_str': None,  # No variance tracking for v18
             'overlap_str': None,
             'paths_str': n_paths,
-            'tau_str': tau_str,
+            'tau_str': None,  # tau is fixed, no need to log
             'version': '18.0'
         }
 
