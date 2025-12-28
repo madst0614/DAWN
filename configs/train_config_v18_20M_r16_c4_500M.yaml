@@ -42,9 +42,9 @@ model:
   gradient_checkpointing: false
   d_space: 256
   router_dropout: 0.1
-  attention_token_routing: false
-  knowledge_token_routing: false
-  use_ssm_context: true
+  attention_token_routing: true
+  knowledge_token_routing: true
+  use_ssm_context: false
 
 training:
   batch_size: 32
