@@ -1,6 +1,11 @@
 """
 DAWN Models Module
 
+v18.0: Adaptive Threshold Multi-Path Routing
+- Per-token adaptive threshold for variable neuron selection
+- Multi-path (1~4) parallel processing with path-wise Q,K,V aggregation
+- rank=16, max_paths=4, threshold_temp=1.0
+
 v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
 - Attention: Q/K separate pools (Feature_Q/K/V, Restore_Q/K/V)
 - Knowledge: Feature-Restore pattern (Feature_Know, Restore_Know)
@@ -13,6 +18,9 @@ v17.2: Feature QK Unified + Restore Q/K Separate
 
 baseline: Vanilla Transformer for fair comparison
 """
+
+# v18.0 - Adaptive Threshold Multi-Path Routing
+from .model_v18 import DAWN as DAWN_v18
 
 # v17.1 - Q/K Separate Pool + Knowledge Feature-Restore (default)
 from .model_v17_1 import DAWN as DAWN_v17_1
@@ -45,6 +53,7 @@ from .version_registry import (
 __all__ = [
     # Models
     'DAWN',
+    'DAWN_v18',
     'DAWN_v17_2',
     'DAWN_v17_1',
     'VanillaTransformer',
@@ -71,7 +80,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "17.2", "17.1", or "baseline"
+        version: "18.0", "17.2", "17.1", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -82,10 +91,12 @@ def create_model_by_version(version, config):
 
     version = normalize_version(version)
 
-    if version == "17.2":
+    if version == "18.0":
+        return DAWN_v18(**config)
+    elif version == "17.2":
         return DAWN_v17_2(**config)
     elif version == "17.1":
         return DAWN_v17_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 17.2, 17.1, baseline")
+                        f"Supported versions: 18.0, 17.2, 17.1, baseline")
