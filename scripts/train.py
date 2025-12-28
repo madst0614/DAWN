@@ -1321,8 +1321,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     except Exception:
                         pass
 
-                except Exception:
-                    pass  # Skip if routing_infos format is different
+                except Exception as e:
+                    print(f"[v18 logging error] {type(e).__name__}: {e}")
+                    import traceback
+                    traceback.print_exc()
 
         # Log aggregated metrics every 100 steps (same format as console output)
         if log_file and (step + 1) % log_interval == 0:
