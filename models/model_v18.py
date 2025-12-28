@@ -401,7 +401,7 @@ class GlobalRouters(nn.Module):
 
     def _threshold_select(self, scores, tau, temp=1.0):
         """
-        Apply soft threshold selection with sigmoid
+        Apply threshold selection with STE (Straight-Through Estimator)
 
         Args:
             scores: [B, S, N] neuron scores
@@ -409,9 +409,17 @@ class GlobalRouters(nn.Module):
             temp: temperature for sigmoid sharpness
 
         Returns:
-            weights: [B, S, N] soft weights (sigmoid applied)
+            weights: [B, S, N] hard weights (0 or 1) with soft gradients
         """
-        weights = torch.sigmoid((scores - tau) / temp)
+        # Soft for gradient flow
+        soft_weights = torch.sigmoid((scores - tau) / temp)
+
+        # Hard for forward (0 or 1)
+        hard_weights = (scores > tau).float()
+
+        # STE: forward uses hard, backward uses soft gradient
+        weights = hard_weights - soft_weights.detach() + soft_weights
+
         return weights
 
     def _chunk_to_paths(self, weights, scores, rank, max_paths):
