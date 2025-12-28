@@ -747,19 +747,41 @@ class AttentionCircuit(nn.Module):
         """
         B, S, D = x.shape
 
-        # Combine path weights (linear operation - sum paths first, compute once)
-        combined_fqk_Q = sum(path_weights['fqk_Q'])
-        combined_fqk_K = sum(path_weights['fqk_K'])
-        combined_fv = sum(path_weights['fv'])
-        combined_rqk_Q = sum(path_weights['rqk_Q'])
-        combined_rqk_K = sum(path_weights['rqk_K'])
-        combined_rv = sum(path_weights['rv'])
+        # Stack path weights: [P, B, S, N]
+        fqk_w_Q_stacked = torch.stack(path_weights['fqk_Q'], dim=0)
+        fqk_w_K_stacked = torch.stack(path_weights['fqk_K'], dim=0)
+        fv_w_stacked = torch.stack(path_weights['fv'], dim=0)
+        rqk_w_Q_stacked = torch.stack(path_weights['rqk_Q'], dim=0)
+        rqk_w_K_stacked = torch.stack(path_weights['rqk_K'], dim=0)
+        rv_w_stacked = torch.stack(path_weights['rv'], dim=0)
 
-        # Single computation with combined weights
-        Q_total, K_total, V_total = self._process_single_path(
-            x, combined_fqk_Q, combined_fqk_K, combined_fv,
-            combined_rqk_Q, combined_rqk_K, combined_rv
-        )
+        # Feature QK: common computation once
+        f_qk = self.shared_neurons.feature_qk_neurons  # [N, D, R]
+        all_h_qk = torch.einsum('bsd,ndr->bsnr', x, f_qk)  # [B, S, N, R]
+
+        # Path-parallel bottleneck for Q, K
+        h_q_all = torch.einsum('bsnr,pbsn->pbsr', all_h_qk, fqk_w_Q_stacked)  # [P, B, S, R]
+        h_k_all = torch.einsum('bsnr,pbsn->pbsr', all_h_qk, fqk_w_K_stacked)  # [P, B, S, R]
+
+        # Feature V: common computation once
+        f_v = self.shared_neurons.feature_v_neurons  # [N, D, R]
+        all_h_v = torch.einsum('bsd,ndr->bsnr', x, f_v)  # [B, S, N, R]
+
+        # Path-parallel bottleneck for V
+        h_v_all = torch.einsum('bsnr,pbsn->pbsr', all_h_v, fv_w_stacked)  # [P, B, S, R]
+
+        # Path-parallel restore
+        r_qk = self.shared_neurons.restore_qk_neurons  # [N, R, D]
+        r_v = self.shared_neurons.restore_v_neurons  # [N, R, D]
+
+        Q_all = torch.einsum('pbsr,nrd,pbsn->pbsd', h_q_all, r_qk, rqk_w_Q_stacked)  # [P, B, S, D]
+        K_all = torch.einsum('pbsr,nrd,pbsn->pbsd', h_k_all, r_qk, rqk_w_K_stacked)  # [P, B, S, D]
+        V_all = torch.einsum('pbsr,nrd,pbsn->pbsd', h_v_all, r_v, rv_w_stacked)  # [P, B, S, D]
+
+        # Sum over paths (each path has own bottleneck, total capacity = R * n_paths)
+        Q_total = Q_all.sum(dim=0)  # [B, S, D]
+        K_total = K_all.sum(dim=0)
+        V_total = V_all.sum(dim=0)
 
         # Multi-head attention
         Q = Q_total.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -827,12 +849,25 @@ class KnowledgeCircuit(nn.Module):
             feature_paths: list of [B, S, N] weights
             restore_paths: list of [B, S, N] weights
         """
-        # Combine path weights (linear operation - sum paths first, compute once)
-        combined_feature = sum(feature_paths)
-        combined_restore = sum(restore_paths)
+        n_paths = max(len(feature_paths), len(restore_paths))
 
-        # Single computation with combined weights
-        output = self._process_single_path(x, combined_feature, combined_restore)
+        # Stack path weights: [P, B, S, N]
+        feature_stacked = torch.stack(feature_paths, dim=0)
+        restore_stacked = torch.stack(restore_paths, dim=0)
+
+        # Feature: common computation once
+        f_know = self.shared_neurons.feature_know  # [N, D, R]
+        all_h = torch.einsum('bsd,ndr->bsnr', x, f_know)  # [B, S, N, R]
+
+        # Path-parallel bottleneck
+        h_all = torch.einsum('bsnr,pbsn->pbsr', all_h, feature_stacked)  # [P, B, S, R]
+
+        # Path-parallel restore
+        r_know = self.shared_neurons.restore_know  # [N, R, D]
+        output_all = torch.einsum('pbsr,nrd,pbsn->pbsd', h_all, r_know, restore_stacked)  # [P, B, S, D]
+
+        # Sum over paths
+        output = output_all.sum(dim=0)  # [B, S, D]
 
         return self.dropout(output)
 
