@@ -586,10 +586,22 @@ class GlobalRouters(nn.Module):
             'n_paths_rqk_Q': len(rqk_paths_Q),
             'n_paths_rqk_K': len(rqk_paths_K),
             'n_paths_rv': len(rv_paths),
-            'tau_fqk': tau_fqk.detach().mean().item(),
-            'tau_fv': tau_fv.detach().mean().item(),
-            'tau_rqk': tau_rqk.detach().mean().item(),
-            'tau_rv': tau_rv.detach().mean().item(),
+            # tau mean and std
+            'tau_fqk_mean': tau_fqk.detach().mean().item(),
+            'tau_fqk_std': tau_fqk.detach().std().item(),
+            'tau_fv_mean': tau_fv.detach().mean().item(),
+            'tau_fv_std': tau_fv.detach().std().item(),
+            'tau_rqk_mean': tau_rqk.detach().mean().item(),
+            'tau_rqk_std': tau_rqk.detach().std().item(),
+            'tau_rv_mean': tau_rv.detach().mean().item(),
+            'tau_rv_std': tau_rv.detach().std().item(),
+            # Activation ratio (soft weights mean)
+            'activation_fqk_Q': fqk_soft_Q.detach().mean().item(),
+            'activation_fqk_K': fqk_soft_K.detach().mean().item(),
+            'activation_fv': fv_soft.detach().mean().item(),
+            'activation_rqk_Q': rqk_soft_Q.detach().mean().item(),
+            'activation_rqk_K': rqk_soft_K.detach().mean().item(),
+            'activation_rv': rv_soft.detach().mean().item(),
             'token_routing': self.attention_token_routing,
         }
 
@@ -643,7 +655,20 @@ class GlobalRouters(nn.Module):
             'restore_know_soft': r_soft,
         }
 
-        return f_paths, r_paths, soft_weights
+        know_info = {
+            'n_paths_feature': len(f_paths),
+            'n_paths_restore': len(r_paths),
+            # tau mean and std
+            'tau_feature_mean': tau_f.detach().mean().item(),
+            'tau_feature_std': tau_f.detach().std().item(),
+            'tau_restore_mean': tau_r.detach().mean().item(),
+            'tau_restore_std': tau_r.detach().std().item(),
+            # Activation ratio
+            'activation_feature': f_soft.detach().mean().item(),
+            'activation_restore': r_soft.detach().mean().item(),
+        }
+
+        return f_paths, r_paths, soft_weights, know_info
 
 
 class AttentionCircuit(nn.Module):
@@ -866,14 +891,10 @@ class DAWNBlock(nn.Module):
 
         # Knowledge
         normed_x = self.norm2(x)
-        feature_paths, restore_paths, soft_weights_know = global_routers.get_knowledge_weights(
+        feature_paths, restore_paths, soft_weights_know, know_info = global_routers.get_knowledge_weights(
             normed_x, importance, attention_mask
         )
         know_out = self.knowledge(normed_x, feature_paths, restore_paths, attention_mask)
-        know_info = {
-            'n_paths_feature': len(feature_paths),
-            'n_paths_restore': len(restore_paths),
-        }
         x = x + know_out
 
         # Collect soft weights for tau regularization
@@ -1128,13 +1149,13 @@ class DAWN(nn.Module):
             f"  tau_reg_lambda={self.tau_reg_lambda}",
             f"  max_seq_len={self.max_seq_len}, state_dim={self.state_dim}, dropout={self.dropout_rate}",
             f"",
-            f"  [Attention - Q/K Shared Pool]",
+            f"  [Attention - Q/K Shared Pool] (adaptive threshold, max_paths={self.max_paths})",
             f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank}",
             f"  Feature_V: {self.n_feature_v} × {self.d_model} × {self.rank}",
             f"  Restore_QK: {self.n_restore_qk} × {self.rank} × {self.d_model}",
             f"  Restore_V: {self.n_restore_v} × {self.rank} × {self.d_model}",
             f"",
-            f"  [Knowledge - Feature-Restore]",
+            f"  [Knowledge - Feature-Restore] (adaptive threshold, max_paths={self.max_paths})",
             f"  Feature_Know: {self.n_feature_know} × {self.d_model} × {self.knowledge_rank}",
             f"  Restore_Know: {self.n_restore_know} × {self.knowledge_rank} × {self.d_model}",
             f"",

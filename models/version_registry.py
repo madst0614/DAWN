@@ -335,7 +335,7 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
 
         # v18 specific: path counts and tau values
         n_paths = f"Paths FQK:{attn0.get('n_paths_fqk_Q', 0)}/{attn0.get('n_paths_fqk_K', 0)} FV:{attn0.get('n_paths_fv', 0)} RQK:{attn0.get('n_paths_rqk_Q', 0)}/{attn0.get('n_paths_rqk_K', 0)} RV:{attn0.get('n_paths_rv', 0)}"
-        tau_str = f"Tau FQK:{attn0.get('tau_fqk', 0):.3f} FV:{attn0.get('tau_fv', 0):.3f} RQK:{attn0.get('tau_rqk', 0):.3f} RV:{attn0.get('tau_rv', 0):.3f}"
+        tau_str = f"Tau FQK:{attn0.get('tau_fqk_mean', 0):.3f} FV:{attn0.get('tau_fv_mean', 0):.3f} RQK:{attn0.get('tau_rqk_mean', 0):.3f} RV:{attn0.get('tau_rv_mean', 0):.3f}"
 
         return {
             'ent_str': ent_str,
