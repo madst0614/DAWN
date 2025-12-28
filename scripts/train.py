@@ -1135,7 +1135,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         # v16: mem_out_norm, v17: know_out_norm
                         mem_norm = layer_info.get('mem_out_norm') or layer_info.get('know_out_norm')
                         if attn_norm is not None and mem_norm is not None:
-                            ratio = (attn_norm / (attn_norm + mem_norm + 1e-8) * 100).item()
+                            # attn_norm/mem_norm are already Python floats from .item() in model
+                            ratio = attn_norm / (attn_norm + mem_norm + 1e-8) * 100
                             attn_ratios.append(f"{ratio:.0f}")
                         else:
                             attn_ratios.append("-")
