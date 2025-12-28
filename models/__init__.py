@@ -1,10 +1,11 @@
 """
 DAWN Models Module
 
-v18.0: Adaptive Threshold Multi-Path Routing
-- Per-token adaptive threshold for variable neuron selection
-- Multi-path (1~4) parallel processing with path-wise Q,K,V aggregation
-- rank=16, max_paths=4, threshold_temp=1.0
+v18.0: Fixed Threshold Multi-Path Routing
+- Fixed threshold + masked softmax for neuron selection
+- Minimum/maximum neuron guarantees (path_min_k, path_max_k * max_paths)
+- Multi-path (1~max_paths) parallel processing with path-wise Q,K,V aggregation
+- rank=16, max_paths=4, fixed_tau=0.0, path_min_k=8, path_max_k=16
 
 v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
 - Attention: Q/K separate pools (Feature_Q/K/V, Restore_Q/K/V)
@@ -19,7 +20,7 @@ v17.2: Feature QK Unified + Restore Q/K Separate
 baseline: Vanilla Transformer for fair comparison
 """
 
-# v18.0 - Adaptive Threshold Multi-Path Routing
+# v18.0 - Fixed Threshold Multi-Path Routing
 from .model_v18 import DAWN as DAWN_v18
 
 # v17.1 - Q/K Separate Pool + Knowledge Feature-Restore (default)

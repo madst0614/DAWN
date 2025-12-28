@@ -2,7 +2,7 @@
 DAWN Model Version Registry - Single Source of Truth
 
 Supported Versions:
-  v18.0: Fixed Threshold Multi-Path Routing (rank=16, max_paths=4, fixed_tau=0.0)
+  v18.0: Fixed Threshold Multi-Path Routing (rank=16, max_paths=4, fixed_tau=0.0, path_min_k=8, path_max_k=16)
   v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
   v17.2: Feature QK Unified + Restore Q/K Separate
   baseline: Vanilla Transformer for comparison
@@ -27,8 +27,9 @@ VERSION_REGISTRY = {
             "dropout": 0.1,
             "state_dim": 64,
             "max_paths": 4,
-            "threshold_temp": 1.0,
             "fixed_tau": 0.0,
+            "path_min_k": 8,
+            "path_max_k": 16,
             "d_space": 64,
             "knowledge_rank": 128,
             "gradient_checkpointing": False,
@@ -40,7 +41,7 @@ VERSION_REGISTRY = {
         "display_info": lambda args: [
             f"DAWN v18.0: Fixed Threshold Multi-Path Routing",
             f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}",
-            f"  threshold_temp={args.get('threshold_temp', 1.0)}, fixed_tau={args.get('fixed_tau', 0.0)}",
+            f"  fixed_tau={args.get('fixed_tau', 0.0)}, path_min_k={args.get('path_min_k', 8)}, path_max_k={args.get('path_max_k', 16)}",
             f"  F-QK: {args.get('n_feature_qk')} - Q/K shared pool",
             f"  F-V: {args.get('n_feature_v')}",
             f"  R-QK: {args.get('n_restore_qk')} - Q/K shared pool",

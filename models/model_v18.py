@@ -347,20 +347,22 @@ class GlobalSSM(nn.Module):
 
 class GlobalRouters(nn.Module):
     """
-    v18.0: Fixed threshold + multi-path routing
+    v18.0: Fixed threshold + softmax multi-path routing
 
     Uses:
-    1. Fixed threshold (tau) for neuron selection
-    2. Soft sigmoid weights for neurons above threshold
-    3. Chunking into multiple paths by score ranking
+    1. Fixed threshold (tau) for initial neuron filtering
+    2. Minimum/maximum neuron guarantees (path_min_k, path_max_k * max_paths)
+    3. Masked softmax for differentiable weighting
+    4. Chunking into multiple paths by score ranking
     """
     def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
                  n_restore_qk: int, n_restore_v: int,
                  n_feature_know: int, n_restore_know: int,
                  rank: int = 16,
                  max_paths: int = 4,
-                 threshold_temp: float = 1.0,
                  fixed_tau: float = 0.0,
+                 path_min_k: int = 8,
+                 path_max_k: int = 16,
                  d_space: int = 64, router_dropout: float = 0.1,
                  attention_token_routing: bool = False,
                  knowledge_token_routing: bool = False, **kwargs):
@@ -374,8 +376,9 @@ class GlobalRouters(nn.Module):
         self.n_restore_know = n_restore_know
         self.rank = rank
         self.max_paths = max_paths
-        self.threshold_temp = threshold_temp
         self.fixed_tau = fixed_tau
+        self.path_min_k = path_min_k
+        self.path_max_k = path_max_k
         self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
 
@@ -385,101 +388,97 @@ class GlobalRouters(nn.Module):
             d_space=d_space, dropout=router_dropout, fixed_tau=fixed_tau, **kwargs
         )
 
-    def _threshold_select(self, scores, tau, temp=1.0):
+    def _threshold_select(self, scores, tau, path_min_k, path_max_k, max_paths):
         """
-        Apply threshold selection with STE (Straight-Through Estimator)
+        Apply threshold selection with min/max guarantees and masked softmax.
 
         Args:
             scores: [B, S, N] neuron scores
-            tau: [B, S, 1] per-token threshold
-            temp: temperature for sigmoid sharpness
-
-        Returns:
-            weights: [B, S, N] hard weights (0 or 1) with soft gradients
-        """
-        # Soft for gradient flow
-        soft_weights = torch.sigmoid((scores - tau) / temp)
-
-        # Hard for forward (0 or 1)
-        hard_weights = (scores > tau).float()
-
-        # STE: forward uses hard, backward uses soft gradient
-        weights = hard_weights - soft_weights.detach() + soft_weights
-
-        return weights
-
-    def _chunk_to_paths(self, weights, scores, rank, max_paths):
-        """
-        Chunk neurons above threshold into rank-sized paths
-
-        Path count is determined by the number of ACTIVE neurons (weight > 0.5),
-        not by total neuron count.
-
-        Args:
-            weights: [B, S, N] soft weights from threshold selection
-            scores: [B, S, N] original scores (for ranking)
-            rank: number of neurons per path
+            tau: scalar threshold
+            path_min_k: minimum neurons to select
+            path_max_k: max neurons per path
             max_paths: maximum number of paths
 
         Returns:
-            path_weights_list: list of [B, S, N] weights (always length max_paths)
-            Each path contains weights for top-k neurons in that chunk.
-            Unused paths are zero-filled for consistent tensor operations.
+            weights: [B, S, N] softmax weights (masked)
+            mask: [B, S, N] boolean mask of selected neurons
         """
         B, S, N = scores.shape
-        device = scores.device
+
+        # 1. Threshold mask
+        mask = scores > tau
+
+        # 2. Ensure minimum path_min_k neurons
+        if path_min_k > 0:
+            topk_vals, topk_idx = scores.topk(min(path_min_k, N), dim=-1)
+            min_mask = torch.zeros_like(mask).scatter_(-1, topk_idx, True)
+            mask = mask | min_mask
+
+        # 3. Cap at path_max_k * max_paths neurons
+        max_neurons = path_max_k * max_paths
+        if max_neurons < N:
+            topk_vals, topk_idx = scores.topk(max_neurons, dim=-1)
+            max_mask = torch.zeros_like(mask).scatter_(-1, topk_idx, True)
+            mask = mask & max_mask
+
+        # 4. Masked softmax
+        masked_scores = scores.masked_fill(~mask, float('-inf'))
+        weights = F.softmax(masked_scores, dim=-1)
+
+        return weights, mask
+
+    def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
+        """
+        Chunk selected neurons into path_max_k-sized paths by score ranking.
+
+        Args:
+            weights: [B, S, N] softmax weights
+            mask: [B, S, N] selection mask
+            scores: [B, S, N] original scores for ranking
+            path_max_k: neurons per path
+            max_paths: maximum number of paths
+
+        Returns:
+            path_weights_list: list of [B, S, N] weights (length = max_paths)
+        """
+        B, S, N = scores.shape
 
         # Sort neurons by score (descending)
         sorted_scores, sorted_indices = torch.sort(scores, dim=-1, descending=True)
-
-        # Get corresponding weights in sorted order
         sorted_weights = torch.gather(weights, dim=-1, index=sorted_indices)
-
-        # Count active neurons (weight > 0.5) to determine path count
-        # Use mean across batch and sequence for stable path count
-        active_mask = (weights > 0.5).float()
-        n_active = active_mask.sum(dim=-1).mean().item()  # average active neurons per token
-
-        # Calculate paths based on active neuron count
-        n_paths_needed = max(1, int((n_active + rank - 1) // rank))
-        n_paths = min(max_paths, n_paths_needed)
+        sorted_mask = torch.gather(mask.float(), dim=-1, index=sorted_indices)
 
         path_weights_list = []
 
-        for p in range(max_paths):  # Always iterate max_paths times
-            if p < n_paths:
-                start_idx = p * rank
-                end_idx = min((p + 1) * rank, N)
+        for p in range(max_paths):
+            start_idx = p * path_max_k
+            end_idx = min((p + 1) * path_max_k, N)
 
-                if start_idx >= N:
-                    # No more neurons to process, add zero path
-                    path_weights_list.append(torch.zeros_like(weights))
-                    continue
-
-                # Create path weights: only neurons in this chunk get their weights
-                path_weights = torch.zeros_like(weights)
-
-                # Get indices for this path's neurons
-                path_indices = sorted_indices[:, :, start_idx:end_idx]  # [B, S, chunk_size]
-                path_w = sorted_weights[:, :, start_idx:end_idx]  # [B, S, chunk_size]
-
-                # Scatter weights back to original positions
-                path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
-
-                path_weights_list.append(path_weights)
-            else:
-                # Pad with zero weights for unused paths
+            if start_idx >= N:
                 path_weights_list.append(torch.zeros_like(weights))
+                continue
 
-        # Ensure exactly max_paths for consistent tensor shapes across pools
-        while len(path_weights_list) < max_paths:
-            path_weights_list.append(torch.zeros_like(weights))
+            # Create path weights
+            path_weights = torch.zeros_like(weights)
 
-        return path_weights_list[:max_paths]
+            # Get indices and weights for this path's neurons
+            path_indices = sorted_indices[:, :, start_idx:end_idx]
+            path_w = sorted_weights[:, :, start_idx:end_idx]
+            path_m = sorted_mask[:, :, start_idx:end_idx]
+
+            # Only include weights for masked (selected) neurons
+            path_w = path_w * path_m
+
+            # Scatter weights back to original positions
+            path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
+
+            path_weights_list.append(path_weights)
+
+        return path_weights_list
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         """
-        v18.0: Adaptive threshold + multi-path routing for attention
+        v18.0: Threshold + masked softmax multi-path routing for attention
 
         Returns:
             path_weights_dict: dict with lists of path weights for each neuron type
@@ -489,60 +488,54 @@ class GlobalRouters(nn.Module):
         (fqk_logits_Q, fqk_logits_K, fv_logits,
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
 
-        # Get per-token thresholds
+        # Get thresholds (fixed scalars)
         thresholds = self.neuron_router.get_thresholds(x)
-        tau_fqk = thresholds['fqk']  # [B, S, 1]
+        tau_fqk = thresholds['fqk']
         tau_fv = thresholds['fv']
         tau_rqk = thresholds['rqk']
         tau_rv = thresholds['rv']
 
-        # Apply threshold selection and chunk to paths
-        temp = self.threshold_temp
+        # Apply threshold selection (returns weights and mask)
+        fqk_weights_Q, fqk_mask_Q = self._threshold_select(
+            fqk_logits_Q, tau_fqk, self.path_min_k, self.path_max_k, self.max_paths)
+        fqk_weights_K, fqk_mask_K = self._threshold_select(
+            fqk_logits_K, tau_fqk, self.path_min_k, self.path_max_k, self.max_paths)
+        fv_weights, fv_mask = self._threshold_select(
+            fv_logits, tau_fv, self.path_min_k, self.path_max_k, self.max_paths)
+        rqk_weights_Q, rqk_mask_Q = self._threshold_select(
+            rqk_logits_Q, tau_rqk, self.path_min_k, self.path_max_k, self.max_paths)
+        rqk_weights_K, rqk_mask_K = self._threshold_select(
+            rqk_logits_K, tau_rqk, self.path_min_k, self.path_max_k, self.max_paths)
+        rv_weights, rv_mask = self._threshold_select(
+            rv_logits, tau_rv, self.path_min_k, self.path_max_k, self.max_paths)
 
-        # Feature QK (Q)
-        fqk_soft_Q = self._threshold_select(fqk_logits_Q, tau_fqk, temp)
-        fqk_paths_Q = self._chunk_to_paths(fqk_soft_Q, fqk_logits_Q, self.rank, self.max_paths)
+        # Chunk to paths
+        fqk_paths_Q = self._chunk_to_paths(fqk_weights_Q, fqk_mask_Q, fqk_logits_Q, self.path_max_k, self.max_paths)
+        fqk_paths_K = self._chunk_to_paths(fqk_weights_K, fqk_mask_K, fqk_logits_K, self.path_max_k, self.max_paths)
+        fv_paths = self._chunk_to_paths(fv_weights, fv_mask, fv_logits, self.path_max_k, self.max_paths)
+        rqk_paths_Q = self._chunk_to_paths(rqk_weights_Q, rqk_mask_Q, rqk_logits_Q, self.path_max_k, self.max_paths)
+        rqk_paths_K = self._chunk_to_paths(rqk_weights_K, rqk_mask_K, rqk_logits_K, self.path_max_k, self.max_paths)
+        rv_paths = self._chunk_to_paths(rv_weights, rv_mask, rv_logits, self.path_max_k, self.max_paths)
 
-        # Feature QK (K)
-        fqk_soft_K = self._threshold_select(fqk_logits_K, tau_fqk, temp)
-        fqk_paths_K = self._chunk_to_paths(fqk_soft_K, fqk_logits_K, self.rank, self.max_paths)
-
-        # Feature V
-        fv_soft = self._threshold_select(fv_logits, tau_fv, temp)
-        fv_paths = self._chunk_to_paths(fv_soft, fv_logits, self.rank, self.max_paths)
-
-        # Restore QK (Q)
-        rqk_soft_Q = self._threshold_select(rqk_logits_Q, tau_rqk, temp)
-        rqk_paths_Q = self._chunk_to_paths(rqk_soft_Q, rqk_logits_Q, self.rank, self.max_paths)
-
-        # Restore QK (K)
-        rqk_soft_K = self._threshold_select(rqk_logits_K, tau_rqk, temp)
-        rqk_paths_K = self._chunk_to_paths(rqk_soft_K, rqk_logits_K, self.rank, self.max_paths)
-
-        # Restore V
-        rv_soft = self._threshold_select(rv_logits, tau_rv, temp)
-        rv_paths = self._chunk_to_paths(rv_soft, rv_logits, self.rank, self.max_paths)
-
-        # Compute aux_loss based on HARD weights (STE output), not softmax
-        # This aligns lb with actual selection behavior
+        # Compute aux_loss for load balancing (using softmax weights)
         aux_loss = 0.0
         if self.training:
             if attention_mask is not None:
-                mask = attention_mask.unsqueeze(-1).float()
-                count = mask.sum() + 1e-8
-                usage_fqk_Q = (fqk_soft_Q * mask).sum(dim=(0, 1)) / count
-                usage_fqk_K = (fqk_soft_K * mask).sum(dim=(0, 1)) / count
-                usage_fv = (fv_soft * mask).sum(dim=(0, 1)) / count
-                usage_rqk_Q = (rqk_soft_Q * mask).sum(dim=(0, 1)) / count
-                usage_rqk_K = (rqk_soft_K * mask).sum(dim=(0, 1)) / count
-                usage_rv = (rv_soft * mask).sum(dim=(0, 1)) / count
+                seq_mask = attention_mask.unsqueeze(-1).float()
+                count = seq_mask.sum() + 1e-8
+                usage_fqk_Q = (fqk_weights_Q * seq_mask).sum(dim=(0, 1)) / count
+                usage_fqk_K = (fqk_weights_K * seq_mask).sum(dim=(0, 1)) / count
+                usage_fv = (fv_weights * seq_mask).sum(dim=(0, 1)) / count
+                usage_rqk_Q = (rqk_weights_Q * seq_mask).sum(dim=(0, 1)) / count
+                usage_rqk_K = (rqk_weights_K * seq_mask).sum(dim=(0, 1)) / count
+                usage_rv = (rv_weights * seq_mask).sum(dim=(0, 1)) / count
             else:
-                usage_fqk_Q = fqk_soft_Q.mean(dim=(0, 1))
-                usage_fqk_K = fqk_soft_K.mean(dim=(0, 1))
-                usage_fv = fv_soft.mean(dim=(0, 1))
-                usage_rqk_Q = rqk_soft_Q.mean(dim=(0, 1))
-                usage_rqk_K = rqk_soft_K.mean(dim=(0, 1))
-                usage_rv = rv_soft.mean(dim=(0, 1))
+                usage_fqk_Q = fqk_weights_Q.mean(dim=(0, 1))
+                usage_fqk_K = fqk_weights_K.mean(dim=(0, 1))
+                usage_fv = fv_weights.mean(dim=(0, 1))
+                usage_rqk_Q = rqk_weights_Q.mean(dim=(0, 1))
+                usage_rqk_K = rqk_weights_K.mean(dim=(0, 1))
+                usage_rv = rv_weights.mean(dim=(0, 1))
 
             target_fqk = 1.0 / self.n_feature_qk
             target_fv = 1.0 / self.n_feature_v
@@ -567,7 +560,7 @@ class GlobalRouters(nn.Module):
         }
 
         routing_info = {
-            # Actual active paths (non-zero path tensors)
+            # Active paths (non-zero)
             'n_paths_fqk_Q': sum(1 for p in fqk_paths_Q if p.abs().sum() > 0),
             'n_paths_fqk_K': sum(1 for p in fqk_paths_K if p.abs().sum() > 0),
             'n_paths_fv': sum(1 for p in fv_paths if p.abs().sum() > 0),
@@ -583,62 +576,52 @@ class GlobalRouters(nn.Module):
             'tau_rqk_std': 0.0,
             'tau_rv_mean': tau_rv,
             'tau_rv_std': 0.0,
-            # Activation ratio (scalar values only - no tensor storage)
-            'activation_fqk_Q': fqk_soft_Q.detach().mean().item(),
-            'activation_fqk_K': fqk_soft_K.detach().mean().item(),
-            'activation_fv': fv_soft.detach().mean().item(),
-            'activation_rqk_Q': rqk_soft_Q.detach().mean().item(),
-            'activation_rqk_K': rqk_soft_K.detach().mean().item(),
-            'activation_rv': rv_soft.detach().mean().item(),
+            # Activation ratio from mask (fraction of selected neurons)
+            'activation_fqk_Q': fqk_mask_Q.float().mean().item(),
+            'activation_fqk_K': fqk_mask_K.float().mean().item(),
+            'activation_fv': fv_mask.float().mean().item(),
+            'activation_rqk_Q': rqk_mask_Q.float().mean().item(),
+            'activation_rqk_K': rqk_mask_K.float().mean().item(),
+            'activation_rv': rv_mask.float().mean().item(),
             'token_routing': self.attention_token_routing,
         }
 
-        # Update usage with combined weights from all paths
-        # Note: Each neuron appears in at most one path (chunked by rank), so sum without division
-        # STE outputs 0 or 1, so combined weight = 1 if selected, 0 if not
+        # Update usage with mask (binary selection)
         if self.training:
-            combined_fqk_Q = sum(fqk_paths_Q)  # [B, S, N] with 0 or 1
-            combined_fqk_K = sum(fqk_paths_K)
-            combined_fv = sum(fv_paths)
-            combined_rqk_Q = sum(rqk_paths_Q)
-            combined_rqk_K = sum(rqk_paths_K)
-            combined_rv = sum(rv_paths)
-
-            self.neuron_router.update_usage(combined_fqk_Q, 'feature_q', attention_mask)
-            self.neuron_router.update_usage(combined_fqk_K, 'feature_k', attention_mask)
-            self.neuron_router.update_usage(combined_fv, 'feature_v', attention_mask)
-            self.neuron_router.update_usage(combined_rqk_Q, 'restore_q', attention_mask)
-            self.neuron_router.update_usage(combined_rqk_K, 'restore_k', attention_mask)
-            self.neuron_router.update_usage(combined_rv, 'restore_v', attention_mask)
+            self.neuron_router.update_usage(fqk_mask_Q.float(), 'feature_q', attention_mask)
+            self.neuron_router.update_usage(fqk_mask_K.float(), 'feature_k', attention_mask)
+            self.neuron_router.update_usage(fv_mask.float(), 'feature_v', attention_mask)
+            self.neuron_router.update_usage(rqk_mask_Q.float(), 'restore_q', attention_mask)
+            self.neuron_router.update_usage(rqk_mask_K.float(), 'restore_k', attention_mask)
+            self.neuron_router.update_usage(rv_mask.float(), 'restore_v', attention_mask)
 
         return path_weights, routing_info, aux_loss
 
     def get_knowledge_weights(self, x, importance, attention_mask=None):
         """
-        v18.0: Adaptive threshold + multi-path routing for knowledge
+        v18.0: Threshold + masked softmax multi-path routing for knowledge
         """
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
-        # Get thresholds
+        # Get thresholds (fixed scalars)
         thresholds = self.neuron_router.get_thresholds(x)
         tau_f = thresholds['feature_know']
         tau_r = thresholds['restore_know']
 
-        temp = self.threshold_temp
+        # Apply threshold selection (returns weights and mask)
+        f_weights, f_mask = self._threshold_select(
+            logits_f, tau_f, self.path_min_k, self.path_max_k, self.max_paths)
+        r_weights, r_mask = self._threshold_select(
+            logits_r, tau_r, self.path_min_k, self.path_max_k, self.max_paths)
 
-        # Feature knowledge
-        f_soft = self._threshold_select(logits_f, tau_f, temp)
-        f_paths = self._chunk_to_paths(f_soft, logits_f, self.rank, self.max_paths)
+        # Chunk to paths
+        f_paths = self._chunk_to_paths(f_weights, f_mask, logits_f, self.path_max_k, self.max_paths)
+        r_paths = self._chunk_to_paths(r_weights, r_mask, logits_r, self.path_max_k, self.max_paths)
 
-        # Restore knowledge
-        r_soft = self._threshold_select(logits_r, tau_r, temp)
-        r_paths = self._chunk_to_paths(r_soft, logits_r, self.rank, self.max_paths)
-
+        # Update usage with mask (binary selection)
         if self.training:
-            combined_f = sum(f_paths)  # No division - each neuron in at most one path
-            combined_r = sum(r_paths)
-            self.neuron_router.update_usage(combined_f, 'feature_know', attention_mask)
-            self.neuron_router.update_usage(combined_r, 'restore_know', attention_mask)
+            self.neuron_router.update_usage(f_mask.float(), 'feature_know', attention_mask)
+            self.neuron_router.update_usage(r_mask.float(), 'restore_know', attention_mask)
 
         know_info = {
             'n_paths_feature': sum(1 for p in f_paths if p.abs().sum() > 0),
@@ -648,9 +631,9 @@ class GlobalRouters(nn.Module):
             'tau_feature_std': 0.0,
             'tau_restore_mean': tau_r,
             'tau_restore_std': 0.0,
-            # Activation ratio
-            'activation_feature': f_soft.detach().mean().item(),
-            'activation_restore': r_soft.detach().mean().item(),
+            # Activation ratio from mask
+            'activation_feature': f_mask.float().mean().item(),
+            'activation_restore': r_mask.float().mean().item(),
         }
 
         return f_paths, r_paths, know_info
@@ -904,17 +887,18 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v18.0: Adaptive Threshold Multi-Path Routing
+    DAWN v18.0: Fixed Threshold Multi-Path Routing
 
     Key Features:
     - Reduced rank (16) for chunked multi-path processing
-    - Per-token adaptive threshold (learned) for variable neuron selection
-    - Multi-path (1~4) parallel processing with path-wise Q,K,V aggregation
+    - Fixed threshold (tau) + masked softmax for neuron selection
+    - Minimum/maximum neuron guarantees (path_min_k, path_max_k * max_paths)
+    - Multi-path (1~max_paths) parallel processing with path-wise Q,K,V aggregation
     - Attention operation unchanged (scaled_dot_product_attention)
 
     Architecture:
-    - UnifiedNeuronRouter: 6 threshold projections for adaptive selection
-    - GlobalRouters: _threshold_select + _chunk_to_paths
+    - UnifiedNeuronRouter: fixed tau (no learnable threshold projections)
+    - GlobalRouters: _threshold_select + _chunk_to_paths with masked softmax
     - AttentionCircuit: Multi-path Q,K,V summation
     - KnowledgeCircuit: Multi-path summation
     """
@@ -932,8 +916,9 @@ class DAWN(nn.Module):
         d_space: int = 64,
         # v18: Multi-path parameters
         max_paths: int = 4,
-        threshold_temp: float = 1.0,
         fixed_tau: float = 0.0,
+        path_min_k: int = 8,
+        path_max_k: int = 16,
         # Attention - shared Q/K pool
         n_feature_qk: int = 56,
         n_feature_v: int = 24,
@@ -976,8 +961,9 @@ class DAWN(nn.Module):
 
         # v18 specific
         self.max_paths = max_paths
-        self.threshold_temp = threshold_temp
         self.fixed_tau = fixed_tau
+        self.path_min_k = path_min_k
+        self.path_max_k = path_max_k
 
         # Neuron counts
         self.n_feature_qk = n_feature_qk
@@ -1013,8 +999,9 @@ class DAWN(nn.Module):
             n_feature_know=n_feature_know, n_restore_know=n_restore_know,
             rank=rank,
             max_paths=max_paths,
-            threshold_temp=threshold_temp,
             fixed_tau=fixed_tau,
+            path_min_k=path_min_k,
+            path_max_k=path_max_k,
             d_space=d_space, router_dropout=router_dropout,
             attention_token_routing=attention_token_routing,
             knowledge_token_routing=knowledge_token_routing,
@@ -1108,8 +1095,9 @@ class DAWN(nn.Module):
             'rank': self.rank, 'knowledge_rank': self.knowledge_rank,
             'max_seq_len': self.max_seq_len,
             'max_paths': self.max_paths,
-            'threshold_temp': self.threshold_temp,
             'fixed_tau': self.fixed_tau,
+            'path_min_k': self.path_min_k,
+            'path_max_k': self.path_max_k,
             'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
             'n_restore_qk': self.n_restore_qk, 'n_restore_v': self.n_restore_v,
             'n_feature_know': self.n_feature_know, 'n_restore_know': self.n_restore_know,
@@ -1120,23 +1108,23 @@ class DAWN(nn.Module):
     def get_model_info(self):
         """Return model architecture info for logging"""
         return [
-            f"DAWN v{self.__version__}: Adaptive Threshold Multi-Path Routing",
+            f"DAWN v{self.__version__}: Fixed Threshold Multi-Path Routing",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  max_paths={self.max_paths}, threshold_temp={self.threshold_temp}, fixed_tau={self.fixed_tau}",
+            f"  max_paths={self.max_paths}, fixed_tau={self.fixed_tau}, path_min_k={self.path_min_k}, path_max_k={self.path_max_k}",
             f"  max_seq_len={self.max_seq_len}, state_dim={self.state_dim}, dropout={self.dropout_rate}",
             f"",
-            f"  [Attention - Q/K Shared Pool] (adaptive threshold, max_paths={self.max_paths})",
+            f"  [Attention - Q/K Shared Pool] (fixed threshold, max_paths={self.max_paths})",
             f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank}",
             f"  Feature_V: {self.n_feature_v} × {self.d_model} × {self.rank}",
             f"  Restore_QK: {self.n_restore_qk} × {self.rank} × {self.d_model}",
             f"  Restore_V: {self.n_restore_v} × {self.rank} × {self.d_model}",
             f"",
-            f"  [Knowledge - Feature-Restore] (adaptive threshold, max_paths={self.max_paths})",
+            f"  [Knowledge - Feature-Restore] (fixed threshold, max_paths={self.max_paths})",
             f"  Feature_Know: {self.n_feature_know} × {self.d_model} × {self.knowledge_rank}",
             f"  Restore_Know: {self.n_restore_know} × {self.knowledge_rank} × {self.d_model}",
             f"",
-            f"  [Router - Adaptive Threshold]",
+            f"  [Router - Fixed Threshold]",
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
             f"  attention_token_routing={self.attention_token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
             f"  use_ssm_context={self.use_ssm_context}",
@@ -1205,9 +1193,9 @@ class DAWN(nn.Module):
         attn_neurons = self.n_feature_qk + self.n_feature_v + self.n_restore_qk + self.n_restore_v
         know_neurons = self.n_feature_know + self.n_restore_know
         return (
-            f"DAWN v{self.__version__}: Adaptive Threshold Multi-Path\n"
+            f"DAWN v{self.__version__}: Fixed Threshold Multi-Path\n"
             f"  Params: {params:.1f}M\n"
-            f"  rank={self.rank}, max_paths={self.max_paths}, threshold_temp={self.threshold_temp}\n"
+            f"  rank={self.rank}, max_paths={self.max_paths}, path_min_k={self.path_min_k}, path_max_k={self.path_max_k}\n"
             f"  Attention: Feature_QK={self.n_feature_qk}, Feature_V={self.n_feature_v}\n"
             f"            Restore_QK={self.n_restore_qk}, Restore_V={self.n_restore_v}\n"
             f"  Knowledge: Feature={self.n_feature_know}, Restore={self.n_restore_know}\n"

@@ -1,6 +1,6 @@
 # DAWN v18.0 Training Config - 20M Scale, 500M tokens
-# Adaptive Threshold Multi-Path Routing
-# rank=16, max_paths=4, threshold-based neuron selection
+# Fixed Threshold Multi-Path Routing
+# rank=16, max_paths=4, fixed tau + masked softmax
 
 seed: 42
 
@@ -23,10 +23,11 @@ model:
 
   # v18: Multi-path parameters
   max_paths: 4
-  threshold_temp: 1.0
-  tau_reg_lambda: 0.01
+  fixed_tau: 0.0
+  path_min_k: 8
+  path_max_k: 16
 
-  # Attention - Q/K shared pool (no top_k, uses adaptive threshold)
+  # Attention - Q/K shared pool (no top_k, uses fixed threshold)
   n_feature_qk: 64
   n_feature_v: 264
   n_restore_qk: 64
@@ -56,7 +57,6 @@ training:
   diversity_weight: 0.1
   load_balance_weight: 0.00002
   entropy_weight: 0.0
-  tau_reg_weight: 1.0  # v18.0: uses model's tau_reg_lambda internally
   process_norm_weight: 0.0
 
 use_amp: true
@@ -66,13 +66,14 @@ log_dir: /content/drive/MyDrive/dawn/logs_v18_20M_500M
 # v18.0 Architecture
 #
 # Key differences from v17.1:
-#   - No top_k parameters (uses adaptive threshold instead)
-#   - threshold_temp controls sigmoid sharpness
-#   - tau_reg_lambda penalizes high activation ratio
-#   - max_paths limits parallel path count
+#   - No top_k parameters (uses fixed threshold + masked softmax)
+#   - fixed_tau: threshold for neuron selection
+#   - path_min_k: minimum neurons guaranteed (topk fallback)
+#   - path_max_k: neurons per path (max = path_max_k * max_paths)
+#   - max_paths: limits parallel path count
 #
 # Neuron selection flow:
-#   x -> threshold_proj(x) -> tau [B, S, 1]
 #   x -> neuron_router -> scores [B, S, N]
-#   sigmoid((scores - tau) / temp) -> soft weights
-#   chunk by score rank -> 1~4 paths -> sum Q, K, V
+#   mask = (scores > tau) | topk(path_min_k) & topk(path_max_k * max_paths)
+#   weights = masked_softmax(scores, mask)
+#   chunk by score rank -> 1~max_paths paths -> sum Q, K, V
