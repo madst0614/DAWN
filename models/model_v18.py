@@ -568,6 +568,17 @@ class GlobalRouters(nn.Module):
             # mask: [B, S, N] -> sum over N, mean over B, S
             return mask.float().sum(dim=-1).mean().item()
 
+        # Helper: Q/K overlap ratio (how much Q and K share the same neurons)
+        def qk_overlap(mask_q, mask_k):
+            # mask: [B, S, N] boolean
+            # overlap = intersection / max(q_count, k_count) per token, then average
+            intersection = (mask_q & mask_k).float().sum(dim=-1)  # [B, S]
+            q_count = mask_q.float().sum(dim=-1)  # [B, S]
+            k_count = mask_k.float().sum(dim=-1)  # [B, S]
+            max_count = torch.maximum(q_count, k_count).clamp(min=1)
+            overlap = (intersection / max_count).mean().item()
+            return overlap
+
         routing_info = {
             # Average paths used per token
             'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
@@ -583,6 +594,9 @@ class GlobalRouters(nn.Module):
             'selected_rqk_Q': avg_selected_per_token(rqk_mask_Q),
             'selected_rqk_K': avg_selected_per_token(rqk_mask_K),
             'selected_rv': avg_selected_per_token(rv_mask),
+            # Q/K overlap ratio
+            'overlap_fqk': qk_overlap(fqk_mask_Q, fqk_mask_K),
+            'overlap_rqk': qk_overlap(rqk_mask_Q, rqk_mask_K),
             # Score statistics (logits mean ± std)
             'score_fqk_Q_mean': fqk_logits_Q.mean().item(),
             'score_fqk_Q_std': fqk_logits_Q.std().item(),

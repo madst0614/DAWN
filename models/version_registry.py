@@ -312,6 +312,8 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
     # Note: v18 doesn't store _pref tensors to avoid memory leaks
     # Uses selected neuron counts and score distribution instead of entropy/variance
     if attn0.get('n_paths_fqk_Q') is not None:
+        know0 = routing_infos[0].get('knowledge', {})
+
         # Selected neurons per token (more informative than activation ratio)
         sel_fqk_Q = attn0.get('selected_fqk_Q', 0)
         sel_fqk_K = attn0.get('selected_fqk_K', 0)
@@ -319,9 +321,16 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
         sel_rqk_Q = attn0.get('selected_rqk_Q', 0)
         sel_rqk_K = attn0.get('selected_rqk_K', 0)
         sel_rv = attn0.get('selected_rv', 0)
+        sel_kf = know0.get('selected_feature', 0)
+        sel_kr = know0.get('selected_restore', 0)
 
-        # Format selected neurons string
-        sel_str = f"Sel FQK:{sel_fqk_Q:.0f}/{sel_fqk_K:.0f} FV:{sel_fv:.0f} RQK:{sel_rqk_Q:.0f}/{sel_rqk_K:.0f} RV:{sel_rv:.0f}"
+        # Format selected neurons string (includes knowledge)
+        sel_str = f"Sel FQK:{sel_fqk_Q:.0f}/{sel_fqk_K:.0f} FV:{sel_fv:.0f} RQK:{sel_rqk_Q:.0f}/{sel_rqk_K:.0f} RV:{sel_rv:.0f} K:{sel_kf:.0f}/{sel_kr:.0f}"
+
+        # Q/K overlap ratio
+        overlap_fqk = attn0.get('overlap_fqk', 0)
+        overlap_rqk = attn0.get('overlap_rqk', 0)
+        overlap_str = f"Q/K Overlap FQK/RQK:{overlap_fqk:.2f}/{overlap_rqk:.2f}"
 
         # v18 specific: path counts
         n_paths = f"Paths FQK:{attn0.get('n_paths_fqk_Q', 0):.1f}/{attn0.get('n_paths_fqk_K', 0):.1f} FV:{attn0.get('n_paths_fv', 0):.1f} RQK:{attn0.get('n_paths_rqk_Q', 0):.1f}/{attn0.get('n_paths_rqk_K', 0):.1f} RV:{attn0.get('n_paths_rv', 0):.1f}"
@@ -329,7 +338,7 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
         return {
             'ent_str': sel_str,  # Use selected neurons instead of entropy for v18
             'var_str': None,  # No variance tracking for v18
-            'overlap_str': None,
+            'overlap_str': overlap_str,  # Q/K overlap
             'paths_str': n_paths,
             'tau_str': None,  # tau is fixed, no need to log
             'version': '18.0'
