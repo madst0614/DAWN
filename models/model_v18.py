@@ -413,6 +413,9 @@ class GlobalRouters(nn.Module):
         """
         Chunk neurons above threshold into rank-sized paths
 
+        Path count is determined by the number of ACTIVE neurons (weight > 0.5),
+        not by total neuron count.
+
         Args:
             weights: [B, S, N] soft weights from threshold selection
             scores: [B, S, N] original scores (for ranking)
@@ -432,9 +435,14 @@ class GlobalRouters(nn.Module):
         # Get corresponding weights in sorted order
         sorted_weights = torch.gather(weights, dim=-1, index=sorted_indices)
 
-        # Calculate how many paths we need (at most max_paths)
-        # Each path handles 'rank' neurons
-        n_paths = min(max_paths, (N + rank - 1) // rank)
+        # Count active neurons (weight > 0.5) to determine path count
+        # Use mean across batch and sequence for stable path count
+        active_mask = (weights > 0.5).float()
+        n_active = active_mask.sum(dim=-1).mean().item()  # average active neurons per token
+
+        # Calculate paths based on active neuron count
+        n_paths_needed = max(1, int((n_active + rank - 1) // rank))
+        n_paths = min(max_paths, n_paths_needed)
 
         path_weights_list = []
 
