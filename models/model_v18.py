@@ -80,12 +80,13 @@ class UnifiedNeuronRouter(nn.Module):
         self.threshold_proj_feature_know = nn.Linear(d_model, 1)
         self.threshold_proj_restore_know = nn.Linear(d_model, 1)
 
-        # Initialize threshold projections to output ~0 (sigmoid(0)=0.5 baseline)
+        # Initialize threshold projections to output ~-1.0 (more neurons pass initially)
+        # With tau=-1, most neurons with score>-1 will be selected
         for proj in [self.threshold_proj_fqk, self.threshold_proj_fv,
                      self.threshold_proj_rqk, self.threshold_proj_rv,
                      self.threshold_proj_feature_know, self.threshold_proj_restore_know]:
             nn.init.zeros_(proj.weight)
-            nn.init.zeros_(proj.bias)
+            nn.init.constant_(proj.bias, -1.0)
 
         # Unified neuron embeddings (std=0.02 is standard transformer initialization)
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
@@ -510,45 +511,6 @@ class GlobalRouters(nn.Module):
         tau_rqk = thresholds['rqk']
         tau_rv = thresholds['rv']
 
-        # Compute soft preferences (for aux loss)
-        fqk_pref_Q = F.softmax(fqk_logits_Q, dim=-1)
-        fqk_pref_K = F.softmax(fqk_logits_K, dim=-1)
-        fv_pref = F.softmax(fv_logits, dim=-1)
-        rqk_pref_Q = F.softmax(rqk_logits_Q, dim=-1)
-        rqk_pref_K = F.softmax(rqk_logits_K, dim=-1)
-        rv_pref = F.softmax(rv_logits, dim=-1)
-
-        aux_loss = 0.0
-        if self.training:
-            if attention_mask is not None:
-                mask = attention_mask.unsqueeze(-1).float()
-                count = mask.sum() + 1e-8
-                usage_fqk_Q = (fqk_pref_Q * mask).sum(dim=(0, 1)) / count
-                usage_fqk_K = (fqk_pref_K * mask).sum(dim=(0, 1)) / count
-                usage_fv = (fv_pref * mask).sum(dim=(0, 1)) / count
-                usage_rqk_Q = (rqk_pref_Q * mask).sum(dim=(0, 1)) / count
-                usage_rqk_K = (rqk_pref_K * mask).sum(dim=(0, 1)) / count
-                usage_rv = (rv_pref * mask).sum(dim=(0, 1)) / count
-            else:
-                usage_fqk_Q = fqk_pref_Q.mean(dim=(0, 1))
-                usage_fqk_K = fqk_pref_K.mean(dim=(0, 1))
-                usage_fv = fv_pref.mean(dim=(0, 1))
-                usage_rqk_Q = rqk_pref_Q.mean(dim=(0, 1))
-                usage_rqk_K = rqk_pref_K.mean(dim=(0, 1))
-                usage_rv = rv_pref.mean(dim=(0, 1))
-
-            target_fqk = 1.0 / self.n_feature_qk
-            target_fv = 1.0 / self.n_feature_v
-            target_rqk = 1.0 / self.n_restore_qk
-            target_rv = 1.0 / self.n_restore_v
-
-            aux_loss += ((usage_fqk_Q - target_fqk) ** 2).sum() * self.n_feature_qk
-            aux_loss += ((usage_fqk_K - target_fqk) ** 2).sum() * self.n_feature_qk
-            aux_loss += ((usage_fv - target_fv) ** 2).sum() * self.n_feature_v
-            aux_loss += ((usage_rqk_Q - target_rqk) ** 2).sum() * self.n_restore_qk
-            aux_loss += ((usage_rqk_K - target_rqk) ** 2).sum() * self.n_restore_qk
-            aux_loss += ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
-
         # Apply threshold selection and chunk to paths
         temp = self.threshold_temp
 
@@ -576,6 +538,39 @@ class GlobalRouters(nn.Module):
         rv_soft = self._threshold_select(rv_logits, tau_rv, temp)
         rv_paths = self._chunk_to_paths(rv_soft, rv_logits, self.rank, self.max_paths)
 
+        # Compute aux_loss based on HARD weights (STE output), not softmax
+        # This aligns lb with actual selection behavior
+        aux_loss = 0.0
+        if self.training:
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(-1).float()
+                count = mask.sum() + 1e-8
+                usage_fqk_Q = (fqk_soft_Q * mask).sum(dim=(0, 1)) / count
+                usage_fqk_K = (fqk_soft_K * mask).sum(dim=(0, 1)) / count
+                usage_fv = (fv_soft * mask).sum(dim=(0, 1)) / count
+                usage_rqk_Q = (rqk_soft_Q * mask).sum(dim=(0, 1)) / count
+                usage_rqk_K = (rqk_soft_K * mask).sum(dim=(0, 1)) / count
+                usage_rv = (rv_soft * mask).sum(dim=(0, 1)) / count
+            else:
+                usage_fqk_Q = fqk_soft_Q.mean(dim=(0, 1))
+                usage_fqk_K = fqk_soft_K.mean(dim=(0, 1))
+                usage_fv = fv_soft.mean(dim=(0, 1))
+                usage_rqk_Q = rqk_soft_Q.mean(dim=(0, 1))
+                usage_rqk_K = rqk_soft_K.mean(dim=(0, 1))
+                usage_rv = rv_soft.mean(dim=(0, 1))
+
+            target_fqk = 1.0 / self.n_feature_qk
+            target_fv = 1.0 / self.n_feature_v
+            target_rqk = 1.0 / self.n_restore_qk
+            target_rv = 1.0 / self.n_restore_v
+
+            aux_loss += ((usage_fqk_Q - target_fqk) ** 2).sum() * self.n_feature_qk
+            aux_loss += ((usage_fqk_K - target_fqk) ** 2).sum() * self.n_feature_qk
+            aux_loss += ((usage_fv - target_fv) ** 2).sum() * self.n_feature_v
+            aux_loss += ((usage_rqk_Q - target_rqk) ** 2).sum() * self.n_restore_qk
+            aux_loss += ((usage_rqk_K - target_rqk) ** 2).sum() * self.n_restore_qk
+            aux_loss += ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
+
         # Package path weights
         path_weights = {
             'fqk_Q': fqk_paths_Q,
@@ -597,12 +592,6 @@ class GlobalRouters(nn.Module):
         }
 
         routing_info = {
-            'fqk_q_pref': fqk_pref_Q.detach(),
-            'fqk_k_pref': fqk_pref_K.detach(),
-            'fv_pref': fv_pref.detach(),
-            'rqk_q_pref': rqk_pref_Q.detach(),
-            'rqk_k_pref': rqk_pref_K.detach(),
-            'rv_pref': rv_pref.detach(),
             # Actual active paths (non-zero path tensors)
             'n_paths_fqk_Q': sum(1 for p in fqk_paths_Q if p.abs().sum() > 0),
             'n_paths_fqk_K': sum(1 for p in fqk_paths_K if p.abs().sum() > 0),
