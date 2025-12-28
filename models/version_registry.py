@@ -42,7 +42,7 @@ VERSION_REGISTRY = {
             "use_soft_mask": True,
             "learnable_tau": True,
             "soft_mask_temp": 1.0,
-            "soft_mask_penalty": 100.0,
+            "soft_mask_penalty": 10.0,
         },
         "display_info": lambda args: [
             f"DAWN v18.1: Soft Mask + Learnable Tau",

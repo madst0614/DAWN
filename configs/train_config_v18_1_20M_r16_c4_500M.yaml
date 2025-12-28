@@ -26,7 +26,7 @@ model:
   use_soft_mask: true
   learnable_tau: true
   soft_mask_temp: 1.0
-  soft_mask_penalty: 100.0
+  soft_mask_penalty: 10.0
   # Attention - Q/K shared pool
   n_feature_qk: 64
   n_feature_v: 264

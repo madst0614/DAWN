@@ -377,7 +377,7 @@ class GlobalRouters(nn.Module):
                  use_soft_mask: bool = False,
                  learnable_tau: bool = False,
                  soft_mask_temp: float = 1.0,
-                 soft_mask_penalty: float = 100.0,
+                 soft_mask_penalty: float = 10.0,
                  **kwargs):
         super().__init__()
         self.d_model = d_model
@@ -1133,7 +1133,7 @@ class DAWN(nn.Module):
         use_soft_mask: bool = True,
         learnable_tau: bool = True,
         soft_mask_temp: float = 1.0,
-        soft_mask_penalty: float = 100.0,
+        soft_mask_penalty: float = 10.0,
         # Attention - shared Q/K pool
         n_feature_qk: int = 56,
         n_feature_v: int = 24,
