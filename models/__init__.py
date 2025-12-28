@@ -1,6 +1,12 @@
 """
 DAWN Models Module
 
+v18.1: Soft Mask + Token-level Learnable Tau
+- Soft mask: sigmoid((score - tau) / temp) instead of hard threshold
+- Learnable tau: token-level tau via nn.Linear(d_model, 6)
+- Penalty-based masking: low-score neurons get penalty instead of -inf
+- Gradients flow through all neurons (differentiable routing)
+
 v18.0: Fixed Threshold Multi-Path Routing
 - Fixed threshold + masked softmax for neuron selection
 - Minimum/maximum neuron guarantees (path_min_k, path_max_k * max_paths)
@@ -19,6 +25,9 @@ v17.2: Feature QK Unified + Restore Q/K Separate
 
 baseline: Vanilla Transformer for fair comparison
 """
+
+# v18.1 - Soft Mask + Token-level Learnable Tau
+from .model_v18_1 import DAWN as DAWN_v18_1
 
 # v18.0 - Fixed Threshold Multi-Path Routing
 from .model_v18 import DAWN as DAWN_v18
@@ -54,6 +63,7 @@ from .version_registry import (
 __all__ = [
     # Models
     'DAWN',
+    'DAWN_v18_1',
     'DAWN_v18',
     'DAWN_v17_2',
     'DAWN_v17_1',
@@ -81,7 +91,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "18.0", "17.2", "17.1", or "baseline"
+        version: "18.1", "18.0", "17.2", "17.1", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -92,7 +102,9 @@ def create_model_by_version(version, config):
 
     version = normalize_version(version)
 
-    if version == "18.0":
+    if version == "18.1":
+        return DAWN_v18_1(**config)
+    elif version == "18.0":
         return DAWN_v18(**config)
     elif version == "17.2":
         return DAWN_v17_2(**config)
@@ -100,4 +112,4 @@ def create_model_by_version(version, config):
         return DAWN_v17_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 18.0, 17.2, 17.1, baseline")
+                        f"Supported versions: 18.1, 18.0, 17.2, 17.1, baseline")
