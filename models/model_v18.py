@@ -485,7 +485,11 @@ class GlobalRouters(nn.Module):
                 # Pad with zero weights for unused paths
                 path_weights_list.append(torch.zeros_like(weights))
 
-        return path_weights_list
+        # Ensure exactly max_paths for consistent tensor shapes across pools
+        while len(path_weights_list) < max_paths:
+            path_weights_list.append(torch.zeros_like(weights))
+
+        return path_weights_list[:max_paths]
 
     def get_attention_weights(self, x, importance, attention_mask=None):
         """
