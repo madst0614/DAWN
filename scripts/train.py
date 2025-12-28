@@ -631,6 +631,18 @@ def _gini(x):
     return (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
 
 
+def _entropy(x):
+    """Normalized entropy (0=concentrated, 100=uniform distribution)"""
+    # Normalize to probability distribution
+    p = x / (x.sum() + 1e-8)
+    # Entropy: -sum(p * log(p)), avoiding log(0)
+    log_p = torch.log(p + 1e-8)
+    entropy = -(p * log_p).sum()
+    # Normalize by max entropy (log(N))
+    max_entropy = math.log(x.numel())
+    return (entropy / max_entropy * 100).item() if max_entropy > 0 else 0.0
+
+
 def _get_router_log_lines(router, global_step, total_steps, global_routers=None):
     """Generate router log lines for both console and file output.
 
@@ -679,11 +691,17 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
         dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
         dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
 
+        # Entropy (normalized, 0=concentrated, 100=uniform)
+        ent_fq, ent_fk, ent_fv = _entropy(ema_fq), _entropy(ema_fk), _entropy(ema_fv)
+        ent_rq, ent_rk, ent_rv = _entropy(ema_rq), _entropy(ema_rk), _entropy(ema_rv)
+        ent_FK, ent_RK = _entropy(ema_FK), _entropy(ema_RK)
+
         # v18.0 format (multi-path, masked softmax)
         lines.append(f"         [v18.0] Neuron Usage")
         lines.append(f"             Feature_Q: {int(active_fq)}/{n_fq} | Feature_K: {int(active_fk)}/{n_fk} | Feature_V: {int(active_fv)}/{n_fv}")
         lines.append(f"             Restore_Q: {int(active_rq)}/{n_rq} | Restore_K: {int(active_rk)}/{n_rk} | Restore_V: {int(active_rv)}/{n_rv}")
         lines.append(f"             Feature_Know: {int(active_FK)}/{n_FK} | Restore_Know: {int(active_RK)}/{n_RK}")
+        lines.append(f"             Ent: FQ={ent_fq:.0f} FK={ent_fk:.0f} FV={ent_fv:.0f} RQ={ent_rq:.0f} RK={ent_rk:.0f} RV={ent_rv:.0f} FKnow={ent_FK:.0f} RKnow={ent_RK:.0f}")
         lines.append(f"             Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
         lines.append(f"             Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
 
@@ -1207,6 +1225,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
                         gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
 
+                        # Entropy (normalized, 0=concentrated, 100=uniform)
+                        ent_fq, ent_fk, ent_fv = _entropy(ema_fq), _entropy(ema_fk), _entropy(ema_fv)
+                        ent_rq, ent_rk, ent_rv = _entropy(ema_rq), _entropy(ema_rk), _entropy(ema_rv)
+                        ent_FK, ent_RK = _entropy(ema_FK), _entropy(ema_RK)
+
                         dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
                         dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
                         dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
@@ -1217,6 +1240,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
 
                         print(f"          Usage: FQ={int(active_fq)}/{n_fq} FK={int(active_fk)}/{n_fk} FV={int(active_fv)}/{n_fv} | RQ={int(active_rq)}/{n_rq} RK={int(active_rk)}/{n_rk} RV={int(active_rv)}/{n_rv} | Know: F={int(active_FK)}/{n_FK} R={int(active_RK)}/{n_RK}")
+                        print(f"          Ent: FQ={ent_fq:.0f} FK={ent_fk:.0f} FV={ent_fv:.0f} RQ={ent_rq:.0f} RK={ent_rk:.0f} RV={ent_rv:.0f} FKnow={ent_FK:.0f} RKnow={ent_RK:.0f}")
                         print(f"          Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
                         print(f"          Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
 
