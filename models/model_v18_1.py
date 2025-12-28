@@ -401,15 +401,13 @@ class GlobalRouters(nn.Module):
         self.soft_mask_temp = soft_mask_temp
         self.soft_mask_penalty = soft_mask_penalty
 
-        # Learnable tau parameters (v18.1)
+        # Learnable tau parameters (v18.1) - token-level projection
         if learnable_tau:
-            # Separate tau for each neuron type
-            self.tau_fqk = nn.Parameter(torch.tensor(fixed_tau))
-            self.tau_fv = nn.Parameter(torch.tensor(fixed_tau))
-            self.tau_rqk = nn.Parameter(torch.tensor(fixed_tau))
-            self.tau_rv = nn.Parameter(torch.tensor(fixed_tau))
-            self.tau_feature_know = nn.Parameter(torch.tensor(fixed_tau))
-            self.tau_restore_know = nn.Parameter(torch.tensor(fixed_tau))
+            # Token-level tau projection (6 pools at once)
+            # Output: [fqk, fv, rqk, rv, feature_know, restore_know]
+            self.tau_proj = nn.Linear(d_model, 6)
+            nn.init.zeros_(self.tau_proj.weight)
+            nn.init.constant_(self.tau_proj.bias, fixed_tau)
 
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
@@ -417,60 +415,60 @@ class GlobalRouters(nn.Module):
             d_space=d_space, dropout=router_dropout, fixed_tau=fixed_tau, **kwargs
         )
 
-    def get_tau(self, tau_type: str):
-        """Get tau value (learnable or fixed)"""
+    def get_tau(self, x, tau_type: str):
+        """
+        Get tau value (learnable or fixed).
+
+        Args:
+            x: [B, S, d_model] input tensor
+            tau_type: one of 'fqk', 'fv', 'rqk', 'rv', 'feature_know', 'restore_know'
+
+        Returns:
+            [B, S, 1] for learnable tau, scalar for fixed tau
+        """
         if self.learnable_tau:
-            tau_map = {
-                'fqk': self.tau_fqk,
-                'fv': self.tau_fv,
-                'rqk': self.tau_rqk,
-                'rv': self.tau_rv,
-                'feature_know': self.tau_feature_know,
-                'restore_know': self.tau_restore_know,
+            tau_all = self.tau_proj(x)  # [B, S, 6]
+            tau_idx = {
+                'fqk': 0, 'fv': 1, 'rqk': 2, 'rv': 3,
+                'feature_know': 4, 'restore_know': 5
             }
-            return tau_map.get(tau_type, self.fixed_tau)
+            idx = tau_idx[tau_type]
+            return tau_all[..., idx:idx+1]  # [B, S, 1]
         else:
             return self.fixed_tau
 
     def get_tau_reg_loss(self):
         """
         Compute tau regularization loss (v18.1 only).
-        Prevents tau from going too extreme.
+        L2 regularization on tau projection weights.
         Returns 0 if learnable_tau=False.
         """
         if not self.learnable_tau:
             return 0.0
 
-        # L2 regularization on tau values
-        tau_reg = (
-            self.tau_fqk ** 2 +
-            self.tau_fv ** 2 +
-            self.tau_rqk ** 2 +
-            self.tau_rv ** 2 +
-            self.tau_feature_know ** 2 +
-            self.tau_restore_know ** 2
-        )
-        return tau_reg
+        # L2 regularization on tau projection weights and bias
+        return (self.tau_proj.weight ** 2).mean() + (self.tau_proj.bias ** 2).mean()
 
     def get_all_tau_values(self):
-        """Get all tau values as a dict (for logging)"""
+        """Get all tau values as a dict (for logging). Returns bias values for learnable tau."""
         if self.learnable_tau:
+            bias = self.tau_proj.bias.detach()
             return {
-                'tau_fqk': self.tau_fqk.item(),
-                'tau_fv': self.tau_fv.item(),
-                'tau_rqk': self.tau_rqk.item(),
-                'tau_rv': self.tau_rv.item(),
-                'tau_feature_know': self.tau_feature_know.item(),
-                'tau_restore_know': self.tau_restore_know.item(),
+                'fqk': bias[0].item(),
+                'fv': bias[1].item(),
+                'rqk': bias[2].item(),
+                'rv': bias[3].item(),
+                'feature_know': bias[4].item(),
+                'restore_know': bias[5].item(),
             }
         else:
             return {
-                'tau_fqk': self.fixed_tau,
-                'tau_fv': self.fixed_tau,
-                'tau_rqk': self.fixed_tau,
-                'tau_rv': self.fixed_tau,
-                'tau_feature_know': self.fixed_tau,
-                'tau_restore_know': self.fixed_tau,
+                'fqk': self.fixed_tau,
+                'fv': self.fixed_tau,
+                'rqk': self.fixed_tau,
+                'rv': self.fixed_tau,
+                'feature_know': self.fixed_tau,
+                'restore_know': self.fixed_tau,
             }
 
     def _threshold_select(self, scores, tau, path_min_k, path_max_k, max_paths):
@@ -612,11 +610,11 @@ class GlobalRouters(nn.Module):
         (fqk_logits_Q, fqk_logits_K, fv_logits,
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
 
-        # Get thresholds (v18.0: fixed, v18.1: learnable)
-        tau_fqk = self.get_tau('fqk')
-        tau_fv = self.get_tau('fv')
-        tau_rqk = self.get_tau('rqk')
-        tau_rv = self.get_tau('rv')
+        # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
+        tau_fqk = self.get_tau(x, 'fqk')
+        tau_fv = self.get_tau(x, 'fv')
+        tau_rqk = self.get_tau(x, 'rqk')
+        tau_rv = self.get_tau(x, 'rv')
 
         # Apply threshold selection (returns weights, mask, and soft_mask for v18.1)
         fqk_weights_Q, fqk_mask_Q, fqk_soft_Q = self._threshold_select(
@@ -702,9 +700,12 @@ class GlobalRouters(nn.Module):
             overlap = (intersection / max_count).mean().item()
             return overlap
 
-        # Helper: get tau value as Python float
-        def tau_to_float(tau):
-            return tau.item() if torch.is_tensor(tau) else tau
+        # Helper: get tau mean/std (for token-level tau)
+        def tau_mean(tau):
+            return tau.mean().item() if torch.is_tensor(tau) else tau
+
+        def tau_std(tau):
+            return tau.std().item() if torch.is_tensor(tau) else 0.0
 
         routing_info = {
             # Average paths used per token
@@ -737,11 +738,15 @@ class GlobalRouters(nn.Module):
             'score_rqk_K_std': rqk_logits_K.std().item(),
             'score_rv_mean': rv_logits.mean().item(),
             'score_rv_std': rv_logits.std().item(),
-            # tau (v18.0: fixed scalar, v18.1: learnable parameter)
-            'tau_fqk': tau_to_float(tau_fqk),
-            'tau_fv': tau_to_float(tau_fv),
-            'tau_rqk': tau_to_float(tau_rqk),
-            'tau_rv': tau_to_float(tau_rv),
+            # tau (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
+            'tau_fqk': tau_mean(tau_fqk),
+            'tau_fqk_std': tau_std(tau_fqk),
+            'tau_fv': tau_mean(tau_fv),
+            'tau_fv_std': tau_std(tau_fv),
+            'tau_rqk': tau_mean(tau_rqk),
+            'tau_rqk_std': tau_std(tau_rqk),
+            'tau_rv': tau_mean(tau_rv),
+            'tau_rv_std': tau_std(tau_rv),
             'learnable_tau': self.learnable_tau,
             'use_soft_mask': self.use_soft_mask,
             'token_routing': self.attention_token_routing,
@@ -774,9 +779,9 @@ class GlobalRouters(nn.Module):
         """
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
-        # Get thresholds (v18.0: fixed, v18.1: learnable)
-        tau_f = self.get_tau('feature_know')
-        tau_r = self.get_tau('restore_know')
+        # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
+        tau_f = self.get_tau(x, 'feature_know')
+        tau_r = self.get_tau(x, 'restore_know')
 
         # Apply threshold selection (returns weights, mask, and soft_mask for v18.1)
         f_weights, f_mask, f_soft = self._threshold_select(
@@ -801,9 +806,12 @@ class GlobalRouters(nn.Module):
         def avg_selected_per_token(mask):
             return mask.float().sum(dim=-1).mean().item()
 
-        # Helper: get tau value as Python float
-        def tau_to_float(tau):
-            return tau.item() if torch.is_tensor(tau) else tau
+        # Helper: get tau mean/std (for token-level tau)
+        def tau_mean(tau):
+            return tau.mean().item() if torch.is_tensor(tau) else tau
+
+        def tau_std(tau):
+            return tau.std().item() if torch.is_tensor(tau) else 0.0
 
         know_info = {
             'n_paths_feature': avg_paths_per_token(f_paths),
@@ -816,9 +824,11 @@ class GlobalRouters(nn.Module):
             'score_feature_std': logits_f.std().item(),
             'score_restore_mean': logits_r.mean().item(),
             'score_restore_std': logits_r.std().item(),
-            # tau (v18.0: fixed scalar, v18.1: learnable parameter)
-            'tau_feature': tau_to_float(tau_f),
-            'tau_restore': tau_to_float(tau_r),
+            # tau (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
+            'tau_feature': tau_mean(tau_f),
+            'tau_feature_std': tau_std(tau_f),
+            'tau_restore': tau_mean(tau_r),
+            'tau_restore_std': tau_std(tau_r),
         }
 
         # Add soft mask activation mean (v18.1 only)
