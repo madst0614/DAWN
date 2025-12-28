@@ -1164,27 +1164,36 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         # v18.0: Fixed threshold multi-path logging
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
 
-                        # Paths (average across layers)
-                        n_fqk_Q = sum(ri.get('attention', ri).get('n_paths_fqk_Q', 0) for ri in routing_infos) / len(routing_infos)
-                        n_fqk_K = sum(ri.get('attention', ri).get('n_paths_fqk_K', 0) for ri in routing_infos) / len(routing_infos)
-                        n_fv = sum(ri.get('attention', ri).get('n_paths_fv', 0) for ri in routing_infos) / len(routing_infos)
-                        n_rqk_Q = sum(ri.get('attention', ri).get('n_paths_rqk_Q', 0) for ri in routing_infos) / len(routing_infos)
-                        n_rqk_K = sum(ri.get('attention', ri).get('n_paths_rqk_K', 0) for ri in routing_infos) / len(routing_infos)
-                        n_rv = sum(ri.get('attention', ri).get('n_paths_rv', 0) for ri in routing_infos) / len(routing_infos)
-                        n_kf = sum(ri.get('knowledge', {}).get('n_paths_feature', 0) for ri in routing_infos) / len(routing_infos)
-                        n_kr = sum(ri.get('knowledge', {}).get('n_paths_restore', 0) for ri in routing_infos) / len(routing_infos)
-                        print(f"      [v18] Paths: fqk_Q={n_fqk_Q:.1f} fqk_K={n_fqk_K:.1f} fv={n_fv:.1f} rqk_Q={n_rqk_Q:.1f} rqk_K={n_rqk_K:.1f} rv={n_rv:.1f} know_f={n_kf:.1f} know_r={n_kr:.1f}")
+                        # Helper for mean±std across layers
+                        def get_mean_std(key, sub='attention'):
+                            vals = [ri.get(sub, ri).get(key, 0) for ri in routing_infos]
+                            if not vals:
+                                return 0, 0
+                            mean = sum(vals) / len(vals)
+                            std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
+                            return mean, std
 
-                        # Selected neurons per token (average across layers)
-                        sel_fqk_Q = sum(ri.get('attention', ri).get('selected_fqk_Q', 0) for ri in routing_infos) / len(routing_infos)
-                        sel_fqk_K = sum(ri.get('attention', ri).get('selected_fqk_K', 0) for ri in routing_infos) / len(routing_infos)
-                        sel_fv = sum(ri.get('attention', ri).get('selected_fv', 0) for ri in routing_infos) / len(routing_infos)
-                        sel_rqk_Q = sum(ri.get('attention', ri).get('selected_rqk_Q', 0) for ri in routing_infos) / len(routing_infos)
-                        sel_rqk_K = sum(ri.get('attention', ri).get('selected_rqk_K', 0) for ri in routing_infos) / len(routing_infos)
-                        sel_rv = sum(ri.get('attention', ri).get('selected_rv', 0) for ri in routing_infos) / len(routing_infos)
-                        sel_kf = sum(ri.get('knowledge', {}).get('selected_feature', 0) for ri in routing_infos) / len(routing_infos)
-                        sel_kr = sum(ri.get('knowledge', {}).get('selected_restore', 0) for ri in routing_infos) / len(routing_infos)
-                        print(f"          Selected: fqk_Q={sel_fqk_Q:.1f} fqk_K={sel_fqk_K:.1f} fv={sel_fv:.1f} rqk_Q={sel_rqk_Q:.1f} rqk_K={sel_rqk_K:.1f} rv={sel_rv:.1f} know_f={sel_kf:.1f} know_r={sel_kr:.1f}")
+                        # Paths (mean±std across layers)
+                        p_fqk_Q, s_fqk_Q = get_mean_std('n_paths_fqk_Q')
+                        p_fqk_K, s_fqk_K = get_mean_std('n_paths_fqk_K')
+                        p_fv, s_fv = get_mean_std('n_paths_fv')
+                        p_rqk_Q, s_rqk_Q = get_mean_std('n_paths_rqk_Q')
+                        p_rqk_K, s_rqk_K = get_mean_std('n_paths_rqk_K')
+                        p_rv, s_rv = get_mean_std('n_paths_rv')
+                        p_kf, s_kf = get_mean_std('n_paths_feature', 'knowledge')
+                        p_kr, s_kr = get_mean_std('n_paths_restore', 'knowledge')
+                        print(f"      [v18] Paths: fqk_Q={p_fqk_Q:.1f}±{s_fqk_Q:.1f} fqk_K={p_fqk_K:.1f}±{s_fqk_K:.1f} fv={p_fv:.1f}±{s_fv:.1f} rqk_Q={p_rqk_Q:.1f}±{s_rqk_Q:.1f} rqk_K={p_rqk_K:.1f}±{s_rqk_K:.1f} rv={p_rv:.1f}±{s_rv:.1f} kf={p_kf:.1f}±{s_kf:.1f} kr={p_kr:.1f}±{s_kr:.1f}")
+
+                        # Selected neurons per token (mean±std across layers)
+                        sel_fqk_Q, ss_fqk_Q = get_mean_std('selected_fqk_Q')
+                        sel_fqk_K, ss_fqk_K = get_mean_std('selected_fqk_K')
+                        sel_fv, ss_fv = get_mean_std('selected_fv')
+                        sel_rqk_Q, ss_rqk_Q = get_mean_std('selected_rqk_Q')
+                        sel_rqk_K, ss_rqk_K = get_mean_std('selected_rqk_K')
+                        sel_rv, ss_rv = get_mean_std('selected_rv')
+                        sel_kf, ss_kf = get_mean_std('selected_feature', 'knowledge')
+                        sel_kr, ss_kr = get_mean_std('selected_restore', 'knowledge')
+                        print(f"          Selected: fqk_Q={sel_fqk_Q:.0f}±{ss_fqk_Q:.0f} fqk_K={sel_fqk_K:.0f}±{ss_fqk_K:.0f} fv={sel_fv:.0f}±{ss_fv:.0f} rqk_Q={sel_rqk_Q:.0f}±{ss_rqk_Q:.0f} rqk_K={sel_rqk_K:.0f}±{ss_rqk_K:.0f} rv={sel_rv:.0f}±{ss_rv:.0f} kf={sel_kf:.0f}±{ss_kf:.0f} kr={sel_kr:.0f}±{ss_kr:.0f}")
 
                         # Score distribution (mean±std, average across layers)
                         score_fqk_Q_mean = sum(ri.get('attention', ri).get('score_fqk_Q_mean', 0) for ri in routing_infos) / len(routing_infos)
