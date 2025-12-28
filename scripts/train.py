@@ -1141,23 +1141,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Compact output with loss/acc
                     model_version = getattr(base_model, '__version__', '')
                     if model_version.startswith('18'):
-                        # v18.0: Detailed adaptive threshold logging
+                        # v18.0: Fixed threshold multi-path logging
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str}")
-
-                        # Collect v18-specific info from routing_infos (average across layers)
-                        attn0 = routing_infos[0].get('attention', routing_infos[0])
-                        know0 = routing_infos[0].get('knowledge', {})
-
-                        # tau mean±std
-                        tau_fqk_m, tau_fqk_s = attn0.get('tau_fqk_mean', 0), attn0.get('tau_fqk_std', 0)
-                        tau_fv_m, tau_fv_s = attn0.get('tau_fv_mean', 0), attn0.get('tau_fv_std', 0)
-                        tau_rqk_m, tau_rqk_s = attn0.get('tau_rqk_mean', 0), attn0.get('tau_rqk_std', 0)
-                        tau_rv_m, tau_rv_s = attn0.get('tau_rv_mean', 0), attn0.get('tau_rv_std', 0)
-                        tau_kf_m, tau_kf_s = know0.get('tau_feature_mean', 0), know0.get('tau_feature_std', 0)
-                        tau_kr_m, tau_kr_s = know0.get('tau_restore_mean', 0), know0.get('tau_restore_std', 0)
-
-                        print(f"      [v18] Adaptive Threshold")
-                        print(f"          tau: fqk={tau_fqk_m:.2f}±{tau_fqk_s:.2f} fv={tau_fv_m:.2f}±{tau_fv_s:.2f} rqk={tau_rqk_m:.2f}±{tau_rqk_s:.2f} rv={tau_rv_m:.2f}±{tau_rv_s:.2f} know_f={tau_kf_m:.2f}±{tau_kf_s:.2f} know_r={tau_kr_m:.2f}±{tau_kr_s:.2f}")
 
                         # Paths (average across layers)
                         n_fqk_Q = sum(ri.get('attention', ri).get('n_paths_fqk_Q', 0) for ri in routing_infos) / len(routing_infos)
@@ -1168,7 +1153,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         n_rv = sum(ri.get('attention', ri).get('n_paths_rv', 0) for ri in routing_infos) / len(routing_infos)
                         n_kf = sum(ri.get('knowledge', {}).get('n_paths_feature', 0) for ri in routing_infos) / len(routing_infos)
                         n_kr = sum(ri.get('knowledge', {}).get('n_paths_restore', 0) for ri in routing_infos) / len(routing_infos)
-                        print(f"          Paths: fqk_Q={n_fqk_Q:.1f} fqk_K={n_fqk_K:.1f} fv={n_fv:.1f} rqk_Q={n_rqk_Q:.1f} rqk_K={n_rqk_K:.1f} rv={n_rv:.1f} know_f={n_kf:.1f} know_r={n_kr:.1f}")
+                        print(f"      [v18] Paths: fqk_Q={n_fqk_Q:.1f} fqk_K={n_fqk_K:.1f} fv={n_fv:.1f} rqk_Q={n_rqk_Q:.1f} rqk_K={n_rqk_K:.1f} rv={n_rv:.1f} know_f={n_kf:.1f} know_r={n_kr:.1f}")
 
                         # Activation ratio (average across layers)
                         act_fqk_Q = sum(ri.get('attention', ri).get('activation_fqk_Q', 0) for ri in routing_infos) / len(routing_infos)
@@ -1180,11 +1165,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         act_kf = sum(ri.get('knowledge', {}).get('activation_feature', 0) for ri in routing_infos) / len(routing_infos)
                         act_kr = sum(ri.get('knowledge', {}).get('activation_restore', 0) for ri in routing_infos) / len(routing_infos)
                         print(f"          Activation: fqk_Q={act_fqk_Q:.2f} fqk_K={act_fqk_K:.2f} fv={act_fv:.2f} rqk_Q={act_rqk_Q:.2f} rqk_K={act_rqk_K:.2f} rv={act_rv:.2f} know_f={act_kf:.2f} know_r={act_kr:.2f}")
-
-                        # tau_reg_loss
-                        if hasattr(base_model, 'tau_regularization_loss'):
-                            tau_reg = base_model.tau_regularization_loss().item()
-                            print(f"          tau_reg_loss: {tau_reg:.4f}")
 
                         # v18 Neuron Usage (integrated here, not in _get_router_log_lines)
                         router = base_model.router.neuron_router
@@ -1354,19 +1334,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         with torch.no_grad():
                             _, routing_infos_log = model(input_ids, return_activations=True)
                             if routing_infos_log:
-                                attn0 = routing_infos_log[0].get('attention', routing_infos_log[0])
-                                know0 = routing_infos_log[0].get('knowledge', {})
-
-                                # tau mean±std
-                                tau_fqk_m, tau_fqk_s = attn0.get('tau_fqk_mean', 0), attn0.get('tau_fqk_std', 0)
-                                tau_fv_m, tau_fv_s = attn0.get('tau_fv_mean', 0), attn0.get('tau_fv_std', 0)
-                                tau_rqk_m, tau_rqk_s = attn0.get('tau_rqk_mean', 0), attn0.get('tau_rqk_std', 0)
-                                tau_rv_m, tau_rv_s = attn0.get('tau_rv_mean', 0), attn0.get('tau_rv_std', 0)
-                                tau_kf_m, tau_kf_s = know0.get('tau_feature_mean', 0), know0.get('tau_feature_std', 0)
-                                tau_kr_m, tau_kr_s = know0.get('tau_restore_mean', 0), know0.get('tau_restore_std', 0)
-
-                                f.write(f"  [v18] tau: fqk={tau_fqk_m:.2f}±{tau_fqk_s:.2f} fv={tau_fv_m:.2f}±{tau_fv_s:.2f} rqk={tau_rqk_m:.2f}±{tau_rqk_s:.2f} rv={tau_rv_m:.2f}±{tau_rv_s:.2f} know_f={tau_kf_m:.2f}±{tau_kf_s:.2f} know_r={tau_kr_m:.2f}±{tau_kr_s:.2f}\n")
-
                                 # Paths (average)
                                 n_fqk_Q = sum(ri.get('attention', ri).get('n_paths_fqk_Q', 0) for ri in routing_infos_log) / len(routing_infos_log)
                                 n_fqk_K = sum(ri.get('attention', ri).get('n_paths_fqk_K', 0) for ri in routing_infos_log) / len(routing_infos_log)
@@ -1376,7 +1343,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                                 n_rv = sum(ri.get('attention', ri).get('n_paths_rv', 0) for ri in routing_infos_log) / len(routing_infos_log)
                                 n_kf = sum(ri.get('knowledge', {}).get('n_paths_feature', 0) for ri in routing_infos_log) / len(routing_infos_log)
                                 n_kr = sum(ri.get('knowledge', {}).get('n_paths_restore', 0) for ri in routing_infos_log) / len(routing_infos_log)
-                                f.write(f"  Paths: fqk_Q={n_fqk_Q:.1f} fqk_K={n_fqk_K:.1f} fv={n_fv:.1f} rqk_Q={n_rqk_Q:.1f} rqk_K={n_rqk_K:.1f} rv={n_rv:.1f} know_f={n_kf:.1f} know_r={n_kr:.1f}\n")
+                                f.write(f"  [v18] Paths: fqk_Q={n_fqk_Q:.1f} fqk_K={n_fqk_K:.1f} fv={n_fv:.1f} rqk_Q={n_rqk_Q:.1f} rqk_K={n_rqk_K:.1f} rv={n_rv:.1f} know_f={n_kf:.1f} know_r={n_kr:.1f}\n")
 
                                 # Activation ratio
                                 act_fqk_Q = sum(ri.get('attention', ri).get('activation_fqk_Q', 0) for ri in routing_infos_log) / len(routing_infos_log)
@@ -1388,11 +1355,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                                 act_kf = sum(ri.get('knowledge', {}).get('activation_feature', 0) for ri in routing_infos_log) / len(routing_infos_log)
                                 act_kr = sum(ri.get('knowledge', {}).get('activation_restore', 0) for ri in routing_infos_log) / len(routing_infos_log)
                                 f.write(f"  Activation: fqk_Q={act_fqk_Q:.2f} fqk_K={act_fqk_K:.2f} fv={act_fv:.2f} rqk_Q={act_rqk_Q:.2f} rqk_K={act_rqk_K:.2f} rv={act_rv:.2f} know_f={act_kf:.2f} know_r={act_kr:.2f}\n")
-
-                                # tau_reg_loss
-                                if hasattr(base_model, 'tau_regularization_loss'):
-                                    tau_reg = base_model.tau_regularization_loss().item()
-                                    f.write(f"  tau_reg_loss: {tau_reg:.4f}\n")
                         model.train()
                     except Exception:
                         pass
