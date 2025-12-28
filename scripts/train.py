@@ -820,7 +820,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
-                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0,
+                orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0, tau_reg_weight=0.0,
                 debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1,
                 total_epoch_steps=None, val_loader=None, val_interval=5000):
     """Train for one epoch
@@ -900,6 +900,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
                     diversity_loss = base_model.knowledge_diversity_loss()
 
+                # Tau regularization loss (v18.0)
+                tau_reg_loss = 0.0
+                if tau_reg_weight > 0 and hasattr(base_model, 'tau_regularization_loss'):
+                    tau_reg_loss = base_model.tau_regularization_loss()
+
                 # Load balance loss (from model.aux_loss)
                 lb_loss = 0.0
                 if load_balance_weight > 0:
@@ -909,7 +914,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         lb_loss = base_model.load_balance_loss(routing_infos)
 
                 # Total loss
-                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+                loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + tau_reg_weight * tau_reg_loss + load_balance_weight * lb_loss
 
                 # NaN/INF detection
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -956,6 +961,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
                 diversity_loss = base_model.knowledge_diversity_loss()
 
+            # Tau regularization loss (v18.0)
+            tau_reg_loss = 0.0
+            if tau_reg_weight > 0 and hasattr(base_model, 'tau_regularization_loss'):
+                tau_reg_loss = base_model.tau_regularization_loss()
+
             # Load balance loss (from model.aux_loss)
             lb_loss = 0.0
             if load_balance_weight > 0:
@@ -965,7 +975,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     lb_loss = base_model.load_balance_loss(routing_infos)
 
             # Total loss
-            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + load_balance_weight * lb_loss
+            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + tau_reg_weight * tau_reg_loss + load_balance_weight * lb_loss
 
             # NaN/INF detection
             if torch.isnan(loss) or torch.isinf(loss):
@@ -973,6 +983,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 print(f"  ce_loss: {ce_loss.item() if torch.is_tensor(ce_loss) else ce_loss}")
                 print(f"  orth_loss: {orth_loss.item() if torch.is_tensor(orth_loss) else orth_loss}")
                 print(f"  diversity_loss: {diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss}")
+                print(f"  tau_reg_loss: {tau_reg_loss.item() if torch.is_tensor(tau_reg_loss) else tau_reg_loss}")
                 print(f"  lb_loss: {lb_loss.item() if torch.is_tensor(lb_loss) else lb_loss}")
                 raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {step}")
 
@@ -1552,6 +1563,7 @@ def main():
     args.diversity_weight = cfg['training'].get('diversity_weight', 0.0)  # v7.0: recipe diversity
     args.load_balance_weight = cfg['training'].get('load_balance_weight', 0.0)  # v7.0: load balance
     args.entropy_weight = cfg['training'].get('entropy_weight', 0.0)  # router entropy loss
+    args.tau_reg_weight = cfg['training'].get('tau_reg_weight', 0.0)  # v18.0: tau regularization
     args.gradient_accumulation_steps = cfg['training'].get('gradient_accumulation_steps', 1)  # gradient accumulation
 
     # Other
@@ -1722,6 +1734,7 @@ def main():
             args.diversity_weight = checkpoint_training_config.get('diversity_weight', args.diversity_weight)
             args.load_balance_weight = checkpoint_training_config.get('load_balance_weight', args.load_balance_weight)
             args.entropy_weight = checkpoint_training_config.get('entropy_weight', args.entropy_weight)
+            args.tau_reg_weight = checkpoint_training_config.get('tau_reg_weight', args.tau_reg_weight)
             print(f"   → Training params: batch={args.batch_size}, epochs={args.num_epochs}, lr={args.lr}")
 
         print(f"   → Updated args from checkpoint config (v{args.model_version})")
@@ -1765,6 +1778,8 @@ def main():
         reg_parts.append(f"lb={args.load_balance_weight}")
     if args.entropy_weight > 0:
         reg_parts.append(f"ent={args.entropy_weight}")
+    if args.tau_reg_weight > 0:
+        reg_parts.append(f"tau={args.tau_reg_weight}")
     if reg_parts:
         print(f"Regularization: {', '.join(reg_parts)}")
 
@@ -1984,6 +1999,7 @@ def main():
             diversity_weight=args.diversity_weight,
             load_balance_weight=args.load_balance_weight,
             entropy_weight=args.entropy_weight,
+            tau_reg_weight=args.tau_reg_weight,
             total_epoch_steps=steps_per_epoch,  # Full epoch steps for progress bar
             debug_logger=debug_logger,
             ckpt_manager=ckpt_manager,
