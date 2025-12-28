@@ -1063,6 +1063,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ent_str = log_info['ent_str']
                     var_str = log_info['var_str']
                     overlap_str = log_info['overlap_str']
+                    paths_str = log_info.get('paths_str')  # v18 only
+                    tau_str = log_info.get('tau_str')  # v18 only
 
                     # Attention ratio (attn_out_norm vs mem/know_out_norm per layer)
                     attn_ratios = []
@@ -1082,7 +1084,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     avg_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
 
                     # Compact output with loss/acc
-                    if overlap_str:
+                    if paths_str and tau_str:
+                        # v18.0: Show path counts and tau values
+                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str}")
+                        print(f"         {paths_str} | {tau_str}")
+                    elif overlap_str:
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
                     else:
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
@@ -1192,6 +1198,30 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             with open(log_file, 'a') as f:
                 # Basic loss/acc line
                 f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
+
+                # Add v18 routing info (paths, tau) if available
+                if needs_routing_info(model):
+                    try:
+                        model.eval()
+                        with torch.no_grad():
+                            _, routing_infos_log = model(input_ids, return_activations=True)
+                            if routing_infos_log:
+                                def calc_ent(pref):
+                                    if pref is None:
+                                        return 0.0
+                                    ent = -(pref * (pref + 1e-8).log()).sum(-1).mean()
+                                    return (ent / math.log(pref.shape[-1]) * 100).item()
+                                def calc_var(pref):
+                                    if pref is None:
+                                        return 0.0
+                                    return pref.var(dim=1).mean().item()
+                                log_info_file = get_routing_log_info(routing_infos_log, calc_ent, calc_var)
+                                # v18: paths_str and tau_str
+                                if log_info_file.get('paths_str') and log_info_file.get('tau_str'):
+                                    f.write(f"  {log_info_file['paths_str']} | {log_info_file['tau_str']}\n")
+                        model.train()
+                    except Exception:
+                        pass
 
                 # Add router metrics (same format as console)
                 router = None
