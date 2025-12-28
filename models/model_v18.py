@@ -891,15 +891,12 @@ class DAWNBlock(nn.Module):
         know_out = self.knowledge(normed_x, feature_paths, restore_paths, attention_mask)
         x = x + know_out
 
-        # Routing info
-        attn_out_norm = attn_out.norm(dim=-1).mean().detach()
-        know_out_norm = know_out.norm(dim=-1).mean().detach()
-
+        # Routing info (all scalar values - no tensor storage to avoid memory leak)
         routing_info = {
             'attention': attn_info,
             'knowledge': know_info,
-            'attn_out_norm': attn_out_norm,
-            'know_out_norm': know_out_norm,
+            'attn_out_norm': attn_out.norm(dim=-1).mean().item(),
+            'know_out_norm': know_out.norm(dim=-1).mean().item(),
         }
 
         return x, routing_info, attn_aux_loss
