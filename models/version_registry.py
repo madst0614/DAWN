@@ -310,24 +310,24 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
 
     # v18.0: Fixed Threshold Multi-Path (has n_paths_* keys)
     # Note: v18 doesn't store _pref tensors to avoid memory leaks
-    # Uses activation ratios instead of entropy/variance
+    # Uses selected neuron counts and score distribution instead of entropy/variance
     if attn0.get('n_paths_fqk_Q') is not None:
-        # Activation ratios (fraction of neurons selected)
-        act_fqk_Q = attn0.get('activation_fqk_Q', 0)
-        act_fqk_K = attn0.get('activation_fqk_K', 0)
-        act_fv = attn0.get('activation_fv', 0)
-        act_rqk_Q = attn0.get('activation_rqk_Q', 0)
-        act_rqk_K = attn0.get('activation_rqk_K', 0)
-        act_rv = attn0.get('activation_rv', 0)
+        # Selected neurons per token (more informative than activation ratio)
+        sel_fqk_Q = attn0.get('selected_fqk_Q', 0)
+        sel_fqk_K = attn0.get('selected_fqk_K', 0)
+        sel_fv = attn0.get('selected_fv', 0)
+        sel_rqk_Q = attn0.get('selected_rqk_Q', 0)
+        sel_rqk_K = attn0.get('selected_rqk_K', 0)
+        sel_rv = attn0.get('selected_rv', 0)
 
-        # Format activation string (percentage of neurons activated)
-        act_str = f"Act F-QK:{act_fqk_Q:.1%}/{act_fqk_K:.1%} FV:{act_fv:.1%} R-QK:{act_rqk_Q:.1%}/{act_rqk_K:.1%} RV:{act_rv:.1%}"
+        # Format selected neurons string
+        sel_str = f"Sel FQK:{sel_fqk_Q:.0f}/{sel_fqk_K:.0f} FV:{sel_fv:.0f} RQK:{sel_rqk_Q:.0f}/{sel_rqk_K:.0f} RV:{sel_rv:.0f}"
 
         # v18 specific: path counts
-        n_paths = f"Paths FQK:{attn0.get('n_paths_fqk_Q', 0)}/{attn0.get('n_paths_fqk_K', 0)} FV:{attn0.get('n_paths_fv', 0)} RQK:{attn0.get('n_paths_rqk_Q', 0)}/{attn0.get('n_paths_rqk_K', 0)} RV:{attn0.get('n_paths_rv', 0)}"
+        n_paths = f"Paths FQK:{attn0.get('n_paths_fqk_Q', 0):.1f}/{attn0.get('n_paths_fqk_K', 0):.1f} FV:{attn0.get('n_paths_fv', 0):.1f} RQK:{attn0.get('n_paths_rqk_Q', 0):.1f}/{attn0.get('n_paths_rqk_K', 0):.1f} RV:{attn0.get('n_paths_rv', 0):.1f}"
 
         return {
-            'ent_str': act_str,  # Use activation instead of entropy for v18
+            'ent_str': sel_str,  # Use selected neurons instead of entropy for v18
             'var_str': None,  # No variance tracking for v18
             'overlap_str': None,
             'paths_str': n_paths,

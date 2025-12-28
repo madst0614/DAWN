@@ -563,6 +563,11 @@ class GlobalRouters(nn.Module):
         def avg_paths_per_token(paths):
             return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
 
+        # Helper: average selected neurons per token
+        def avg_selected_per_token(mask):
+            # mask: [B, S, N] -> sum over N, mean over B, S
+            return mask.float().sum(dim=-1).mean().item()
+
         routing_info = {
             # Average paths used per token
             'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
@@ -571,22 +576,31 @@ class GlobalRouters(nn.Module):
             'n_paths_rqk_Q': avg_paths_per_token(rqk_paths_Q),
             'n_paths_rqk_K': avg_paths_per_token(rqk_paths_K),
             'n_paths_rv': avg_paths_per_token(rv_paths),
+            # Average selected neurons per token
+            'selected_fqk_Q': avg_selected_per_token(fqk_mask_Q),
+            'selected_fqk_K': avg_selected_per_token(fqk_mask_K),
+            'selected_fv': avg_selected_per_token(fv_mask),
+            'selected_rqk_Q': avg_selected_per_token(rqk_mask_Q),
+            'selected_rqk_K': avg_selected_per_token(rqk_mask_K),
+            'selected_rv': avg_selected_per_token(rv_mask),
+            # Score statistics (logits mean ± std)
+            'score_fqk_Q_mean': fqk_logits_Q.mean().item(),
+            'score_fqk_Q_std': fqk_logits_Q.std().item(),
+            'score_fqk_K_mean': fqk_logits_K.mean().item(),
+            'score_fqk_K_std': fqk_logits_K.std().item(),
+            'score_fv_mean': fv_logits.mean().item(),
+            'score_fv_std': fv_logits.std().item(),
+            'score_rqk_Q_mean': rqk_logits_Q.mean().item(),
+            'score_rqk_Q_std': rqk_logits_Q.std().item(),
+            'score_rqk_K_mean': rqk_logits_K.mean().item(),
+            'score_rqk_K_std': rqk_logits_K.std().item(),
+            'score_rv_mean': rv_logits.mean().item(),
+            'score_rv_std': rv_logits.std().item(),
             # tau (fixed scalar)
-            'tau_fqk_mean': tau_fqk,
-            'tau_fqk_std': 0.0,
-            'tau_fv_mean': tau_fv,
-            'tau_fv_std': 0.0,
-            'tau_rqk_mean': tau_rqk,
-            'tau_rqk_std': 0.0,
-            'tau_rv_mean': tau_rv,
-            'tau_rv_std': 0.0,
-            # Activation ratio from mask (fraction of selected neurons)
-            'activation_fqk_Q': fqk_mask_Q.float().mean().item(),
-            'activation_fqk_K': fqk_mask_K.float().mean().item(),
-            'activation_fv': fv_mask.float().mean().item(),
-            'activation_rqk_Q': rqk_mask_Q.float().mean().item(),
-            'activation_rqk_K': rqk_mask_K.float().mean().item(),
-            'activation_rv': rv_mask.float().mean().item(),
+            'tau_fqk': tau_fqk,
+            'tau_fv': tau_fv,
+            'tau_rqk': tau_rqk,
+            'tau_rv': tau_rv,
             'token_routing': self.attention_token_routing,
         }
 
@@ -631,17 +645,24 @@ class GlobalRouters(nn.Module):
         def avg_paths_per_token(paths):
             return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
 
+        # Helper: average selected neurons per token
+        def avg_selected_per_token(mask):
+            return mask.float().sum(dim=-1).mean().item()
+
         know_info = {
             'n_paths_feature': avg_paths_per_token(f_paths),
             'n_paths_restore': avg_paths_per_token(r_paths),
+            # Average selected neurons per token
+            'selected_feature': avg_selected_per_token(f_mask),
+            'selected_restore': avg_selected_per_token(r_mask),
+            # Score statistics (logits mean ± std)
+            'score_feature_mean': logits_f.mean().item(),
+            'score_feature_std': logits_f.std().item(),
+            'score_restore_mean': logits_r.mean().item(),
+            'score_restore_std': logits_r.std().item(),
             # tau (fixed scalar)
-            'tau_feature_mean': tau_f,
-            'tau_feature_std': 0.0,
-            'tau_restore_mean': tau_r,
-            'tau_restore_std': 0.0,
-            # Activation ratio from mask
-            'activation_feature': f_mask.float().mean().item(),
-            'activation_restore': r_mask.float().mean().item(),
+            'tau_feature': tau_f,
+            'tau_restore': tau_r,
         }
 
         return f_paths, r_paths, know_info
