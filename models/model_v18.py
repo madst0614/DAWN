@@ -583,7 +583,7 @@ class GlobalRouters(nn.Module):
             'tau_rqk_std': 0.0,
             'tau_rv_mean': tau_rv,
             'tau_rv_std': 0.0,
-            # Activation ratio (soft weights mean)
+            # Activation ratio (scalar values only - no tensor storage)
             'activation_fqk_Q': fqk_soft_Q.detach().mean().item(),
             'activation_fqk_K': fqk_soft_K.detach().mean().item(),
             'activation_fv': fv_soft.detach().mean().item(),
@@ -591,14 +591,6 @@ class GlobalRouters(nn.Module):
             'activation_rqk_K': rqk_soft_K.detach().mean().item(),
             'activation_rv': rv_soft.detach().mean().item(),
             'token_routing': self.attention_token_routing,
-            # Soft weights for entropy calculation (normalized to pseudo-probability)
-            # Use softmax over logits for proper entropy computation
-            'fqk_q_pref': F.softmax(fqk_logits_Q.detach(), dim=-1),
-            'fqk_k_pref': F.softmax(fqk_logits_K.detach(), dim=-1),
-            'fv_pref': F.softmax(fv_logits.detach(), dim=-1),
-            'rqk_q_pref': F.softmax(rqk_logits_Q.detach(), dim=-1),
-            'rqk_k_pref': F.softmax(rqk_logits_K.detach(), dim=-1),
-            'rv_pref': F.softmax(rv_logits.detach(), dim=-1),
         }
 
         # Update usage with combined weights from all paths
