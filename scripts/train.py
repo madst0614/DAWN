@@ -1342,7 +1342,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     try:
                         model.eval()
                         with torch.no_grad():
-                            _, routing_infos_log = model(input_ids, return_activations=True)
+                            _, routing_infos_log = model(input_ids, return_routing_info=True)
                             if routing_infos_log:
                                 # Paths (average)
                                 n_fqk_Q = sum(ri.get('attention', ri).get('n_paths_fqk_Q', 0) for ri in routing_infos_log) / len(routing_infos_log)
@@ -1385,7 +1385,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             model.eval()
             with torch.no_grad():
                 try:
-                    _, neuron_indices = model(input_ids, return_activations=True)
+                    _, neuron_indices = model(input_ids, return_routing_info=True)
                     neuron_metrics = compute_training_metrics(model, neuron_indices, device)
                     last_neuron_metrics = neuron_metrics
 
