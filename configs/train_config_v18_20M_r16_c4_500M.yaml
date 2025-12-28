@@ -35,7 +35,7 @@ model:
   # Knowledge - Feature-Restore pattern
   n_feature_know: 160
   n_restore_know: 160
-  knowledge_rank: 48
+  knowledge_rank: 16
 
   max_seq_len: 512
   dropout: 0.1

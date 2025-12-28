@@ -34,7 +34,7 @@ model:
   # Knowledge - Feature-Restore pattern
   n_feature_know: 160
   n_restore_know: 160
-  knowledge_rank: 48
+  knowledge_rank: 16
   top_k_feature_know: 48
   top_k_restore_know: 48
 
