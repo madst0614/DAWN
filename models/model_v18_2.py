@@ -483,7 +483,14 @@ class GlobalRouters(nn.Module):
             keep_mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, topk_idx, True)
             mask = mask & keep_mask
 
-        # 4. Apply mask and softmax
+        # 4. Fallback: force top-1 selection for tokens with all-False mask
+        if not mask.any(dim=-1).all():
+            _, top1_idx = scores.topk(1, dim=-1)
+            fallback = torch.zeros_like(mask).scatter_(-1, top1_idx, True)
+            no_selection = ~mask.any(dim=-1, keepdim=True)
+            mask = mask | (no_selection & fallback)
+
+        # 5. Apply mask and softmax (now guaranteed at least 1 True per token)
         masked_scores = scores.masked_fill(~mask, float('-inf'))
         weights = F.softmax(masked_scores, dim=-1)
 
