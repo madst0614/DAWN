@@ -1,11 +1,15 @@
 """
 DAWN Models Module
 
+v18.2: ReLU-Masked Learnable Tau (Q/K separated)
+- ReLU mask: mask = (ReLU(scores - tau) > 0)
+- Learnable tau: token-level tau via nn.Linear(d_model, 8) - Q/K separated
+- Hard masking with differentiable tau learning
+
 v18.1: Soft Mask + Token-level Learnable Tau
 - Soft mask: sigmoid((score - tau) / temp) instead of hard threshold
-- Learnable tau: token-level tau via nn.Linear(d_model, 6)
-- Penalty-based masking: low-score neurons get penalty instead of -inf
-- Gradients flow through all neurons (differentiable routing)
+- Learnable tau: token-level tau via nn.Linear(d_model, 8)
+- Gate-based scoring: weights = softmax(scores * gate)
 
 v18.0: Fixed Threshold Multi-Path Routing
 - Fixed threshold + masked softmax for neuron selection
@@ -25,6 +29,9 @@ v17.2: Feature QK Unified + Restore Q/K Separate
 
 baseline: Vanilla Transformer for fair comparison
 """
+
+# v18.2 - ReLU-Masked Learnable Tau
+from .model_v18_2 import DAWN as DAWN_v18_2
 
 # v18.1 - Soft Mask + Token-level Learnable Tau
 from .model_v18_1 import DAWN as DAWN_v18_1
@@ -63,6 +70,7 @@ from .version_registry import (
 __all__ = [
     # Models
     'DAWN',
+    'DAWN_v18_2',
     'DAWN_v18_1',
     'DAWN_v18',
     'DAWN_v17_2',
@@ -91,7 +99,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "18.1", "18.0", "17.2", "17.1", or "baseline"
+        version: "18.2", "18.1", "18.0", "17.2", "17.1", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -102,7 +110,9 @@ def create_model_by_version(version, config):
 
     version = normalize_version(version)
 
-    if version == "18.1":
+    if version == "18.2":
+        return DAWN_v18_2(**config)
+    elif version == "18.1":
         return DAWN_v18_1(**config)
     elif version == "18.0":
         return DAWN_v18(**config)
@@ -112,4 +122,4 @@ def create_model_by_version(version, config):
         return DAWN_v17_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 18.1, 18.0, 17.2, 17.1, baseline")
+                        f"Supported versions: 18.2, 18.1, 18.0, 17.2, 17.1, baseline")

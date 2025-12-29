@@ -2,6 +2,7 @@
 DAWN Model Version Registry - Single Source of Truth
 
 Supported Versions:
+  v18.2: ReLU-Masked Learnable Tau (mask = ReLU(scores - tau) > 0, Q/K separated)
   v18.1: Soft Mask + Learnable Tau (use_soft_mask=True, learnable_tau=True)
   v18.0: Fixed Threshold Multi-Path Routing (rank=16, max_paths=4, fixed_tau=0.0, path_min_k=8, path_max_k=16)
   v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
@@ -14,6 +15,47 @@ import torch
 
 
 VERSION_REGISTRY = {
+    "18.2": {
+        "description": "ReLU-Masked Learnable Tau (Q/K separated)",
+        "aliases": ["182"],
+        "module": "model_v18_2",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "max_paths": 4,
+            "fixed_tau": 0.0,
+            "path_min_k": 8,
+            "path_max_k": 16,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "attention_token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+            # v18.2 specific
+            "use_soft_mask": True,
+            "learnable_tau": True,
+            "soft_mask_temp": 1.0,
+        },
+        "display_info": lambda args: [
+            f"DAWN v18.2: ReLU-Masked Learnable Tau",
+            f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}",
+            f"  fixed_tau={args.get('fixed_tau', 0.0)}, path_min_k={args.get('path_min_k', 8)}, path_max_k={args.get('path_max_k', 16)}",
+            f"  F-QK: {args.get('n_feature_qk')} - Q/K separated tau",
+            f"  F-V: {args.get('n_feature_v')}",
+            f"  R-QK: {args.get('n_restore_qk')} - Q/K separated tau",
+            f"  R-V: {args.get('n_restore_v')}",
+            f"  F-Know: {args.get('n_feature_know')}, R-Know: {args.get('n_restore_know')}",
+        ],
+    },
+
     "18.1": {
         "description": "Soft Mask + Learnable Tau",
         "aliases": ["181"],
