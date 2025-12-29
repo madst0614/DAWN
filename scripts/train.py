@@ -1253,8 +1253,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         print(f"          Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
                         print(f"          Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
 
-                        # v18.1 specific: learnable tau and soft mask
-                        if model_version.startswith('18.1'):
+                        # v18.1/v18.2 specific: learnable tau and soft mask
+                        if model_version.startswith('18.1') or model_version.startswith('18.2'):
                             # Tau values from learnable parameters
                             tau_vals = base_model.router.get_all_tau_values()
                             if tau_vals:
@@ -1264,6 +1264,24 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                                 else:
                                     # v18.0 format (fqk, fv, rqk, rv)
                                     print(f"          Tau: fqk={tau_vals.get('fqk', 0):.3f} fv={tau_vals.get('fv', 0):.3f} rqk={tau_vals.get('rqk', 0):.3f} rv={tau_vals.get('rv', 0):.3f} kF={tau_vals.get('feature_know', 0):.3f} kR={tau_vals.get('restore_know', 0):.3f}")
+
+                            # Tau values from routing_info (actual per-forward values, averaged across layers)
+                            if routing_infos:
+                                tau_fq = sum(ri.get('attention', {}).get('tau_fq', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_fk = sum(ri.get('attention', {}).get('tau_fk', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_fv = sum(ri.get('attention', {}).get('tau_fv', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_rq = sum(ri.get('attention', {}).get('tau_rq', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_rk = sum(ri.get('attention', {}).get('tau_rk', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_rv = sum(ri.get('attention', {}).get('tau_rv', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_kf = sum(ri.get('knowledge', {}).get('tau_feature', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_kr = sum(ri.get('knowledge', {}).get('tau_restore', 0) for ri in routing_infos) / len(routing_infos)
+                                print(f"          Tau(fwd): fq={tau_fq:.2f} fk={tau_fk:.2f} fv={tau_fv:.2f} rq={tau_rq:.2f} rk={tau_rk:.2f} rv={tau_rv:.2f} kf={tau_kf:.2f} kr={tau_kr:.2f}")
+
+                            # tau_proj gradient norm
+                            if hasattr(base_model.router, 'tau_proj') and base_model.router.tau_proj.weight.grad is not None:
+                                tau_w_grad = base_model.router.tau_proj.weight.grad.norm().item()
+                                tau_b_grad = base_model.router.tau_proj.bias.grad.norm().item() if base_model.router.tau_proj.bias.grad is not None else 0
+                                print(f"          Tau grad: weight={tau_w_grad:.6f} bias={tau_b_grad:.6f}")
 
                             # Gate/Adjusted mean values (from first routing info)
                             if routing_infos and routing_infos[0].get('use_soft_mask'):
@@ -1451,11 +1469,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                                 score_rv_std = sum(ri.get('attention', ri).get('score_rv_std', 0) for ri in routing_infos_log) / len(routing_infos_log)
                                 f.write(f"  Score: fqk={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f}\n")
 
-                                # v18.1 specific: tau and soft mask
-                                if model_version.startswith('18.1'):
+                                # v18.1/v18.2 specific: tau and soft mask
+                                if model_version.startswith('18.1') or model_version.startswith('18.2'):
                                     tau_vals = base_model.router.get_all_tau_values()
                                     if tau_vals:
-                                        f.write(f"  Tau: fqk={tau_vals['fqk']:.3f} fv={tau_vals['fv']:.3f} rqk={tau_vals['rqk']:.3f} rv={tau_vals['rv']:.3f} kF={tau_vals['feature_know']:.3f} kR={tau_vals['restore_know']:.3f}\n")
+                                        # v18.2: Q/K separated tau (fq, fk, fv, rq, rk, rv)
+                                        if 'fq' in tau_vals:
+                                            f.write(f"  Tau: fq={tau_vals['fq']:.3f} fk={tau_vals['fk']:.3f} fv={tau_vals['fv']:.3f} rq={tau_vals['rq']:.3f} rk={tau_vals['rk']:.3f} rv={tau_vals['rv']:.3f} kF={tau_vals['feature_know']:.3f} kR={tau_vals['restore_know']:.3f}\n")
+                                        else:
+                                            f.write(f"  Tau: fqk={tau_vals['fqk']:.3f} fv={tau_vals['fv']:.3f} rqk={tau_vals['rqk']:.3f} rv={tau_vals['rv']:.3f} kF={tau_vals['feature_know']:.3f} kR={tau_vals['restore_know']:.3f}\n")
 
                                     if routing_infos_log and routing_infos_log[0].get('use_soft_mask'):
                                         ri0 = routing_infos_log[0]
