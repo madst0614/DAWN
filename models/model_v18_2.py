@@ -473,8 +473,8 @@ class GlobalRouters(nn.Module):
             mask: [B, S, N] boolean mask (gate > 0) for statistics
             gate: [B, S, N] gate values (ReLU output)
         """
-        # Soft gate (ReLU)
-        gate = F.relu(scores - tau)
+        # Soft gate (ReLU with temperature)
+        gate = F.relu((scores - tau) / self.gate_temp)
 
         # Softmax + gate
         weights = F.softmax(scores, dim=-1) * gate
