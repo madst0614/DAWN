@@ -414,9 +414,6 @@ class GlobalRouters(nn.Module):
             # Initialize bias to -1.0: ensures most neurons pass initially
             nn.init.constant_(self.tau_proj.bias, -1.0)
 
-        # Gate temperature for soft gating
-        self.gate_temp = nn.Parameter(torch.tensor(1.0))
-
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
             n_feature_know, n_restore_know,
@@ -478,32 +475,27 @@ class GlobalRouters(nn.Module):
 
     def _threshold_select(self, scores, tau, path_max_k, max_paths):
         """
-        Apply soft gate selection with ReLU.
+        Log-gated threshold selection.
+        - tau 위: 정상 경쟁 (log scale boost)
+        - tau 아래: log(eps) ≈ -18 → softmax에서 거의 0
+        - gradient가 tau로 흐름 (학습됨)
 
         Args:
             scores: [B, S, N] neuron scores
             tau: scalar or [B, S, 1] tensor threshold
-            path_max_k: max neurons per path (unused in soft mode)
-            max_paths: maximum number of paths (unused in soft mode)
+            path_max_k: max neurons per path (unused)
+            max_paths: maximum number of paths (unused)
 
         Returns:
-            weights: [B, S, N] gated softmax weights
-            mask: [B, S, N] boolean mask (gate > 0) for statistics
-            gate: [B, S, N] gate values (ReLU output)
+            weights: [B, S, N] softmax weights
+            mask: [B, S, N] boolean mask (scores > tau) for statistics
+            gate: [B, S, N] gate values (ReLU + eps)
         """
-        # Soft gate (ReLU with temperature)
-        gate = F.relu((scores - tau) / self.gate_temp)
+        gate = F.relu(scores - tau) + 1e-8
+        masked_scores = scores + torch.log(gate)
+        weights = F.softmax(masked_scores, dim=-1)
 
-        # Softmax + gate
-        weights = F.softmax(scores, dim=-1) * gate
-
-        # Renormalize
-        weight_sum = weights.sum(dim=-1, keepdim=True)
-        weights = torch.where(weight_sum > 1e-8,
-                              weights / weight_sum,
-                              torch.zeros_like(weights))
-
-        mask = gate > 0  # 통계용
+        mask = (scores > tau)  # 통계용
         return weights, mask, gate
 
     def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
