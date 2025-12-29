@@ -108,11 +108,13 @@ class UnifiedNeuronRouter(nn.Module):
 
         # Feature_know
         h_feature_know = self.dropout(self.proj_feature_know(x))
+        h_feature_know = F.normalize(h_feature_know, dim=-1)
         emb_feature_know = emb_norm[self.restore_v_end:self.feature_know_end]
         logits_feature_know = torch.einsum('bsd,nd->bsn', h_feature_know, emb_feature_know)
 
         # Restore_know
         h_restore_know = self.dropout(self.proj_restore_know(x))
+        h_restore_know = F.normalize(h_restore_know, dim=-1)
         emb_restore_know = emb_norm[self.feature_know_end:]
         logits_restore_know = torch.einsum('bsd,nd->bsn', h_restore_know, emb_restore_know)
 
@@ -124,6 +126,14 @@ class UnifiedNeuronRouter(nn.Module):
 
         all_proj = self.dropout(self.proj_all(x))
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = all_proj.chunk(6, dim=-1)
+
+        # Normalize projections → cosine similarity [-1, 1]
+        h_fqk_Q = F.normalize(h_fqk_Q, dim=-1)
+        h_fqk_K = F.normalize(h_fqk_K, dim=-1)
+        h_fv = F.normalize(h_fv, dim=-1)
+        h_rqk_Q = F.normalize(h_rqk_Q, dim=-1)
+        h_rqk_K = F.normalize(h_rqk_K, dim=-1)
+        h_rv = F.normalize(h_rv, dim=-1)
 
         fqk_emb = emb_norm[:self.feature_qk_end]
         fv_emb = emb_norm[self.feature_qk_end:self.feature_v_end]
@@ -390,9 +400,8 @@ class GlobalRouters(nn.Module):
             # Output: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
             self.tau_proj = nn.Linear(d_model, 8)
             nn.init.zeros_(self.tau_proj.weight)
-            # Initialize bias to -1.0 to ensure neurons pass initially
-            # (scores are normalized cosine similarity, typically in [-1, 1])
-            nn.init.constant_(self.tau_proj.bias, -1.0)
+            # Initialize bias to -0.5: selects neurons with cosine > -0.5 (~75% pass)
+            nn.init.constant_(self.tau_proj.bias, -0.5)
 
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
@@ -483,14 +492,7 @@ class GlobalRouters(nn.Module):
             keep_mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, topk_idx, True)
             mask = mask & keep_mask
 
-        # 4. Fallback: force top-1 selection for tokens with all-False mask
-        if not mask.any(dim=-1).all():
-            _, top1_idx = scores.topk(1, dim=-1)
-            fallback = torch.zeros_like(mask).scatter_(-1, top1_idx, True)
-            no_selection = ~mask.any(dim=-1, keepdim=True)
-            mask = mask | (no_selection & fallback)
-
-        # 5. Apply mask and softmax (now guaranteed at least 1 True per token)
+        # 4. Apply mask and softmax
         masked_scores = scores.masked_fill(~mask, float('-inf'))
         weights = F.softmax(masked_scores, dim=-1)
 
