@@ -403,8 +403,8 @@ class GlobalRouters(nn.Module):
             # Output: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
             self.tau_proj = nn.Linear(d_model, 8)
             nn.init.zeros_(self.tau_proj.weight)
-            # Initialize bias to -0.5: selects neurons with cosine > -0.5 (~75% pass)
-            nn.init.constant_(self.tau_proj.bias, -0.5)
+            # Initialize bias to -1.0: ensures most neurons pass initially
+            nn.init.constant_(self.tau_proj.bias, -1.0)
 
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
