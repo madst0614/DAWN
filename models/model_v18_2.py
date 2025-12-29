@@ -71,8 +71,13 @@ class UnifiedNeuronRouter(nn.Module):
         self.proj_restore_know = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
-        # LayerNorm for each projection output
-        self.norm_all = nn.LayerNorm(d_space)
+        # LayerNorm for each projection output (separate for each pool)
+        self.norm_fqk_Q = nn.LayerNorm(d_space)
+        self.norm_fqk_K = nn.LayerNorm(d_space)
+        self.norm_fv = nn.LayerNorm(d_space)
+        self.norm_rqk_Q = nn.LayerNorm(d_space)
+        self.norm_rqk_K = nn.LayerNorm(d_space)
+        self.norm_rv = nn.LayerNorm(d_space)
         self.norm_feature_know = nn.LayerNorm(d_space)
         self.norm_restore_know = nn.LayerNorm(d_space)
 
@@ -130,13 +135,13 @@ class UnifiedNeuronRouter(nn.Module):
         all_proj = self.dropout(self.proj_all(x))
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = all_proj.chunk(6, dim=-1)
 
-        # Apply LayerNorm to each projection
-        h_fqk_Q = self.norm_all(h_fqk_Q)
-        h_fqk_K = self.norm_all(h_fqk_K)
-        h_fv = self.norm_all(h_fv)
-        h_rqk_Q = self.norm_all(h_rqk_Q)
-        h_rqk_K = self.norm_all(h_rqk_K)
-        h_rv = self.norm_all(h_rv)
+        # Apply LayerNorm to each projection (separate for each pool)
+        h_fqk_Q = self.norm_fqk_Q(h_fqk_Q)
+        h_fqk_K = self.norm_fqk_K(h_fqk_K)
+        h_fv = self.norm_fv(h_fv)
+        h_rqk_Q = self.norm_rqk_Q(h_rqk_Q)
+        h_rqk_K = self.norm_rqk_K(h_rqk_K)
+        h_rv = self.norm_rv(h_rv)
 
         fqk_emb = emb_norm[:self.feature_qk_end]
         fv_emb = emb_norm[self.feature_qk_end:self.feature_v_end]
