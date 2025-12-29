@@ -1255,62 +1255,51 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                         # v18.1/v18.2 specific: learnable tau and soft mask
                         if model_version.startswith('18.1') or model_version.startswith('18.2'):
-                            # Tau values from learnable parameters
-                            tau_vals = base_model.router.get_all_tau_values()
-                            if tau_vals:
-                                # v18.1/v18.2: Q/K separated tau (fq, fk, fv, rq, rk, rv)
-                                if 'fq' in tau_vals:
-                                    print(f"          Tau: fQ={tau_vals['fq']:.3f} fK={tau_vals['fk']:.3f} fV={tau_vals['fv']:.3f} rQ={tau_vals['rq']:.3f} rK={tau_vals['rk']:.3f} rV={tau_vals['rv']:.3f} kF={tau_vals['feature_know']:.3f} kR={tau_vals['restore_know']:.3f}")
-                                else:
-                                    # v18.0 format (fqk, fv, rqk, rv)
-                                    print(f"          Tau: fqk={tau_vals.get('fqk', 0):.3f} fv={tau_vals.get('fv', 0):.3f} rqk={tau_vals.get('rqk', 0):.3f} rv={tau_vals.get('rv', 0):.3f} kF={tau_vals.get('feature_know', 0):.3f} kR={tau_vals.get('restore_know', 0):.3f}")
-
-                            # Tau values from routing_info (actual per-forward values, averaged across layers)
+                            # Tau and Gate from routing_info (averaged across layers)
                             if routing_infos:
+                                # Tau with std
                                 tau_fq = sum(ri.get('attention', {}).get('tau_fq', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_fq_std = sum(ri.get('attention', {}).get('tau_fq_std', 0) for ri in routing_infos) / len(routing_infos)
                                 tau_fk = sum(ri.get('attention', {}).get('tau_fk', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_fk_std = sum(ri.get('attention', {}).get('tau_fk_std', 0) for ri in routing_infos) / len(routing_infos)
                                 tau_fv = sum(ri.get('attention', {}).get('tau_fv', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_fv_std = sum(ri.get('attention', {}).get('tau_fv_std', 0) for ri in routing_infos) / len(routing_infos)
                                 tau_rq = sum(ri.get('attention', {}).get('tau_rq', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_rq_std = sum(ri.get('attention', {}).get('tau_rq_std', 0) for ri in routing_infos) / len(routing_infos)
                                 tau_rk = sum(ri.get('attention', {}).get('tau_rk', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_rk_std = sum(ri.get('attention', {}).get('tau_rk_std', 0) for ri in routing_infos) / len(routing_infos)
                                 tau_rv = sum(ri.get('attention', {}).get('tau_rv', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_rv_std = sum(ri.get('attention', {}).get('tau_rv_std', 0) for ri in routing_infos) / len(routing_infos)
                                 tau_kf = sum(ri.get('knowledge', {}).get('tau_feature', 0) for ri in routing_infos) / len(routing_infos)
+                                tau_kf_std = sum(ri.get('knowledge', {}).get('tau_feature_std', 0) for ri in routing_infos) / len(routing_infos)
                                 tau_kr = sum(ri.get('knowledge', {}).get('tau_restore', 0) for ri in routing_infos) / len(routing_infos)
-                                print(f"          Tau(fwd): fq={tau_fq:.2f} fk={tau_fk:.2f} fv={tau_fv:.2f} rq={tau_rq:.2f} rk={tau_rk:.2f} rv={tau_rv:.2f} kf={tau_kf:.2f} kr={tau_kr:.2f}")
+                                tau_kr_std = sum(ri.get('knowledge', {}).get('tau_restore_std', 0) for ri in routing_infos) / len(routing_infos)
+                                print(f"          Tau: fq={tau_fq:.2f}±{tau_fq_std:.2f} fk={tau_fk:.2f}±{tau_fk_std:.2f} fv={tau_fv:.2f}±{tau_fv_std:.2f} rq={tau_rq:.2f}±{tau_rq_std:.2f} rk={tau_rk:.2f}±{tau_rk_std:.2f} rv={tau_rv:.2f}±{tau_rv_std:.2f} kf={tau_kf:.2f}±{tau_kf_std:.2f} kr={tau_kr:.2f}±{tau_kr_std:.2f}")
+
+                                # Gate with std (v18.2)
+                                gate_fq = sum(ri.get('attention', {}).get('gate_fq_mean', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_fq_std = sum(ri.get('attention', {}).get('gate_fq_std', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_fk = sum(ri.get('attention', {}).get('gate_fk_mean', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_fk_std = sum(ri.get('attention', {}).get('gate_fk_std', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_fv = sum(ri.get('attention', {}).get('gate_fv_mean', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_fv_std = sum(ri.get('attention', {}).get('gate_fv_std', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_rq = sum(ri.get('attention', {}).get('gate_rq_mean', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_rq_std = sum(ri.get('attention', {}).get('gate_rq_std', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_rk = sum(ri.get('attention', {}).get('gate_rk_mean', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_rk_std = sum(ri.get('attention', {}).get('gate_rk_std', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_rv = sum(ri.get('attention', {}).get('gate_rv_mean', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_rv_std = sum(ri.get('attention', {}).get('gate_rv_std', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_kf = sum(ri.get('knowledge', {}).get('gate_feature_mean', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_kf_std = sum(ri.get('knowledge', {}).get('gate_feature_std', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_kr = sum(ri.get('knowledge', {}).get('gate_restore_mean', 0) for ri in routing_infos) / len(routing_infos)
+                                gate_kr_std = sum(ri.get('knowledge', {}).get('gate_restore_std', 0) for ri in routing_infos) / len(routing_infos)
+                                print(f"          Gate: fq={gate_fq:.2f}±{gate_fq_std:.2f} fk={gate_fk:.2f}±{gate_fk_std:.2f} fv={gate_fv:.2f}±{gate_fv_std:.2f} rq={gate_rq:.2f}±{gate_rq_std:.2f} rk={gate_rk:.2f}±{gate_rk_std:.2f} rv={gate_rv:.2f}±{gate_rv_std:.2f} kf={gate_kf:.2f}±{gate_kf_std:.2f} kr={gate_kr:.2f}±{gate_kr_std:.2f}")
 
                             # tau_proj gradient norm
                             if hasattr(base_model.router, 'tau_proj') and base_model.router.tau_proj.weight.grad is not None:
                                 tau_w_grad = base_model.router.tau_proj.weight.grad.norm().item()
                                 tau_b_grad = base_model.router.tau_proj.bias.grad.norm().item() if base_model.router.tau_proj.bias.grad is not None else 0
                                 print(f"          Tau grad: weight={tau_w_grad:.6f} bias={tau_b_grad:.6f}")
-
-                            # Gate/Adjusted mean values (from first routing info)
-                            if routing_infos and routing_infos[0].get('use_soft_mask'):
-                                ri0 = routing_infos[0]
-                                attn = ri0.get('attention', ri0)
-                                know = ri0.get('knowledge', ri0)
-                                # v18.2: adj_* keys, v18.1: gate_* keys
-                                if attn.get('adj_fq') is not None:
-                                    # v18.2: ReLU mask adjusted scores
-                                    adj_fq = attn.get('adj_fq', 0)
-                                    adj_fk = attn.get('adj_fk', 0)
-                                    adj_fv = attn.get('adj_fv', 0)
-                                    adj_rq = attn.get('adj_rq', 0)
-                                    adj_rk = attn.get('adj_rk', 0)
-                                    adj_rv = attn.get('adj_rv', 0)
-                                    adj_kf = know.get('adj_feature', 0)
-                                    adj_kr = know.get('adj_restore', 0)
-                                    print(f"          Adjusted: fQ={adj_fq:.2f} fK={adj_fk:.2f} fV={adj_fv:.2f} rQ={adj_rq:.2f} rK={adj_rk:.2f} rV={adj_rv:.2f} kF={adj_kf:.2f} kR={adj_kr:.2f}")
-                                else:
-                                    # v18.1: gate values
-                                    g_fq = attn.get('gate_fq', 0)
-                                    g_fk = attn.get('gate_fk', 0)
-                                    g_fv = attn.get('gate_fv', 0)
-                                    g_rq = attn.get('gate_rq', 0)
-                                    g_rk = attn.get('gate_rk', 0)
-                                    g_rv = attn.get('gate_rv', 0)
-                                    g_kf = know.get('gate_feature', 0)
-                                    g_kr = know.get('gate_restore', 0)
-                                    print(f"          Gate: fQ={g_fq:.2f} fK={g_fk:.2f} fV={g_fv:.2f} rQ={g_rq:.2f} rK={g_rk:.2f} rV={g_rv:.2f} kF={g_kf:.2f} kR={g_kr:.2f}")
 
                     elif overlap_str:
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")

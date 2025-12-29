@@ -108,13 +108,11 @@ class UnifiedNeuronRouter(nn.Module):
 
         # Feature_know
         h_feature_know = self.dropout(self.proj_feature_know(x))
-        h_feature_know = F.normalize(h_feature_know, dim=-1)
         emb_feature_know = emb_norm[self.restore_v_end:self.feature_know_end]
         logits_feature_know = torch.einsum('bsd,nd->bsn', h_feature_know, emb_feature_know)
 
         # Restore_know
         h_restore_know = self.dropout(self.proj_restore_know(x))
-        h_restore_know = F.normalize(h_restore_know, dim=-1)
         emb_restore_know = emb_norm[self.feature_know_end:]
         logits_restore_know = torch.einsum('bsd,nd->bsn', h_restore_know, emb_restore_know)
 
@@ -126,14 +124,6 @@ class UnifiedNeuronRouter(nn.Module):
 
         all_proj = self.dropout(self.proj_all(x))
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = all_proj.chunk(6, dim=-1)
-
-        # Normalize projections → cosine similarity [-1, 1]
-        h_fqk_Q = F.normalize(h_fqk_Q, dim=-1)
-        h_fqk_K = F.normalize(h_fqk_K, dim=-1)
-        h_fv = F.normalize(h_fv, dim=-1)
-        h_rqk_Q = F.normalize(h_rqk_Q, dim=-1)
-        h_rqk_K = F.normalize(h_rqk_K, dim=-1)
-        h_rv = F.normalize(h_rv, dim=-1)
 
         fqk_emb = emb_norm[:self.feature_qk_end]
         fv_emb = emb_norm[self.feature_qk_end:self.feature_v_end]
@@ -406,6 +396,9 @@ class GlobalRouters(nn.Module):
             # Initialize bias to -1.0: ensures most neurons pass initially
             nn.init.constant_(self.tau_proj.bias, -1.0)
 
+        # Gate temperature for soft gating
+        self.gate_temp = nn.Parameter(torch.tensor(1.0))
+
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
             n_feature_know, n_restore_know,
@@ -467,40 +460,33 @@ class GlobalRouters(nn.Module):
 
     def _threshold_select(self, scores, tau, path_max_k, max_paths):
         """
-        Apply ReLU-based threshold selection with masked softmax.
+        Apply soft gate selection with ReLU.
 
         Args:
             scores: [B, S, N] neuron scores
             tau: scalar or [B, S, 1] tensor threshold
-            path_max_k: max neurons per path
-            max_paths: maximum number of paths
+            path_max_k: max neurons per path (unused in soft mode)
+            max_paths: maximum number of paths (unused in soft mode)
 
         Returns:
-            weights: [B, S, N] softmax weights (masked)
-            mask: [B, S, N] boolean mask of selected neurons
-            adjusted: [B, S, N] adjusted scores (scores - tau)
+            weights: [B, S, N] gated softmax weights
+            mask: [B, S, N] boolean mask (gate > 0) for statistics
+            gate: [B, S, N] gate values (ReLU output)
         """
-        B, S, N = scores.shape
+        # Soft gate (ReLU)
+        gate = F.relu(scores - tau)
 
-        # 1. Compute adjusted scores
-        adjusted = scores - tau
+        # Softmax + gate
+        weights = F.softmax(scores, dim=-1) * gate
 
-        # 2. Create mask (scores > tau)
-        mask = adjusted > 0
+        # Renormalize
+        weight_sum = weights.sum(dim=-1, keepdim=True)
+        weights = torch.where(weight_sum > 1e-8,
+                              weights / weight_sum,
+                              torch.zeros_like(weights))
 
-        # 3. Cap at path_max_k * max_paths neurons
-        max_neurons = path_max_k * max_paths
-        if max_neurons < N:
-            _, topk_idx = scores.topk(max_neurons, dim=-1)
-            keep_mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, topk_idx, True)
-            mask = mask & keep_mask
-
-        # 4. Apply mask and softmax
-        masked_scores = scores.masked_fill(~mask, float('-inf'))
-        weights = F.softmax(masked_scores, dim=-1)
-        weights = torch.nan_to_num(weights, nan=0.0)
-
-        return weights, mask, adjusted
+        mask = gate > 0  # 통계용
+        return weights, mask, gate
 
     def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
         """
@@ -582,18 +568,18 @@ class GlobalRouters(nn.Module):
         else:
             tau_fq = tau_fk = tau_fv = tau_rq = tau_rk = tau_rv = self.fixed_tau
 
-        # Apply threshold selection (returns weights, mask, and adjusted)
-        fqk_weights_Q, fqk_mask_Q, fqk_adj_Q = self._threshold_select(
+        # Apply threshold selection (returns weights, mask, and gate)
+        fqk_weights_Q, fqk_mask_Q, fqk_gate_Q = self._threshold_select(
             fqk_logits_Q, tau_fq, self.path_max_k, self.max_paths)
-        fqk_weights_K, fqk_mask_K, fqk_adj_K = self._threshold_select(
+        fqk_weights_K, fqk_mask_K, fqk_gate_K = self._threshold_select(
             fqk_logits_K, tau_fk, self.path_max_k, self.max_paths)
-        fv_weights, fv_mask, fv_adj = self._threshold_select(
+        fv_weights, fv_mask, fv_gate = self._threshold_select(
             fv_logits, tau_fv, self.path_max_k, self.max_paths)
-        rqk_weights_Q, rqk_mask_Q, rqk_adj_Q = self._threshold_select(
+        rqk_weights_Q, rqk_mask_Q, rqk_gate_Q = self._threshold_select(
             rqk_logits_Q, tau_rq, self.path_max_k, self.max_paths)
-        rqk_weights_K, rqk_mask_K, rqk_adj_K = self._threshold_select(
+        rqk_weights_K, rqk_mask_K, rqk_gate_K = self._threshold_select(
             rqk_logits_K, tau_rk, self.path_max_k, self.max_paths)
-        rv_weights, rv_mask, rv_adj = self._threshold_select(
+        rv_weights, rv_mask, rv_gate = self._threshold_select(
             rv_logits, tau_rv, self.path_max_k, self.max_paths)
 
         # Chunk to paths
@@ -718,15 +704,21 @@ class GlobalRouters(nn.Module):
             'tau_rv': tau_mean(tau_rv),
             'tau_rv_std': tau_std(tau_rv),
             'learnable_tau': self.learnable_tau,
-            'use_soft_mask': True,  # v18.2 always uses ReLU mask
+            'use_soft_mask': True,  # v18.2 always uses ReLU gate
             'token_routing': self.attention_token_routing,
-            # Adjusted scores (scores - tau)
-            'adj_fq': fqk_adj_Q.mean().item(),
-            'adj_fk': fqk_adj_K.mean().item(),
-            'adj_fv': fv_adj.mean().item(),
-            'adj_rq': rqk_adj_Q.mean().item(),
-            'adj_rk': rqk_adj_K.mean().item(),
-            'adj_rv': rv_adj.mean().item(),
+            # Gate statistics (ReLU output)
+            'gate_fq_mean': fqk_gate_Q.mean().item(),
+            'gate_fq_std': fqk_gate_Q.std().item(),
+            'gate_fk_mean': fqk_gate_K.mean().item(),
+            'gate_fk_std': fqk_gate_K.std().item(),
+            'gate_fv_mean': fv_gate.mean().item(),
+            'gate_fv_std': fv_gate.std().item(),
+            'gate_rq_mean': rqk_gate_Q.mean().item(),
+            'gate_rq_std': rqk_gate_Q.std().item(),
+            'gate_rk_mean': rqk_gate_K.mean().item(),
+            'gate_rk_std': rqk_gate_K.std().item(),
+            'gate_rv_mean': rv_gate.mean().item(),
+            'gate_rv_std': rv_gate.std().item(),
         }
 
         # Update usage with mask (binary selection)
@@ -760,10 +752,10 @@ class GlobalRouters(nn.Module):
         else:
             tau_f = tau_r = self.fixed_tau
 
-        # Apply threshold selection (returns weights, mask, and adjusted)
-        f_weights, f_mask, f_adj = self._threshold_select(
+        # Apply threshold selection (returns weights, mask, and gate)
+        f_weights, f_mask, f_gate = self._threshold_select(
             logits_f, tau_f, self.path_max_k, self.max_paths)
-        r_weights, r_mask, r_adj = self._threshold_select(
+        r_weights, r_mask, r_gate = self._threshold_select(
             logits_r, tau_r, self.path_max_k, self.max_paths)
 
         # Chunk to paths
@@ -806,9 +798,11 @@ class GlobalRouters(nn.Module):
             'tau_feature_std': tau_std(tau_f),
             'tau_restore': tau_mean(tau_r),
             'tau_restore_std': tau_std(tau_r),
-            # Adjusted scores (scores - tau)
-            'adj_feature': f_adj.mean().item(),
-            'adj_restore': r_adj.mean().item(),
+            # Gate statistics (ReLU output)
+            'gate_feature_mean': f_gate.mean().item(),
+            'gate_feature_std': f_gate.std().item(),
+            'gate_restore_mean': r_gate.mean().item(),
+            'gate_restore_std': r_gate.std().item(),
         }
 
         return f_paths, r_paths, know_info
@@ -1204,6 +1198,10 @@ class DAWN(nn.Module):
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
+                # Skip tau_proj (has its own initialization)
+                if hasattr(self, 'router') and hasattr(self.router, 'tau_proj'):
+                    if module is self.router.tau_proj:
+                        continue
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
