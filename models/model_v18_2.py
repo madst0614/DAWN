@@ -71,6 +71,11 @@ class UnifiedNeuronRouter(nn.Module):
         self.proj_restore_know = nn.Linear(d_model, d_space)
         self.dropout = nn.Dropout(dropout)
 
+        # LayerNorm for each projection output
+        self.norm_all = nn.LayerNorm(d_space)
+        self.norm_feature_know = nn.LayerNorm(d_space)
+        self.norm_restore_know = nn.LayerNorm(d_space)
+
         # Unified neuron embeddings (std=0.02 is standard transformer initialization)
         self.neuron_emb = nn.Parameter(torch.randn(total_neurons, d_space) * 0.02)
 
@@ -107,12 +112,12 @@ class UnifiedNeuronRouter(nn.Module):
         emb_norm = F.normalize(self.neuron_emb, dim=-1)
 
         # Feature_know
-        h_feature_know = self.dropout(self.proj_feature_know(x))
+        h_feature_know = self.norm_feature_know(self.dropout(self.proj_feature_know(x)))
         emb_feature_know = emb_norm[self.restore_v_end:self.feature_know_end]
         logits_feature_know = torch.einsum('bsd,nd->bsn', h_feature_know, emb_feature_know)
 
         # Restore_know
-        h_restore_know = self.dropout(self.proj_restore_know(x))
+        h_restore_know = self.norm_restore_know(self.dropout(self.proj_restore_know(x)))
         emb_restore_know = emb_norm[self.feature_know_end:]
         logits_restore_know = torch.einsum('bsd,nd->bsn', h_restore_know, emb_restore_know)
 
@@ -124,6 +129,14 @@ class UnifiedNeuronRouter(nn.Module):
 
         all_proj = self.dropout(self.proj_all(x))
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = all_proj.chunk(6, dim=-1)
+
+        # Apply LayerNorm to each projection
+        h_fqk_Q = self.norm_all(h_fqk_Q)
+        h_fqk_K = self.norm_all(h_fqk_K)
+        h_fv = self.norm_all(h_fv)
+        h_rqk_Q = self.norm_all(h_rqk_Q)
+        h_rqk_K = self.norm_all(h_rqk_K)
+        h_rv = self.norm_all(h_rv)
 
         fqk_emb = emb_norm[:self.feature_qk_end]
         fv_emb = emb_norm[self.feature_qk_end:self.feature_v_end]
