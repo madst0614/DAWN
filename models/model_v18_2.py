@@ -170,6 +170,9 @@ class UnifiedNeuronRouter(nn.Module):
         else:
             usage = weights.mean(dim=0)
 
+        # Detach to prevent memory leak from computation graph retention
+        usage = usage.detach()
+
         decay = 1 - self.ema_alpha
         if neuron_type == 'feature_q':
             self.usage_ema_feature_q.mul_(decay).add_(usage, alpha=self.ema_alpha)
