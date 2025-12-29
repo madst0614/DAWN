@@ -492,7 +492,8 @@ class GlobalRouters(nn.Module):
             gate: [B, S, N] gate values (ReLU + eps)
         """
         gate = F.relu(scores - tau) + 1e-8
-        masked_scores = scores + torch.log(gate)
+        log_gate = torch.log(gate).clamp(min=-20)
+        masked_scores = scores + log_gate
         weights = F.softmax(masked_scores, dim=-1)
 
         mask = (scores > tau)  # 통계용
