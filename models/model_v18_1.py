@@ -415,27 +415,19 @@ class GlobalRouters(nn.Module):
             d_space=d_space, dropout=router_dropout, fixed_tau=fixed_tau, **kwargs
         )
 
-    def get_tau(self, x, tau_type: str):
+    def get_tau_all(self, x):
         """
-        Get tau value (learnable or fixed).
+        Compute tau_proj once for all pools.
 
         Args:
             x: [B, S, d_model] input tensor
-            tau_type: one of 'fqk', 'fv', 'rqk', 'rv', 'feature_know', 'restore_know'
 
         Returns:
-            [B, S, 1] for learnable tau, scalar for fixed tau
+            [B, S, 6] tau values for all pools, or None if not learnable
         """
         if self.learnable_tau:
-            tau_all = self.tau_proj(x)  # [B, S, 6]
-            tau_idx = {
-                'fqk': 0, 'fv': 1, 'rqk': 2, 'rv': 3,
-                'feature_know': 4, 'restore_know': 5
-            }
-            idx = tau_idx[tau_type]
-            return tau_all[..., idx:idx+1]  # [B, S, 1]
-        else:
-            return self.fixed_tau
+            return self.tau_proj(x)  # [B, S, 6]
+        return None
 
     def get_tau_reg_loss(self):
         """
@@ -597,10 +589,13 @@ class GlobalRouters(nn.Module):
 
         return path_weights_list
 
-    def get_attention_weights(self, x, importance, attention_mask=None):
+    def get_attention_weights(self, x, importance, attention_mask=None, tau_all=None):
         """
         v18.0: Threshold + masked softmax multi-path routing for attention
         v18.1: Soft mask + learnable tau (when use_soft_mask=True)
+
+        Args:
+            tau_all: [B, S, 6] pre-computed tau values (optional, avoids recomputation)
 
         Returns:
             path_weights_dict: dict with lists of path weights for each neuron type
@@ -611,9 +606,9 @@ class GlobalRouters(nn.Module):
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
 
         # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
-        # Compute tau_proj once to avoid multiple forward passes
         if self.learnable_tau:
-            tau_all = self.tau_proj(x)  # [B, S, 6] - compute once
+            if tau_all is None:
+                tau_all = self.tau_proj(x)  # fallback if not provided
             tau_fqk = tau_all[..., 0:1]
             tau_fv = tau_all[..., 1:2]
             tau_rqk = tau_all[..., 2:3]
@@ -777,17 +772,20 @@ class GlobalRouters(nn.Module):
 
         return path_weights, routing_info, aux_loss
 
-    def get_knowledge_weights(self, x, importance, attention_mask=None):
+    def get_knowledge_weights(self, x, importance, attention_mask=None, tau_all=None):
         """
         v18.0: Threshold + masked softmax multi-path routing for knowledge
         v18.1: Soft mask + learnable tau (when use_soft_mask=True)
+
+        Args:
+            tau_all: [B, S, 6] pre-computed tau values (optional, avoids recomputation)
         """
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
         # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
-        # Compute tau_proj once (reuse from attention if possible, but separate for clarity)
         if self.learnable_tau:
-            tau_all = self.tau_proj(x)  # [B, S, 6] - compute once
+            if tau_all is None:
+                tau_all = self.tau_proj(x)  # fallback if not provided
             tau_f = tau_all[..., 4:5]
             tau_r = tau_all[..., 5:6]
         else:
@@ -1069,19 +1067,21 @@ class DAWNBlock(nn.Module):
 
     def forward(self, x, importance, global_routers: GlobalRouters, attention_mask=None):
         # Attention
-        normed_x = self.norm1(x)
+        normed_x_attn = self.norm1(x)
+        tau_all_attn = global_routers.get_tau_all(normed_x_attn)
         path_weights, attn_info, attn_aux_loss = global_routers.get_attention_weights(
-            normed_x, importance, attention_mask
+            normed_x_attn, importance, attention_mask, tau_all=tau_all_attn
         )
-        attn_out, _ = self.attn(normed_x, path_weights, attention_mask)
+        attn_out, _ = self.attn(normed_x_attn, path_weights, attention_mask)
         x = x + attn_out
 
         # Knowledge
-        normed_x = self.norm2(x)
+        normed_x_know = self.norm2(x)
+        tau_all_know = global_routers.get_tau_all(normed_x_know)
         feature_paths, restore_paths, know_info = global_routers.get_knowledge_weights(
-            normed_x, importance, attention_mask
+            normed_x_know, importance, attention_mask, tau_all=tau_all_know
         )
-        know_out = self.knowledge(normed_x, feature_paths, restore_paths, attention_mask)
+        know_out = self.knowledge(normed_x_know, feature_paths, restore_paths, attention_mask)
         x = x + know_out
 
         # Routing info (all scalar values - no tensor storage to avoid memory leak)
