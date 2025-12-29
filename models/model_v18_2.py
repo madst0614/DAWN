@@ -347,19 +347,14 @@ class GlobalSSM(nn.Module):
 
 class GlobalRouters(nn.Module):
     """
-    v18.0: Fixed threshold + softmax multi-path routing
-    v18.1: Soft mask + softmax with learnable tau (when use_soft_mask=True)
+    v18.2: ReLU-masked learnable tau routing
 
-    v18.0 uses:
-    1. Fixed threshold (tau) for initial neuron filtering
-    2. Minimum/maximum neuron guarantees (path_min_k, path_max_k * max_paths)
-    3. Masked softmax for differentiable weighting
-    4. Chunking into multiple paths by score ranking
-
-    v18.1 adds:
-    1. Soft mask: sigmoid((score - tau) / temp) instead of hard threshold
-    2. Learnable tau: tau becomes nn.Parameter
-    3. Penalty-based masking: low-score neurons get penalty instead of -inf
+    Uses:
+    1. ReLU-based threshold mask: mask = (scores - tau) > 0
+    2. Learnable tau: token-level tau projection (8 pools, Q/K separated)
+    3. Cap at path_max_k * max_paths neurons
+    4. Masked softmax for differentiable weighting
+    5. Chunking into multiple paths by score ranking
     """
     def __init__(self, d_model: int, n_feature_qk: int, n_feature_v: int,
                  n_restore_qk: int, n_restore_v: int,
@@ -367,16 +362,11 @@ class GlobalRouters(nn.Module):
                  rank: int = 16,
                  max_paths: int = 4,
                  fixed_tau: float = 0.0,
-                 path_min_k: int = 8,
                  path_max_k: int = 16,
                  d_space: int = 64, router_dropout: float = 0.1,
                  attention_token_routing: bool = False,
                  knowledge_token_routing: bool = False,
-                 # v18.1 parameters
-                 use_soft_mask: bool = False,
-                 learnable_tau: bool = False,
-                 soft_mask_temp: float = 1.0,
-                 soft_mask_penalty: float = 10.0,
+                 learnable_tau: bool = True,
                  **kwargs):
         super().__init__()
         self.d_model = d_model
@@ -389,18 +379,12 @@ class GlobalRouters(nn.Module):
         self.rank = rank
         self.max_paths = max_paths
         self.fixed_tau = fixed_tau
-        self.path_min_k = path_min_k
         self.path_max_k = path_max_k
         self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
-
-        # v18.1 parameters
-        self.use_soft_mask = use_soft_mask
         self.learnable_tau = learnable_tau
-        self.soft_mask_temp = soft_mask_temp
-        self.soft_mask_penalty = soft_mask_penalty
 
-        # Learnable tau parameters (v18.1) - token-level projection
+        # Learnable tau parameters - token-level projection
         if learnable_tau:
             # Token-level tau projection (8 pools - Q/K separated)
             # Output: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
@@ -467,70 +451,41 @@ class GlobalRouters(nn.Module):
                 'restore_know': self.fixed_tau,
             }
 
-    def _threshold_select(self, scores, tau, path_min_k, path_max_k, max_paths):
+    def _threshold_select(self, scores, tau, path_max_k, max_paths):
         """
-        Apply threshold selection with min/max guarantees and masked softmax.
-
-        v18.0: Hard mask (scores > tau)
-        v18.2: ReLU-based mask: mask = (ReLU(scores - tau) > 0), weights = softmax(masked_scores)
+        Apply ReLU-based threshold selection with masked softmax.
 
         Args:
             scores: [B, S, N] neuron scores
-            tau: scalar or tensor threshold
-            path_min_k: minimum neurons to select
+            tau: scalar or [B, S, 1] tensor threshold
             path_max_k: max neurons per path
             max_paths: maximum number of paths
 
         Returns:
             weights: [B, S, N] softmax weights (masked)
             mask: [B, S, N] boolean mask of selected neurons
-            adjusted: [B, S, N] adjusted scores (scores - tau) for v18.2, None for v18.0
+            adjusted: [B, S, N] adjusted scores (scores - tau)
         """
         B, S, N = scores.shape
 
-        if self.use_soft_mask:
-            # v18.2: ReLU-based mask approach
-            # 1. Compute adjusted scores
-            adjusted = scores - tau
+        # 1. Compute adjusted scores
+        adjusted = scores - tau
 
-            # 2. Create mask using ReLU (scores > tau)
-            mask = F.relu(adjusted) > 0
+        # 2. Create mask (scores > tau)
+        mask = adjusted > 0
 
-            # 3. Cap at path_max_k * max_paths neurons
-            max_neurons = path_max_k * max_paths
-            if max_neurons < N:
-                _, topk_idx = scores.topk(max_neurons, dim=-1)
-                keep_mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, topk_idx, True)
-                mask = mask & keep_mask
+        # 3. Cap at path_max_k * max_paths neurons
+        max_neurons = path_max_k * max_paths
+        if max_neurons < N:
+            _, topk_idx = scores.topk(max_neurons, dim=-1)
+            keep_mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, topk_idx, True)
+            mask = mask & keep_mask
 
-            # 4. Apply mask and softmax
-            masked_scores = scores.masked_fill(~mask, float('-inf'))
-            weights = F.softmax(masked_scores, dim=-1)
+        # 4. Apply mask and softmax
+        masked_scores = scores.masked_fill(~mask, float('-inf'))
+        weights = F.softmax(masked_scores, dim=-1)
 
-            return weights, mask, adjusted
-        else:
-            # v18.0: Hard mask approach
-            # 1. Threshold mask
-            mask = scores > tau
-
-            # 2. Ensure minimum path_min_k neurons
-            if path_min_k > 0:
-                topk_vals, topk_idx = scores.topk(min(path_min_k, N), dim=-1)
-                min_mask = torch.zeros_like(mask).scatter_(-1, topk_idx, True)
-                mask = mask | min_mask
-
-            # 3. Cap at path_max_k * max_paths neurons
-            max_neurons = path_max_k * max_paths
-            if max_neurons < N:
-                topk_vals, topk_idx = scores.topk(max_neurons, dim=-1)
-                max_mask = torch.zeros_like(mask).scatter_(-1, topk_idx, True)
-                mask = mask & max_mask
-
-            # 4. Masked softmax
-            masked_scores = scores.masked_fill(~mask, float('-inf'))
-            weights = F.softmax(masked_scores, dim=-1)
-
-            return weights, mask, None
+        return weights, mask, adjusted
 
     def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
         """
@@ -612,19 +567,19 @@ class GlobalRouters(nn.Module):
         else:
             tau_fq = tau_fk = tau_fv = tau_rq = tau_rk = tau_rv = self.fixed_tau
 
-        # Apply threshold selection (returns weights, mask, and adjusted for v18.2)
+        # Apply threshold selection (returns weights, mask, and adjusted)
         fqk_weights_Q, fqk_mask_Q, fqk_adj_Q = self._threshold_select(
-            fqk_logits_Q, tau_fq, self.path_min_k, self.path_max_k, self.max_paths)
+            fqk_logits_Q, tau_fq, self.path_max_k, self.max_paths)
         fqk_weights_K, fqk_mask_K, fqk_adj_K = self._threshold_select(
-            fqk_logits_K, tau_fk, self.path_min_k, self.path_max_k, self.max_paths)
+            fqk_logits_K, tau_fk, self.path_max_k, self.max_paths)
         fv_weights, fv_mask, fv_adj = self._threshold_select(
-            fv_logits, tau_fv, self.path_min_k, self.path_max_k, self.max_paths)
+            fv_logits, tau_fv, self.path_max_k, self.max_paths)
         rqk_weights_Q, rqk_mask_Q, rqk_adj_Q = self._threshold_select(
-            rqk_logits_Q, tau_rq, self.path_min_k, self.path_max_k, self.max_paths)
+            rqk_logits_Q, tau_rq, self.path_max_k, self.max_paths)
         rqk_weights_K, rqk_mask_K, rqk_adj_K = self._threshold_select(
-            rqk_logits_K, tau_rk, self.path_min_k, self.path_max_k, self.max_paths)
+            rqk_logits_K, tau_rk, self.path_max_k, self.max_paths)
         rv_weights, rv_mask, rv_adj = self._threshold_select(
-            rv_logits, tau_rv, self.path_min_k, self.path_max_k, self.max_paths)
+            rv_logits, tau_rv, self.path_max_k, self.max_paths)
 
         # Chunk to paths
         fqk_paths_Q = self._chunk_to_paths(fqk_weights_Q, fqk_mask_Q, fqk_logits_Q, self.path_max_k, self.max_paths)
@@ -748,18 +703,16 @@ class GlobalRouters(nn.Module):
             'tau_rv': tau_mean(tau_rv),
             'tau_rv_std': tau_std(tau_rv),
             'learnable_tau': self.learnable_tau,
-            'use_soft_mask': self.use_soft_mask,
+            'use_soft_mask': True,  # v18.2 always uses ReLU mask
             'token_routing': self.attention_token_routing,
+            # Adjusted scores (scores - tau)
+            'adj_fq': fqk_adj_Q.mean().item(),
+            'adj_fk': fqk_adj_K.mean().item(),
+            'adj_fv': fv_adj.mean().item(),
+            'adj_rq': rqk_adj_Q.mean().item(),
+            'adj_rk': rqk_adj_K.mean().item(),
+            'adj_rv': rv_adj.mean().item(),
         }
-
-        # Add adjusted scores mean (v18.2 only, scores - tau)
-        if self.use_soft_mask:
-            routing_info['adj_fq'] = fqk_adj_Q.mean().item()
-            routing_info['adj_fk'] = fqk_adj_K.mean().item()
-            routing_info['adj_fv'] = fv_adj.mean().item()
-            routing_info['adj_rq'] = rqk_adj_Q.mean().item()
-            routing_info['adj_rk'] = rqk_adj_K.mean().item()
-            routing_info['adj_rv'] = rv_adj.mean().item()
 
         # Update usage with mask (binary selection)
         if self.training:
@@ -792,11 +745,11 @@ class GlobalRouters(nn.Module):
         else:
             tau_f = tau_r = self.fixed_tau
 
-        # Apply threshold selection (returns weights, mask, and adjusted for v18.2)
+        # Apply threshold selection (returns weights, mask, and adjusted)
         f_weights, f_mask, f_adj = self._threshold_select(
-            logits_f, tau_f, self.path_min_k, self.path_max_k, self.max_paths)
+            logits_f, tau_f, self.path_max_k, self.max_paths)
         r_weights, r_mask, r_adj = self._threshold_select(
-            logits_r, tau_r, self.path_min_k, self.path_max_k, self.max_paths)
+            logits_r, tau_r, self.path_max_k, self.max_paths)
 
         # Chunk to paths
         f_paths = self._chunk_to_paths(f_weights, f_mask, logits_f, self.path_max_k, self.max_paths)
@@ -838,12 +791,10 @@ class GlobalRouters(nn.Module):
             'tau_feature_std': tau_std(tau_f),
             'tau_restore': tau_mean(tau_r),
             'tau_restore_std': tau_std(tau_r),
+            # Adjusted scores (scores - tau)
+            'adj_feature': f_adj.mean().item(),
+            'adj_restore': r_adj.mean().item(),
         }
-
-        # Add adjusted scores mean (v18.2 only, scores - tau)
-        if self.use_soft_mask:
-            know_info['adj_feature'] = f_adj.mean().item()
-            know_info['adj_restore'] = r_adj.mean().item()
 
         return f_paths, r_paths, know_info
 
@@ -1127,13 +1078,8 @@ class DAWN(nn.Module):
         # v18: Multi-path parameters
         max_paths: int = 4,
         fixed_tau: float = 0.0,
-        path_min_k: int = 8,
         path_max_k: int = 16,
-        # v18.1: Soft mask parameters (defaults for v18.1)
-        use_soft_mask: bool = True,
         learnable_tau: bool = True,
-        soft_mask_temp: float = 1.0,
-        soft_mask_penalty: float = 10.0,
         # Attention - shared Q/K pool
         n_feature_qk: int = 56,
         n_feature_v: int = 24,
@@ -1177,14 +1123,8 @@ class DAWN(nn.Module):
         # v18 specific
         self.max_paths = max_paths
         self.fixed_tau = fixed_tau
-        self.path_min_k = path_min_k
         self.path_max_k = path_max_k
-
-        # v18.1 specific
-        self.use_soft_mask = use_soft_mask
         self.learnable_tau = learnable_tau
-        self.soft_mask_temp = soft_mask_temp
-        self.soft_mask_penalty = soft_mask_penalty
 
         # Neuron counts
         self.n_feature_qk = n_feature_qk
@@ -1221,16 +1161,11 @@ class DAWN(nn.Module):
             rank=rank,
             max_paths=max_paths,
             fixed_tau=fixed_tau,
-            path_min_k=path_min_k,
             path_max_k=path_max_k,
             d_space=d_space, router_dropout=router_dropout,
             attention_token_routing=attention_token_routing,
             knowledge_token_routing=knowledge_token_routing,
-            # v18.1 parameters
-            use_soft_mask=use_soft_mask,
             learnable_tau=learnable_tau,
-            soft_mask_temp=soft_mask_temp,
-            soft_mask_penalty=soft_mask_penalty,
         )
 
         self.layers = nn.ModuleList([
@@ -1322,8 +1257,8 @@ class DAWN(nn.Module):
             'max_seq_len': self.max_seq_len,
             'max_paths': self.max_paths,
             'fixed_tau': self.fixed_tau,
-            'path_min_k': self.path_min_k,
             'path_max_k': self.path_max_k,
+            'learnable_tau': self.learnable_tau,
             'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
             'n_restore_qk': self.n_restore_qk, 'n_restore_v': self.n_restore_v,
             'n_feature_know': self.n_feature_know, 'n_restore_know': self.n_restore_know,
@@ -1337,16 +1272,16 @@ class DAWN(nn.Module):
             f"DAWN v{self.__version__}: ReLU-Masked Learnable Tau Routing",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  rank={self.rank}, knowledge_rank={self.knowledge_rank}",
-            f"  max_paths={self.max_paths}, fixed_tau={self.fixed_tau}, path_min_k={self.path_min_k}, path_max_k={self.path_max_k}",
+            f"  max_paths={self.max_paths}, fixed_tau={self.fixed_tau}, path_max_k={self.path_max_k}",
             f"  max_seq_len={self.max_seq_len}, state_dim={self.state_dim}, dropout={self.dropout_rate}",
             f"",
-            f"  [Attention - Q/K Separate Tau] (ReLU mask + learnable tau, max_paths={self.max_paths})",
+            f"  [Attention - Q/K Separate Tau] (ReLU mask + learnable tau={self.learnable_tau})",
             f"  Feature_QK: {self.n_feature_qk} × {self.d_model} × {self.rank}",
             f"  Feature_V: {self.n_feature_v} × {self.d_model} × {self.rank}",
             f"  Restore_QK: {self.n_restore_qk} × {self.rank} × {self.d_model}",
             f"  Restore_V: {self.n_restore_v} × {self.rank} × {self.d_model}",
             f"",
-            f"  [Knowledge - Feature-Restore] (ReLU mask + learnable tau, max_paths={self.max_paths})",
+            f"  [Knowledge - Feature-Restore] (ReLU mask + learnable tau={self.learnable_tau})",
             f"  Feature_Know: {self.n_feature_know} × {self.d_model} × {self.knowledge_rank}",
             f"  Restore_Know: {self.n_restore_know} × {self.knowledge_rank} × {self.d_model}",
             f"",
@@ -1421,7 +1356,7 @@ class DAWN(nn.Module):
         return (
             f"DAWN v{self.__version__}: ReLU-Masked Learnable Tau\n"
             f"  Params: {params:.1f}M\n"
-            f"  rank={self.rank}, max_paths={self.max_paths}, path_min_k={self.path_min_k}, path_max_k={self.path_max_k}\n"
+            f"  rank={self.rank}, max_paths={self.max_paths}, path_max_k={self.path_max_k}\n"
             f"  Attention: Feature_QK={self.n_feature_qk}, Feature_V={self.n_feature_v}\n"
             f"            Restore_QK={self.n_restore_qk}, Restore_V={self.n_restore_v}\n"
             f"  Knowledge: Feature={self.n_feature_know}, Restore={self.n_restore_know}\n"
