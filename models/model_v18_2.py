@@ -390,7 +390,9 @@ class GlobalRouters(nn.Module):
             # Output: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
             self.tau_proj = nn.Linear(d_model, 8)
             nn.init.zeros_(self.tau_proj.weight)
-            nn.init.constant_(self.tau_proj.bias, fixed_tau)
+            # Initialize bias to -1.0 to ensure neurons pass initially
+            # (scores are normalized cosine similarity, typically in [-1, 1])
+            nn.init.constant_(self.tau_proj.bias, -1.0)
 
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
