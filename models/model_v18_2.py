@@ -495,6 +495,7 @@ class GlobalRouters(nn.Module):
         # 4. Apply mask and softmax
         masked_scores = scores.masked_fill(~mask, float('-inf'))
         weights = F.softmax(masked_scores, dim=-1)
+        weights = torch.nan_to_num(weights, nan=0.0)
 
         return weights, mask, adjusted
 
