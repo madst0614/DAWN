@@ -1258,20 +1258,41 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                             # Tau values from learnable parameters
                             tau_vals = base_model.router.get_all_tau_values()
                             if tau_vals:
-                                print(f"          Tau: fqk={tau_vals['fqk']:.3f} fv={tau_vals['fv']:.3f} rqk={tau_vals['rqk']:.3f} rv={tau_vals['rv']:.3f} kF={tau_vals['feature_know']:.3f} kR={tau_vals['restore_know']:.3f}")
+                                # v18.1/v18.2: Q/K separated tau (fq, fk, fv, rq, rk, rv)
+                                if 'fq' in tau_vals:
+                                    print(f"          Tau: fQ={tau_vals['fq']:.3f} fK={tau_vals['fk']:.3f} fV={tau_vals['fv']:.3f} rQ={tau_vals['rq']:.3f} rK={tau_vals['rk']:.3f} rV={tau_vals['rv']:.3f} kF={tau_vals['feature_know']:.3f} kR={tau_vals['restore_know']:.3f}")
+                                else:
+                                    # v18.0 format (fqk, fv, rqk, rv)
+                                    print(f"          Tau: fqk={tau_vals.get('fqk', 0):.3f} fv={tau_vals.get('fv', 0):.3f} rqk={tau_vals.get('rqk', 0):.3f} rv={tau_vals.get('rv', 0):.3f} kF={tau_vals.get('feature_know', 0):.3f} kR={tau_vals.get('restore_know', 0):.3f}")
 
-                            # Soft mask mean values (from first routing info)
+                            # Gate/Adjusted mean values (from first routing info)
                             if routing_infos and routing_infos[0].get('use_soft_mask'):
                                 ri0 = routing_infos[0]
                                 attn = ri0.get('attention', ri0)
                                 know = ri0.get('knowledge', ri0)
-                                sm_fqk = attn.get('soft_mask_fqk_Q_mean', 0)
-                                sm_fv = attn.get('soft_mask_fv_mean', 0)
-                                sm_rqk = attn.get('soft_mask_rqk_Q_mean', 0)
-                                sm_rv = attn.get('soft_mask_rv_mean', 0)
-                                sm_kf = know.get('soft_mask_feature_mean', 0)
-                                sm_kr = know.get('soft_mask_restore_mean', 0)
-                                print(f"          SoftMask: fqk={sm_fqk:.2f} fv={sm_fv:.2f} rqk={sm_rqk:.2f} rv={sm_rv:.2f} kF={sm_kf:.2f} kR={sm_kr:.2f}")
+                                # v18.2: adj_* keys, v18.1: gate_* keys
+                                if attn.get('adj_fq') is not None:
+                                    # v18.2: ReLU mask adjusted scores
+                                    adj_fq = attn.get('adj_fq', 0)
+                                    adj_fk = attn.get('adj_fk', 0)
+                                    adj_fv = attn.get('adj_fv', 0)
+                                    adj_rq = attn.get('adj_rq', 0)
+                                    adj_rk = attn.get('adj_rk', 0)
+                                    adj_rv = attn.get('adj_rv', 0)
+                                    adj_kf = know.get('adj_feature', 0)
+                                    adj_kr = know.get('adj_restore', 0)
+                                    print(f"          Adjusted: fQ={adj_fq:.2f} fK={adj_fk:.2f} fV={adj_fv:.2f} rQ={adj_rq:.2f} rK={adj_rk:.2f} rV={adj_rv:.2f} kF={adj_kf:.2f} kR={adj_kr:.2f}")
+                                else:
+                                    # v18.1: gate values
+                                    g_fq = attn.get('gate_fq', 0)
+                                    g_fk = attn.get('gate_fk', 0)
+                                    g_fv = attn.get('gate_fv', 0)
+                                    g_rq = attn.get('gate_rq', 0)
+                                    g_rk = attn.get('gate_rk', 0)
+                                    g_rv = attn.get('gate_rv', 0)
+                                    g_kf = know.get('gate_feature', 0)
+                                    g_kr = know.get('gate_restore', 0)
+                                    print(f"          Gate: fQ={g_fq:.2f} fK={g_fk:.2f} fV={g_fv:.2f} rQ={g_rq:.2f} rK={g_rk:.2f} rV={g_rv:.2f} kF={g_kf:.2f} kR={g_kr:.2f}")
 
                     elif overlap_str:
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
