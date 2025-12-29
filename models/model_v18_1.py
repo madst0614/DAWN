@@ -403,9 +403,9 @@ class GlobalRouters(nn.Module):
 
         # Learnable tau parameters (v18.1) - token-level projection
         if learnable_tau:
-            # Token-level tau projection (6 pools at once)
-            # Output: [fqk, fv, rqk, rv, feature_know, restore_know]
-            self.tau_proj = nn.Linear(d_model, 6)
+            # Token-level tau projection (8 pools - Q/K separated)
+            # Output: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
+            self.tau_proj = nn.Linear(d_model, 8)
             nn.init.zeros_(self.tau_proj.weight)
             nn.init.constant_(self.tau_proj.bias, fixed_tau)
 
@@ -423,10 +423,11 @@ class GlobalRouters(nn.Module):
             x: [B, S, d_model] input tensor
 
         Returns:
-            [B, S, 6] tau values for all pools, or None if not learnable
+            [B, S, 8] tau values for all pools, or None if not learnable
+            Order: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
         """
         if self.learnable_tau:
-            return self.tau_proj(x)  # [B, S, 6]
+            return self.tau_proj(x)  # [B, S, 8]
         return None
 
     def get_tau_reg_loss(self):
@@ -446,18 +447,22 @@ class GlobalRouters(nn.Module):
         if self.learnable_tau:
             bias = self.tau_proj.bias.detach()
             return {
-                'fqk': bias[0].item(),
-                'fv': bias[1].item(),
-                'rqk': bias[2].item(),
-                'rv': bias[3].item(),
-                'feature_know': bias[4].item(),
-                'restore_know': bias[5].item(),
+                'fq': bias[0].item(),
+                'fk': bias[1].item(),
+                'fv': bias[2].item(),
+                'rq': bias[3].item(),
+                'rk': bias[4].item(),
+                'rv': bias[5].item(),
+                'feature_know': bias[6].item(),
+                'restore_know': bias[7].item(),
             }
         else:
             return {
-                'fqk': self.fixed_tau,
+                'fq': self.fixed_tau,
+                'fk': self.fixed_tau,
                 'fv': self.fixed_tau,
-                'rqk': self.fixed_tau,
+                'rq': self.fixed_tau,
+                'rk': self.fixed_tau,
                 'rv': self.fixed_tau,
                 'feature_know': self.fixed_tau,
                 'restore_know': self.fixed_tau,
@@ -468,7 +473,7 @@ class GlobalRouters(nn.Module):
         Apply threshold selection with min/max guarantees and masked softmax.
 
         v18.0: Hard mask (scores > tau)
-        v18.1: Soft mask (sigmoid((scores - tau) / temp)) with penalty
+        v18.1: Gate-based soft mask: gate = sigmoid((scores - tau) / temp), weights = softmax(scores * gate)
 
         Args:
             scores: [B, S, N] neuron scores
@@ -480,42 +485,32 @@ class GlobalRouters(nn.Module):
         Returns:
             weights: [B, S, N] softmax weights (masked)
             mask: [B, S, N] boolean mask of selected neurons
-            soft_mask: [B, S, N] soft mask values (v18.1 only, None for v18.0)
+            gate: [B, S, N] gate values (v18.1 only, None for v18.0)
         """
         B, S, N = scores.shape
 
         if self.use_soft_mask:
-            # v18.1: Soft mask approach
-            # 1. Compute soft mask using sigmoid
-            soft_mask = torch.sigmoid((scores - tau) / self.soft_mask_temp)
+            # v18.1: Gate-based soft mask approach
+            # 1. Compute gate using sigmoid
+            gate = torch.sigmoid((scores - tau) / self.soft_mask_temp)
 
-            # 2. Apply penalty to low-confidence neurons
-            penalty = (1 - soft_mask) * (-self.soft_mask_penalty)
-            masked_scores = scores + penalty
+            # 2. Apply gate to scores
+            gated_scores = scores * gate
 
-            # 3. Ensure minimum path_min_k neurons (boost top-k scores)
-            if path_min_k > 0:
-                topk_vals, topk_idx = scores.topk(min(path_min_k, N), dim=-1)
-                # Remove penalty for top-k neurons
-                penalty_relief = torch.zeros_like(scores).scatter_(-1, topk_idx, self.soft_mask_penalty)
-                masked_scores = masked_scores + penalty_relief
-
-            # 4. Cap at path_max_k * max_paths neurons (apply strong penalty to rest)
+            # 3. Cap at path_max_k * max_paths neurons (mask out rest)
             max_neurons = path_max_k * max_paths
             if max_neurons < N:
-                # Get indices of neurons to keep
                 _, topk_idx = scores.topk(max_neurons, dim=-1)
                 keep_mask = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, topk_idx, True)
-                # Apply very strong penalty to neurons outside top max_neurons
-                masked_scores = masked_scores.masked_fill(~keep_mask, float('-inf'))
+                gated_scores = gated_scores.masked_fill(~keep_mask, float('-inf'))
 
-            # 5. Softmax
-            weights = F.softmax(masked_scores, dim=-1)
+            # 4. Softmax
+            weights = F.softmax(gated_scores, dim=-1)
 
-            # Hard mask for logging (soft_mask > 0.5)
-            mask = soft_mask > 0.5
+            # Hard mask for logging (gate > 0.5)
+            mask = gate > 0.5
 
-            return weights, mask, soft_mask
+            return weights, mask, gate
         else:
             # v18.0: Hard mask approach
             # 1. Threshold mask
@@ -595,7 +590,8 @@ class GlobalRouters(nn.Module):
         v18.1: Soft mask + learnable tau (when use_soft_mask=True)
 
         Args:
-            tau_all: [B, S, 6] pre-computed tau values (optional, avoids recomputation)
+            tau_all: [B, S, 8] pre-computed tau values (optional, avoids recomputation)
+                     Order: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
 
         Returns:
             path_weights_dict: dict with lists of path weights for each neuron type
@@ -606,28 +602,31 @@ class GlobalRouters(nn.Module):
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
 
         # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
+        # Q/K have separate tau values
         if self.learnable_tau:
             if tau_all is None:
                 tau_all = self.tau_proj(x)  # fallback if not provided
-            tau_fqk = tau_all[..., 0:1]
-            tau_fv = tau_all[..., 1:2]
-            tau_rqk = tau_all[..., 2:3]
-            tau_rv = tau_all[..., 3:4]
+            tau_fq = tau_all[..., 0:1]
+            tau_fk = tau_all[..., 1:2]
+            tau_fv = tau_all[..., 2:3]
+            tau_rq = tau_all[..., 3:4]
+            tau_rk = tau_all[..., 4:5]
+            tau_rv = tau_all[..., 5:6]
         else:
-            tau_fqk = tau_fv = tau_rqk = tau_rv = self.fixed_tau
+            tau_fq = tau_fk = tau_fv = tau_rq = tau_rk = tau_rv = self.fixed_tau
 
-        # Apply threshold selection (returns weights, mask, and soft_mask for v18.1)
-        fqk_weights_Q, fqk_mask_Q, fqk_soft_Q = self._threshold_select(
-            fqk_logits_Q, tau_fqk, self.path_min_k, self.path_max_k, self.max_paths)
-        fqk_weights_K, fqk_mask_K, fqk_soft_K = self._threshold_select(
-            fqk_logits_K, tau_fqk, self.path_min_k, self.path_max_k, self.max_paths)
-        fv_weights, fv_mask, fv_soft = self._threshold_select(
+        # Apply threshold selection (returns weights, mask, and gate for v18.1)
+        fqk_weights_Q, fqk_mask_Q, fqk_gate_Q = self._threshold_select(
+            fqk_logits_Q, tau_fq, self.path_min_k, self.path_max_k, self.max_paths)
+        fqk_weights_K, fqk_mask_K, fqk_gate_K = self._threshold_select(
+            fqk_logits_K, tau_fk, self.path_min_k, self.path_max_k, self.max_paths)
+        fv_weights, fv_mask, fv_gate = self._threshold_select(
             fv_logits, tau_fv, self.path_min_k, self.path_max_k, self.max_paths)
-        rqk_weights_Q, rqk_mask_Q, rqk_soft_Q = self._threshold_select(
-            rqk_logits_Q, tau_rqk, self.path_min_k, self.path_max_k, self.max_paths)
-        rqk_weights_K, rqk_mask_K, rqk_soft_K = self._threshold_select(
-            rqk_logits_K, tau_rqk, self.path_min_k, self.path_max_k, self.max_paths)
-        rv_weights, rv_mask, rv_soft = self._threshold_select(
+        rqk_weights_Q, rqk_mask_Q, rqk_gate_Q = self._threshold_select(
+            rqk_logits_Q, tau_rq, self.path_min_k, self.path_max_k, self.max_paths)
+        rqk_weights_K, rqk_mask_K, rqk_gate_K = self._threshold_select(
+            rqk_logits_K, tau_rk, self.path_min_k, self.path_max_k, self.max_paths)
+        rv_weights, rv_mask, rv_gate = self._threshold_select(
             rv_logits, tau_rv, self.path_min_k, self.path_max_k, self.max_paths)
 
         # Chunk to paths
@@ -738,13 +737,17 @@ class GlobalRouters(nn.Module):
             'score_rqk_K_std': rqk_logits_K.std().item(),
             'score_rv_mean': rv_logits.mean().item(),
             'score_rv_std': rv_logits.std().item(),
-            # tau (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
-            'tau_fqk': tau_mean(tau_fqk),
-            'tau_fqk_std': tau_std(tau_fqk),
+            # tau (v18.0: fixed scalar, v18.1: token-level [B, S, 1], Q/K separated)
+            'tau_fq': tau_mean(tau_fq),
+            'tau_fq_std': tau_std(tau_fq),
+            'tau_fk': tau_mean(tau_fk),
+            'tau_fk_std': tau_std(tau_fk),
             'tau_fv': tau_mean(tau_fv),
             'tau_fv_std': tau_std(tau_fv),
-            'tau_rqk': tau_mean(tau_rqk),
-            'tau_rqk_std': tau_std(tau_rqk),
+            'tau_rq': tau_mean(tau_rq),
+            'tau_rq_std': tau_std(tau_rq),
+            'tau_rk': tau_mean(tau_rk),
+            'tau_rk_std': tau_std(tau_rk),
             'tau_rv': tau_mean(tau_rv),
             'tau_rv_std': tau_std(tau_rv),
             'learnable_tau': self.learnable_tau,
@@ -752,14 +755,14 @@ class GlobalRouters(nn.Module):
             'token_routing': self.attention_token_routing,
         }
 
-        # Add soft mask activation mean (v18.1 only)
+        # Add gate activation mean (v18.1 only)
         if self.use_soft_mask:
-            routing_info['soft_mask_fqk_Q'] = fqk_soft_Q.mean().item()
-            routing_info['soft_mask_fqk_K'] = fqk_soft_K.mean().item()
-            routing_info['soft_mask_fv'] = fv_soft.mean().item()
-            routing_info['soft_mask_rqk_Q'] = rqk_soft_Q.mean().item()
-            routing_info['soft_mask_rqk_K'] = rqk_soft_K.mean().item()
-            routing_info['soft_mask_rv'] = rv_soft.mean().item()
+            routing_info['gate_fq'] = fqk_gate_Q.mean().item()
+            routing_info['gate_fk'] = fqk_gate_K.mean().item()
+            routing_info['gate_fv'] = fv_gate.mean().item()
+            routing_info['gate_rq'] = rqk_gate_Q.mean().item()
+            routing_info['gate_rk'] = rqk_gate_K.mean().item()
+            routing_info['gate_rv'] = rv_gate.mean().item()
 
         # Update usage with mask (binary selection)
         if self.training:
@@ -778,7 +781,8 @@ class GlobalRouters(nn.Module):
         v18.1: Soft mask + learnable tau (when use_soft_mask=True)
 
         Args:
-            tau_all: [B, S, 6] pre-computed tau values (optional, avoids recomputation)
+            tau_all: [B, S, 8] pre-computed tau values (optional, avoids recomputation)
+                     Order: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
         """
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
@@ -786,15 +790,15 @@ class GlobalRouters(nn.Module):
         if self.learnable_tau:
             if tau_all is None:
                 tau_all = self.tau_proj(x)  # fallback if not provided
-            tau_f = tau_all[..., 4:5]
-            tau_r = tau_all[..., 5:6]
+            tau_f = tau_all[..., 6:7]
+            tau_r = tau_all[..., 7:8]
         else:
             tau_f = tau_r = self.fixed_tau
 
-        # Apply threshold selection (returns weights, mask, and soft_mask for v18.1)
-        f_weights, f_mask, f_soft = self._threshold_select(
+        # Apply threshold selection (returns weights, mask, and gate for v18.1)
+        f_weights, f_mask, f_gate = self._threshold_select(
             logits_f, tau_f, self.path_min_k, self.path_max_k, self.max_paths)
-        r_weights, r_mask, r_soft = self._threshold_select(
+        r_weights, r_mask, r_gate = self._threshold_select(
             logits_r, tau_r, self.path_min_k, self.path_max_k, self.max_paths)
 
         # Chunk to paths
@@ -839,10 +843,10 @@ class GlobalRouters(nn.Module):
             'tau_restore_std': tau_std(tau_r),
         }
 
-        # Add soft mask activation mean (v18.1 only)
+        # Add gate activation mean (v18.1 only)
         if self.use_soft_mask:
-            know_info['soft_mask_feature'] = f_soft.mean().item()
-            know_info['soft_mask_restore'] = r_soft.mean().item()
+            know_info['gate_feature'] = f_gate.mean().item()
+            know_info['gate_restore'] = r_gate.mean().item()
 
         return f_paths, r_paths, know_info
 
