@@ -702,6 +702,13 @@ class GlobalRouters(nn.Module):
             return tau.item() if torch.is_tensor(tau) else tau
 
         routing_info = {
+            # Combined weights (sum of all paths) - compatible with v17.1 format
+            'fqk_weights_Q': sum(fqk_paths_Q).detach(),
+            'fqk_weights_K': sum(fqk_paths_K).detach(),
+            'fv_weights': sum(fv_paths).detach(),
+            'rqk_weights_Q': sum(rqk_paths_Q).detach(),
+            'rqk_weights_K': sum(rqk_paths_K).detach(),
+            'rv_weights': sum(rv_paths).detach(),
             # Average paths used per token
             'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
             'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
@@ -801,6 +808,9 @@ class GlobalRouters(nn.Module):
             return tau.item() if torch.is_tensor(tau) else tau
 
         know_info = {
+            # Combined weights (sum of all paths) - compatible with v17.1 format
+            'feature_know_w': sum(f_paths).detach(),
+            'restore_know_w': sum(r_paths).detach(),
             'n_paths_feature': avg_paths_per_token(f_paths),
             'n_paths_restore': avg_paths_per_token(r_paths),
             # Average selected neurons per token
