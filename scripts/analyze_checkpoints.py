@@ -237,11 +237,21 @@ def load_model_from_checkpoint(ckpt_path, device='cuda'):
     # Create model
     version = config.get('model_version', config.get('version', None))
 
-    # Auto-detect baseline if no version specified
+    # Auto-detect version from state_dict keys if not in config
     if version is None:
-        # Check if it's a baseline model (has d_ff but no DAWN-specific keys)
-        dawn_keys = ['n_feature_qk', 'n_feature_v', 'n_restore_qk', 'rank']
-        if any(k in config for k in dawn_keys):
+        # Check for version-specific keys (most specific first)
+        v18_2_keys = ['router.tau_proj.weight', 'router.neuron_router.norm_fqk_Q.weight']
+        dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
+        dawn_config_keys = ['n_feature_qk', 'n_feature_v', 'n_restore_qk', 'rank']
+
+        if all(k in state_dict for k in v18_2_keys):
+            version = '18.2'
+        elif any(k in state_dict for k in dawn_keys):
+            if config.get('learnable_tau', False) or config.get('max_paths'):
+                version = '18.2'
+            else:
+                version = '17.1'
+        elif any(k in config for k in dawn_config_keys):
             version = '17.1'
         else:
             version = 'baseline'
