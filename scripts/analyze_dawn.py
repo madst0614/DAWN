@@ -532,6 +532,10 @@ class DAWNAnalyzer:
             results['trajectory'] = self.run_trajectory_analysis(dataloader, n_batches, output_dir)
             results['coselection'] = self.run_coselection_analysis(dataloader, n_batches, output_dir)
 
+        # v18.x specific analysis (auto-detect)
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'tau_proj'):
+            results['v18'] = self.run_v18_analysis(dataloader, n_batches, output_dir)
+
         output_path = os.path.join(output_dir, 'dawn_analysis.json')
         save_results(results, output_path)
         print(f"\nResults saved to: {output_path}")
