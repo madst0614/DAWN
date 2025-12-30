@@ -518,7 +518,8 @@ class GlobalRouters(nn.Module):
         # Sort neurons by score (descending)
         sorted_scores, sorted_indices = torch.sort(scores, dim=-1, descending=True)
         sorted_weights = torch.gather(weights, dim=-1, index=sorted_indices)
-        sorted_mask = torch.gather(mask.float(), dim=-1, index=sorted_indices)
+        # Use same dtype as weights to avoid dtype mismatch in bfloat16 mode
+        sorted_mask = torch.gather(mask.to(weights.dtype), dim=-1, index=sorted_indices)
 
         path_weights_list = []
 
