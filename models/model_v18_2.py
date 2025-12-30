@@ -405,6 +405,7 @@ class GlobalRouters(nn.Module):
         self.knowledge_token_routing = knowledge_token_routing
         self.learnable_tau = learnable_tau
         self.inference_hard_mask = False  # Set True for clean hard mask during inference
+        self.debug_mode = False  # Set True to enable routing stats (adds GPU sync overhead)
 
         # Learnable tau parameters - token-level projection
         if learnable_tau:
@@ -652,109 +653,96 @@ class GlobalRouters(nn.Module):
             'rv': rv_paths,
         }
 
-        # Helper: average paths used per token (sum of fraction of tokens using each path)
-        def avg_paths_per_token(paths):
-            return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
+        # Routing stats only in debug mode (avoid GPU sync overhead)
+        if self.debug_mode:
+            def avg_paths_per_token(paths):
+                return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
 
-        # Helper: average selected neurons per token
-        def avg_selected_per_token(mask):
-            # mask: [B, S, N] -> sum over N, mean over B, S
-            return mask.float().sum(dim=-1).mean().item()
+            def avg_selected_per_token(mask):
+                return mask.float().sum(dim=-1).mean().item()
 
-        # Helper: Q/K overlap ratio (how much Q and K share the same neurons)
-        def qk_overlap(mask_q, mask_k):
-            # mask: [B, S, N] boolean
-            # overlap = intersection / max(q_count, k_count) per token, then average
-            intersection = (mask_q & mask_k).float().sum(dim=-1)  # [B, S]
-            q_count = mask_q.float().sum(dim=-1)  # [B, S]
-            k_count = mask_k.float().sum(dim=-1)  # [B, S]
-            max_count = torch.maximum(q_count, k_count).clamp(min=1)
-            overlap = (intersection / max_count).mean().item()
-            return overlap
+            def qk_overlap(mask_q, mask_k):
+                intersection = (mask_q & mask_k).float().sum(dim=-1)
+                q_count = mask_q.float().sum(dim=-1)
+                k_count = mask_k.float().sum(dim=-1)
+                max_count = torch.maximum(q_count, k_count).clamp(min=1)
+                return (intersection / max_count).mean().item()
 
-        # Helper: get tau mean/std (for token-level tau)
-        def tau_mean(tau):
-            return tau.mean().item() if torch.is_tensor(tau) else tau
+            def tau_mean(tau):
+                return tau.mean().item() if torch.is_tensor(tau) else tau
 
-        def tau_std(tau):
-            return tau.std().item() if torch.is_tensor(tau) else 0.0
+            def tau_std(tau):
+                return tau.std().item() if torch.is_tensor(tau) else 0.0
 
-        routing_info = {
-            # Softmax weights (before mask multiplication) - for analysis
-            # These show relative importance of all neurons, not just selected ones
-            'fqk_weights_Q': fqk_weights_Q.detach(),
-            'fqk_weights_K': fqk_weights_K.detach(),
-            'fv_weights': fv_weights.detach(),
-            'rqk_weights_Q': rqk_weights_Q.detach(),
-            'rqk_weights_K': rqk_weights_K.detach(),
-            'rv_weights': rv_weights.detach(),
-            # Binary selection masks (scores > tau) - for POS analysis
-            'fqk_mask_Q': fqk_mask_Q.detach(),
-            'fqk_mask_K': fqk_mask_K.detach(),
-            'fv_mask': fv_mask.detach(),
-            'rqk_mask_Q': rqk_mask_Q.detach(),
-            'rqk_mask_K': rqk_mask_K.detach(),
-            'rv_mask': rv_mask.detach(),
-            # Average paths used per token
-            'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
-            'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
-            'n_paths_fv': avg_paths_per_token(fv_paths),
-            'n_paths_rqk_Q': avg_paths_per_token(rqk_paths_Q),
-            'n_paths_rqk_K': avg_paths_per_token(rqk_paths_K),
-            'n_paths_rv': avg_paths_per_token(rv_paths),
-            # Average selected neurons per token
-            'selected_fqk_Q': avg_selected_per_token(fqk_mask_Q),
-            'selected_fqk_K': avg_selected_per_token(fqk_mask_K),
-            'selected_fv': avg_selected_per_token(fv_mask),
-            'selected_rqk_Q': avg_selected_per_token(rqk_mask_Q),
-            'selected_rqk_K': avg_selected_per_token(rqk_mask_K),
-            'selected_rv': avg_selected_per_token(rv_mask),
-            # Q/K overlap ratio
-            'overlap_fqk': qk_overlap(fqk_mask_Q, fqk_mask_K),
-            'overlap_rqk': qk_overlap(rqk_mask_Q, rqk_mask_K),
-            # Score statistics (logits mean ± std)
-            'score_fqk_Q_mean': fqk_logits_Q.mean().item(),
-            'score_fqk_Q_std': fqk_logits_Q.std().item(),
-            'score_fqk_K_mean': fqk_logits_K.mean().item(),
-            'score_fqk_K_std': fqk_logits_K.std().item(),
-            'score_fv_mean': fv_logits.mean().item(),
-            'score_fv_std': fv_logits.std().item(),
-            'score_rqk_Q_mean': rqk_logits_Q.mean().item(),
-            'score_rqk_Q_std': rqk_logits_Q.std().item(),
-            'score_rqk_K_mean': rqk_logits_K.mean().item(),
-            'score_rqk_K_std': rqk_logits_K.std().item(),
-            'score_rv_mean': rv_logits.mean().item(),
-            'score_rv_std': rv_logits.std().item(),
-            # tau (v18.0: fixed scalar, v18.1: token-level [B, S, 1], Q/K separated)
-            'tau_fq': tau_mean(tau_fq),
-            'tau_fq_std': tau_std(tau_fq),
-            'tau_fk': tau_mean(tau_fk),
-            'tau_fk_std': tau_std(tau_fk),
-            'tau_fv': tau_mean(tau_fv),
-            'tau_fv_std': tau_std(tau_fv),
-            'tau_rq': tau_mean(tau_rq),
-            'tau_rq_std': tau_std(tau_rq),
-            'tau_rk': tau_mean(tau_rk),
-            'tau_rk_std': tau_std(tau_rk),
-            'tau_rv': tau_mean(tau_rv),
-            'tau_rv_std': tau_std(tau_rv),
-            'learnable_tau': self.learnable_tau,
-            'use_soft_mask': True,  # v18.2 always uses ReLU gate
-            'token_routing': self.attention_token_routing,
-            # Gate statistics (ReLU output)
-            'gate_fq_mean': fqk_gate_Q.mean().item(),
-            'gate_fq_std': fqk_gate_Q.std().item(),
-            'gate_fk_mean': fqk_gate_K.mean().item(),
-            'gate_fk_std': fqk_gate_K.std().item(),
-            'gate_fv_mean': fv_gate.mean().item(),
-            'gate_fv_std': fv_gate.std().item(),
-            'gate_rq_mean': rqk_gate_Q.mean().item(),
-            'gate_rq_std': rqk_gate_Q.std().item(),
-            'gate_rk_mean': rqk_gate_K.mean().item(),
-            'gate_rk_std': rqk_gate_K.std().item(),
-            'gate_rv_mean': rv_gate.mean().item(),
-            'gate_rv_std': rv_gate.std().item(),
-        }
+            routing_info = {
+                'fqk_weights_Q': fqk_weights_Q.detach(),
+                'fqk_weights_K': fqk_weights_K.detach(),
+                'fv_weights': fv_weights.detach(),
+                'rqk_weights_Q': rqk_weights_Q.detach(),
+                'rqk_weights_K': rqk_weights_K.detach(),
+                'rv_weights': rv_weights.detach(),
+                'fqk_mask_Q': fqk_mask_Q.detach(),
+                'fqk_mask_K': fqk_mask_K.detach(),
+                'fv_mask': fv_mask.detach(),
+                'rqk_mask_Q': rqk_mask_Q.detach(),
+                'rqk_mask_K': rqk_mask_K.detach(),
+                'rv_mask': rv_mask.detach(),
+                'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
+                'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
+                'n_paths_fv': avg_paths_per_token(fv_paths),
+                'n_paths_rqk_Q': avg_paths_per_token(rqk_paths_Q),
+                'n_paths_rqk_K': avg_paths_per_token(rqk_paths_K),
+                'n_paths_rv': avg_paths_per_token(rv_paths),
+                'selected_fqk_Q': avg_selected_per_token(fqk_mask_Q),
+                'selected_fqk_K': avg_selected_per_token(fqk_mask_K),
+                'selected_fv': avg_selected_per_token(fv_mask),
+                'selected_rqk_Q': avg_selected_per_token(rqk_mask_Q),
+                'selected_rqk_K': avg_selected_per_token(rqk_mask_K),
+                'selected_rv': avg_selected_per_token(rv_mask),
+                'overlap_fqk': qk_overlap(fqk_mask_Q, fqk_mask_K),
+                'overlap_rqk': qk_overlap(rqk_mask_Q, rqk_mask_K),
+                'score_fqk_Q_mean': fqk_logits_Q.mean().item(),
+                'score_fqk_Q_std': fqk_logits_Q.std().item(),
+                'score_fqk_K_mean': fqk_logits_K.mean().item(),
+                'score_fqk_K_std': fqk_logits_K.std().item(),
+                'score_fv_mean': fv_logits.mean().item(),
+                'score_fv_std': fv_logits.std().item(),
+                'score_rqk_Q_mean': rqk_logits_Q.mean().item(),
+                'score_rqk_Q_std': rqk_logits_Q.std().item(),
+                'score_rqk_K_mean': rqk_logits_K.mean().item(),
+                'score_rqk_K_std': rqk_logits_K.std().item(),
+                'score_rv_mean': rv_logits.mean().item(),
+                'score_rv_std': rv_logits.std().item(),
+                'tau_fq': tau_mean(tau_fq),
+                'tau_fq_std': tau_std(tau_fq),
+                'tau_fk': tau_mean(tau_fk),
+                'tau_fk_std': tau_std(tau_fk),
+                'tau_fv': tau_mean(tau_fv),
+                'tau_fv_std': tau_std(tau_fv),
+                'tau_rq': tau_mean(tau_rq),
+                'tau_rq_std': tau_std(tau_rq),
+                'tau_rk': tau_mean(tau_rk),
+                'tau_rk_std': tau_std(tau_rk),
+                'tau_rv': tau_mean(tau_rv),
+                'tau_rv_std': tau_std(tau_rv),
+                'learnable_tau': self.learnable_tau,
+                'use_soft_mask': True,
+                'token_routing': self.attention_token_routing,
+                'gate_fq_mean': fqk_gate_Q.mean().item(),
+                'gate_fq_std': fqk_gate_Q.std().item(),
+                'gate_fk_mean': fqk_gate_K.mean().item(),
+                'gate_fk_std': fqk_gate_K.std().item(),
+                'gate_fv_mean': fv_gate.mean().item(),
+                'gate_fv_std': fv_gate.std().item(),
+                'gate_rq_mean': rqk_gate_Q.mean().item(),
+                'gate_rq_std': rqk_gate_Q.std().item(),
+                'gate_rk_mean': rqk_gate_K.mean().item(),
+                'gate_rk_std': rqk_gate_K.std().item(),
+                'gate_rv_mean': rv_gate.mean().item(),
+                'gate_rv_std': rv_gate.std().item(),
+            }
+        else:
+            routing_info = {}
 
         # Update usage with mask (binary selection)
         if self.training:
@@ -802,49 +790,44 @@ class GlobalRouters(nn.Module):
             self.neuron_router.update_usage(f_mask.float(), 'feature_know', attention_mask)
             self.neuron_router.update_usage(r_mask.float(), 'restore_know', attention_mask)
 
-        # Helper: average paths used per token
-        def avg_paths_per_token(paths):
-            return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
+        # Routing stats only in debug mode (avoid GPU sync overhead)
+        if self.debug_mode:
+            def avg_paths_per_token(paths):
+                return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
 
-        # Helper: average selected neurons per token
-        def avg_selected_per_token(mask):
-            return mask.float().sum(dim=-1).mean().item()
+            def avg_selected_per_token(mask):
+                return mask.float().sum(dim=-1).mean().item()
 
-        # Helper: get tau mean/std (for token-level tau)
-        def tau_mean(tau):
-            return tau.mean().item() if torch.is_tensor(tau) else tau
+            def tau_mean(tau):
+                return tau.mean().item() if torch.is_tensor(tau) else tau
 
-        def tau_std(tau):
-            return tau.std().item() if torch.is_tensor(tau) else 0.0
+            def tau_std(tau):
+                return tau.std().item() if torch.is_tensor(tau) else 0.0
 
-        know_info = {
-            # Softmax weights (before mask multiplication) - for analysis
-            'feature_know_w': f_weights.detach(),
-            'restore_know_w': r_weights.detach(),
-            # Binary selection masks (scores > tau) - for POS analysis
-            'feature_know_mask': f_mask.detach(),
-            'restore_know_mask': r_mask.detach(),
-            'n_paths_feature': avg_paths_per_token(f_paths),
-            'n_paths_restore': avg_paths_per_token(r_paths),
-            # Average selected neurons per token
-            'selected_feature': avg_selected_per_token(f_mask),
-            'selected_restore': avg_selected_per_token(r_mask),
-            # Score statistics (logits mean ± std)
-            'score_feature_mean': logits_f.mean().item(),
-            'score_feature_std': logits_f.std().item(),
-            'score_restore_mean': logits_r.mean().item(),
-            'score_restore_std': logits_r.std().item(),
-            # tau (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
-            'tau_feature': tau_mean(tau_f),
-            'tau_feature_std': tau_std(tau_f),
-            'tau_restore': tau_mean(tau_r),
-            'tau_restore_std': tau_std(tau_r),
-            # Gate statistics (ReLU output)
-            'gate_feature_mean': f_gate.mean().item(),
-            'gate_feature_std': f_gate.std().item(),
-            'gate_restore_mean': r_gate.mean().item(),
-            'gate_restore_std': r_gate.std().item(),
-        }
+            know_info = {
+                'feature_know_w': f_weights.detach(),
+                'restore_know_w': r_weights.detach(),
+                'feature_know_mask': f_mask.detach(),
+                'restore_know_mask': r_mask.detach(),
+                'n_paths_feature': avg_paths_per_token(f_paths),
+                'n_paths_restore': avg_paths_per_token(r_paths),
+                'selected_feature': avg_selected_per_token(f_mask),
+                'selected_restore': avg_selected_per_token(r_mask),
+                'score_feature_mean': logits_f.mean().item(),
+                'score_feature_std': logits_f.std().item(),
+                'score_restore_mean': logits_r.mean().item(),
+                'score_restore_std': logits_r.std().item(),
+                'tau_feature': tau_mean(tau_f),
+                'tau_feature_std': tau_std(tau_f),
+                'tau_restore': tau_mean(tau_r),
+                'tau_restore_std': tau_std(tau_r),
+                'gate_feature_mean': f_gate.mean().item(),
+                'gate_feature_std': f_gate.std().item(),
+                'gate_restore_mean': r_gate.mean().item(),
+                'gate_restore_std': r_gate.std().item(),
+            }
+        else:
+            know_info = {}
 
         return f_paths, r_paths, know_info
 
@@ -1086,13 +1069,15 @@ class DAWNBlock(nn.Module):
         know_out = self.knowledge(normed_x_know, feature_paths, restore_paths, attention_mask)
         x = x + know_out
 
-        # Routing info (all scalar values - no tensor storage to avoid memory leak)
+        # Routing info
         routing_info = {
             'attention': attn_info,
             'knowledge': know_info,
-            'attn_out_norm': attn_out.norm(dim=-1).mean().item(),
-            'know_out_norm': know_out.norm(dim=-1).mean().item(),
         }
+        # Norms only in debug mode (avoid GPU sync overhead)
+        if global_routers.debug_mode:
+            routing_info['attn_out_norm'] = attn_out.norm(dim=-1).mean().item()
+            routing_info['know_out_norm'] = know_out.norm(dim=-1).mean().item()
 
         return x, routing_info, attn_aux_loss
 
