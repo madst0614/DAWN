@@ -1232,8 +1232,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         window_acc_valid += valid_tokens
         window_count += 1
 
-        # Real-time entropy monitoring (every 200 steps)
-        if (step + 1) % 200 == 0 and routing_infos is not None:
+        # Real-time entropy monitoring (every log_interval steps)
+        if (step + 1) % log_interval == 0 and routing_infos is not None:
             with torch.no_grad():
                 try:
                     # Helper functions for entropy/variance calculation
