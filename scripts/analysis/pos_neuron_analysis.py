@@ -314,6 +314,28 @@ class POSNeuronAnalyzer:
         position_neurons = defaultdict(set)
         seq_len = input_ids.shape[1]
 
+        # Debug: check structure on first call
+        if not hasattr(self, '_debug_printed'):
+            self._debug_printed = True
+            print(f"\n[DEBUG] Routing info structure:")
+            print(f"  Number of layers: {len(routing_infos)}")
+            if routing_infos:
+                layer0 = routing_infos[0]
+                print(f"  Layer 0 keys: {list(layer0.keys())}")
+                if 'attention' in layer0:
+                    print(f"  attention keys: {list(layer0['attention'].keys())}")
+                    attn = layer0['attention']
+                    if weight_key in attn:
+                        w = attn[weight_key]
+                        print(f"  {weight_key} type: {type(w)}, shape: {w.shape if hasattr(w, 'shape') else 'N/A'}")
+                        print(f"  {weight_key} dtype: {w.dtype if hasattr(w, 'dtype') else 'N/A'}")
+                        print(f"  {weight_key} sum: {w.sum().item() if hasattr(w, 'sum') else 'N/A'}")
+                        print(f"  {weight_key} nonzero: {(w > 0).sum().item() if hasattr(w, 'sum') else 'N/A'}")
+                    else:
+                        print(f"  {weight_key} NOT FOUND in attention!")
+                if 'knowledge' in layer0:
+                    print(f"  knowledge keys: {list(layer0['knowledge'].keys())}")
+
         for layer_idx, layer_info in enumerate(routing_infos):
             # Skip if not target layer
             if self.target_layer is not None and layer_idx != self.target_layer:
