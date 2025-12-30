@@ -581,6 +581,15 @@ def get_underlying_model(model):
     return model
 
 
+def set_v18_debug_mode(model, enabled: bool):
+    """Toggle debug_mode for v18.x models (controls routing stats computation)"""
+    base_model = get_underlying_model(model)
+    if hasattr(base_model, 'blocks'):
+        for block in base_model.blocks:
+            if hasattr(block, 'router') and hasattr(block.router, 'debug_mode'):
+                block.router.debug_mode = enabled
+
+
 def is_modern_dawn_model(model):
     """Check if model is DAWN v16.0+"""
     base_model = get_underlying_model(model)
@@ -951,6 +960,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         if local_step % accumulation_steps == 0:
             optimizer.zero_grad()
 
+        # Enable v18 debug_mode on log steps (for routing stats)
+        is_log_step = (step + 1) % log_interval == 0
+        if is_log_step:
+            set_v18_debug_mode(model, True)
+
         # Mixed precision training
         if scaler is not None:
             with torch.amp.autocast('cuda', enabled=True):
@@ -963,6 +977,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 else:
                     ce_loss, logits = model(input_ids, labels, attention_mask=attention_mask)
                     routing_infos = None
+
+                # Disable v18 debug_mode after forward (avoid overhead on other steps)
+                if is_log_step:
+                    set_v18_debug_mode(model, False)
 
                 # Orthogonality loss
                 orth_loss = 0.0
@@ -1024,6 +1042,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             else:
                 ce_loss, logits = model(input_ids, labels, attention_mask=attention_mask)
                 routing_infos = None
+
+            # Disable v18 debug_mode after forward (avoid overhead on other steps)
+            if is_log_step:
+                set_v18_debug_mode(model, False)
 
             # Orthogonality loss
             orth_loss = 0.0
