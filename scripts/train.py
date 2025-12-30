@@ -1073,10 +1073,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     ce_loss, logits = model(input_ids, labels, attention_mask=attention_mask)
                     routing_infos = None
 
-                # Disable v18 debug_mode after forward (avoid overhead on other steps)
-                if is_log_step:
-                    set_v18_debug_mode(model, False)
-
                 # Orthogonality loss
                 orth_loss = 0.0
                 if orthogonality_weight > 0 and hasattr(base_model, 'orthogonality_loss'):
@@ -1115,6 +1111,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             # Scale loss for accumulation and backward
             scaler.scale(loss / accumulation_steps).backward()
 
+            # Disable v18 debug_mode after backward (must be after for gradient checkpointing)
+            if is_log_step:
+                set_v18_debug_mode(model, False)
+
             # Only update optimizer on accumulation boundary
             if (local_step + 1) % accumulation_steps == 0:
                 # Gradient clipping
@@ -1137,10 +1137,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
             else:
                 ce_loss, logits = model(input_ids, labels, attention_mask=attention_mask)
                 routing_infos = None
-
-            # Disable v18 debug_mode after forward (avoid overhead on other steps)
-            if is_log_step:
-                set_v18_debug_mode(model, False)
 
             # Orthogonality loss
             orth_loss = 0.0
@@ -1180,6 +1176,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
             # Scale loss for accumulation and backward
             (loss / accumulation_steps).backward()
+
+            # Disable v18 debug_mode after backward (must be after for gradient checkpointing)
+            if is_log_step:
+                set_v18_debug_mode(model, False)
 
             # Only update optimizer on accumulation boundary
             if (local_step + 1) % accumulation_steps == 0:
