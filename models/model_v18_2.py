@@ -675,18 +675,7 @@ class GlobalRouters(nn.Module):
                 return tau.std().item() if torch.is_tensor(tau) else 0.0
 
             routing_info = {
-                'fqk_weights_Q': fqk_weights_Q.detach(),
-                'fqk_weights_K': fqk_weights_K.detach(),
-                'fv_weights': fv_weights.detach(),
-                'rqk_weights_Q': rqk_weights_Q.detach(),
-                'rqk_weights_K': rqk_weights_K.detach(),
-                'rv_weights': rv_weights.detach(),
-                'fqk_mask_Q': fqk_mask_Q.detach(),
-                'fqk_mask_K': fqk_mask_K.detach(),
-                'fv_mask': fv_mask.detach(),
-                'rqk_mask_Q': rqk_mask_Q.detach(),
-                'rqk_mask_K': rqk_mask_K.detach(),
-                'rv_mask': rv_mask.detach(),
+                # Only store scalar stats for logging (not large tensors to save memory)
                 'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
                 'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
                 'n_paths_fv': avg_paths_per_token(fv_paths),
@@ -805,10 +794,7 @@ class GlobalRouters(nn.Module):
                 return tau.std().item() if torch.is_tensor(tau) else 0.0
 
             know_info = {
-                'feature_know_w': f_weights.detach(),
-                'restore_know_w': r_weights.detach(),
-                'feature_know_mask': f_mask.detach(),
-                'restore_know_mask': r_mask.detach(),
+                # Only store scalar stats for logging (not large tensors to save memory)
                 'n_paths_feature': avg_paths_per_token(f_paths),
                 'n_paths_restore': avg_paths_per_token(r_paths),
                 'selected_feature': avg_selected_per_token(f_mask),
