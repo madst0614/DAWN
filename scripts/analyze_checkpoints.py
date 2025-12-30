@@ -234,6 +234,9 @@ def load_model_from_checkpoint(ckpt_path, device='cuda'):
     if not config:
         raise ValueError(f"No model config in checkpoint")
 
+    # Get state_dict first (needed for version detection)
+    state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
+
     # Create model
     version = config.get('model_version', config.get('version', None))
 
@@ -259,9 +262,6 @@ def load_model_from_checkpoint(ckpt_path, device='cuda'):
     version = normalize_version(version)
 
     model = create_model_by_version(version, config)
-
-    # Load weights
-    state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
 
     # Remove compiled prefix
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
