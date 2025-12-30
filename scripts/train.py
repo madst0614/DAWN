@@ -89,6 +89,10 @@ DEAD_NEURON_THRESHOLD = 0.01
 # If max routing weight > 0.8, the model is over-relying on a single neuron
 WEIGHT_CONCENTRATION_WARNING = 0.8
 
+# Logging interval: how often to log training metrics (every N steps)
+# Both console and file logging use this interval
+LOG_INTERVAL = 100
+
 
 # ============================================================
 # DEBUG LOGGING FUNCTIONS
@@ -685,6 +689,101 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
     return lines
 
 
+def format_v18_neuron_usage(router, model_version, prefix="      "):
+    """
+    Format v18 neuron usage stats from router.
+    Returns list of formatted strings.
+    """
+    lines = []
+
+    ema_fq = router.usage_ema_feature_q
+    ema_fk = router.usage_ema_feature_k
+    ema_fv = router.usage_ema_feature_v
+    ema_rq = router.usage_ema_restore_q
+    ema_rk = router.usage_ema_restore_k
+    ema_rv = router.usage_ema_restore_v
+    ema_FK = router.usage_ema_feature_know
+    ema_RK = router.usage_ema_restore_know
+
+    # Active neuron counts (EMA > 0.01)
+    active_fq = (ema_fq > 0.01).sum().item()
+    active_fk = (ema_fk > 0.01).sum().item()
+    active_fv = (ema_fv > 0.01).sum().item()
+    active_rq = (ema_rq > 0.01).sum().item()
+    active_rk = (ema_rk > 0.01).sum().item()
+    active_rv = (ema_rv > 0.01).sum().item()
+    active_FK = (ema_FK > 0.01).sum().item()
+    active_RK = (ema_RK > 0.01).sum().item()
+    n_fq, n_fk, n_fv = ema_fq.numel(), ema_fk.numel(), ema_fv.numel()
+    n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
+    n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+
+    gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
+    gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
+    gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+
+    # Entropy (normalized, 0=concentrated, 100=uniform)
+    ent_fq, ent_fk, ent_fv = _entropy(ema_fq), _entropy(ema_fk), _entropy(ema_fv)
+    ent_rq, ent_rk, ent_rv = _entropy(ema_rq), _entropy(ema_rk), _entropy(ema_rv)
+    ent_FK, ent_RK = _entropy(ema_FK), _entropy(ema_RK)
+
+    dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
+    dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
+    dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
+    dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
+    dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
+    dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
+    dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
+    dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
+
+    lines.append(f"{prefix}Usage: FQ={int(active_fq)}/{n_fq} FK={int(active_fk)}/{n_fk} FV={int(active_fv)}/{n_fv} | RQ={int(active_rq)}/{n_rq} RK={int(active_rk)}/{n_rk} RV={int(active_rv)}/{n_rv} | Know: F={int(active_FK)}/{n_FK} R={int(active_RK)}/{n_RK}")
+    lines.append(f"{prefix}Ent: FQ={ent_fq:.0f} FK={ent_fk:.0f} FV={ent_fv:.0f} RQ={ent_rq:.0f} RK={ent_rk:.0f} RV={ent_rv:.0f} FKnow={ent_FK:.0f} RKnow={ent_RK:.0f}")
+    lines.append(f"{prefix}Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
+    lines.append(f"{prefix}Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
+
+    return lines
+
+
+def format_v18_full_log(routing_infos, router, model_version, step, avg_loss, avg_acc,
+                        ent_str, overlap_str, attn_str, tau_grad_info=None, prefix=""):
+    """
+    v18 콘솔/파일 공용 로그 포맷터.
+
+    Args:
+        routing_infos: list of routing info dicts from model forward
+        router: UnifiedNeuronRouter instance (base_model.router.neuron_router)
+        model_version: str like "18.2"
+        step: current step (0-indexed, will display as step+1)
+        avg_loss: average loss for window
+        avg_acc: average accuracy for window
+        ent_str: entropy string from get_routing_log_info
+        overlap_str: Q/K overlap string
+        attn_str: attention ratio string (e.g., "62/68/74...")
+        tau_grad_info: optional dict with 'weight' and 'bias' gradient norms
+        prefix: line prefix for indentation
+
+    Returns: list of strings (each line)
+    """
+    lines = []
+
+    # Header line
+    lines.append(f"{prefix}[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
+
+    # Routing stats (Paths, Selected, Score, Tau, Gate)
+    inner_prefix = prefix + "      "
+    lines.extend(format_v18_routing_stats(routing_infos, model_version, prefix=inner_prefix))
+
+    # Neuron usage stats
+    if router is not None:
+        lines.extend(format_v18_neuron_usage(router, model_version, prefix=inner_prefix))
+
+    # Tau gradient (only if available)
+    if tau_grad_info is not None:
+        lines.append(f"{inner_prefix}Tau grad: weight={tau_grad_info['weight']:.6f} bias={tau_grad_info['bias']:.6f}")
+
+    return lines
+
+
 def is_modern_dawn_model(model):
     """Check if model is DAWN v16.0+"""
     base_model = get_underlying_model(model)
@@ -1020,8 +1119,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     total_valid_tokens = 0
     num_batches = 0
 
-    # Window accumulators for logging every 100 steps
-    log_interval = 100
+    # Window accumulators for logging every LOG_INTERVAL steps
+    log_interval = LOG_INTERVAL
     window_loss = 0.0
     window_acc_correct = 0
     window_acc_valid = 0
@@ -1278,66 +1377,22 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Compact output with loss/acc
                     model_version = getattr(base_model, '__version__', '')
                     if model_version.startswith('18'):
-                        # v18.0: Fixed threshold multi-path logging
-                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
-
-                        # Unified routing stats (Paths, Selected, Score, Tau, Gate)
-                        for line in format_v18_routing_stats(routing_infos, model_version, prefix="      "):
-                            print(line)
-
-                        # v18 Neuron Usage (integrated here, not in _get_router_log_lines)
-                        router = base_model.router.neuron_router
-                        ema_fq = router.usage_ema_feature_q
-                        ema_fk = router.usage_ema_feature_k
-                        ema_fv = router.usage_ema_feature_v
-                        ema_rq = router.usage_ema_restore_q
-                        ema_rk = router.usage_ema_restore_k
-                        ema_rv = router.usage_ema_restore_v
-                        ema_FK = router.usage_ema_feature_know
-                        ema_RK = router.usage_ema_restore_know
-
-                        # Active neuron counts (EMA > 0.01)
-                        active_fq = (ema_fq > 0.01).sum().item()
-                        active_fk = (ema_fk > 0.01).sum().item()
-                        active_fv = (ema_fv > 0.01).sum().item()
-                        active_rq = (ema_rq > 0.01).sum().item()
-                        active_rk = (ema_rk > 0.01).sum().item()
-                        active_rv = (ema_rv > 0.01).sum().item()
-                        active_FK = (ema_FK > 0.01).sum().item()
-                        active_RK = (ema_RK > 0.01).sum().item()
-                        n_fq, n_fk, n_fv = ema_fq.numel(), ema_fk.numel(), ema_fv.numel()
-                        n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
-                        n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
-
-                        gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
-                        gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
-                        gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
-
-                        # Entropy (normalized, 0=concentrated, 100=uniform)
-                        ent_fq, ent_fk, ent_fv = _entropy(ema_fq), _entropy(ema_fk), _entropy(ema_fv)
-                        ent_rq, ent_rk, ent_rv = _entropy(ema_rq), _entropy(ema_rk), _entropy(ema_rv)
-                        ent_FK, ent_RK = _entropy(ema_FK), _entropy(ema_RK)
-
-                        dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
-                        dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
-                        dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
-                        dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
-                        dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
-                        dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
-                        dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
-                        dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
-
-                        print(f"          Usage: FQ={int(active_fq)}/{n_fq} FK={int(active_fk)}/{n_fk} FV={int(active_fv)}/{n_fv} | RQ={int(active_rq)}/{n_rq} RK={int(active_rk)}/{n_rk} RV={int(active_rv)}/{n_rv} | Know: F={int(active_FK)}/{n_FK} R={int(active_RK)}/{n_RK}")
-                        print(f"          Ent: FQ={ent_fq:.0f} FK={ent_fk:.0f} FV={ent_fv:.0f} RQ={ent_rq:.0f} RK={ent_rk:.0f} RV={ent_rv:.0f} FKnow={ent_FK:.0f} RKnow={ent_RK:.0f}")
-                        print(f"          Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
-                        print(f"          Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
-
-                        # tau_proj gradient norm (v18.1/v18.2 only)
+                        # Get tau gradient info if available
+                        tau_grad_info = None
                         if model_version.startswith('18.1') or model_version.startswith('18.2'):
                             if hasattr(base_model.router, 'tau_proj') and base_model.router.tau_proj.weight.grad is not None:
-                                tau_w_grad = base_model.router.tau_proj.weight.grad.norm().item()
-                                tau_b_grad = base_model.router.tau_proj.bias.grad.norm().item() if base_model.router.tau_proj.bias.grad is not None else 0
-                                print(f"          Tau grad: weight={tau_w_grad:.6f} bias={tau_b_grad:.6f}")
+                                tau_grad_info = {
+                                    'weight': base_model.router.tau_proj.weight.grad.norm().item(),
+                                    'bias': base_model.router.tau_proj.bias.grad.norm().item() if base_model.router.tau_proj.bias.grad is not None else 0
+                                }
+
+                        # Use unified formatter for v18 logging
+                        router = base_model.router.neuron_router
+                        for line in format_v18_full_log(
+                            routing_infos, router, model_version, step, avg_loss, avg_acc,
+                            ent_str, overlap_str, attn_str, tau_grad_info=tau_grad_info
+                        ):
+                            print(line)
 
                     elif overlap_str:
                         print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
@@ -1446,43 +1501,73 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     import traceback
                     traceback.print_exc()
 
-        # Log aggregated metrics every 100 steps (same format as console output)
+        # Log aggregated metrics every log_interval steps (same format as console output)
         if log_file and (step + 1) % log_interval == 0:
-            avg_window_loss = window_loss / window_count
+            avg_window_loss = window_loss / window_count if window_count > 0 else 0.0
             avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
 
             with open(log_file, 'a') as f:
-                # Basic loss/acc line
-                f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
-
-                # Add v18 routing info (detailed format) if available
                 model_version = getattr(base_model, '__version__', '')
-                if model_version.startswith('18') and needs_routing_info(model):
-                    try:
-                        model.eval()
-                        set_v18_debug_mode(model, True)  # Enable for routing stats
-                        with torch.no_grad():
-                            _, routing_infos_log = model(input_ids, return_routing_info=True)
-                        set_v18_debug_mode(model, False)  # Disable after
-                        if routing_infos_log:
-                            # Use unified formatter (same as console output)
-                            for line in format_v18_routing_stats(routing_infos_log, model_version, prefix="  "):
-                                f.write(line + "\n")
-                        model.train()
-                    except Exception:
-                        pass
 
-                # Add router metrics (same format as console)
-                router = None
-                global_routers = None
-                if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1/v18
-                    router = base_model.router.neuron_router
-                    global_routers = base_model.router  # For v18 detection (has max_paths)
-                elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
-                    router = base_model.global_routers.neuron_router
-                if router is not None:
-                    for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
-                        f.write(line + "\n")
+                # v18: Use unified full log format (same as console)
+                if model_version.startswith('18') and routing_infos is not None:
+                    try:
+                        # Compute ent_str, overlap_str, attn_str for file log
+                        def calc_entropy_ratio(pref):
+                            if pref is None:
+                                return 0.0
+                            ent = -(pref * (pref + 1e-8).log()).sum(-1).mean()
+                            return (ent / math.log(pref.shape[-1]) * 100).item()
+
+                        def calc_token_var(pref):
+                            if pref is None:
+                                return 0.0
+                            return pref.var(dim=1).mean().item()
+
+                        log_info = get_routing_log_info(routing_infos, calc_entropy_ratio, calc_token_var)
+                        ent_str = log_info['ent_str']
+                        overlap_str = log_info['overlap_str']
+
+                        # Attention ratio
+                        attn_ratios = []
+                        for layer_info in routing_infos:
+                            attn_norm = layer_info.get('attn_out_norm')
+                            mem_norm = layer_info.get('mem_out_norm') or layer_info.get('know_out_norm')
+                            if attn_norm is not None and mem_norm is not None:
+                                ratio = attn_norm / (attn_norm + mem_norm + 1e-8) * 100
+                                attn_ratios.append(f"{ratio:.0f}")
+                            else:
+                                attn_ratios.append("-")
+                        attn_str = "/".join(attn_ratios)
+
+                        # Get router for neuron usage stats
+                        router = base_model.router.neuron_router if hasattr(base_model, 'router') else None
+
+                        # Use unified formatter (no tau_grad for file - only scalar stats)
+                        for line in format_v18_full_log(
+                            routing_infos, router, model_version, step,
+                            avg_window_loss, avg_window_acc,
+                            ent_str, overlap_str, attn_str
+                        ):
+                            f.write(line + "\n")
+                    except Exception:
+                        # Fallback: just write basic line
+                        f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
+                else:
+                    # Non-v18: Basic loss/acc line + legacy router metrics
+                    f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
+
+                    # Add router metrics for non-v18 models
+                    router = None
+                    global_routers = None
+                    if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):
+                        router = base_model.router.neuron_router
+                        global_routers = base_model.router
+                    elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
+                        router = base_model.global_routers.neuron_router
+                    if router is not None:
+                        for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
+                            f.write(line + "\n")
 
             # Collect neuron metrics
             model.eval()
