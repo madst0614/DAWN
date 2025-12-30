@@ -478,7 +478,7 @@ class GlobalRouters(nn.Module):
         """
         Threshold selection with two modes:
         - Training: Log-gated differentiable selection (gradient flows to tau)
-        - Inference (hard mask): Clean hard threshold for deployment
+        - Inference (hard mask): Same log-gated weights above tau, complete removal below
 
         Args:
             scores: [B, S, N] neuron scores
@@ -493,16 +493,17 @@ class GlobalRouters(nn.Module):
         """
         mask = (scores > tau)
 
+        # Log-gated selection (used in both modes)
+        gate = F.relu(scores - tau) + 1e-8
+        log_gate = torch.log(gate).clamp(min=-20)
+
         if self.inference_hard_mask and not self.training:
-            # Inference: clean hard mask - zero out neurons below threshold
-            weights = F.softmax(scores.masked_fill(~mask, -1e9), dim=-1)
-            gate = mask.to(scores.dtype)  # for stats
-        else:
-            # Training: differentiable log-gated selection
-            gate = F.relu(scores - tau) + 1e-8
-            log_gate = torch.log(gate).clamp(min=-20)
-            masked_scores = scores + log_gate
-            weights = F.softmax(masked_scores, dim=-1)
+            # Inference: keep log-gated weights for neurons above tau,
+            # completely remove neurons below tau
+            log_gate = torch.where(mask, log_gate, torch.full_like(log_gate, -1e9))
+
+        masked_scores = scores + log_gate
+        weights = F.softmax(masked_scores, dim=-1)
 
         return weights, mask, gate
 
