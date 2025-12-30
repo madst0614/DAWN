@@ -588,15 +588,16 @@ class SemanticAnalyzer:
     # POS Routing Analysis - BATCH OPTIMIZED with nlp.pipe()
     # ============================================================
 
-    def analyze_pos_routing(self, dataloader, max_batches: int = 50) -> Dict:
+    def analyze_pos_routing(self, dataloader, max_batches: int = 50, target_layers: list = None) -> Dict:
         """
-        Analyze routing patterns by part-of-speech across ALL layers.
+        Analyze routing patterns by part-of-speech across selected layers.
         Uses spaCy pipe for batch processing.
         Optimized with batch CPU transfers.
 
         Args:
             dataloader: DataLoader for input data
             max_batches: Maximum batches to process
+            target_layers: List of layer indices to analyze (default: [0, n_layers//2, n_layers-1])
 
         Returns:
             POS-wise routing statistics with layer breakdown
@@ -606,6 +607,12 @@ class SemanticAnalyzer:
 
         pos_weights = defaultdict(list)
         pos_counts = defaultdict(int)
+
+        # Determine which layers to analyze (default: first, middle, last)
+        n_layers = getattr(self.model, 'n_layers', 12)
+        if target_layers is None:
+            target_layers = [0, n_layers // 2, n_layers - 1]
+        target_layers_set = set(target_layers)
 
         self.model.eval()
         with torch.no_grad():
@@ -637,8 +644,11 @@ class SemanticAnalyzer:
                     for b in range(batch_size)
                 ]
 
-                # Process each layer
+                # Process selected layers only (skip others for speed)
                 for layer_idx, layer_info in enumerate(routing_infos):
+                    if layer_idx not in target_layers_set:
+                        continue
+
                     attn = layer_info.get('attention', {})
                     knowledge = layer_info.get('knowledge', {})
 
