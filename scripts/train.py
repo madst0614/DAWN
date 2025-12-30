@@ -584,10 +584,9 @@ def get_underlying_model(model):
 def set_v18_debug_mode(model, enabled: bool):
     """Toggle debug_mode for v18.x models (controls routing stats computation)"""
     base_model = get_underlying_model(model)
-    if hasattr(base_model, 'blocks'):
-        for block in base_model.blocks:
-            if hasattr(block, 'router') and hasattr(block.router, 'debug_mode'):
-                block.router.debug_mode = enabled
+    # v18.x: debug_mode is in GlobalRouters (base_model.router)
+    if hasattr(base_model, 'router') and hasattr(base_model.router, 'debug_mode'):
+        base_model.router.debug_mode = enabled
 
 
 def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
