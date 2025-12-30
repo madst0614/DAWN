@@ -2,6 +2,9 @@
 DAWN Model Version Registry - Single Source of Truth
 
 Supported Versions:
+  v18.2: ReLU-Masked Learnable Tau (mask = ReLU(scores - tau) > 0, Q/K separated)
+  v18.1: Soft Mask + Learnable Tau (use_soft_mask=True, learnable_tau=True)
+  v18.0: Fixed Threshold Multi-Path Routing (rank=16, max_paths=4, fixed_tau=0.0, path_min_k=8, path_max_k=16)
   v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
   v17.2: Feature QK Unified + Restore Q/K Separate
   baseline: Vanilla Transformer for comparison
@@ -12,6 +15,123 @@ import torch
 
 
 VERSION_REGISTRY = {
+    "18.2": {
+        "description": "ReLU-Masked Learnable Tau (Q/K separated)",
+        "aliases": ["182"],
+        "module": "model_v18_2",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "max_paths": 4,
+            "fixed_tau": 0.0,
+            "path_max_k": 16,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "attention_token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+            "learnable_tau": True,
+        },
+        "display_info": lambda args: [
+            f"DAWN v18.2: ReLU-Masked Learnable Tau",
+            f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}, path_max_k={args.get('path_max_k', 16)}",
+            f"  fixed_tau={args.get('fixed_tau', 0.0)}, learnable_tau={args.get('learnable_tau', True)}",
+            f"  F-QK: {args.get('n_feature_qk')} - Q/K separated tau",
+            f"  F-V: {args.get('n_feature_v')}",
+            f"  R-QK: {args.get('n_restore_qk')} - Q/K separated tau",
+            f"  R-V: {args.get('n_restore_v')}",
+            f"  F-Know: {args.get('n_feature_know')}, R-Know: {args.get('n_restore_know')}",
+        ],
+    },
+
+    "18.1": {
+        "description": "Soft Mask + Learnable Tau",
+        "aliases": ["181"],
+        "module": "model_v18_1",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "max_paths": 4,
+            "fixed_tau": 0.0,
+            "path_min_k": 8,
+            "path_max_k": 16,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "attention_token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+            # v18.1 specific
+            "use_soft_mask": True,
+            "learnable_tau": True,
+            "soft_mask_temp": 1.0,
+            "soft_mask_penalty": 10.0,
+        },
+        "display_info": lambda args: [
+            f"DAWN v18.1: Soft Mask + Learnable Tau",
+            f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}",
+            f"  fixed_tau={args.get('fixed_tau', 0.0)}, path_min_k={args.get('path_min_k', 8)}, path_max_k={args.get('path_max_k', 16)}",
+            f"  soft_mask_temp={args.get('soft_mask_temp', 1.0)}, soft_mask_penalty={args.get('soft_mask_penalty', 100.0)}",
+            f"  F-QK: {args.get('n_feature_qk')} - Q/K shared pool",
+            f"  F-V: {args.get('n_feature_v')}",
+            f"  R-QK: {args.get('n_restore_qk')} - Q/K shared pool",
+            f"  R-V: {args.get('n_restore_v')}",
+            f"  F-Know: {args.get('n_feature_know')}, R-Know: {args.get('n_restore_know')}",
+        ],
+    },
+
+    "18.0": {
+        "description": "Fixed Threshold Multi-Path Routing",
+        "aliases": ["18", "180"],
+        "module": "model_v18",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "max_paths": 4,
+            "fixed_tau": 0.0,
+            "path_min_k": 8,
+            "path_max_k": 16,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "attention_token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+        },
+        "display_info": lambda args: [
+            f"DAWN v18.0: Fixed Threshold Multi-Path Routing",
+            f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}",
+            f"  fixed_tau={args.get('fixed_tau', 0.0)}, path_min_k={args.get('path_min_k', 8)}, path_max_k={args.get('path_max_k', 16)}",
+            f"  F-QK: {args.get('n_feature_qk')} - Q/K shared pool",
+            f"  F-V: {args.get('n_feature_v')}",
+            f"  R-QK: {args.get('n_restore_qk')} - Q/K shared pool",
+            f"  R-V: {args.get('n_restore_v')}",
+            f"  F-Know: {args.get('n_feature_know')}, R-Know: {args.get('n_restore_know')}",
+        ],
+    },
+
     "17.2": {
         "description": "Feature QK Unified + Restore Q/K Separate",
         "aliases": ["172"],
@@ -262,7 +382,7 @@ def get_all_versions_info() -> str:
 
 def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[str, Any]:
     """
-    Extract routing log info for v17.1/v17.2.
+    Extract routing log info for v17.1/v17.2/v18.0/v18.1/v18.2.
     Computes AVERAGE entropy across all layers.
     """
     if isinstance(routing_infos, dict):
@@ -270,8 +390,55 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
 
     attn0 = routing_infos[0].get('attention', routing_infos[0])
 
+    # v18.0/v18.1: Fixed Threshold Multi-Path (has n_paths_* keys)
+    # Note: v18 doesn't store _pref tensors to avoid memory leaks
+    # Uses selected neuron counts and score distribution instead of entropy/variance
+    if attn0.get('n_paths_fqk_Q') is not None:
+        know0 = routing_infos[0].get('knowledge', {})
+
+        # Selected neurons per token (more informative than activation ratio)
+        sel_fqk_Q = attn0.get('selected_fqk_Q', 0)
+        sel_fqk_K = attn0.get('selected_fqk_K', 0)
+        sel_fv = attn0.get('selected_fv', 0)
+        sel_rqk_Q = attn0.get('selected_rqk_Q', 0)
+        sel_rqk_K = attn0.get('selected_rqk_K', 0)
+        sel_rv = attn0.get('selected_rv', 0)
+        sel_kf = know0.get('selected_feature', 0)
+        sel_kr = know0.get('selected_restore', 0)
+
+        # Format selected neurons string (includes knowledge)
+        sel_str = f"Sel FQK:{sel_fqk_Q:.0f}/{sel_fqk_K:.0f} FV:{sel_fv:.0f} RQK:{sel_rqk_Q:.0f}/{sel_rqk_K:.0f} RV:{sel_rv:.0f} K:{sel_kf:.0f}/{sel_kr:.0f}"
+
+        # Q/K overlap ratio
+        overlap_fqk = attn0.get('overlap_fqk', 0)
+        overlap_rqk = attn0.get('overlap_rqk', 0)
+        overlap_str = f"Q/K Overlap FQK/RQK:{overlap_fqk:.2f}/{overlap_rqk:.2f}"
+
+        # v18 specific: path counts
+        n_paths = f"Paths FQK:{attn0.get('n_paths_fqk_Q', 0):.1f}/{attn0.get('n_paths_fqk_K', 0):.1f} FV:{attn0.get('n_paths_fv', 0):.1f} RQK:{attn0.get('n_paths_rqk_Q', 0):.1f}/{attn0.get('n_paths_rqk_K', 0):.1f} RV:{attn0.get('n_paths_rv', 0):.1f}"
+
+        # Detect v18.1/v18.2 by flag and key presence
+        # v18.2: has adj_* keys (ReLU mask)
+        # v18.1: has gate_* keys (sigmoid gate)
+        # v18.0: neither (fixed tau)
+        is_soft_mask = attn0.get('use_soft_mask', False) or attn0.get('learnable_tau', False)
+        if is_soft_mask:
+            # v18.2 uses adj_*, v18.1 uses gate_*
+            version = '18.2' if attn0.get('adj_fq') is not None else '18.1'
+        else:
+            version = '18.0'
+
+        return {
+            'ent_str': sel_str,  # Use selected neurons instead of entropy for v18
+            'var_str': None,  # No variance tracking for v18
+            'overlap_str': overlap_str,  # Q/K overlap
+            'paths_str': n_paths,
+            'tau_str': None,  # tau logged separately in train.py for v18.1
+            'version': version
+        }
+
     # v17.2: Feature QK Unified (fqk_pref exists, fqk_q_pref does not)
-    if attn0.get('fqk_pref') is not None:
+    elif attn0.get('fqk_pref') is not None:
         all_ents = {k: [] for k in ['FQK', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
         all_vars = {k: [] for k in ['FQK', 'FV', 'RQK_Q', 'RQK_K', 'RV']}
 

@@ -1,6 +1,22 @@
 """
 DAWN Models Module
 
+v18.2: ReLU-Masked Learnable Tau (Q/K separated)
+- ReLU mask: mask = (ReLU(scores - tau) > 0)
+- Learnable tau: token-level tau via nn.Linear(d_model, 8) - Q/K separated
+- Hard masking with differentiable tau learning
+
+v18.1: Soft Mask + Token-level Learnable Tau
+- Soft mask: sigmoid((score - tau) / temp) instead of hard threshold
+- Learnable tau: token-level tau via nn.Linear(d_model, 8)
+- Gate-based scoring: weights = softmax(scores * gate)
+
+v18.0: Fixed Threshold Multi-Path Routing
+- Fixed threshold + masked softmax for neuron selection
+- Minimum/maximum neuron guarantees (path_min_k, path_max_k * max_paths)
+- Multi-path (1~max_paths) parallel processing with path-wise Q,K,V aggregation
+- rank=16, max_paths=4, fixed_tau=0.0, path_min_k=8, path_max_k=16
+
 v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
 - Attention: Q/K separate pools (Feature_Q/K/V, Restore_Q/K/V)
 - Knowledge: Feature-Restore pattern (Feature_Know, Restore_Know)
@@ -13,6 +29,15 @@ v17.2: Feature QK Unified + Restore Q/K Separate
 
 baseline: Vanilla Transformer for fair comparison
 """
+
+# v18.2 - ReLU-Masked Learnable Tau
+from .model_v18_2 import DAWN as DAWN_v18_2
+
+# v18.1 - Soft Mask + Token-level Learnable Tau
+from .model_v18_1 import DAWN as DAWN_v18_1
+
+# v18.0 - Fixed Threshold Multi-Path Routing
+from .model_v18 import DAWN as DAWN_v18
 
 # v17.1 - Q/K Separate Pool + Knowledge Feature-Restore (default)
 from .model_v17_1 import DAWN as DAWN_v17_1
@@ -45,6 +70,9 @@ from .version_registry import (
 __all__ = [
     # Models
     'DAWN',
+    'DAWN_v18_2',
+    'DAWN_v18_1',
+    'DAWN_v18',
     'DAWN_v17_2',
     'DAWN_v17_1',
     'VanillaTransformer',
@@ -71,7 +99,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "17.2", "17.1", or "baseline"
+        version: "18.2", "18.1", "18.0", "17.2", "17.1", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -82,10 +110,16 @@ def create_model_by_version(version, config):
 
     version = normalize_version(version)
 
-    if version == "17.2":
+    if version == "18.2":
+        return DAWN_v18_2(**config)
+    elif version == "18.1":
+        return DAWN_v18_1(**config)
+    elif version == "18.0":
+        return DAWN_v18(**config)
+    elif version == "17.2":
         return DAWN_v17_2(**config)
     elif version == "17.1":
         return DAWN_v17_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 17.2, 17.1, baseline")
+                        f"Supported versions: 18.2, 18.1, 18.0, 17.2, 17.1, baseline")
