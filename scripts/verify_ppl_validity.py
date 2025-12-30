@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PPL Validity Verification Script for DAWN v17.1
+PPL Validity Verification Script for DAWN
 
 This script performs two critical tests to verify if the reported PPL is valid:
 1. Mask Visualization Test - Checks if causal mask is properly applied
@@ -13,6 +13,8 @@ If PPL 1.8~2.3 is valid:
 If PPL is invalid (mask leak / future token access):
 - Mask might be all zeros or incorrect pattern
 - Generated text will be garbage, repetitive, or NaN
+
+Supports all DAWN versions (auto-detection from checkpoint).
 
 Usage:
     python scripts/verify_ppl_validity.py --weights /path/to/checkpoint.pt
@@ -28,30 +30,55 @@ import torch
 import torch.nn.functional as F
 from transformers import BertTokenizer
 
-from models import DAWN
+from models import create_model_by_version, normalize_version
 
 
-# Model config (v17.1) - same as validate_weights.py
-CONFIG = {
-    'vocab_size': 30522,
-    'd_model': 384,
-    'n_layers': 12,
-    'n_heads': 6,
-    'rank': 64,
-    'knowledge_rank': 128,
-    'n_feature_qk': 120,
-    'n_feature_v': 24,
-    'n_restore_qk': 120,
-    'n_restore_v': 24,
-    'n_feature_know': 24,
-    'n_restore_know': 24,
-    'top_k_feature_qk': 20,
-    'top_k_feature_v': 6,
-    'top_k_restore_qk': 20,
-    'top_k_restore_v': 6,
-    'top_k_feature_know': 4,
-    'top_k_restore_know': 4,
-}
+def load_model_from_checkpoint(weights_path, device='cpu'):
+    """Load model from checkpoint with auto version detection."""
+    ckpt = torch.load(weights_path, map_location=device)
+
+    # Get config and state_dict
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        state_dict = ckpt['model_state_dict']
+        config = ckpt.get('model_config', ckpt.get('config', {}))
+        epoch = ckpt.get('epoch')
+        step = ckpt.get('step')
+    else:
+        state_dict = ckpt
+        config = {}
+        epoch = step = None
+
+    # Clean compiled model prefix
+    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    # Auto-detect version from config or state_dict keys
+    version = config.get('model_version', None)
+    if version is None:
+        v18_2_keys = ['router.tau_proj.weight', 'router.neuron_router.norm_fqk_Q.weight']
+        dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
+
+        if all(k in state_dict for k in v18_2_keys):
+            version = '18.2'
+        elif any(k in state_dict for k in dawn_keys):
+            if config.get('learnable_tau', False) or config.get('max_paths'):
+                version = '18.2'
+            else:
+                version = '17.1'
+        else:
+            version = 'baseline'
+
+    version = normalize_version(version)
+    print(f"  Detected version: {version}")
+
+    model = create_model_by_version(version, config)
+    model.load_state_dict(state_dict, strict=False)
+
+    if epoch is not None:
+        print(f"  Loaded from epoch {epoch}")
+    if step is not None:
+        print(f"  Loaded from step {step}")
+
+    return model, config, version
 
 
 def visualize_attention_mask(model, tokenizer, device, prompt="Hello world"):
@@ -329,7 +356,7 @@ def main():
     args = parser.parse_args()
 
     print("="*60)
-    print("DAWN v17.1 PPL Validity Verification")
+    print("DAWN PPL Validity Verification")
     print("="*60)
     print(f"\nDevice: {args.device}")
     print(f"Weights: {args.weights}")
@@ -338,25 +365,15 @@ def main():
     print("\nLoading tokenizer (bert-base-uncased)...")
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
-    # Load model
+    # Load model with auto version detection
     print(f"Loading model...")
-    model = DAWN(**CONFIG)
-
-    ckpt = torch.load(args.weights, map_location='cpu')
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
-        if 'epoch' in ckpt:
-            print(f"  Loaded from epoch {ckpt['epoch']}")
-        if 'step' in ckpt:
-            print(f"  Loaded from step {ckpt['step']}")
-    else:
-        model.load_state_dict(ckpt)
-
+    model, config, version = load_model_from_checkpoint(args.weights, device='cpu')
     model = model.to(args.device)
 
     # Use batch-level routing (same as training) + 512 padding for stable importance
-    model.router.attention_token_routing = False
-    model.router.knowledge_token_routing = False
+    if hasattr(model, 'router'):
+        model.router.attention_token_routing = False
+        model.router.knowledge_token_routing = False
 
     model.eval()
 
@@ -389,17 +406,17 @@ def main():
     any_fail = any(r is False for r in results.values())
 
     if all_pass:
-        print("""
+        print(f"""
 [VALID] All tests passed!
 
-Your PPL 1.8~2.3 result appears to be VALID.
+Your PPL result appears to be VALID.
 
 This means:
 - Causal masking is correctly implemented (no future token leak)
 - Model generates coherent text (learned meaningful patterns)
 - No NaN/Inf issues in model outputs
 
-Congratulations! Your DAWN v17.1 model is performing exceptionally well.
+Congratulations! Your DAWN {version} model is performing well.
 The dynamic routing and orthogonality constraints are working as intended.
 """)
     elif any_fail:
