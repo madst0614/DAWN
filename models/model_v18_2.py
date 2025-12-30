@@ -672,13 +672,14 @@ class GlobalRouters(nn.Module):
             return tau.std().item() if torch.is_tensor(tau) else 0.0
 
         routing_info = {
-            # Combined weights (sum of all paths) - compatible with v17.1 format
-            'fqk_weights_Q': sum(fqk_paths_Q).detach(),
-            'fqk_weights_K': sum(fqk_paths_K).detach(),
-            'fv_weights': sum(fv_paths).detach(),
-            'rqk_weights_Q': sum(rqk_paths_Q).detach(),
-            'rqk_weights_K': sum(rqk_paths_K).detach(),
-            'rv_weights': sum(rv_paths).detach(),
+            # Softmax weights (before mask multiplication) - for analysis
+            # These show relative importance of all neurons, not just selected ones
+            'fqk_weights_Q': fqk_weights_Q.detach(),
+            'fqk_weights_K': fqk_weights_K.detach(),
+            'fv_weights': fv_weights.detach(),
+            'rqk_weights_Q': rqk_weights_Q.detach(),
+            'rqk_weights_K': rqk_weights_K.detach(),
+            'rv_weights': rv_weights.detach(),
             # Average paths used per token
             'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
             'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
@@ -802,9 +803,9 @@ class GlobalRouters(nn.Module):
             return tau.std().item() if torch.is_tensor(tau) else 0.0
 
         know_info = {
-            # Combined weights (sum of all paths) - compatible with v17.1 format
-            'feature_know_w': sum(f_paths).detach(),
-            'restore_know_w': sum(r_paths).detach(),
+            # Softmax weights (before mask multiplication) - for analysis
+            'feature_know_w': f_weights.detach(),
+            'restore_know_w': r_weights.detach(),
             'n_paths_feature': avg_paths_per_token(f_paths),
             'n_paths_restore': avg_paths_per_token(r_paths),
             # Average selected neurons per token
