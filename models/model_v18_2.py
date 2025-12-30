@@ -404,6 +404,7 @@ class GlobalRouters(nn.Module):
         self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
         self.learnable_tau = learnable_tau
+        self.inference_hard_mask = False  # Set True for clean hard mask during inference
 
         # Learnable tau parameters - token-level projection
         if learnable_tau:
@@ -475,10 +476,9 @@ class GlobalRouters(nn.Module):
 
     def _threshold_select(self, scores, tau, path_max_k, max_paths):
         """
-        Log-gated threshold selection.
-        - tau 위: 정상 경쟁 (log scale boost)
-        - tau 아래: log(eps) ≈ -18 → softmax에서 거의 0
-        - gradient가 tau로 흐름 (학습됨)
+        Threshold selection with two modes:
+        - Training: Log-gated differentiable selection (gradient flows to tau)
+        - Inference (hard mask): Clean hard threshold for deployment
 
         Args:
             scores: [B, S, N] neuron scores
@@ -489,14 +489,21 @@ class GlobalRouters(nn.Module):
         Returns:
             weights: [B, S, N] softmax weights
             mask: [B, S, N] boolean mask (scores > tau) for statistics
-            gate: [B, S, N] gate values (ReLU + eps)
+            gate: [B, S, N] gate values
         """
-        gate = F.relu(scores - tau) + 1e-8
-        log_gate = torch.log(gate).clamp(min=-20)
-        masked_scores = scores + log_gate
-        weights = F.softmax(masked_scores, dim=-1)
+        mask = (scores > tau)
 
-        mask = (scores > tau)  # 통계용
+        if self.inference_hard_mask and not self.training:
+            # Inference: clean hard mask - zero out neurons below threshold
+            weights = F.softmax(scores.masked_fill(~mask, -1e9), dim=-1)
+            gate = mask.to(scores.dtype)  # for stats
+        else:
+            # Training: differentiable log-gated selection
+            gate = F.relu(scores - tau) + 1e-8
+            log_gate = torch.log(gate).clamp(min=-20)
+            masked_scores = scores + log_gate
+            weights = F.softmax(masked_scores, dim=-1)
+
         return weights, mask, gate
 
     def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
@@ -680,6 +687,13 @@ class GlobalRouters(nn.Module):
             'rqk_weights_Q': rqk_weights_Q.detach(),
             'rqk_weights_K': rqk_weights_K.detach(),
             'rv_weights': rv_weights.detach(),
+            # Binary selection masks (scores > tau) - for POS analysis
+            'fqk_mask_Q': fqk_mask_Q.detach(),
+            'fqk_mask_K': fqk_mask_K.detach(),
+            'fv_mask': fv_mask.detach(),
+            'rqk_mask_Q': rqk_mask_Q.detach(),
+            'rqk_mask_K': rqk_mask_K.detach(),
+            'rv_mask': rv_mask.detach(),
             # Average paths used per token
             'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
             'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
@@ -806,6 +820,9 @@ class GlobalRouters(nn.Module):
             # Softmax weights (before mask multiplication) - for analysis
             'feature_know_w': f_weights.detach(),
             'restore_know_w': r_weights.detach(),
+            # Binary selection masks (scores > tau) - for POS analysis
+            'feature_know_mask': f_mask.detach(),
+            'restore_know_mask': r_mask.detach(),
             'n_paths_feature': avg_paths_per_token(f_paths),
             'n_paths_restore': avg_paths_per_token(r_paths),
             # Average selected neurons per token

@@ -297,8 +297,19 @@ class POSNeuronAnalyzer:
         else:
             return {}
 
-        # Map pool_type to routing key
-        pool_key_map = {
+        # Map pool_type to binary mask key (v18.x uses boolean masks for selection)
+        mask_key_map = {
+            'fv': 'fv_mask',
+            'rv': 'rv_mask',
+            'fqk_q': 'fqk_mask_Q',
+            'fqk_k': 'fqk_mask_K',
+            'rqk_q': 'rqk_mask_Q',
+            'rqk_k': 'rqk_mask_K',
+            'fknow': 'feature_know_mask',
+            'rknow': 'restore_know_mask',
+        }
+        # Fallback to weights for older models
+        weight_key_map = {
             'fv': 'fv_weights',
             'rv': 'rv_weights',
             'fqk_q': 'fqk_weights_Q',
@@ -308,7 +319,8 @@ class POSNeuronAnalyzer:
             'fknow': 'feature_know_w',
             'rknow': 'restore_know_w',
         }
-        weight_key = pool_key_map.get(pool_type, 'fv_weights')
+        mask_key = mask_key_map.get(pool_type, 'fv_mask')
+        weight_key = weight_key_map.get(pool_type, 'fv_weights')
 
         # Collect per-position neuron indices
         position_neurons = defaultdict(set)
@@ -325,14 +337,20 @@ class POSNeuronAnalyzer:
                 if 'attention' in layer0:
                     print(f"  attention keys: {list(layer0['attention'].keys())}")
                     attn = layer0['attention']
-                    if weight_key in attn:
+                    # Check for binary mask (preferred)
+                    if mask_key in attn:
+                        m = attn[mask_key]
+                        print(f"  {mask_key} type: {type(m)}, shape: {m.shape if hasattr(m, 'shape') else 'N/A'}")
+                        print(f"  {mask_key} dtype: {m.dtype if hasattr(m, 'dtype') else 'N/A'}")
+                        print(f"  {mask_key} active: {m.sum().item() if hasattr(m, 'sum') else 'N/A'}")
+                        print(f"  Using binary mask for POS analysis")
+                    elif weight_key in attn:
                         w = attn[weight_key]
                         print(f"  {weight_key} type: {type(w)}, shape: {w.shape if hasattr(w, 'shape') else 'N/A'}")
                         print(f"  {weight_key} dtype: {w.dtype if hasattr(w, 'dtype') else 'N/A'}")
-                        print(f"  {weight_key} sum: {w.sum().item() if hasattr(w, 'sum') else 'N/A'}")
-                        print(f"  {weight_key} nonzero: {(w > 0).sum().item() if hasattr(w, 'sum') else 'N/A'}")
+                        print(f"  Falling back to weights (no mask available)")
                     else:
-                        print(f"  {weight_key} NOT FOUND in attention!")
+                        print(f"  Neither {mask_key} nor {weight_key} found in attention!")
                 if 'knowledge' in layer0:
                     print(f"  knowledge keys: {list(layer0['knowledge'].keys())}")
 
@@ -341,19 +359,32 @@ class POSNeuronAnalyzer:
             if self.target_layer is not None and layer_idx != self.target_layer:
                 continue
 
-            # Get weights from attention or knowledge
+            # Get mask/weights from attention or knowledge
             attn = layer_info.get('attention', layer_info)
             know = layer_info.get('knowledge', {})
 
-            weights = attn.get(weight_key)
-            if weights is None:
-                weights = know.get(weight_key)
+            # Prefer binary mask over weights
+            mask = attn.get(mask_key)
+            if mask is None:
+                mask = know.get(mask_key)
 
-            if weights is not None:
-                # weights: [B, T, N]
+            # Fallback to weights if mask not available
+            use_mask = mask is not None
+            if not use_mask:
+                mask = attn.get(weight_key)
+                if mask is None:
+                    mask = know.get(weight_key)
+
+            if mask is not None:
+                # mask: [B, T, N] - boolean for mask, float for weights
                 for pos in range(seq_len):
-                    w = weights[0, pos]  # [N]
-                    active_neurons = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    m = mask[0, pos]  # [N]
+                    if use_mask:
+                        # Binary mask: use nonzero directly
+                        active_neurons = m.nonzero(as_tuple=True)[0].cpu().tolist()
+                    else:
+                        # Weights fallback: threshold at > 0
+                        active_neurons = (m > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     position_neurons[pos].update(active_neurons)
 
         return {pos: list(neurons) for pos, neurons in position_neurons.items()}

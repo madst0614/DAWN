@@ -297,6 +297,62 @@ def get_model_info(model, ckpt_path, config):
     }
 
 
+def compare_v18_hard_mask(model, val_tokens, batch_size=32, seq_len=512, device='cuda'):
+    """
+    Compare v18.x model performance with soft mask (training) vs hard mask (inference).
+
+    Returns:
+        Dict with soft_loss, hard_loss, and difference
+    """
+    # Check if model is v18.x with inference_hard_mask support
+    if not hasattr(model, 'router') or not hasattr(model.router, 'inference_hard_mask'):
+        return {'error': 'Not a v18.x model with inference_hard_mask support'}
+
+    print("\n--- v18.x Hard Mask Comparison ---")
+
+    # Test with soft mask (default training mode)
+    model.router.inference_hard_mask = False
+    model.eval()
+    print("  Evaluating with soft mask (log-gated)...")
+    soft_metrics = evaluate_model(model, val_tokens, batch_size, seq_len, device)
+
+    # Test with hard mask
+    model.router.inference_hard_mask = True
+    model.eval()
+    print("  Evaluating with hard mask (clean threshold)...")
+    hard_metrics = evaluate_model(model, val_tokens, batch_size, seq_len, device)
+
+    # Reset to default
+    model.router.inference_hard_mask = False
+
+    # Calculate difference
+    loss_diff = hard_metrics['loss'] - soft_metrics['loss']
+    ppl_ratio = hard_metrics['perplexity'] / soft_metrics['perplexity']
+
+    result = {
+        'soft_loss': soft_metrics['loss'],
+        'soft_ppl': soft_metrics['perplexity'],
+        'hard_loss': hard_metrics['loss'],
+        'hard_ppl': hard_metrics['perplexity'],
+        'loss_diff': loss_diff,
+        'ppl_ratio': ppl_ratio,
+    }
+
+    print(f"\n  Results:")
+    print(f"    Soft mask:  Loss={soft_metrics['loss']:.4f}, PPL={soft_metrics['perplexity']:.2f}")
+    print(f"    Hard mask:  Loss={hard_metrics['loss']:.4f}, PPL={hard_metrics['perplexity']:.2f}")
+    print(f"    Difference: ΔLoss={loss_diff:+.4f}, PPL ratio={ppl_ratio:.4f}x")
+
+    if abs(loss_diff) < 0.01:
+        print(f"    → Hard mask is equivalent (diff < 0.01)")
+    elif loss_diff > 0:
+        print(f"    → Hard mask is slightly worse")
+    else:
+        print(f"    → Hard mask is slightly better")
+
+    return result
+
+
 def print_table(results, headers):
     """Print markdown table"""
     # Calculate column widths
@@ -395,6 +451,19 @@ def main():
             print(f"  Params: {format_params(total_params)} | FLOPs: {format_flops(flops)}")
             if metrics['loss']:
                 print(f"  Loss: {metrics['loss']:.4f} | PPL: {metrics['perplexity']:.1f} | Acc: {metrics['accuracy']:.1f}%")
+
+            # v18.x hard mask comparison (auto-detect)
+            if val_tokens is not None and hasattr(model, 'router') and hasattr(model.router, 'inference_hard_mask'):
+                hard_mask_result = compare_v18_hard_mask(
+                    model, val_tokens,
+                    batch_size=args.batch_size,
+                    seq_len=args.seq_len,
+                    device=args.device
+                )
+                if 'error' not in hard_mask_result:
+                    result['Hard Loss'] = f"{hard_mask_result['hard_loss']:.4f}"
+                    result['Hard PPL'] = f"{hard_mask_result['hard_ppl']:.1f}"
+                    result['ΔLoss'] = f"{hard_mask_result['loss_diff']:+.4f}"
 
             del model
             torch.cuda.empty_cache()

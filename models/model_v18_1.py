@@ -714,6 +714,13 @@ class GlobalRouters(nn.Module):
             'rqk_weights_Q': rqk_weights_Q.detach(),
             'rqk_weights_K': rqk_weights_K.detach(),
             'rv_weights': rv_weights.detach(),
+            # Binary selection masks (scores > tau) - for POS analysis
+            'fqk_mask_Q': fqk_mask_Q.detach(),
+            'fqk_mask_K': fqk_mask_K.detach(),
+            'fv_mask': fv_mask.detach(),
+            'rqk_mask_Q': rqk_mask_Q.detach(),
+            'rqk_mask_K': rqk_mask_K.detach(),
+            'rv_mask': rv_mask.detach(),
             # Average paths used per token
             'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
             'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
@@ -836,6 +843,9 @@ class GlobalRouters(nn.Module):
             # Softmax weights (before mask multiplication) - for analysis
             'feature_know_w': f_weights.detach(),
             'restore_know_w': r_weights.detach(),
+            # Binary selection masks - for POS analysis
+            'feature_know_mask': f_mask.detach(),
+            'restore_know_mask': r_mask.detach(),
             'n_paths_feature': avg_paths_per_token(f_paths),
             'n_paths_restore': avg_paths_per_token(r_paths),
             # Average selected neurons per token
