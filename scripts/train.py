@@ -1444,9 +1444,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 if model_version.startswith('18') and needs_routing_info(model):
                     try:
                         model.eval()
+                        set_v18_debug_mode(model, True)  # Enable for routing stats
                         with torch.no_grad():
                             _, routing_infos_log = model(input_ids, return_routing_info=True)
-                            if routing_infos_log:
+                        set_v18_debug_mode(model, False)  # Disable after
+                        if routing_infos_log:
                                 # Paths (average)
                                 n_fqk_Q = sum(ri.get('attention', ri).get('n_paths_fqk_Q', 0) for ri in routing_infos_log) / len(routing_infos_log)
                                 n_fqk_K = sum(ri.get('attention', ri).get('n_paths_fqk_K', 0) for ri in routing_infos_log) / len(routing_infos_log)
