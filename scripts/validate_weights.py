@@ -5,6 +5,8 @@ Uses same data processing as training:
 - Concatenate all tokens into flat stream (no special tokens)
 - Reshape to [N, seq_len] sequences
 - No padding within sequences
+
+Supports all DAWN versions (auto-detection from checkpoint).
 """
 
 import argparse
@@ -20,29 +22,47 @@ from transformers import BertTokenizer
 from tqdm import tqdm
 import math
 
-from models import DAWN
+from models import create_model_by_version, normalize_version
 
-# Config (v17.1)
-CONFIG = {
-    'vocab_size': 30522,
-    'd_model': 384,
-    'n_layers': 12,
-    'n_heads': 6,
-    'rank': 64,
-    'knowledge_rank': 128,
-    'n_feature_qk': 120,
-    'n_feature_v': 24,
-    'n_restore_qk': 120,
-    'n_restore_v': 24,
-    'n_feature_know': 24,
-    'n_restore_know': 24,
-    'top_k_feature_qk': 20,
-    'top_k_feature_v': 6,
-    'top_k_restore_qk': 20,
-    'top_k_restore_v': 6,
-    'top_k_feature_know': 4,
-    'top_k_restore_know': 4,
-}
+
+def load_model_from_checkpoint(weights_path, device='cpu'):
+    """Load model from checkpoint with auto version detection."""
+    ckpt = torch.load(weights_path, map_location=device)
+
+    # Get config and state_dict
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        state_dict = ckpt['model_state_dict']
+        config = ckpt.get('model_config', ckpt.get('config', {}))
+    else:
+        state_dict = ckpt
+        config = {}
+
+    # Clean compiled model prefix
+    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    # Auto-detect version from config or state_dict keys
+    version = config.get('model_version', None)
+    if version is None:
+        v18_2_keys = ['router.tau_proj.weight', 'router.neuron_router.norm_fqk_Q.weight']
+        dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
+
+        if all(k in state_dict for k in v18_2_keys):
+            version = '18.2'
+        elif any(k in state_dict for k in dawn_keys):
+            if config.get('learnable_tau', False) or config.get('max_paths'):
+                version = '18.2'
+            else:
+                version = '17.1'
+        else:
+            version = 'baseline'
+
+    version = normalize_version(version)
+    print(f"  Detected version: {version}")
+
+    model = create_model_by_version(version, config)
+    model.load_state_dict(state_dict, strict=False)
+
+    return model, config, version
 
 
 def validate(model, dataloader, device, max_batches=200):
@@ -96,14 +116,9 @@ def main():
 
     print(f"Device: {args.device}")
 
-    # Load model
+    # Load model with auto version detection
     print(f"Loading model from {args.weights}")
-    model = DAWN(**CONFIG)
-    ckpt = torch.load(args.weights, map_location='cpu')
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
-    else:
-        model.load_state_dict(ckpt)
+    model, config, version = load_model_from_checkpoint(args.weights, device='cpu')
     model = model.to(args.device)
     model.eval()
 

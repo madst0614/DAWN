@@ -4,13 +4,15 @@ DAWN vs Vanilla Speed Benchmark
 ================================
 Compares inference speed (ms/token) between DAWN and Vanilla transformers.
 
+Supports all DAWN versions (auto-detection from checkpoint).
+
 Usage:
     python benchmark_speed.py --folder checkpoints/  # Auto-discover
     python benchmark_speed.py --dawn_ckpt path/to/dawn.pt --vanilla_ckpt path/to/vanilla.pt
     python benchmark_speed.py --dawn_ckpt path/to/dawn.pt  # DAWN only
 
 Auto-discovery looks for:
-    - DAWN: files containing 'dawn', 'v16', 'v15', 'v14'
+    - DAWN: files containing 'dawn', 'v18', 'v17', 'v16', 'v15', 'v14'
     - Vanilla: files containing 'vanilla', 'baseline', 'gpt', 'transformer'
     - Prefers 'best' or 'final' checkpoints
 """
@@ -39,7 +41,7 @@ def find_checkpoints(folder, pattern="*.pt"):
 
     for ckpt in all_ckpts:
         name = os.path.basename(ckpt).lower()
-        if any(x in name for x in ['dawn', 'v16', 'v15', 'v14']):
+        if any(x in name for x in ['dawn', 'v18', 'v17', 'v16', 'v15', 'v14']):
             if dawn_ckpt is None or 'best' in name or 'final' in name:
                 dawn_ckpt = ckpt
         elif any(x in name for x in ['vanilla', 'baseline', 'gpt', 'transformer']):
@@ -89,16 +91,41 @@ def resolve_checkpoint_path(path):
 
 
 def load_dawn_model(ckpt_path, device='cuda'):
-    """Load DAWN model from checkpoint (handles directory paths)"""
-    from models.model_v16 import DAWN
+    """Load DAWN model from checkpoint with auto version detection (handles directory paths)"""
+    from models import create_model_by_version, normalize_version
 
     # Resolve directory to actual checkpoint file
     ckpt_path = resolve_checkpoint_path(ckpt_path)
     checkpoint = torch.load(ckpt_path, map_location=device)
-    config = checkpoint.get('config', {})
 
-    model = DAWN(**config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Get config and state_dict
+    config = checkpoint.get('model_config', checkpoint.get('config', {}))
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+    # Clean compiled model prefix
+    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    # Auto-detect version from config or state_dict keys
+    version = config.get('model_version', None)
+    if version is None:
+        v18_2_keys = ['router.tau_proj.weight', 'router.neuron_router.norm_fqk_Q.weight']
+        dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
+
+        if all(k in state_dict for k in v18_2_keys):
+            version = '18.2'
+        elif any(k in state_dict for k in dawn_keys):
+            if config.get('learnable_tau', False) or config.get('max_paths'):
+                version = '18.2'
+            else:
+                version = '17.1'
+        else:
+            version = 'baseline'
+
+    version = normalize_version(version)
+    print(f"  Detected version: {version}")
+
+    model = create_model_by_version(version, config)
+    model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
 
@@ -113,33 +140,41 @@ def load_vanilla_model(ckpt_path, device='cuda'):
     """Load Vanilla transformer from checkpoint (handles directory paths)"""
     # Resolve directory to actual checkpoint file
     ckpt_path = resolve_checkpoint_path(ckpt_path)
+    checkpoint = torch.load(ckpt_path, map_location=device)
+
+    config = checkpoint.get('model_config', checkpoint.get('config', {}))
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+    # Clean compiled model prefix
+    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
     # Try different model imports
     try:
-        from models.model_vanilla import VanillaTransformer
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        config = checkpoint.get('config', {})
+        from models import VanillaTransformer
         model = VanillaTransformer(**config)
-        model.load_state_dict(checkpoint['model_state_dict'])
-    except ImportError:
-        # Fallback: try to load as generic transformer
+        model.load_state_dict(state_dict, strict=False)
+    except (ImportError, Exception):
+        # Fallback: try model_vanilla
         try:
-            from transformers import GPT2LMHeadModel, GPT2Config
-            checkpoint = torch.load(ckpt_path, map_location=device)
-            config = checkpoint.get('config', {})
+            from models.model_vanilla import VanillaTransformer
+            model = VanillaTransformer(**config)
+            model.load_state_dict(state_dict, strict=False)
+        except (ImportError, Exception):
+            # Fallback: try to load as generic transformer
+            try:
+                from transformers import GPT2LMHeadModel, GPT2Config
 
-            gpt2_config = GPT2Config(
-                vocab_size=config.get('vocab_size', 30522),
-                n_embd=config.get('d_model', 512),
-                n_layer=config.get('n_layers', 12),
-                n_head=config.get('n_heads', 8),
-            )
-            model = GPT2LMHeadModel(gpt2_config)
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        except Exception as e:
-            print(f"Error loading vanilla model: {e}")
-            return None, None
+                gpt2_config = GPT2Config(
+                    vocab_size=config.get('vocab_size', 30522),
+                    n_embd=config.get('d_model', 512),
+                    n_layer=config.get('n_layers', 12),
+                    n_head=config.get('n_heads', 8),
+                )
+                model = GPT2LMHeadModel(gpt2_config)
+                model.load_state_dict(state_dict, strict=False)
+            except Exception as e:
+                print(f"Error loading vanilla model: {e}")
+                return None, None
 
     model.to(device)
     model.eval()

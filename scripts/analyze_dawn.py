@@ -22,8 +22,9 @@ Analysis Categories:
 3. Embedding Analysis   - Similarity, clustering, t-SNE/PCA visualization
 4. Weight Analysis      - SVD decomposition, effective rank
 5. Behavioral Analysis  - Token trajectory, probing classifier, ablation study
-6. Semantic Analysis    - Path similarity, context-dependent routing, POS patterns (NEW)
+6. Semantic Analysis    - Path similarity, context-dependent routing, POS patterns
 7. Co-selection         - Feature/Restore neuron pairing analysis
+8. V18 Analysis         - Learnable tau, gate distribution, Q/K tau differentiation (v18.x only)
 
 Usage:
     python analyze_dawn.py --checkpoint path/to/ckpt --mode all
@@ -31,6 +32,7 @@ Usage:
     python analyze_dawn.py --checkpoint path/to/ckpt --mode routing --val_data path/to/data
     python analyze_dawn.py --checkpoint path/to/ckpt --mode semantic --val_data path/to/data
     python analyze_dawn.py --checkpoint path/to/ckpt --mode paper --val_data path/to/data
+    python analyze_dawn.py --checkpoint path/to/ckpt --mode v18 --val_data path/to/data
 """
 
 import sys
@@ -271,6 +273,184 @@ class DAWNAnalyzer:
 
         return results
 
+    def run_v18_analysis(self, dataloader=None, n_batches: int = 50, output_dir: str = None) -> Dict:
+        """v18.2-specific analysis: tau, gate, Q/K differentiation.
+
+        Analyzes v18.x specific features:
+        1. Learnable Tau - 8 pool tau values (Q/K separated)
+        2. Gate Distribution - log-gated threshold selection
+        3. Token-level Tau - tau variance across tokens/positions
+        4. Q/K Tau Differentiation - how Q and K taus diverge
+        """
+        print("\n" + "="*60)
+        print("V18.2 SPECIFIC ANALYSIS")
+        print("="*60)
+
+        results = {}
+
+        # Check if model has v18 features
+        if not hasattr(self.model, 'router') or not hasattr(self.model.router, 'tau_proj'):
+            print("Warning: Model does not have learnable tau (not v18.x)")
+            return {'error': 'Not a v18.x model with learnable tau'}
+
+        tau_proj = self.model.router.tau_proj
+        pool_names = ['fq', 'fk', 'fv', 'rq', 'rk', 'rv', 'feature_know', 'restore_know']
+
+        # 1. Tau Parameters Analysis
+        print("\n--- Tau Parameters ---")
+        weight = tau_proj.weight.detach().cpu()  # [8, d_model]
+        bias = tau_proj.bias.detach().cpu()      # [8]
+
+        tau_params = {
+            'tau_bias': {name: bias[i].item() for i, name in enumerate(pool_names)},
+            'tau_weight_norm': {name: weight[i].norm().item() for i, name in enumerate(pool_names)},
+            'tau_weight_std': {name: weight[i].std().item() for i, name in enumerate(pool_names)},
+        }
+
+        print("Pool         Bias      Weight Norm   Weight Std")
+        print("-" * 50)
+        for name in pool_names:
+            print(f"{name:12} {tau_params['tau_bias'][name]:8.4f}  "
+                  f"{tau_params['tau_weight_norm'][name]:10.4f}   "
+                  f"{tau_params['tau_weight_std'][name]:.4f}")
+
+        # Q/K Differentiation
+        import torch.nn.functional as F
+        qk_diff = {
+            'fqk_bias_diff': abs(bias[0].item() - bias[1].item()),
+            'rqk_bias_diff': abs(bias[3].item() - bias[4].item()),
+            'fqk_weight_cosine': F.cosine_similarity(weight[0:1], weight[1:2]).item(),
+            'rqk_weight_cosine': F.cosine_similarity(weight[3:4], weight[4:5]).item(),
+        }
+        tau_params['qk_differentiation'] = qk_diff
+
+        print("\n--- Q/K Tau Differentiation ---")
+        print(f"  Feature Q/K bias diff:     {qk_diff['fqk_bias_diff']:.4f}")
+        print(f"  Restore Q/K bias diff:     {qk_diff['rqk_bias_diff']:.4f}")
+        print(f"  Feature Q/K weight cosine: {qk_diff['fqk_weight_cosine']:.4f}")
+        print(f"  Restore Q/K weight cosine: {qk_diff['rqk_weight_cosine']:.4f}")
+
+        if qk_diff['fqk_bias_diff'] > 0.1 or qk_diff['rqk_bias_diff'] > 0.1:
+            print("  -> Q and K have learned DIFFERENT tau values (good!)")
+        else:
+            print("  -> Q and K tau values are similar (may need more training)")
+
+        results['tau_parameters'] = tau_params
+
+        # 2. Runtime Analysis (requires dataloader)
+        if dataloader is not None:
+            from collections import defaultdict
+            import numpy as np
+
+            print("\n--- Runtime Gate/Tau Analysis ---")
+
+            gate_stats = defaultdict(list)
+            tau_runtime = defaultdict(list)
+            qk_patterns = defaultdict(list)
+
+            self.model.eval()
+            batch_count = 0
+
+            with torch.no_grad():
+                for batch in dataloader:
+                    if batch_count >= n_batches:
+                        break
+
+                    if isinstance(batch, dict):
+                        input_ids = batch['input_ids'].to(self.device)
+                    elif isinstance(batch, (list, tuple)):
+                        input_ids = batch[0].to(self.device)
+                    else:
+                        input_ids = batch.to(self.device)
+
+                    outputs = self.model(input_ids, return_routing_info=True)
+
+                    if isinstance(outputs, tuple) and len(outputs) >= 2:
+                        routing_infos = outputs[-1]
+
+                        for layer_idx, layer_info in enumerate(routing_infos):
+                            attn = layer_info.get('attention', layer_info)
+
+                            # Gate statistics
+                            for pool in ['fq', 'fk', 'fv', 'rq', 'rk', 'rv']:
+                                mean_key = f'gate_{pool}_mean'
+                                if mean_key in attn:
+                                    gate_stats[f'L{layer_idx}_{pool}_gate'].append(attn[mean_key])
+
+                            # Tau statistics
+                            for pool in ['fq', 'fk', 'fv', 'rq', 'rk', 'rv']:
+                                tau_key = f'tau_{pool}'
+                                if tau_key in attn:
+                                    tau_runtime[f'L{layer_idx}_{pool}_tau'].append(attn[tau_key])
+
+                            # Q/K patterns
+                            if 'overlap_fqk' in attn:
+                                qk_patterns[f'L{layer_idx}_fqk_overlap'].append(attn['overlap_fqk'])
+                            if 'overlap_rqk' in attn:
+                                qk_patterns[f'L{layer_idx}_rqk_overlap'].append(attn['overlap_rqk'])
+
+                    batch_count += 1
+
+            # Aggregate gate stats
+            gate_summary = {}
+            for key, values in gate_stats.items():
+                if values:
+                    gate_summary[key] = {
+                        'mean': float(np.mean(values)),
+                        'std': float(np.std(values)),
+                    }
+            results['gate_distribution'] = gate_summary
+
+            # Aggregate tau runtime
+            tau_summary = {}
+            for key, values in tau_runtime.items():
+                if values:
+                    tau_summary[key] = {
+                        'mean': float(np.mean(values)),
+                        'std': float(np.std(values)),
+                    }
+            results['tau_runtime'] = tau_summary
+
+            # Aggregate Q/K patterns
+            qk_summary = {}
+            for key, values in qk_patterns.items():
+                if values:
+                    qk_summary[key] = {
+                        'mean': float(np.mean(values)),
+                        'std': float(np.std(values)),
+                    }
+            results['qk_patterns'] = qk_summary
+
+            # Print per-layer summary
+            n_layers = self.model.n_layers
+            print("\nPer-Layer Gate Mean:")
+            print("Layer   FQ      FK      FV      RQ      RK      RV")
+            print("-" * 60)
+            for layer_idx in range(n_layers):
+                row = f"L{layer_idx:2}    "
+                for pool in ['fq', 'fk', 'fv', 'rq', 'rk', 'rv']:
+                    key = f'L{layer_idx}_{pool}_gate'
+                    val = gate_summary.get(key, {}).get('mean', 0)
+                    row += f"{val:7.3f} "
+                print(row)
+
+            print("\nPer-Layer Q/K Overlap:")
+            print("Layer   FQK     RQK")
+            print("-" * 30)
+            for layer_idx in range(n_layers):
+                fqk = qk_summary.get(f'L{layer_idx}_fqk_overlap', {}).get('mean', 0)
+                rqk = qk_summary.get(f'L{layer_idx}_rqk_overlap', {}).get('mean', 0)
+                print(f"L{layer_idx:2}    {fqk:7.3f} {rqk:7.3f}")
+
+        # Save results
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, 'v18_analysis.json')
+            save_results(results, output_path)
+            print(f"\nResults saved to: {output_path}")
+
+        return results
+
     def run_trajectory_analysis(self, dataloader, n_batches: int = 20, output_dir: str = None) -> Dict:
         """Token trajectory analysis."""
         print("\n" + "="*60)
@@ -352,6 +532,10 @@ class DAWNAnalyzer:
             results['trajectory'] = self.run_trajectory_analysis(dataloader, n_batches, output_dir)
             results['coselection'] = self.run_coselection_analysis(dataloader, n_batches, output_dir)
 
+        # v18.x specific analysis (auto-detect)
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'tau_proj'):
+            results['v18'] = self.run_v18_analysis(dataloader, n_batches, output_dir)
+
         output_path = os.path.join(output_dir, 'dawn_analysis.json')
         save_results(results, output_path)
         print(f"\nResults saved to: {output_path}")
@@ -369,7 +553,7 @@ def main():
     parser.add_argument('--mode', type=str, default='all',
                         choices=['all', 'usage', 'routing', 'embedding', 'weight_svd',
                                 'clustering', 'trajectory', 'probing', 'ablation',
-                                'neuron', 'semantic', 'coselection', 'paper'],
+                                'neuron', 'semantic', 'coselection', 'paper', 'v18'],
                         help='Analysis mode')
     parser.add_argument('--val_data', type=str, default=None, help='Validation data path')
     parser.add_argument('--output_dir', type=str, default='./dawn_analysis', help='Output directory')
@@ -402,7 +586,7 @@ def main():
 
     dataloader = None
     if args.val_data and args.mode in ['all', 'routing', 'trajectory', 'probing',
-                                        'ablation', 'semantic', 'coselection']:
+                                        'ablation', 'semantic', 'coselection', 'v18']:
         dataloader = create_dataloader(args.val_data, tokenizer, args.batch_size)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -446,6 +630,10 @@ def main():
             print("ERROR: --val_data required for coselection analysis")
             return
         results = analyzer.run_coselection_analysis(dataloader, args.max_batches, args.output_dir)
+    elif args.mode == 'v18':
+        # v18.2 specific analysis (tau, gate, Q/K differentiation)
+        # dataloader is optional - without it, only static tau params are analyzed
+        results = analyzer.run_v18_analysis(dataloader, args.max_batches, args.output_dir)
 
     output_path = os.path.join(args.output_dir, f'dawn_{args.mode}.json')
     save_results(results, output_path)

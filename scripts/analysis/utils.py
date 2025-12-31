@@ -225,9 +225,28 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
     print(f"Loading: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint.get('model_config', checkpoint.get('config', {}))
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    cleaned = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Force v17.1
-    version = '17.1'
+    # Auto-detect version from config or state_dict keys
+    version = config.get('model_version', None)
+    if version is None:
+        # Check for version-specific keys (most specific first)
+        v18_2_keys = ['router.tau_proj.weight', 'router.neuron_router.norm_fqk_Q.weight']
+        dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
+
+        if all(k in cleaned for k in v18_2_keys):
+            version = '18.2'
+        elif any(k in cleaned for k in dawn_keys):
+            if config.get('learnable_tau', False) or config.get('max_paths'):
+                version = '18.2'
+            else:
+                version = '17.1'
+        else:
+            version = 'baseline'
+
+    from models import normalize_version
+    version = normalize_version(version)
     print(f"Model version: {version}")
 
     model = create_model_by_version(version, config)

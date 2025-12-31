@@ -585,101 +585,147 @@ class SemanticAnalyzer:
         ]
 
     # ============================================================
-    # POS Routing Analysis - BATCH OPTIMIZED with nlp.pipe()
+    # POS Routing Analysis - Using UD Dataset (pre-tagged, fast)
     # ============================================================
 
-    def analyze_pos_routing(self, dataloader, max_batches: int = 50) -> Dict:
+    def _load_ud_dataset(self, max_sentences: int = 1000) -> list:
+        """Load UD English EWT dataset (cached)."""
+        if hasattr(self, '_ud_cache') and self._ud_cache:
+            return self._ud_cache
+
+        try:
+            import conllu
+        except ImportError:
+            print("conllu not installed. Install with: pip install conllu")
+            return []
+
+        import urllib.request
+        url = 'https://raw.githubusercontent.com/UniversalDependencies/UD_English-EWT/master/en_ewt-ud-train.conllu'
+
+        try:
+            print("Downloading UD English EWT...")
+            with urllib.request.urlopen(url) as response:
+                data = response.read().decode('utf-8')
+        except Exception as e:
+            print(f"UD download failed: {e}")
+            return []
+
+        sentences = conllu.parse(data)[:max_sentences]
+        dataset = []
+        for sent in sentences:
+            tokens = [token['form'] for token in sent]
+            upos = [token['upos'] for token in sent]
+            dataset.append({'tokens': tokens, 'upos': upos})
+
+        self._ud_cache = dataset
+        print(f"Loaded {len(dataset)} UD sentences")
+        return dataset
+
+    def _align_tokens_to_pos(self, ud_tokens: list, ud_pos: list) -> tuple:
+        """Align tokenizer tokens to UD POS tags using offset_mapping."""
+        text = " ".join(ud_tokens)
+        ud_char_spans = []
+        pos = 0
+        for token, upos in zip(ud_tokens, ud_pos):
+            start = pos
+            end = pos + len(token)
+            ud_char_spans.append((start, end, upos))
+            pos = end + 1  # +1 for space
+
+        try:
+            encoding = self.tokenizer(
+                text, add_special_tokens=False,
+                return_offsets_mapping=True, return_tensors=None
+            )
+            token_ids = encoding['input_ids']
+            offset_mapping = encoding['offset_mapping']
+
+            pos_tags = []
+            for start, end in offset_mapping:
+                assigned = 'X'
+                for ud_start, ud_end, upos in ud_char_spans:
+                    if start < ud_end and end > ud_start:
+                        assigned = upos
+                        break
+                pos_tags.append(assigned)
+
+            return pos_tags, token_ids
+        except:
+            return [], []
+
+    def analyze_pos_routing(self, dataloader, max_batches: int = 50, target_layers: list = None) -> Dict:
         """
-        Analyze routing patterns by part-of-speech across ALL layers.
-        Uses spaCy pipe for batch processing.
-        Optimized with batch CPU transfers.
+        Analyze routing patterns by POS using UD dataset (pre-tagged, fast).
 
         Args:
-            dataloader: DataLoader for input data
-            max_batches: Maximum batches to process
+            dataloader: Unused (uses UD dataset instead)
+            max_batches: Max sentences to process
+            target_layers: Layer indices to analyze (default: [0, n_layers//2, n_layers-1])
 
         Returns:
             POS-wise routing statistics with layer breakdown
         """
-        if self.nlp is None:
-            return {'error': 'spaCy not available. Install with: pip install spacy && python -m spacy download en_core_web_sm'}
+        # Load UD dataset
+        ud_data = self._load_ud_dataset(max_sentences=max_batches * 32)
+        if not ud_data:
+            return {'error': 'Could not load UD dataset'}
 
         pos_weights = defaultdict(list)
         pos_counts = defaultdict(int)
 
+        n_layers = getattr(self.model, 'n_layers', 12)
+        if target_layers is None:
+            target_layers = [0, n_layers // 2, n_layers - 1]
+        target_layers_set = set(target_layers)
+
         self.model.eval()
         with torch.no_grad():
-            for i, batch in enumerate(tqdm(dataloader, desc='POS Analysis', total=max_batches)):
-                if i >= max_batches:
-                    break
+            for sent_data in tqdm(ud_data, desc='POS Analysis (UD)'):
+                pos_tags, token_ids = self._align_tokens_to_pos(
+                    sent_data['tokens'], sent_data['upos']
+                )
+                if not token_ids:
+                    continue
 
-                input_ids = get_batch_input_ids(batch, self.device)
-                batch_size, seq_len = input_ids.shape
-
+                input_ids = torch.tensor([token_ids], device=self.device)
                 outputs = self.model(input_ids, return_routing_info=True)
                 routing_infos = get_routing_from_outputs(outputs)
 
                 if routing_infos is None:
                     continue
 
-                # Move input_ids to CPU once for all processing
-                input_ids_cpu = input_ids.cpu()
-
-                # Decode all texts in batch
-                texts = [self.tokenizer.decode(input_ids_cpu[b], skip_special_tokens=True) for b in range(batch_size)]
-
-                # Batch POS tagging with nlp.pipe()
-                docs = list(self.nlp.pipe(texts, batch_size=batch_size))
-
-                # Pre-convert all tokens for the batch
-                batch_tokens = [
-                    self.tokenizer.convert_ids_to_tokens(input_ids_cpu[b].tolist())
-                    for b in range(batch_size)
-                ]
-
-                # Process each layer
+                # Process selected layers
                 for layer_idx, layer_info in enumerate(routing_infos):
+                    if layer_idx not in target_layers_set:
+                        continue
+
                     attn = layer_info.get('attention', {})
                     knowledge = layer_info.get('knowledge', {})
 
-                    # Combine routing and move to CPU once per layer
-                    all_routing_cpu = {}
+                    # Collect weights
+                    all_routing = {}
                     for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
                         w = attn.get(weight_key)
                         if w is not None:
-                            all_routing_cpu[f'L{layer_idx}/{key}'] = w.cpu()
+                            all_routing[f'L{layer_idx}/{key}'] = w
 
                     for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
                         w = knowledge.get(weight_key)
                         if w is not None:
-                            all_routing_cpu[f'L{layer_idx}/{key}'] = w.cpu()
+                            all_routing[f'L{layer_idx}/{key}'] = w
 
-                    # Process each sequence
-                    for b in range(batch_size):
-                        tokens = batch_tokens[b]
-                        doc = docs[b]
-                        spacy_tokens = [(t.text.lower(), t.pos_) for t in doc]
+                    # Map tokens to POS
+                    for s, upos in enumerate(pos_tags):
+                        if upos == 'X':
+                            continue
+                        pos_counts[upos] += 1
 
-                        spacy_idx = 0
-                        for s, token in enumerate(tokens):
-                            if token.startswith('[') or token.startswith('##'):
-                                continue
-
-                            token_clean = token.replace('##', '').lower()
-                            while spacy_idx < len(spacy_tokens):
-                                sp_token, sp_pos = spacy_tokens[spacy_idx]
-                                if token_clean in sp_token or sp_token in token_clean:
-                                    for routing_key, w in all_routing_cpu.items():
-                                        if w is not None and w.dim() >= 2:
-                                            if w.dim() == 3 and s < w.shape[1]:
-                                                pos_weights[f"{routing_key}/{sp_pos}"].append(w[b, s])
-                                            elif w.dim() == 2:
-                                                pos_weights[f"{routing_key}/{sp_pos}"].append(w[b])
-
-                                    pos_counts[sp_pos] += 1
-                                    spacy_idx += 1
-                                    break
-                                spacy_idx += 1
+                        for routing_key, w in all_routing.items():
+                            if w is not None and w.dim() >= 2:
+                                if w.dim() == 3 and s < w.shape[1]:
+                                    pos_weights[f"{routing_key}/{upos}"].append(w[0, s].cpu())
+                                elif w.dim() == 2:
+                                    pos_weights[f"{routing_key}/{upos}"].append(w[0].cpu())
 
         # Analyze results
         results = {
