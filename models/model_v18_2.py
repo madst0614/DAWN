@@ -118,6 +118,9 @@ class UnifiedNeuronRouter(nn.Module):
         Return 2 knowledge logits (feature_know, restore_know)
         x: [B, S, d_model]
         """
+        # Defensive check: cache if not already cached (standalone call)
+        if not hasattr(self, '_cached_emb_norm'):
+            self.cache_emb_norm()
         emb_norm = self._cached_emb_norm
 
         # Feature_know
