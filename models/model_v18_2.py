@@ -521,27 +521,29 @@ class GlobalRouters(nn.Module):
         topk_weights = F.softmax(masked_scores, dim=-1)  # [B, S, k]
 
         # 6. Chunk to paths (already sorted by topk)
+        # Use topk_weights.dtype to avoid AMP dtype mismatch (bfloat16/float16)
+        out_dtype = topk_weights.dtype
         path_weights_list = []
         for p in range(max_paths):
             start_idx = p * path_max_k
             end_idx = min((p + 1) * path_max_k, k)
 
             if start_idx >= k:
-                path_weights_list.append(torch.zeros(B, S, N, device=scores.device, dtype=scores.dtype))
+                path_weights_list.append(torch.zeros(B, S, N, device=scores.device, dtype=out_dtype))
                 continue
 
-            path_weights = torch.zeros(B, S, N, device=scores.device, dtype=scores.dtype)
+            path_weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
             path_indices = topk_indices[:, :, start_idx:end_idx]
             path_w = topk_weights[:, :, start_idx:end_idx]
             # Apply mask within this path's range
-            path_m = topk_mask[:, :, start_idx:end_idx].to(path_w.dtype)
+            path_m = topk_mask[:, :, start_idx:end_idx].to(out_dtype)
             path_w = path_w * path_m
 
             path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
             path_weights_list.append(path_weights)
 
         # 7. Create sparse full weights for aux_loss
-        weights = torch.zeros(B, S, N, device=scores.device, dtype=scores.dtype)
+        weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
         weights.scatter_(dim=-1, index=topk_indices, src=topk_weights)
 
         # 8. Create full mask for statistics
