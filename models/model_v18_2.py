@@ -109,12 +109,16 @@ class UnifiedNeuronRouter(nn.Module):
             'restore_know': self.fixed_tau,
         }
 
+    def cache_emb_norm(self):
+        """Cache normalized embeddings for reuse within a forward pass."""
+        self._cached_emb_norm = F.normalize(self.neuron_emb, dim=-1)
+
     def get_knowledge_logits(self, x):
         """
         Return 2 knowledge logits (feature_know, restore_know)
         x: [B, S, d_model]
         """
-        emb_norm = F.normalize(self.neuron_emb, dim=-1)
+        emb_norm = self._cached_emb_norm
 
         # Feature_know
         h_feature_know = self.norm_feature_know(self.dropout(self.proj_feature_know(x)))
@@ -130,7 +134,7 @@ class UnifiedNeuronRouter(nn.Module):
 
     def get_all_logits(self, x):
         """6 attention logits at once"""
-        emb_norm = F.normalize(self.neuron_emb, dim=-1)
+        emb_norm = self._cached_emb_norm
 
         all_proj = self.dropout(self.proj_all(x))
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = all_proj.chunk(6, dim=-1)
@@ -600,6 +604,9 @@ class GlobalRouters(nn.Module):
             routing_info: dict with routing statistics
             aux_loss: auxiliary loss for load balancing
         """
+        # Cache normalized embeddings for reuse in get_knowledge_logits
+        self.neuron_router.cache_emb_norm()
+
         (fqk_logits_Q, fqk_logits_K, fv_logits,
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
 
