@@ -51,8 +51,8 @@ model:
   use_ssm_context: false
 
   # v18.2 specific - multi-path learnable tau routing
-  max_paths: 4
-  path_max_k: 8
+  max_paths: 2
+  path_max_k: 16
   learnable_tau: true
 
 training:
