@@ -65,7 +65,7 @@ training:
   orthogonality_weight: 0.01
   diversity_weight: 0.1
   load_balance_weight: 0.00002
-  tau_reg_weight: 0.001
+  tau_reg_weight: 0.00002
 
 use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v18.2_40M_c4_5B_seed1
