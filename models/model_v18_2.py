@@ -520,35 +520,43 @@ class GlobalRouters(nn.Module):
         masked_scores = topk_scores + log_gate
         topk_weights = F.softmax(masked_scores, dim=-1)  # [B, S, k]
 
-        # 6. Chunk to paths (already sorted by topk)
+        # 6. Chunk to paths (vectorized scatter)
         # Use topk_weights.dtype to avoid AMP dtype mismatch (bfloat16/float16)
         out_dtype = topk_weights.dtype
-        path_weights_list = []
-        for p in range(max_paths):
-            start_idx = p * path_max_k
-            end_idx = min((p + 1) * path_max_k, k)
+        total_k = max_paths * path_max_k
 
-            if start_idx >= k:
-                path_weights_list.append(torch.zeros(B, S, N, device=scores.device, dtype=out_dtype))
-                continue
+        # Save original for aux_loss before padding
+        orig_topk_indices = topk_indices
+        orig_topk_weights = topk_weights
+        orig_topk_mask = topk_mask
 
-            path_weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
-            path_indices = topk_indices[:, :, start_idx:end_idx]
-            path_w = topk_weights[:, :, start_idx:end_idx]
-            # Apply mask within this path's range
-            path_m = topk_mask[:, :, start_idx:end_idx].to(out_dtype)
-            path_w = path_w * path_m
+        # Pad if k < total_k (when N < total_k)
+        if k < total_k:
+            pad_size = total_k - k
+            topk_indices = F.pad(topk_indices, (0, pad_size), value=0)
+            topk_weights = F.pad(topk_weights, (0, pad_size), value=0.0)
+            topk_mask = F.pad(topk_mask, (0, pad_size), value=False)
 
-            path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
-            path_weights_list.append(path_weights)
+        # Reshape to [B, S, max_paths, path_max_k]
+        indices_reshaped = topk_indices.view(B, S, max_paths, path_max_k)
+        weights_reshaped = topk_weights.view(B, S, max_paths, path_max_k)
+        mask_reshaped = topk_mask.view(B, S, max_paths, path_max_k).to(out_dtype)
+        weights_reshaped = weights_reshaped * mask_reshaped
 
-        # 7. Create sparse full weights for aux_loss
+        # Scatter all paths at once: [B, S, max_paths, N]
+        all_path_weights = torch.zeros(B, S, max_paths, N, device=scores.device, dtype=out_dtype)
+        all_path_weights.scatter_(dim=-1, index=indices_reshaped, src=weights_reshaped)
+
+        # Convert to list for backward compatibility
+        path_weights_list = [all_path_weights[:, :, p, :] for p in range(max_paths)]
+
+        # 7. Create sparse full weights for aux_loss (use original, non-padded)
         weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
-        weights.scatter_(dim=-1, index=topk_indices, src=topk_weights)
+        weights.scatter_(dim=-1, index=orig_topk_indices, src=orig_topk_weights)
 
-        # 8. Create full mask for statistics
+        # 8. Create full mask for statistics (use original, non-padded)
         mask = torch.zeros(B, S, N, device=scores.device, dtype=torch.bool)
-        mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
+        mask.scatter_(dim=-1, index=orig_topk_indices, src=orig_topk_mask)
 
         return path_weights_list, weights, mask, gate
 
