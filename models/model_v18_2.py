@@ -475,87 +475,113 @@ class GlobalRouters(nn.Module):
                 'restore_know': self.fixed_tau,
             }
 
-    def _threshold_select(self, scores, tau, path_max_k, max_paths):
+    def _topk_select_and_chunk(self, scores, tau, path_max_k, max_paths):
         """
-        Threshold selection with two modes:
-        - Training: Log-gated differentiable selection (gradient flows to tau)
-        - Inference (hard mask): Same log-gated weights above tau, complete removal below
+        Optimized routing: top-k selection → threshold → softmax → chunking
+
+        Optimization: O(N log N) sort → O(N + k log k) top-k
+        For N=1020, k=32: ~30x reduction in computation
 
         Args:
             scores: [B, S, N] neuron scores
             tau: scalar or [B, S, 1] tensor threshold
-            path_max_k: max neurons per path (unused)
-            max_paths: maximum number of paths (unused)
-
-        Returns:
-            weights: [B, S, N] softmax weights
-            mask: [B, S, N] boolean mask (scores > tau) for statistics
-            gate: [B, S, N] gate values
-        """
-        mask = (scores > tau)
-
-        # Log-gated selection (used in both modes)
-        gate = F.relu(scores - tau) + 1e-8
-        log_gate = torch.log(gate).clamp(min=-20)
-
-        if self.inference_hard_mask and not self.training:
-            # Inference: keep log-gated weights for neurons above tau,
-            # completely remove neurons below tau
-            log_gate = torch.where(mask, log_gate, torch.full_like(log_gate, -1e9))
-
-        masked_scores = scores + log_gate
-        weights = F.softmax(masked_scores, dim=-1)
-
-        return weights, mask, gate
-
-    def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
-        """
-        Chunk selected neurons into path_max_k-sized paths by score ranking.
-
-        Args:
-            weights: [B, S, N] softmax weights
-            mask: [B, S, N] selection mask
-            scores: [B, S, N] original scores for ranking
             path_max_k: neurons per path
             max_paths: maximum number of paths
 
         Returns:
             path_weights_list: list of [B, S, N] weights (length = max_paths)
+            weights: [B, S, N] sparse weights for aux_loss
+            mask: [B, S, N] boolean mask for statistics
+            gate: [B, S, k] gate values for tau regularization
         """
         B, S, N = scores.shape
+        k = min(path_max_k * max_paths, N)
 
-        # Sort neurons by score (descending)
+        # 1. Top-k selection (sorted by descending scores)
+        topk_scores, topk_indices = torch.topk(scores, k=k, dim=-1, sorted=True)
+
+        # 2. Expand tau for top-k positions
+        if torch.is_tensor(tau) and tau.dim() == 3:
+            topk_tau = tau.expand(-1, -1, k)
+        else:
+            topk_tau = tau
+
+        # 3. Threshold mask for top-k neurons
+        topk_mask = (topk_scores > topk_tau)
+
+        # 4. Log-gated selection on top-k only
+        gate = F.relu(topk_scores - topk_tau) + 1e-8
+        log_gate = torch.log(gate).clamp(min=-20)
+
+        if self.inference_hard_mask and not self.training:
+            log_gate = torch.where(topk_mask, log_gate, torch.full_like(log_gate, -1e9))
+
+        # 5. Softmax on top-k only (O(k) instead of O(N))
+        masked_scores = topk_scores + log_gate
+        topk_weights = F.softmax(masked_scores, dim=-1)  # [B, S, k]
+
+        # 6. Chunk to paths (already sorted by topk)
+        path_weights_list = []
+        for p in range(max_paths):
+            start_idx = p * path_max_k
+            end_idx = min((p + 1) * path_max_k, k)
+
+            if start_idx >= k:
+                path_weights_list.append(torch.zeros(B, S, N, device=scores.device, dtype=scores.dtype))
+                continue
+
+            path_weights = torch.zeros(B, S, N, device=scores.device, dtype=scores.dtype)
+            path_indices = topk_indices[:, :, start_idx:end_idx]
+            path_w = topk_weights[:, :, start_idx:end_idx]
+            # Apply mask within this path's range
+            path_m = topk_mask[:, :, start_idx:end_idx].to(path_w.dtype)
+            path_w = path_w * path_m
+
+            path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
+            path_weights_list.append(path_weights)
+
+        # 7. Create sparse full weights for aux_loss
+        weights = torch.zeros(B, S, N, device=scores.device, dtype=scores.dtype)
+        weights.scatter_(dim=-1, index=topk_indices, src=topk_weights)
+
+        # 8. Create full mask for statistics
+        mask = torch.zeros(B, S, N, device=scores.device, dtype=torch.bool)
+        mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
+
+        return path_weights_list, weights, mask, gate
+
+    # Keep original functions for backward compatibility / other uses
+    def _threshold_select(self, scores, tau, path_max_k, max_paths):
+        """Legacy threshold selection - use _topk_select_and_chunk for optimized version."""
+        mask = (scores > tau)
+        gate = F.relu(scores - tau) + 1e-8
+        log_gate = torch.log(gate).clamp(min=-20)
+        if self.inference_hard_mask and not self.training:
+            log_gate = torch.where(mask, log_gate, torch.full_like(log_gate, -1e9))
+        masked_scores = scores + log_gate
+        weights = F.softmax(masked_scores, dim=-1)
+        return weights, mask, gate
+
+    def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
+        """Legacy chunking - use _topk_select_and_chunk for optimized version."""
+        B, S, N = scores.shape
         sorted_scores, sorted_indices = torch.sort(scores, dim=-1, descending=True)
         sorted_weights = torch.gather(weights, dim=-1, index=sorted_indices)
-        # Use same dtype as weights to avoid dtype mismatch in bfloat16 mode
         sorted_mask = torch.gather(mask.to(weights.dtype), dim=-1, index=sorted_indices)
-
         path_weights_list = []
-
         for p in range(max_paths):
             start_idx = p * path_max_k
             end_idx = min((p + 1) * path_max_k, N)
-
             if start_idx >= N:
                 path_weights_list.append(torch.zeros_like(weights))
                 continue
-
-            # Create path weights
             path_weights = torch.zeros_like(weights)
-
-            # Get indices and weights for this path's neurons
             path_indices = sorted_indices[:, :, start_idx:end_idx]
             path_w = sorted_weights[:, :, start_idx:end_idx]
             path_m = sorted_mask[:, :, start_idx:end_idx]
-
-            # Only include weights for masked (selected) neurons
             path_w = path_w * path_m
-
-            # Scatter weights back to original positions
             path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
-
             path_weights_list.append(path_weights)
-
         return path_weights_list
 
     def get_attention_weights(self, x, importance, attention_mask=None, tau_all=None):
@@ -589,27 +615,19 @@ class GlobalRouters(nn.Module):
         else:
             tau_fq = tau_fk = tau_fv = tau_rq = tau_rk = tau_rv = self.fixed_tau
 
-        # Apply threshold selection (returns weights, mask, and gate)
-        fqk_weights_Q, fqk_mask_Q, fqk_gate_Q = self._threshold_select(
+        # Optimized top-k selection + threshold + softmax + chunking
+        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q = self._topk_select_and_chunk(
             fqk_logits_Q, tau_fq, self.path_max_k, self.max_paths)
-        fqk_weights_K, fqk_mask_K, fqk_gate_K = self._threshold_select(
+        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K = self._topk_select_and_chunk(
             fqk_logits_K, tau_fk, self.path_max_k, self.max_paths)
-        fv_weights, fv_mask, fv_gate = self._threshold_select(
+        fv_paths, fv_weights, fv_mask, fv_gate = self._topk_select_and_chunk(
             fv_logits, tau_fv, self.path_max_k, self.max_paths)
-        rqk_weights_Q, rqk_mask_Q, rqk_gate_Q = self._threshold_select(
+        rqk_paths_Q, rqk_weights_Q, rqk_mask_Q, rqk_gate_Q = self._topk_select_and_chunk(
             rqk_logits_Q, tau_rq, self.path_max_k, self.max_paths)
-        rqk_weights_K, rqk_mask_K, rqk_gate_K = self._threshold_select(
+        rqk_paths_K, rqk_weights_K, rqk_mask_K, rqk_gate_K = self._topk_select_and_chunk(
             rqk_logits_K, tau_rk, self.path_max_k, self.max_paths)
-        rv_weights, rv_mask, rv_gate = self._threshold_select(
+        rv_paths, rv_weights, rv_mask, rv_gate = self._topk_select_and_chunk(
             rv_logits, tau_rv, self.path_max_k, self.max_paths)
-
-        # Chunk to paths
-        fqk_paths_Q = self._chunk_to_paths(fqk_weights_Q, fqk_mask_Q, fqk_logits_Q, self.path_max_k, self.max_paths)
-        fqk_paths_K = self._chunk_to_paths(fqk_weights_K, fqk_mask_K, fqk_logits_K, self.path_max_k, self.max_paths)
-        fv_paths = self._chunk_to_paths(fv_weights, fv_mask, fv_logits, self.path_max_k, self.max_paths)
-        rqk_paths_Q = self._chunk_to_paths(rqk_weights_Q, rqk_mask_Q, rqk_logits_Q, self.path_max_k, self.max_paths)
-        rqk_paths_K = self._chunk_to_paths(rqk_weights_K, rqk_mask_K, rqk_logits_K, self.path_max_k, self.max_paths)
-        rv_paths = self._chunk_to_paths(rv_weights, rv_mask, rv_logits, self.path_max_k, self.max_paths)
 
         # Compute aux_loss for load balancing (using softmax weights)
         aux_loss = 0.0
@@ -764,15 +782,11 @@ class GlobalRouters(nn.Module):
         else:
             tau_f = tau_r = self.fixed_tau
 
-        # Apply threshold selection (returns weights, mask, and gate)
-        f_weights, f_mask, f_gate = self._threshold_select(
+        # Optimized top-k selection + threshold + softmax + chunking
+        f_paths, f_weights, f_mask, f_gate = self._topk_select_and_chunk(
             logits_f, tau_f, self.path_max_k, self.max_paths)
-        r_weights, r_mask, r_gate = self._threshold_select(
+        r_paths, r_weights, r_mask, r_gate = self._topk_select_and_chunk(
             logits_r, tau_r, self.path_max_k, self.max_paths)
-
-        # Chunk to paths
-        f_paths = self._chunk_to_paths(f_weights, f_mask, logits_f, self.path_max_k, self.max_paths)
-        r_paths = self._chunk_to_paths(r_weights, r_mask, logits_r, self.path_max_k, self.max_paths)
 
         # Update usage with mask (binary selection)
         if self.training:
