@@ -1076,6 +1076,18 @@ class DAWNBlock(nn.Module):
             'attention': attn_info,
             'knowledge': know_info,
         }
+        # Store path_weights for analysis (when enabled)
+        if getattr(global_routers, 'store_path_weights', False):
+            routing_info['path_weights'] = {
+                'fv': path_weights['fv'],
+                'rv': path_weights['rv'],
+                'fqk_Q': path_weights['fqk_Q'],
+                'fqk_K': path_weights['fqk_K'],
+                'rqk_Q': path_weights['rqk_Q'],
+                'rqk_K': path_weights['rqk_K'],
+                'feature_know': feature_paths,
+                'restore_know': restore_paths,
+            }
         # Norms only in debug mode (avoid GPU sync overhead)
         if global_routers.debug_mode:
             routing_info['attn_out_norm'] = attn_out.norm(dim=-1).mean().item()
@@ -1236,9 +1248,13 @@ class DAWN(nn.Module):
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids, labels=None, attention_mask=None, return_routing_info=False):
+    def forward(self, input_ids, labels=None, attention_mask=None, return_routing_info=False, return_path_weights=False):
         B, S = input_ids.shape
         device = input_ids.device
+
+        # Enable path_weights storage for analysis
+        if return_path_weights:
+            self.router.store_path_weights = True
 
         # Validate sequence length
         if S > self.max_seq_len:
@@ -1277,15 +1293,19 @@ class DAWN(nn.Module):
         x = self.norm(x)
         logits = self.lm_head(x)
 
+        # Reset path_weights flag after forward
+        if return_path_weights:
+            self.router.store_path_weights = False
+
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous().long()
             loss = F.cross_entropy(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1), ignore_index=-100)
-            if return_routing_info:
+            if return_routing_info or return_path_weights:
                 return loss, logits, routing_infos
             return loss, logits
 
-        if return_routing_info:
+        if return_routing_info or return_path_weights:
             return logits, routing_infos
         return logits
 
