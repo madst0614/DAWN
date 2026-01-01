@@ -142,9 +142,11 @@ def continuation_test(model, tokenizer, val_tokens, sample_indices, context_len=
         context_text = tokenizer.decode(context_tokens[0], skip_special_tokens=True)
         actual_text = tokenizer.decode(actual_next, skip_special_tokens=True)
 
-        # Greedy generation with top-5 tracking
+        # Greedy generation with top-k tracking
         top1_matches = 0
         top5_matches = 0
+        top10_matches = 0
+        top20_matches = 0
         with torch.no_grad():
             generated = context_tokens.clone()
             for step in range(gen_len):
@@ -155,15 +157,19 @@ def continuation_test(model, tokenizer, val_tokens, sample_indices, context_len=
                 # Top-1 prediction
                 next_token = last_logits.argmax(dim=-1, keepdim=True)
 
-                # Top-5 predictions
-                top5_tokens = last_logits.topk(5, dim=-1).indices[0]
+                # Top-20 predictions (covers all k values)
+                top20_tokens = last_logits.topk(20, dim=-1).indices[0].tolist()
 
                 # Check matches against actual token
                 actual_token = actual_next[step].item()
                 if next_token[0].item() == actual_token:
                     top1_matches += 1
-                if actual_token in top5_tokens.tolist():
+                if actual_token in top20_tokens[:5]:
                     top5_matches += 1
+                if actual_token in top20_tokens[:10]:
+                    top10_matches += 1
+                if actual_token in top20_tokens:
+                    top20_matches += 1
 
                 generated = torch.cat([generated, next_token], dim=1)
 
@@ -177,8 +183,12 @@ def continuation_test(model, tokenizer, val_tokens, sample_indices, context_len=
             'generated': generated_text,
             'top1_match': top1_matches,
             'top5_match': top5_matches,
+            'top10_match': top10_matches,
+            'top20_match': top20_matches,
             'top1_rate': top1_matches / gen_len,
             'top5_rate': top5_matches / gen_len,
+            'top10_rate': top10_matches / gen_len,
+            'top20_rate': top20_matches / gen_len,
         })
 
     return results
@@ -282,6 +292,8 @@ def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda'):
     results['continuation'] = cont_results
     results['avg_top1_match'] = sum(r['top1_match'] for r in cont_results) / (len(sample_indices) * 30)
     results['avg_top5_match'] = sum(r['top5_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top10_match'] = sum(r['top10_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top20_match'] = sum(r['top20_match'] for r in cont_results) / (len(sample_indices) * 30)
 
     # 3. Perplexity
     avg_loss, ppl = compute_perplexity(model, val_tokens, num_seqs=50, device=device)
@@ -353,9 +365,9 @@ def main():
                 output_lines.append(f"\n[Sample {r['sample_idx']}]")
                 output_lines.append(f"Actual:    {r['actual'][:60]}...")
                 output_lines.append(f"Generated: {r['generated'][:60]}...")
-                output_lines.append(f"Top-1: {r['top1_match']}/30 ({r['top1_rate']*100:.1f}%) | Top-5: {r['top5_match']}/30 ({r['top5_rate']*100:.1f}%)")
+                output_lines.append(f"Top-1: {r['top1_match']}/30 ({r['top1_rate']*100:.1f}%) | Top-5: {r['top5_match']}/30 ({r['top5_rate']*100:.1f}%) | Top-10: {r['top10_match']}/30 ({r['top10_rate']*100:.1f}%) | Top-20: {r['top20_match']}/30 ({r['top20_rate']*100:.1f}%)")
 
-            output_lines.append(f"\nAvg Top-1: {results['avg_top1_match']*100:.1f}% | Avg Top-5: {results['avg_top5_match']*100:.1f}%")
+            output_lines.append(f"\nAvg Top-1: {results['avg_top1_match']*100:.1f}% | Top-5: {results['avg_top5_match']*100:.1f}% | Top-10: {results['avg_top10_match']*100:.1f}% | Top-20: {results['avg_top20_match']*100:.1f}%")
             output_lines.append(f"Loss: {results['loss']:.4f} | PPL: {results['ppl']:.2f}")
             output_lines.append("")
 
@@ -366,13 +378,13 @@ def main():
             output_lines.append(f"ERROR for {ckpt_path}: {e}\n")
 
     # Summary table
-    output_lines.append("\n" + "=" * 70)
+    output_lines.append("\n" + "=" * 100)
     output_lines.append("SUMMARY")
-    output_lines.append("=" * 70)
-    output_lines.append(f"{'Model':<50} {'PPL':>8} {'Top-1':>8} {'Top-5':>8}")
-    output_lines.append("-" * 70)
+    output_lines.append("=" * 100)
+    output_lines.append(f"{'Model':<50} {'PPL':>8} {'Top-1':>8} {'Top-5':>8} {'Top-10':>8} {'Top-20':>8}")
+    output_lines.append("-" * 100)
     for r in all_results:
-        output_lines.append(f"{r['name']:<50} {r['ppl']:>8.2f} {r['avg_top1_match']*100:>7.1f}% {r['avg_top5_match']*100:>7.1f}%")
+        output_lines.append(f"{r['name']:<50} {r['ppl']:>8.2f} {r['avg_top1_match']*100:>7.1f}% {r['avg_top5_match']*100:>7.1f}% {r['avg_top10_match']*100:>7.1f}% {r['avg_top20_match']*100:>7.1f}%")
 
     # Write output
     output_text = "\n".join(output_lines)
