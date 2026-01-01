@@ -280,7 +280,8 @@ def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda'):
     sample_indices = [100, 500, 1000]
     cont_results = continuation_test(model, tokenizer, val_tokens, sample_indices, device=device)
     results['continuation'] = cont_results
-    results['avg_match'] = sum(r['token_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top1_match'] = sum(r['top1_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top5_match'] = sum(r['top5_match'] for r in cont_results) / (len(sample_indices) * 30)
 
     # 3. Perplexity
     avg_loss, ppl = compute_perplexity(model, val_tokens, num_seqs=50, device=device)
@@ -352,9 +353,9 @@ def main():
                 output_lines.append(f"\n[Sample {r['sample_idx']}]")
                 output_lines.append(f"Actual:    {r['actual'][:60]}...")
                 output_lines.append(f"Generated: {r['generated'][:60]}...")
-                output_lines.append(f"Match: {r['token_match']}/30 ({r['match_rate']*100:.1f}%)")
+                output_lines.append(f"Top-1: {r['top1_match']}/30 ({r['top1_rate']*100:.1f}%) | Top-5: {r['top5_match']}/30 ({r['top5_rate']*100:.1f}%)")
 
-            output_lines.append(f"\nAvg Match: {results['avg_match']*100:.1f}%")
+            output_lines.append(f"\nAvg Top-1: {results['avg_top1_match']*100:.1f}% | Avg Top-5: {results['avg_top5_match']*100:.1f}%")
             output_lines.append(f"Loss: {results['loss']:.4f} | PPL: {results['ppl']:.2f}")
             output_lines.append("")
 
@@ -368,10 +369,10 @@ def main():
     output_lines.append("\n" + "=" * 70)
     output_lines.append("SUMMARY")
     output_lines.append("=" * 70)
-    output_lines.append(f"{'Model':<50} {'PPL':>8} {'Match':>8}")
+    output_lines.append(f"{'Model':<50} {'PPL':>8} {'Top-1':>8} {'Top-5':>8}")
     output_lines.append("-" * 70)
     for r in all_results:
-        output_lines.append(f"{r['name']:<50} {r['ppl']:>8.2f} {r['avg_match']*100:>7.1f}%")
+        output_lines.append(f"{r['name']:<50} {r['ppl']:>8.2f} {r['avg_top1_match']*100:>7.1f}% {r['avg_top5_match']*100:>7.1f}%")
 
     # Write output
     output_text = "\n".join(output_lines)
