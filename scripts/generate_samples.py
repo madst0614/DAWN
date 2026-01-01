@@ -142,27 +142,43 @@ def continuation_test(model, tokenizer, val_tokens, sample_indices, context_len=
         context_text = tokenizer.decode(context_tokens[0], skip_special_tokens=True)
         actual_text = tokenizer.decode(actual_next, skip_special_tokens=True)
 
-        # Greedy generation
+        # Greedy generation with top-5 tracking
+        top1_matches = 0
+        top5_matches = 0
         with torch.no_grad():
             generated = context_tokens.clone()
-            for _ in range(gen_len):
+            for step in range(gen_len):
                 output = model(generated, attention_mask=None)
                 logits = output[0] if isinstance(output, tuple) else output
-                next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                last_logits = logits[:, -1, :]
+
+                # Top-1 prediction
+                next_token = last_logits.argmax(dim=-1, keepdim=True)
+
+                # Top-5 predictions
+                top5_tokens = last_logits.topk(5, dim=-1).indices[0]
+
+                # Check matches against actual token
+                actual_token = actual_next[step].item()
+                if next_token[0].item() == actual_token:
+                    top1_matches += 1
+                if actual_token in top5_tokens.tolist():
+                    top5_matches += 1
+
                 generated = torch.cat([generated, next_token], dim=1)
 
         generated_tokens = generated[0, context_len:context_len+gen_len]
         generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-
-        match = (generated_tokens.cpu() == actual_next).sum().item()
 
         results.append({
             'sample_idx': sample_idx,
             'context': context_text[-100:],
             'actual': actual_text,
             'generated': generated_text,
-            'token_match': match,
-            'match_rate': match / gen_len,
+            'top1_match': top1_matches,
+            'top5_match': top5_matches,
+            'top1_rate': top1_matches / gen_len,
+            'top5_rate': top5_matches / gen_len,
         })
 
     return results
