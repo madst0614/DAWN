@@ -911,6 +911,11 @@ Examples:
     model = model.to(args.device)
     model.eval()
 
+    # Enable debug mode for routing info (required for analysis)
+    if hasattr(model, 'router') and hasattr(model.router, 'debug_mode'):
+        model.router.debug_mode = True
+        print("Enabled router debug_mode for analysis")
+
     # Apply optimizations
     if args.bf16:
         print("Using bfloat16 precision")
