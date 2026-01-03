@@ -195,22 +195,33 @@ class GenerationRoutingAnalyzer:
             path_weights = layer_info.get('path_weights', {})
             if path_weights:
                 # v18.2 format: path_weights contains fv, rv, fqk_Q, etc.
-                def extract_indices(weights, indices_list, weights_holder=None):
-                    if weights is not None and torch.is_tensor(weights):
-                        w_last = weights[0, -1]  # [N]
-                        idx = (w_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                # Each is a LIST of [B, S, N] tensors (one per path)
+                def extract_indices_from_paths(path_list, indices_list):
+                    """Extract active neuron indices from list of path weight tensors."""
+                    if path_list is None:
+                        return None
+                    combined_weights = None
+                    for path_w in path_list:
+                        if torch.is_tensor(path_w):
+                            w_last = path_w[0, -1]  # [N]
+                            if combined_weights is None:
+                                combined_weights = w_last.clone()
+                            else:
+                                combined_weights = combined_weights + w_last
+                    if combined_weights is not None:
+                        idx = (combined_weights > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                         indices_list.extend(idx)
-                        return w_last.cpu()
+                        return combined_weights.cpu()
                     return None
 
-                fv_weights_last = extract_indices(path_weights.get('fv'), fv_indices_all)
-                rv_weights_last = extract_indices(path_weights.get('rv'), rv_indices_all)
-                extract_indices(path_weights.get('fqk_Q'), fqk_q_indices_all)
-                extract_indices(path_weights.get('fqk_K'), fqk_k_indices_all)
-                extract_indices(path_weights.get('rqk_Q'), rqk_q_indices_all)
-                extract_indices(path_weights.get('rqk_K'), rqk_k_indices_all)
-                extract_indices(path_weights.get('feature_know'), fknow_indices_all)
-                extract_indices(path_weights.get('restore_know'), rknow_indices_all)
+                fv_weights_last = extract_indices_from_paths(path_weights.get('fv'), fv_indices_all)
+                rv_weights_last = extract_indices_from_paths(path_weights.get('rv'), rv_indices_all)
+                extract_indices_from_paths(path_weights.get('fqk_Q'), fqk_q_indices_all)
+                extract_indices_from_paths(path_weights.get('fqk_K'), fqk_k_indices_all)
+                extract_indices_from_paths(path_weights.get('rqk_Q'), rqk_q_indices_all)
+                extract_indices_from_paths(path_weights.get('rqk_K'), rqk_k_indices_all)
+                extract_indices_from_paths(path_weights.get('feature_know'), fknow_indices_all)
+                extract_indices_from_paths(path_weights.get('restore_know'), rknow_indices_all)
             else:
                 # v17.1 format: weights in attention/knowledge dicts
                 attn = layer_info.get('attention', layer_info)
