@@ -420,7 +420,7 @@ def get_all_versions_info() -> str:
 
 def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[str, Any]:
     """
-    Extract routing log info for v17.1/v17.2/v18.0/v18.1/v18.2.
+    Extract routing log info for v17.1/v17.2/v18.0/v18.1/v18.2/v18.3.
     Computes AVERAGE entropy across all layers.
     """
     if isinstance(routing_infos, dict):
@@ -455,14 +455,16 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
         # v18 specific: path counts
         n_paths = f"Paths FQK:{attn0.get('n_paths_fqk_Q', 0):.1f}/{attn0.get('n_paths_fqk_K', 0):.1f} FV:{attn0.get('n_paths_fv', 0):.1f} RQK:{attn0.get('n_paths_rqk_Q', 0):.1f}/{attn0.get('n_paths_rqk_K', 0):.1f} RV:{attn0.get('n_paths_rv', 0):.1f}"
 
-        # Detect v18.1/v18.2 by flag and key presence
+        # Detect v18.1/v18.2/v18.3 by flag and key presence
+        # v18.3: confidence-scaled soft gating (same routing_info format as v18.2)
         # v18.2: has adj_* keys (ReLU mask)
         # v18.1: has gate_* keys (sigmoid gate)
         # v18.0: neither (fixed tau)
         is_soft_mask = attn0.get('use_soft_mask', False) or attn0.get('learnable_tau', False)
         if is_soft_mask:
-            # v18.2 uses adj_*, v18.1 uses gate_*
-            version = '18.2' if attn0.get('adj_fq') is not None else '18.1'
+            # v18.2/v18.3 uses adj_*, v18.1 uses gate_*
+            # Note: v18.3 has same routing_info format as v18.2
+            version = '18.2+' if attn0.get('adj_fq') is not None else '18.1'
         else:
             version = '18.0'
 

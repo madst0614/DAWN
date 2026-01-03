@@ -70,8 +70,8 @@ class GenerationRoutingAnalyzer:
         self.target_layer = target_layer
         self.model.eval()
 
-        # Detect v18.2 model (uses path_weights instead of per-pool weights)
-        self.is_v18_2 = hasattr(model, '__version__') and model.__version__ == "18.2"
+        # Detect v18.2+ models (uses path_weights instead of per-pool weights)
+        self.is_v18_2 = hasattr(model, '__version__') and model.__version__ in ("18.2", "18.3")
 
     def generate_with_routing(
         self,
