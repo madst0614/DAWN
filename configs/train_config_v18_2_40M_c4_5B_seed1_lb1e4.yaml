@@ -1,4 +1,4 @@
-# DAWN v18.2 Training Config - 40M Scale, 5B tokens (Seed 1, tau_lb=1e-4)
+# DAWN v18.2 Training Config - 40M Scale, 5B tokens (Seed 1, lb=1e-4)
 # Ablation vs v17.1: rank 16 (vs 64), 4x neurons, learnable tau (vs top-k=12)
 # Fair comparison: 4 paths × 12 neurons × rank 16 = 768 dim (same as v17.1's 12 × 64)
 
@@ -54,7 +54,6 @@ model:
   max_paths: 2
   path_max_k: 16
   learnable_tau: true
-  tau_lb: 0.0001  # lower bound for tau
 
 training:
   batch_size: 128
@@ -65,12 +64,12 @@ training:
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.00002
+  load_balance_weight: 0.0001
   tau_reg_weight: 0.00002
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v18.2_40M_c4_5B_seed1_tau_lb1e4
-log_dir: /content/drive/MyDrive/dawn/logs_v18.2_40M_c4_5B_seed1_tau_lb1e4
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v18.2_40M_c4_5B_seed1_lb1e4
+log_dir: /content/drive/MyDrive/dawn/logs_v18.2_40M_c4_5B_seed1_lb1e4
 
 # v18.2 Multi-Path Learnable Tau Architecture
 #
