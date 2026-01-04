@@ -554,7 +554,7 @@ class GlobalRouters(nn.Module):
         mask = torch.zeros(B, S, N, device=scores.device, dtype=torch.bool)
         mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
 
-        return path_weights_list, weights, mask, gate
+        return path_weights_list, weights, mask, gate, confidence
 
     # Keep original functions for backward compatibility / other uses
     def _threshold_select(self, scores, tau, path_max_k, max_paths):
@@ -570,7 +570,7 @@ class GlobalRouters(nn.Module):
         # v18.3: confidence scaling
         confidence = gate / (gate + 1)
         scaled_weights = weights * confidence
-        return scaled_weights, mask, gate
+        return scaled_weights, mask, gate, confidence
 
     def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
         """Legacy chunking - use _topk_select_and_chunk for optimized version."""
@@ -625,18 +625,18 @@ class GlobalRouters(nn.Module):
         else:
             tau_fq = tau_fk = tau_fv = tau_rq = tau_rk = tau_rv = self.fixed_tau
 
-        # Optimized top-k selection + threshold + softmax + chunking
-        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q = self._topk_select_and_chunk(
+        # Optimized top-k selection + threshold + softmax + chunking + confidence
+        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q, fqk_conf_Q = self._topk_select_and_chunk(
             fqk_logits_Q, tau_fq, self.path_max_k, self.max_paths)
-        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K = self._topk_select_and_chunk(
+        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K, fqk_conf_K = self._topk_select_and_chunk(
             fqk_logits_K, tau_fk, self.path_max_k, self.max_paths)
-        fv_paths, fv_weights, fv_mask, fv_gate = self._topk_select_and_chunk(
+        fv_paths, fv_weights, fv_mask, fv_gate, fv_conf = self._topk_select_and_chunk(
             fv_logits, tau_fv, self.path_max_k, self.max_paths)
-        rqk_paths_Q, rqk_weights_Q, rqk_mask_Q, rqk_gate_Q = self._topk_select_and_chunk(
+        rqk_paths_Q, rqk_weights_Q, rqk_mask_Q, rqk_gate_Q, rqk_conf_Q = self._topk_select_and_chunk(
             rqk_logits_Q, tau_rq, self.path_max_k, self.max_paths)
-        rqk_paths_K, rqk_weights_K, rqk_mask_K, rqk_gate_K = self._topk_select_and_chunk(
+        rqk_paths_K, rqk_weights_K, rqk_mask_K, rqk_gate_K, rqk_conf_K = self._topk_select_and_chunk(
             rqk_logits_K, tau_rk, self.path_max_k, self.max_paths)
-        rv_paths, rv_weights, rv_mask, rv_gate = self._topk_select_and_chunk(
+        rv_paths, rv_weights, rv_mask, rv_gate, rv_conf = self._topk_select_and_chunk(
             rv_logits, tau_rv, self.path_max_k, self.max_paths)
 
         # Compute aux_loss for load balancing (using softmax weights)
@@ -757,6 +757,19 @@ class GlobalRouters(nn.Module):
                 'gate_rk_std': rqk_gate_K.std().item(),
                 'gate_rv_mean': rv_gate.mean().item(),
                 'gate_rv_std': rv_gate.std().item(),
+                # v18.3: confidence stats (gate / (gate + 1))
+                'conf_fq_mean': fqk_conf_Q.mean().item(),
+                'conf_fq_std': fqk_conf_Q.std().item(),
+                'conf_fk_mean': fqk_conf_K.mean().item(),
+                'conf_fk_std': fqk_conf_K.std().item(),
+                'conf_fv_mean': fv_conf.mean().item(),
+                'conf_fv_std': fv_conf.std().item(),
+                'conf_rq_mean': rqk_conf_Q.mean().item(),
+                'conf_rq_std': rqk_conf_Q.std().item(),
+                'conf_rk_mean': rqk_conf_K.mean().item(),
+                'conf_rk_std': rqk_conf_K.std().item(),
+                'conf_rv_mean': rv_conf.mean().item(),
+                'conf_rv_std': rv_conf.std().item(),
             }
         else:
             routing_info = {}
@@ -792,10 +805,10 @@ class GlobalRouters(nn.Module):
         else:
             tau_f = tau_r = self.fixed_tau
 
-        # Optimized top-k selection + threshold + softmax + chunking
-        f_paths, f_weights, f_mask, f_gate = self._topk_select_and_chunk(
+        # Optimized top-k selection + threshold + softmax + chunking + confidence
+        f_paths, f_weights, f_mask, f_gate, f_conf = self._topk_select_and_chunk(
             logits_f, tau_f, self.path_max_k, self.max_paths)
-        r_paths, r_weights, r_mask, r_gate = self._topk_select_and_chunk(
+        r_paths, r_weights, r_mask, r_gate, r_conf = self._topk_select_and_chunk(
             logits_r, tau_r, self.path_max_k, self.max_paths)
 
         # Update usage with mask (binary selection)
@@ -835,6 +848,11 @@ class GlobalRouters(nn.Module):
                 'gate_feature_std': f_gate.std().item(),
                 'gate_restore_mean': r_gate.mean().item(),
                 'gate_restore_std': r_gate.std().item(),
+                # v18.3: confidence stats (gate / (gate + 1))
+                'conf_feature_mean': f_conf.mean().item(),
+                'conf_feature_std': f_conf.std().item(),
+                'conf_restore_mean': r_conf.mean().item(),
+                'conf_restore_std': r_conf.std().item(),
             }
         else:
             know_info = {}
