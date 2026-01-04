@@ -39,10 +39,10 @@ def find_checkpoint_file(ckpt_path):
             if (ckpt_path / name).exists():
                 return ckpt_path / name
 
-        # Fall back to any .pt file
+        # Fall back to any .pt file - sort by modification time (newest last)
         pt_files = list(ckpt_path.glob('*.pt'))
         if pt_files:
-            return sorted(pt_files)[-1]  # Most recent
+            return sorted(pt_files, key=lambda f: f.stat().st_mtime)[-1]
 
     raise FileNotFoundError(f"No checkpoint found in {ckpt_path}")
 
