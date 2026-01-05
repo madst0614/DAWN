@@ -24,7 +24,7 @@ Analysis Categories:
 5. Behavioral Analysis  - Token trajectory, probing classifier, ablation study
 6. Semantic Analysis    - Path similarity, context-dependent routing, POS patterns
 7. Co-selection         - Feature/Restore neuron pairing analysis
-8. V18 Analysis         - Learnable tau, gate distribution, Q/K tau differentiation (v18.x only)
+8. V18 Analysis         - Learnable tau, gate distribution, Q/K tau differentiation, confidence (v18.2/v18.3)
 
 Usage:
     python analyze_dawn.py --checkpoint path/to/ckpt --mode all
@@ -274,19 +274,22 @@ class DAWNAnalyzer:
         return results
 
     def run_v18_analysis(self, dataloader=None, n_batches: int = 50, output_dir: str = None) -> Dict:
-        """v18.2-specific analysis: tau, gate, Q/K differentiation.
+        """v18.x-specific analysis: tau, gate, confidence, Q/K differentiation.
 
         Analyzes v18.x specific features:
         1. Learnable Tau - 8 pool tau values (Q/K separated)
         2. Gate Distribution - log-gated threshold selection
         3. Token-level Tau - tau variance across tokens/positions
         4. Q/K Tau Differentiation - how Q and K taus diverge
+        5. Confidence Stats (v18.3) - confidence scaling metrics
         """
+        # Detect model version
+        model_version = getattr(self.model, '__version__', '18.2')
         print("\n" + "="*60)
-        print("V18.2 SPECIFIC ANALYSIS")
+        print(f"V18.x SPECIFIC ANALYSIS (v{model_version})")
         print("="*60)
 
-        results = {}
+        results = {'model_version': model_version}
 
         # Check if model has v18 features
         if not hasattr(self.model, 'router') or not hasattr(self.model.router, 'tau_proj'):
@@ -347,6 +350,7 @@ class DAWNAnalyzer:
             gate_stats = defaultdict(list)
             tau_runtime = defaultdict(list)
             qk_patterns = defaultdict(list)
+            conf_stats = defaultdict(list)  # v18.3 confidence
 
             self.model.eval()
             batch_count = 0
@@ -389,6 +393,12 @@ class DAWNAnalyzer:
                             if 'overlap_rqk' in attn:
                                 qk_patterns[f'L{layer_idx}_rqk_overlap'].append(attn['overlap_rqk'])
 
+                            # v18.3: Confidence statistics
+                            for pool in ['fq', 'fk', 'fv', 'rq', 'rk', 'rv']:
+                                conf_key = f'conf_{pool}_mean'
+                                if conf_key in attn:
+                                    conf_stats[f'L{layer_idx}_{pool}_conf'].append(attn[conf_key])
+
                     batch_count += 1
 
             # Aggregate gate stats
@@ -421,6 +431,17 @@ class DAWNAnalyzer:
                     }
             results['qk_patterns'] = qk_summary
 
+            # Aggregate confidence stats (v18.3)
+            conf_summary = {}
+            for key, values in conf_stats.items():
+                if values:
+                    conf_summary[key] = {
+                        'mean': float(np.mean(values)),
+                        'std': float(np.std(values)),
+                    }
+            if conf_summary:
+                results['confidence'] = conf_summary
+
             # Print per-layer summary
             n_layers = self.model.n_layers
             print("\nPer-Layer Gate Mean:")
@@ -441,6 +462,19 @@ class DAWNAnalyzer:
                 fqk = qk_summary.get(f'L{layer_idx}_fqk_overlap', {}).get('mean', 0)
                 rqk = qk_summary.get(f'L{layer_idx}_rqk_overlap', {}).get('mean', 0)
                 print(f"L{layer_idx:2}    {fqk:7.3f} {rqk:7.3f}")
+
+            # v18.3: Print confidence stats
+            if conf_summary:
+                print("\nPer-Layer Confidence Mean (v18.3):")
+                print("Layer   FQ      FK      FV      RQ      RK      RV")
+                print("-" * 60)
+                for layer_idx in range(n_layers):
+                    row = f"L{layer_idx:2}    "
+                    for pool in ['fq', 'fk', 'fv', 'rq', 'rk', 'rv']:
+                        key = f'L{layer_idx}_{pool}_conf'
+                        val = conf_summary.get(key, {}).get('mean', 0)
+                        row += f"{val:7.3f} "
+                    print(row)
 
         # Save results
         if output_dir:
@@ -631,8 +665,9 @@ def main():
             return
         results = analyzer.run_coselection_analysis(dataloader, args.max_batches, args.output_dir)
     elif args.mode == 'v18':
-        # v18.2 specific analysis (tau, gate, Q/K differentiation)
+        # v18.x specific analysis (tau, gate, confidence, Q/K differentiation)
         # dataloader is optional - without it, only static tau params are analyzed
+        # v18.3 adds confidence stats
         results = analyzer.run_v18_analysis(dataloader, args.max_batches, args.output_dir)
 
     output_path = os.path.join(args.output_dir, f'dawn_{args.mode}.json')
