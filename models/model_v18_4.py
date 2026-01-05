@@ -495,10 +495,12 @@ class GlobalRouters(nn.Module):
 
     def _topk_select_and_chunk(self, scores, tau, path_max_k, max_paths):
         """
-        Optimized routing: top-k selection → threshold → gate normalization → chunking
+        Optimized routing: top-k selection → threshold → exp gate normalization → chunking
 
-        v18.4: Gate-only normalization (no softmax)
-        scaled_weights = gate / gate_sum where gate = ReLU(score - tau)
+        v18.4: Exponential gate scaling with gradient flow
+        - gate = score - tau (positive) or 1e-8 * exp(score - tau) (negative, for gradient)
+        - exp_gate = exp(gate) - 1 (amplifies differences, 0 when gate=0)
+        - scaled_weights = exp_gate / sum(exp_gate)
 
         Optimization: O(N log N) sort → O(N + k log k) top-k
         For N=1020, k=32: ~30x reduction in computation
@@ -513,8 +515,8 @@ class GlobalRouters(nn.Module):
             path_weights_list: list of [B, S, N] weights (length = max_paths)
             weights: [B, S, N] sparse weights for aux_loss
             mask: [B, S, N] boolean mask for statistics
-            gate: [B, S, k] gate values for tau regularization
-            scaled_weights: [B, S, k] normalized gate weights (= gate / gate_sum)
+            gate: [B, S, k] gate values (with gradient flow)
+            scaled_weights: [B, S, k] normalized exp gate weights
         """
         B, S, N = scores.shape
         k = min(path_max_k * max_paths, N)
@@ -531,16 +533,21 @@ class GlobalRouters(nn.Module):
         # 3. Threshold mask for top-k neurons
         topk_mask = (topk_scores > topk_tau)
 
-        # 4. Gate = ReLU(score - tau), can be 0
-        gate = F.relu(topk_scores - topk_tau)  # [B, S, k], can be 0
+        # 4. Gate with gradient flow for dead neurons
+        raw_gate = topk_scores - topk_tau
+        gate = torch.where(
+            raw_gate > 0,
+            raw_gate,
+            1e-8 * torch.exp(raw_gate)  # 음수여도 작은 값 + gradient 흐름
+        )
 
-        # 5. Gate-only normalization (no softmax)
-        # scaled_weights = gate / gate_sum, sums to 1 (or 0 if all gates are 0)
-        gate_sum = gate.sum(dim=-1, keepdim=True)
+        # 5. Exponential scaling for sparsity + normalization
+        exp_gate = torch.exp(gate) - 1  # 차이 극대화, gate=0이면 0
+        exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
         scaled_weights = torch.where(
-            gate_sum > 1e-8,
-            gate / (gate_sum + 1e-8),
-            torch.zeros_like(gate)
+            exp_gate_sum > 1e-8,
+            exp_gate / (exp_gate_sum + 1e-8),
+            exp_gate * 0
         )
 
         # 7. Chunk to paths (already sorted by topk)
@@ -576,14 +583,20 @@ class GlobalRouters(nn.Module):
     def _threshold_select(self, scores, tau, path_max_k, max_paths):
         """Legacy threshold selection - use _topk_select_and_chunk for optimized version."""
         mask = (scores > tau)
-        # Gate = ReLU(score - tau), can be 0
-        gate = F.relu(scores - tau)
-        # Gate-only normalization (no softmax)
-        gate_sum = gate.sum(dim=-1, keepdim=True)
+        # Gate with gradient flow for dead neurons
+        raw_gate = scores - tau
+        gate = torch.where(
+            raw_gate > 0,
+            raw_gate,
+            1e-8 * torch.exp(raw_gate)  # 음수여도 작은 값 + gradient 흐름
+        )
+        # Exponential scaling for sparsity + normalization
+        exp_gate = torch.exp(gate) - 1  # 차이 극대화, gate=0이면 0
+        exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
         scaled_weights = torch.where(
-            gate_sum > 1e-8,
-            gate / (gate_sum + 1e-8),
-            torch.zeros_like(gate)
+            exp_gate_sum > 1e-8,
+            exp_gate / (exp_gate_sum + 1e-8),
+            exp_gate * 0
         )
         return scaled_weights, mask, gate, scaled_weights
 
