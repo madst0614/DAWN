@@ -681,7 +681,14 @@ class GlobalRouters(nn.Module):
             'rv': rv_paths,
         }
 
-        # Routing stats only in debug mode (avoid GPU sync overhead)
+        # ============================================================
+        # ROUTING INFO (for logging/analysis only)
+        # ============================================================
+        # IMPORTANT: This section is ONLY executed when debug_mode=True
+        # During training: debug_mode=False → routing_info={} → NO OVERHEAD
+        # On log steps: debug_mode=True → compute stats → GPU sync overhead (acceptable)
+        # train.py controls debug_mode via set_v18_debug_mode() on log steps only
+        # ============================================================
         if self.debug_mode:
             def avg_paths_per_token(paths):
                 return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
