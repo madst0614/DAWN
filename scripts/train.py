@@ -1397,10 +1397,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Compact output with loss/acc
                     model_version = getattr(base_model, '__version__', '')
                     if model_version.startswith('18'):
-                        # Get tau gradient info if available
+                        # Get tau gradient info if available (v18.1, v18.2, v18.3)
                         tau_grad_info = None
-                        if model_version.startswith('18.1') or model_version.startswith('18.2'):
-                            if hasattr(base_model.router, 'tau_proj') and base_model.router.tau_proj.weight.grad is not None:
+                        if hasattr(base_model, 'router') and hasattr(base_model.router, 'tau_proj'):
+                            if base_model.router.tau_proj.weight.grad is not None:
                                 tau_grad_info = {
                                     'weight': base_model.router.tau_proj.weight.grad.norm().item(),
                                     'bias': base_model.router.tau_proj.bias.grad.norm().item() if base_model.router.tau_proj.bias.grad is not None else 0
@@ -1408,19 +1408,30 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                         # Use unified formatter for v18 logging
                         router = base_model.router.neuron_router
-                        for line in format_v18_full_log(
+                        log_lines = list(format_v18_full_log(
                             routing_infos, router, model_version, step, avg_loss, avg_acc,
                             ent_str, overlap_str, attn_str, tau_grad_info=tau_grad_info
-                        ):
+                        ))
+
+                        # Console output
+                        for line in log_lines:
                             print(line)
 
-                    elif overlap_str:
-                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
-                    else:
-                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
+                        # File output (same format)
+                        if log_file:
+                            with open(log_file, 'a') as f:
+                                for line in log_lines:
+                                    f.write(line + "\n")
 
-                    # Usage EMA logging (skip for v18, already printed above)
-                    if not (hasattr(base_model, 'router') and hasattr(base_model.router, 'max_paths')):
+                    else:
+                        # Non-v18 models: collect log lines for console + file
+                        non_v18_lines = []
+                        if overlap_str:
+                            non_v18_lines.append(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
+                        else:
+                            non_v18_lines.append(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
+
+                        # Usage EMA logging (v17/v16)
                         router = None
                         global_routers = None
                         if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
@@ -1429,8 +1440,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                             router = base_model.global_routers.neuron_router
                         if router is not None:
-                            for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
-                                print(line)
+                            non_v18_lines.extend(_get_router_log_lines(router, global_step, total_steps, global_routers))
+
+                        # Console output
+                        for line in non_v18_lines:
+                            print(line)
+
+                        # File output (same format)
+                        if log_file:
+                            with open(log_file, 'a') as f:
+                                for line in non_v18_lines:
+                                    f.write(line + "\n")
 
                     # Importance entropy logging (from routing preferences)
                     try:
@@ -1521,75 +1541,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     import traceback
                     traceback.print_exc()
 
-        # Log aggregated metrics every log_interval steps (same format as console output)
+        # Collect neuron metrics every log_interval steps
         if log_file and (step + 1) % log_interval == 0:
-            avg_window_loss = window_loss / window_count if window_count > 0 else 0.0
-            avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
-
-            with open(log_file, 'a') as f:
-                model_version = getattr(base_model, '__version__', '')
-
-                # v18: Use unified full log format (same as console)
-                if model_version.startswith('18') and routing_infos is not None:
-                    try:
-                        # Compute ent_str, overlap_str, attn_str for file log
-                        def calc_entropy_ratio(pref):
-                            if pref is None:
-                                return 0.0
-                            ent = -(pref * (pref + 1e-8).log()).sum(-1).mean()
-                            return (ent / math.log(pref.shape[-1]) * 100).item()
-
-                        def calc_token_var(pref):
-                            if pref is None:
-                                return 0.0
-                            return pref.var(dim=1).mean().item()
-
-                        log_info = get_routing_log_info(routing_infos, calc_entropy_ratio, calc_token_var)
-                        ent_str = log_info['ent_str']
-                        overlap_str = log_info['overlap_str']
-
-                        # Attention ratio
-                        attn_ratios = []
-                        for layer_info in routing_infos:
-                            attn_norm = layer_info.get('attn_out_norm')
-                            mem_norm = layer_info.get('mem_out_norm') or layer_info.get('know_out_norm')
-                            if attn_norm is not None and mem_norm is not None:
-                                ratio = attn_norm / (attn_norm + mem_norm + 1e-8) * 100
-                                attn_ratios.append(f"{ratio:.0f}")
-                            else:
-                                attn_ratios.append("-")
-                        attn_str = "/".join(attn_ratios)
-
-                        # Get router for neuron usage stats
-                        router = base_model.router.neuron_router if hasattr(base_model, 'router') else None
-
-                        # Use unified formatter (no tau_grad for file - only scalar stats)
-                        for line in format_v18_full_log(
-                            routing_infos, router, model_version, step,
-                            avg_window_loss, avg_window_acc,
-                            ent_str, overlap_str, attn_str
-                        ):
-                            f.write(line + "\n")
-                    except Exception:
-                        # Fallback: just write basic line
-                        f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
-                else:
-                    # Non-v18: Basic loss/acc line + legacy router metrics
-                    f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
-
-                    # Add router metrics for non-v18 models
-                    router = None
-                    global_routers = None
-                    if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):
-                        router = base_model.router.neuron_router
-                        global_routers = base_model.router
-                    elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
-                        router = base_model.global_routers.neuron_router
-                    if router is not None:
-                        for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
-                            f.write(line + "\n")
-
-            # Collect neuron metrics
+            # Neuron metrics collection
             model.eval()
             with torch.no_grad():
                 try:
