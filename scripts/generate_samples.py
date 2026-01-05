@@ -112,6 +112,9 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=30, temperature=0.8, 
     input_ids = tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt').to(device)
     generated = input_ids.clone()
 
+    # BERT uses [SEP] as EOS token
+    eos_token_id = tokenizer.sep_token_id
+
     with torch.no_grad():
         for _ in range(max_new_tokens):
             output = model(generated, attention_mask=None)
@@ -125,6 +128,10 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=30, temperature=0.8, 
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             generated = torch.cat([generated, next_token], dim=1)
+
+            # Stop if EOS token generated
+            if next_token.item() == eos_token_id:
+                break
 
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
