@@ -495,7 +495,10 @@ class GlobalRouters(nn.Module):
 
     def _topk_select_and_chunk(self, scores, tau, path_max_k, max_paths):
         """
-        Optimized routing: top-k selection → threshold → softmax → chunking
+        Optimized routing: top-k selection → threshold → gate normalization → chunking
+
+        v18.4: Gate-only normalization (no softmax)
+        scaled_weights = gate / gate_sum where gate = ReLU(score - tau)
 
         Optimization: O(N log N) sort → O(N + k log k) top-k
         For N=1020, k=32: ~30x reduction in computation
@@ -511,6 +514,7 @@ class GlobalRouters(nn.Module):
             weights: [B, S, N] sparse weights for aux_loss
             mask: [B, S, N] boolean mask for statistics
             gate: [B, S, k] gate values for tau regularization
+            scaled_weights: [B, S, k] normalized gate weights (= gate / gate_sum)
         """
         B, S, N = scores.shape
         k = min(path_max_k * max_paths, N)
@@ -527,24 +531,17 @@ class GlobalRouters(nn.Module):
         # 3. Threshold mask for top-k neurons
         topk_mask = (topk_scores > topk_tau)
 
-        # 4. v18.3: Confidence-scaled soft gating
-        # gate can be 0 (no +1e-8), epsilon only in log
+        # 4. Gate = ReLU(score - tau), can be 0
         gate = F.relu(topk_scores - topk_tau)  # [B, S, k], can be 0
-        log_gate = torch.log(gate + 1e-8).clamp(min=-20)
 
-        if self.inference_hard_mask and not self.training:
-            log_gate = torch.where(topk_mask, log_gate, torch.full_like(log_gate, -1e9))
-
-        # 5. Softmax on top-k only (O(k) instead of O(N))
-        masked_scores = topk_scores + log_gate
-        topk_weights = F.softmax(masked_scores, dim=-1)  # [B, S, k]
-
-        # 6. v18.4: Relative confidence scaling
-        # confidence = gate / gate_sum: relative proportion, sums to 1
-        # Benefits: tau decoupled from lb_loss, true zero possible, healthy gradients
-        gate_sum = gate.sum(dim=-1, keepdim=True) + 1e-8  # [B, S, 1]
-        confidence = gate / gate_sum  # [B, S, k], sum ≈ 1
-        scaled_weights = topk_weights * confidence  # [B, S, k]
+        # 5. Gate-only normalization (no softmax)
+        # scaled_weights = gate / gate_sum, sums to 1 (or 0 if all gates are 0)
+        gate_sum = gate.sum(dim=-1, keepdim=True)
+        scaled_weights = torch.where(
+            gate_sum > 1e-8,
+            gate / (gate_sum + 1e-8),
+            torch.zeros_like(gate)
+        )
 
         # 7. Chunk to paths (already sorted by topk)
         # Use scaled_weights.dtype to avoid AMP dtype mismatch (bfloat16/float16)
@@ -573,24 +570,22 @@ class GlobalRouters(nn.Module):
         mask = torch.zeros(B, S, N, device=scores.device, dtype=torch.bool)
         mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
 
-        return path_weights_list, weights, mask, gate, confidence
+        return path_weights_list, weights, mask, gate, scaled_weights
 
     # Keep original functions for backward compatibility / other uses
     def _threshold_select(self, scores, tau, path_max_k, max_paths):
         """Legacy threshold selection - use _topk_select_and_chunk for optimized version."""
         mask = (scores > tau)
-        # v18.3: gate can be 0, confidence scaling
+        # Gate = ReLU(score - tau), can be 0
         gate = F.relu(scores - tau)
-        log_gate = torch.log(gate + 1e-8).clamp(min=-20)
-        if self.inference_hard_mask and not self.training:
-            log_gate = torch.where(mask, log_gate, torch.full_like(log_gate, -1e9))
-        masked_scores = scores + log_gate
-        weights = F.softmax(masked_scores, dim=-1)
-        # v18.4: relative confidence scaling
-        gate_sum = gate.sum(dim=-1, keepdim=True) + 1e-8
-        confidence = gate / gate_sum
-        scaled_weights = weights * confidence
-        return scaled_weights, mask, gate, confidence
+        # Gate-only normalization (no softmax)
+        gate_sum = gate.sum(dim=-1, keepdim=True)
+        scaled_weights = torch.where(
+            gate_sum > 1e-8,
+            gate / (gate_sum + 1e-8),
+            torch.zeros_like(gate)
+        )
+        return scaled_weights, mask, gate, scaled_weights
 
     def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
         """Legacy chunking - use _topk_select_and_chunk for optimized version."""
