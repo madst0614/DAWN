@@ -42,6 +42,16 @@ class RoutingAnalyzer:
         self.router = router
         self.device = device
 
+    def _enable_pref_tensors(self):
+        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = True
+
+    def _disable_pref_tensors(self):
+        """Disable store_pref_tensors after analysis."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = False
+
     def analyze_entropy(self, dataloader, n_batches: int = 50) -> Dict:
         """
         Analyze routing entropy across batches.
@@ -342,32 +352,37 @@ class RoutingAnalyzer:
             return jaccard.cpu().tolist()
 
         self.model.eval()
-        with torch.no_grad():
-            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Q/K Overlap')):
-                if i >= n_batches:
-                    break
+        self._enable_pref_tensors()
 
-                input_ids = get_batch_input_ids(batch, self.device)
-                outputs = self.model(input_ids, return_routing_info=True)
-                routing_infos = get_routing_from_outputs(outputs)
+        try:
+            with torch.no_grad():
+                for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Q/K Overlap')):
+                    if i >= n_batches:
+                        break
 
-                if routing_infos is None:
-                    continue
+                    input_ids = get_batch_input_ids(batch, self.device)
+                    outputs = self.model(input_ids, return_routing_info=True)
+                    routing_infos = get_routing_from_outputs(outputs)
 
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', {})
+                    if routing_infos is None:
+                        continue
 
-                    # F-QK Q/K overlap - vectorized
-                    fqk_q = attn.get('fqk_q_pref')
-                    fqk_k = attn.get('fqk_k_pref')
-                    if fqk_q is not None and fqk_k is not None:
-                        overlap_data['fqk'].extend(compute_jaccard_batch(fqk_q, fqk_k))
+                    for layer_info in routing_infos:
+                        attn = layer_info.get('attention', {})
 
-                    # R-QK Q/K overlap - vectorized
-                    rqk_q = attn.get('rqk_q_pref')
-                    rqk_k = attn.get('rqk_k_pref')
-                    if rqk_q is not None and rqk_k is not None:
-                        overlap_data['rqk'].extend(compute_jaccard_batch(rqk_q, rqk_k))
+                        # F-QK Q/K overlap - vectorized
+                        fqk_q = attn.get('fqk_q_pref')
+                        fqk_k = attn.get('fqk_k_pref')
+                        if fqk_q is not None and fqk_k is not None:
+                            overlap_data['fqk'].extend(compute_jaccard_batch(fqk_q, fqk_k))
+
+                        # R-QK Q/K overlap - vectorized
+                        rqk_q = attn.get('rqk_q_pref')
+                        rqk_k = attn.get('rqk_k_pref')
+                        if rqk_q is not None and rqk_k is not None:
+                            overlap_data['rqk'].extend(compute_jaccard_batch(rqk_q, rqk_k))
+        finally:
+            self._disable_pref_tensors()
 
         results = {}
         for key in ['fqk', 'rqk']:
@@ -397,137 +412,142 @@ class RoutingAnalyzer:
             Dictionary with Q/K usage statistics
         """
         results = {}
+        self.model.eval()
+        self._enable_pref_tensors()
 
-        for pool_name, pool_info in QK_POOLS.items():
-            n_neurons = getattr(self.router, pool_info['n_attr'], 0)
-            if n_neurons == 0:
-                continue
+        try:
+            for pool_name, pool_info in QK_POOLS.items():
+                n_neurons = getattr(self.router, pool_info['n_attr'], 0)
+                if n_neurons == 0:
+                    continue
 
-            # Per-layer counts: {lidx: (q_counts, k_counts, overlaps)}
-            layer_data = {}
+                # Per-layer counts: {lidx: (q_counts, k_counts, overlaps)}
+                layer_data = {}
 
-            self.model.eval()
-            with torch.no_grad():
-                for i, batch in enumerate(tqdm(dataloader, desc=f'{pool_info["display"]} Q/K', total=n_batches)):
-                    if i >= n_batches:
-                        break
+                with torch.no_grad():
+                    for i, batch in enumerate(tqdm(dataloader, desc=f'{pool_info["display"]} Q/K', total=n_batches)):
+                        if i >= n_batches:
+                            break
 
-                    input_ids = get_batch_input_ids(batch, self.device)
+                        input_ids = get_batch_input_ids(batch, self.device)
 
-                    try:
-                        outputs = self.model(input_ids, return_routing_info=True)
-                        routing_infos = get_routing_from_outputs(outputs)
-                        if routing_infos is None:
-                            continue
-                    except Exception:
-                        continue
-
-                    # Process ALL layers
-                    for lidx, layer_info in enumerate(routing_infos):
-                        if layer_idx is not None and lidx != layer_idx:
+                        try:
+                            outputs = self.model(input_ids, return_routing_info=True)
+                            routing_infos = get_routing_from_outputs(outputs)
+                            if routing_infos is None:
+                                continue
+                        except Exception:
                             continue
 
-                        attn = layer_info.get('attention', {})
-
-                        # Get Q/K weights
-                        w_q = attn.get(pool_info['q_weight'])
-                        w_k = attn.get(pool_info['k_weight'])
-
-                        if w_q is None or w_k is None:
-                            w_q = attn.get(pool_info['q_pref'])
-                            w_k = attn.get(pool_info['k_pref'])
-                            if w_q is None or w_k is None:
+                        # Process ALL layers
+                        for lidx, layer_info in enumerate(routing_infos):
+                            if layer_idx is not None and lidx != layer_idx:
                                 continue
 
-                        # Initialize layer data if needed
-                        if lidx not in layer_data:
-                            layer_data[lidx] = (
-                                torch.zeros(n_neurons, device=self.device),
-                                torch.zeros(n_neurons, device=self.device),
-                                []
-                            )
+                            attn = layer_info.get('attention', {})
 
-                        q_counts, k_counts, batch_overlaps = layer_data[lidx]
+                            # Get Q/K weights
+                            w_q = attn.get(pool_info['q_weight'])
+                            w_k = attn.get(pool_info['k_weight'])
 
-                        # Count selections
-                        if w_q.dim() == 3:  # [B, S, N]
-                            selected_q = (w_q > 0).float().sum(dim=[0, 1])
-                            selected_k = (w_k > 0).float().sum(dim=[0, 1])
-                        else:  # [B, N]
-                            selected_q = (w_q > 0).float().sum(dim=0)
-                            selected_k = (w_k > 0).float().sum(dim=0)
+                            if w_q is None or w_k is None:
+                                w_q = attn.get(pool_info['q_pref'])
+                                w_k = attn.get(pool_info['k_pref'])
+                                if w_q is None or w_k is None:
+                                    continue
 
-                        q_counts += selected_q
-                        k_counts += selected_k
+                            # Initialize layer data if needed
+                            if lidx not in layer_data:
+                                layer_data[lidx] = (
+                                    torch.zeros(n_neurons, device=self.device),
+                                    torch.zeros(n_neurons, device=self.device),
+                                    []
+                                )
 
-                        # Calculate batch overlap
-                        if w_q.dim() >= 2:
-                            overlap = ((w_q > 0) & (w_k > 0)).float()
-                            active_q = (w_q > 0).float().sum(-1)
-                            overlap_ratio = (overlap.sum(-1) / (active_q + 1e-8)).mean().item()
-                            batch_overlaps.append(overlap_ratio)
+                            q_counts, k_counts, batch_overlaps = layer_data[lidx]
 
-                        layer_data[lidx] = (q_counts, k_counts, batch_overlaps)
+                            # Count selections
+                            if w_q.dim() == 3:  # [B, S, N]
+                                selected_q = (w_q > 0).float().sum(dim=[0, 1])
+                                selected_k = (w_k > 0).float().sum(dim=[0, 1])
+                            else:  # [B, N]
+                                selected_q = (w_q > 0).float().sum(dim=0)
+                                selected_k = (w_k > 0).float().sum(dim=0)
 
-            # Aggregate across all layers
-            total_q = torch.zeros(n_neurons, device=self.device)
-            total_k = torch.zeros(n_neurons, device=self.device)
-            all_overlaps = []
+                            q_counts += selected_q
+                            k_counts += selected_k
 
-            per_layer_results = {}
-            for lidx, (q_counts, k_counts, batch_overlaps) in layer_data.items():
-                total_q += q_counts
-                total_k += k_counts
-                all_overlaps.extend(batch_overlaps)
+                            # Calculate batch overlap
+                            if w_q.dim() >= 2:
+                                overlap = ((w_q > 0) & (w_k > 0)).float()
+                                active_q = (w_q > 0).float().sum(-1)
+                                overlap_ratio = (overlap.sum(-1) / (active_q + 1e-8)).mean().item()
+                                batch_overlaps.append(overlap_ratio)
 
-                # Per-layer stats
-                q_np = q_counts.cpu().numpy()
-                k_np = k_counts.cpu().numpy()
-                corr = float(np.corrcoef(q_np, k_np)[0, 1]) if q_np.sum() > 0 and k_np.sum() > 0 else 0.0
+                            layer_data[lidx] = (q_counts, k_counts, batch_overlaps)
 
-                per_layer_results[f'L{lidx}'] = {
+                # Aggregate across all layers
+                total_q = torch.zeros(n_neurons, device=self.device)
+                total_k = torch.zeros(n_neurons, device=self.device)
+                all_overlaps = []
+
+                per_layer_results = {}
+                for lidx, (q_counts, k_counts, batch_overlaps) in layer_data.items():
+                    total_q += q_counts
+                    total_k += k_counts
+                    all_overlaps.extend(batch_overlaps)
+
+                    # Per-layer stats
+                    q_np = q_counts.cpu().numpy()
+                    k_np = k_counts.cpu().numpy()
+                    corr = float(np.corrcoef(q_np, k_np)[0, 1]) if q_np.sum() > 0 and k_np.sum() > 0 else 0.0
+
+                    per_layer_results[f'L{lidx}'] = {
+                        'correlation': corr,
+                        'avg_overlap': float(np.mean(batch_overlaps)) if batch_overlaps else 0,
+                        'q_total': int(q_np.sum()),
+                        'k_total': int(k_np.sum()),
+                    }
+
+                # Aggregated statistics
+                q_np = total_q.cpu().numpy()
+                k_np = total_k.cpu().numpy()
+
+                # Correlation
+                if q_np.sum() > 0 and k_np.sum() > 0:
+                    corr = float(np.corrcoef(q_np, k_np)[0, 1])
+                else:
+                    corr = 0.0
+
+                # Specialization analysis
+                threshold = (q_np.sum() + k_np.sum()) / (2 * len(q_np)) * 0.1
+                q_only = int(((q_np > threshold) & (k_np < threshold)).sum())
+                k_only = int(((k_np > threshold) & (q_np < threshold)).sum())
+                shared = int(((q_np > threshold) & (k_np > threshold)).sum())
+                inactive = int(((q_np < threshold) & (k_np < threshold)).sum())
+
+                results[pool_name] = {
+                    'display': pool_info['display'],
+                    'n_neurons': n_neurons,
+                    'n_layers': len(layer_data),
+                    'q_counts': q_np.tolist(),
+                    'k_counts': k_np.tolist(),
                     'correlation': corr,
-                    'avg_overlap': float(np.mean(batch_overlaps)) if batch_overlaps else 0,
+                    'avg_overlap': float(np.mean(all_overlaps)) if all_overlaps else 0,
+                    'std_overlap': float(np.std(all_overlaps)) if all_overlaps else 0,
+                    'q_specialized': q_only,
+                    'k_specialized': k_only,
+                    'shared': shared,
+                    'inactive': inactive,
                     'q_total': int(q_np.sum()),
                     'k_total': int(k_np.sum()),
+                    'per_layer': per_layer_results,
                 }
 
-            # Aggregated statistics
-            q_np = total_q.cpu().numpy()
-            k_np = total_k.cpu().numpy()
+            results['n_batches'] = n_batches
+        finally:
+            self._disable_pref_tensors()
 
-            # Correlation
-            if q_np.sum() > 0 and k_np.sum() > 0:
-                corr = float(np.corrcoef(q_np, k_np)[0, 1])
-            else:
-                corr = 0.0
-
-            # Specialization analysis
-            threshold = (q_np.sum() + k_np.sum()) / (2 * len(q_np)) * 0.1
-            q_only = int(((q_np > threshold) & (k_np < threshold)).sum())
-            k_only = int(((k_np > threshold) & (q_np < threshold)).sum())
-            shared = int(((q_np > threshold) & (k_np > threshold)).sum())
-            inactive = int(((q_np < threshold) & (k_np < threshold)).sum())
-
-            results[pool_name] = {
-                'display': pool_info['display'],
-                'n_neurons': n_neurons,
-                'n_layers': len(layer_data),
-                'q_counts': q_np.tolist(),
-                'k_counts': k_np.tolist(),
-                'correlation': corr,
-                'avg_overlap': float(np.mean(all_overlaps)) if all_overlaps else 0,
-                'std_overlap': float(np.std(all_overlaps)) if all_overlaps else 0,
-                'q_specialized': q_only,
-                'k_specialized': k_only,
-                'shared': shared,
-                'inactive': inactive,
-                'q_total': int(q_np.sum()),
-                'k_total': int(k_np.sum()),
-                'per_layer': per_layer_results,
-            }
-
-        results['n_batches'] = n_batches
         return results
 
     def analyze_qk_entropy(self, dataloader, n_batches: int = 50) -> Dict:
@@ -545,45 +565,50 @@ class RoutingAnalyzer:
         layer_entropy = {pool: {} for pool in QK_POOLS.keys()}
 
         self.model.eval()
-        with torch.no_grad():
-            for i, batch in enumerate(tqdm(dataloader, desc='Q/K Entropy', total=n_batches)):
-                if i >= n_batches:
-                    break
+        self._enable_pref_tensors()
 
-                input_ids = get_batch_input_ids(batch, self.device)
+        try:
+            with torch.no_grad():
+                for i, batch in enumerate(tqdm(dataloader, desc='Q/K Entropy', total=n_batches)):
+                    if i >= n_batches:
+                        break
 
-                try:
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    routing_infos = get_routing_from_outputs(outputs)
-                    if routing_infos is None:
+                    input_ids = get_batch_input_ids(batch, self.device)
+
+                    try:
+                        outputs = self.model(input_ids, return_routing_info=True)
+                        routing_infos = get_routing_from_outputs(outputs)
+                        if routing_infos is None:
+                            continue
+                    except Exception:
                         continue
-                except Exception:
-                    continue
 
-                # Process ALL layers
-                for layer_idx, layer_info in enumerate(routing_infos):
-                    attn = layer_info.get('attention', {})
+                    # Process ALL layers
+                    for layer_idx, layer_info in enumerate(routing_infos):
+                        attn = layer_info.get('attention', {})
 
-                    for pool_name, pool_info in QK_POOLS.items():
-                        if layer_idx not in layer_entropy[pool_name]:
-                            layer_entropy[pool_name][layer_idx] = {'q': [], 'k': []}
+                        for pool_name, pool_info in QK_POOLS.items():
+                            if layer_idx not in layer_entropy[pool_name]:
+                                layer_entropy[pool_name][layer_idx] = {'q': [], 'k': []}
 
-                        pref_q = attn.get(pool_info['q_pref'])
-                        pref_k = attn.get(pool_info['k_pref'])
+                            pref_q = attn.get(pool_info['q_pref'])
+                            pref_k = attn.get(pool_info['k_pref'])
 
-                        if pref_q is not None:
-                            p = pref_q.mean(dim=0) if pref_q.dim() > 1 else pref_q
-                            p = p.clamp(min=1e-8)
-                            ent = -torch.sum(p * torch.log(p)).item()
-                            max_ent = np.log(pref_q.shape[-1])
-                            layer_entropy[pool_name][layer_idx]['q'].append(ent / max_ent * 100)
+                            if pref_q is not None:
+                                p = pref_q.mean(dim=0) if pref_q.dim() > 1 else pref_q
+                                p = p.clamp(min=1e-8)
+                                ent = -torch.sum(p * torch.log(p)).item()
+                                max_ent = np.log(pref_q.shape[-1])
+                                layer_entropy[pool_name][layer_idx]['q'].append(ent / max_ent * 100)
 
-                        if pref_k is not None:
-                            p = pref_k.mean(dim=0) if pref_k.dim() > 1 else pref_k
-                            p = p.clamp(min=1e-8)
-                            ent = -torch.sum(p * torch.log(p)).item()
-                            max_ent = np.log(pref_k.shape[-1])
-                            layer_entropy[pool_name][layer_idx]['k'].append(ent / max_ent * 100)
+                            if pref_k is not None:
+                                p = pref_k.mean(dim=0) if pref_k.dim() > 1 else pref_k
+                                p = p.clamp(min=1e-8)
+                                ent = -torch.sum(p * torch.log(p)).item()
+                                max_ent = np.log(pref_k.shape[-1])
+                                layer_entropy[pool_name][layer_idx]['k'].append(ent / max_ent * 100)
+        finally:
+            self._disable_pref_tensors()
 
         # Build results
         results = {}
