@@ -102,6 +102,16 @@ class POSNeuronAnalyzer:
         self.pos_total_tokens = defaultdict(int)
         self.layer_pos_neurons = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 
+    def _enable_pref_tensors(self):
+        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = True
+
+    def _disable_pref_tensors(self):
+        """Disable store_pref_tensors after analysis."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = False
+
     def load_ud_dataset(self, split: str = 'train', max_sentences: int = None, data_path: str = None):
         """
         Load Universal Dependencies English Web Treebank.
@@ -289,13 +299,17 @@ class POSNeuronAnalyzer:
         """
         input_ids = torch.tensor([token_ids], device=self.device)
 
-        with torch.no_grad():
-            outputs = self.model(input_ids, return_path_weights=True)
+        self._enable_pref_tensors()
+        try:
+            with torch.no_grad():
+                outputs = self.model(input_ids, return_path_weights=True)
 
-        if isinstance(outputs, tuple) and len(outputs) >= 2:
-            routing_infos = outputs[1]
-        else:
-            return {}
+            if isinstance(outputs, tuple) and len(outputs) >= 2:
+                routing_infos = outputs[1]
+            else:
+                return {}
+        finally:
+            self._disable_pref_tensors()
 
         # Map pool_type to path_weights key (v18.2 uses path_weights)
         path_weights_key_map = {

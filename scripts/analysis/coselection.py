@@ -46,6 +46,16 @@ class CoselectionAnalyzer:
         self.shared = shared_neurons
         self.device = device
 
+    def _enable_pref_tensors(self):
+        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = True
+
+    def _disable_pref_tensors(self):
+        """Disable store_pref_tensors after analysis."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = False
+
     def analyze_coselection(self, dataloader, pair_key: str, n_batches: int = 50, layer_idx: int = None) -> Dict:
         """
         Analyze co-selection patterns between two neuron pools.
@@ -79,69 +89,73 @@ class CoselectionAnalyzer:
         total_samples = 0
 
         self.model.eval()
-        with torch.no_grad():
-            for i, batch in enumerate(tqdm(dataloader, desc=pair_key, total=n_batches)):
-                if i >= n_batches:
-                    break
+        self._enable_pref_tensors()
+        try:
+            with torch.no_grad():
+                for i, batch in enumerate(tqdm(dataloader, desc=pair_key, total=n_batches)):
+                    if i >= n_batches:
+                        break
 
-                input_ids = get_batch_input_ids(batch, self.device)
-                B = input_ids.shape[0]
-                total_samples += B
+                    input_ids = get_batch_input_ids(batch, self.device)
+                    B = input_ids.shape[0]
+                    total_samples += B
 
-                try:
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    routing_infos = get_routing_from_outputs(outputs)
-                    if routing_infos is None:
-                        continue
-                except Exception:
-                    continue
-
-                # Process all layers (or specific layer)
-                for lidx, layer_info in enumerate(routing_infos):
-                    if layer_idx is not None and lidx != layer_idx:
+                    try:
+                        outputs = self.model(input_ids, return_routing_info=True)
+                        routing_infos = get_routing_from_outputs(outputs)
+                        if routing_infos is None:
+                            continue
+                    except Exception:
                         continue
 
-                    if lidx not in layer_matrices:
-                        layer_matrices[lidx] = (
-                            torch.zeros(n_a, n_b, device=self.device),
-                            torch.zeros(n_a, device=self.device),
-                            torch.zeros(n_b, device=self.device)
-                        )
+                    # Process all layers (or specific layer)
+                    for lidx, layer_info in enumerate(routing_infos):
+                        if layer_idx is not None and lidx != layer_idx:
+                            continue
 
-                    co_matrix, a_counts, b_counts = layer_matrices[lidx]
+                        if lidx not in layer_matrices:
+                            layer_matrices[lidx] = (
+                                torch.zeros(n_a, n_b, device=self.device),
+                                torch.zeros(n_a, device=self.device),
+                                torch.zeros(n_b, device=self.device)
+                            )
 
-                    # Get preferences from appropriate source
-                    source_a = layer_info.get(pool_a.get('source', 'attention'), {})
-                    source_b = layer_info.get(pool_b.get('source', 'attention'), {})
-                    pref_a = source_a.get(pool_a['pref_key'])
-                    pref_b = source_b.get(pool_b['pref_key'])
+                        co_matrix, a_counts, b_counts = layer_matrices[lidx]
 
-                    if pref_a is None or pref_b is None:
-                        continue
+                        # Get preferences from appropriate source
+                        source_a = layer_info.get(pool_a.get('source', 'attention'), {})
+                        source_b = layer_info.get(pool_b.get('source', 'attention'), {})
+                        pref_a = source_a.get(pool_a['pref_key'])
+                        pref_b = source_b.get(pool_b['pref_key'])
 
-                    # Handle different shapes: [B, S, N] or [B, N]
-                    if pref_a.dim() == 3:
-                        pref_a = pref_a.mean(dim=1)
-                    if pref_b.dim() == 3:
-                        pref_b = pref_b.mean(dim=1)
+                        if pref_a is None or pref_b is None:
+                            continue
 
-                    # Binary selection (above uniform threshold)
-                    thresh_a = 1.0 / n_a
-                    thresh_b = 1.0 / n_b
+                        # Handle different shapes: [B, S, N] or [B, N]
+                        if pref_a.dim() == 3:
+                            pref_a = pref_a.mean(dim=1)
+                        if pref_b.dim() == 3:
+                            pref_b = pref_b.mean(dim=1)
 
-                    selected_a = (pref_a > thresh_a).float()
-                    selected_b = (pref_b > thresh_b).float()
+                        # Binary selection (above uniform threshold)
+                        thresh_a = 1.0 / n_a
+                        thresh_b = 1.0 / n_b
 
-                    # Count individual selections
-                    a_counts += selected_a.sum(dim=0)
-                    b_counts += selected_b.sum(dim=0)
+                        selected_a = (pref_a > thresh_a).float()
+                        selected_b = (pref_b > thresh_b).float()
 
-                    # Co-occurrence: vectorized batch outer product sum
-                    # einsum('bi,bj->ij') = sum over batch of outer products
-                    co_matrix += torch.einsum('bi,bj->ij', selected_a, selected_b)
+                        # Count individual selections
+                        a_counts += selected_a.sum(dim=0)
+                        b_counts += selected_b.sum(dim=0)
 
-                    # Store back
-                    layer_matrices[lidx] = (co_matrix, a_counts, b_counts)
+                        # Co-occurrence: vectorized batch outer product sum
+                        # einsum('bi,bj->ij') = sum over batch of outer products
+                        co_matrix += torch.einsum('bi,bj->ij', selected_a, selected_b)
+
+                        # Store back
+                        layer_matrices[lidx] = (co_matrix, a_counts, b_counts)
+        finally:
+            self._disable_pref_tensors()
 
         # Build results per layer
         results = {

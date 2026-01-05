@@ -73,6 +73,16 @@ class GenerationRoutingAnalyzer:
         # Detect v18.2+ models (uses path_weights instead of per-pool weights)
         self.is_v18_2 = hasattr(model, '__version__') and model.__version__ in ("18.2", "18.3")
 
+    def _enable_pref_tensors(self):
+        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = True
+
+    def _disable_pref_tensors(self):
+        """Disable store_pref_tensors after analysis."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = False
+
     def generate_with_routing(
         self,
         prompt: str,
@@ -118,45 +128,50 @@ class GenerationRoutingAnalyzer:
             'rv_weights': [],
         }
 
-        with torch.no_grad():
-            for step in range(max_new_tokens):
-                # Forward with routing info
-                # v18.2 needs return_path_weights=True to store actual weights
-                if self.is_v18_2:
-                    outputs = self.model(generated, return_path_weights=True)
-                else:
-                    outputs = self.model(generated, return_routing_info=True)
+        self._enable_pref_tensors()
 
-                if isinstance(outputs, tuple) and len(outputs) >= 2:
-                    logits, routing_infos = outputs[0], outputs[1]
-                else:
-                    logits = outputs
-                    routing_infos = None
+        try:
+            with torch.no_grad():
+                for step in range(max_new_tokens):
+                    # Forward with routing info
+                    # v18.2 needs return_path_weights=True to store actual weights
+                    if self.is_v18_2:
+                        outputs = self.model(generated, return_path_weights=True)
+                    else:
+                        outputs = self.model(generated, return_routing_info=True)
 
-                # Get next token
-                next_token_logits = logits[:, -1, :]
+                    if isinstance(outputs, tuple) and len(outputs) >= 2:
+                        logits, routing_infos = outputs[0], outputs[1]
+                    else:
+                        logits = outputs
+                        routing_infos = None
 
-                if temperature != 1.0:
-                    next_token_logits = next_token_logits / temperature
+                    # Get next token
+                    next_token_logits = logits[:, -1, :]
 
-                if top_k > 0:
-                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                    next_token_logits[indices_to_remove] = float('-inf')
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                else:
-                    next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+                    if temperature != 1.0:
+                        next_token_logits = next_token_logits / temperature
 
-                # Decode token
-                token_text = self.tokenizer.decode(next_token[0])
-                routing_logs['tokens'].append(token_text)
-                routing_logs['token_ids'].append(next_token.item())
+                    if top_k > 0:
+                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = float('-inf')
+                        probs = F.softmax(next_token_logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                    else:
+                        next_token = next_token_logits.argmax(dim=-1, keepdim=True)
 
-                # Extract routing indices from last position
-                if routing_infos is not None:
-                    self._extract_routing_indices(routing_infos, routing_logs)
+                    # Decode token
+                    token_text = self.tokenizer.decode(next_token[0])
+                    routing_logs['tokens'].append(token_text)
+                    routing_logs['token_ids'].append(next_token.item())
 
-                generated = torch.cat([generated, next_token], dim=1)
+                    # Extract routing indices from last position
+                    if routing_infos is not None:
+                        self._extract_routing_indices(routing_infos, routing_logs)
+
+                    generated = torch.cat([generated, next_token], dim=1)
+        finally:
+            self._disable_pref_tensors()
 
         # Decode full generation
         generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
