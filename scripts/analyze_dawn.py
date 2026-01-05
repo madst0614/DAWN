@@ -366,6 +366,11 @@ class DAWNAnalyzer:
             conf_stats = defaultdict(list)  # v18.3 confidence
 
             self.model.eval()
+
+            # Enable debug_mode to get gate/tau/overlap stats in routing_info
+            if hasattr(self.model, 'router') and hasattr(self.model.router, 'debug_mode'):
+                self.model.router.debug_mode = True
+
             batch_count = 0
 
             with torch.no_grad():
@@ -413,6 +418,10 @@ class DAWNAnalyzer:
                                     conf_stats[f'L{layer_idx}_{pool}_conf'].append(attn[conf_key])
 
                     batch_count += 1
+
+            # Disable debug_mode after analysis
+            if hasattr(self.model, 'router') and hasattr(self.model.router, 'debug_mode'):
+                self.model.router.debug_mode = False
 
             # Aggregate gate stats
             gate_summary = {}

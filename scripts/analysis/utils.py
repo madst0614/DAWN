@@ -241,8 +241,9 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     cleaned = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Auto-detect version from config or state_dict keys
-    version = config.get('model_version', None)
+    # Auto-detect version from checkpoint or config
+    # Note: CheckpointManager stores model_version at top-level, not inside config
+    version = checkpoint.get('model_version') or config.get('model_version')
     if version is None:
         # Check for version-specific keys (most specific first)
         # v18.3 has confidence-related keys or specific config
