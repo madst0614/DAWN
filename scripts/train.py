@@ -648,7 +648,12 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
     score_rqk_K_std = sum(ri.get('attention', ri).get('score_rqk_K_std', 0) for ri in routing_infos) / n
     score_rv_mean = sum(ri.get('attention', ri).get('score_rv_mean', 0) for ri in routing_infos) / n
     score_rv_std = sum(ri.get('attention', ri).get('score_rv_std', 0) for ri in routing_infos) / n
-    lines.append(f"{prefix}Score: fqk_Q={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fqk_K={score_fqk_K_mean:.2f}±{score_fqk_K_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk_Q={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rqk_K={score_rqk_K_mean:.2f}±{score_rqk_K_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f}")
+    # Knowledge scores
+    score_kf_mean = sum(ri.get('knowledge', {}).get('score_feature_mean', 0) for ri in routing_infos) / n
+    score_kf_std = sum(ri.get('knowledge', {}).get('score_feature_std', 0) for ri in routing_infos) / n
+    score_kr_mean = sum(ri.get('knowledge', {}).get('score_restore_mean', 0) for ri in routing_infos) / n
+    score_kr_std = sum(ri.get('knowledge', {}).get('score_restore_std', 0) for ri in routing_infos) / n
+    lines.append(f"{prefix}Score: fqk_Q={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fqk_K={score_fqk_K_mean:.2f}±{score_fqk_K_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk_Q={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rqk_K={score_rqk_K_mean:.2f}±{score_rqk_K_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f} kf={score_kf_mean:.2f}±{score_kf_std:.2f} kr={score_kr_mean:.2f}±{score_kr_std:.2f}")
 
     # v18.1+ specific: Tau and Gate with mean±std (18.1, 18.2, 18.3, 18.4)
     if model_version.startswith('18.') and not model_version.startswith('18.0'):
