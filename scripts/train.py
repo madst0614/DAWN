@@ -635,16 +635,20 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
     sel_kr, ss_kr = get_mean_std('selected_restore', 'knowledge')
     lines.append(f"{prefix}Selected: fqk_Q={sel_fqk_Q:.0f}±{ss_fqk_Q:.0f} fqk_K={sel_fqk_K:.0f}±{ss_fqk_K:.0f} fv={sel_fv:.0f}±{ss_fv:.0f} rqk_Q={sel_rqk_Q:.0f}±{ss_rqk_Q:.0f} rqk_K={sel_rqk_K:.0f}±{ss_rqk_K:.0f} rv={sel_rv:.0f}±{ss_rv:.0f} kf={sel_kf:.0f}±{ss_kf:.0f} kr={sel_kr:.0f}±{ss_kr:.0f}")
 
-    # Score distribution (mean±std, average across layers)
+    # Score distribution (mean±std, average across layers) - Q/K separated
     score_fqk_Q_mean = sum(ri.get('attention', ri).get('score_fqk_Q_mean', 0) for ri in routing_infos) / n
     score_fqk_Q_std = sum(ri.get('attention', ri).get('score_fqk_Q_std', 0) for ri in routing_infos) / n
+    score_fqk_K_mean = sum(ri.get('attention', ri).get('score_fqk_K_mean', 0) for ri in routing_infos) / n
+    score_fqk_K_std = sum(ri.get('attention', ri).get('score_fqk_K_std', 0) for ri in routing_infos) / n
     score_fv_mean = sum(ri.get('attention', ri).get('score_fv_mean', 0) for ri in routing_infos) / n
     score_fv_std = sum(ri.get('attention', ri).get('score_fv_std', 0) for ri in routing_infos) / n
     score_rqk_Q_mean = sum(ri.get('attention', ri).get('score_rqk_Q_mean', 0) for ri in routing_infos) / n
     score_rqk_Q_std = sum(ri.get('attention', ri).get('score_rqk_Q_std', 0) for ri in routing_infos) / n
+    score_rqk_K_mean = sum(ri.get('attention', ri).get('score_rqk_K_mean', 0) for ri in routing_infos) / n
+    score_rqk_K_std = sum(ri.get('attention', ri).get('score_rqk_K_std', 0) for ri in routing_infos) / n
     score_rv_mean = sum(ri.get('attention', ri).get('score_rv_mean', 0) for ri in routing_infos) / n
     score_rv_std = sum(ri.get('attention', ri).get('score_rv_std', 0) for ri in routing_infos) / n
-    lines.append(f"{prefix}Score: fqk={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f}")
+    lines.append(f"{prefix}Score: fqk_Q={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fqk_K={score_fqk_K_mean:.2f}±{score_fqk_K_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk_Q={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rqk_K={score_rqk_K_mean:.2f}±{score_rqk_K_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f}")
 
     # v18.1+ specific: Tau and Gate with mean±std (18.1, 18.2, 18.3, 18.4)
     if model_version.startswith('18.') and not model_version.startswith('18.0'):
