@@ -753,6 +753,21 @@ class GlobalRouters(nn.Module):
         else:
             routing_info = {}
 
+        # Always include preference tensors for analysis (logits before selection)
+        routing_info['fqk_q_pref'] = fqk_logits_Q
+        routing_info['fqk_k_pref'] = fqk_logits_K
+        routing_info['fv_pref'] = fv_logits
+        routing_info['rqk_q_pref'] = rqk_logits_Q
+        routing_info['rqk_k_pref'] = rqk_logits_K
+        routing_info['rv_pref'] = rv_logits
+        # Also include weight tensors for semantic analysis
+        routing_info['fqk_weights_Q'] = fqk_weights_Q
+        routing_info['fqk_weights_K'] = fqk_weights_K
+        routing_info['fv_weights'] = fv_weights
+        routing_info['rqk_weights_Q'] = rqk_weights_Q
+        routing_info['rqk_weights_K'] = rqk_weights_K
+        routing_info['rv_weights'] = rv_weights
+
         # Update usage with mask (binary selection)
         if self.training:
             self.neuron_router.update_usage(fqk_mask_Q.float(), 'feature_q', attention_mask)

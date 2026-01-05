@@ -245,11 +245,16 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
     version = config.get('model_version', None)
     if version is None:
         # Check for version-specific keys (most specific first)
+        # v18.3 has confidence-related keys or specific config
         v18_2_keys = ['router.tau_proj.weight', 'router.neuron_router.norm_fqk_Q.weight']
         dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
 
         if all(k in cleaned for k in v18_2_keys):
-            version = '18.2'
+            # Could be 18.2 or 18.3 - check config for hints
+            if config.get('model_version') == '18.3':
+                version = '18.3'
+            else:
+                version = '18.2'  # Default to 18.2 for v18.x
         elif any(k in cleaned for k in dawn_keys):
             if config.get('learnable_tau', False) or config.get('max_paths'):
                 version = '18.2'
