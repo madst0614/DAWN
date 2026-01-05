@@ -27,6 +27,17 @@ import json
 from typing import Dict, List, Tuple, Optional, Any
 from collections import Counter, defaultdict
 
+# Import analysis utilities from version_registry (centralized model handling)
+from models.version_registry import (
+    get_router as get_global_router,  # Gets GlobalRouters (for store_pref_tensors)
+    enable_analysis_mode,
+    disable_analysis_mode,
+    analysis_context,
+    forward_for_analysis,
+    get_model_version,
+    is_v18_plus,
+)
+
 try:
     from tqdm import tqdm
     HAS_TQDM = True

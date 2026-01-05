@@ -1,6 +1,11 @@
 """
 DAWN Models Module
 
+v18.4: Relative Confidence Scaling
+- Gate: gate = ReLU(scores - tau), can be 0
+- Confidence: confidence = gate / gate_sum (relative, sums to 1)
+- tau decoupled from lb_loss, healthy gradient flow
+
 v18.3: Confidence-Scaled Soft Gating
 - Gate: gate = ReLU(scores - tau), can be 0
 - Confidence: confidence = gate / (gate + 1)
@@ -35,6 +40,9 @@ v17.2: Feature QK Unified + Restore Q/K Separate
 
 baseline: Vanilla Transformer for fair comparison
 """
+
+# v18.4 - Relative Confidence Scaling
+from .model_v18_4 import DAWN as DAWN_v18_4
 
 # v18.3 - Confidence-Scaled Soft Gating
 from .model_v18_3 import DAWN as DAWN_v18_3
@@ -74,11 +82,20 @@ from .version_registry import (
     list_versions,
     get_all_versions_info,
     get_routing_log_info,
+    # Analysis utilities
+    get_router,
+    enable_analysis_mode,
+    disable_analysis_mode,
+    analysis_context,
+    forward_for_analysis,
+    get_model_version,
+    is_v18_plus,
 )
 
 __all__ = [
     # Models
     'DAWN',
+    'DAWN_v18_4',
     'DAWN_v18_3',
     'DAWN_v18_2',
     'DAWN_v18_1',
@@ -100,6 +117,14 @@ __all__ = [
     'get_all_versions_info',
     'get_routing_log_info',
     'create_model_by_version',
+    # Analysis utilities
+    'get_router',
+    'enable_analysis_mode',
+    'disable_analysis_mode',
+    'analysis_context',
+    'forward_for_analysis',
+    'get_model_version',
+    'is_v18_plus',
 ]
 
 __version__ = "17.1"
@@ -109,7 +134,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "18.3", "18.2", "18.1", "18.0", "17.2", "17.1", or "baseline"
+        version: "18.4", "18.3", "18.2", "18.1", "18.0", "17.2", "17.1", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -120,7 +145,9 @@ def create_model_by_version(version, config):
 
     version = normalize_version(version)
 
-    if version == "18.3":
+    if version == "18.4":
+        return DAWN_v18_4(**config)
+    elif version == "18.3":
         return DAWN_v18_3(**config)
     elif version == "18.2":
         return DAWN_v18_2(**config)
@@ -134,4 +161,4 @@ def create_model_by_version(version, config):
         return DAWN_v17_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 18.3, 18.2, 18.1, 18.0, 17.2, 17.1, baseline")
+                        f"Supported versions: 18.4, 18.3, 18.2, 18.1, 18.0, 17.2, 17.1, baseline")
