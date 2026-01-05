@@ -150,6 +150,19 @@ class DAWNAnalyzer:
             print(f"\n  Overall health: {div['overall']['health']} "
                   f"(score={div['overall']['diversity_score']:.2f})")
 
+        # v18.x Q/K EMA Overlap
+        qk_overlap = results.get('qk_ema_overlap', {})
+        if qk_overlap and 'error' not in qk_overlap:
+            print("\n--- Q/K Neuron Specialization (v18.x) ---")
+            for pool_name, data in qk_overlap.items():
+                n = data['n_total']
+                print(f"\n  {pool_name.upper()} Pool ({n} neurons):")
+                print(f"    Q only:  {data['q_only']:>4} ({data['q_only']/n*100:5.1f}%)")
+                print(f"    K only:  {data['k_only']:>4} ({data['k_only']/n*100:5.1f}%)")
+                print(f"    Shared:  {data['shared']:>4} ({data['shared']/n*100:5.1f}%)")
+                print(f"    Dead:    {data['dead']:>4} ({data['dead']/n*100:5.1f}%)")
+                print(f"    Q/K corr: {data['correlation']:.3f}")
+
         return results
 
     def run_routing_analysis(self, dataloader, n_batches: int = 50, output_dir: str = None) -> Dict:

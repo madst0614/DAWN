@@ -44,6 +44,7 @@ from .utils import (
 
     # Constants
     NEURON_TYPES,
+    NEURON_TYPES_V18,
     ROUTING_KEYS,
     KNOWLEDGE_ROUTING_KEYS,
     ALL_ROUTING_KEYS,

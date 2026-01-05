@@ -71,6 +71,19 @@ NEURON_TYPES = {
     'restore_know': ('R-Know', 'usage_ema_restore_know', 'n_restore_know', 'cyan'),
 }
 
+# v18.x: Separate Q/K EMA tracking
+NEURON_TYPES_V18 = {
+    # (display_name, ema_attr, n_attr, color)
+    'feature_q':    ('F-Q',    'usage_ema_feature_q',    'n_feature_qk',   'red'),
+    'feature_k':    ('F-K',    'usage_ema_feature_k',    'n_feature_qk',   'darkred'),
+    'feature_v':    ('F-V',    'usage_ema_feature_v',    'n_feature_v',    'orange'),
+    'restore_q':    ('R-Q',    'usage_ema_restore_q',    'n_restore_qk',   'blue'),
+    'restore_k':    ('R-K',    'usage_ema_restore_k',    'n_restore_qk',   'darkblue'),
+    'restore_v':    ('R-V',    'usage_ema_restore_v',    'n_restore_v',    'green'),
+    'feature_know': ('F-Know', 'usage_ema_feature_know', 'n_feature_know', 'purple'),
+    'restore_know': ('R-Know', 'usage_ema_restore_know', 'n_restore_know', 'cyan'),
+}
+
 ROUTING_KEYS = {
     # (display_name, pref_key, weight_key, pool_type)
     'fqk_q': ('F-QK_Q', 'fqk_q_pref', 'fqk_weights_Q', 'feature_qk'),
