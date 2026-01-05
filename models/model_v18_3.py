@@ -406,7 +406,18 @@ class GlobalRouters(nn.Module):
         self.knowledge_token_routing = knowledge_token_routing
         self.learnable_tau = learnable_tau
         self.inference_hard_mask = False  # Set True for clean hard mask during inference
-        self.debug_mode = False  # Set True to enable routing stats (adds GPU sync overhead)
+        # ============================================================
+        # MODE FLAGS (mutually exclusive usage patterns)
+        # ============================================================
+        # debug_mode: Enables routing stats (.item() calls) for 100-step logging
+        #   - train.py toggles this on log steps only via set_v18_debug_mode()
+        #   - Adds GPU sync overhead, use sparingly
+        # store_pref_tensors: Enables storing pref/weight tensors for detailed analysis
+        #   - analyze_dawn.py sets this explicitly when needed
+        #   - Large memory footprint, never enable during training/validation
+        # ============================================================
+        self.debug_mode = False
+        self.store_pref_tensors = False
 
         # Learnable tau parameters - token-level projection
         if learnable_tau:
@@ -781,8 +792,12 @@ class GlobalRouters(nn.Module):
         else:
             routing_info = {}
 
-        # Include preference/weight tensors for analysis (only during eval, not training)
-        if not self.training:
+        # Include preference/weight tensors for analysis (only when explicitly enabled)
+        # NOTE: This is SEPARATE from debug_mode and self.training
+        # - debug_mode: scalar stats for logging (100-step)
+        # - store_pref_tensors: full tensors for detailed analysis (analyze_dawn.py)
+        # - NEVER enable during training or validation to avoid memory leaks
+        if self.store_pref_tensors:
             routing_info['fqk_q_pref'] = fqk_logits_Q
             routing_info['fqk_k_pref'] = fqk_logits_K
             routing_info['fv_pref'] = fv_logits
