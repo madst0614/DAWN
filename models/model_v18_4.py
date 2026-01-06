@@ -579,49 +579,6 @@ class GlobalRouters(nn.Module):
 
         return path_weights_list, weights, mask, gate, scaled_weights
 
-    # Keep original functions for backward compatibility / other uses
-    def _threshold_select(self, scores, tau, path_max_k, max_paths):
-        """Legacy threshold selection - use _topk_select_and_chunk for optimized version."""
-        mask = (scores > tau)
-        # Gate with gradient flow for dead neurons
-        raw_gate = scores - tau
-        gate = torch.where(
-            raw_gate > 0,
-            raw_gate,
-            1e-8 * torch.exp(raw_gate)  # 음수여도 작은 값 + gradient 흐름
-        )
-        # Exponential scaling for sparsity + normalization
-        exp_gate = torch.exp(gate) - 1  # 차이 극대화, gate=0이면 0
-        exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
-        scaled_weights = torch.where(
-            exp_gate_sum > 1e-8,
-            exp_gate / (exp_gate_sum + 1e-8),
-            exp_gate * 0
-        )
-        return scaled_weights, mask, gate, scaled_weights
-
-    def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
-        """Legacy chunking - use _topk_select_and_chunk for optimized version."""
-        B, S, N = scores.shape
-        sorted_scores, sorted_indices = torch.sort(scores, dim=-1, descending=True)
-        sorted_weights = torch.gather(weights, dim=-1, index=sorted_indices)
-        sorted_mask = torch.gather(mask.to(weights.dtype), dim=-1, index=sorted_indices)
-        path_weights_list = []
-        for p in range(max_paths):
-            start_idx = p * path_max_k
-            end_idx = min((p + 1) * path_max_k, N)
-            if start_idx >= N:
-                path_weights_list.append(torch.zeros_like(weights))
-                continue
-            path_weights = torch.zeros_like(weights)
-            path_indices = sorted_indices[:, :, start_idx:end_idx]
-            path_w = sorted_weights[:, :, start_idx:end_idx]
-            path_m = sorted_mask[:, :, start_idx:end_idx]
-            path_w = path_w * path_m
-            path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
-            path_weights_list.append(path_weights)
-        return path_weights_list
-
     def get_attention_weights(self, x, importance, attention_mask=None, tau_all=None):
         """
         v18.0: Threshold + masked softmax multi-path routing for attention
