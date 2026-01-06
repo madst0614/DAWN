@@ -547,7 +547,7 @@ class GlobalRouters(nn.Module):
         scaled_weights = torch.where(
             exp_gate_sum > 1e-8,
             exp_gate / (exp_gate_sum + 1e-8),
-            exp_gate * 0
+            exp_gate * 1e-8
         )
 
         # 7. Chunk to paths (already sorted by topk)
@@ -975,6 +975,9 @@ class AttentionCircuit(nn.Module):
         K_total = K_all.sum(dim=0)
         V_total = V_all.sum(dim=0)
 
+        # Q norm for dead routing detection
+        q_norm = Q_total.norm(dim=-1, keepdim=True)  # [B, S, 1]
+
         # Multi-head attention
         Q = Q_total.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         K = K_total.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -989,6 +992,15 @@ class AttentionCircuit(nn.Module):
             dropout_p=dropout_p,
         )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
+
+        # Q≈0 토큰은 attn 출력 억제
+        scale = torch.where(
+            q_norm > 1e-6,
+            torch.ones_like(q_norm),
+            q_norm * 1e-6
+        )
+        attn_out = attn_out * scale
+
         output = self.expand_O(attn_out)
         output = self.out_dropout(output)
 
