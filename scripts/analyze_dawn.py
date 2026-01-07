@@ -24,7 +24,7 @@ Analysis Categories:
 5. Behavioral Analysis  - Token trajectory, probing classifier, ablation study
 6. Semantic Analysis    - Path similarity, context-dependent routing, POS patterns
 7. Co-selection         - Feature/Restore neuron pairing analysis
-8. V18 Analysis         - Learnable tau, gate distribution, Q/K tau differentiation, confidence (v18.2/v18.3)
+8. V18 Analysis         - Learnable tau, gate distribution, Q/K tau differentiation, confidence (v18.2+)
 
 Usage:
     python analyze_dawn.py --checkpoint path/to/ckpt --mode all
@@ -294,7 +294,7 @@ class DAWNAnalyzer:
         2. Gate Distribution - log-gated threshold selection
         3. Token-level Tau - tau variance across tokens/positions
         4. Q/K Tau Differentiation - how Q and K taus diverge
-        5. Confidence Stats (v18.3) - confidence scaling metrics
+        5. Confidence Stats (v18.3+) - confidence scaling metrics
         """
         # Detect model version
         model_version = getattr(self.model, '__version__', '18.2')
@@ -485,9 +485,9 @@ class DAWNAnalyzer:
                 rqk = qk_summary.get(f'L{layer_idx}_rqk_overlap', {}).get('mean', 0)
                 print(f"L{layer_idx:2}    {fqk:7.3f} {rqk:7.3f}")
 
-            # v18.3: Print confidence stats
+            # v18.3+: Print confidence stats
             if conf_summary:
-                print("\nPer-Layer Confidence Mean (v18.3):")
+                print(f"\nPer-Layer Confidence Mean (v{model_version}):")
                 print("Layer   FQ      FK      FV      RQ      RK      RV")
                 print("-" * 60)
                 for layer_idx in range(n_layers):
