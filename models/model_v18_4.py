@@ -1289,6 +1289,7 @@ class DAWN(nn.Module):
         self.fixed_tau = fixed_tau
         self.path_max_k = path_max_k
         self.learnable_tau = learnable_tau
+        self.tau_reg_weight = tau_reg_weight
 
         # Neuron counts
         self.n_feature_qk = n_feature_qk
@@ -1436,6 +1437,7 @@ class DAWN(nn.Module):
             'fixed_tau': self.fixed_tau,
             'path_max_k': self.path_max_k,
             'learnable_tau': self.learnable_tau,
+            'tau_reg_weight': self.tau_reg_weight,
             'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
             'n_restore_qk': self.n_restore_qk, 'n_restore_v': self.n_restore_v,
             'n_feature_know': self.n_feature_know, 'n_restore_know': self.n_restore_know,
@@ -1465,7 +1467,7 @@ class DAWN(nn.Module):
             f"  [Router - ReLU Mask + Learnable Tau (8 pools)]",
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
             f"  attention_token_routing={self.attention_token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
-            f"  use_ssm_context={self.use_ssm_context}",
+            f"  use_ssm_context={self.use_ssm_context}, tau_reg_weight={self.tau_reg_weight}",
             f"",
             f"  [Other]",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
