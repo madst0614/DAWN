@@ -633,7 +633,14 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
     sel_rv, ss_rv = get_mean_std('selected_rv')
     sel_kf, ss_kf = get_mean_std('selected_feature', 'knowledge')
     sel_kr, ss_kr = get_mean_std('selected_restore', 'knowledge')
-    lines.append(f"{prefix}Selected: fqk_Q={sel_fqk_Q:.0f}±{ss_fqk_Q:.0f} fqk_K={sel_fqk_K:.0f}±{ss_fqk_K:.0f} fv={sel_fv:.0f}±{ss_fv:.0f} rqk_Q={sel_rqk_Q:.0f}±{ss_rqk_Q:.0f} rqk_K={sel_rqk_K:.0f}±{ss_rqk_K:.0f} rv={sel_rv:.0f}±{ss_rv:.0f} kf={sel_kf:.0f}±{ss_kf:.0f} kr={sel_kr:.0f}±{ss_kr:.0f}")
+
+    # v18.4: Show pass rate % (selected / top_k)
+    if model_version.startswith('18.4'):
+        top_k = 32  # path_max_k(8) * max_paths(4)
+        def pct(sel): return sel / top_k * 100 if top_k > 0 else 0
+        lines.append(f"{prefix}Selected: fqk_Q={sel_fqk_Q:.0f}({pct(sel_fqk_Q):.0f}%) fqk_K={sel_fqk_K:.0f}({pct(sel_fqk_K):.0f}%) fv={sel_fv:.0f}({pct(sel_fv):.0f}%) rqk_Q={sel_rqk_Q:.0f}({pct(sel_rqk_Q):.0f}%) rqk_K={sel_rqk_K:.0f}({pct(sel_rqk_K):.0f}%) rv={sel_rv:.0f}({pct(sel_rv):.0f}%) kf={sel_kf:.0f}({pct(sel_kf):.0f}%) kr={sel_kr:.0f}({pct(sel_kr):.0f}%)")
+    else:
+        lines.append(f"{prefix}Selected: fqk_Q={sel_fqk_Q:.0f}±{ss_fqk_Q:.0f} fqk_K={sel_fqk_K:.0f}±{ss_fqk_K:.0f} fv={sel_fv:.0f}±{ss_fv:.0f} rqk_Q={sel_rqk_Q:.0f}±{ss_rqk_Q:.0f} rqk_K={sel_rqk_K:.0f}±{ss_rqk_K:.0f} rv={sel_rv:.0f}±{ss_rv:.0f} kf={sel_kf:.0f}±{ss_kf:.0f} kr={sel_kr:.0f}±{ss_kr:.0f}")
 
     # Score distribution (mean±std, average across layers) - Q/K separated
     score_fqk_Q_mean = sum(ri.get('attention', ri).get('score_fqk_Q_mean', 0) for ri in routing_infos) / n
@@ -655,9 +662,10 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
     score_kr_std = sum(ri.get('knowledge', {}).get('score_restore_std', 0) for ri in routing_infos) / n
     lines.append(f"{prefix}Score: fqk_Q={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fqk_K={score_fqk_K_mean:.2f}±{score_fqk_K_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk_Q={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rqk_K={score_rqk_K_mean:.2f}±{score_rqk_K_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f} kf={score_kf_mean:.2f}±{score_kf_std:.2f} kr={score_kr_mean:.2f}±{score_kr_std:.2f}")
 
-    # v18.1+ specific: Tau and Gate with mean±std (18.1, 18.2, 18.3, 18.4)
-    if model_version.startswith('18.') and not model_version.startswith('18.0'):
-        # Tau with std
+    # v18.1+ specific: Tau and Gate with mean±std (18.1, 18.2, 18.3)
+    # v18.4 uses relative tau, so absolute Tau values are not meaningful
+    if model_version.startswith('18.') and not model_version.startswith('18.0') and not model_version.startswith('18.4'):
+        # Tau with std (absolute values, meaningful for v18.1-18.3)
         tau_fq = sum(ri.get('attention', {}).get('tau_fq', 0) for ri in routing_infos) / n
         tau_fq_std = sum(ri.get('attention', {}).get('tau_fq_std', 0) for ri in routing_infos) / n
         tau_fk = sum(ri.get('attention', {}).get('tau_fk', 0) for ri in routing_infos) / n
@@ -676,38 +684,32 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         tau_kr_std = sum(ri.get('knowledge', {}).get('tau_restore_std', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}Tau: fq={tau_fq:.2f}±{tau_fq_std:.2f} fk={tau_fk:.2f}±{tau_fk_std:.2f} fv={tau_fv:.2f}±{tau_fv_std:.2f} rq={tau_rq:.2f}±{tau_rq_std:.2f} rk={tau_rk:.2f}±{tau_rk_std:.2f} rv={tau_rv:.2f}±{tau_rv_std:.2f} kf={tau_kf:.2f}±{tau_kf_std:.2f} kr={tau_kr:.2f}±{tau_kr_std:.2f}")
 
-        # v18.4: tau_offset (learned parameter, in std units from mean)
-        if model_version.startswith('18.4'):
-            off_fq = sum(ri.get('attention', {}).get('tau_offset_fq', 0) for ri in routing_infos) / n
-            off_fq_std = sum(ri.get('attention', {}).get('tau_offset_fq_std', 0) for ri in routing_infos) / n
-            off_fk = sum(ri.get('attention', {}).get('tau_offset_fk', 0) for ri in routing_infos) / n
-            off_fk_std = sum(ri.get('attention', {}).get('tau_offset_fk_std', 0) for ri in routing_infos) / n
-            off_fv = sum(ri.get('attention', {}).get('tau_offset_fv', 0) for ri in routing_infos) / n
-            off_fv_std = sum(ri.get('attention', {}).get('tau_offset_fv_std', 0) for ri in routing_infos) / n
-            off_rq = sum(ri.get('attention', {}).get('tau_offset_rq', 0) for ri in routing_infos) / n
-            off_rq_std = sum(ri.get('attention', {}).get('tau_offset_rq_std', 0) for ri in routing_infos) / n
-            off_rk = sum(ri.get('attention', {}).get('tau_offset_rk', 0) for ri in routing_infos) / n
-            off_rk_std = sum(ri.get('attention', {}).get('tau_offset_rk_std', 0) for ri in routing_infos) / n
-            off_rv = sum(ri.get('attention', {}).get('tau_offset_rv', 0) for ri in routing_infos) / n
-            off_rv_std = sum(ri.get('attention', {}).get('tau_offset_rv_std', 0) for ri in routing_infos) / n
-            off_kf = sum(ri.get('knowledge', {}).get('tau_offset_feature', 0) for ri in routing_infos) / n
-            off_kf_std = sum(ri.get('knowledge', {}).get('tau_offset_feature_std', 0) for ri in routing_infos) / n
-            off_kr = sum(ri.get('knowledge', {}).get('tau_offset_restore', 0) for ri in routing_infos) / n
-            off_kr_std = sum(ri.get('knowledge', {}).get('tau_offset_restore_std', 0) for ri in routing_infos) / n
-            lines.append(f"{prefix}TauOff: fq={off_fq:.2f}±{off_fq_std:.2f} fk={off_fk:.2f}±{off_fk_std:.2f} fv={off_fv:.2f}±{off_fv_std:.2f} rq={off_rq:.2f}±{off_rq_std:.2f} rk={off_rk:.2f}±{off_rk_std:.2f} rv={off_rv:.2f}±{off_rv_std:.2f} kf={off_kf:.2f}±{off_kf_std:.2f} kr={off_kr:.2f}±{off_kr_std:.2f}")
+    # v18.4: tau_offset (learned parameter, in std units from mean) + gate_strength
+    if model_version.startswith('18.4'):
+        # tau_offset with +/- sign format
+        off_fq = sum(ri.get('attention', {}).get('tau_offset_fq', 0) for ri in routing_infos) / n
+        off_fk = sum(ri.get('attention', {}).get('tau_offset_fk', 0) for ri in routing_infos) / n
+        off_fv = sum(ri.get('attention', {}).get('tau_offset_fv', 0) for ri in routing_infos) / n
+        off_rq = sum(ri.get('attention', {}).get('tau_offset_rq', 0) for ri in routing_infos) / n
+        off_rk = sum(ri.get('attention', {}).get('tau_offset_rk', 0) for ri in routing_infos) / n
+        off_rv = sum(ri.get('attention', {}).get('tau_offset_rv', 0) for ri in routing_infos) / n
+        off_kf = sum(ri.get('knowledge', {}).get('tau_offset_feature', 0) for ri in routing_infos) / n
+        off_kr = sum(ri.get('knowledge', {}).get('tau_offset_restore', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}TauOff: fq={off_fq:+.2f} fk={off_fk:+.2f} fv={off_fv:+.2f} rq={off_rq:+.2f} rk={off_rk:+.2f} rv={off_rv:+.2f} kf={off_kf:+.2f} kr={off_kr:+.2f}")
 
-            # v18.4: gate_strength (tanh of max exp_gate, 0~1, low = more pass-through)
-            gstr_fq = sum(ri.get('attention', {}).get('gstr_fq', 0) for ri in routing_infos) / n
-            gstr_fk = sum(ri.get('attention', {}).get('gstr_fk', 0) for ri in routing_infos) / n
-            gstr_fv = sum(ri.get('attention', {}).get('gstr_fv', 0) for ri in routing_infos) / n
-            gstr_rq = sum(ri.get('attention', {}).get('gstr_rq', 0) for ri in routing_infos) / n
-            gstr_rk = sum(ri.get('attention', {}).get('gstr_rk', 0) for ri in routing_infos) / n
-            gstr_rv = sum(ri.get('attention', {}).get('gstr_rv', 0) for ri in routing_infos) / n
-            gstr_kf = sum(ri.get('knowledge', {}).get('gstr_feature', 0) for ri in routing_infos) / n
-            gstr_kr = sum(ri.get('knowledge', {}).get('gstr_restore', 0) for ri in routing_infos) / n
-            lines.append(f"{prefix}GateStr: fq={gstr_fq:.2f} fk={gstr_fk:.2f} fv={gstr_fv:.2f} rq={gstr_rq:.2f} rk={gstr_rk:.2f} rv={gstr_rv:.2f} kf={gstr_kf:.2f} kr={gstr_kr:.2f}")
+        # gate_strength (tanh of max exp_gate, 0~1, low = more pass-through)
+        gstr_fq = sum(ri.get('attention', {}).get('gstr_fq', 0) for ri in routing_infos) / n
+        gstr_fk = sum(ri.get('attention', {}).get('gstr_fk', 0) for ri in routing_infos) / n
+        gstr_fv = sum(ri.get('attention', {}).get('gstr_fv', 0) for ri in routing_infos) / n
+        gstr_rq = sum(ri.get('attention', {}).get('gstr_rq', 0) for ri in routing_infos) / n
+        gstr_rk = sum(ri.get('attention', {}).get('gstr_rk', 0) for ri in routing_infos) / n
+        gstr_rv = sum(ri.get('attention', {}).get('gstr_rv', 0) for ri in routing_infos) / n
+        gstr_kf = sum(ri.get('knowledge', {}).get('gstr_feature', 0) for ri in routing_infos) / n
+        gstr_kr = sum(ri.get('knowledge', {}).get('gstr_restore', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}GateStr: fq={gstr_fq:.2f} fk={gstr_fk:.2f} fv={gstr_fv:.2f} rq={gstr_rq:.2f} rk={gstr_rk:.2f} rv={gstr_rv:.2f} kf={gstr_kf:.2f} kr={gstr_kr:.2f}")
 
-        # Gate with std (v18.2)
+    # Gate with std (v18.1+)
+    if model_version.startswith('18.') and not model_version.startswith('18.0'):
         gate_fq = sum(ri.get('attention', {}).get('gate_fq_mean', 0) for ri in routing_infos) / n
         gate_fq_std = sum(ri.get('attention', {}).get('gate_fq_std', 0) for ri in routing_infos) / n
         gate_fk = sum(ri.get('attention', {}).get('gate_fk_mean', 0) for ri in routing_infos) / n
@@ -726,25 +728,25 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         gate_kr_std = sum(ri.get('knowledge', {}).get('gate_restore_std', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}Gate: fq={gate_fq:.2f}±{gate_fq_std:.2f} fk={gate_fk:.2f}±{gate_fk_std:.2f} fv={gate_fv:.2f}±{gate_fv_std:.2f} rq={gate_rq:.2f}±{gate_rq_std:.2f} rk={gate_rk:.2f}±{gate_rk_std:.2f} rv={gate_rv:.2f}±{gate_rv_std:.2f} kf={gate_kf:.2f}±{gate_kf_std:.2f} kr={gate_kr:.2f}±{gate_kr_std:.2f}")
 
-        # v18.3+ specific: Confidence stats (18.3: gate/(gate+1), 18.4: gate/gate_sum)
-        if model_version.startswith('18.3') or model_version.startswith('18.4'):
-            conf_fq = sum(ri.get('attention', {}).get('conf_fq_mean', 0) for ri in routing_infos) / n
-            conf_fq_std = sum(ri.get('attention', {}).get('conf_fq_std', 0) for ri in routing_infos) / n
-            conf_fk = sum(ri.get('attention', {}).get('conf_fk_mean', 0) for ri in routing_infos) / n
-            conf_fk_std = sum(ri.get('attention', {}).get('conf_fk_std', 0) for ri in routing_infos) / n
-            conf_fv = sum(ri.get('attention', {}).get('conf_fv_mean', 0) for ri in routing_infos) / n
-            conf_fv_std = sum(ri.get('attention', {}).get('conf_fv_std', 0) for ri in routing_infos) / n
-            conf_rq = sum(ri.get('attention', {}).get('conf_rq_mean', 0) for ri in routing_infos) / n
-            conf_rq_std = sum(ri.get('attention', {}).get('conf_rq_std', 0) for ri in routing_infos) / n
-            conf_rk = sum(ri.get('attention', {}).get('conf_rk_mean', 0) for ri in routing_infos) / n
-            conf_rk_std = sum(ri.get('attention', {}).get('conf_rk_std', 0) for ri in routing_infos) / n
-            conf_rv = sum(ri.get('attention', {}).get('conf_rv_mean', 0) for ri in routing_infos) / n
-            conf_rv_std = sum(ri.get('attention', {}).get('conf_rv_std', 0) for ri in routing_infos) / n
-            conf_kf = sum(ri.get('knowledge', {}).get('conf_feature_mean', 0) for ri in routing_infos) / n
-            conf_kf_std = sum(ri.get('knowledge', {}).get('conf_feature_std', 0) for ri in routing_infos) / n
-            conf_kr = sum(ri.get('knowledge', {}).get('conf_restore_mean', 0) for ri in routing_infos) / n
-            conf_kr_std = sum(ri.get('knowledge', {}).get('conf_restore_std', 0) for ri in routing_infos) / n
-            lines.append(f"{prefix}Conf: fq={conf_fq:.2f}±{conf_fq_std:.2f} fk={conf_fk:.2f}±{conf_fk_std:.2f} fv={conf_fv:.2f}±{conf_fv_std:.2f} rq={conf_rq:.2f}±{conf_rq_std:.2f} rk={conf_rk:.2f}±{conf_rk_std:.2f} rv={conf_rv:.2f}±{conf_rv_std:.2f} kf={conf_kf:.2f}±{conf_kf_std:.2f} kr={conf_kr:.2f}±{conf_kr_std:.2f}")
+    # v18.3+ specific: Confidence stats (18.3: gate/(gate+1), 18.4: gate/gate_sum)
+    if model_version.startswith('18.3') or model_version.startswith('18.4'):
+        conf_fq = sum(ri.get('attention', {}).get('conf_fq_mean', 0) for ri in routing_infos) / n
+        conf_fq_std = sum(ri.get('attention', {}).get('conf_fq_std', 0) for ri in routing_infos) / n
+        conf_fk = sum(ri.get('attention', {}).get('conf_fk_mean', 0) for ri in routing_infos) / n
+        conf_fk_std = sum(ri.get('attention', {}).get('conf_fk_std', 0) for ri in routing_infos) / n
+        conf_fv = sum(ri.get('attention', {}).get('conf_fv_mean', 0) for ri in routing_infos) / n
+        conf_fv_std = sum(ri.get('attention', {}).get('conf_fv_std', 0) for ri in routing_infos) / n
+        conf_rq = sum(ri.get('attention', {}).get('conf_rq_mean', 0) for ri in routing_infos) / n
+        conf_rq_std = sum(ri.get('attention', {}).get('conf_rq_std', 0) for ri in routing_infos) / n
+        conf_rk = sum(ri.get('attention', {}).get('conf_rk_mean', 0) for ri in routing_infos) / n
+        conf_rk_std = sum(ri.get('attention', {}).get('conf_rk_std', 0) for ri in routing_infos) / n
+        conf_rv = sum(ri.get('attention', {}).get('conf_rv_mean', 0) for ri in routing_infos) / n
+        conf_rv_std = sum(ri.get('attention', {}).get('conf_rv_std', 0) for ri in routing_infos) / n
+        conf_kf = sum(ri.get('knowledge', {}).get('conf_feature_mean', 0) for ri in routing_infos) / n
+        conf_kf_std = sum(ri.get('knowledge', {}).get('conf_feature_std', 0) for ri in routing_infos) / n
+        conf_kr = sum(ri.get('knowledge', {}).get('conf_restore_mean', 0) for ri in routing_infos) / n
+        conf_kr_std = sum(ri.get('knowledge', {}).get('conf_restore_std', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}Conf: fq={conf_fq:.2f}±{conf_fq_std:.2f} fk={conf_fk:.2f}±{conf_fk_std:.2f} fv={conf_fv:.2f}±{conf_fv_std:.2f} rq={conf_rq:.2f}±{conf_rq_std:.2f} rk={conf_rk:.2f}±{conf_rk_std:.2f} rv={conf_rv:.2f}±{conf_rv_std:.2f} kf={conf_kf:.2f}±{conf_kf_std:.2f} kr={conf_kr:.2f}±{conf_kr_std:.2f}")
 
     return lines
 
