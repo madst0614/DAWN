@@ -66,7 +66,7 @@ training:
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.0001
+  load_balance_weight: 0.00002
   tau_reg_weight: 0.00002
 
 use_amp: true
