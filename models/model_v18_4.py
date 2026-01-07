@@ -749,19 +749,20 @@ class GlobalRouters(nn.Module):
                 'gate_rk_std': rqk_gate_K.std().item(),
                 'gate_rv_mean': rv_gate.mean().item(),
                 'gate_rv_std': rv_gate.std().item(),
-                # v18.3: confidence stats (gate / (gate + 1))
-                'conf_fq_mean': fqk_conf_Q.mean().item(),
-                'conf_fq_std': fqk_conf_Q.std().item(),
-                'conf_fk_mean': fqk_conf_K.mean().item(),
-                'conf_fk_std': fqk_conf_K.std().item(),
-                'conf_fv_mean': fv_conf.mean().item(),
-                'conf_fv_std': fv_conf.std().item(),
-                'conf_rq_mean': rqk_conf_Q.mean().item(),
-                'conf_rq_std': rqk_conf_Q.std().item(),
-                'conf_rk_mean': rqk_conf_K.mean().item(),
-                'conf_rk_std': rqk_conf_K.std().item(),
-                'conf_rv_mean': rv_conf.mean().item(),
-                'conf_rv_std': rv_conf.std().item(),
+                # v18.4: weight concentration (max of exp_gate / exp_gate_sum)
+                # Higher = more concentrated selection, 1/k = uniform
+                'conf_fq_mean': fqk_conf_Q.max(dim=-1).values.mean().item(),
+                'conf_fq_std': fqk_conf_Q.max(dim=-1).values.std().item(),
+                'conf_fk_mean': fqk_conf_K.max(dim=-1).values.mean().item(),
+                'conf_fk_std': fqk_conf_K.max(dim=-1).values.std().item(),
+                'conf_fv_mean': fv_conf.max(dim=-1).values.mean().item(),
+                'conf_fv_std': fv_conf.max(dim=-1).values.std().item(),
+                'conf_rq_mean': rqk_conf_Q.max(dim=-1).values.mean().item(),
+                'conf_rq_std': rqk_conf_Q.max(dim=-1).values.std().item(),
+                'conf_rk_mean': rqk_conf_K.max(dim=-1).values.mean().item(),
+                'conf_rk_std': rqk_conf_K.max(dim=-1).values.std().item(),
+                'conf_rv_mean': rv_conf.max(dim=-1).values.mean().item(),
+                'conf_rv_std': rv_conf.max(dim=-1).values.std().item(),
             }
         else:
             routing_info = {}
@@ -859,11 +860,11 @@ class GlobalRouters(nn.Module):
                 'gate_feature_std': f_gate.std().item(),
                 'gate_restore_mean': r_gate.mean().item(),
                 'gate_restore_std': r_gate.std().item(),
-                # v18.3: confidence stats (gate / (gate + 1))
-                'conf_feature_mean': f_conf.mean().item(),
-                'conf_feature_std': f_conf.std().item(),
-                'conf_restore_mean': r_conf.mean().item(),
-                'conf_restore_std': r_conf.std().item(),
+                # v18.4: weight concentration (max of exp_gate / exp_gate_sum)
+                'conf_feature_mean': f_conf.max(dim=-1).values.mean().item(),
+                'conf_feature_std': f_conf.max(dim=-1).values.std().item(),
+                'conf_restore_mean': r_conf.max(dim=-1).values.mean().item(),
+                'conf_restore_std': r_conf.max(dim=-1).values.std().item(),
             }
         else:
             know_info = {}
