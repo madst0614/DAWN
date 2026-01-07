@@ -56,6 +56,7 @@ model:
   max_paths: 2
   path_max_k: 16
   learnable_tau: true
+  tau_reg_weight: 0.001
 
 training:
   batch_size: 128
@@ -67,7 +68,6 @@ training:
   orthogonality_weight: 0.01
   diversity_weight: 0.1
   load_balance_weight: 0.00002
-  tau_reg_weight: 0
 
 use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v18.4_40M_c4_5B_seed1_qk384

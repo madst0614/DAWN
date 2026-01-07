@@ -395,6 +395,7 @@ class GlobalRouters(nn.Module):
                  attention_token_routing: bool = False,
                  knowledge_token_routing: bool = False,
                  learnable_tau: bool = True,
+                 tau_reg_weight: float = 0.0,
                  **kwargs):
         super().__init__()
         self.d_model = d_model
@@ -411,6 +412,7 @@ class GlobalRouters(nn.Module):
         self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
         self.learnable_tau = learnable_tau
+        self.tau_reg_weight = tau_reg_weight
         self.inference_hard_mask = False  # Set True for clean hard mask during inference
         # ============================================================
         # MODE FLAGS (mutually exclusive usage patterns)
@@ -458,15 +460,13 @@ class GlobalRouters(nn.Module):
 
     def get_tau_reg_loss(self):
         """
-        Compute tau regularization loss (v18.1 only).
-        L2 regularization on tau projection weights.
-        Returns 0 if learnable_tau=False.
-        """
-        if not self.learnable_tau:
-            return 0.0
+        DEPRECATED in v18.4: tau_reg is now computed inside routing functions
+        and added to aux_loss with tau_reg_weight. This method returns 0.
 
-        # L2 regularization on tau projection weights and bias
-        return (self.tau_proj.weight ** 2).mean() + (self.tau_proj.bias ** 2).mean()
+        For v18.4, use tau_reg_weight parameter in model config instead.
+        tau_reg = relu(tau - score_mean) penalizes tau > score_mean.
+        """
+        return 0.0
 
     def get_all_tau_values(self):
         """Get all tau values as a dict (for logging). Returns bias values for learnable tau."""
@@ -665,6 +665,24 @@ class GlobalRouters(nn.Module):
             aux_loss += ((usage_rqk_K - target_rqk) ** 2).sum() * self.n_restore_qk
             aux_loss += ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
 
+        # Compute tau regularization loss (score-based: penalize tau > score_mean)
+        if self.training and self.learnable_tau and self.tau_reg_weight > 0:
+            # For each pool: relu(tau - score_mean) penalizes tau being too high
+            score_mean_fq = fqk_logits_Q.mean(dim=-1, keepdim=True).detach()
+            score_mean_fk = fqk_logits_K.mean(dim=-1, keepdim=True).detach()
+            score_mean_fv = fv_logits.mean(dim=-1, keepdim=True).detach()
+            score_mean_rq = rqk_logits_Q.mean(dim=-1, keepdim=True).detach()
+            score_mean_rk = rqk_logits_K.mean(dim=-1, keepdim=True).detach()
+            score_mean_rv = rv_logits.mean(dim=-1, keepdim=True).detach()
+
+            tau_reg = F.relu(tau_fq - score_mean_fq).mean()
+            tau_reg += F.relu(tau_fk - score_mean_fk).mean()
+            tau_reg += F.relu(tau_fv - score_mean_fv).mean()
+            tau_reg += F.relu(tau_rq - score_mean_rq).mean()
+            tau_reg += F.relu(tau_rk - score_mean_rk).mean()
+            tau_reg += F.relu(tau_rv - score_mean_rv).mean()
+            aux_loss += tau_reg * self.tau_reg_weight
+
         # Package path weights
         path_weights = {
             'fqk_Q': fqk_paths_Q,
@@ -858,6 +876,15 @@ class GlobalRouters(nn.Module):
 
             aux_loss += ((usage_f - target_f) ** 2).sum() * self.n_feature_know
             aux_loss += ((usage_r - target_r) ** 2).sum() * self.n_restore_know
+
+        # Compute tau regularization loss (score-based: penalize tau > score_mean)
+        if self.training and self.learnable_tau and self.tau_reg_weight > 0:
+            score_mean_f = logits_f.mean(dim=-1, keepdim=True).detach()
+            score_mean_r = logits_r.mean(dim=-1, keepdim=True).detach()
+
+            tau_reg = F.relu(tau_f - score_mean_f).mean()
+            tau_reg += F.relu(tau_r - score_mean_r).mean()
+            aux_loss += tau_reg * self.tau_reg_weight
 
         # Routing stats only in debug mode (avoid GPU sync overhead)
         if self.debug_mode:
@@ -1232,6 +1259,7 @@ class DAWN(nn.Module):
         router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
         use_ssm_context: bool = True,
+        tau_reg_weight: float = 0.0,
         **kwargs,
     ):
         super().__init__()
@@ -1302,6 +1330,7 @@ class DAWN(nn.Module):
             attention_token_routing=attention_token_routing,
             knowledge_token_routing=knowledge_token_routing,
             learnable_tau=learnable_tau,
+            tau_reg_weight=tau_reg_weight,
         )
 
         self.layers = nn.ModuleList([

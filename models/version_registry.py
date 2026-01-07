@@ -155,6 +155,7 @@ VERSION_REGISTRY = {
             "knowledge_token_routing": False,
             "use_ssm_context": True,
             "learnable_tau": True,
+            "tau_reg_weight": 0.0,
         },
         "display_info": lambda args: [
             f"DAWN v18.4: Relative Confidence Scaling",
