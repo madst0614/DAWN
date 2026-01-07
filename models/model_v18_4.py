@@ -697,111 +697,41 @@ class GlobalRouters(nn.Module):
         # ============================================================
         # ROUTING INFO (for logging/analysis only)
         # ============================================================
-        # IMPORTANT: This section is ONLY executed when debug_mode=True
-        # During training: debug_mode=False → routing_info={} → NO OVERHEAD
+        # IMPORTANT: debug_mode=True only on log steps, ~20 metrics, torch.no_grad
         # ============================================================
         if self.debug_mode:
-            def avg_paths_per_token(paths):
-                return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
-
-            def avg_selected_per_token(mask):
-                return mask.float().sum(dim=-1).mean().item()
-
-            def qk_overlap(mask_q, mask_k):
-                intersection = (mask_q & mask_k).float().sum(dim=-1)
-                q_count = mask_q.float().sum(dim=-1)
-                k_count = mask_k.float().sum(dim=-1)
-                max_count = torch.maximum(q_count, k_count).clamp(min=1)
-                return (intersection / max_count).mean().item()
-
-            def tau_mean(tau):
-                return tau.mean().item() if torch.is_tensor(tau) else tau
-
-            def tau_std(tau):
-                return tau.std().item() if torch.is_tensor(tau) else 0.0
-
-            # Compute gstr from gate (gate_strength = tanh(max(exp(gate)-1)))
-            def compute_gstr(gate):
-                exp_gate = torch.exp(gate) - 1
-                return torch.tanh(exp_gate.max(dim=-1).values).mean().item()
-
-            routing_info = {
-                'top_k': self.path_max_k * self.max_paths,
-                'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
-                'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
-                'n_paths_fv': avg_paths_per_token(fv_paths),
-                'n_paths_rqk_Q': avg_paths_per_token(rqk_paths_Q),
-                'n_paths_rqk_K': avg_paths_per_token(rqk_paths_K),
-                'n_paths_rv': avg_paths_per_token(rv_paths),
-                'selected_fqk_Q': avg_selected_per_token(fqk_mask_Q),
-                'selected_fqk_K': avg_selected_per_token(fqk_mask_K),
-                'selected_fv': avg_selected_per_token(fv_mask),
-                'selected_rqk_Q': avg_selected_per_token(rqk_mask_Q),
-                'selected_rqk_K': avg_selected_per_token(rqk_mask_K),
-                'selected_rv': avg_selected_per_token(rv_mask),
-                'overlap_fqk': qk_overlap(fqk_mask_Q, fqk_mask_K),
-                'overlap_rqk': qk_overlap(rqk_mask_Q, rqk_mask_K),
-                'score_fqk_Q_mean': fqk_logits_Q.mean().item(),
-                'score_fqk_Q_std': fqk_logits_Q.std().item(),
-                'score_fqk_K_mean': fqk_logits_K.mean().item(),
-                'score_fqk_K_std': fqk_logits_K.std().item(),
-                'score_fv_mean': fv_logits.mean().item(),
-                'score_fv_std': fv_logits.std().item(),
-                'score_rqk_Q_mean': rqk_logits_Q.mean().item(),
-                'score_rqk_Q_std': rqk_logits_Q.std().item(),
-                'score_rqk_K_mean': rqk_logits_K.mean().item(),
-                'score_rqk_K_std': rqk_logits_K.std().item(),
-                'score_rv_mean': rv_logits.mean().item(),
-                'score_rv_std': rv_logits.std().item(),
-                # v18.4: tau_offset values (learned parameter, in std units)
-                'tau_offset_fq': tau_mean(tau_offset_fq) if self.learnable_tau else 0.0,
-                'tau_offset_fq_std': tau_std(tau_offset_fq) if self.learnable_tau else 0.0,
-                'tau_offset_fk': tau_mean(tau_offset_fk) if self.learnable_tau else 0.0,
-                'tau_offset_fk_std': tau_std(tau_offset_fk) if self.learnable_tau else 0.0,
-                'tau_offset_fv': tau_mean(tau_offset_fv) if self.learnable_tau else 0.0,
-                'tau_offset_fv_std': tau_std(tau_offset_fv) if self.learnable_tau else 0.0,
-                'tau_offset_rq': tau_mean(tau_offset_rq) if self.learnable_tau else 0.0,
-                'tau_offset_rq_std': tau_std(tau_offset_rq) if self.learnable_tau else 0.0,
-                'tau_offset_rk': tau_mean(tau_offset_rk) if self.learnable_tau else 0.0,
-                'tau_offset_rk_std': tau_std(tau_offset_rk) if self.learnable_tau else 0.0,
-                'tau_offset_rv': tau_mean(tau_offset_rv) if self.learnable_tau else 0.0,
-                'tau_offset_rv_std': tau_std(tau_offset_rv) if self.learnable_tau else 0.0,
-                # v18.4: gate_strength computed from gate
-                'gstr_fq': compute_gstr(fqk_gate_Q),
-                'gstr_fk': compute_gstr(fqk_gate_K),
-                'gstr_fv': compute_gstr(fv_gate),
-                'gstr_rq': compute_gstr(rqk_gate_Q),
-                'gstr_rk': compute_gstr(rqk_gate_K),
-                'gstr_rv': compute_gstr(rv_gate),
-                'learnable_tau': self.learnable_tau,
-                'use_soft_mask': True,
-                'token_routing': self.attention_token_routing,
-                'gate_fq_mean': fqk_gate_Q.mean().item(),
-                'gate_fq_std': fqk_gate_Q.std().item(),
-                'gate_fk_mean': fqk_gate_K.mean().item(),
-                'gate_fk_std': fqk_gate_K.std().item(),
-                'gate_fv_mean': fv_gate.mean().item(),
-                'gate_fv_std': fv_gate.std().item(),
-                'gate_rq_mean': rqk_gate_Q.mean().item(),
-                'gate_rq_std': rqk_gate_Q.std().item(),
-                'gate_rk_mean': rqk_gate_K.mean().item(),
-                'gate_rk_std': rqk_gate_K.std().item(),
-                'gate_rv_mean': rv_gate.mean().item(),
-                'gate_rv_std': rv_gate.std().item(),
-                # v18.4: weight concentration
-                'conf_fq_mean': fqk_conf_Q.max(dim=-1).values.mean().item(),
-                'conf_fq_std': fqk_conf_Q.max(dim=-1).values.std().item(),
-                'conf_fk_mean': fqk_conf_K.max(dim=-1).values.mean().item(),
-                'conf_fk_std': fqk_conf_K.max(dim=-1).values.std().item(),
-                'conf_fv_mean': fv_conf.max(dim=-1).values.mean().item(),
-                'conf_fv_std': fv_conf.max(dim=-1).values.std().item(),
-                'conf_rq_mean': rqk_conf_Q.max(dim=-1).values.mean().item(),
-                'conf_rq_std': rqk_conf_Q.max(dim=-1).values.std().item(),
-                'conf_rk_mean': rqk_conf_K.max(dim=-1).values.mean().item(),
-                'conf_rk_std': rqk_conf_K.max(dim=-1).values.std().item(),
-                'conf_rv_mean': rv_conf.max(dim=-1).values.mean().item(),
-                'conf_rv_std': rv_conf.max(dim=-1).values.std().item(),
-            }
+            with torch.no_grad():
+                routing_info = {
+                    'top_k': self.path_max_k * self.max_paths,
+                    # Selected neurons (pass rate = selected / top_k)
+                    'selected_fqk_Q': fqk_mask_Q.float().sum(dim=-1).mean().item(),
+                    'selected_fqk_K': fqk_mask_K.float().sum(dim=-1).mean().item(),
+                    'selected_fv': fv_mask.float().sum(dim=-1).mean().item(),
+                    'selected_rqk_Q': rqk_mask_Q.float().sum(dim=-1).mean().item(),
+                    'selected_rqk_K': rqk_mask_K.float().sum(dim=-1).mean().item(),
+                    'selected_rv': rv_mask.float().sum(dim=-1).mean().item(),
+                    # tau_offset (the learned parameter, in std units)
+                    'tau_offset_fq': tau_offset_fq.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_fk': tau_offset_fk.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_fv': tau_offset_fv.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_rq': tau_offset_rq.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_rk': tau_offset_rk.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_rv': tau_offset_rv.mean().item() if self.learnable_tau else 0.0,
+                    # gate_strength (0~1, low = more pass-through)
+                    'gstr_fq': torch.tanh(fqk_gate_Q.max(dim=-1).values).mean().item(),
+                    'gstr_fk': torch.tanh(fqk_gate_K.max(dim=-1).values).mean().item(),
+                    'gstr_fv': torch.tanh(fv_gate.max(dim=-1).values).mean().item(),
+                    'gstr_rq': torch.tanh(rqk_gate_Q.max(dim=-1).values).mean().item(),
+                    'gstr_rk': torch.tanh(rqk_gate_K.max(dim=-1).values).mean().item(),
+                    'gstr_rv': torch.tanh(rv_gate.max(dim=-1).values).mean().item(),
+                    # Q/K overlap
+                    'overlap_fqk': ((fqk_mask_Q & fqk_mask_K).float().sum(dim=-1) /
+                                   torch.maximum(fqk_mask_Q.float().sum(dim=-1),
+                                                fqk_mask_K.float().sum(dim=-1)).clamp(min=1)).mean().item(),
+                    'overlap_rqk': ((rqk_mask_Q & rqk_mask_K).float().sum(dim=-1) /
+                                   torch.maximum(rqk_mask_Q.float().sum(dim=-1),
+                                                rqk_mask_K.float().sum(dim=-1)).clamp(min=1)).mean().item(),
+                }
         else:
             routing_info = {}
 
@@ -894,51 +824,19 @@ class GlobalRouters(nn.Module):
 
         # Routing stats only in debug mode (avoid GPU sync overhead)
         if self.debug_mode:
-            def avg_paths_per_token(paths):
-                return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
-
-            def avg_selected_per_token(mask):
-                return mask.float().sum(dim=-1).mean().item()
-
-            def tau_mean(tau):
-                return tau.mean().item() if torch.is_tensor(tau) else tau
-
-            def tau_std(tau):
-                return tau.std().item() if torch.is_tensor(tau) else 0.0
-
-            # Compute gstr from gate
-            def compute_gstr(gate):
-                exp_gate = torch.exp(gate) - 1
-                return torch.tanh(exp_gate.max(dim=-1).values).mean().item()
-
-            know_info = {
-                'top_k': self.path_max_k * self.max_paths,
-                'n_paths_feature': avg_paths_per_token(f_paths),
-                'n_paths_restore': avg_paths_per_token(r_paths),
-                'selected_feature': avg_selected_per_token(f_mask),
-                'selected_restore': avg_selected_per_token(r_mask),
-                'score_feature_mean': logits_f.mean().item(),
-                'score_feature_std': logits_f.std().item(),
-                'score_restore_mean': logits_r.mean().item(),
-                'score_restore_std': logits_r.std().item(),
-                # v18.4: tau_offset values (learned parameter, in std units)
-                'tau_offset_feature': tau_mean(tau_offset_f) if self.learnable_tau else 0.0,
-                'tau_offset_feature_std': tau_std(tau_offset_f) if self.learnable_tau else 0.0,
-                'tau_offset_restore': tau_mean(tau_offset_r) if self.learnable_tau else 0.0,
-                'tau_offset_restore_std': tau_std(tau_offset_r) if self.learnable_tau else 0.0,
-                # v18.4: gate_strength computed from gate
-                'gstr_feature': compute_gstr(f_gate),
-                'gstr_restore': compute_gstr(r_gate),
-                'gate_feature_mean': f_gate.mean().item(),
-                'gate_feature_std': f_gate.std().item(),
-                'gate_restore_mean': r_gate.mean().item(),
-                'gate_restore_std': r_gate.std().item(),
-                # v18.4: weight concentration
-                'conf_feature_mean': f_conf.max(dim=-1).values.mean().item(),
-                'conf_feature_std': f_conf.max(dim=-1).values.std().item(),
-                'conf_restore_mean': r_conf.max(dim=-1).values.mean().item(),
-                'conf_restore_std': r_conf.max(dim=-1).values.std().item(),
-            }
+            with torch.no_grad():
+                know_info = {
+                    'top_k': self.path_max_k * self.max_paths,
+                    # Selected counts (what % passed tau)
+                    'selected_feature': f_mask.float().sum(dim=-1).mean().item(),
+                    'selected_restore': r_mask.float().sum(dim=-1).mean().item(),
+                    # v18.4: tau_offset (learned parameter, in std units)
+                    'tau_offset_feature': tau_offset_f.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_restore': tau_offset_r.mean().item() if self.learnable_tau else 0.0,
+                    # v18.4: gate_strength from gate (0~1, low = pass-through)
+                    'gstr_feature': torch.tanh((torch.exp(f_gate) - 1).max(dim=-1).values).mean().item(),
+                    'gstr_restore': torch.tanh((torch.exp(r_gate) - 1).max(dim=-1).values).mean().item(),
+                }
         else:
             know_info = {}
 
