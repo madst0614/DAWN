@@ -434,8 +434,8 @@ class GlobalRouters(nn.Module):
             # Output: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
             self.tau_proj = nn.Linear(d_model, 8)
             nn.init.zeros_(self.tau_proj.weight)
-            # Initialize bias to -1.0: ensures most neurons pass initially
-            nn.init.constant_(self.tau_proj.bias, -1.0)
+            # Initialize bias to -0.5: relative tau starts at mean - 0.5σ
+            nn.init.constant_(self.tau_proj.bias, -0.5)
 
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
@@ -597,17 +597,43 @@ class GlobalRouters(nn.Module):
         (fqk_logits_Q, fqk_logits_K, fv_logits,
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
 
-        # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
+        # Get thresholds (v18.4: relative tau = score_mean + tau_offset * score_std)
         # Q/K have separate tau values
         if self.learnable_tau:
             if tau_all is None:
                 tau_all = self.tau_proj(x)  # fallback if not provided
-            tau_fq = tau_all[..., 0:1]
-            tau_fk = tau_all[..., 1:2]
-            tau_fv = tau_all[..., 2:3]
-            tau_rq = tau_all[..., 3:4]
-            tau_rk = tau_all[..., 4:5]
-            tau_rv = tau_all[..., 5:6]
+            # tau_all is now "offset" in units of std from mean
+            tau_offset_fq = tau_all[..., 0:1]
+            tau_offset_fk = tau_all[..., 1:2]
+            tau_offset_fv = tau_all[..., 2:3]
+            tau_offset_rq = tau_all[..., 3:4]
+            tau_offset_rk = tau_all[..., 4:5]
+            tau_offset_rv = tau_all[..., 5:6]
+
+            # Compute relative tau: mean + offset * std
+            score_mean_fq = fqk_logits_Q.mean(dim=-1, keepdim=True)
+            score_std_fq = fqk_logits_Q.std(dim=-1, keepdim=True) + 1e-8
+            tau_fq = score_mean_fq + tau_offset_fq * score_std_fq
+
+            score_mean_fk = fqk_logits_K.mean(dim=-1, keepdim=True)
+            score_std_fk = fqk_logits_K.std(dim=-1, keepdim=True) + 1e-8
+            tau_fk = score_mean_fk + tau_offset_fk * score_std_fk
+
+            score_mean_fv = fv_logits.mean(dim=-1, keepdim=True)
+            score_std_fv = fv_logits.std(dim=-1, keepdim=True) + 1e-8
+            tau_fv = score_mean_fv + tau_offset_fv * score_std_fv
+
+            score_mean_rq = rqk_logits_Q.mean(dim=-1, keepdim=True)
+            score_std_rq = rqk_logits_Q.std(dim=-1, keepdim=True) + 1e-8
+            tau_rq = score_mean_rq + tau_offset_rq * score_std_rq
+
+            score_mean_rk = rqk_logits_K.mean(dim=-1, keepdim=True)
+            score_std_rk = rqk_logits_K.std(dim=-1, keepdim=True) + 1e-8
+            tau_rk = score_mean_rk + tau_offset_rk * score_std_rk
+
+            score_mean_rv = rv_logits.mean(dim=-1, keepdim=True)
+            score_std_rv = rv_logits.std(dim=-1, keepdim=True) + 1e-8
+            tau_rv = score_mean_rv + tau_offset_rv * score_std_rv
         else:
             tau_fq = tau_fk = tau_fv = tau_rq = tau_rk = tau_rv = self.fixed_tau
 
@@ -665,22 +691,15 @@ class GlobalRouters(nn.Module):
             aux_loss += ((usage_rqk_K - target_rqk) ** 2).sum() * self.n_restore_qk
             aux_loss += ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
 
-        # Compute tau regularization loss (score-based: penalize tau > score_mean)
+        # Compute tau regularization loss (relative tau: penalize tau_offset > 0)
+        # With tau = mean + offset * std, tau > mean when offset > 0
         if self.training and self.learnable_tau and self.tau_reg_weight > 0:
-            # For each pool: relu(tau - score_mean) penalizes tau being too high
-            score_mean_fq = fqk_logits_Q.mean(dim=-1, keepdim=True).detach()
-            score_mean_fk = fqk_logits_K.mean(dim=-1, keepdim=True).detach()
-            score_mean_fv = fv_logits.mean(dim=-1, keepdim=True).detach()
-            score_mean_rq = rqk_logits_Q.mean(dim=-1, keepdim=True).detach()
-            score_mean_rk = rqk_logits_K.mean(dim=-1, keepdim=True).detach()
-            score_mean_rv = rv_logits.mean(dim=-1, keepdim=True).detach()
-
-            tau_reg = F.relu(tau_fq - score_mean_fq).mean()
-            tau_reg += F.relu(tau_fk - score_mean_fk).mean()
-            tau_reg += F.relu(tau_fv - score_mean_fv).mean()
-            tau_reg += F.relu(tau_rq - score_mean_rq).mean()
-            tau_reg += F.relu(tau_rk - score_mean_rk).mean()
-            tau_reg += F.relu(tau_rv - score_mean_rv).mean()
+            tau_reg = F.relu(tau_offset_fq * score_std_fq.detach()).mean()
+            tau_reg += F.relu(tau_offset_fk * score_std_fk.detach()).mean()
+            tau_reg += F.relu(tau_offset_fv * score_std_fv.detach()).mean()
+            tau_reg += F.relu(tau_offset_rq * score_std_rq.detach()).mean()
+            tau_reg += F.relu(tau_offset_rk * score_std_rk.detach()).mean()
+            tau_reg += F.relu(tau_offset_rv * score_std_rv.detach()).mean()
             aux_loss += tau_reg * self.tau_reg_weight
 
         # Package path weights
@@ -835,12 +854,22 @@ class GlobalRouters(nn.Module):
         """
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
-        # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
+        # Get thresholds (v18.4: relative tau = score_mean + tau_offset * score_std)
         if self.learnable_tau:
             if tau_all is None:
                 tau_all = self.tau_proj(x)  # fallback if not provided
-            tau_f = tau_all[..., 6:7]
-            tau_r = tau_all[..., 7:8]
+            # tau_all is now "offset" in units of std from mean
+            tau_offset_f = tau_all[..., 6:7]
+            tau_offset_r = tau_all[..., 7:8]
+
+            # Compute relative tau: mean + offset * std
+            score_mean_f = logits_f.mean(dim=-1, keepdim=True)
+            score_std_f = logits_f.std(dim=-1, keepdim=True) + 1e-8
+            tau_f = score_mean_f + tau_offset_f * score_std_f
+
+            score_mean_r = logits_r.mean(dim=-1, keepdim=True)
+            score_std_r = logits_r.std(dim=-1, keepdim=True) + 1e-8
+            tau_r = score_mean_r + tau_offset_r * score_std_r
         else:
             tau_f = tau_r = self.fixed_tau
 
@@ -877,13 +906,11 @@ class GlobalRouters(nn.Module):
             aux_loss += ((usage_f - target_f) ** 2).sum() * self.n_feature_know
             aux_loss += ((usage_r - target_r) ** 2).sum() * self.n_restore_know
 
-        # Compute tau regularization loss (score-based: penalize tau > score_mean)
+        # Compute tau regularization loss (relative tau: penalize tau_offset > 0)
+        # With tau = mean + offset * std, tau > mean when offset > 0
         if self.training and self.learnable_tau and self.tau_reg_weight > 0:
-            score_mean_f = logits_f.mean(dim=-1, keepdim=True).detach()
-            score_mean_r = logits_r.mean(dim=-1, keepdim=True).detach()
-
-            tau_reg = F.relu(tau_f - score_mean_f).mean()
-            tau_reg += F.relu(tau_r - score_mean_r).mean()
+            tau_reg = F.relu(tau_offset_f * score_std_f.detach()).mean()
+            tau_reg += F.relu(tau_offset_r * score_std_r.detach()).mean()
             aux_loss += tau_reg * self.tau_reg_weight
 
         # Routing stats only in debug mode (avoid GPU sync overhead)
