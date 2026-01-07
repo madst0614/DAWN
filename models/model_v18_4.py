@@ -625,25 +625,33 @@ class GlobalRouters(nn.Module):
         rv_paths, rv_weights, rv_mask, rv_gate, rv_conf = self._topk_select_and_chunk(
             rv_logits, tau_rv, self.path_max_k, self.max_paths)
 
-        # Compute aux_loss for load balancing (using softmax weights)
+        # Compute aux_loss for load balancing (score-based: softmax before top-k)
         aux_loss = 0.0
         if self.training:
+            # Score-based: use softmax(logits) instead of sparse weights
+            fqk_pref_Q = F.softmax(fqk_logits_Q, dim=-1)
+            fqk_pref_K = F.softmax(fqk_logits_K, dim=-1)
+            fv_pref = F.softmax(fv_logits, dim=-1)
+            rqk_pref_Q = F.softmax(rqk_logits_Q, dim=-1)
+            rqk_pref_K = F.softmax(rqk_logits_K, dim=-1)
+            rv_pref = F.softmax(rv_logits, dim=-1)
+
             if attention_mask is not None:
                 seq_mask = attention_mask.unsqueeze(-1).float()
                 count = seq_mask.sum() + 1e-8
-                usage_fqk_Q = (fqk_weights_Q * seq_mask).sum(dim=(0, 1)) / count
-                usage_fqk_K = (fqk_weights_K * seq_mask).sum(dim=(0, 1)) / count
-                usage_fv = (fv_weights * seq_mask).sum(dim=(0, 1)) / count
-                usage_rqk_Q = (rqk_weights_Q * seq_mask).sum(dim=(0, 1)) / count
-                usage_rqk_K = (rqk_weights_K * seq_mask).sum(dim=(0, 1)) / count
-                usage_rv = (rv_weights * seq_mask).sum(dim=(0, 1)) / count
+                usage_fqk_Q = (fqk_pref_Q * seq_mask).sum(dim=(0, 1)) / count
+                usage_fqk_K = (fqk_pref_K * seq_mask).sum(dim=(0, 1)) / count
+                usage_fv = (fv_pref * seq_mask).sum(dim=(0, 1)) / count
+                usage_rqk_Q = (rqk_pref_Q * seq_mask).sum(dim=(0, 1)) / count
+                usage_rqk_K = (rqk_pref_K * seq_mask).sum(dim=(0, 1)) / count
+                usage_rv = (rv_pref * seq_mask).sum(dim=(0, 1)) / count
             else:
-                usage_fqk_Q = fqk_weights_Q.mean(dim=(0, 1))
-                usage_fqk_K = fqk_weights_K.mean(dim=(0, 1))
-                usage_fv = fv_weights.mean(dim=(0, 1))
-                usage_rqk_Q = rqk_weights_Q.mean(dim=(0, 1))
-                usage_rqk_K = rqk_weights_K.mean(dim=(0, 1))
-                usage_rv = rv_weights.mean(dim=(0, 1))
+                usage_fqk_Q = fqk_pref_Q.mean(dim=(0, 1))
+                usage_fqk_K = fqk_pref_K.mean(dim=(0, 1))
+                usage_fv = fv_pref.mean(dim=(0, 1))
+                usage_rqk_Q = rqk_pref_Q.mean(dim=(0, 1))
+                usage_rqk_K = rqk_pref_K.mean(dim=(0, 1))
+                usage_rv = rv_pref.mean(dim=(0, 1))
 
             target_fqk = 1.0 / self.n_feature_qk
             target_fv = 1.0 / self.n_feature_v
@@ -829,6 +837,28 @@ class GlobalRouters(nn.Module):
             self.neuron_router.update_usage(f_mask.float(), 'feature_know', attention_mask)
             self.neuron_router.update_usage(r_mask.float(), 'restore_know', attention_mask)
 
+        # Compute aux_loss for load balancing (score-based: softmax before top-k)
+        aux_loss = 0.0
+        if self.training:
+            # Score-based: use softmax(logits) instead of sparse weights
+            f_pref = F.softmax(logits_f, dim=-1)
+            r_pref = F.softmax(logits_r, dim=-1)
+
+            if attention_mask is not None:
+                seq_mask = attention_mask.unsqueeze(-1).float()
+                count = seq_mask.sum() + 1e-8
+                usage_f = (f_pref * seq_mask).sum(dim=(0, 1)) / count
+                usage_r = (r_pref * seq_mask).sum(dim=(0, 1)) / count
+            else:
+                usage_f = f_pref.mean(dim=(0, 1))
+                usage_r = r_pref.mean(dim=(0, 1))
+
+            target_f = 1.0 / self.n_feature_know
+            target_r = 1.0 / self.n_restore_know
+
+            aux_loss += ((usage_f - target_f) ** 2).sum() * self.n_feature_know
+            aux_loss += ((usage_r - target_r) ** 2).sum() * self.n_restore_know
+
         # Routing stats only in debug mode (avoid GPU sync overhead)
         if self.debug_mode:
             def avg_paths_per_token(paths):
@@ -870,7 +900,7 @@ class GlobalRouters(nn.Module):
         else:
             know_info = {}
 
-        return f_paths, r_paths, know_info
+        return f_paths, r_paths, know_info, aux_loss
 
 
 class AttentionCircuit(nn.Module):
@@ -1116,7 +1146,7 @@ class DAWNBlock(nn.Module):
         # Knowledge
         normed_x_know = self.norm2(x)
         tau_all_know = global_routers.get_tau_all(normed_x_know)
-        feature_paths, restore_paths, know_info = global_routers.get_knowledge_weights(
+        feature_paths, restore_paths, know_info, know_aux_loss = global_routers.get_knowledge_weights(
             normed_x_know, importance, attention_mask, tau_all=tau_all_know
         )
         know_out = self.knowledge(normed_x_know, feature_paths, restore_paths, attention_mask)
@@ -1144,7 +1174,7 @@ class DAWNBlock(nn.Module):
             routing_info['attn_out_norm'] = attn_out.norm(dim=-1).mean().item()
             routing_info['know_out_norm'] = know_out.norm(dim=-1).mean().item()
 
-        return x, routing_info, attn_aux_loss
+        return x, routing_info, attn_aux_loss + know_aux_loss
 
 
 class DAWN(nn.Module):
