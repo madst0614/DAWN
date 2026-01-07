@@ -763,53 +763,55 @@ def format_v18_neuron_usage(router, model_version, prefix="      "):
     """
     Format v18 neuron usage stats from router.
     Returns list of formatted strings.
+
+    Optimized: Move EMA tensors to CPU first (8 GPU syncs), then compute on CPU.
     """
     lines = []
 
-    ema_fq = router.usage_ema_feature_q
-    ema_fk = router.usage_ema_feature_k
-    ema_fv = router.usage_ema_feature_v
-    ema_rq = router.usage_ema_restore_q
-    ema_rk = router.usage_ema_restore_k
-    ema_rv = router.usage_ema_restore_v
-    ema_FK = router.usage_ema_feature_know
-    ema_RK = router.usage_ema_restore_know
+    # Move all EMA tensors to CPU first (8 GPU syncs total)
+    with torch.no_grad():
+        ema_fq = router.usage_ema_feature_q.cpu()
+        ema_fk = router.usage_ema_feature_k.cpu()
+        ema_fv = router.usage_ema_feature_v.cpu()
+        ema_rq = router.usage_ema_restore_q.cpu()
+        ema_rk = router.usage_ema_restore_k.cpu()
+        ema_rv = router.usage_ema_restore_v.cpu()
+        ema_FK = router.usage_ema_feature_know.cpu()
+        ema_RK = router.usage_ema_restore_know.cpu()
 
-    # Active neuron counts (EMA > 0.01)
-    active_fq = (ema_fq > 0.01).sum().item()
-    active_fk = (ema_fk > 0.01).sum().item()
-    active_fv = (ema_fv > 0.01).sum().item()
-    active_rq = (ema_rq > 0.01).sum().item()
-    active_rk = (ema_rk > 0.01).sum().item()
-    active_rv = (ema_rv > 0.01).sum().item()
-    active_FK = (ema_FK > 0.01).sum().item()
-    active_RK = (ema_RK > 0.01).sum().item()
-    n_fq, n_fk, n_fv = ema_fq.numel(), ema_fk.numel(), ema_fv.numel()
-    n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
-    n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+    # Calculate all stats on CPU (no GPU sync for .item())
+    def calc_stats(ema):
+        n = ema.numel()
+        active = (ema > 0.01).sum().item()
+        dead = (ema < DEAD_NEURON_THRESHOLD).float().mean().item()
 
-    gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
-    gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
-    gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+        # Gini (CPU) - inline to avoid function call overhead
+        x_sorted = torch.sort(ema)[0]
+        idx = torch.arange(1, n + 1, dtype=ema.dtype)
+        gini = (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
 
-    # Entropy (normalized, 0=concentrated, 100=uniform)
-    ent_fq, ent_fk, ent_fv = _entropy(ema_fq), _entropy(ema_fk), _entropy(ema_fv)
-    ent_rq, ent_rk, ent_rv = _entropy(ema_rq), _entropy(ema_rk), _entropy(ema_rv)
-    ent_FK, ent_RK = _entropy(ema_FK), _entropy(ema_RK)
+        # Entropy (CPU)
+        p = ema / (ema.sum() + 1e-8)
+        log_p = torch.log(p + 1e-8)
+        entropy = -(p * log_p).sum()
+        max_ent = math.log(n)
+        ent = (entropy / max_ent * 100).item() if max_ent > 0 else 0.0
 
-    dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
+        return active, n, dead, gini, ent
 
-    lines.append(f"{prefix}Usage: FQ={int(active_fq)}/{n_fq} FK={int(active_fk)}/{n_fk} FV={int(active_fv)}/{n_fv} | RQ={int(active_rq)}/{n_rq} RK={int(active_rk)}/{n_rk} RV={int(active_rv)}/{n_rv} | Know: F={int(active_FK)}/{n_FK} R={int(active_RK)}/{n_RK}")
-    lines.append(f"{prefix}Ent: FQ={ent_fq:.0f} FK={ent_fk:.0f} FV={ent_fv:.0f} RQ={ent_rq:.0f} RK={ent_rk:.0f} RV={ent_rv:.0f} FKnow={ent_FK:.0f} RKnow={ent_RK:.0f}")
-    lines.append(f"{prefix}Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
-    lines.append(f"{prefix}Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
+    fq = calc_stats(ema_fq)
+    fk = calc_stats(ema_fk)
+    fv = calc_stats(ema_fv)
+    rq = calc_stats(ema_rq)
+    rk = calc_stats(ema_rk)
+    rv = calc_stats(ema_rv)
+    FK = calc_stats(ema_FK)
+    RK = calc_stats(ema_RK)
+
+    lines.append(f"{prefix}Usage: FQ={fq[0]}/{fq[1]} FK={fk[0]}/{fk[1]} FV={fv[0]}/{fv[1]} | RQ={rq[0]}/{rq[1]} RK={rk[0]}/{rk[1]} RV={rv[0]}/{rv[1]} | Know: F={FK[0]}/{FK[1]} R={RK[0]}/{RK[1]}")
+    lines.append(f"{prefix}Ent: FQ={fq[4]:.0f} FK={fk[4]:.0f} FV={fv[4]:.0f} RQ={rq[4]:.0f} RK={rk[4]:.0f} RV={rv[4]:.0f} FKnow={FK[4]:.0f} RKnow={RK[4]:.0f}")
+    lines.append(f"{prefix}Dead: FQ={fq[2]:.1%} FK={fk[2]:.1%} FV={fv[2]:.1%} RQ={rq[2]:.1%} RK={rk[2]:.1%} RV={rv[2]:.1%} FKnow={FK[2]:.1%} RKnow={RK[2]:.1%}")
+    lines.append(f"{prefix}Gini: FQ={fq[3]:.2f} FK={fk[3]:.2f} FV={fv[3]:.2f} RQ={rq[3]:.2f} RK={rk[3]:.2f} RV={rv[3]:.2f} FKnow={FK[3]:.2f} RKnow={RK[3]:.2f}")
 
     return lines
 
