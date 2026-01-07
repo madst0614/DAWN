@@ -468,8 +468,15 @@ class GlobalRouters(nn.Module):
         """
         return 0.0
 
-    def get_all_tau_values(self):
-        """Get all tau values as a dict (for logging). Returns bias values for learnable tau."""
+    def get_all_tau_offset_values(self):
+        """
+        Get all tau offset values as a dict (for logging).
+
+        v18.4: Returns tau_offset values (in std units from score mean).
+        Actual tau = score_mean + tau_offset * score_std
+
+        A tau_offset of -0.5 means threshold is 0.5 std below the mean.
+        """
         if self.learnable_tau:
             bias = self.tau_proj.bias.detach()
             return {
@@ -484,14 +491,14 @@ class GlobalRouters(nn.Module):
             }
         else:
             return {
-                'fq': self.fixed_tau,
-                'fk': self.fixed_tau,
-                'fv': self.fixed_tau,
-                'rq': self.fixed_tau,
-                'rk': self.fixed_tau,
-                'rv': self.fixed_tau,
-                'feature_know': self.fixed_tau,
-                'restore_know': self.fixed_tau,
+                'fq': 0.0,
+                'fk': 0.0,
+                'fv': 0.0,
+                'rq': 0.0,
+                'rk': 0.0,
+                'rv': 0.0,
+                'feature_know': 0.0,
+                'restore_know': 0.0,
             }
 
     def _topk_select_and_chunk(self, scores, tau, path_max_k, max_paths):
@@ -780,6 +787,13 @@ class GlobalRouters(nn.Module):
                 'tau_rk_std': tau_std(tau_rk),
                 'tau_rv': tau_mean(tau_rv),
                 'tau_rv_std': tau_std(tau_rv),
+                # v18.4: tau_offset values (learned parameter, in std units)
+                'tau_offset_fq': tau_mean(tau_offset_fq) if self.learnable_tau else 0.0,
+                'tau_offset_fk': tau_mean(tau_offset_fk) if self.learnable_tau else 0.0,
+                'tau_offset_fv': tau_mean(tau_offset_fv) if self.learnable_tau else 0.0,
+                'tau_offset_rq': tau_mean(tau_offset_rq) if self.learnable_tau else 0.0,
+                'tau_offset_rk': tau_mean(tau_offset_rk) if self.learnable_tau else 0.0,
+                'tau_offset_rv': tau_mean(tau_offset_rv) if self.learnable_tau else 0.0,
                 'learnable_tau': self.learnable_tau,
                 'use_soft_mask': True,
                 'token_routing': self.attention_token_routing,
@@ -941,6 +955,9 @@ class GlobalRouters(nn.Module):
                 'tau_feature_std': tau_std(tau_f),
                 'tau_restore': tau_mean(tau_r),
                 'tau_restore_std': tau_std(tau_r),
+                # v18.4: tau_offset values (learned parameter, in std units)
+                'tau_offset_feature': tau_mean(tau_offset_f) if self.learnable_tau else 0.0,
+                'tau_offset_restore': tau_mean(tau_offset_r) if self.learnable_tau else 0.0,
                 'gate_feature_mean': f_gate.mean().item(),
                 'gate_feature_std': f_gate.std().item(),
                 'gate_restore_mean': r_gate.mean().item(),
