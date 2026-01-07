@@ -508,7 +508,9 @@ class GlobalRouters(nn.Module):
         v18.4: Exponential gate scaling with gradient flow
         - gate = score - tau (positive) or 1e-8 * exp(score - tau) (negative, for gradient)
         - exp_gate = exp(gate) - 1 (amplifies differences, 0 when gate=0)
-        - scaled_weights = exp_gate / sum(exp_gate)
+        - ratio_weights = exp_gate / sum(exp_gate)
+        - gate_strength = tanh(max(exp_gate))  # overall confidence
+        - scaled_weights = ratio_weights * gate_strength
 
         Optimization: O(N log N) sort → O(N + k log k) top-k
         For N=1020, k=32: ~30x reduction in computation
@@ -552,11 +554,19 @@ class GlobalRouters(nn.Module):
         # 5. Exponential scaling for sparsity + normalization
         exp_gate = torch.exp(gate) - 1  # 차이 극대화, gate=0이면 0
         exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
-        scaled_weights = torch.where(
+
+        # 비율 계산
+        ratio_weights = torch.where(
             exp_gate_sum > 1e-8,
             exp_gate / (exp_gate_sum + 1e-8),
-            exp_gate * 1e-8
+            exp_gate * 1e-8  # gradient 유지
         )
+
+        # gate_strength: max exp_gate의 tanh로 전체 강도 조절
+        gate_strength = exp_gate.max(dim=-1, keepdim=True).values
+        gate_strength = torch.tanh(gate_strength)
+
+        scaled_weights = ratio_weights * gate_strength
 
         # 7. Chunk to paths (already sorted by topk)
         # Use scaled_weights.dtype to avoid AMP dtype mismatch (bfloat16/float16)
