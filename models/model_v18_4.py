@@ -759,6 +759,7 @@ class GlobalRouters(nn.Module):
 
             routing_info = {
                 # Only store scalar stats for logging (not large tensors to save memory)
+                'top_k': self.path_max_k * self.max_paths,  # for pass rate calculation
                 'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
                 'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
                 'n_paths_fv': avg_paths_per_token(fv_paths),
@@ -966,6 +967,7 @@ class GlobalRouters(nn.Module):
 
             know_info = {
                 # Only store scalar stats for logging (not large tensors to save memory)
+                'top_k': self.path_max_k * self.max_paths,  # for pass rate calculation
                 'n_paths_feature': avg_paths_per_token(f_paths),
                 'n_paths_restore': avg_paths_per_token(r_paths),
                 'selected_feature': avg_selected_per_token(f_mask),

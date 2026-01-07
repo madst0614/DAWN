@@ -636,7 +636,8 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
 
     # v18.4: Show pass rate % (selected / top_k)
     if model_version.startswith('18.4'):
-        top_k = 32  # path_max_k(8) * max_paths(4)
+        # Get top_k from routing_info (computed in debug_mode only)
+        top_k = routing_infos[0].get('attention', {}).get('top_k', 32) if routing_infos else 32
         def pct(sel): return sel / top_k * 100 if top_k > 0 else 0
         lines.append(f"{prefix}Selected: fqk_Q={sel_fqk_Q:.0f}({pct(sel_fqk_Q):.0f}%) fqk_K={sel_fqk_K:.0f}({pct(sel_fqk_K):.0f}%) fv={sel_fv:.0f}({pct(sel_fv):.0f}%) rqk_Q={sel_rqk_Q:.0f}({pct(sel_rqk_Q):.0f}%) rqk_K={sel_rqk_K:.0f}({pct(sel_rqk_K):.0f}%) rv={sel_rv:.0f}({pct(sel_rv):.0f}%) kf={sel_kf:.0f}({pct(sel_kf):.0f}%) kr={sel_kr:.0f}({pct(sel_kr):.0f}%)")
     else:
