@@ -424,6 +424,7 @@ class GlobalRouters(nn.Module):
         # ============================================================
         self.debug_mode = False
         self.store_pref_tensors = False
+        self.store_path_weights = False  # For returning path_weights in routing_info
 
         # Learnable tau parameters - token-level projection
         if learnable_tau:
