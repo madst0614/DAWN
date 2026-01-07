@@ -595,7 +595,7 @@ class GlobalRouters(nn.Module):
         mask = torch.zeros(B, S, N, device=scores.device, dtype=torch.bool)
         mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
 
-        return path_weights_list, weights, mask, gate, scaled_weights
+        return path_weights_list, weights, mask, gate, scaled_weights, gate_strength
 
     def get_attention_weights(self, x, importance, attention_mask=None, tau_all=None):
         """
@@ -655,17 +655,17 @@ class GlobalRouters(nn.Module):
             tau_fq = tau_fk = tau_fv = tau_rq = tau_rk = tau_rv = self.fixed_tau
 
         # Optimized top-k selection + threshold + softmax + chunking + confidence
-        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q, fqk_conf_Q = self._topk_select_and_chunk(
+        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q, fqk_conf_Q, fqk_gstr_Q = self._topk_select_and_chunk(
             fqk_logits_Q, tau_fq, self.path_max_k, self.max_paths)
-        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K, fqk_conf_K = self._topk_select_and_chunk(
+        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K, fqk_conf_K, fqk_gstr_K = self._topk_select_and_chunk(
             fqk_logits_K, tau_fk, self.path_max_k, self.max_paths)
-        fv_paths, fv_weights, fv_mask, fv_gate, fv_conf = self._topk_select_and_chunk(
+        fv_paths, fv_weights, fv_mask, fv_gate, fv_conf, fv_gstr = self._topk_select_and_chunk(
             fv_logits, tau_fv, self.path_max_k, self.max_paths)
-        rqk_paths_Q, rqk_weights_Q, rqk_mask_Q, rqk_gate_Q, rqk_conf_Q = self._topk_select_and_chunk(
+        rqk_paths_Q, rqk_weights_Q, rqk_mask_Q, rqk_gate_Q, rqk_conf_Q, rqk_gstr_Q = self._topk_select_and_chunk(
             rqk_logits_Q, tau_rq, self.path_max_k, self.max_paths)
-        rqk_paths_K, rqk_weights_K, rqk_mask_K, rqk_gate_K, rqk_conf_K = self._topk_select_and_chunk(
+        rqk_paths_K, rqk_weights_K, rqk_mask_K, rqk_gate_K, rqk_conf_K, rqk_gstr_K = self._topk_select_and_chunk(
             rqk_logits_K, tau_rk, self.path_max_k, self.max_paths)
-        rv_paths, rv_weights, rv_mask, rv_gate, rv_conf = self._topk_select_and_chunk(
+        rv_paths, rv_weights, rv_mask, rv_gate, rv_conf, rv_gstr = self._topk_select_and_chunk(
             rv_logits, tau_rv, self.path_max_k, self.max_paths)
 
         # Compute aux_loss for load balancing (score-based: softmax before top-k)
@@ -799,11 +799,24 @@ class GlobalRouters(nn.Module):
                 'tau_rv_std': tau_std(tau_rv),
                 # v18.4: tau_offset values (learned parameter, in std units)
                 'tau_offset_fq': tau_mean(tau_offset_fq) if self.learnable_tau else 0.0,
+                'tau_offset_fq_std': tau_std(tau_offset_fq) if self.learnable_tau else 0.0,
                 'tau_offset_fk': tau_mean(tau_offset_fk) if self.learnable_tau else 0.0,
+                'tau_offset_fk_std': tau_std(tau_offset_fk) if self.learnable_tau else 0.0,
                 'tau_offset_fv': tau_mean(tau_offset_fv) if self.learnable_tau else 0.0,
+                'tau_offset_fv_std': tau_std(tau_offset_fv) if self.learnable_tau else 0.0,
                 'tau_offset_rq': tau_mean(tau_offset_rq) if self.learnable_tau else 0.0,
+                'tau_offset_rq_std': tau_std(tau_offset_rq) if self.learnable_tau else 0.0,
                 'tau_offset_rk': tau_mean(tau_offset_rk) if self.learnable_tau else 0.0,
+                'tau_offset_rk_std': tau_std(tau_offset_rk) if self.learnable_tau else 0.0,
                 'tau_offset_rv': tau_mean(tau_offset_rv) if self.learnable_tau else 0.0,
+                'tau_offset_rv_std': tau_std(tau_offset_rv) if self.learnable_tau else 0.0,
+                # v18.4: gate_strength (tanh of max exp_gate, 0~1)
+                'gstr_fq': fqk_gstr_Q.mean().item(),
+                'gstr_fk': fqk_gstr_K.mean().item(),
+                'gstr_fv': fv_gstr.mean().item(),
+                'gstr_rq': rqk_gstr_Q.mean().item(),
+                'gstr_rk': rqk_gstr_K.mean().item(),
+                'gstr_rv': rv_gstr.mean().item(),
                 'learnable_tau': self.learnable_tau,
                 'use_soft_mask': True,
                 'token_routing': self.attention_token_routing,
@@ -898,9 +911,9 @@ class GlobalRouters(nn.Module):
             tau_f = tau_r = self.fixed_tau
 
         # Optimized top-k selection + threshold + softmax + chunking + confidence
-        f_paths, f_weights, f_mask, f_gate, f_conf = self._topk_select_and_chunk(
+        f_paths, f_weights, f_mask, f_gate, f_conf, f_gstr = self._topk_select_and_chunk(
             logits_f, tau_f, self.path_max_k, self.max_paths)
-        r_paths, r_weights, r_mask, r_gate, r_conf = self._topk_select_and_chunk(
+        r_paths, r_weights, r_mask, r_gate, r_conf, r_gstr = self._topk_select_and_chunk(
             logits_r, tau_r, self.path_max_k, self.max_paths)
 
         # Update usage with mask (binary selection)
@@ -967,7 +980,12 @@ class GlobalRouters(nn.Module):
                 'tau_restore_std': tau_std(tau_r),
                 # v18.4: tau_offset values (learned parameter, in std units)
                 'tau_offset_feature': tau_mean(tau_offset_f) if self.learnable_tau else 0.0,
+                'tau_offset_feature_std': tau_std(tau_offset_f) if self.learnable_tau else 0.0,
                 'tau_offset_restore': tau_mean(tau_offset_r) if self.learnable_tau else 0.0,
+                'tau_offset_restore_std': tau_std(tau_offset_r) if self.learnable_tau else 0.0,
+                # v18.4: gate_strength (tanh of max exp_gate, 0~1)
+                'gstr_feature': f_gstr.mean().item(),
+                'gstr_restore': r_gstr.mean().item(),
                 'gate_feature_mean': f_gate.mean().item(),
                 'gate_feature_std': f_gate.std().item(),
                 'gate_restore_mean': r_gate.mean().item(),
