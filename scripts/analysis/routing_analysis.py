@@ -71,7 +71,7 @@ class GenerationRoutingAnalyzer:
         self.model.eval()
 
         # Detect v18.2+ models (uses path_weights instead of per-pool weights)
-        self.is_v18_2 = hasattr(model, '__version__') and model.__version__ in ("18.2", "18.3")
+        self.is_v18_2 = hasattr(model, '__version__') and model.__version__.startswith('18.')
 
     def _enable_pref_tensors(self):
         """Enable store_pref_tensors for detailed analysis (v18.2+)."""

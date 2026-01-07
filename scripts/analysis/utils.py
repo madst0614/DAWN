@@ -262,9 +262,10 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
         dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
 
         if all(k in cleaned for k in v18_2_keys):
-            # Could be 18.2 or 18.3 - check config for hints
-            if config.get('model_version') == '18.3':
-                version = '18.3'
+            # Could be 18.2, 18.3, 18.4 - check config for hints
+            cfg_version = config.get('model_version', '')
+            if cfg_version.startswith('18.'):
+                version = cfg_version
             else:
                 version = '18.2'  # Default to 18.2 for v18.x
         elif any(k in cleaned for k in dawn_keys):
