@@ -34,14 +34,14 @@ model:
   state_dim: 64
 
   # Attention - 4x neurons from v17.1
-  n_feature_qk: 384
+  n_feature_qk: 300
   n_feature_v: 1000
-  n_restore_qk: 384
+  n_restore_qk: 300
   n_restore_v: 1000
 
   # Knowledge - 4x neurons from v17.1
-  n_feature_know: 580
-  n_restore_know: 580
+  n_feature_know: 650
+  n_restore_know: 650
   knowledge_rank: 16
 
   max_seq_len: 512
