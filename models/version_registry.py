@@ -2,6 +2,7 @@
 DAWN Model Version Registry - Single Source of Truth
 
 Supported Versions:
+  v18.5: Context-Aware Restore Routing (restore routing on [h_proj, neuron_context])
   v18.4: Relative Confidence Scaling (confidence = gate / gate_sum)
   v18.3: Confidence-Scaled Soft Gating (confidence = gate / (gate + 1))
   v18.2: ReLU-Masked Learnable Tau (mask = ReLU(scores - tau) > 0, Q/K separated)
@@ -131,6 +132,44 @@ def is_v18_plus(model) -> bool:
 # =============================================================================
 
 VERSION_REGISTRY = {
+    "18.5": {
+        "description": "Context-Aware Restore Routing",
+        "aliases": ["185"],
+        "module": "model_v18_5",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "max_paths": 4,
+            "fixed_tau": 0.0,
+            "path_max_k": 16,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "attention_token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+            "learnable_tau": True,
+            "tau_reg_weight": 0.0,
+        },
+        "display_info": lambda args: [
+            f"DAWN v18.5: Context-Aware Restore Routing",
+            f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}, path_max_k={args.get('path_max_k', 16)}",
+            f"  Feature routing on x, Restore routing on [h_proj, neuron_ctx]",
+            f"  F-QK: {args.get('n_feature_qk')} - tau on x",
+            f"  F-V: {args.get('n_feature_v')} - tau on x",
+            f"  R-QK: {args.get('n_restore_qk')} - context-based routing",
+            f"  R-V: {args.get('n_restore_v')} - context-based routing",
+            f"  F-Know: {args.get('n_feature_know')}, R-Know: {args.get('n_restore_know')} (context-routed)",
+        ],
+    },
+
     "18.4": {
         "description": "Relative Confidence Scaling",
         "aliases": ["184"],

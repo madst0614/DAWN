@@ -1,6 +1,12 @@
 """
 DAWN Models Module
 
+v18.5: Context-Aware Restore Routing
+- Feature routing: done on input x (same as v18.4)
+- Restore routing: done on [h_proj, neuron_context]
+- h_proj: intermediate representation h projected to d_space
+- neuron_context: weighted sum of feature neuron embeddings
+
 v18.4: Relative Confidence Scaling
 - Gate: gate = ReLU(scores - tau), can be 0
 - Confidence: confidence = gate / gate_sum (relative, sums to 1)
@@ -40,6 +46,9 @@ v17.2: Feature QK Unified + Restore Q/K Separate
 
 baseline: Vanilla Transformer for fair comparison
 """
+
+# v18.5 - Context-Aware Restore Routing
+from .model_v18_5 import DAWN as DAWN_v18_5
 
 # v18.4 - Relative Confidence Scaling
 from .model_v18_4 import DAWN as DAWN_v18_4
@@ -95,6 +104,7 @@ from .version_registry import (
 __all__ = [
     # Models
     'DAWN',
+    'DAWN_v18_5',
     'DAWN_v18_4',
     'DAWN_v18_3',
     'DAWN_v18_2',
@@ -134,7 +144,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "18.4", "18.3", "18.2", "18.1", "18.0", "17.2", "17.1", or "baseline"
+        version: "18.5", "18.4", "18.3", "18.2", "18.1", "18.0", "17.2", "17.1", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -145,7 +155,9 @@ def create_model_by_version(version, config):
 
     version = normalize_version(version)
 
-    if version == "18.4":
+    if version == "18.5":
+        return DAWN_v18_5(**config)
+    elif version == "18.4":
         return DAWN_v18_4(**config)
     elif version == "18.3":
         return DAWN_v18_3(**config)
@@ -161,4 +173,4 @@ def create_model_by_version(version, config):
         return DAWN_v17_1(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 18.4, 18.3, 18.2, 18.1, 18.0, 17.2, 17.1, baseline")
+                        f"Supported versions: 18.5, 18.4, 18.3, 18.2, 18.1, 18.0, 17.2, 17.1, baseline")

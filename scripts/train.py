@@ -635,8 +635,8 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
     sel_kf, ss_kf = get_mean_std('selected_feature', 'knowledge')
     sel_kr, ss_kr = get_mean_std('selected_restore', 'knowledge')
 
-    # v18.4: Show pass rate % (selected / top_k)
-    if model_version.startswith('18.4'):
+    # v18.4/v18.5: Show pass rate % (selected / top_k)
+    if model_version.startswith('18.4') or model_version.startswith('18.5'):
         # Get top_k from routing_info (computed in debug_mode only)
         top_k = routing_infos[0].get('attention', {}).get('top_k', 32) if routing_infos else 32
         def pct(sel): return sel / top_k * 100 if top_k > 0 else 0
@@ -644,8 +644,8 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
     else:
         lines.append(f"{prefix}Selected: fqk_Q={sel_fqk_Q:.0f}±{ss_fqk_Q:.0f} fqk_K={sel_fqk_K:.0f}±{ss_fqk_K:.0f} fv={sel_fv:.0f}±{ss_fv:.0f} rqk_Q={sel_rqk_Q:.0f}±{ss_rqk_Q:.0f} rqk_K={sel_rqk_K:.0f}±{ss_rqk_K:.0f} rv={sel_rv:.0f}±{ss_rv:.0f} kf={sel_kf:.0f}±{ss_kf:.0f} kr={sel_kr:.0f}±{ss_kr:.0f}")
 
-    # Score distribution (mean±std, average across layers) - skip for v18.4 (simplified output)
-    if not model_version.startswith('18.4'):
+    # Score distribution (mean±std, average across layers) - skip for v18.4/v18.5 (simplified output)
+    if not model_version.startswith('18.4') and not model_version.startswith('18.5'):
         score_fqk_Q_mean = sum(ri.get('attention', ri).get('score_fqk_Q_mean', 0) for ri in routing_infos) / n
         score_fqk_Q_std = sum(ri.get('attention', ri).get('score_fqk_Q_std', 0) for ri in routing_infos) / n
         score_fqk_K_mean = sum(ri.get('attention', ri).get('score_fqk_K_mean', 0) for ri in routing_infos) / n
@@ -666,8 +666,8 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         lines.append(f"{prefix}Score: fqk_Q={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fqk_K={score_fqk_K_mean:.2f}±{score_fqk_K_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk_Q={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rqk_K={score_rqk_K_mean:.2f}±{score_rqk_K_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f} kf={score_kf_mean:.2f}±{score_kf_std:.2f} kr={score_kr_mean:.2f}±{score_kr_std:.2f}")
 
     # v18.1+ specific: Tau and Gate with mean±std (18.1, 18.2, 18.3)
-    # v18.4 uses relative tau, so absolute Tau values are not meaningful
-    if model_version.startswith('18.') and not model_version.startswith('18.0') and not model_version.startswith('18.4'):
+    # v18.4/v18.5 use relative tau, so absolute Tau values are not meaningful
+    if model_version.startswith('18.') and not model_version.startswith('18.0') and not model_version.startswith('18.4') and not model_version.startswith('18.5'):
         # Tau with std (absolute values, meaningful for v18.1-18.3)
         tau_fq = sum(ri.get('attention', {}).get('tau_fq', 0) for ri in routing_infos) / n
         tau_fq_std = sum(ri.get('attention', {}).get('tau_fq_std', 0) for ri in routing_infos) / n
@@ -716,8 +716,28 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         ovlp_rqk = sum(ri.get('attention', {}).get('overlap_rqk', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}Overlap: fqk={ovlp_fqk:.0%} rqk={ovlp_rqk:.0%}")
 
-    # Gate with std (v18.1-18.3, skip for v18.4)
-    if model_version.startswith('18.') and not model_version.startswith('18.0') and not model_version.startswith('18.4'):
+    # v18.5: tau_offset for feature only (restore is context-based)
+    if model_version.startswith('18.5'):
+        # tau_offset with +/- sign format (feature only)
+        off_fq = sum(ri.get('attention', {}).get('tau_offset_fq', 0) for ri in routing_infos) / n
+        off_fk = sum(ri.get('attention', {}).get('tau_offset_fk', 0) for ri in routing_infos) / n
+        off_fv = sum(ri.get('attention', {}).get('tau_offset_fv', 0) for ri in routing_infos) / n
+        off_kf = sum(ri.get('knowledge', {}).get('tau_offset_feature', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}TauOff(feat): fq={off_fq:+.2f} fk={off_fk:+.2f} fv={off_fv:+.2f} kf={off_kf:+.2f} (restore=ctx)")
+
+        # gate_strength (feature only from routing_info)
+        gstr_fq = sum(ri.get('attention', {}).get('gstr_fq', 0) for ri in routing_infos) / n
+        gstr_fk = sum(ri.get('attention', {}).get('gstr_fk', 0) for ri in routing_infos) / n
+        gstr_fv = sum(ri.get('attention', {}).get('gstr_fv', 0) for ri in routing_infos) / n
+        gstr_kf = sum(ri.get('knowledge', {}).get('gstr_feature', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}GateStr(feat): fq={gstr_fq:.2f} fk={gstr_fk:.2f} fv={gstr_fv:.2f} kf={gstr_kf:.2f}")
+
+        # Overlap (Q/K mask overlap ratio) - feature only for v18.5
+        ovlp_fqk = sum(ri.get('attention', {}).get('overlap_fqk', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}Overlap: fqk={ovlp_fqk:.0%}")
+
+    # Gate with std (v18.1-18.3, skip for v18.4/v18.5)
+    if model_version.startswith('18.') and not model_version.startswith('18.0') and not model_version.startswith('18.4') and not model_version.startswith('18.5'):
         gate_fq = sum(ri.get('attention', {}).get('gate_fq_mean', 0) for ri in routing_infos) / n
         gate_fq_std = sum(ri.get('attention', {}).get('gate_fq_std', 0) for ri in routing_infos) / n
         gate_fk = sum(ri.get('attention', {}).get('gate_fk_mean', 0) for ri in routing_infos) / n
@@ -1449,13 +1469,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Compact output with loss/acc
                     model_version = getattr(base_model, '__version__', '')
                     if model_version.startswith('18'):
-                        # Get tau gradient info if available (v18.1, v18.2, v18.3)
+                        # Get tau gradient info if available (v18.1, v18.2, v18.3, v18.4, v18.5)
                         tau_grad_info = None
-                        if hasattr(base_model, 'router') and hasattr(base_model.router, 'tau_proj'):
-                            if base_model.router.tau_proj.weight.grad is not None:
+                        if hasattr(base_model, 'router'):
+                            # v18.5 uses tau_proj_feature, v18.1-18.4 use tau_proj
+                            tau_proj = getattr(base_model.router, 'tau_proj_feature', None) or getattr(base_model.router, 'tau_proj', None)
+                            if tau_proj is not None and tau_proj.weight.grad is not None:
                                 tau_grad_info = {
-                                    'weight': base_model.router.tau_proj.weight.grad.norm().item(),
-                                    'bias': base_model.router.tau_proj.bias.grad.norm().item() if base_model.router.tau_proj.bias.grad is not None else 0
+                                    'weight': tau_proj.weight.grad.norm().item(),
+                                    'bias': tau_proj.bias.grad.norm().item() if tau_proj.bias.grad is not None else 0
                                 }
 
                         # Use unified formatter for v18 logging
