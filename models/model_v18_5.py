@@ -489,13 +489,21 @@ class GlobalRouters(nn.Module):
         self.store_pref_tensors = False
         self.store_path_weights = False
 
-        # v18.5: Learnable tau for feature routing only (6 pools)
-        # Restore tau is computed from context scores
+        # v18.5: Learnable tau for both feature and restore routing
         if learnable_tau:
-            # Feature tau projection: [fq, fk, fv, feature_know]
+            # Feature tau projection (input: d_model): [fq, fk, fv, feature_know]
             self.tau_proj_feature = nn.Linear(d_model, 4)
             nn.init.zeros_(self.tau_proj_feature.weight)
             nn.init.constant_(self.tau_proj_feature.bias, -0.5)
+
+            # Restore tau projection (input: 2*d_space, context-based)
+            self.tau_proj_restore_qk = nn.Linear(2 * d_space, 1)    # rqk (Q/K shared)
+            self.tau_proj_restore_v = nn.Linear(2 * d_space, 1)     # rv
+            self.tau_proj_restore_know = nn.Linear(2 * d_space, 1)  # restore_know
+
+            for proj in [self.tau_proj_restore_qk, self.tau_proj_restore_v, self.tau_proj_restore_know]:
+                nn.init.zeros_(proj.weight)
+                nn.init.constant_(proj.bias, -0.5)
 
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
@@ -524,26 +532,25 @@ class GlobalRouters(nn.Module):
 
     def get_all_tau_offset_values(self):
         """
-        v18.5: Returns tau_offset values for feature pools only.
-        Restore tau is context-dependent and not logged here.
+        v18.5: Returns tau_offset values for all pools.
+        Feature: bias from tau_proj_feature
+        Restore: bias from tau_proj_restore_* (context-based projections)
         """
         if self.learnable_tau:
-            bias = self.tau_proj_feature.bias.detach()
+            feat_bias = self.tau_proj_feature.bias.detach()
             return {
-                'fq': bias[0].item(),
-                'fk': bias[1].item(),
-                'fv': bias[2].item(),
-                'feature_know': bias[3].item(),
-                # Restore tau is context-dependent
-                'rq': 0.0,
-                'rk': 0.0,
-                'rv': 0.0,
-                'restore_know': 0.0,
+                'fq': feat_bias[0].item(),
+                'fk': feat_bias[1].item(),
+                'fv': feat_bias[2].item(),
+                'feature_know': feat_bias[3].item(),
+                'rqk': self.tau_proj_restore_qk.bias.detach().item(),
+                'rv': self.tau_proj_restore_v.bias.detach().item(),
+                'restore_know': self.tau_proj_restore_know.bias.detach().item(),
             }
         else:
             return {
                 'fq': 0.0, 'fk': 0.0, 'fv': 0.0,
-                'rq': 0.0, 'rk': 0.0, 'rv': 0.0,
+                'rqk': 0.0, 'rv': 0.0,
                 'feature_know': 0.0, 'restore_know': 0.0,
             }
 
@@ -806,7 +813,7 @@ class GlobalRouters(nn.Module):
 
     def get_restore_attention_weights(self, ctx, pool_type, attention_mask=None):
         """
-        v18.5: Context-aware restore attention routing.
+        v18.5: Context-aware restore attention routing with learnable tau.
 
         Args:
             ctx: [P, B, S, 2*d_space] context (h_proj + neuron_context)
@@ -823,12 +830,21 @@ class GlobalRouters(nn.Module):
         if pool_type == 'qk':
             logits = self.neuron_router.get_restore_qk_logits_from_context(ctx)  # [P, B, S, N_rqk]
             n_neurons = self.n_restore_qk
+            tau_proj = self.tau_proj_restore_qk if self.learnable_tau else None
         else:
             logits = self.neuron_router.get_restore_v_logits_from_context(ctx)   # [P, B, S, N_rv]
             n_neurons = self.n_restore_v
+            tau_proj = self.tau_proj_restore_v if self.learnable_tau else None
 
-        # Compute tau from context scores (mean-based, no learnable offset for restore)
-        tau = logits.mean(dim=-1, keepdim=True)
+        # Compute tau (learnable offset from context)
+        if self.learnable_tau:
+            # ctx: [P, B, S, 2*d_space] -> tau_offset: [P, B, S, 1]
+            ctx_flat = ctx.view(P * B, S, -1)
+            tau_offset = tau_proj(ctx_flat).view(P, B, S, 1)
+            tau = logits.mean(dim=-1, keepdim=True) + tau_offset * (logits.std(dim=-1, keepdim=True) + 1e-8)
+        else:
+            tau_offset = 0.0
+            tau = logits.mean(dim=-1, keepdim=True)
 
         # Batched top-k selection
         weights, mask = self._topk_select_batched(logits, tau, self.path_max_k)
@@ -840,6 +856,11 @@ class GlobalRouters(nn.Module):
             usage = pref.mean(dim=(0, 1, 2))  # Average over P, B, S
             target = 1.0 / n_neurons
             aux_loss = ((usage - target) ** 2).sum() * n_neurons
+
+        # Tau regularization (penalize positive tau_offset)
+        if self.training and self.learnable_tau and self.tau_reg_weight > 0:
+            tau_reg = F.relu(tau_offset).mean()
+            aux_loss = aux_loss + tau_reg * self.tau_reg_weight
 
         # Update usage
         if self.training:
@@ -854,6 +875,8 @@ class GlobalRouters(nn.Module):
             with torch.no_grad():
                 selected = mask.float().sum(dim=-1).mean().item()
                 routing_info[f'selected_r{pool_type}'] = selected
+                if self.learnable_tau:
+                    routing_info[f'tau_offset_r{pool_type}'] = tau_offset.mean().item()
 
         return weights, aux_loss, routing_info
 
@@ -926,7 +949,7 @@ class GlobalRouters(nn.Module):
 
     def get_restore_knowledge_weights(self, ctx, attention_mask=None):
         """
-        v18.5: Context-aware restore knowledge routing.
+        v18.5: Context-aware restore knowledge routing with learnable tau.
 
         Args:
             ctx: [P, B, S, 2*d_space] context (h_proj + neuron_context)
@@ -941,8 +964,14 @@ class GlobalRouters(nn.Module):
 
         logits = self.neuron_router.get_restore_know_logits_from_context(ctx)  # [P, B, S, N_r]
 
-        # Compute tau from context scores
-        tau = logits.mean(dim=-1, keepdim=True)
+        # Compute tau (learnable offset from context)
+        if self.learnable_tau:
+            ctx_flat = ctx.view(P * B, S, -1)
+            tau_offset = self.tau_proj_restore_know(ctx_flat).view(P, B, S, 1)
+            tau = logits.mean(dim=-1, keepdim=True) + tau_offset * (logits.std(dim=-1, keepdim=True) + 1e-8)
+        else:
+            tau_offset = 0.0
+            tau = logits.mean(dim=-1, keepdim=True)
 
         # Batched top-k selection
         weights, mask = self._topk_select_batched(logits, tau, self.path_max_k)
@@ -955,6 +984,11 @@ class GlobalRouters(nn.Module):
             target = 1.0 / self.n_restore_know
             aux_loss = ((usage - target) ** 2).sum() * self.n_restore_know
 
+        # Tau regularization
+        if self.training and self.learnable_tau and self.tau_reg_weight > 0:
+            tau_reg = F.relu(tau_offset).mean()
+            aux_loss = aux_loss + tau_reg * self.tau_reg_weight
+
         # Update usage
         if self.training:
             mask_avg = mask.float().mean(dim=0)
@@ -966,6 +1000,8 @@ class GlobalRouters(nn.Module):
             with torch.no_grad():
                 selected = mask.float().sum(dim=-1).mean().item()
                 routing_info['selected_restore'] = selected
+                if self.learnable_tau:
+                    routing_info['tau_offset_restore'] = tau_offset.mean().item()
 
         return weights, aux_loss, routing_info
 
@@ -1426,9 +1462,15 @@ class DAWN(nn.Module):
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                # Skip tau_proj_feature (has its own initialization)
-                if hasattr(self, 'router') and hasattr(self.router, 'tau_proj_feature'):
-                    if module is self.router.tau_proj_feature:
+                # Skip tau projections (have their own initialization)
+                if hasattr(self, 'router'):
+                    skip_modules = [
+                        getattr(self.router, 'tau_proj_feature', None),
+                        getattr(self.router, 'tau_proj_restore_qk', None),
+                        getattr(self.router, 'tau_proj_restore_v', None),
+                        getattr(self.router, 'tau_proj_restore_know', None),
+                    ]
+                    if module in skip_modules:
                         continue
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:

@@ -716,14 +716,20 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         ovlp_rqk = sum(ri.get('attention', {}).get('overlap_rqk', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}Overlap: fqk={ovlp_fqk:.0%} rqk={ovlp_rqk:.0%}")
 
-    # v18.5: tau_offset for feature only (restore is context-based)
+    # v18.5: tau_offset for both feature and restore (context-based learnable tau)
     if model_version.startswith('18.5'):
-        # tau_offset with +/- sign format (feature only)
+        # Feature tau_offset
         off_fq = sum(ri.get('attention', {}).get('tau_offset_fq', 0) for ri in routing_infos) / n
         off_fk = sum(ri.get('attention', {}).get('tau_offset_fk', 0) for ri in routing_infos) / n
         off_fv = sum(ri.get('attention', {}).get('tau_offset_fv', 0) for ri in routing_infos) / n
         off_kf = sum(ri.get('knowledge', {}).get('tau_offset_feature', 0) for ri in routing_infos) / n
-        lines.append(f"{prefix}TauOff(feat): fq={off_fq:+.2f} fk={off_fk:+.2f} fv={off_fv:+.2f} kf={off_kf:+.2f} (restore=ctx)")
+        lines.append(f"{prefix}TauOff(feat): fq={off_fq:+.2f} fk={off_fk:+.2f} fv={off_fv:+.2f} kf={off_kf:+.2f}")
+
+        # Restore tau_offset (context-based learnable)
+        off_rqk = sum(ri.get('attention', {}).get('tau_offset_rqk', 0) for ri in routing_infos) / n
+        off_rv = sum(ri.get('attention', {}).get('tau_offset_rv', 0) for ri in routing_infos) / n
+        off_kr = sum(ri.get('knowledge', {}).get('tau_offset_restore', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}TauOff(rest): rqk={off_rqk:+.2f} rv={off_rv:+.2f} kr={off_kr:+.2f}")
 
         # gate_strength (feature only from routing_info)
         gstr_fq = sum(ri.get('attention', {}).get('gstr_fq', 0) for ri in routing_infos) / n
@@ -1472,13 +1478,23 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         # Get tau gradient info if available (v18.1, v18.2, v18.3, v18.4, v18.5)
                         tau_grad_info = None
                         if hasattr(base_model, 'router'):
-                            # v18.5 uses tau_proj_feature, v18.1-18.4 use tau_proj
+                            # v18.5 uses tau_proj_feature + tau_proj_restore_*, v18.1-18.4 use tau_proj
                             tau_proj = getattr(base_model.router, 'tau_proj_feature', None) or getattr(base_model.router, 'tau_proj', None)
                             if tau_proj is not None and tau_proj.weight.grad is not None:
                                 tau_grad_info = {
                                     'weight': tau_proj.weight.grad.norm().item(),
                                     'bias': tau_proj.bias.grad.norm().item() if tau_proj.bias.grad is not None else 0
                                 }
+                                # v18.5: also log restore tau gradients
+                                restore_tau_projs = [
+                                    ('rqk', getattr(base_model.router, 'tau_proj_restore_qk', None)),
+                                    ('rv', getattr(base_model.router, 'tau_proj_restore_v', None)),
+                                    ('rknow', getattr(base_model.router, 'tau_proj_restore_know', None)),
+                                ]
+                                for name, proj in restore_tau_projs:
+                                    if proj is not None and proj.weight.grad is not None:
+                                        tau_grad_info[f'weight_{name}'] = proj.weight.grad.norm().item()
+                                        tau_grad_info[f'bias_{name}'] = proj.bias.grad.norm().item() if proj.bias.grad is not None else 0
 
                         # Use unified formatter for v18 logging
                         router = base_model.router.neuron_router
