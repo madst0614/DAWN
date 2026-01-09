@@ -1081,10 +1081,10 @@ class AttentionCircuit(nn.Module):
 
         # h projection (Q/K 합쳐서 효율적 처리)
         h_qk_cat = torch.cat([h_q_all, h_k_all], dim=0)  # [2P, B, S, R]
-        h_qk_proj = self.proj_h_qk(h_qk_cat.view(2*P*B, S, -1)).view(2*P, B, S, self.d_space)
+        h_qk_proj = self.proj_h_qk(h_qk_cat.reshape(2*P*B, S, -1)).view(2*P, B, S, self.d_space)
         h_q_proj, h_k_proj = h_qk_proj[:P], h_qk_proj[P:]  # 각 [P, B, S, d_space]
 
-        h_v_proj = self.proj_h_v(h_v_all.view(P*B, S, -1)).view(P, B, S, self.d_space)
+        h_v_proj = self.proj_h_v(h_v_all.reshape(P*B, S, -1)).view(P, B, S, self.d_space)
 
         # neuron context: weighted sum of feature embeddings
         ctx_q = torch.einsum('pbsn,nd->pbsd', fqk_w_Q_stacked, fqk_emb)  # [P, B, S, d_space]
@@ -1218,7 +1218,7 @@ class KnowledgeCircuit(nn.Module):
         # ===== Restore context 생성 =====
         feature_emb = router.neuron_router.get_feature_know_emb()  # [N_f, d_space]
 
-        h_proj = self.proj_h_know(h_all.view(P*B, S, -1)).view(P, B, S, self.d_space)
+        h_proj = self.proj_h_know(h_all.reshape(P*B, S, -1)).view(P, B, S, self.d_space)
         neuron_ctx = torch.einsum('pbsn,nd->pbsd', feature_stacked, feature_emb)  # [P, B, S, d_space]
         restore_input = torch.cat([h_proj, neuron_ctx], dim=-1)  # [P, B, S, 2*d_space]
 
