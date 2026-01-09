@@ -165,8 +165,9 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        emb_norm = F.normalize(self.neuron_emb, dim=-1)
-        rqk_emb = emb_norm[self.feature_v_end:self.restore_qk_end]
+        # Optimized: slice first, normalize after (5.5x less computation)
+        rqk_emb_raw = self.neuron_emb[self.feature_v_end:self.restore_qk_end]
+        rqk_emb = F.normalize(rqk_emb_raw, dim=-1)
 
         h = self.norm_restore_qk_ctx(self.dropout(self.proj_restore_qk_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, rqk_emb)
@@ -187,8 +188,9 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        emb_norm = F.normalize(self.neuron_emb, dim=-1)
-        rv_emb = emb_norm[self.restore_qk_end:self.restore_v_end]
+        # Optimized: slice first, normalize after
+        rv_emb_raw = self.neuron_emb[self.restore_qk_end:self.restore_v_end]
+        rv_emb = F.normalize(rv_emb_raw, dim=-1)
 
         h = self.norm_restore_v_ctx(self.dropout(self.proj_restore_v_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, rv_emb)
@@ -209,8 +211,9 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        emb_norm = F.normalize(self.neuron_emb, dim=-1)
-        restore_know_emb = emb_norm[self.feature_know_end:]
+        # Optimized: slice first, normalize after
+        restore_know_emb_raw = self.neuron_emb[self.feature_know_end:]
+        restore_know_emb = F.normalize(restore_know_emb_raw, dim=-1)
 
         h = self.norm_restore_know_ctx(self.dropout(self.proj_restore_know_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, restore_know_emb)
