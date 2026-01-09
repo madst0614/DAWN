@@ -816,6 +816,7 @@ class GlobalRouters(nn.Module):
         Returns:
             weights: [P, B, S, N] sparse weights
             aux_loss: auxiliary loss
+            routing_info: dict with routing stats (only when debug_mode=True)
         """
         P, B, S, _ = ctx.shape
 
@@ -847,7 +848,14 @@ class GlobalRouters(nn.Module):
             mask_avg = mask.float().mean(dim=0)  # [B, S, N]
             self.neuron_router.update_usage(mask_avg, neuron_type, attention_mask)
 
-        return weights, aux_loss
+        # Debug info
+        routing_info = {}
+        if self.debug_mode:
+            with torch.no_grad():
+                selected = mask.float().sum(dim=-1).mean().item()
+                routing_info[f'selected_r{pool_type}'] = selected
+
+        return weights, aux_loss, routing_info
 
     def get_feature_knowledge_weights(self, x, attention_mask=None, tau_feature=None):
         """
@@ -927,6 +935,7 @@ class GlobalRouters(nn.Module):
         Returns:
             weights: [P, B, S, N] sparse weights
             aux_loss: auxiliary loss
+            routing_info: dict with routing stats (only when debug_mode=True)
         """
         P, B, S, _ = ctx.shape
 
@@ -951,7 +960,14 @@ class GlobalRouters(nn.Module):
             mask_avg = mask.float().mean(dim=0)
             self.neuron_router.update_usage(mask_avg, 'restore_know', attention_mask)
 
-        return weights, aux_loss
+        # Debug info
+        routing_info = {}
+        if self.debug_mode:
+            with torch.no_grad():
+                selected = mask.float().sum(dim=-1).mean().item()
+                routing_info['selected_restore'] = selected
+
+        return weights, aux_loss, routing_info
 
 
 class AttentionCircuit(nn.Module):
@@ -1040,11 +1056,20 @@ class AttentionCircuit(nn.Module):
         rv_input = torch.cat([h_v_proj, ctx_v], dim=-1)
 
         # ===== Restore 라우팅 (router callback) =====
-        rqk_Q_weights, aux_rqk_Q = router.get_restore_attention_weights(rqk_Q_input, 'qk', attention_mask)
-        rqk_K_weights, aux_rqk_K = router.get_restore_attention_weights(rqk_K_input, 'qk', attention_mask)
-        rv_weights, aux_rv = router.get_restore_attention_weights(rv_input, 'v', attention_mask)
+        rqk_Q_weights, aux_rqk_Q, info_rqk_Q = router.get_restore_attention_weights(rqk_Q_input, 'qk', attention_mask)
+        rqk_K_weights, aux_rqk_K, info_rqk_K = router.get_restore_attention_weights(rqk_K_input, 'qk', attention_mask)
+        rv_weights, aux_rv, info_rv = router.get_restore_attention_weights(rv_input, 'v', attention_mask)
 
         restore_aux_loss = aux_rqk_Q + aux_rqk_K + aux_rv
+
+        # Merge restore routing info
+        restore_info = {}
+        if info_rqk_Q:
+            restore_info['selected_rqk_Q'] = info_rqk_Q.get('selected_rqk', 0)
+        if info_rqk_K:
+            restore_info['selected_rqk_K'] = info_rqk_K.get('selected_rqk', 0)
+        if info_rv:
+            restore_info['selected_rv'] = info_rv.get('selected_rv', 0)
 
         # ===== Restore 처리 =====
         r_qk = self.shared_neurons.restore_qk_neurons  # [N_rqk, R, D]
@@ -1087,7 +1112,7 @@ class AttentionCircuit(nn.Module):
         output = self.expand_O(attn_out)
         output = self.out_dropout(output)
 
-        return output, restore_aux_loss
+        return output, restore_aux_loss, restore_info
 
 
 class KnowledgeCircuit(nn.Module):
@@ -1151,7 +1176,7 @@ class KnowledgeCircuit(nn.Module):
         restore_input = torch.cat([h_proj, neuron_ctx], dim=-1)  # [P, B, S, 2*d_space]
 
         # ===== Restore 라우팅 (router callback) =====
-        restore_weights, restore_aux_loss = router.get_restore_knowledge_weights(restore_input, attention_mask)
+        restore_weights, restore_aux_loss, restore_info = router.get_restore_knowledge_weights(restore_input, attention_mask)
 
         # ===== Restore 처리 =====
         r_know = self.shared_neurons.restore_know  # [N_r, R, D]
@@ -1160,7 +1185,7 @@ class KnowledgeCircuit(nn.Module):
         # Sum over paths
         output = output_all.sum(dim=0)  # [B, S, D]
 
-        return self.dropout(output), restore_aux_loss
+        return self.dropout(output), restore_aux_loss, restore_info
 
 
 class DAWNBlock(nn.Module):
@@ -1203,10 +1228,14 @@ class DAWNBlock(nn.Module):
         )
 
         # Circuit handles restore routing internally via router callback
-        attn_out, restore_aux_loss = self.attn(normed_x_attn, feature_weights, global_routers, attention_mask)
+        attn_out, restore_aux_loss, attn_restore_info = self.attn(normed_x_attn, feature_weights, global_routers, attention_mask)
         x = x + attn_out
 
         attn_aux_loss = feature_aux_loss + restore_aux_loss
+
+        # Merge restore info into attention info
+        if attn_restore_info:
+            attn_info.update(attn_restore_info)
 
         # ===== Knowledge =====
         normed_x_know = self.norm2(x)
@@ -1218,10 +1247,14 @@ class DAWNBlock(nn.Module):
         )
 
         # Circuit handles restore routing internally via router callback
-        know_out, know_restore_aux_loss = self.knowledge(normed_x_know, know_feature_paths, global_routers, attention_mask)
+        know_out, know_restore_aux_loss, know_restore_info = self.knowledge(normed_x_know, know_feature_paths, global_routers, attention_mask)
         x = x + know_out
 
         know_aux_loss = know_feature_aux_loss + know_restore_aux_loss
+
+        # Merge restore info into knowledge info
+        if know_restore_info:
+            know_info.update(know_restore_info)
 
         # Routing info
         routing_info = {
@@ -1239,8 +1272,9 @@ class DAWNBlock(nn.Module):
             }
         # Norms only in debug mode (avoid GPU sync overhead)
         if global_routers.debug_mode:
-            routing_info['attn_out_norm'] = attn_out.norm(dim=-1).mean().item()
-            routing_info['know_out_norm'] = know_out.norm(dim=-1).mean().item()
+            with torch.no_grad():
+                routing_info['attn_out_norm'] = attn_out.norm(dim=-1).mean().item()
+                routing_info['know_out_norm'] = know_out.norm(dim=-1).mean().item()
 
         return x, routing_info, attn_aux_loss + know_aux_loss
 
