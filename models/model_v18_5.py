@@ -638,63 +638,6 @@ class GlobalRouters(nn.Module):
 
         return path_weights_list, weights, mask, gate, scaled_weights
 
-    def _topk_select_batched(self, scores, tau, path_max_k):
-        """
-        v18.5: Path-batched top-k selection for restore routing.
-
-        Args:
-            scores: [P, B, S, N] neuron scores
-            tau: [P, B, S, 1] threshold values
-            path_max_k: neurons per path
-
-        Returns:
-            weights: [P, B, S, N] sparse weights
-            mask: [P, B, S, N] boolean mask
-            aux_loss: scalar auxiliary loss
-        """
-        P, B, S, N = scores.shape
-        k = min(path_max_k, N)
-
-        # Flatten for batched processing
-        scores_flat = scores.view(P * B, S, N)
-        tau_flat = tau.view(P * B, S, 1)
-
-        # Top-k
-        topk_scores, topk_indices = torch.topk(scores_flat, k=k, dim=-1, sorted=True)
-
-        # Gate
-        raw_gate = topk_scores - tau_flat
-        gate = torch.where(
-            raw_gate > 0,
-            raw_gate,
-            1e-8 * torch.exp(raw_gate)
-        )
-
-        # Normalize
-        exp_gate = torch.exp(gate) - 1
-        exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
-        ratio = torch.where(
-            exp_gate_sum > 1e-8,
-            exp_gate / (exp_gate_sum + 1e-8),
-            exp_gate * 1e-8
-        )
-        gate_strength = torch.tanh(exp_gate.max(dim=-1, keepdim=True).values)
-        scaled_weights = ratio * gate_strength
-
-        # Scatter - AMP에서 scaled_weights dtype 불일치 방지
-        weights_flat = torch.zeros(P * B, S, N, device=scores.device, dtype=scores.dtype)
-        weights_flat.scatter_(dim=-1, index=topk_indices, src=scaled_weights.to(scores.dtype))
-
-        # Mask
-        topk_mask = (topk_scores > tau_flat)
-        mask_flat = torch.zeros(P * B, S, N, device=scores.device, dtype=torch.bool)
-        mask_flat.scatter_(dim=-1, index=topk_indices, src=topk_mask)
-
-        weights = weights_flat.view(P, B, S, N)
-        mask = mask_flat.view(P, B, S, N)
-
-        return weights, mask
-
     def get_feature_attention_weights(self, x, attention_mask=None, tau_feature=None):
         """
         v18.5: Feature-only attention routing (restore is context-based).
@@ -813,67 +756,82 @@ class GlobalRouters(nn.Module):
 
     def get_restore_attention_weights(self, ctx, pool_type, qk_type=None, attention_mask=None):
         """
-        v18.5: Context-aware restore attention routing with learnable tau.
+        v18.5: Context-aware restore attention routing (single path).
 
         Args:
-            ctx: [P, B, S, 2*d_space] context (h_proj + neuron_context)
+            ctx: [B, S, 2*d_space] context for single path
             pool_type: 'qk' or 'v'
-            qk_type: 'Q' or 'K' (only used when pool_type='qk' for usage tracking)
-            attention_mask: [B, S] optional mask
+            qk_type: 'Q' or 'K' (for usage tracking)
+            attention_mask: [B, S]
 
         Returns:
-            weights: [P, B, S, N] sparse weights
-            aux_loss: auxiliary loss
-            routing_info: dict with routing stats (only when debug_mode=True)
+            weights: [B, S, N] sparse weights
+            aux_loss: scalar
+            routing_info: dict
         """
-        P, B, S, _ = ctx.shape
+        B, S, _ = ctx.shape
 
         if pool_type == 'qk':
-            logits = self.neuron_router.get_restore_qk_logits_from_context(ctx)  # [P, B, S, N_rqk]
+            logits = self.neuron_router.get_restore_qk_logits_from_context(ctx)  # [B, S, N_rqk]
             n_neurons = self.n_restore_qk
             tau_proj = self.tau_proj_restore_qk if self.learnable_tau else None
         else:
-            logits = self.neuron_router.get_restore_v_logits_from_context(ctx)   # [P, B, S, N_rv]
+            logits = self.neuron_router.get_restore_v_logits_from_context(ctx)   # [B, S, N_rv]
             n_neurons = self.n_restore_v
             tau_proj = self.tau_proj_restore_v if self.learnable_tau else None
 
-        # Compute tau (learnable offset from context)
+        # Tau
         if self.learnable_tau:
-            # ctx: [P, B, S, 2*d_space] -> tau_offset: [P, B, S, 1]
-            ctx_flat = ctx.view(P * B, S, -1)
-            tau_offset = tau_proj(ctx_flat).view(P, B, S, 1)
+            tau_offset = tau_proj(ctx).view(B, S, 1)
             tau = logits.mean(dim=-1, keepdim=True) + tau_offset * (logits.std(dim=-1, keepdim=True) + 1e-8)
         else:
             tau_offset = 0.0
             tau = logits.mean(dim=-1, keepdim=True)
 
-        # Batched top-k selection
-        weights, mask = self._topk_select_batched(logits, tau, self.path_max_k)
+        # Top-k selection
+        k = min(self.path_max_k, n_neurons)
+        topk_scores, topk_indices = torch.topk(logits, k=k, dim=-1)
+
+        raw_gate = topk_scores - tau
+        gate = torch.where(raw_gate > 0, raw_gate, 1e-8 * torch.exp(raw_gate))
+
+        exp_gate = torch.exp(gate) - 1
+        exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
+        ratio = torch.where(exp_gate_sum > 1e-8, exp_gate / (exp_gate_sum + 1e-8), exp_gate * 1e-8)
+        gate_strength = torch.tanh(exp_gate.max(dim=-1, keepdim=True).values)
+        scaled_weights = ratio * gate_strength
+
+        # Scatter
+        out_dtype = logits.dtype
+        weights = torch.zeros(B, S, n_neurons, device=logits.device, dtype=out_dtype)
+        weights.scatter_(dim=-1, index=topk_indices, src=scaled_weights.to(out_dtype))
+
+        # Mask
+        topk_mask = (topk_scores > tau)
+        mask = torch.zeros(B, S, n_neurons, device=logits.device, dtype=torch.bool)
+        mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
 
         # Aux loss
         aux_loss = 0.0
         if self.training:
             pref = F.softmax(logits, dim=-1)
-            usage = pref.mean(dim=(0, 1, 2))  # Average over P, B, S
+            usage = pref.mean(dim=(0, 1))
             target = 1.0 / n_neurons
             aux_loss = ((usage - target) ** 2).sum() * n_neurons
 
-        # Tau regularization (penalize positive tau_offset)
-        if self.training and self.learnable_tau and self.tau_reg_weight > 0:
-            tau_reg = F.relu(tau_offset).mean()
-            aux_loss = aux_loss + tau_reg * self.tau_reg_weight
+            if self.learnable_tau and self.tau_reg_weight > 0:
+                tau_reg = F.relu(tau_offset).mean()
+                aux_loss = aux_loss + tau_reg * self.tau_reg_weight
 
-        # Update usage (Q/K separated for pool_type='qk')
+        # Usage tracking
         if self.training:
             if pool_type == 'qk':
                 neuron_type = 'restore_q' if qk_type == 'Q' else 'restore_k'
             else:
                 neuron_type = 'restore_v'
-            # Average mask over paths for usage tracking
-            mask_avg = mask.float().mean(dim=0)  # [B, S, N]
-            self.neuron_router.update_usage(mask_avg, neuron_type, attention_mask)
+            self.neuron_router.update_usage(mask.float(), neuron_type, attention_mask)
 
-        # Debug info (use qk_type suffix for Q/K distinction)
+        # Debug info
         routing_info = {}
         if self.debug_mode:
             with torch.no_grad():
@@ -954,50 +912,67 @@ class GlobalRouters(nn.Module):
 
     def get_restore_knowledge_weights(self, ctx, attention_mask=None):
         """
-        v18.5: Context-aware restore knowledge routing with learnable tau.
+        v18.5: Context-aware restore knowledge routing (single path).
 
         Args:
-            ctx: [P, B, S, 2*d_space] context (h_proj + neuron_context)
-            attention_mask: [B, S] optional mask
+            ctx: [B, S, 2*d_space] context for single path
+            attention_mask: [B, S]
 
         Returns:
-            weights: [P, B, S, N] sparse weights
-            aux_loss: auxiliary loss
-            routing_info: dict with routing stats (only when debug_mode=True)
+            weights: [B, S, N] sparse weights
+            aux_loss: scalar
+            routing_info: dict
         """
-        P, B, S, _ = ctx.shape
+        B, S, _ = ctx.shape
 
-        logits = self.neuron_router.get_restore_know_logits_from_context(ctx)  # [P, B, S, N_r]
+        logits = self.neuron_router.get_restore_know_logits_from_context(ctx)  # [B, S, N_r]
 
-        # Compute tau (learnable offset from context)
+        # Tau
         if self.learnable_tau:
-            ctx_flat = ctx.view(P * B, S, -1)
-            tau_offset = self.tau_proj_restore_know(ctx_flat).view(P, B, S, 1)
+            tau_offset = self.tau_proj_restore_know(ctx).view(B, S, 1)
             tau = logits.mean(dim=-1, keepdim=True) + tau_offset * (logits.std(dim=-1, keepdim=True) + 1e-8)
         else:
             tau_offset = 0.0
             tau = logits.mean(dim=-1, keepdim=True)
 
-        # Batched top-k selection
-        weights, mask = self._topk_select_batched(logits, tau, self.path_max_k)
+        # Top-k selection
+        k = min(self.path_max_k, self.n_restore_know)
+        topk_scores, topk_indices = torch.topk(logits, k=k, dim=-1)
+
+        raw_gate = topk_scores - tau
+        gate = torch.where(raw_gate > 0, raw_gate, 1e-8 * torch.exp(raw_gate))
+
+        exp_gate = torch.exp(gate) - 1
+        exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
+        ratio = torch.where(exp_gate_sum > 1e-8, exp_gate / (exp_gate_sum + 1e-8), exp_gate * 1e-8)
+        gate_strength = torch.tanh(exp_gate.max(dim=-1, keepdim=True).values)
+        scaled_weights = ratio * gate_strength
+
+        # Scatter
+        out_dtype = logits.dtype
+        weights = torch.zeros(B, S, self.n_restore_know, device=logits.device, dtype=out_dtype)
+        weights.scatter_(dim=-1, index=topk_indices, src=scaled_weights.to(out_dtype))
+
+        # Mask
+        topk_mask = (topk_scores > tau)
+        mask = torch.zeros(B, S, self.n_restore_know, device=logits.device, dtype=torch.bool)
+        mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
 
         # Aux loss
         aux_loss = 0.0
         if self.training:
             pref = F.softmax(logits, dim=-1)
-            usage = pref.mean(dim=(0, 1, 2))
+            usage = pref.mean(dim=(0, 1))
             target = 1.0 / self.n_restore_know
             aux_loss = ((usage - target) ** 2).sum() * self.n_restore_know
 
-        # Tau regularization
-        if self.training and self.learnable_tau and self.tau_reg_weight > 0:
-            tau_reg = F.relu(tau_offset).mean()
-            aux_loss = aux_loss + tau_reg * self.tau_reg_weight
+            if self.learnable_tau and self.tau_reg_weight > 0:
+                tau_reg = F.relu(tau_offset).mean()
+                aux_loss = aux_loss + tau_reg * self.tau_reg_weight
 
-        # Update usage
+        # Usage tracking
         if self.training:
-            mask_avg = mask.float().mean(dim=0)
-            self.neuron_router.update_usage(mask_avg, 'restore_know', attention_mask)
+            self.neuron_router.update_usage(mask.float(), 'restore_know', attention_mask)
 
         # Debug info
         routing_info = {}
@@ -1079,57 +1054,65 @@ class AttentionCircuit(nn.Module):
         fqk_emb = router.neuron_router.get_fqk_emb()  # [N_fqk, d_space]
         fv_emb = router.neuron_router.get_fv_emb()    # [N_fv, d_space]
 
-        # h projection (Q/K 합쳐서 효율적 처리)
-        h_qk_cat = torch.cat([h_q_all, h_k_all], dim=0)  # [2P, B, S, R]
-        h_qk_proj = self.proj_h_qk(h_qk_cat.reshape(2*P*B, S, -1)).view(2*P, B, S, self.d_space)
-        h_q_proj, h_k_proj = h_qk_proj[:P], h_qk_proj[P:]  # 각 [P, B, S, d_space]
-
-        h_v_proj = self.proj_h_v(h_v_all.reshape(P*B, S, -1)).view(P, B, S, self.d_space)
-
-        # neuron context: weighted sum of feature embeddings
-        ctx_q = torch.einsum('pbsn,nd->pbsd', fqk_w_Q_stacked, fqk_emb)  # [P, B, S, d_space]
-        ctx_k = torch.einsum('pbsn,nd->pbsd', fqk_w_K_stacked, fqk_emb)
-        ctx_v = torch.einsum('pbsn,nd->pbsd', fv_w_stacked, fv_emb)
-
-        # concat: [h_proj, neuron_context]
-        rqk_Q_input = torch.cat([h_q_proj, ctx_q], dim=-1)  # [P, B, S, 2*d_space]
-        rqk_K_input = torch.cat([h_k_proj, ctx_k], dim=-1)
-        rv_input = torch.cat([h_v_proj, ctx_v], dim=-1)
-
-        # ===== Restore 라우팅 (router callback) =====
-        rqk_Q_weights, aux_rqk_Q, info_rqk_Q = router.get_restore_attention_weights(rqk_Q_input, 'qk', 'Q', attention_mask)
-        rqk_K_weights, aux_rqk_K, info_rqk_K = router.get_restore_attention_weights(rqk_K_input, 'qk', 'K', attention_mask)
-        rv_weights, aux_rv, info_rv = router.get_restore_attention_weights(rv_input, 'v', None, attention_mask)
-
-        restore_aux_loss = aux_rqk_Q + aux_rqk_K + aux_rv
-
-        # Merge restore routing info
-        restore_info = {}
-        if info_rqk_Q:
-            restore_info['selected_rqk_Q'] = info_rqk_Q.get('selected_rqk_Q', 0)
-            if 'tau_offset_rqk_Q' in info_rqk_Q:
-                restore_info['tau_offset_rqk_Q'] = info_rqk_Q['tau_offset_rqk_Q']
-        if info_rqk_K:
-            restore_info['selected_rqk_K'] = info_rqk_K.get('selected_rqk_K', 0)
-            if 'tau_offset_rqk_K' in info_rqk_K:
-                restore_info['tau_offset_rqk_K'] = info_rqk_K['tau_offset_rqk_K']
-        if info_rv:
-            restore_info['selected_rv'] = info_rv.get('selected_rv', 0)
-            if 'tau_offset_rv' in info_rv:
-                restore_info['tau_offset_rv'] = info_rv['tau_offset_rv']
-
-        # ===== Restore 처리 =====
+        # ===== Restore 라우팅 (for loop) =====
         r_qk = self.shared_neurons.restore_qk_neurons  # [N_rqk, R, D]
         r_v = self.shared_neurons.restore_v_neurons    # [N_rv, R, D]
 
-        Q_all = torch.einsum('pbsr,nrd,pbsn->pbsd', h_q_all, r_qk, rqk_Q_weights)  # [P, B, S, D]
-        K_all = torch.einsum('pbsr,nrd,pbsn->pbsd', h_k_all, r_qk, rqk_K_weights)
-        V_all = torch.einsum('pbsr,nrd,pbsn->pbsd', h_v_all, r_v, rv_weights)
+        Q_total = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
+        K_total = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
+        V_total = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
+        restore_aux_loss = 0.0
+        restore_info = {}
 
-        # Sum over paths
-        Q_total = Q_all.sum(dim=0)  # [B, S, D]
-        K_total = K_all.sum(dim=0)
-        V_total = V_all.sum(dim=0)
+        for p in range(P):
+            h_q = h_q_all[p]  # [B, S, R]
+            h_k = h_k_all[p]
+            h_v = h_v_all[p]
+            fqk_w_Q = feature_weights['fqk_Q'][p]  # [B, S, N_fqk]
+            fqk_w_K = feature_weights['fqk_K'][p]
+            fv_w = feature_weights['fv'][p]
+
+            # h projection
+            h_q_proj = self.proj_h_qk(h_q)  # [B, S, d_space]
+            h_k_proj = self.proj_h_qk(h_k)
+            h_v_proj = self.proj_h_v(h_v)
+
+            # neuron context
+            ctx_q = torch.einsum('bsn,nd->bsd', fqk_w_Q, fqk_emb)  # [B, S, d_space]
+            ctx_k = torch.einsum('bsn,nd->bsd', fqk_w_K, fqk_emb)
+            ctx_v = torch.einsum('bsn,nd->bsd', fv_w, fv_emb)
+
+            # concat: [h_proj, neuron_context]
+            rqk_Q_input = torch.cat([h_q_proj, ctx_q], dim=-1)  # [B, S, 2*d_space]
+            rqk_K_input = torch.cat([h_k_proj, ctx_k], dim=-1)
+            rv_input = torch.cat([h_v_proj, ctx_v], dim=-1)
+
+            # Restore routing
+            w_q, aux_q, info_q = router.get_restore_attention_weights(rqk_Q_input, 'qk', 'Q', attention_mask)
+            w_k, aux_k, info_k = router.get_restore_attention_weights(rqk_K_input, 'qk', 'K', attention_mask)
+            w_v, aux_v, info_v = router.get_restore_attention_weights(rv_input, 'v', None, attention_mask)
+
+            restore_aux_loss += aux_q + aux_k + aux_v
+
+            # Restore 처리 (accumulate Q/K/V)
+            Q_total += torch.einsum('bsr,nrd,bsn->bsd', h_q, r_qk, w_q)
+            K_total += torch.einsum('bsr,nrd,bsn->bsd', h_k, r_qk, w_k)
+            V_total += torch.einsum('bsr,nrd,bsn->bsd', h_v, r_v, w_v)
+
+            # Collect debug info from first path only
+            if p == 0:
+                if info_q:
+                    restore_info['selected_rqk_Q'] = info_q.get('selected_rqk_Q', 0)
+                    if 'tau_offset_rqk_Q' in info_q:
+                        restore_info['tau_offset_rqk_Q'] = info_q['tau_offset_rqk_Q']
+                if info_k:
+                    restore_info['selected_rqk_K'] = info_k.get('selected_rqk_K', 0)
+                    if 'tau_offset_rqk_K' in info_k:
+                        restore_info['tau_offset_rqk_K'] = info_k['tau_offset_rqk_K']
+                if info_v:
+                    restore_info['selected_rv'] = info_v.get('selected_rv', 0)
+                    if 'tau_offset_rv' in info_v:
+                        restore_info['tau_offset_rv'] = info_v['tau_offset_rv']
 
         # Q norm for dead routing detection
         q_norm = Q_total.norm(dim=-1, keepdim=True)
@@ -1217,20 +1200,36 @@ class KnowledgeCircuit(nn.Module):
 
         # ===== Restore context 생성 =====
         feature_emb = router.neuron_router.get_feature_know_emb()  # [N_f, d_space]
-
-        h_proj = self.proj_h_know(h_all.reshape(P*B, S, -1)).view(P, B, S, self.d_space)
-        neuron_ctx = torch.einsum('pbsn,nd->pbsd', feature_stacked, feature_emb)  # [P, B, S, d_space]
-        restore_input = torch.cat([h_proj, neuron_ctx], dim=-1)  # [P, B, S, 2*d_space]
-
-        # ===== Restore 라우팅 (router callback) =====
-        restore_weights, restore_aux_loss, restore_info = router.get_restore_knowledge_weights(restore_input, attention_mask)
-
-        # ===== Restore 처리 =====
         r_know = self.shared_neurons.restore_know  # [N_r, R, D]
-        output_all = torch.einsum('pbsr,nrd,pbsn->pbsd', h_all, r_know, restore_weights)  # [P, B, S, D]
 
-        # Sum over paths
-        output = output_all.sum(dim=0)  # [B, S, D]
+        # ===== Restore 라우팅 (for loop) =====
+        output = torch.zeros(B, S, D, device=x.device, dtype=x.dtype)
+        restore_aux_loss = 0.0
+        restore_info = {}
+
+        for p in range(P):
+            h = h_all[p]  # [B, S, R]
+            f_w = feature_paths[p]  # [B, S, N_f]
+
+            # h projection
+            h_proj = self.proj_h_know(h)  # [B, S, d_space]
+
+            # neuron context
+            neuron_ctx = torch.einsum('bsn,nd->bsd', f_w, feature_emb)  # [B, S, d_space]
+
+            # concat: [h_proj, neuron_context]
+            restore_input = torch.cat([h_proj, neuron_ctx], dim=-1)  # [B, S, 2*d_space]
+
+            # Restore routing
+            w, aux, info = router.get_restore_knowledge_weights(restore_input, attention_mask)
+            restore_aux_loss += aux
+
+            # Restore 처리 (accumulate output)
+            output += torch.einsum('bsr,nrd,bsn->bsd', h, r_know, w)
+
+            # Collect debug info from first path only
+            if p == 0:
+                restore_info = info
 
         return self.dropout(output), restore_aux_loss, restore_info
 
