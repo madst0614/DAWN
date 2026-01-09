@@ -681,9 +681,9 @@ class GlobalRouters(nn.Module):
         gate_strength = torch.tanh(exp_gate.max(dim=-1, keepdim=True).values)
         scaled_weights = ratio * gate_strength
 
-        # Scatter
+        # Scatter - AMP에서 scaled_weights dtype 불일치 방지
         weights_flat = torch.zeros(P * B, S, N, device=scores.device, dtype=scores.dtype)
-        weights_flat.scatter_(dim=-1, index=topk_indices, src=scaled_weights)
+        weights_flat.scatter_(dim=-1, index=topk_indices, src=scaled_weights.to(scores.dtype))
 
         # Mask
         topk_mask = (topk_scores > tau_flat)
