@@ -1107,14 +1107,28 @@ class AttentionCircuit(nn.Module):
                     restore_info['selected_rqk_Q'] = info_q.get('selected_rqk_Q', 0)
                     if 'tau_offset_rqk_Q' in info_q:
                         restore_info['tau_offset_rqk_Q'] = info_q['tau_offset_rqk_Q']
+                    if 'gstr_rqk_Q' in info_q:
+                        restore_info['gstr_rqk_Q'] = info_q['gstr_rqk_Q']
                 if info_k:
                     restore_info['selected_rqk_K'] = info_k.get('selected_rqk_K', 0)
                     if 'tau_offset_rqk_K' in info_k:
                         restore_info['tau_offset_rqk_K'] = info_k['tau_offset_rqk_K']
+                    if 'gstr_rqk_K' in info_k:
+                        restore_info['gstr_rqk_K'] = info_k['gstr_rqk_K']
                 if info_v:
                     restore_info['selected_rv'] = info_v.get('selected_rv', 0)
                     if 'tau_offset_rv' in info_v:
                         restore_info['tau_offset_rv'] = info_v['tau_offset_rv']
+                    if 'gstr_rv' in info_v:
+                        restore_info['gstr_rv'] = info_v['gstr_rv']
+                # RQK overlap (w > 0 인 뉴런 비교)
+                if getattr(router, 'debug_mode', False):
+                    with torch.no_grad():
+                        mask_q = (w_q > 1e-6).float()
+                        mask_k = (w_k > 1e-6).float()
+                        overlap = ((mask_q * mask_k).sum(dim=-1) /
+                                  torch.maximum(mask_q.sum(dim=-1), mask_k.sum(dim=-1)).clamp(min=1)).mean().item()
+                        restore_info['overlap_rqk'] = overlap
 
         # Q norm for dead routing detection
         q_norm = Q_total.norm(dim=-1, keepdim=True)

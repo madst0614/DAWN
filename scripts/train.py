@@ -746,9 +746,10 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         gstr_kr = sum(ri.get('knowledge', {}).get('gstr_restore', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}GateStr(rest): rq={gstr_rq:.2f} rk={gstr_rk:.2f} rv={gstr_rv:.2f} kr={gstr_kr:.2f}")
 
-        # Overlap (Q/K mask overlap ratio) - feature only for v18.5
+        # Overlap (Q/K mask overlap ratio)
         ovlp_fqk = sum(ri.get('attention', {}).get('overlap_fqk', 0) for ri in routing_infos) / n
-        lines.append(f"{prefix}Overlap: fqk={ovlp_fqk:.0%}")
+        ovlp_rqk = sum(ri.get('attention', {}).get('overlap_rqk', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}Overlap: fqk={ovlp_fqk:.0%} rqk={ovlp_rqk:.0%}")
 
     # Gate with std (v18.1-18.3, skip for v18.4/v18.5)
     if model_version.startswith('18.') and not model_version.startswith('18.0') and not model_version.startswith('18.4') and not model_version.startswith('18.5'):
