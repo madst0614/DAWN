@@ -840,6 +840,7 @@ class GlobalRouters(nn.Module):
                 routing_info[f'selected_r{pool_type}{key_suffix}'] = selected
                 if self.learnable_tau:
                     routing_info[f'tau_offset_r{pool_type}{key_suffix}'] = tau_offset.mean().item()
+                routing_info[f'gstr_r{pool_type}{key_suffix}'] = gate_strength.mean().item()
 
         return weights, aux_loss, routing_info
 
@@ -982,6 +983,7 @@ class GlobalRouters(nn.Module):
                 routing_info['selected_restore'] = selected
                 if self.learnable_tau:
                     routing_info['tau_offset_restore'] = tau_offset.mean().item()
+                routing_info['gstr_restore'] = gate_strength.mean().item()
 
         return weights, aux_loss, routing_info
 

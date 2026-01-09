@@ -739,6 +739,13 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         gstr_kf = sum(ri.get('knowledge', {}).get('gstr_feature', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}GateStr(feat): fq={gstr_fq:.2f} fk={gstr_fk:.2f} fv={gstr_fv:.2f} kf={gstr_kf:.2f}")
 
+        # gate_strength for restore (context-based)
+        gstr_rq = sum(ri.get('attention', {}).get('gstr_rqk_Q', 0) for ri in routing_infos) / n
+        gstr_rk = sum(ri.get('attention', {}).get('gstr_rqk_K', 0) for ri in routing_infos) / n
+        gstr_rv = sum(ri.get('attention', {}).get('gstr_rv', 0) for ri in routing_infos) / n
+        gstr_kr = sum(ri.get('knowledge', {}).get('gstr_restore', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}GateStr(rest): rq={gstr_rq:.2f} rk={gstr_rk:.2f} rv={gstr_rv:.2f} kr={gstr_kr:.2f}")
+
         # Overlap (Q/K mask overlap ratio) - feature only for v18.5
         ovlp_fqk = sum(ri.get('attention', {}).get('overlap_fqk', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}Overlap: fqk={ovlp_fqk:.0%}")
