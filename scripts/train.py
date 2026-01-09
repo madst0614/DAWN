@@ -613,8 +613,8 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
         return mean, std
 
-    # Paths (mean±std across layers) - skip for v18.4 (simplified output)
-    if not model_version.startswith('18.4'):
+    # Paths (mean±std across layers) - skip for v18.4/v18.5 (simplified output)
+    if not model_version.startswith('18.4') and not model_version.startswith('18.5'):
         p_fqk_Q, s_fqk_Q = get_mean_std('n_paths_fqk_Q')
         p_fqk_K, s_fqk_K = get_mean_std('n_paths_fqk_K')
         p_fv, s_fv = get_mean_std('n_paths_fv')
