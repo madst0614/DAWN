@@ -811,13 +811,14 @@ class GlobalRouters(nn.Module):
 
         return feature_weights, routing_info, aux_loss
 
-    def get_restore_attention_weights(self, ctx, pool_type, attention_mask=None):
+    def get_restore_attention_weights(self, ctx, pool_type, qk_type=None, attention_mask=None):
         """
         v18.5: Context-aware restore attention routing with learnable tau.
 
         Args:
             ctx: [P, B, S, 2*d_space] context (h_proj + neuron_context)
             pool_type: 'qk' or 'v'
+            qk_type: 'Q' or 'K' (only used when pool_type='qk' for usage tracking)
             attention_mask: [B, S] optional mask
 
         Returns:
@@ -862,21 +863,25 @@ class GlobalRouters(nn.Module):
             tau_reg = F.relu(tau_offset).mean()
             aux_loss = aux_loss + tau_reg * self.tau_reg_weight
 
-        # Update usage
+        # Update usage (Q/K separated for pool_type='qk')
         if self.training:
-            neuron_type = 'restore_q' if pool_type == 'qk' else 'restore_v'
+            if pool_type == 'qk':
+                neuron_type = 'restore_q' if qk_type == 'Q' else 'restore_k'
+            else:
+                neuron_type = 'restore_v'
             # Average mask over paths for usage tracking
             mask_avg = mask.float().mean(dim=0)  # [B, S, N]
             self.neuron_router.update_usage(mask_avg, neuron_type, attention_mask)
 
-        # Debug info
+        # Debug info (use qk_type suffix for Q/K distinction)
         routing_info = {}
         if self.debug_mode:
             with torch.no_grad():
                 selected = mask.float().sum(dim=-1).mean().item()
-                routing_info[f'selected_r{pool_type}'] = selected
+                key_suffix = f'_{qk_type}' if qk_type else ''
+                routing_info[f'selected_r{pool_type}{key_suffix}'] = selected
                 if self.learnable_tau:
-                    routing_info[f'tau_offset_r{pool_type}'] = tau_offset.mean().item()
+                    routing_info[f'tau_offset_r{pool_type}{key_suffix}'] = tau_offset.mean().item()
 
         return weights, aux_loss, routing_info
 
@@ -1092,20 +1097,26 @@ class AttentionCircuit(nn.Module):
         rv_input = torch.cat([h_v_proj, ctx_v], dim=-1)
 
         # ===== Restore 라우팅 (router callback) =====
-        rqk_Q_weights, aux_rqk_Q, info_rqk_Q = router.get_restore_attention_weights(rqk_Q_input, 'qk', attention_mask)
-        rqk_K_weights, aux_rqk_K, info_rqk_K = router.get_restore_attention_weights(rqk_K_input, 'qk', attention_mask)
-        rv_weights, aux_rv, info_rv = router.get_restore_attention_weights(rv_input, 'v', attention_mask)
+        rqk_Q_weights, aux_rqk_Q, info_rqk_Q = router.get_restore_attention_weights(rqk_Q_input, 'qk', 'Q', attention_mask)
+        rqk_K_weights, aux_rqk_K, info_rqk_K = router.get_restore_attention_weights(rqk_K_input, 'qk', 'K', attention_mask)
+        rv_weights, aux_rv, info_rv = router.get_restore_attention_weights(rv_input, 'v', None, attention_mask)
 
         restore_aux_loss = aux_rqk_Q + aux_rqk_K + aux_rv
 
         # Merge restore routing info
         restore_info = {}
         if info_rqk_Q:
-            restore_info['selected_rqk_Q'] = info_rqk_Q.get('selected_rqk', 0)
+            restore_info['selected_rqk_Q'] = info_rqk_Q.get('selected_rqk_Q', 0)
+            if 'tau_offset_rqk_Q' in info_rqk_Q:
+                restore_info['tau_offset_rqk_Q'] = info_rqk_Q['tau_offset_rqk_Q']
         if info_rqk_K:
-            restore_info['selected_rqk_K'] = info_rqk_K.get('selected_rqk', 0)
+            restore_info['selected_rqk_K'] = info_rqk_K.get('selected_rqk_K', 0)
+            if 'tau_offset_rqk_K' in info_rqk_K:
+                restore_info['tau_offset_rqk_K'] = info_rqk_K['tau_offset_rqk_K']
         if info_rv:
             restore_info['selected_rv'] = info_rv.get('selected_rv', 0)
+            if 'tau_offset_rv' in info_rv:
+                restore_info['tau_offset_rv'] = info_rv['tau_offset_rv']
 
         # ===== Restore 처리 =====
         r_qk = self.shared_neurons.restore_qk_neurons  # [N_rqk, R, D]

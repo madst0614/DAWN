@@ -725,11 +725,12 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         off_kf = sum(ri.get('knowledge', {}).get('tau_offset_feature', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}TauOff(feat): fq={off_fq:+.2f} fk={off_fk:+.2f} fv={off_fv:+.2f} kf={off_kf:+.2f}")
 
-        # Restore tau_offset (context-based learnable)
-        off_rqk = sum(ri.get('attention', {}).get('tau_offset_rqk', 0) for ri in routing_infos) / n
+        # Restore tau_offset (context-based learnable, Q/K separated)
+        off_rq = sum(ri.get('attention', {}).get('tau_offset_rqk_Q', 0) for ri in routing_infos) / n
+        off_rk = sum(ri.get('attention', {}).get('tau_offset_rqk_K', 0) for ri in routing_infos) / n
         off_rv = sum(ri.get('attention', {}).get('tau_offset_rv', 0) for ri in routing_infos) / n
         off_kr = sum(ri.get('knowledge', {}).get('tau_offset_restore', 0) for ri in routing_infos) / n
-        lines.append(f"{prefix}TauOff(rest): rqk={off_rqk:+.2f} rv={off_rv:+.2f} kr={off_kr:+.2f}")
+        lines.append(f"{prefix}TauOff(rest): rq={off_rq:+.2f} rk={off_rk:+.2f} rv={off_rv:+.2f} kr={off_kr:+.2f}")
 
         # gate_strength (feature only from routing_info)
         gstr_fq = sum(ri.get('attention', {}).get('gstr_fq', 0) for ri in routing_infos) / n
