@@ -122,10 +122,12 @@ class UnifiedNeuronRouter(nn.Module):
         v18.5: Return feature knowledge logits only (restore is context-based)
         x: [B, S, d_model]
         """
-        emb_norm = F.normalize(self.neuron_emb, dim=-1)
+        # Optimized: slice first, normalize after
+        emb_feature_know = F.normalize(
+            self.neuron_emb[self.restore_v_end:self.feature_know_end], dim=-1
+        )
 
         h_feature_know = self.norm_feature_know(self.dropout(self.proj_feature_know(x)))
-        emb_feature_know = emb_norm[self.restore_v_end:self.feature_know_end]
         logits_feature_know = torch.einsum('bsd,nd->bsn', h_feature_know, emb_feature_know)
 
         return logits_feature_know
@@ -135,7 +137,9 @@ class UnifiedNeuronRouter(nn.Module):
         v18.5: Return 3 feature attention logits only (restore is context-based)
         x: [B, S, d_model]
         """
-        emb_norm = F.normalize(self.neuron_emb, dim=-1)
+        # Optimized: slice first, normalize after
+        fqk_emb = F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1)
+        fv_emb = F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1)
 
         all_proj = self.dropout(self.proj_feature(x))
         h_fqk_Q, h_fqk_K, h_fv = all_proj.chunk(3, dim=-1)
@@ -144,9 +148,6 @@ class UnifiedNeuronRouter(nn.Module):
         h_fqk_Q = self.norm_fqk_Q(h_fqk_Q)
         h_fqk_K = self.norm_fqk_K(h_fqk_K)
         h_fv = self.norm_fv(h_fv)
-
-        fqk_emb = emb_norm[:self.feature_qk_end]
-        fv_emb = emb_norm[self.feature_qk_end:self.feature_v_end]
 
         logits_fqk_Q = torch.einsum('bsd,nd->bsn', h_fqk_Q, fqk_emb)
         logits_fqk_K = torch.einsum('bsd,nd->bsn', h_fqk_K, fqk_emb)
