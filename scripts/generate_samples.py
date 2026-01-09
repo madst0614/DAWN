@@ -39,10 +39,10 @@ def find_checkpoint_file(ckpt_path):
             if (ckpt_path / name).exists():
                 return ckpt_path / name
 
-        # Fall back to any .pt file
+        # Fall back to any .pt file - sort by modification time (newest last)
         pt_files = list(ckpt_path.glob('*.pt'))
         if pt_files:
-            return sorted(pt_files)[-1]  # Most recent
+            return sorted(pt_files, key=lambda f: f.stat().st_mtime)[-1]
 
     raise FileNotFoundError(f"No checkpoint found in {ckpt_path}")
 
@@ -112,6 +112,9 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=30, temperature=0.8, 
     input_ids = tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt').to(device)
     generated = input_ids.clone()
 
+    # BERT uses [SEP] as EOS token
+    eos_token_id = tokenizer.sep_token_id
+
     with torch.no_grad():
         for _ in range(max_new_tokens):
             output = model(generated, attention_mask=None)
@@ -125,6 +128,10 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=30, temperature=0.8, 
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             generated = torch.cat([generated, next_token], dim=1)
+
+            # Stop if EOS token generated
+            if next_token.item() == eos_token_id:
+                break
 
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
@@ -142,27 +149,68 @@ def continuation_test(model, tokenizer, val_tokens, sample_indices, context_len=
         context_text = tokenizer.decode(context_tokens[0], skip_special_tokens=True)
         actual_text = tokenizer.decode(actual_next, skip_special_tokens=True)
 
-        # Greedy generation
+        # Greedy generation with top-k tracking
+        top1_matches = 0
+        top5_matches = 0
+        top10_matches = 0
+        top20_matches = 0
+        top30_matches = 0
+        top40_matches = 0
+        top50_matches = 0
         with torch.no_grad():
             generated = context_tokens.clone()
-            for _ in range(gen_len):
+            for step in range(gen_len):
                 output = model(generated, attention_mask=None)
                 logits = output[0] if isinstance(output, tuple) else output
-                next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                last_logits = logits[:, -1, :]
+
+                # Top-1 prediction
+                next_token = last_logits.argmax(dim=-1, keepdim=True)
+
+                # Top-50 predictions (covers all k values)
+                top50_tokens = last_logits.topk(50, dim=-1).indices[0].tolist()
+
+                # Check matches against actual token
+                actual_token = actual_next[step].item()
+                if next_token[0].item() == actual_token:
+                    top1_matches += 1
+                if actual_token in top50_tokens[:5]:
+                    top5_matches += 1
+                if actual_token in top50_tokens[:10]:
+                    top10_matches += 1
+                if actual_token in top50_tokens[:20]:
+                    top20_matches += 1
+                if actual_token in top50_tokens[:30]:
+                    top30_matches += 1
+                if actual_token in top50_tokens[:40]:
+                    top40_matches += 1
+                if actual_token in top50_tokens:
+                    top50_matches += 1
+
                 generated = torch.cat([generated, next_token], dim=1)
 
         generated_tokens = generated[0, context_len:context_len+gen_len]
         generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-
-        match = (generated_tokens.cpu() == actual_next).sum().item()
 
         results.append({
             'sample_idx': sample_idx,
             'context': context_text[-100:],
             'actual': actual_text,
             'generated': generated_text,
-            'token_match': match,
-            'match_rate': match / gen_len,
+            'top1_match': top1_matches,
+            'top5_match': top5_matches,
+            'top10_match': top10_matches,
+            'top20_match': top20_matches,
+            'top30_match': top30_matches,
+            'top40_match': top40_matches,
+            'top50_match': top50_matches,
+            'top1_rate': top1_matches / gen_len,
+            'top5_rate': top5_matches / gen_len,
+            'top10_rate': top10_matches / gen_len,
+            'top20_rate': top20_matches / gen_len,
+            'top30_rate': top30_matches / gen_len,
+            'top40_rate': top40_matches / gen_len,
+            'top50_rate': top50_matches / gen_len,
         })
 
     return results
@@ -264,7 +312,13 @@ def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda'):
     sample_indices = [100, 500, 1000]
     cont_results = continuation_test(model, tokenizer, val_tokens, sample_indices, device=device)
     results['continuation'] = cont_results
-    results['avg_match'] = sum(r['token_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top1_match'] = sum(r['top1_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top5_match'] = sum(r['top5_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top10_match'] = sum(r['top10_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top20_match'] = sum(r['top20_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top30_match'] = sum(r['top30_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top40_match'] = sum(r['top40_match'] for r in cont_results) / (len(sample_indices) * 30)
+    results['avg_top50_match'] = sum(r['top50_match'] for r in cont_results) / (len(sample_indices) * 30)
 
     # 3. Perplexity
     avg_loss, ppl = compute_perplexity(model, val_tokens, num_seqs=50, device=device)
@@ -336,9 +390,9 @@ def main():
                 output_lines.append(f"\n[Sample {r['sample_idx']}]")
                 output_lines.append(f"Actual:    {r['actual'][:60]}...")
                 output_lines.append(f"Generated: {r['generated'][:60]}...")
-                output_lines.append(f"Match: {r['token_match']}/30 ({r['match_rate']*100:.1f}%)")
+                output_lines.append(f"Top-1: {r['top1_match']}/30 | Top-5: {r['top5_match']}/30 | Top-10: {r['top10_match']}/30 | Top-20: {r['top20_match']}/30 | Top-30: {r['top30_match']}/30 | Top-40: {r['top40_match']}/30 | Top-50: {r['top50_match']}/30")
 
-            output_lines.append(f"\nAvg Match: {results['avg_match']*100:.1f}%")
+            output_lines.append(f"\nAvg: Top-1={results['avg_top1_match']*100:.1f}% | Top-5={results['avg_top5_match']*100:.1f}% | Top-10={results['avg_top10_match']*100:.1f}% | Top-20={results['avg_top20_match']*100:.1f}% | Top-30={results['avg_top30_match']*100:.1f}% | Top-40={results['avg_top40_match']*100:.1f}% | Top-50={results['avg_top50_match']*100:.1f}%")
             output_lines.append(f"Loss: {results['loss']:.4f} | PPL: {results['ppl']:.2f}")
             output_lines.append("")
 
@@ -349,13 +403,13 @@ def main():
             output_lines.append(f"ERROR for {ckpt_path}: {e}\n")
 
     # Summary table
-    output_lines.append("\n" + "=" * 70)
+    output_lines.append("\n" + "=" * 140)
     output_lines.append("SUMMARY")
-    output_lines.append("=" * 70)
-    output_lines.append(f"{'Model':<50} {'PPL':>8} {'Match':>8}")
-    output_lines.append("-" * 70)
+    output_lines.append("=" * 140)
+    output_lines.append(f"{'Model':<50} {'PPL':>8} {'Top-1':>8} {'Top-5':>8} {'Top-10':>8} {'Top-20':>8} {'Top-30':>8} {'Top-40':>8} {'Top-50':>8}")
+    output_lines.append("-" * 140)
     for r in all_results:
-        output_lines.append(f"{r['name']:<50} {r['ppl']:>8.2f} {r['avg_match']*100:>7.1f}%")
+        output_lines.append(f"{r['name']:<50} {r['ppl']:>8.2f} {r['avg_top1_match']*100:>7.1f}% {r['avg_top5_match']*100:>7.1f}% {r['avg_top10_match']*100:>7.1f}% {r['avg_top20_match']*100:>7.1f}% {r['avg_top30_match']*100:>7.1f}% {r['avg_top40_match']*100:>7.1f}% {r['avg_top50_match']*100:>7.1f}%")
 
     # Write output
     output_text = "\n".join(output_lines)

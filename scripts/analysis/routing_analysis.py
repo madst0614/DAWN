@@ -70,6 +70,19 @@ class GenerationRoutingAnalyzer:
         self.target_layer = target_layer
         self.model.eval()
 
+        # Detect v18.2+ models (uses path_weights instead of per-pool weights)
+        self.is_v18_2 = hasattr(model, '__version__') and model.__version__.startswith('18.')
+
+    def _enable_pref_tensors(self):
+        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = True
+
+    def _disable_pref_tensors(self):
+        """Disable store_pref_tensors after analysis."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = False
+
     def generate_with_routing(
         self,
         prompt: str,
@@ -115,41 +128,50 @@ class GenerationRoutingAnalyzer:
             'rv_weights': [],
         }
 
-        with torch.no_grad():
-            for step in range(max_new_tokens):
-                # Forward with routing info
-                outputs = self.model(generated, return_routing_info=True)
+        self._enable_pref_tensors()
 
-                if isinstance(outputs, tuple) and len(outputs) >= 2:
-                    logits, routing_infos = outputs[0], outputs[1]
-                else:
-                    logits = outputs
-                    routing_infos = None
+        try:
+            with torch.no_grad():
+                for step in range(max_new_tokens):
+                    # Forward with routing info
+                    # v18.2 needs return_path_weights=True to store actual weights
+                    if self.is_v18_2:
+                        outputs = self.model(generated, return_path_weights=True)
+                    else:
+                        outputs = self.model(generated, return_routing_info=True)
 
-                # Get next token
-                next_token_logits = logits[:, -1, :]
+                    if isinstance(outputs, tuple) and len(outputs) >= 2:
+                        logits, routing_infos = outputs[0], outputs[1]
+                    else:
+                        logits = outputs
+                        routing_infos = None
 
-                if temperature != 1.0:
-                    next_token_logits = next_token_logits / temperature
+                    # Get next token
+                    next_token_logits = logits[:, -1, :]
 
-                if top_k > 0:
-                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                    next_token_logits[indices_to_remove] = float('-inf')
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                else:
-                    next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+                    if temperature != 1.0:
+                        next_token_logits = next_token_logits / temperature
 
-                # Decode token
-                token_text = self.tokenizer.decode(next_token[0])
-                routing_logs['tokens'].append(token_text)
-                routing_logs['token_ids'].append(next_token.item())
+                    if top_k > 0:
+                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = float('-inf')
+                        probs = F.softmax(next_token_logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                    else:
+                        next_token = next_token_logits.argmax(dim=-1, keepdim=True)
 
-                # Extract routing indices from last position
-                if routing_infos is not None:
-                    self._extract_routing_indices(routing_infos, routing_logs)
+                    # Decode token
+                    token_text = self.tokenizer.decode(next_token[0])
+                    routing_logs['tokens'].append(token_text)
+                    routing_logs['token_ids'].append(next_token.item())
 
-                generated = torch.cat([generated, next_token], dim=1)
+                    # Extract routing indices from last position
+                    if routing_infos is not None:
+                        self._extract_routing_indices(routing_infos, routing_logs)
+
+                    generated = torch.cat([generated, next_token], dim=1)
+        finally:
+            self._disable_pref_tensors()
 
         # Decode full generation
         generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
@@ -184,64 +206,97 @@ class GenerationRoutingAnalyzer:
             layers_to_process = enumerate(routing_infos)
 
         for layer_idx, layer_info in layers_to_process:
-            attn = layer_info.get('attention', layer_info)
-            know = layer_info.get('knowledge', {})
+            # v18.2: path_weights stored in layer_info['path_weights']
+            path_weights = layer_info.get('path_weights', {})
+            if path_weights:
+                # v18.2 format: path_weights contains fv, rv, fqk_Q, etc.
+                # Each is a LIST of [B, S, N] tensors (one per path)
+                def extract_indices_from_paths(path_list, indices_list):
+                    """Extract active neuron indices from list of path weight tensors."""
+                    if path_list is None:
+                        return None
+                    combined_weights = None
+                    for path_w in path_list:
+                        if torch.is_tensor(path_w):
+                            w_last = path_w[0, -1]  # [N]
+                            if combined_weights is None:
+                                combined_weights = w_last.clone()
+                            else:
+                                combined_weights = combined_weights + w_last
+                    if combined_weights is not None:
+                        idx = (combined_weights > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                        indices_list.extend(idx)
+                        return combined_weights.cpu()
+                    return None
 
-            # Feature V weights -> indices
-            fv_w = attn.get('fv_weights')
-            if fv_w is not None:
-                # Get indices for last token position
-                fv_last = fv_w[0, -1]  # [N_v]
-                fv_idx = (fv_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                fv_indices_all.extend(fv_idx)
-                fv_weights_last = fv_last.cpu()
+                fv_weights_last = extract_indices_from_paths(path_weights.get('fv'), fv_indices_all)
+                rv_weights_last = extract_indices_from_paths(path_weights.get('rv'), rv_indices_all)
+                extract_indices_from_paths(path_weights.get('fqk_Q'), fqk_q_indices_all)
+                extract_indices_from_paths(path_weights.get('fqk_K'), fqk_k_indices_all)
+                extract_indices_from_paths(path_weights.get('rqk_Q'), rqk_q_indices_all)
+                extract_indices_from_paths(path_weights.get('rqk_K'), rqk_k_indices_all)
+                extract_indices_from_paths(path_weights.get('feature_know'), fknow_indices_all)
+                extract_indices_from_paths(path_weights.get('restore_know'), rknow_indices_all)
+            else:
+                # v17.1 format: weights in attention/knowledge dicts
+                attn = layer_info.get('attention', layer_info)
+                know = layer_info.get('knowledge', {})
 
-            # Restore V weights -> indices
-            rv_w = attn.get('rv_weights')
-            if rv_w is not None:
-                rv_last = rv_w[0, -1]
-                rv_idx = (rv_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                rv_indices_all.extend(rv_idx)
-                rv_weights_last = rv_last.cpu()
+                # Feature V weights -> indices
+                fv_w = attn.get('fv_weights')
+                if fv_w is not None:
+                    # Get indices for last token position
+                    fv_last = fv_w[0, -1]  # [N_v]
+                    fv_idx = (fv_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    fv_indices_all.extend(fv_idx)
+                    fv_weights_last = fv_last.cpu()
 
-            # Feature QK (Q/K)
-            fqk_q_w = attn.get('fqk_weights_Q')
-            if fqk_q_w is not None:
-                fqk_q_last = fqk_q_w[0, -1]
-                fqk_q_idx = (fqk_q_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                fqk_q_indices_all.extend(fqk_q_idx)
+                # Restore V weights -> indices
+                rv_w = attn.get('rv_weights')
+                if rv_w is not None:
+                    rv_last = rv_w[0, -1]
+                    rv_idx = (rv_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    rv_indices_all.extend(rv_idx)
+                    rv_weights_last = rv_last.cpu()
 
-            fqk_k_w = attn.get('fqk_weights_K')
-            if fqk_k_w is not None:
-                fqk_k_last = fqk_k_w[0, -1]
-                fqk_k_idx = (fqk_k_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                fqk_k_indices_all.extend(fqk_k_idx)
+                # Feature QK (Q/K)
+                fqk_q_w = attn.get('fqk_weights_Q')
+                if fqk_q_w is not None:
+                    fqk_q_last = fqk_q_w[0, -1]
+                    fqk_q_idx = (fqk_q_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    fqk_q_indices_all.extend(fqk_q_idx)
 
-            # Restore QK (Q/K)
-            rqk_q_w = attn.get('rqk_weights_Q')
-            if rqk_q_w is not None:
-                rqk_q_last = rqk_q_w[0, -1]
-                rqk_q_idx = (rqk_q_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                rqk_q_indices_all.extend(rqk_q_idx)
+                fqk_k_w = attn.get('fqk_weights_K')
+                if fqk_k_w is not None:
+                    fqk_k_last = fqk_k_w[0, -1]
+                    fqk_k_idx = (fqk_k_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    fqk_k_indices_all.extend(fqk_k_idx)
 
-            rqk_k_w = attn.get('rqk_weights_K')
-            if rqk_k_w is not None:
-                rqk_k_last = rqk_k_w[0, -1]
-                rqk_k_idx = (rqk_k_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                rqk_k_indices_all.extend(rqk_k_idx)
+                # Restore QK (Q/K)
+                rqk_q_w = attn.get('rqk_weights_Q')
+                if rqk_q_w is not None:
+                    rqk_q_last = rqk_q_w[0, -1]
+                    rqk_q_idx = (rqk_q_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    rqk_q_indices_all.extend(rqk_q_idx)
 
-            # Knowledge
-            fknow_w = know.get('feature_know_w')
-            if fknow_w is not None:
-                fknow_last = fknow_w[0, -1]
-                fknow_idx = (fknow_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                fknow_indices_all.extend(fknow_idx)
+                rqk_k_w = attn.get('rqk_weights_K')
+                if rqk_k_w is not None:
+                    rqk_k_last = rqk_k_w[0, -1]
+                    rqk_k_idx = (rqk_k_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    rqk_k_indices_all.extend(rqk_k_idx)
 
-            rknow_w = know.get('restore_know_w')
-            if rknow_w is not None:
-                rknow_last = rknow_w[0, -1]
-                rknow_idx = (rknow_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                rknow_indices_all.extend(rknow_idx)
+                # Knowledge
+                fknow_w = know.get('feature_know_w')
+                if fknow_w is not None:
+                    fknow_last = fknow_w[0, -1]
+                    fknow_idx = (fknow_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    fknow_indices_all.extend(fknow_idx)
+
+                rknow_w = know.get('restore_know_w')
+                if rknow_w is not None:
+                    rknow_last = rknow_w[0, -1]
+                    rknow_idx = (rknow_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                    rknow_indices_all.extend(rknow_idx)
 
         # Store unique indices per token
         routing_logs['fv_indices'].append(list(set(fv_indices_all)))

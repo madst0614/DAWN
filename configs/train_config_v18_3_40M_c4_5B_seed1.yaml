@@ -1,6 +1,8 @@
-# DAWN v18.2 Training Config - 40M Scale, 5B tokens (Seed 1)
-# Ablation vs v17.1: rank 16 (vs 64), 4x neurons, learnable tau (vs top-k=12)
-# Fair comparison: 4 paths × 12 neurons × rank 16 = 768 dim (same as v17.1's 12 × 64)
+# DAWN v18.3 Training Config - 40M Scale, 5B tokens (Seed 1)
+# v18.3: Confidence-Scaled Soft Gating
+# - gate = ReLU(scores - tau), can be 0
+# - confidence = gate / (gate + 1)
+# - scaled_weights = weights * confidence
 
 seed: 1
 
@@ -23,7 +25,7 @@ data:
   max_val_tokens: 2000000
 
 model:
-  model_version: "18.2"
+  model_version: "18.3"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -50,7 +52,7 @@ model:
   knowledge_token_routing: true
   use_ssm_context: false
 
-  # v18.2 specific - multi-path learnable tau routing
+  # v18.3 specific - confidence-scaled soft gating
   max_paths: 2
   path_max_k: 16
   learnable_tau: true
@@ -64,23 +66,27 @@ training:
   warmup_ratio: 0.06
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.00002
+  load_balance_weight: 0.0001
   tau_reg_weight: 0.00002
 
 use_amp: true
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v18.2_40M_c4_5B_seed1
-log_dir: /content/drive/MyDrive/dawn/logs_v18.2_40M_c4_5B_seed1
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v18.3_40M_c4_5B_seed1
+log_dir: /content/drive/MyDrive/dawn/logs_v18.3_40M_c4_5B_seed1
 
-# v18.2 Multi-Path Learnable Tau Architecture
+# v18.3 Confidence-Scaled Soft Gating Architecture
 #
-#   Attention Circuit (4-path routing, 48 total neurons):
-#   - Feature_QK=256 (4 paths × 12): per-token Q/K compression
-#   - Feature_V=1056 (4 paths × 12): per-token V compression
-#   - Restore_QK=256 (4 paths × 12): per-token Q/K restoration
-#   - Restore_V=1056 (4 paths × 12): per-token V restoration
+#   Key difference from v18.2:
+#   - gate = ReLU(scores - tau), can be 0 (no +1e-8)
+#   - confidence = gate / (gate + 1), sigmoid-like [0, 1]
+#   - scaled_weights = softmax(scores + log_gate) * confidence
+#   - Smoother gradient flow through confidence term
 #
-#   Knowledge Circuit (4-path routing, 48 total neurons):
-#   - Feature_Know=640 (4 paths × 12): per-token compression
-#   - Restore_Know=640 (4 paths × 12): per-token restoration
+#   Attention Circuit (2-path routing):
+#   - Feature_QK=256 (2 paths × 16): per-token Q/K compression
+#   - Feature_V=1020 (2 paths × 16): per-token V compression
+#   - Restore_QK=256 (2 paths × 16): per-token Q/K restoration
+#   - Restore_V=1020 (2 paths × 16): per-token V restoration
 #
-#   vs v17.1: same activation dims (768), but rank 16 vs 64
+#   Knowledge Circuit (2-path routing):
+#   - Feature_Know=620 (2 paths × 16): per-token compression
+#   - Restore_Know=620 (2 paths × 16): per-token restoration

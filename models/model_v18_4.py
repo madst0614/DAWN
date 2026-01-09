@@ -1,20 +1,27 @@
 """
-DAWN v18.2: ReLU-Masked Learnable Tau Routing
+DAWN v18.4: Relative Confidence Scaling
 
 Key Concept:
-- Based on v18.1 with simplified threshold selection
-- ReLU-based masking: mask = (ReLU(scores - tau) > 0)
-- Learnable tau: separate tau for each pool (Q/K separated)
-- Hard masking with differentiable tau
+- Based on v18.3 with relative confidence scaling
+- Gate: gate = ReLU(scores - tau), can be 0
+- Confidence: confidence = gate / gate_sum (relative, sums to 1)
+- Scaled weights: weights * confidence
 
-Changes from v18.1:
-- Gate-based scoring → ReLU-based hard mask
-- scores * gate → scores masked by (scores > tau)
-- Simpler forward pass, gradients flow through tau
+Changes from v18.3:
+- confidence = gate / (gate + 1) → gate / gate_sum
+- Relative scaling instead of absolute
+- tau decoupled from load-balance loss pressure
+- True zero possible (hard sparsity)
+- Healthy gradients (no vanishing)
+
+Benefits over v18.3:
+- tau stays in reasonable range (-3 ~ +3 instead of -170)
+- conf distribution is differentiated (not all 0.99)
+- lb_loss doesn't push tau to extremes
 
 Architecture:
 - UnifiedNeuronRouter: same as v18.0
-- GlobalRouters: ReLU mask + learnable tau (8 pools)
+- GlobalRouters: Relative confidence gating + learnable tau (8 pools)
 - AttentionCircuit: same as v18.0 (multi-path Q, K, V aggregation)
 - KnowledgeCircuit: same as v18.0 (multi-path aggregation)
 """
@@ -388,6 +395,7 @@ class GlobalRouters(nn.Module):
                  attention_token_routing: bool = False,
                  knowledge_token_routing: bool = False,
                  learnable_tau: bool = True,
+                 tau_reg_weight: float = 0.0,
                  **kwargs):
         super().__init__()
         self.d_model = d_model
@@ -404,6 +412,7 @@ class GlobalRouters(nn.Module):
         self.attention_token_routing = attention_token_routing
         self.knowledge_token_routing = knowledge_token_routing
         self.learnable_tau = learnable_tau
+        self.tau_reg_weight = tau_reg_weight
         self.inference_hard_mask = False  # Set True for clean hard mask during inference
         # ============================================================
         # MODE FLAGS (mutually exclusive usage patterns)
@@ -417,6 +426,7 @@ class GlobalRouters(nn.Module):
         # ============================================================
         self.debug_mode = False
         self.store_pref_tensors = False
+        self.store_path_weights = False  # For returning path_weights in routing_info
 
         # Learnable tau parameters - token-level projection
         if learnable_tau:
@@ -424,8 +434,8 @@ class GlobalRouters(nn.Module):
             # Output: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
             self.tau_proj = nn.Linear(d_model, 8)
             nn.init.zeros_(self.tau_proj.weight)
-            # Initialize bias to -1.0: ensures most neurons pass initially
-            nn.init.constant_(self.tau_proj.bias, -1.0)
+            # Initialize bias to -0.5: relative tau starts at mean - 0.5σ
+            nn.init.constant_(self.tau_proj.bias, -0.5)
 
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
@@ -450,18 +460,23 @@ class GlobalRouters(nn.Module):
 
     def get_tau_reg_loss(self):
         """
-        Compute tau regularization loss (v18.1 only).
-        L2 regularization on tau projection weights.
-        Returns 0 if learnable_tau=False.
+        DEPRECATED in v18.4: tau_reg is now computed inside routing functions
+        and added to aux_loss with tau_reg_weight. This method returns 0.
+
+        For v18.4, use tau_reg_weight parameter in model config instead.
+        tau_reg = relu(tau - score_mean) penalizes tau > score_mean.
         """
-        if not self.learnable_tau:
-            return 0.0
+        return 0.0
 
-        # L2 regularization on tau projection weights and bias
-        return (self.tau_proj.weight ** 2).mean() + (self.tau_proj.bias ** 2).mean()
+    def get_all_tau_offset_values(self):
+        """
+        Get all tau offset values as a dict (for logging).
 
-    def get_all_tau_values(self):
-        """Get all tau values as a dict (for logging). Returns bias values for learnable tau."""
+        v18.4: Returns tau_offset values (in std units from score mean).
+        Actual tau = score_mean + tau_offset * score_std
+
+        A tau_offset of -0.5 means threshold is 0.5 std below the mean.
+        """
         if self.learnable_tau:
             bias = self.tau_proj.bias.detach()
             return {
@@ -476,26 +491,30 @@ class GlobalRouters(nn.Module):
             }
         else:
             return {
-                'fq': self.fixed_tau,
-                'fk': self.fixed_tau,
-                'fv': self.fixed_tau,
-                'rq': self.fixed_tau,
-                'rk': self.fixed_tau,
-                'rv': self.fixed_tau,
-                'feature_know': self.fixed_tau,
-                'restore_know': self.fixed_tau,
+                'fq': 0.0,
+                'fk': 0.0,
+                'fv': 0.0,
+                'rq': 0.0,
+                'rk': 0.0,
+                'rv': 0.0,
+                'feature_know': 0.0,
+                'restore_know': 0.0,
             }
 
     def _topk_select_and_chunk(self, scores, tau, path_max_k, max_paths):
         """
-        Optimized routing: top-k selection → threshold → softmax → chunking
+        Optimized routing: top-k selection → tau threshold → exp gate → chunking
 
-        Optimization: O(N log N) sort → O(N + k log k) top-k
-        For N=1020, k=32: ~30x reduction in computation
+        v18.4: Relative tau (calculated from full scores by caller)
+        - tau = score_mean + tau_offset * score_std (relative to full neuron pool)
+        - gate = score - tau (positive) or 1e-8 * exp(score - tau) (negative, for gradient)
+        - exp_gate = exp(gate) - 1 (amplifies differences, 0 when gate=0)
+        - gate_strength = tanh(max(exp_gate))
+        - scaled_weights = (exp_gate / sum) * gate_strength
 
         Args:
             scores: [B, S, N] neuron scores
-            tau: scalar or [B, S, 1] tensor threshold
+            tau: scalar or [B, S, 1] tensor (threshold value)
             path_max_k: neurons per path
             max_paths: maximum number of paths
 
@@ -503,7 +522,8 @@ class GlobalRouters(nn.Module):
             path_weights_list: list of [B, S, N] weights (length = max_paths)
             weights: [B, S, N] sparse weights for aux_loss
             mask: [B, S, N] boolean mask for statistics
-            gate: [B, S, k] gate values for tau regularization
+            gate: [B, S, k] gate values (with gradient flow)
+            scaled_weights: [B, S, k] normalized exp gate weights
         """
         B, S, N = scores.shape
         k = min(path_max_k * max_paths, N)
@@ -511,29 +531,34 @@ class GlobalRouters(nn.Module):
         # 1. Top-k selection (sorted by descending scores)
         topk_scores, topk_indices = torch.topk(scores, k=k, dim=-1, sorted=True)
 
-        # 2. Expand tau for top-k positions
-        if torch.is_tensor(tau) and tau.dim() == 3:
-            topk_tau = tau.expand(-1, -1, k)
-        else:
-            topk_tau = tau
+        # 2. Threshold mask for top-k neurons (tau already computed by caller)
+        topk_mask = (topk_scores > tau)
 
-        # 3. Threshold mask for top-k neurons
-        topk_mask = (topk_scores > topk_tau)
+        # 4. Gate with gradient flow for dead neurons
+        raw_gate = topk_scores - tau
+        gate = torch.where(
+            raw_gate > 0,
+            raw_gate,
+            1e-8 * torch.exp(raw_gate)  # 음수여도 작은 값 + gradient 흐름
+        )
 
-        # 4. Log-gated selection on top-k only
-        gate = F.relu(topk_scores - topk_tau) + 1e-8
-        log_gate = torch.log(gate).clamp(min=-20)
+        # 5. Exponential scaling for sparsity + normalization
+        exp_gate = torch.exp(gate) - 1  # 차이 극대화, gate=0이면 0
+        exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
 
-        if self.inference_hard_mask and not self.training:
-            log_gate = torch.where(topk_mask, log_gate, torch.full_like(log_gate, -1e9))
+        # 비율 계산
+        ratio_weights = torch.where(
+            exp_gate_sum > 1e-8,
+            exp_gate / (exp_gate_sum + 1e-8),
+            exp_gate * 1e-8  # gradient 유지
+        )
 
-        # 5. Softmax on top-k only (O(k) instead of O(N))
-        masked_scores = topk_scores + log_gate
-        topk_weights = F.softmax(masked_scores, dim=-1)  # [B, S, k]
+        # gate_strength: max exp_gate의 tanh로 전체 강도 조절
+        gate_strength = torch.tanh(exp_gate.max(dim=-1, keepdim=True).values)
+        scaled_weights = ratio_weights * gate_strength
 
         # 6. Chunk to paths (already sorted by topk)
-        # Use topk_weights.dtype to avoid AMP dtype mismatch (bfloat16/float16)
-        out_dtype = topk_weights.dtype
+        out_dtype = scaled_weights.dtype
         path_weights_list = []
         for p in range(max_paths):
             start_idx = p * path_max_k
@@ -545,65 +570,29 @@ class GlobalRouters(nn.Module):
 
             path_weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
             path_indices = topk_indices[:, :, start_idx:end_idx]
-            path_w = topk_weights[:, :, start_idx:end_idx]
-            # Apply mask within this path's range
-            path_m = topk_mask[:, :, start_idx:end_idx].to(out_dtype)
-            path_w = path_w * path_m
+            path_w = scaled_weights[:, :, start_idx:end_idx]
 
             path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
             path_weights_list.append(path_weights)
 
-        # 7. Create sparse full weights for aux_loss
+        # 7. Create sparse full weights for aux_loss (use scaled_weights)
         weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
-        weights.scatter_(dim=-1, index=topk_indices, src=topk_weights)
+        weights.scatter_(dim=-1, index=topk_indices, src=scaled_weights)
 
         # 8. Create full mask for statistics
         mask = torch.zeros(B, S, N, device=scores.device, dtype=torch.bool)
         mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
 
-        return path_weights_list, weights, mask, gate
-
-    # Keep original functions for backward compatibility / other uses
-    def _threshold_select(self, scores, tau, path_max_k, max_paths):
-        """Legacy threshold selection - use _topk_select_and_chunk for optimized version."""
-        mask = (scores > tau)
-        gate = F.relu(scores - tau) + 1e-8
-        log_gate = torch.log(gate).clamp(min=-20)
-        if self.inference_hard_mask and not self.training:
-            log_gate = torch.where(mask, log_gate, torch.full_like(log_gate, -1e9))
-        masked_scores = scores + log_gate
-        weights = F.softmax(masked_scores, dim=-1)
-        return weights, mask, gate
-
-    def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
-        """Legacy chunking - use _topk_select_and_chunk for optimized version."""
-        B, S, N = scores.shape
-        sorted_scores, sorted_indices = torch.sort(scores, dim=-1, descending=True)
-        sorted_weights = torch.gather(weights, dim=-1, index=sorted_indices)
-        sorted_mask = torch.gather(mask.to(weights.dtype), dim=-1, index=sorted_indices)
-        path_weights_list = []
-        for p in range(max_paths):
-            start_idx = p * path_max_k
-            end_idx = min((p + 1) * path_max_k, N)
-            if start_idx >= N:
-                path_weights_list.append(torch.zeros_like(weights))
-                continue
-            path_weights = torch.zeros_like(weights)
-            path_indices = sorted_indices[:, :, start_idx:end_idx]
-            path_w = sorted_weights[:, :, start_idx:end_idx]
-            path_m = sorted_mask[:, :, start_idx:end_idx]
-            path_w = path_w * path_m
-            path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
-            path_weights_list.append(path_weights)
-        return path_weights_list
+        return path_weights_list, weights, mask, gate, scaled_weights
 
     def get_attention_weights(self, x, importance, attention_mask=None, tau_all=None):
         """
-        v18.0: Threshold + masked softmax multi-path routing for attention
-        v18.1: Soft mask + learnable tau (when use_soft_mask=True)
+        v18.4: Relative tau routing - tau calculated from full scores
+
+        tau = score_mean + tau_offset * score_std (relative to full neuron pool)
 
         Args:
-            tau_all: [B, S, 8] pre-computed tau values (optional, avoids recomputation)
+            tau_all: [B, S, 8] pre-computed tau_offset values (optional)
                      Order: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
 
         Returns:
@@ -614,53 +603,75 @@ class GlobalRouters(nn.Module):
         (fqk_logits_Q, fqk_logits_K, fv_logits,
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
 
-        # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
-        # Q/K have separate tau values
+        # Get tau_offset and compute tau from full scores
         if self.learnable_tau:
             if tau_all is None:
-                tau_all = self.tau_proj(x)  # fallback if not provided
-            tau_fq = tau_all[..., 0:1]
-            tau_fk = tau_all[..., 1:2]
-            tau_fv = tau_all[..., 2:3]
-            tau_rq = tau_all[..., 3:4]
-            tau_rk = tau_all[..., 4:5]
-            tau_rv = tau_all[..., 5:6]
-        else:
-            tau_fq = tau_fk = tau_fv = tau_rq = tau_rk = tau_rv = self.fixed_tau
+                tau_all = self.tau_proj(x)
+            tau_offset_fq = tau_all[..., 0:1]
+            tau_offset_fk = tau_all[..., 1:2]
+            tau_offset_fv = tau_all[..., 2:3]
+            tau_offset_rq = tau_all[..., 3:4]
+            tau_offset_rk = tau_all[..., 4:5]
+            tau_offset_rv = tau_all[..., 5:6]
 
-        # Optimized top-k selection + threshold + softmax + chunking
-        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q = self._topk_select_and_chunk(
+            # Compute tau from full scores: tau = mean + offset * std
+            tau_fq = fqk_logits_Q.mean(dim=-1, keepdim=True) + tau_offset_fq * (fqk_logits_Q.std(dim=-1, keepdim=True) + 1e-8)
+            tau_fk = fqk_logits_K.mean(dim=-1, keepdim=True) + tau_offset_fk * (fqk_logits_K.std(dim=-1, keepdim=True) + 1e-8)
+            tau_fv = fv_logits.mean(dim=-1, keepdim=True) + tau_offset_fv * (fv_logits.std(dim=-1, keepdim=True) + 1e-8)
+            tau_rq = rqk_logits_Q.mean(dim=-1, keepdim=True) + tau_offset_rq * (rqk_logits_Q.std(dim=-1, keepdim=True) + 1e-8)
+            tau_rk = rqk_logits_K.mean(dim=-1, keepdim=True) + tau_offset_rk * (rqk_logits_K.std(dim=-1, keepdim=True) + 1e-8)
+            tau_rv = rv_logits.mean(dim=-1, keepdim=True) + tau_offset_rv * (rv_logits.std(dim=-1, keepdim=True) + 1e-8)
+        else:
+            # For fixed tau, use score mean (offset = 0)
+            tau_offset_fq = tau_offset_fk = tau_offset_fv = 0.0
+            tau_offset_rq = tau_offset_rk = tau_offset_rv = 0.0
+            tau_fq = fqk_logits_Q.mean(dim=-1, keepdim=True)
+            tau_fk = fqk_logits_K.mean(dim=-1, keepdim=True)
+            tau_fv = fv_logits.mean(dim=-1, keepdim=True)
+            tau_rq = rqk_logits_Q.mean(dim=-1, keepdim=True)
+            tau_rk = rqk_logits_K.mean(dim=-1, keepdim=True)
+            tau_rv = rv_logits.mean(dim=-1, keepdim=True)
+
+        # Top-k selection with tau threshold
+        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q, fqk_conf_Q = self._topk_select_and_chunk(
             fqk_logits_Q, tau_fq, self.path_max_k, self.max_paths)
-        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K = self._topk_select_and_chunk(
+        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K, fqk_conf_K = self._topk_select_and_chunk(
             fqk_logits_K, tau_fk, self.path_max_k, self.max_paths)
-        fv_paths, fv_weights, fv_mask, fv_gate = self._topk_select_and_chunk(
+        fv_paths, fv_weights, fv_mask, fv_gate, fv_conf = self._topk_select_and_chunk(
             fv_logits, tau_fv, self.path_max_k, self.max_paths)
-        rqk_paths_Q, rqk_weights_Q, rqk_mask_Q, rqk_gate_Q = self._topk_select_and_chunk(
+        rqk_paths_Q, rqk_weights_Q, rqk_mask_Q, rqk_gate_Q, rqk_conf_Q = self._topk_select_and_chunk(
             rqk_logits_Q, tau_rq, self.path_max_k, self.max_paths)
-        rqk_paths_K, rqk_weights_K, rqk_mask_K, rqk_gate_K = self._topk_select_and_chunk(
+        rqk_paths_K, rqk_weights_K, rqk_mask_K, rqk_gate_K, rqk_conf_K = self._topk_select_and_chunk(
             rqk_logits_K, tau_rk, self.path_max_k, self.max_paths)
-        rv_paths, rv_weights, rv_mask, rv_gate = self._topk_select_and_chunk(
+        rv_paths, rv_weights, rv_mask, rv_gate, rv_conf = self._topk_select_and_chunk(
             rv_logits, tau_rv, self.path_max_k, self.max_paths)
 
-        # Compute aux_loss for load balancing (using softmax weights)
+        # Compute aux_loss for load balancing (score-based: softmax before top-k)
         aux_loss = 0.0
         if self.training:
+            fqk_pref_Q = F.softmax(fqk_logits_Q, dim=-1)
+            fqk_pref_K = F.softmax(fqk_logits_K, dim=-1)
+            fv_pref = F.softmax(fv_logits, dim=-1)
+            rqk_pref_Q = F.softmax(rqk_logits_Q, dim=-1)
+            rqk_pref_K = F.softmax(rqk_logits_K, dim=-1)
+            rv_pref = F.softmax(rv_logits, dim=-1)
+
             if attention_mask is not None:
                 seq_mask = attention_mask.unsqueeze(-1).float()
                 count = seq_mask.sum() + 1e-8
-                usage_fqk_Q = (fqk_weights_Q * seq_mask).sum(dim=(0, 1)) / count
-                usage_fqk_K = (fqk_weights_K * seq_mask).sum(dim=(0, 1)) / count
-                usage_fv = (fv_weights * seq_mask).sum(dim=(0, 1)) / count
-                usage_rqk_Q = (rqk_weights_Q * seq_mask).sum(dim=(0, 1)) / count
-                usage_rqk_K = (rqk_weights_K * seq_mask).sum(dim=(0, 1)) / count
-                usage_rv = (rv_weights * seq_mask).sum(dim=(0, 1)) / count
+                usage_fqk_Q = (fqk_pref_Q * seq_mask).sum(dim=(0, 1)) / count
+                usage_fqk_K = (fqk_pref_K * seq_mask).sum(dim=(0, 1)) / count
+                usage_fv = (fv_pref * seq_mask).sum(dim=(0, 1)) / count
+                usage_rqk_Q = (rqk_pref_Q * seq_mask).sum(dim=(0, 1)) / count
+                usage_rqk_K = (rqk_pref_K * seq_mask).sum(dim=(0, 1)) / count
+                usage_rv = (rv_pref * seq_mask).sum(dim=(0, 1)) / count
             else:
-                usage_fqk_Q = fqk_weights_Q.mean(dim=(0, 1))
-                usage_fqk_K = fqk_weights_K.mean(dim=(0, 1))
-                usage_fv = fv_weights.mean(dim=(0, 1))
-                usage_rqk_Q = rqk_weights_Q.mean(dim=(0, 1))
-                usage_rqk_K = rqk_weights_K.mean(dim=(0, 1))
-                usage_rv = rv_weights.mean(dim=(0, 1))
+                usage_fqk_Q = fqk_pref_Q.mean(dim=(0, 1))
+                usage_fqk_K = fqk_pref_K.mean(dim=(0, 1))
+                usage_fv = fv_pref.mean(dim=(0, 1))
+                usage_rqk_Q = rqk_pref_Q.mean(dim=(0, 1))
+                usage_rqk_K = rqk_pref_K.mean(dim=(0, 1))
+                usage_rv = rv_pref.mean(dim=(0, 1))
 
             target_fqk = 1.0 / self.n_feature_qk
             target_fv = 1.0 / self.n_feature_v
@@ -674,6 +685,16 @@ class GlobalRouters(nn.Module):
             aux_loss += ((usage_rqk_K - target_rqk) ** 2).sum() * self.n_restore_qk
             aux_loss += ((usage_rv - target_rv) ** 2).sum() * self.n_restore_v
 
+        # Compute tau regularization loss (penalize positive tau_offset)
+        if self.training and self.learnable_tau and self.tau_reg_weight > 0:
+            tau_reg = F.relu(tau_offset_fq).mean()
+            tau_reg += F.relu(tau_offset_fk).mean()
+            tau_reg += F.relu(tau_offset_fv).mean()
+            tau_reg += F.relu(tau_offset_rq).mean()
+            tau_reg += F.relu(tau_offset_rk).mean()
+            tau_reg += F.relu(tau_offset_rv).mean()
+            aux_loss += tau_reg * self.tau_reg_weight
+
         # Package path weights
         path_weights = {
             'fqk_Q': fqk_paths_Q,
@@ -684,83 +705,44 @@ class GlobalRouters(nn.Module):
             'rv': rv_paths,
         }
 
-        # Routing stats only in debug mode (avoid GPU sync overhead)
+        # ============================================================
+        # ROUTING INFO (for logging/analysis only)
+        # ============================================================
+        # IMPORTANT: debug_mode=True only on log steps, ~20 metrics, torch.no_grad
+        # ============================================================
         if self.debug_mode:
-            def avg_paths_per_token(paths):
-                return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
-
-            def avg_selected_per_token(mask):
-                return mask.float().sum(dim=-1).mean().item()
-
-            def qk_overlap(mask_q, mask_k):
-                intersection = (mask_q & mask_k).float().sum(dim=-1)
-                q_count = mask_q.float().sum(dim=-1)
-                k_count = mask_k.float().sum(dim=-1)
-                max_count = torch.maximum(q_count, k_count).clamp(min=1)
-                return (intersection / max_count).mean().item()
-
-            def tau_mean(tau):
-                return tau.mean().item() if torch.is_tensor(tau) else tau
-
-            def tau_std(tau):
-                return tau.std().item() if torch.is_tensor(tau) else 0.0
-
-            routing_info = {
-                # Only store scalar stats for logging (not large tensors to save memory)
-                'n_paths_fqk_Q': avg_paths_per_token(fqk_paths_Q),
-                'n_paths_fqk_K': avg_paths_per_token(fqk_paths_K),
-                'n_paths_fv': avg_paths_per_token(fv_paths),
-                'n_paths_rqk_Q': avg_paths_per_token(rqk_paths_Q),
-                'n_paths_rqk_K': avg_paths_per_token(rqk_paths_K),
-                'n_paths_rv': avg_paths_per_token(rv_paths),
-                'selected_fqk_Q': avg_selected_per_token(fqk_mask_Q),
-                'selected_fqk_K': avg_selected_per_token(fqk_mask_K),
-                'selected_fv': avg_selected_per_token(fv_mask),
-                'selected_rqk_Q': avg_selected_per_token(rqk_mask_Q),
-                'selected_rqk_K': avg_selected_per_token(rqk_mask_K),
-                'selected_rv': avg_selected_per_token(rv_mask),
-                'overlap_fqk': qk_overlap(fqk_mask_Q, fqk_mask_K),
-                'overlap_rqk': qk_overlap(rqk_mask_Q, rqk_mask_K),
-                'score_fqk_Q_mean': fqk_logits_Q.mean().item(),
-                'score_fqk_Q_std': fqk_logits_Q.std().item(),
-                'score_fqk_K_mean': fqk_logits_K.mean().item(),
-                'score_fqk_K_std': fqk_logits_K.std().item(),
-                'score_fv_mean': fv_logits.mean().item(),
-                'score_fv_std': fv_logits.std().item(),
-                'score_rqk_Q_mean': rqk_logits_Q.mean().item(),
-                'score_rqk_Q_std': rqk_logits_Q.std().item(),
-                'score_rqk_K_mean': rqk_logits_K.mean().item(),
-                'score_rqk_K_std': rqk_logits_K.std().item(),
-                'score_rv_mean': rv_logits.mean().item(),
-                'score_rv_std': rv_logits.std().item(),
-                'tau_fq': tau_mean(tau_fq),
-                'tau_fq_std': tau_std(tau_fq),
-                'tau_fk': tau_mean(tau_fk),
-                'tau_fk_std': tau_std(tau_fk),
-                'tau_fv': tau_mean(tau_fv),
-                'tau_fv_std': tau_std(tau_fv),
-                'tau_rq': tau_mean(tau_rq),
-                'tau_rq_std': tau_std(tau_rq),
-                'tau_rk': tau_mean(tau_rk),
-                'tau_rk_std': tau_std(tau_rk),
-                'tau_rv': tau_mean(tau_rv),
-                'tau_rv_std': tau_std(tau_rv),
-                'learnable_tau': self.learnable_tau,
-                'use_soft_mask': True,
-                'token_routing': self.attention_token_routing,
-                'gate_fq_mean': fqk_gate_Q.mean().item(),
-                'gate_fq_std': fqk_gate_Q.std().item(),
-                'gate_fk_mean': fqk_gate_K.mean().item(),
-                'gate_fk_std': fqk_gate_K.std().item(),
-                'gate_fv_mean': fv_gate.mean().item(),
-                'gate_fv_std': fv_gate.std().item(),
-                'gate_rq_mean': rqk_gate_Q.mean().item(),
-                'gate_rq_std': rqk_gate_Q.std().item(),
-                'gate_rk_mean': rqk_gate_K.mean().item(),
-                'gate_rk_std': rqk_gate_K.std().item(),
-                'gate_rv_mean': rv_gate.mean().item(),
-                'gate_rv_std': rv_gate.std().item(),
-            }
+            with torch.no_grad():
+                routing_info = {
+                    'top_k': self.path_max_k * self.max_paths,
+                    # Selected neurons (pass rate = selected / top_k)
+                    'selected_fqk_Q': fqk_mask_Q.float().sum(dim=-1).mean().item(),
+                    'selected_fqk_K': fqk_mask_K.float().sum(dim=-1).mean().item(),
+                    'selected_fv': fv_mask.float().sum(dim=-1).mean().item(),
+                    'selected_rqk_Q': rqk_mask_Q.float().sum(dim=-1).mean().item(),
+                    'selected_rqk_K': rqk_mask_K.float().sum(dim=-1).mean().item(),
+                    'selected_rv': rv_mask.float().sum(dim=-1).mean().item(),
+                    # tau_offset (the learned parameter, in std units)
+                    'tau_offset_fq': tau_offset_fq.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_fk': tau_offset_fk.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_fv': tau_offset_fv.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_rq': tau_offset_rq.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_rk': tau_offset_rk.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_rv': tau_offset_rv.mean().item() if self.learnable_tau else 0.0,
+                    # gate_strength (0~1, low = more pass-through)
+                    'gstr_fq': torch.tanh(fqk_gate_Q.max(dim=-1).values).mean().item(),
+                    'gstr_fk': torch.tanh(fqk_gate_K.max(dim=-1).values).mean().item(),
+                    'gstr_fv': torch.tanh(fv_gate.max(dim=-1).values).mean().item(),
+                    'gstr_rq': torch.tanh(rqk_gate_Q.max(dim=-1).values).mean().item(),
+                    'gstr_rk': torch.tanh(rqk_gate_K.max(dim=-1).values).mean().item(),
+                    'gstr_rv': torch.tanh(rv_gate.max(dim=-1).values).mean().item(),
+                    # Q/K overlap
+                    'overlap_fqk': ((fqk_mask_Q & fqk_mask_K).float().sum(dim=-1) /
+                                   torch.maximum(fqk_mask_Q.float().sum(dim=-1),
+                                                fqk_mask_K.float().sum(dim=-1)).clamp(min=1)).mean().item(),
+                    'overlap_rqk': ((rqk_mask_Q & rqk_mask_K).float().sum(dim=-1) /
+                                   torch.maximum(rqk_mask_Q.float().sum(dim=-1),
+                                                rqk_mask_K.float().sum(dim=-1)).clamp(min=1)).mean().item(),
+                }
         else:
             routing_info = {}
 
@@ -796,28 +778,35 @@ class GlobalRouters(nn.Module):
 
     def get_knowledge_weights(self, x, importance, attention_mask=None, tau_all=None):
         """
-        v18.0: Threshold + masked softmax multi-path routing for knowledge
-        v18.1: Soft mask + learnable tau (when use_soft_mask=True)
+        v18.4: Relative tau routing - tau calculated from full scores
+
+        tau = score_mean + tau_offset * score_std (relative to full neuron pool)
 
         Args:
-            tau_all: [B, S, 8] pre-computed tau values (optional, avoids recomputation)
+            tau_all: [B, S, 8] pre-computed tau_offset values (optional)
                      Order: [fq, fk, fv, rq, rk, rv, feature_know, restore_know]
         """
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
 
-        # Get thresholds (v18.0: fixed scalar, v18.1: token-level [B, S, 1])
+        # Get tau_offset and compute tau from full scores
         if self.learnable_tau:
             if tau_all is None:
-                tau_all = self.tau_proj(x)  # fallback if not provided
-            tau_f = tau_all[..., 6:7]
-            tau_r = tau_all[..., 7:8]
-        else:
-            tau_f = tau_r = self.fixed_tau
+                tau_all = self.tau_proj(x)
+            tau_offset_f = tau_all[..., 6:7]
+            tau_offset_r = tau_all[..., 7:8]
 
-        # Optimized top-k selection + threshold + softmax + chunking
-        f_paths, f_weights, f_mask, f_gate = self._topk_select_and_chunk(
+            # Compute tau from full scores: tau = mean + offset * std
+            tau_f = logits_f.mean(dim=-1, keepdim=True) + tau_offset_f * (logits_f.std(dim=-1, keepdim=True) + 1e-8)
+            tau_r = logits_r.mean(dim=-1, keepdim=True) + tau_offset_r * (logits_r.std(dim=-1, keepdim=True) + 1e-8)
+        else:
+            tau_offset_f = tau_offset_r = 0.0
+            tau_f = logits_f.mean(dim=-1, keepdim=True)
+            tau_r = logits_r.mean(dim=-1, keepdim=True)
+
+        # Top-k selection with tau threshold
+        f_paths, f_weights, f_mask, f_gate, f_conf = self._topk_select_and_chunk(
             logits_f, tau_f, self.path_max_k, self.max_paths)
-        r_paths, r_weights, r_mask, r_gate = self._topk_select_and_chunk(
+        r_paths, r_weights, r_mask, r_gate, r_conf = self._topk_select_and_chunk(
             logits_r, tau_r, self.path_max_k, self.max_paths)
 
         # Update usage with mask (binary selection)
@@ -825,43 +814,52 @@ class GlobalRouters(nn.Module):
             self.neuron_router.update_usage(f_mask.float(), 'feature_know', attention_mask)
             self.neuron_router.update_usage(r_mask.float(), 'restore_know', attention_mask)
 
+        # Compute aux_loss for load balancing (score-based: softmax before top-k)
+        aux_loss = 0.0
+        if self.training:
+            f_pref = F.softmax(logits_f, dim=-1)
+            r_pref = F.softmax(logits_r, dim=-1)
+
+            if attention_mask is not None:
+                seq_mask = attention_mask.unsqueeze(-1).float()
+                count = seq_mask.sum() + 1e-8
+                usage_f = (f_pref * seq_mask).sum(dim=(0, 1)) / count
+                usage_r = (r_pref * seq_mask).sum(dim=(0, 1)) / count
+            else:
+                usage_f = f_pref.mean(dim=(0, 1))
+                usage_r = r_pref.mean(dim=(0, 1))
+
+            target_f = 1.0 / self.n_feature_know
+            target_r = 1.0 / self.n_restore_know
+
+            aux_loss += ((usage_f - target_f) ** 2).sum() * self.n_feature_know
+            aux_loss += ((usage_r - target_r) ** 2).sum() * self.n_restore_know
+
+        # Compute tau regularization loss (penalize positive tau_offset)
+        if self.training and self.learnable_tau and self.tau_reg_weight > 0:
+            tau_reg = F.relu(tau_offset_f).mean()
+            tau_reg += F.relu(tau_offset_r).mean()
+            aux_loss += tau_reg * self.tau_reg_weight
+
         # Routing stats only in debug mode (avoid GPU sync overhead)
         if self.debug_mode:
-            def avg_paths_per_token(paths):
-                return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
-
-            def avg_selected_per_token(mask):
-                return mask.float().sum(dim=-1).mean().item()
-
-            def tau_mean(tau):
-                return tau.mean().item() if torch.is_tensor(tau) else tau
-
-            def tau_std(tau):
-                return tau.std().item() if torch.is_tensor(tau) else 0.0
-
-            know_info = {
-                # Only store scalar stats for logging (not large tensors to save memory)
-                'n_paths_feature': avg_paths_per_token(f_paths),
-                'n_paths_restore': avg_paths_per_token(r_paths),
-                'selected_feature': avg_selected_per_token(f_mask),
-                'selected_restore': avg_selected_per_token(r_mask),
-                'score_feature_mean': logits_f.mean().item(),
-                'score_feature_std': logits_f.std().item(),
-                'score_restore_mean': logits_r.mean().item(),
-                'score_restore_std': logits_r.std().item(),
-                'tau_feature': tau_mean(tau_f),
-                'tau_feature_std': tau_std(tau_f),
-                'tau_restore': tau_mean(tau_r),
-                'tau_restore_std': tau_std(tau_r),
-                'gate_feature_mean': f_gate.mean().item(),
-                'gate_feature_std': f_gate.std().item(),
-                'gate_restore_mean': r_gate.mean().item(),
-                'gate_restore_std': r_gate.std().item(),
-            }
+            with torch.no_grad():
+                know_info = {
+                    'top_k': self.path_max_k * self.max_paths,
+                    # Selected counts (what % passed tau)
+                    'selected_feature': f_mask.float().sum(dim=-1).mean().item(),
+                    'selected_restore': r_mask.float().sum(dim=-1).mean().item(),
+                    # v18.4: tau_offset (learned parameter, in std units)
+                    'tau_offset_feature': tau_offset_f.mean().item() if self.learnable_tau else 0.0,
+                    'tau_offset_restore': tau_offset_r.mean().item() if self.learnable_tau else 0.0,
+                    # v18.4: gate_strength from gate (0~1, low = pass-through)
+                    'gstr_feature': torch.tanh((torch.exp(f_gate) - 1).max(dim=-1).values).mean().item(),
+                    'gstr_restore': torch.tanh((torch.exp(r_gate) - 1).max(dim=-1).values).mean().item(),
+                }
         else:
             know_info = {}
 
-        return f_paths, r_paths, know_info
+        return f_paths, r_paths, know_info, aux_loss
 
 
 class AttentionCircuit(nn.Module):
@@ -968,6 +966,9 @@ class AttentionCircuit(nn.Module):
         K_total = K_all.sum(dim=0)
         V_total = V_all.sum(dim=0)
 
+        # Q norm for dead routing detection
+        q_norm = Q_total.norm(dim=-1, keepdim=True)  # [B, S, 1]
+
         # Multi-head attention
         Q = Q_total.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
         K = K_total.view(B, S, self.n_heads, self.d_head).transpose(1, 2)
@@ -982,6 +983,15 @@ class AttentionCircuit(nn.Module):
             dropout_p=dropout_p,
         )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
+
+        # Q≈0 토큰은 attn 출력 억제
+        scale = torch.where(
+            q_norm > 1e-6,
+            torch.ones_like(q_norm),
+            q_norm * 1e-6
+        )
+        attn_out = attn_out * scale
+
         output = self.expand_O(attn_out)
         output = self.out_dropout(output)
 
@@ -1095,7 +1105,7 @@ class DAWNBlock(nn.Module):
         # Knowledge
         normed_x_know = self.norm2(x)
         tau_all_know = global_routers.get_tau_all(normed_x_know)
-        feature_paths, restore_paths, know_info = global_routers.get_knowledge_weights(
+        feature_paths, restore_paths, know_info, know_aux_loss = global_routers.get_knowledge_weights(
             normed_x_know, importance, attention_mask, tau_all=tau_all_know
         )
         know_out = self.knowledge(normed_x_know, feature_paths, restore_paths, attention_mask)
@@ -1123,26 +1133,32 @@ class DAWNBlock(nn.Module):
             routing_info['attn_out_norm'] = attn_out.norm(dim=-1).mean().item()
             routing_info['know_out_norm'] = know_out.norm(dim=-1).mean().item()
 
-        return x, routing_info, attn_aux_loss
+        return x, routing_info, attn_aux_loss + know_aux_loss
 
 
 class DAWN(nn.Module):
     """
-    DAWN v18.2: ReLU-Masked Learnable Tau Routing
+    DAWN v18.4: Relative Confidence Scaling
 
     Key Features:
-    - Based on v18.1 with simplified threshold selection
-    - ReLU-based mask: mask = (ReLU(scores - tau) > 0)
-    - Learnable tau: separate tau for Q/K (8 pools total)
-    - Hard masking with differentiable tau learning
+    - Based on v18.3 with relative confidence scaling
+    - Gate: gate = ReLU(scores - tau), can be 0
+    - Confidence: confidence = gate / gate_sum (relative, sums to 1)
+    - Scaled weights: weights * confidence
+    - tau decoupled from lb_loss, healthy gradient flow
+
+    Benefits over v18.3:
+    - tau stays in reasonable range (-3 ~ +3 instead of -170)
+    - conf distribution is differentiated (not all 0.99)
+    - lb_loss doesn't push tau to extremes
 
     Architecture:
     - UnifiedNeuronRouter: same as v18.0
-    - GlobalRouters: ReLU mask + learnable tau (8 pools)
+    - GlobalRouters: Relative confidence gating + learnable tau (8 pools)
     - AttentionCircuit: Multi-path Q,K,V summation (same as v18.0)
     - KnowledgeCircuit: Multi-path summation (same as v18.0)
     """
-    __version__ = "18.2"
+    __version__ = "18.4"
 
     def __init__(
         self,
@@ -1175,6 +1191,7 @@ class DAWN(nn.Module):
         router_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
         use_ssm_context: bool = True,
+        tau_reg_weight: float = 0.0,
         **kwargs,
     ):
         super().__init__()
@@ -1204,6 +1221,7 @@ class DAWN(nn.Module):
         self.fixed_tau = fixed_tau
         self.path_max_k = path_max_k
         self.learnable_tau = learnable_tau
+        self.tau_reg_weight = tau_reg_weight
 
         # Neuron counts
         self.n_feature_qk = n_feature_qk
@@ -1245,6 +1263,7 @@ class DAWN(nn.Module):
             attention_token_routing=attention_token_routing,
             knowledge_token_routing=knowledge_token_routing,
             learnable_tau=learnable_tau,
+            tau_reg_weight=tau_reg_weight,
         )
 
         self.layers = nn.ModuleList([
@@ -1350,6 +1369,7 @@ class DAWN(nn.Module):
             'fixed_tau': self.fixed_tau,
             'path_max_k': self.path_max_k,
             'learnable_tau': self.learnable_tau,
+            'tau_reg_weight': self.tau_reg_weight,
             'n_feature_qk': self.n_feature_qk, 'n_feature_v': self.n_feature_v,
             'n_restore_qk': self.n_restore_qk, 'n_restore_v': self.n_restore_v,
             'n_feature_know': self.n_feature_know, 'n_restore_know': self.n_restore_know,
@@ -1379,7 +1399,7 @@ class DAWN(nn.Module):
             f"  [Router - ReLU Mask + Learnable Tau (8 pools)]",
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
             f"  attention_token_routing={self.attention_token_routing}, knowledge_token_routing={self.knowledge_token_routing}",
-            f"  use_ssm_context={self.use_ssm_context}",
+            f"  use_ssm_context={self.use_ssm_context}, tau_reg_weight={self.tau_reg_weight}",
             f"",
             f"  [Other]",
             f"  gradient_checkpointing={self.gradient_checkpointing}",

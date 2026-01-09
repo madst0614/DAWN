@@ -613,16 +613,17 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
         return mean, std
 
-    # Paths (mean±std across layers)
-    p_fqk_Q, s_fqk_Q = get_mean_std('n_paths_fqk_Q')
-    p_fqk_K, s_fqk_K = get_mean_std('n_paths_fqk_K')
-    p_fv, s_fv = get_mean_std('n_paths_fv')
-    p_rqk_Q, s_rqk_Q = get_mean_std('n_paths_rqk_Q')
-    p_rqk_K, s_rqk_K = get_mean_std('n_paths_rqk_K')
-    p_rv, s_rv = get_mean_std('n_paths_rv')
-    p_kf, s_kf = get_mean_std('n_paths_feature', 'knowledge')
-    p_kr, s_kr = get_mean_std('n_paths_restore', 'knowledge')
-    lines.append(f"{prefix}[v18] Paths: fqk_Q={p_fqk_Q:.1f}±{s_fqk_Q:.1f} fqk_K={p_fqk_K:.1f}±{s_fqk_K:.1f} fv={p_fv:.1f}±{s_fv:.1f} rqk_Q={p_rqk_Q:.1f}±{s_rqk_Q:.1f} rqk_K={p_rqk_K:.1f}±{s_rqk_K:.1f} rv={p_rv:.1f}±{s_rv:.1f} kf={p_kf:.1f}±{s_kf:.1f} kr={p_kr:.1f}±{s_kr:.1f}")
+    # Paths (mean±std across layers) - skip for v18.4 (simplified output)
+    if not model_version.startswith('18.4'):
+        p_fqk_Q, s_fqk_Q = get_mean_std('n_paths_fqk_Q')
+        p_fqk_K, s_fqk_K = get_mean_std('n_paths_fqk_K')
+        p_fv, s_fv = get_mean_std('n_paths_fv')
+        p_rqk_Q, s_rqk_Q = get_mean_std('n_paths_rqk_Q')
+        p_rqk_K, s_rqk_K = get_mean_std('n_paths_rqk_K')
+        p_rv, s_rv = get_mean_std('n_paths_rv')
+        p_kf, s_kf = get_mean_std('n_paths_feature', 'knowledge')
+        p_kr, s_kr = get_mean_std('n_paths_restore', 'knowledge')
+        lines.append(f"{prefix}[v18] Paths: fqk_Q={p_fqk_Q:.1f}±{s_fqk_Q:.1f} fqk_K={p_fqk_K:.1f}±{s_fqk_K:.1f} fv={p_fv:.1f}±{s_fv:.1f} rqk_Q={p_rqk_Q:.1f}±{s_rqk_Q:.1f} rqk_K={p_rqk_K:.1f}±{s_rqk_K:.1f} rv={p_rv:.1f}±{s_rv:.1f} kf={p_kf:.1f}±{s_kf:.1f} kr={p_kr:.1f}±{s_kr:.1f}")
 
     # Selected neurons per token (mean±std across layers)
     sel_fqk_Q, ss_fqk_Q = get_mean_std('selected_fqk_Q')
@@ -633,22 +634,41 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
     sel_rv, ss_rv = get_mean_std('selected_rv')
     sel_kf, ss_kf = get_mean_std('selected_feature', 'knowledge')
     sel_kr, ss_kr = get_mean_std('selected_restore', 'knowledge')
-    lines.append(f"{prefix}Selected: fqk_Q={sel_fqk_Q:.0f}±{ss_fqk_Q:.0f} fqk_K={sel_fqk_K:.0f}±{ss_fqk_K:.0f} fv={sel_fv:.0f}±{ss_fv:.0f} rqk_Q={sel_rqk_Q:.0f}±{ss_rqk_Q:.0f} rqk_K={sel_rqk_K:.0f}±{ss_rqk_K:.0f} rv={sel_rv:.0f}±{ss_rv:.0f} kf={sel_kf:.0f}±{ss_kf:.0f} kr={sel_kr:.0f}±{ss_kr:.0f}")
 
-    # Score distribution (mean±std, average across layers)
-    score_fqk_Q_mean = sum(ri.get('attention', ri).get('score_fqk_Q_mean', 0) for ri in routing_infos) / n
-    score_fqk_Q_std = sum(ri.get('attention', ri).get('score_fqk_Q_std', 0) for ri in routing_infos) / n
-    score_fv_mean = sum(ri.get('attention', ri).get('score_fv_mean', 0) for ri in routing_infos) / n
-    score_fv_std = sum(ri.get('attention', ri).get('score_fv_std', 0) for ri in routing_infos) / n
-    score_rqk_Q_mean = sum(ri.get('attention', ri).get('score_rqk_Q_mean', 0) for ri in routing_infos) / n
-    score_rqk_Q_std = sum(ri.get('attention', ri).get('score_rqk_Q_std', 0) for ri in routing_infos) / n
-    score_rv_mean = sum(ri.get('attention', ri).get('score_rv_mean', 0) for ri in routing_infos) / n
-    score_rv_std = sum(ri.get('attention', ri).get('score_rv_std', 0) for ri in routing_infos) / n
-    lines.append(f"{prefix}Score: fqk={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f}")
+    # v18.4: Show pass rate % (selected / top_k)
+    if model_version.startswith('18.4'):
+        # Get top_k from routing_info (computed in debug_mode only)
+        top_k = routing_infos[0].get('attention', {}).get('top_k', 32) if routing_infos else 32
+        def pct(sel): return sel / top_k * 100 if top_k > 0 else 0
+        lines.append(f"{prefix}Selected: fqk_Q={sel_fqk_Q:.0f}({pct(sel_fqk_Q):.0f}%) fqk_K={sel_fqk_K:.0f}({pct(sel_fqk_K):.0f}%) fv={sel_fv:.0f}({pct(sel_fv):.0f}%) rqk_Q={sel_rqk_Q:.0f}({pct(sel_rqk_Q):.0f}%) rqk_K={sel_rqk_K:.0f}({pct(sel_rqk_K):.0f}%) rv={sel_rv:.0f}({pct(sel_rv):.0f}%) kf={sel_kf:.0f}({pct(sel_kf):.0f}%) kr={sel_kr:.0f}({pct(sel_kr):.0f}%)")
+    else:
+        lines.append(f"{prefix}Selected: fqk_Q={sel_fqk_Q:.0f}±{ss_fqk_Q:.0f} fqk_K={sel_fqk_K:.0f}±{ss_fqk_K:.0f} fv={sel_fv:.0f}±{ss_fv:.0f} rqk_Q={sel_rqk_Q:.0f}±{ss_rqk_Q:.0f} rqk_K={sel_rqk_K:.0f}±{ss_rqk_K:.0f} rv={sel_rv:.0f}±{ss_rv:.0f} kf={sel_kf:.0f}±{ss_kf:.0f} kr={sel_kr:.0f}±{ss_kr:.0f}")
 
-    # v18.1/v18.2 specific: Tau and Gate with mean±std
-    if model_version.startswith('18.1') or model_version.startswith('18.2'):
-        # Tau with std
+    # Score distribution (mean±std, average across layers) - skip for v18.4 (simplified output)
+    if not model_version.startswith('18.4'):
+        score_fqk_Q_mean = sum(ri.get('attention', ri).get('score_fqk_Q_mean', 0) for ri in routing_infos) / n
+        score_fqk_Q_std = sum(ri.get('attention', ri).get('score_fqk_Q_std', 0) for ri in routing_infos) / n
+        score_fqk_K_mean = sum(ri.get('attention', ri).get('score_fqk_K_mean', 0) for ri in routing_infos) / n
+        score_fqk_K_std = sum(ri.get('attention', ri).get('score_fqk_K_std', 0) for ri in routing_infos) / n
+        score_fv_mean = sum(ri.get('attention', ri).get('score_fv_mean', 0) for ri in routing_infos) / n
+        score_fv_std = sum(ri.get('attention', ri).get('score_fv_std', 0) for ri in routing_infos) / n
+        score_rqk_Q_mean = sum(ri.get('attention', ri).get('score_rqk_Q_mean', 0) for ri in routing_infos) / n
+        score_rqk_Q_std = sum(ri.get('attention', ri).get('score_rqk_Q_std', 0) for ri in routing_infos) / n
+        score_rqk_K_mean = sum(ri.get('attention', ri).get('score_rqk_K_mean', 0) for ri in routing_infos) / n
+        score_rqk_K_std = sum(ri.get('attention', ri).get('score_rqk_K_std', 0) for ri in routing_infos) / n
+        score_rv_mean = sum(ri.get('attention', ri).get('score_rv_mean', 0) for ri in routing_infos) / n
+        score_rv_std = sum(ri.get('attention', ri).get('score_rv_std', 0) for ri in routing_infos) / n
+        # Knowledge scores
+        score_kf_mean = sum(ri.get('knowledge', {}).get('score_feature_mean', 0) for ri in routing_infos) / n
+        score_kf_std = sum(ri.get('knowledge', {}).get('score_feature_std', 0) for ri in routing_infos) / n
+        score_kr_mean = sum(ri.get('knowledge', {}).get('score_restore_mean', 0) for ri in routing_infos) / n
+        score_kr_std = sum(ri.get('knowledge', {}).get('score_restore_std', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}Score: fqk_Q={score_fqk_Q_mean:.2f}±{score_fqk_Q_std:.2f} fqk_K={score_fqk_K_mean:.2f}±{score_fqk_K_std:.2f} fv={score_fv_mean:.2f}±{score_fv_std:.2f} rqk_Q={score_rqk_Q_mean:.2f}±{score_rqk_Q_std:.2f} rqk_K={score_rqk_K_mean:.2f}±{score_rqk_K_std:.2f} rv={score_rv_mean:.2f}±{score_rv_std:.2f} kf={score_kf_mean:.2f}±{score_kf_std:.2f} kr={score_kr_mean:.2f}±{score_kr_std:.2f}")
+
+    # v18.1+ specific: Tau and Gate with mean±std (18.1, 18.2, 18.3)
+    # v18.4 uses relative tau, so absolute Tau values are not meaningful
+    if model_version.startswith('18.') and not model_version.startswith('18.0') and not model_version.startswith('18.4'):
+        # Tau with std (absolute values, meaningful for v18.1-18.3)
         tau_fq = sum(ri.get('attention', {}).get('tau_fq', 0) for ri in routing_infos) / n
         tau_fq_std = sum(ri.get('attention', {}).get('tau_fq_std', 0) for ri in routing_infos) / n
         tau_fk = sum(ri.get('attention', {}).get('tau_fk', 0) for ri in routing_infos) / n
@@ -667,7 +687,37 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         tau_kr_std = sum(ri.get('knowledge', {}).get('tau_restore_std', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}Tau: fq={tau_fq:.2f}±{tau_fq_std:.2f} fk={tau_fk:.2f}±{tau_fk_std:.2f} fv={tau_fv:.2f}±{tau_fv_std:.2f} rq={tau_rq:.2f}±{tau_rq_std:.2f} rk={tau_rk:.2f}±{tau_rk_std:.2f} rv={tau_rv:.2f}±{tau_rv_std:.2f} kf={tau_kf:.2f}±{tau_kf_std:.2f} kr={tau_kr:.2f}±{tau_kr_std:.2f}")
 
-        # Gate with std (v18.2)
+    # v18.4: tau_offset (learned parameter, in std units from mean) + gate_strength
+    if model_version.startswith('18.4'):
+        # tau_offset with +/- sign format
+        off_fq = sum(ri.get('attention', {}).get('tau_offset_fq', 0) for ri in routing_infos) / n
+        off_fk = sum(ri.get('attention', {}).get('tau_offset_fk', 0) for ri in routing_infos) / n
+        off_fv = sum(ri.get('attention', {}).get('tau_offset_fv', 0) for ri in routing_infos) / n
+        off_rq = sum(ri.get('attention', {}).get('tau_offset_rq', 0) for ri in routing_infos) / n
+        off_rk = sum(ri.get('attention', {}).get('tau_offset_rk', 0) for ri in routing_infos) / n
+        off_rv = sum(ri.get('attention', {}).get('tau_offset_rv', 0) for ri in routing_infos) / n
+        off_kf = sum(ri.get('knowledge', {}).get('tau_offset_feature', 0) for ri in routing_infos) / n
+        off_kr = sum(ri.get('knowledge', {}).get('tau_offset_restore', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}TauOff: fq={off_fq:+.2f} fk={off_fk:+.2f} fv={off_fv:+.2f} rq={off_rq:+.2f} rk={off_rk:+.2f} rv={off_rv:+.2f} kf={off_kf:+.2f} kr={off_kr:+.2f}")
+
+        # gate_strength (tanh of max exp_gate, 0~1, low = more pass-through)
+        gstr_fq = sum(ri.get('attention', {}).get('gstr_fq', 0) for ri in routing_infos) / n
+        gstr_fk = sum(ri.get('attention', {}).get('gstr_fk', 0) for ri in routing_infos) / n
+        gstr_fv = sum(ri.get('attention', {}).get('gstr_fv', 0) for ri in routing_infos) / n
+        gstr_rq = sum(ri.get('attention', {}).get('gstr_rq', 0) for ri in routing_infos) / n
+        gstr_rk = sum(ri.get('attention', {}).get('gstr_rk', 0) for ri in routing_infos) / n
+        gstr_rv = sum(ri.get('attention', {}).get('gstr_rv', 0) for ri in routing_infos) / n
+        gstr_kf = sum(ri.get('knowledge', {}).get('gstr_feature', 0) for ri in routing_infos) / n
+        gstr_kr = sum(ri.get('knowledge', {}).get('gstr_restore', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}GateStr: fq={gstr_fq:.2f} fk={gstr_fk:.2f} fv={gstr_fv:.2f} rq={gstr_rq:.2f} rk={gstr_rk:.2f} rv={gstr_rv:.2f} kf={gstr_kf:.2f} kr={gstr_kr:.2f}")
+
+        # Overlap (Q/K mask overlap ratio)
+        ovlp_fqk = sum(ri.get('attention', {}).get('overlap_fqk', 0) for ri in routing_infos) / n
+        ovlp_rqk = sum(ri.get('attention', {}).get('overlap_rqk', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}Overlap: fqk={ovlp_fqk:.0%} rqk={ovlp_rqk:.0%}")
+
+    # Gate with std (v18.1-18.3, skip for v18.4)
+    if model_version.startswith('18.') and not model_version.startswith('18.0') and not model_version.startswith('18.4'):
         gate_fq = sum(ri.get('attention', {}).get('gate_fq_mean', 0) for ri in routing_infos) / n
         gate_fq_std = sum(ri.get('attention', {}).get('gate_fq_std', 0) for ri in routing_infos) / n
         gate_fk = sum(ri.get('attention', {}).get('gate_fk_mean', 0) for ri in routing_infos) / n
@@ -686,6 +736,26 @@ def format_v18_routing_stats(routing_infos, model_version, prefix="  "):
         gate_kr_std = sum(ri.get('knowledge', {}).get('gate_restore_std', 0) for ri in routing_infos) / n
         lines.append(f"{prefix}Gate: fq={gate_fq:.2f}±{gate_fq_std:.2f} fk={gate_fk:.2f}±{gate_fk_std:.2f} fv={gate_fv:.2f}±{gate_fv_std:.2f} rq={gate_rq:.2f}±{gate_rq_std:.2f} rk={gate_rk:.2f}±{gate_rk_std:.2f} rv={gate_rv:.2f}±{gate_rv_std:.2f} kf={gate_kf:.2f}±{gate_kf_std:.2f} kr={gate_kr:.2f}±{gate_kr_std:.2f}")
 
+    # v18.3 specific: Confidence stats (skip for v18.4)
+    if model_version.startswith('18.3'):
+        conf_fq = sum(ri.get('attention', {}).get('conf_fq_mean', 0) for ri in routing_infos) / n
+        conf_fq_std = sum(ri.get('attention', {}).get('conf_fq_std', 0) for ri in routing_infos) / n
+        conf_fk = sum(ri.get('attention', {}).get('conf_fk_mean', 0) for ri in routing_infos) / n
+        conf_fk_std = sum(ri.get('attention', {}).get('conf_fk_std', 0) for ri in routing_infos) / n
+        conf_fv = sum(ri.get('attention', {}).get('conf_fv_mean', 0) for ri in routing_infos) / n
+        conf_fv_std = sum(ri.get('attention', {}).get('conf_fv_std', 0) for ri in routing_infos) / n
+        conf_rq = sum(ri.get('attention', {}).get('conf_rq_mean', 0) for ri in routing_infos) / n
+        conf_rq_std = sum(ri.get('attention', {}).get('conf_rq_std', 0) for ri in routing_infos) / n
+        conf_rk = sum(ri.get('attention', {}).get('conf_rk_mean', 0) for ri in routing_infos) / n
+        conf_rk_std = sum(ri.get('attention', {}).get('conf_rk_std', 0) for ri in routing_infos) / n
+        conf_rv = sum(ri.get('attention', {}).get('conf_rv_mean', 0) for ri in routing_infos) / n
+        conf_rv_std = sum(ri.get('attention', {}).get('conf_rv_std', 0) for ri in routing_infos) / n
+        conf_kf = sum(ri.get('knowledge', {}).get('conf_feature_mean', 0) for ri in routing_infos) / n
+        conf_kf_std = sum(ri.get('knowledge', {}).get('conf_feature_std', 0) for ri in routing_infos) / n
+        conf_kr = sum(ri.get('knowledge', {}).get('conf_restore_mean', 0) for ri in routing_infos) / n
+        conf_kr_std = sum(ri.get('knowledge', {}).get('conf_restore_std', 0) for ri in routing_infos) / n
+        lines.append(f"{prefix}Conf: fq={conf_fq:.2f}±{conf_fq_std:.2f} fk={conf_fk:.2f}±{conf_fk_std:.2f} fv={conf_fv:.2f}±{conf_fv_std:.2f} rq={conf_rq:.2f}±{conf_rq_std:.2f} rk={conf_rk:.2f}±{conf_rk_std:.2f} rv={conf_rv:.2f}±{conf_rv_std:.2f} kf={conf_kf:.2f}±{conf_kf_std:.2f} kr={conf_kr:.2f}±{conf_kr_std:.2f}")
+
     return lines
 
 
@@ -693,53 +763,55 @@ def format_v18_neuron_usage(router, model_version, prefix="      "):
     """
     Format v18 neuron usage stats from router.
     Returns list of formatted strings.
+
+    Optimized: Move EMA tensors to CPU first (8 GPU syncs), then compute on CPU.
     """
     lines = []
 
-    ema_fq = router.usage_ema_feature_q
-    ema_fk = router.usage_ema_feature_k
-    ema_fv = router.usage_ema_feature_v
-    ema_rq = router.usage_ema_restore_q
-    ema_rk = router.usage_ema_restore_k
-    ema_rv = router.usage_ema_restore_v
-    ema_FK = router.usage_ema_feature_know
-    ema_RK = router.usage_ema_restore_know
+    # Move all EMA tensors to CPU first (8 GPU syncs total)
+    with torch.no_grad():
+        ema_fq = router.usage_ema_feature_q.cpu()
+        ema_fk = router.usage_ema_feature_k.cpu()
+        ema_fv = router.usage_ema_feature_v.cpu()
+        ema_rq = router.usage_ema_restore_q.cpu()
+        ema_rk = router.usage_ema_restore_k.cpu()
+        ema_rv = router.usage_ema_restore_v.cpu()
+        ema_FK = router.usage_ema_feature_know.cpu()
+        ema_RK = router.usage_ema_restore_know.cpu()
 
-    # Active neuron counts (EMA > 0.01)
-    active_fq = (ema_fq > 0.01).sum().item()
-    active_fk = (ema_fk > 0.01).sum().item()
-    active_fv = (ema_fv > 0.01).sum().item()
-    active_rq = (ema_rq > 0.01).sum().item()
-    active_rk = (ema_rk > 0.01).sum().item()
-    active_rv = (ema_rv > 0.01).sum().item()
-    active_FK = (ema_FK > 0.01).sum().item()
-    active_RK = (ema_RK > 0.01).sum().item()
-    n_fq, n_fk, n_fv = ema_fq.numel(), ema_fk.numel(), ema_fv.numel()
-    n_rq, n_rk, n_rv = ema_rq.numel(), ema_rk.numel(), ema_rv.numel()
-    n_FK, n_RK = ema_FK.numel(), ema_RK.numel()
+    # Calculate all stats on CPU (no GPU sync for .item())
+    def calc_stats(ema):
+        n = ema.numel()
+        active = (ema > 0.01).sum().item()
+        dead = (ema < DEAD_NEURON_THRESHOLD).float().mean().item()
 
-    gini_fq, gini_fk, gini_fv = _gini(ema_fq), _gini(ema_fk), _gini(ema_fv)
-    gini_rq, gini_rk, gini_rv = _gini(ema_rq), _gini(ema_rk), _gini(ema_rv)
-    gini_FK, gini_RK = _gini(ema_FK), _gini(ema_RK)
+        # Gini (CPU) - inline to avoid function call overhead
+        x_sorted = torch.sort(ema)[0]
+        idx = torch.arange(1, n + 1, dtype=ema.dtype)
+        gini = (2 * (idx * x_sorted).sum() / (n * x_sorted.sum() + 1e-8) - (n + 1) / n).item()
 
-    # Entropy (normalized, 0=concentrated, 100=uniform)
-    ent_fq, ent_fk, ent_fv = _entropy(ema_fq), _entropy(ema_fk), _entropy(ema_fv)
-    ent_rq, ent_rk, ent_rv = _entropy(ema_rq), _entropy(ema_rk), _entropy(ema_rv)
-    ent_FK, ent_RK = _entropy(ema_FK), _entropy(ema_RK)
+        # Entropy (CPU)
+        p = ema / (ema.sum() + 1e-8)
+        log_p = torch.log(p + 1e-8)
+        entropy = -(p * log_p).sum()
+        max_ent = math.log(n)
+        ent = (entropy / max_ent * 100).item() if max_ent > 0 else 0.0
 
-    dead_fq = (ema_fq < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_fk = (ema_fk < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_fv = (ema_fv < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_rq = (ema_rq < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_rk = (ema_rk < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_rv = (ema_rv < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_FK = (ema_FK < DEAD_NEURON_THRESHOLD).float().mean().item()
-    dead_RK = (ema_RK < DEAD_NEURON_THRESHOLD).float().mean().item()
+        return active, n, dead, gini, ent
 
-    lines.append(f"{prefix}Usage: FQ={int(active_fq)}/{n_fq} FK={int(active_fk)}/{n_fk} FV={int(active_fv)}/{n_fv} | RQ={int(active_rq)}/{n_rq} RK={int(active_rk)}/{n_rk} RV={int(active_rv)}/{n_rv} | Know: F={int(active_FK)}/{n_FK} R={int(active_RK)}/{n_RK}")
-    lines.append(f"{prefix}Ent: FQ={ent_fq:.0f} FK={ent_fk:.0f} FV={ent_fv:.0f} RQ={ent_rq:.0f} RK={ent_rk:.0f} RV={ent_rv:.0f} FKnow={ent_FK:.0f} RKnow={ent_RK:.0f}")
-    lines.append(f"{prefix}Dead: FQ={dead_fq:.1%} FK={dead_fk:.1%} FV={dead_fv:.1%} RQ={dead_rq:.1%} RK={dead_rk:.1%} RV={dead_rv:.1%} FKnow={dead_FK:.1%} RKnow={dead_RK:.1%}")
-    lines.append(f"{prefix}Gini: FQ={gini_fq:.2f} FK={gini_fk:.2f} FV={gini_fv:.2f} RQ={gini_rq:.2f} RK={gini_rk:.2f} RV={gini_rv:.2f} FKnow={gini_FK:.2f} RKnow={gini_RK:.2f}")
+    fq = calc_stats(ema_fq)
+    fk = calc_stats(ema_fk)
+    fv = calc_stats(ema_fv)
+    rq = calc_stats(ema_rq)
+    rk = calc_stats(ema_rk)
+    rv = calc_stats(ema_rv)
+    FK = calc_stats(ema_FK)
+    RK = calc_stats(ema_RK)
+
+    lines.append(f"{prefix}Usage: FQ={fq[0]}/{fq[1]} FK={fk[0]}/{fk[1]} FV={fv[0]}/{fv[1]} | RQ={rq[0]}/{rq[1]} RK={rk[0]}/{rk[1]} RV={rv[0]}/{rv[1]} | Know: F={FK[0]}/{FK[1]} R={RK[0]}/{RK[1]}")
+    lines.append(f"{prefix}Ent: FQ={fq[4]:.0f} FK={fk[4]:.0f} FV={fv[4]:.0f} RQ={rq[4]:.0f} RK={rk[4]:.0f} RV={rv[4]:.0f} FKnow={FK[4]:.0f} RKnow={RK[4]:.0f}")
+    lines.append(f"{prefix}Dead: FQ={fq[2]:.1%} FK={fk[2]:.1%} FV={fv[2]:.1%} RQ={rq[2]:.1%} RK={rk[2]:.1%} RV={rv[2]:.1%} FKnow={FK[2]:.1%} RKnow={RK[2]:.1%}")
+    lines.append(f"{prefix}Gini: FQ={fq[3]:.2f} FK={fk[3]:.2f} FV={fv[3]:.2f} RQ={rq[3]:.2f} RK={rk[3]:.2f} RV={rv[3]:.2f} FKnow={FK[3]:.2f} RKnow={RK[3]:.2f}")
 
     return lines
 
@@ -1377,10 +1449,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     # Compact output with loss/acc
                     model_version = getattr(base_model, '__version__', '')
                     if model_version.startswith('18'):
-                        # Get tau gradient info if available
+                        # Get tau gradient info if available (v18.1, v18.2, v18.3)
                         tau_grad_info = None
-                        if model_version.startswith('18.1') or model_version.startswith('18.2'):
-                            if hasattr(base_model.router, 'tau_proj') and base_model.router.tau_proj.weight.grad is not None:
+                        if hasattr(base_model, 'router') and hasattr(base_model.router, 'tau_proj'):
+                            if base_model.router.tau_proj.weight.grad is not None:
                                 tau_grad_info = {
                                     'weight': base_model.router.tau_proj.weight.grad.norm().item(),
                                     'bias': base_model.router.tau_proj.bias.grad.norm().item() if base_model.router.tau_proj.bias.grad is not None else 0
@@ -1388,19 +1460,30 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
                         # Use unified formatter for v18 logging
                         router = base_model.router.neuron_router
-                        for line in format_v18_full_log(
+                        log_lines = list(format_v18_full_log(
                             routing_infos, router, model_version, step, avg_loss, avg_acc,
                             ent_str, overlap_str, attn_str, tau_grad_info=tau_grad_info
-                        ):
+                        ))
+
+                        # Console output
+                        for line in log_lines:
                             print(line)
 
-                    elif overlap_str:
-                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
-                    else:
-                        print(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
+                        # File output (same format)
+                        if log_file:
+                            with open(log_file, 'a') as f:
+                                for line in log_lines:
+                                    f.write(line + "\n")
 
-                    # Usage EMA logging (skip for v18, already printed above)
-                    if not (hasattr(base_model, 'router') and hasattr(base_model.router, 'max_paths')):
+                    else:
+                        # Non-v18 models: collect log lines for console + file
+                        non_v18_lines = []
+                        if overlap_str:
+                            non_v18_lines.append(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {overlap_str} | Attn:{attn_str}")
+                        else:
+                            non_v18_lines.append(f"[{step+1}] Loss:{avg_loss:.4f} Acc:{avg_acc:.4f} | {ent_str} | {var_str} | Attn:{attn_str}")
+
+                        # Usage EMA logging (v17/v16)
                         router = None
                         global_routers = None
                         if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):  # v17/v17.1
@@ -1409,8 +1492,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                         elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):  # v16
                             router = base_model.global_routers.neuron_router
                         if router is not None:
-                            for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
-                                print(line)
+                            non_v18_lines.extend(_get_router_log_lines(router, global_step, total_steps, global_routers))
+
+                        # Console output
+                        for line in non_v18_lines:
+                            print(line)
+
+                        # File output (same format)
+                        if log_file:
+                            with open(log_file, 'a') as f:
+                                for line in non_v18_lines:
+                                    f.write(line + "\n")
 
                     # Importance entropy logging (from routing preferences)
                     try:
@@ -1501,75 +1593,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                     import traceback
                     traceback.print_exc()
 
-        # Log aggregated metrics every log_interval steps (same format as console output)
+        # Collect neuron metrics every log_interval steps
         if log_file and (step + 1) % log_interval == 0:
-            avg_window_loss = window_loss / window_count if window_count > 0 else 0.0
-            avg_window_acc = window_acc_correct / window_acc_valid if window_acc_valid > 0 else 0.0
-
-            with open(log_file, 'a') as f:
-                model_version = getattr(base_model, '__version__', '')
-
-                # v18: Use unified full log format (same as console)
-                if model_version.startswith('18') and routing_infos is not None:
-                    try:
-                        # Compute ent_str, overlap_str, attn_str for file log
-                        def calc_entropy_ratio(pref):
-                            if pref is None:
-                                return 0.0
-                            ent = -(pref * (pref + 1e-8).log()).sum(-1).mean()
-                            return (ent / math.log(pref.shape[-1]) * 100).item()
-
-                        def calc_token_var(pref):
-                            if pref is None:
-                                return 0.0
-                            return pref.var(dim=1).mean().item()
-
-                        log_info = get_routing_log_info(routing_infos, calc_entropy_ratio, calc_token_var)
-                        ent_str = log_info['ent_str']
-                        overlap_str = log_info['overlap_str']
-
-                        # Attention ratio
-                        attn_ratios = []
-                        for layer_info in routing_infos:
-                            attn_norm = layer_info.get('attn_out_norm')
-                            mem_norm = layer_info.get('mem_out_norm') or layer_info.get('know_out_norm')
-                            if attn_norm is not None and mem_norm is not None:
-                                ratio = attn_norm / (attn_norm + mem_norm + 1e-8) * 100
-                                attn_ratios.append(f"{ratio:.0f}")
-                            else:
-                                attn_ratios.append("-")
-                        attn_str = "/".join(attn_ratios)
-
-                        # Get router for neuron usage stats
-                        router = base_model.router.neuron_router if hasattr(base_model, 'router') else None
-
-                        # Use unified formatter (no tau_grad for file - only scalar stats)
-                        for line in format_v18_full_log(
-                            routing_infos, router, model_version, step,
-                            avg_window_loss, avg_window_acc,
-                            ent_str, overlap_str, attn_str
-                        ):
-                            f.write(line + "\n")
-                    except Exception:
-                        # Fallback: just write basic line
-                        f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
-                else:
-                    # Non-v18: Basic loss/acc line + legacy router metrics
-                    f.write(f"[{step+1}] Loss:{avg_window_loss:.4f} Acc:{avg_window_acc:.4f}\n")
-
-                    # Add router metrics for non-v18 models
-                    router = None
-                    global_routers = None
-                    if hasattr(base_model, 'router') and hasattr(base_model.router, 'neuron_router'):
-                        router = base_model.router.neuron_router
-                        global_routers = base_model.router
-                    elif hasattr(base_model, 'global_routers') and hasattr(base_model.global_routers, 'neuron_router'):
-                        router = base_model.global_routers.neuron_router
-                    if router is not None:
-                        for line in _get_router_log_lines(router, global_step, total_steps, global_routers):
-                            f.write(line + "\n")
-
-            # Collect neuron metrics
+            # Neuron metrics collection
             model.eval()
             with torch.no_grad():
                 try:

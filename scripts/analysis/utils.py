@@ -27,6 +27,17 @@ import json
 from typing import Dict, List, Tuple, Optional, Any
 from collections import Counter, defaultdict
 
+# Import analysis utilities from version_registry (centralized model handling)
+from models.version_registry import (
+    get_router as get_global_router,  # Gets GlobalRouters (for store_pref_tensors)
+    enable_analysis_mode,
+    disable_analysis_mode,
+    analysis_context,
+    forward_for_analysis,
+    get_model_version,
+    is_v18_plus,
+)
+
 try:
     from tqdm import tqdm
     HAS_TQDM = True
@@ -66,6 +77,19 @@ NEURON_TYPES = {
     'feature_qk':   ('F-QK',   'usage_ema_feature_qk',   'n_feature_qk',   'red'),
     'feature_v':    ('F-V',    'usage_ema_feature_v',    'n_feature_v',    'orange'),
     'restore_qk':   ('R-QK',   'usage_ema_restore_qk',   'n_restore_qk',   'blue'),
+    'restore_v':    ('R-V',    'usage_ema_restore_v',    'n_restore_v',    'green'),
+    'feature_know': ('F-Know', 'usage_ema_feature_know', 'n_feature_know', 'purple'),
+    'restore_know': ('R-Know', 'usage_ema_restore_know', 'n_restore_know', 'cyan'),
+}
+
+# v18.x: Separate Q/K EMA tracking
+NEURON_TYPES_V18 = {
+    # (display_name, ema_attr, n_attr, color)
+    'feature_q':    ('F-Q',    'usage_ema_feature_q',    'n_feature_qk',   'red'),
+    'feature_k':    ('F-K',    'usage_ema_feature_k',    'n_feature_qk',   'darkred'),
+    'feature_v':    ('F-V',    'usage_ema_feature_v',    'n_feature_v',    'orange'),
+    'restore_q':    ('R-Q',    'usage_ema_restore_q',    'n_restore_qk',   'blue'),
+    'restore_k':    ('R-K',    'usage_ema_restore_k',    'n_restore_qk',   'darkblue'),
     'restore_v':    ('R-V',    'usage_ema_restore_v',    'n_restore_v',    'green'),
     'feature_know': ('F-Know', 'usage_ema_feature_know', 'n_feature_know', 'purple'),
     'restore_know': ('R-Know', 'usage_ema_restore_know', 'n_restore_know', 'cyan'),
@@ -228,15 +252,22 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     cleaned = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Auto-detect version from config or state_dict keys
-    version = config.get('model_version', None)
+    # Auto-detect version from checkpoint or config
+    # Note: CheckpointManager stores model_version at top-level, not inside config
+    version = checkpoint.get('model_version') or config.get('model_version')
     if version is None:
         # Check for version-specific keys (most specific first)
+        # v18.3 has confidence-related keys or specific config
         v18_2_keys = ['router.tau_proj.weight', 'router.neuron_router.norm_fqk_Q.weight']
         dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
 
         if all(k in cleaned for k in v18_2_keys):
-            version = '18.2'
+            # Could be 18.2, 18.3, 18.4 - check config for hints
+            cfg_version = config.get('model_version', '')
+            if cfg_version.startswith('18.'):
+                version = cfg_version
+            else:
+                version = '18.2'  # Default to 18.2 for v18.x
         elif any(k in cleaned for k in dawn_keys):
             if config.get('learnable_tau', False) or config.get('max_paths'):
                 version = '18.2'

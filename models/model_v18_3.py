@@ -1,20 +1,21 @@
 """
-DAWN v18.2: ReLU-Masked Learnable Tau Routing
+DAWN v18.3: Confidence-Scaled Soft Gating
 
 Key Concept:
-- Based on v18.1 with simplified threshold selection
-- ReLU-based masking: mask = (ReLU(scores - tau) > 0)
-- Learnable tau: separate tau for each pool (Q/K separated)
-- Hard masking with differentiable tau
+- Based on v18.2 with soft confidence scaling
+- Gate: gate = ReLU(scores - tau), can be 0
+- Confidence: confidence = gate / (gate + 1), sigmoid-like [0, 1]
+- Scaled weights: weights * confidence
 
-Changes from v18.1:
-- Gate-based scoring → ReLU-based hard mask
-- scores * gate → scores masked by (scores > tau)
-- Simpler forward pass, gradients flow through tau
+Changes from v18.2:
+- Hard mask → Soft confidence scaling
+- gate + 1e-8 → gate can be 0, epsilon only in log
+- New confidence term: gate / (gate + 1)
+- Smoother gradient flow through confidence
 
 Architecture:
 - UnifiedNeuronRouter: same as v18.0
-- GlobalRouters: ReLU mask + learnable tau (8 pools)
+- GlobalRouters: Confidence-scaled gating + learnable tau (8 pools)
 - AttentionCircuit: same as v18.0 (multi-path Q, K, V aggregation)
 - KnowledgeCircuit: same as v18.0 (multi-path aggregation)
 """
@@ -520,9 +521,10 @@ class GlobalRouters(nn.Module):
         # 3. Threshold mask for top-k neurons
         topk_mask = (topk_scores > topk_tau)
 
-        # 4. Log-gated selection on top-k only
-        gate = F.relu(topk_scores - topk_tau) + 1e-8
-        log_gate = torch.log(gate).clamp(min=-20)
+        # 4. v18.3: Confidence-scaled soft gating
+        # gate can be 0 (no +1e-8), epsilon only in log
+        gate = F.relu(topk_scores - topk_tau)  # [B, S, k], can be 0
+        log_gate = torch.log(gate + 1e-8).clamp(min=-20)
 
         if self.inference_hard_mask and not self.training:
             log_gate = torch.where(topk_mask, log_gate, torch.full_like(log_gate, -1e9))
@@ -531,9 +533,14 @@ class GlobalRouters(nn.Module):
         masked_scores = topk_scores + log_gate
         topk_weights = F.softmax(masked_scores, dim=-1)  # [B, S, k]
 
-        # 6. Chunk to paths (already sorted by topk)
-        # Use topk_weights.dtype to avoid AMP dtype mismatch (bfloat16/float16)
-        out_dtype = topk_weights.dtype
+        # 6. v18.3: Confidence scaling (sigmoid-like, smooth [0,1])
+        # confidence = gate / (gate + 1): 0 when gate=0, approaches 1 for large gate
+        confidence = gate / (gate + 1)  # [B, S, k]
+        scaled_weights = topk_weights * confidence  # [B, S, k]
+
+        # 7. Chunk to paths (already sorted by topk)
+        # Use scaled_weights.dtype to avoid AMP dtype mismatch (bfloat16/float16)
+        out_dtype = scaled_weights.dtype
         path_weights_list = []
         for p in range(max_paths):
             start_idx = p * path_max_k
@@ -545,35 +552,36 @@ class GlobalRouters(nn.Module):
 
             path_weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
             path_indices = topk_indices[:, :, start_idx:end_idx]
-            path_w = topk_weights[:, :, start_idx:end_idx]
-            # Apply mask within this path's range
-            path_m = topk_mask[:, :, start_idx:end_idx].to(out_dtype)
-            path_w = path_w * path_m
+            path_w = scaled_weights[:, :, start_idx:end_idx]
 
             path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
             path_weights_list.append(path_weights)
 
-        # 7. Create sparse full weights for aux_loss
+        # 8. Create sparse full weights for aux_loss (use scaled_weights)
         weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
-        weights.scatter_(dim=-1, index=topk_indices, src=topk_weights)
+        weights.scatter_(dim=-1, index=topk_indices, src=scaled_weights)
 
-        # 8. Create full mask for statistics
+        # 9. Create full mask for statistics
         mask = torch.zeros(B, S, N, device=scores.device, dtype=torch.bool)
         mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
 
-        return path_weights_list, weights, mask, gate
+        return path_weights_list, weights, mask, gate, confidence
 
     # Keep original functions for backward compatibility / other uses
     def _threshold_select(self, scores, tau, path_max_k, max_paths):
         """Legacy threshold selection - use _topk_select_and_chunk for optimized version."""
         mask = (scores > tau)
-        gate = F.relu(scores - tau) + 1e-8
-        log_gate = torch.log(gate).clamp(min=-20)
+        # v18.3: gate can be 0, confidence scaling
+        gate = F.relu(scores - tau)
+        log_gate = torch.log(gate + 1e-8).clamp(min=-20)
         if self.inference_hard_mask and not self.training:
             log_gate = torch.where(mask, log_gate, torch.full_like(log_gate, -1e9))
         masked_scores = scores + log_gate
         weights = F.softmax(masked_scores, dim=-1)
-        return weights, mask, gate
+        # v18.3: confidence scaling
+        confidence = gate / (gate + 1)
+        scaled_weights = weights * confidence
+        return scaled_weights, mask, gate, confidence
 
     def _chunk_to_paths(self, weights, mask, scores, path_max_k, max_paths):
         """Legacy chunking - use _topk_select_and_chunk for optimized version."""
@@ -628,18 +636,18 @@ class GlobalRouters(nn.Module):
         else:
             tau_fq = tau_fk = tau_fv = tau_rq = tau_rk = tau_rv = self.fixed_tau
 
-        # Optimized top-k selection + threshold + softmax + chunking
-        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q = self._topk_select_and_chunk(
+        # Optimized top-k selection + threshold + softmax + chunking + confidence
+        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q, fqk_conf_Q = self._topk_select_and_chunk(
             fqk_logits_Q, tau_fq, self.path_max_k, self.max_paths)
-        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K = self._topk_select_and_chunk(
+        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K, fqk_conf_K = self._topk_select_and_chunk(
             fqk_logits_K, tau_fk, self.path_max_k, self.max_paths)
-        fv_paths, fv_weights, fv_mask, fv_gate = self._topk_select_and_chunk(
+        fv_paths, fv_weights, fv_mask, fv_gate, fv_conf = self._topk_select_and_chunk(
             fv_logits, tau_fv, self.path_max_k, self.max_paths)
-        rqk_paths_Q, rqk_weights_Q, rqk_mask_Q, rqk_gate_Q = self._topk_select_and_chunk(
+        rqk_paths_Q, rqk_weights_Q, rqk_mask_Q, rqk_gate_Q, rqk_conf_Q = self._topk_select_and_chunk(
             rqk_logits_Q, tau_rq, self.path_max_k, self.max_paths)
-        rqk_paths_K, rqk_weights_K, rqk_mask_K, rqk_gate_K = self._topk_select_and_chunk(
+        rqk_paths_K, rqk_weights_K, rqk_mask_K, rqk_gate_K, rqk_conf_K = self._topk_select_and_chunk(
             rqk_logits_K, tau_rk, self.path_max_k, self.max_paths)
-        rv_paths, rv_weights, rv_mask, rv_gate = self._topk_select_and_chunk(
+        rv_paths, rv_weights, rv_mask, rv_gate, rv_conf = self._topk_select_and_chunk(
             rv_logits, tau_rv, self.path_max_k, self.max_paths)
 
         # Compute aux_loss for load balancing (using softmax weights)
@@ -684,7 +692,14 @@ class GlobalRouters(nn.Module):
             'rv': rv_paths,
         }
 
-        # Routing stats only in debug mode (avoid GPU sync overhead)
+        # ============================================================
+        # ROUTING INFO (for logging/analysis only)
+        # ============================================================
+        # IMPORTANT: This section is ONLY executed when debug_mode=True
+        # During training: debug_mode=False → routing_info={} → NO OVERHEAD
+        # On log steps: debug_mode=True → compute stats → GPU sync overhead (acceptable)
+        # train.py controls debug_mode via set_v18_debug_mode() on log steps only
+        # ============================================================
         if self.debug_mode:
             def avg_paths_per_token(paths):
                 return sum((p.sum(dim=-1) > 0).float().mean().item() for p in paths)
@@ -760,6 +775,19 @@ class GlobalRouters(nn.Module):
                 'gate_rk_std': rqk_gate_K.std().item(),
                 'gate_rv_mean': rv_gate.mean().item(),
                 'gate_rv_std': rv_gate.std().item(),
+                # v18.3: confidence stats (gate / (gate + 1))
+                'conf_fq_mean': fqk_conf_Q.mean().item(),
+                'conf_fq_std': fqk_conf_Q.std().item(),
+                'conf_fk_mean': fqk_conf_K.mean().item(),
+                'conf_fk_std': fqk_conf_K.std().item(),
+                'conf_fv_mean': fv_conf.mean().item(),
+                'conf_fv_std': fv_conf.std().item(),
+                'conf_rq_mean': rqk_conf_Q.mean().item(),
+                'conf_rq_std': rqk_conf_Q.std().item(),
+                'conf_rk_mean': rqk_conf_K.mean().item(),
+                'conf_rk_std': rqk_conf_K.std().item(),
+                'conf_rv_mean': rv_conf.mean().item(),
+                'conf_rv_std': rv_conf.std().item(),
             }
         else:
             routing_info = {}
@@ -814,10 +842,10 @@ class GlobalRouters(nn.Module):
         else:
             tau_f = tau_r = self.fixed_tau
 
-        # Optimized top-k selection + threshold + softmax + chunking
-        f_paths, f_weights, f_mask, f_gate = self._topk_select_and_chunk(
+        # Optimized top-k selection + threshold + softmax + chunking + confidence
+        f_paths, f_weights, f_mask, f_gate, f_conf = self._topk_select_and_chunk(
             logits_f, tau_f, self.path_max_k, self.max_paths)
-        r_paths, r_weights, r_mask, r_gate = self._topk_select_and_chunk(
+        r_paths, r_weights, r_mask, r_gate, r_conf = self._topk_select_and_chunk(
             logits_r, tau_r, self.path_max_k, self.max_paths)
 
         # Update usage with mask (binary selection)
@@ -857,6 +885,11 @@ class GlobalRouters(nn.Module):
                 'gate_feature_std': f_gate.std().item(),
                 'gate_restore_mean': r_gate.mean().item(),
                 'gate_restore_std': r_gate.std().item(),
+                # v18.3: confidence stats (gate / (gate + 1))
+                'conf_feature_mean': f_conf.mean().item(),
+                'conf_feature_std': f_conf.std().item(),
+                'conf_restore_mean': r_conf.mean().item(),
+                'conf_restore_std': r_conf.std().item(),
             }
         else:
             know_info = {}
@@ -1128,21 +1161,22 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """
-    DAWN v18.2: ReLU-Masked Learnable Tau Routing
+    DAWN v18.3: Confidence-Scaled Soft Gating
 
     Key Features:
-    - Based on v18.1 with simplified threshold selection
-    - ReLU-based mask: mask = (ReLU(scores - tau) > 0)
-    - Learnable tau: separate tau for Q/K (8 pools total)
-    - Hard masking with differentiable tau learning
+    - Based on v18.2 with soft confidence scaling
+    - Gate: gate = ReLU(scores - tau), can be 0
+    - Confidence: confidence = gate / (gate + 1)
+    - Scaled weights: weights * confidence
+    - Smoother gradient flow through confidence
 
     Architecture:
     - UnifiedNeuronRouter: same as v18.0
-    - GlobalRouters: ReLU mask + learnable tau (8 pools)
+    - GlobalRouters: Confidence-scaled gating + learnable tau (8 pools)
     - AttentionCircuit: Multi-path Q,K,V summation (same as v18.0)
     - KnowledgeCircuit: Multi-path summation (same as v18.0)
     """
-    __version__ = "18.2"
+    __version__ = "18.3"
 
     def __init__(
         self,

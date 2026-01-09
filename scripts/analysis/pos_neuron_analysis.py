@@ -102,6 +102,16 @@ class POSNeuronAnalyzer:
         self.pos_total_tokens = defaultdict(int)
         self.layer_pos_neurons = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 
+    def _enable_pref_tensors(self):
+        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = True
+
+    def _disable_pref_tensors(self):
+        """Disable store_pref_tensors after analysis."""
+        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
+            self.model.router.store_pref_tensors = False
+
     def load_ud_dataset(self, split: str = 'train', max_sentences: int = None, data_path: str = None):
         """
         Load Universal Dependencies English Web Treebank.
@@ -289,15 +299,31 @@ class POSNeuronAnalyzer:
         """
         input_ids = torch.tensor([token_ids], device=self.device)
 
-        with torch.no_grad():
-            outputs = self.model(input_ids, return_routing_info=True)
+        self._enable_pref_tensors()
+        try:
+            with torch.no_grad():
+                outputs = self.model(input_ids, return_path_weights=True)
 
-        if isinstance(outputs, tuple) and len(outputs) >= 2:
-            routing_infos = outputs[1]
-        else:
-            return {}
+            if isinstance(outputs, tuple) and len(outputs) >= 2:
+                routing_infos = outputs[1]
+            else:
+                return {}
+        finally:
+            self._disable_pref_tensors()
 
-        # Map pool_type to binary mask key (v18.x uses boolean masks for selection)
+        # Map pool_type to path_weights key (v18.2 uses path_weights)
+        path_weights_key_map = {
+            'fv': 'fv',
+            'rv': 'rv',
+            'fqk_q': 'fqk_Q',
+            'fqk_k': 'fqk_K',
+            'rqk_q': 'rqk_Q',
+            'rqk_k': 'rqk_K',
+            'fknow': 'feature_know',
+            'rknow': 'restore_know',
+        }
+
+        # Legacy: Map pool_type to binary mask key (v18.x uses boolean masks for selection)
         mask_key_map = {
             'fv': 'fv_mask',
             'rv': 'rv_mask',
@@ -319,6 +345,7 @@ class POSNeuronAnalyzer:
             'fknow': 'feature_know_w',
             'rknow': 'restore_know_w',
         }
+        path_weights_key = path_weights_key_map.get(pool_type, 'fv')
         mask_key = mask_key_map.get(pool_type, 'fv_mask')
         weight_key = weight_key_map.get(pool_type, 'fv_weights')
 
@@ -334,20 +361,25 @@ class POSNeuronAnalyzer:
             if routing_infos:
                 layer0 = routing_infos[0]
                 print(f"  Layer 0 keys: {list(layer0.keys())}")
-                if 'attention' in layer0:
+                # Check for path_weights (v18.2+)
+                if 'path_weights' in layer0:
+                    pw = layer0['path_weights']
+                    print(f"  path_weights keys: {list(pw.keys())}")
+                    if path_weights_key in pw:
+                        paths = pw[path_weights_key]
+                        print(f"  {path_weights_key}: {len(paths)} paths, shape {paths[0].shape if paths else 'N/A'}")
+                        print(f"  Using path_weights for POS analysis")
+                elif 'attention' in layer0:
                     print(f"  attention keys: {list(layer0['attention'].keys())}")
                     attn = layer0['attention']
                     # Check for binary mask (preferred)
                     if mask_key in attn:
                         m = attn[mask_key]
                         print(f"  {mask_key} type: {type(m)}, shape: {m.shape if hasattr(m, 'shape') else 'N/A'}")
-                        print(f"  {mask_key} dtype: {m.dtype if hasattr(m, 'dtype') else 'N/A'}")
-                        print(f"  {mask_key} active: {m.sum().item() if hasattr(m, 'sum') else 'N/A'}")
                         print(f"  Using binary mask for POS analysis")
                     elif weight_key in attn:
                         w = attn[weight_key]
                         print(f"  {weight_key} type: {type(w)}, shape: {w.shape if hasattr(w, 'shape') else 'N/A'}")
-                        print(f"  {weight_key} dtype: {w.dtype if hasattr(w, 'dtype') else 'N/A'}")
                         print(f"  Falling back to weights (no mask available)")
                     else:
                         print(f"  Neither {mask_key} nor {weight_key} found in attention!")
@@ -359,7 +391,22 @@ class POSNeuronAnalyzer:
             if self.target_layer is not None and layer_idx != self.target_layer:
                 continue
 
-            # Get mask/weights from attention or knowledge
+            # Try path_weights first (v18.2+)
+            path_weights = layer_info.get('path_weights', {})
+            if path_weights_key in path_weights:
+                # path_weights[key] is a list of [B, S, N] tensors (one per path)
+                paths = path_weights[path_weights_key]
+                # Combine all paths: neuron is active if non-zero in any path
+                combined = torch.zeros_like(paths[0])
+                for p in paths:
+                    combined = combined + p.abs()
+                # combined: [B, S, N] - non-zero means active
+                for pos in range(min(seq_len, combined.shape[1])):
+                    active = (combined[0, pos] > 0).nonzero(as_tuple=True)[0]
+                    position_neurons[pos].update(active.cpu().tolist())
+                continue
+
+            # Fallback: Get mask/weights from attention or knowledge
             attn = layer_info.get('attention', layer_info)
             know = layer_info.get('knowledge', {})
 
@@ -910,6 +957,11 @@ Examples:
     model, tokenizer, config = load_model(str(ckpt_path), args.device)
     model = model.to(args.device)
     model.eval()
+
+    # Enable debug mode for routing info (required for analysis)
+    if hasattr(model, 'router') and hasattr(model.router, 'debug_mode'):
+        model.router.debug_mode = True
+        print("Enabled router debug_mode for analysis")
 
     # Apply optimizations
     if args.bf16:

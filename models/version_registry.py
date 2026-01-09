@@ -2,19 +2,210 @@
 DAWN Model Version Registry - Single Source of Truth
 
 Supported Versions:
+  v18.4: Relative Confidence Scaling (confidence = gate / gate_sum)
+  v18.3: Confidence-Scaled Soft Gating (confidence = gate / (gate + 1))
   v18.2: ReLU-Masked Learnable Tau (mask = ReLU(scores - tau) > 0, Q/K separated)
   v18.1: Soft Mask + Learnable Tau (use_soft_mask=True, learnable_tau=True)
   v18.0: Fixed Threshold Multi-Path Routing (rank=16, max_paths=4, fixed_tau=0.0, path_min_k=8, path_max_k=16)
   v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
   v17.2: Feature QK Unified + Restore Q/K Separate
   baseline: Vanilla Transformer for comparison
+
+Analysis Utilities:
+  get_router(model) - Get router from any DAWN model version
+  enable_analysis_mode(model) - Enable full tensor storage for analysis
+  disable_analysis_mode(model) - Disable tensor storage after analysis
+  forward_for_analysis(model, input_ids) - Standardized forward call for analysis
+  analysis_context(model) - Context manager for analysis mode
 """
 
 from typing import Dict, Any, List
+from contextlib import contextmanager
 import torch
 
 
+# =============================================================================
+# Analysis Utilities - Centralized model handling for all analysis scripts
+# =============================================================================
+
+def get_router(model):
+    """
+    Get router from model, handling version differences.
+
+    Works for v17.x, v18.x, and future versions.
+    """
+    # v18.x style: GlobalRouters at model.router
+    if hasattr(model, 'router'):
+        return model.router
+
+    # v17.x style: router in each layer
+    if hasattr(model, 'layers') and len(model.layers) > 0:
+        layer = model.layers[0]
+        if hasattr(layer, 'router'):
+            return layer.router
+
+    return None
+
+
+def enable_analysis_mode(model):
+    """
+    Enable full tensor storage for analysis.
+
+    Sets store_pref_tensors=True (for routing tensors) and
+    optionally debug_mode=True (for scalar stats).
+    """
+    router = get_router(model)
+    if router:
+        if hasattr(router, 'store_pref_tensors'):
+            router.store_pref_tensors = True
+        if hasattr(router, 'debug_mode'):
+            router.debug_mode = True
+
+
+def disable_analysis_mode(model):
+    """
+    Disable tensor storage after analysis to avoid memory leaks.
+    """
+    router = get_router(model)
+    if router:
+        if hasattr(router, 'store_pref_tensors'):
+            router.store_pref_tensors = False
+        if hasattr(router, 'debug_mode'):
+            router.debug_mode = False
+
+
+@contextmanager
+def analysis_context(model):
+    """
+    Context manager for analysis mode.
+
+    Usage:
+        with analysis_context(model):
+            outputs = model(input_ids, return_path_weights=True)
+            # ... process outputs
+        # automatically disables analysis mode on exit
+    """
+    enable_analysis_mode(model)
+    try:
+        yield
+    finally:
+        disable_analysis_mode(model)
+
+
+def forward_for_analysis(model, input_ids, **kwargs):
+    """
+    Standardized forward call for analysis that works across all versions.
+
+    Automatically determines which kwargs to pass based on model version.
+    Returns (logits, routing_info) tuple.
+
+    Usage:
+        with analysis_context(model):
+            outputs = forward_for_analysis(model, input_ids)
+    """
+    version = getattr(model, '__version__', None)
+
+    # v18.2+ uses return_path_weights=True
+    if version in ('18.2', '18.3', '18.4'):
+        return model(input_ids, return_path_weights=True, **kwargs)
+
+    # v18.0/v18.1 and v17.x use return_routing_info=True
+    return model(input_ids, return_routing_info=True, **kwargs)
+
+
+def get_model_version(model) -> str:
+    """Get model version string."""
+    if hasattr(model, '__version__'):
+        return model.__version__
+    return 'unknown'
+
+
+def is_v18_plus(model) -> bool:
+    """Check if model is v18.x or later."""
+    version = get_model_version(model)
+    return version.startswith('18.')
+
+
+# =============================================================================
+# Version Registry - Configuration for each model version
+# =============================================================================
+
 VERSION_REGISTRY = {
+    "18.4": {
+        "description": "Relative Confidence Scaling",
+        "aliases": ["184"],
+        "module": "model_v18_4",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "max_paths": 4,
+            "fixed_tau": 0.0,
+            "path_max_k": 16,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "attention_token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+            "learnable_tau": True,
+            "tau_reg_weight": 0.0,
+        },
+        "display_info": lambda args: [
+            f"DAWN v18.4: Relative Confidence Scaling",
+            f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}, path_max_k={args.get('path_max_k', 16)}",
+            f"  confidence = gate / gate_sum (relative, sum=1)",
+            f"  F-QK: {args.get('n_feature_qk')} - Q/K separated tau",
+            f"  F-V: {args.get('n_feature_v')}",
+            f"  R-QK: {args.get('n_restore_qk')} - Q/K separated tau",
+            f"  R-V: {args.get('n_restore_v')}",
+            f"  F-Know: {args.get('n_feature_know')}, R-Know: {args.get('n_restore_know')}",
+        ],
+    },
+
+    "18.3": {
+        "description": "Confidence-Scaled Soft Gating",
+        "aliases": ["183"],
+        "module": "model_v18_3",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "state_dim": 64,
+            "max_paths": 4,
+            "fixed_tau": 0.0,
+            "path_max_k": 16,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+            "attention_token_routing": False,
+            "knowledge_token_routing": False,
+            "use_ssm_context": True,
+            "learnable_tau": True,
+        },
+        "display_info": lambda args: [
+            f"DAWN v18.3: Confidence-Scaled Soft Gating",
+            f"  rank={args.get('rank', 16)}, max_paths={args.get('max_paths', 4)}, path_max_k={args.get('path_max_k', 16)}",
+            f"  confidence = gate / (gate + 1), smoother gradient flow",
+            f"  F-QK: {args.get('n_feature_qk')} - Q/K separated tau",
+            f"  F-V: {args.get('n_feature_v')}",
+            f"  R-QK: {args.get('n_restore_qk')} - Q/K separated tau",
+            f"  R-V: {args.get('n_restore_v')}",
+            f"  F-Know: {args.get('n_feature_know')}, R-Know: {args.get('n_restore_know')}",
+        ],
+    },
+
     "18.2": {
         "description": "ReLU-Masked Learnable Tau (Q/K separated)",
         "aliases": ["182"],
@@ -382,7 +573,7 @@ def get_all_versions_info() -> str:
 
 def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[str, Any]:
     """
-    Extract routing log info for v17.1/v17.2/v18.0/v18.1/v18.2.
+    Extract routing log info for v17.1/v17.2/v18.0/v18.1/v18.2/v18.3.
     Computes AVERAGE entropy across all layers.
     """
     if isinstance(routing_infos, dict):
@@ -417,14 +608,16 @@ def get_routing_log_info(routing_infos, calc_entropy_fn, calc_var_fn) -> Dict[st
         # v18 specific: path counts
         n_paths = f"Paths FQK:{attn0.get('n_paths_fqk_Q', 0):.1f}/{attn0.get('n_paths_fqk_K', 0):.1f} FV:{attn0.get('n_paths_fv', 0):.1f} RQK:{attn0.get('n_paths_rqk_Q', 0):.1f}/{attn0.get('n_paths_rqk_K', 0):.1f} RV:{attn0.get('n_paths_rv', 0):.1f}"
 
-        # Detect v18.1/v18.2 by flag and key presence
+        # Detect v18.1/v18.2/v18.3 by flag and key presence
+        # v18.3: confidence-scaled soft gating (same routing_info format as v18.2)
         # v18.2: has adj_* keys (ReLU mask)
         # v18.1: has gate_* keys (sigmoid gate)
         # v18.0: neither (fixed tau)
         is_soft_mask = attn0.get('use_soft_mask', False) or attn0.get('learnable_tau', False)
         if is_soft_mask:
-            # v18.2 uses adj_*, v18.1 uses gate_*
-            version = '18.2' if attn0.get('adj_fq') is not None else '18.1'
+            # v18.2/v18.3 uses adj_*, v18.1 uses gate_*
+            # Note: v18.3 has same routing_info format as v18.2
+            version = '18.2+' if attn0.get('adj_fq') is not None else '18.1'
         else:
             version = '18.0'
 
