@@ -114,6 +114,20 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('usage_ema_feature_know', torch.zeros(n_feature_know))
         self.register_buffer('usage_ema_restore_know', torch.zeros(n_restore_know))
 
+    def get_cached_emb(self):
+        """
+        Compute all normalized embeddings once for caching.
+        Call this outside checkpoint, pass result to layers.
+        """
+        return {
+            'fqk': F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1),
+            'fv': F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1),
+            'rqk': F.normalize(self.neuron_emb[self.feature_v_end:self.restore_qk_end], dim=-1),
+            'rv': F.normalize(self.neuron_emb[self.restore_qk_end:self.restore_v_end], dim=-1),
+            'feature_know': F.normalize(self.neuron_emb[self.restore_v_end:self.feature_know_end], dim=-1),
+            'restore_know': F.normalize(self.neuron_emb[self.feature_know_end:], dim=-1),
+        }
+
     def get_thresholds(self, x):
         """
         Return fixed tau for all pools (no learnable threshold)
@@ -129,29 +143,36 @@ class UnifiedNeuronRouter(nn.Module):
             'restore_know': self.fixed_tau,
         }
 
-    def get_feature_knowledge_logits(self, x):
+    def get_feature_knowledge_logits(self, x, cached_emb=None):
         """
         v18.5: Return feature knowledge logits only (restore is context-based)
         x: [B, S, d_model]
+        cached_emb: optional dict from get_cached_emb()
         """
-        # Optimized: slice first, normalize after
-        emb_feature_know = F.normalize(
-            self.neuron_emb[self.restore_v_end:self.feature_know_end], dim=-1
-        )
+        if cached_emb is not None:
+            emb_feature_know = cached_emb['feature_know']
+        else:
+            emb_feature_know = F.normalize(
+                self.neuron_emb[self.restore_v_end:self.feature_know_end], dim=-1
+            )
 
         h_feature_know = self.norm_feature_know(self.dropout(self.proj_feature_know(x)))
         logits_feature_know = torch.einsum('bsd,nd->bsn', h_feature_know, emb_feature_know)
 
         return logits_feature_know
 
-    def get_feature_attention_logits(self, x):
+    def get_feature_attention_logits(self, x, cached_emb=None):
         """
         v18.5: Return 3 feature attention logits only (restore is context-based)
         x: [B, S, d_model]
+        cached_emb: optional dict from get_cached_emb()
         """
-        # Optimized: slice first, normalize after
-        fqk_emb = F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1)
-        fv_emb = F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1)
+        if cached_emb is not None:
+            fqk_emb = cached_emb['fqk']
+            fv_emb = cached_emb['fv']
+        else:
+            fqk_emb = F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1)
+            fv_emb = F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1)
 
         all_proj = self.dropout(self.proj_feature(x))
         h_fqk_Q, h_fqk_K, h_fv = all_proj.chunk(3, dim=-1)
@@ -167,10 +188,11 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits_fqk_Q, logits_fqk_K, logits_fv
 
-    def get_restore_Q_logits_from_context(self, ctx):
+    def get_restore_Q_logits_from_context(self, ctx, cached_emb=None):
         """
         v18.5: Context-aware restore Q routing (separated from K)
         ctx: [P, B, S, d_space+rank] or [P*B, S, d_space+rank] (ctx + raw h)
+        cached_emb: optional dict from get_cached_emb()
         Returns: [P, B, S, N_rqk] or [P*B, S, N_rqk]
         """
         original_shape = ctx.shape
@@ -178,9 +200,10 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        # Optimized: slice first, normalize after (5.5x less computation)
-        rqk_emb_raw = self.neuron_emb[self.feature_v_end:self.restore_qk_end]
-        rqk_emb = F.normalize(rqk_emb_raw, dim=-1)
+        if cached_emb is not None:
+            rqk_emb = cached_emb['rqk']
+        else:
+            rqk_emb = F.normalize(self.neuron_emb[self.feature_v_end:self.restore_qk_end], dim=-1)
 
         h = self.norm_restore_Q_ctx(self.dropout(self.proj_restore_Q_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, rqk_emb)
@@ -190,10 +213,11 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits
 
-    def get_restore_K_logits_from_context(self, ctx):
+    def get_restore_K_logits_from_context(self, ctx, cached_emb=None):
         """
         v18.5: Context-aware restore K routing (separated from Q)
         ctx: [P, B, S, d_space+rank] or [P*B, S, d_space+rank] (ctx + raw h)
+        cached_emb: optional dict from get_cached_emb()
         Returns: [P, B, S, N_rqk] or [P*B, S, N_rqk]
         """
         original_shape = ctx.shape
@@ -201,9 +225,10 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        # Optimized: slice first, normalize after (5.5x less computation)
-        rqk_emb_raw = self.neuron_emb[self.feature_v_end:self.restore_qk_end]
-        rqk_emb = F.normalize(rqk_emb_raw, dim=-1)
+        if cached_emb is not None:
+            rqk_emb = cached_emb['rqk']
+        else:
+            rqk_emb = F.normalize(self.neuron_emb[self.feature_v_end:self.restore_qk_end], dim=-1)
 
         h = self.norm_restore_K_ctx(self.dropout(self.proj_restore_K_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, rqk_emb)
@@ -213,10 +238,11 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits
 
-    def get_restore_v_logits_from_context(self, ctx):
+    def get_restore_v_logits_from_context(self, ctx, cached_emb=None):
         """
         v18.5: Context-aware restore V routing
         ctx: [P, B, S, d_space+rank] or [P*B, S, d_space+rank] (ctx + raw h)
+        cached_emb: optional dict from get_cached_emb()
         Returns: [P, B, S, N_rv] or [P*B, S, N_rv]
         """
         original_shape = ctx.shape
@@ -224,9 +250,10 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        # Optimized: slice first, normalize after
-        rv_emb_raw = self.neuron_emb[self.restore_qk_end:self.restore_v_end]
-        rv_emb = F.normalize(rv_emb_raw, dim=-1)
+        if cached_emb is not None:
+            rv_emb = cached_emb['rv']
+        else:
+            rv_emb = F.normalize(self.neuron_emb[self.restore_qk_end:self.restore_v_end], dim=-1)
 
         h = self.norm_restore_v_ctx(self.dropout(self.proj_restore_v_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, rv_emb)
@@ -236,10 +263,11 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits
 
-    def get_restore_know_logits_from_context(self, ctx):
+    def get_restore_know_logits_from_context(self, ctx, cached_emb=None):
         """
         v18.5: Context-aware restore knowledge routing
         ctx: [P, B, S, d_space+knowledge_rank] or [P*B, S, d_space+knowledge_rank] (ctx + raw h)
+        cached_emb: optional dict from get_cached_emb()
         Returns: [P, B, S, N_restore_know] or [P*B, S, N_restore_know]
         """
         original_shape = ctx.shape
@@ -247,9 +275,10 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        # Optimized: slice first, normalize after
-        restore_know_emb_raw = self.neuron_emb[self.feature_know_end:]
-        restore_know_emb = F.normalize(restore_know_emb_raw, dim=-1)
+        if cached_emb is not None:
+            restore_know_emb = cached_emb['restore_know']
+        else:
+            restore_know_emb = F.normalize(self.neuron_emb[self.feature_know_end:], dim=-1)
 
         h = self.norm_restore_know_ctx(self.dropout(self.proj_restore_know_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, restore_know_emb)
@@ -259,16 +288,22 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits
 
-    def get_fqk_emb(self):
+    def get_fqk_emb(self, cached_emb=None):
         """Return normalized feature QK neuron embeddings"""
+        if cached_emb is not None:
+            return cached_emb['fqk']
         return F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1)
 
-    def get_fv_emb(self):
+    def get_fv_emb(self, cached_emb=None):
         """Return normalized feature V neuron embeddings"""
+        if cached_emb is not None:
+            return cached_emb['fv']
         return F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1)
 
-    def get_feature_know_emb(self):
+    def get_feature_know_emb(self, cached_emb=None):
         """Return normalized feature knowledge neuron embeddings"""
+        if cached_emb is not None:
+            return cached_emb['feature_know']
         return F.normalize(self.neuron_emb[self.restore_v_end:self.feature_know_end], dim=-1)
 
     def update_usage(self, weights, neuron_type, attention_mask=None):
@@ -683,7 +718,7 @@ class GlobalRouters(nn.Module):
 
         return path_weights_list, weights, mask, gate, scaled_weights
 
-    def get_feature_attention_weights(self, x, attention_mask=None, tau_feature=None):
+    def get_feature_attention_weights(self, x, attention_mask=None, tau_feature=None, cached_emb=None):
         """
         v18.5: Feature-only attention routing (restore is context-based).
 
@@ -691,13 +726,14 @@ class GlobalRouters(nn.Module):
             x: [B, S, D] input
             tau_feature: [B, S, 4] pre-computed tau values (optional)
                          Order: [fq, fk, fv, feature_know]
+            cached_emb: optional dict from neuron_router.get_cached_emb()
 
         Returns:
             feature_weights: dict with 'fqk_Q', 'fqk_K', 'fv' (each list of [B, S, N])
             routing_info: dict with routing statistics
             aux_loss: auxiliary loss for load balancing
         """
-        fqk_logits_Q, fqk_logits_K, fv_logits = self.neuron_router.get_feature_attention_logits(x)
+        fqk_logits_Q, fqk_logits_K, fv_logits = self.neuron_router.get_feature_attention_logits(x, cached_emb)
 
         # Get tau
         if self.learnable_tau:
@@ -799,7 +835,7 @@ class GlobalRouters(nn.Module):
 
         return feature_weights, routing_info, aux_loss
 
-    def get_restore_attention_weights(self, ctx, pool_type, qk_type=None, attention_mask=None):
+    def get_restore_attention_weights(self, ctx, pool_type, qk_type=None, attention_mask=None, cached_emb=None):
         """
         v18.5: Context-aware restore attention routing (single path).
 
@@ -808,6 +844,7 @@ class GlobalRouters(nn.Module):
             pool_type: 'qk' or 'v'
             qk_type: 'Q' or 'K' (for usage tracking)
             attention_mask: [B, S]
+            cached_emb: optional dict from neuron_router.get_cached_emb()
 
         Returns:
             weights: [B, S, N] sparse weights
@@ -819,14 +856,14 @@ class GlobalRouters(nn.Module):
         if pool_type == 'qk':
             # Q/K separated projections and tau
             if qk_type == 'Q':
-                logits = self.neuron_router.get_restore_Q_logits_from_context(ctx)  # [B, S, N_rqk]
+                logits = self.neuron_router.get_restore_Q_logits_from_context(ctx, cached_emb)  # [B, S, N_rqk]
                 tau_proj = self.tau_proj_restore_Q if self.learnable_tau else None
             else:  # 'K'
-                logits = self.neuron_router.get_restore_K_logits_from_context(ctx)  # [B, S, N_rqk]
+                logits = self.neuron_router.get_restore_K_logits_from_context(ctx, cached_emb)  # [B, S, N_rqk]
                 tau_proj = self.tau_proj_restore_K if self.learnable_tau else None
             n_neurons = self.n_restore_qk
         else:
-            logits = self.neuron_router.get_restore_v_logits_from_context(ctx)   # [B, S, N_rv]
+            logits = self.neuron_router.get_restore_v_logits_from_context(ctx, cached_emb)   # [B, S, N_rv]
             n_neurons = self.n_restore_v
             tau_proj = self.tau_proj_restore_v if self.learnable_tau else None
 
@@ -894,20 +931,21 @@ class GlobalRouters(nn.Module):
 
         return weights, aux_loss, routing_info
 
-    def get_feature_knowledge_weights(self, x, attention_mask=None, tau_feature=None):
+    def get_feature_knowledge_weights(self, x, attention_mask=None, tau_feature=None, cached_emb=None):
         """
         v18.5: Feature-only knowledge routing (restore is context-based).
 
         Args:
             x: [B, S, D] input
             tau_feature: [B, S, 4] pre-computed tau values (optional)
+            cached_emb: optional dict from neuron_router.get_cached_emb()
 
         Returns:
             feature_paths: list of [B, S, N] weights
             routing_info: dict with routing statistics
             aux_loss: auxiliary loss
         """
-        logits_f = self.neuron_router.get_feature_knowledge_logits(x)
+        logits_f = self.neuron_router.get_feature_knowledge_logits(x, cached_emb)
 
         # Get tau
         if self.learnable_tau:
@@ -961,13 +999,14 @@ class GlobalRouters(nn.Module):
 
         return f_paths, know_info, aux_loss
 
-    def get_restore_knowledge_weights(self, ctx, attention_mask=None):
+    def get_restore_knowledge_weights(self, ctx, attention_mask=None, cached_emb=None):
         """
         v18.5: Context-aware restore knowledge routing (single path).
 
         Args:
             ctx: [B, S, d_space+knowledge_rank] context for single path ([neuron_ctx, h])
             attention_mask: [B, S]
+            cached_emb: optional dict from neuron_router.get_cached_emb()
 
         Returns:
             weights: [B, S, N] sparse weights
@@ -976,7 +1015,7 @@ class GlobalRouters(nn.Module):
         """
         B, S, _ = ctx.shape
 
-        logits = self.neuron_router.get_restore_know_logits_from_context(ctx)  # [B, S, N_r]
+        logits = self.neuron_router.get_restore_know_logits_from_context(ctx, cached_emb)  # [B, S, N_r]
 
         # Tau
         if self.learnable_tau:
@@ -1069,7 +1108,7 @@ class AttentionCircuit(nn.Module):
         self.out_dropout = nn.Dropout(dropout)
         # v18.5: No h projection - uses raw h in restore context
 
-    def forward(self, x, feature_weights, router, attention_mask=None):
+    def forward(self, x, feature_weights, router, attention_mask=None, cached_emb=None):
         """
         v18.5: Feature processing + context-aware restore routing.
 
@@ -1077,6 +1116,7 @@ class AttentionCircuit(nn.Module):
             x: [B, S, D] input
             feature_weights: dict with 'fqk_Q', 'fqk_K', 'fv' (each list of [B, S, N])
             router: GlobalRouters instance for restore routing callback
+            cached_emb: optional dict from router.neuron_router.get_cached_emb()
 
         Returns:
             output: [B, S, D]
@@ -1102,8 +1142,8 @@ class AttentionCircuit(nn.Module):
         h_v_all = torch.einsum('bsnr,pbsn->pbsr', all_h_v, fv_w_stacked)
 
         # ===== Restore context 생성 =====
-        fqk_emb = router.neuron_router.get_fqk_emb()  # [N_fqk, d_space]
-        fv_emb = router.neuron_router.get_fv_emb()    # [N_fv, d_space]
+        fqk_emb = router.neuron_router.get_fqk_emb(cached_emb)  # [N_fqk, d_space]
+        fv_emb = router.neuron_router.get_fv_emb(cached_emb)    # [N_fv, d_space]
 
         # ===== Restore 라우팅 (for loop) =====
         r_qk = self.shared_neurons.restore_qk_neurons  # [N_rqk, R, D]
@@ -1134,9 +1174,9 @@ class AttentionCircuit(nn.Module):
             rv_input = torch.cat([ctx_v, h_v], dim=-1)
 
             # Restore routing
-            w_q, aux_q, info_q = router.get_restore_attention_weights(rqk_Q_input, 'qk', 'Q', attention_mask)
-            w_k, aux_k, info_k = router.get_restore_attention_weights(rqk_K_input, 'qk', 'K', attention_mask)
-            w_v, aux_v, info_v = router.get_restore_attention_weights(rv_input, 'v', None, attention_mask)
+            w_q, aux_q, info_q = router.get_restore_attention_weights(rqk_Q_input, 'qk', 'Q', attention_mask, cached_emb)
+            w_k, aux_k, info_k = router.get_restore_attention_weights(rqk_K_input, 'qk', 'K', attention_mask, cached_emb)
+            w_v, aux_v, info_v = router.get_restore_attention_weights(rv_input, 'v', None, attention_mask, cached_emb)
 
             restore_aux_loss += aux_q + aux_k + aux_v
 
@@ -1234,7 +1274,7 @@ class KnowledgeCircuit(nn.Module):
         self.dropout = nn.Dropout(dropout)
         # v18.5: No h projection - uses raw h in restore context
 
-    def forward(self, x, feature_paths, router, attention_mask=None):
+    def forward(self, x, feature_paths, router, attention_mask=None, cached_emb=None):
         """
         v18.5: Feature processing + context-aware restore routing.
 
@@ -1242,6 +1282,7 @@ class KnowledgeCircuit(nn.Module):
             x: [B, S, D] input
             feature_paths: list of [B, S, N] weights
             router: GlobalRouters instance for restore routing callback
+            cached_emb: optional dict from router.neuron_router.get_cached_emb()
 
         Returns:
             output: [B, S, D]
@@ -1259,7 +1300,7 @@ class KnowledgeCircuit(nn.Module):
         h_all = torch.einsum('bsnr,pbsn->pbsr', all_h, feature_stacked)  # [P, B, S, R]
 
         # ===== Restore context 생성 =====
-        feature_emb = router.neuron_router.get_feature_know_emb()  # [N_f, d_space]
+        feature_emb = router.neuron_router.get_feature_know_emb(cached_emb)  # [N_f, d_space]
         r_know = self.shared_neurons.restore_know  # [N_r, R, D]
 
         # ===== Restore 라우팅 (for loop) =====
@@ -1278,7 +1319,7 @@ class KnowledgeCircuit(nn.Module):
             restore_input = torch.cat([neuron_ctx, h], dim=-1)  # [B, S, d_space + knowledge_rank]
 
             # Restore routing
-            w, aux, info = router.get_restore_knowledge_weights(restore_input, attention_mask)
+            w, aux, info = router.get_restore_knowledge_weights(restore_input, attention_mask, cached_emb)
             restore_aux_loss += aux
 
             # Restore 처리 (accumulate output)
@@ -1320,18 +1361,18 @@ class DAWNBlock(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, x, importance, global_routers: GlobalRouters, attention_mask=None):
+    def forward(self, x, importance, global_routers: GlobalRouters, attention_mask=None, cached_emb=None):
         # ===== Attention =====
         normed_x_attn = self.norm1(x)
         tau_feature_attn = global_routers.get_tau_feature(normed_x_attn)
 
         # v18.5: Feature routing only (restore is context-based inside circuit)
         feature_weights, attn_info, feature_aux_loss = global_routers.get_feature_attention_weights(
-            normed_x_attn, attention_mask, tau_feature=tau_feature_attn
+            normed_x_attn, attention_mask, tau_feature=tau_feature_attn, cached_emb=cached_emb
         )
 
         # Circuit handles restore routing internally via router callback
-        attn_out, restore_aux_loss, attn_restore_info = self.attn(normed_x_attn, feature_weights, global_routers, attention_mask)
+        attn_out, restore_aux_loss, attn_restore_info = self.attn(normed_x_attn, feature_weights, global_routers, attention_mask, cached_emb)
         x = x + attn_out
 
         attn_aux_loss = feature_aux_loss + restore_aux_loss
@@ -1346,11 +1387,11 @@ class DAWNBlock(nn.Module):
 
         # v18.5: Feature routing only
         know_feature_paths, know_info, know_feature_aux_loss = global_routers.get_feature_knowledge_weights(
-            normed_x_know, attention_mask, tau_feature=tau_feature_know
+            normed_x_know, attention_mask, tau_feature=tau_feature_know, cached_emb=cached_emb
         )
 
         # Circuit handles restore routing internally via router callback
-        know_out, know_restore_aux_loss, know_restore_info = self.knowledge(normed_x_know, know_feature_paths, global_routers, attention_mask)
+        know_out, know_restore_aux_loss, know_restore_info = self.knowledge(normed_x_know, know_feature_paths, global_routers, attention_mask, cached_emb)
         x = x + know_out
 
         know_aux_loss = know_feature_aux_loss + know_restore_aux_loss
@@ -1573,17 +1614,20 @@ class DAWN(nn.Module):
                     context = context * attention_mask.unsqueeze(-1)
                 x = x + context
 
+        # Cache normalized embeddings once (outside checkpoint for gradient safety)
+        cached_emb = self.router.neuron_router.get_cached_emb()
+
         routing_infos = []
         total_aux_loss = 0.0
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 x, routing_info, aux_loss = checkpoint(
-                    layer, x, importance, self.router, attention_mask,
+                    layer, x, importance, self.router, attention_mask, cached_emb,
                     use_reentrant=False
                 )
             else:
-                x, routing_info, aux_loss = layer(x, importance, self.router, attention_mask)
+                x, routing_info, aux_loss = layer(x, importance, self.router, attention_mask, cached_emb)
 
             routing_infos.append(routing_info)
             total_aux_loss += aux_loss
