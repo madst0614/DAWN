@@ -110,8 +110,8 @@ class EmbeddingAnalyzer:
             mask = ~torch.eye(n, dtype=torch.bool, device=self.device)
             off_diag = sim_matrix[mask]
 
-            neuron_types = self._get_neuron_types()
-            display = neuron_types[name][0]
+            pools = self._get_embedding_pools()
+            display = pools[name][0]
             results[name] = {
                 'display': display,
                 'n_neurons': n,
@@ -137,12 +137,12 @@ class EmbeddingAnalyzer:
         if n_types == 1:
             axes = [axes]
 
-        neuron_types = self._get_neuron_types()
+        pools = self._get_embedding_pools()
         for ax, (name, emb) in zip(axes, embeddings.items()):
             emb_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
             sim_matrix = emb_norm @ emb_norm.T
             sns.heatmap(sim_matrix, ax=ax, cmap='coolwarm', vmin=-1, vmax=1)
-            ax.set_title(f'{neuron_types[name][0]} Similarity')
+            ax.set_title(f'{pools[name][0]} Similarity')
 
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'similarity_heatmap.png'), dpi=150)
