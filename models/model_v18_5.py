@@ -4,20 +4,22 @@ DAWN v18.5: Context-Aware Restore Routing
 Key Concept:
 - Based on v18.4 with context-aware restore routing
 - Feature routing: done on input x (same as v18.4)
-- Restore routing: done on [h_proj, neuron_context] where:
-  - h_proj: intermediate representation h projected to d_space
-  - neuron_context: weighted sum of feature neuron embeddings
+- Restore routing: done on [neuron_context, h] where:
+  - neuron_context: weighted sum of feature neuron embeddings (d_space)
+  - h: raw intermediate representation (rank for attention, knowledge_rank for knowledge)
+  - No h projection - uses raw h directly
 
 Changes from v18.4:
 - Restore routing now sees feature processing results (h + activated neurons)
 - Feature/Restore routing separated in GlobalRouters
 - Circuit classes call router for restore routing after feature processing
-- Path-parallel batched restore routing (no for loops)
+- Q/K fully separated: separate projections, norms, tau for Q and K paths
+- Context dimension: d_space + rank (attention) or d_space + knowledge_rank (knowledge)
 
 Architecture:
-- UnifiedNeuronRouter: Context-aware restore projections added
+- UnifiedNeuronRouter: Context-aware restore projections (input: d_space + rank/knowledge_rank)
 - GlobalRouters: Feature-only routing + context-aware restore routing
-- AttentionCircuit: h projection + restore context generation + router callback
+- AttentionCircuit: No h projection, uses [neuron_context, raw_h] for restore context
 - KnowledgeCircuit: Same pattern as AttentionCircuit
 """
 
@@ -40,11 +42,14 @@ class UnifiedNeuronRouter(nn.Module):
     v18.5: Context-aware restore routing
 
     Feature routing: 3 attention projections (fqk_Q, fqk_K, fv) + 1 knowledge projection
-    Restore routing: Context-based projections (from h_proj + neuron_context)
+    Restore routing: Context-based projections (from [neuron_context, h])
+      - Attention: input dim = d_space + rank
+      - Knowledge: input dim = d_space + knowledge_rank
     """
     def __init__(self, d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
                  n_feature_know, n_restore_know,
-                 d_space=64, dropout=0.1, fixed_tau=0.0, **kwargs):
+                 d_space=64, dropout=0.1, fixed_tau=0.0,
+                 rank=16, knowledge_rank=128, **kwargs):
         super().__init__()
         self.n_feature_qk = n_feature_qk
         self.n_feature_v = n_feature_v
@@ -53,6 +58,8 @@ class UnifiedNeuronRouter(nn.Module):
         self.n_feature_know = n_feature_know
         self.n_restore_know = n_restore_know
         self.d_space = d_space
+        self.rank = rank
+        self.knowledge_rank = knowledge_rank
         self.fixed_tau = fixed_tau
         self.ema_alpha = kwargs.get('excitability_ema_alpha', 0.01)
 
@@ -80,12 +87,14 @@ class UnifiedNeuronRouter(nn.Module):
         self.norm_fv = nn.LayerNorm(d_space)
         self.norm_feature_know = nn.LayerNorm(d_space)
 
-        # v18.5: Context-aware restore routing projections (from 2*d_space context)
+        # v18.5: Context-aware restore routing projections (from [ctx, h])
         # Q/K separated projections for restore routing
-        self.proj_restore_Q_from_ctx = nn.Linear(2 * d_space, d_space)
-        self.proj_restore_K_from_ctx = nn.Linear(2 * d_space, d_space)
-        self.proj_restore_v_from_ctx = nn.Linear(2 * d_space, d_space)
-        self.proj_restore_know_from_ctx = nn.Linear(2 * d_space, d_space)
+        # Attention: input dim = d_space + rank (ctx + raw h)
+        # Knowledge: input dim = d_space + knowledge_rank (ctx + raw h)
+        self.proj_restore_Q_from_ctx = nn.Linear(d_space + rank, d_space)
+        self.proj_restore_K_from_ctx = nn.Linear(d_space + rank, d_space)
+        self.proj_restore_v_from_ctx = nn.Linear(d_space + rank, d_space)
+        self.proj_restore_know_from_ctx = nn.Linear(d_space + knowledge_rank, d_space)
 
         self.norm_restore_Q_ctx = nn.LayerNorm(d_space)
         self.norm_restore_K_ctx = nn.LayerNorm(d_space)
@@ -161,7 +170,7 @@ class UnifiedNeuronRouter(nn.Module):
     def get_restore_Q_logits_from_context(self, ctx):
         """
         v18.5: Context-aware restore Q routing (separated from K)
-        ctx: [P, B, S, 2*d_space] or [P*B, S, 2*d_space]
+        ctx: [P, B, S, d_space+rank] or [P*B, S, d_space+rank] (ctx + raw h)
         Returns: [P, B, S, N_rqk] or [P*B, S, N_rqk]
         """
         original_shape = ctx.shape
@@ -184,7 +193,7 @@ class UnifiedNeuronRouter(nn.Module):
     def get_restore_K_logits_from_context(self, ctx):
         """
         v18.5: Context-aware restore K routing (separated from Q)
-        ctx: [P, B, S, 2*d_space] or [P*B, S, 2*d_space]
+        ctx: [P, B, S, d_space+rank] or [P*B, S, d_space+rank] (ctx + raw h)
         Returns: [P, B, S, N_rqk] or [P*B, S, N_rqk]
         """
         original_shape = ctx.shape
@@ -207,7 +216,7 @@ class UnifiedNeuronRouter(nn.Module):
     def get_restore_v_logits_from_context(self, ctx):
         """
         v18.5: Context-aware restore V routing
-        ctx: [P, B, S, 2*d_space] or [P*B, S, 2*d_space]
+        ctx: [P, B, S, d_space+rank] or [P*B, S, d_space+rank] (ctx + raw h)
         Returns: [P, B, S, N_rv] or [P*B, S, N_rv]
         """
         original_shape = ctx.shape
@@ -230,7 +239,7 @@ class UnifiedNeuronRouter(nn.Module):
     def get_restore_know_logits_from_context(self, ctx):
         """
         v18.5: Context-aware restore knowledge routing
-        ctx: [P, B, S, 2*d_space] or [P*B, S, 2*d_space]
+        ctx: [P, B, S, d_space+knowledge_rank] or [P*B, S, d_space+knowledge_rank] (ctx + raw h)
         Returns: [P, B, S, N_restore_know] or [P*B, S, N_restore_know]
         """
         original_shape = ctx.shape
@@ -477,7 +486,7 @@ class GlobalRouters(nn.Module):
 
     Key changes from v18.4:
     1. Feature routing: same as v18.4 (on input x)
-    2. Restore routing: context-based (on [h_proj, neuron_context])
+    2. Restore routing: context-based (on [neuron_context, h])
     3. Separated feature/restore routing methods
     4. Batched top-k selection for path-aware processing
     """
@@ -485,6 +494,7 @@ class GlobalRouters(nn.Module):
                  n_restore_qk: int, n_restore_v: int,
                  n_feature_know: int, n_restore_know: int,
                  rank: int = 16,
+                 knowledge_rank: int = 128,
                  max_paths: int = 4,
                  fixed_tau: float = 0.0,
                  path_max_k: int = 16,
@@ -504,6 +514,7 @@ class GlobalRouters(nn.Module):
         self.n_feature_know = n_feature_know
         self.n_restore_know = n_restore_know
         self.rank = rank
+        self.knowledge_rank = knowledge_rank
         self.max_paths = max_paths
         self.fixed_tau = fixed_tau
         self.path_max_k = path_max_k
@@ -526,12 +537,12 @@ class GlobalRouters(nn.Module):
             nn.init.zeros_(self.tau_proj_feature.weight)
             nn.init.constant_(self.tau_proj_feature.bias, -0.5)
 
-            # Restore tau projection (input: 2*d_space, context-based)
+            # Restore tau projection (input: d_space + rank or d_space + knowledge_rank)
             # Q/K separated tau projections
-            self.tau_proj_restore_Q = nn.Linear(2 * d_space, 1)     # rQ
-            self.tau_proj_restore_K = nn.Linear(2 * d_space, 1)     # rK
-            self.tau_proj_restore_v = nn.Linear(2 * d_space, 1)     # rv
-            self.tau_proj_restore_know = nn.Linear(2 * d_space, 1)  # restore_know
+            self.tau_proj_restore_Q = nn.Linear(d_space + rank, 1)              # rQ
+            self.tau_proj_restore_K = nn.Linear(d_space + rank, 1)              # rK
+            self.tau_proj_restore_v = nn.Linear(d_space + rank, 1)              # rv
+            self.tau_proj_restore_know = nn.Linear(d_space + knowledge_rank, 1) # restore_know
 
             for proj in [self.tau_proj_restore_Q, self.tau_proj_restore_K, self.tau_proj_restore_v, self.tau_proj_restore_know]:
                 nn.init.zeros_(proj.weight)
@@ -540,7 +551,8 @@ class GlobalRouters(nn.Module):
         self.neuron_router = UnifiedNeuronRouter(
             d_model, n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
             n_feature_know, n_restore_know,
-            d_space=d_space, dropout=router_dropout, fixed_tau=fixed_tau, **kwargs
+            d_space=d_space, dropout=router_dropout, fixed_tau=fixed_tau,
+            rank=rank, knowledge_rank=knowledge_rank, **kwargs
         )
 
     def get_tau_feature(self, x):
@@ -792,7 +804,7 @@ class GlobalRouters(nn.Module):
         v18.5: Context-aware restore attention routing (single path).
 
         Args:
-            ctx: [B, S, 2*d_space] context for single path
+            ctx: [B, S, d_space+rank] context for single path ([neuron_ctx, h])
             pool_type: 'qk' or 'v'
             qk_type: 'Q' or 'K' (for usage tracking)
             attention_mask: [B, S]
@@ -954,7 +966,7 @@ class GlobalRouters(nn.Module):
         v18.5: Context-aware restore knowledge routing (single path).
 
         Args:
-            ctx: [B, S, 2*d_space] context for single path
+            ctx: [B, S, d_space+knowledge_rank] context for single path ([neuron_ctx, h])
             attention_mask: [B, S]
 
         Returns:
@@ -1031,7 +1043,9 @@ class AttentionCircuit(nn.Module):
     v18.5: Multi-path attention circuit with context-aware restore routing.
 
     Feature processing: same as v18.4
-    Restore routing: context-based (h_proj + neuron_context) -> router callback
+    Restore routing: context-based ([neuron_context, h]) -> router callback
+      - No h projection, uses raw h directly
+      - Context dimension: d_space + rank
     """
     def __init__(
         self,
@@ -1053,11 +1067,7 @@ class AttentionCircuit(nn.Module):
         self.expand_O = nn.Linear(d_model, d_model, bias=False)
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
-
-        # v18.5: h -> d_space projection for restore context (Q/K separated)
-        self.proj_h_Q = nn.Linear(rank, d_space)
-        self.proj_h_K = nn.Linear(rank, d_space)
-        self.proj_h_v = nn.Linear(rank, d_space)
+        # v18.5: No h projection - uses raw h in restore context
 
     def forward(self, x, feature_weights, router, attention_mask=None):
         """
@@ -1113,20 +1123,15 @@ class AttentionCircuit(nn.Module):
             fqk_w_K = feature_weights['fqk_K'][p]
             fv_w = feature_weights['fv'][p]
 
-            # h projection
-            h_q_proj = self.proj_h_Q(h_q)  # [B, S, d_space]
-            h_k_proj = self.proj_h_K(h_k)
-            h_v_proj = self.proj_h_v(h_v)
-
             # neuron context
             ctx_q = torch.einsum('bsn,nd->bsd', fqk_w_Q, fqk_emb)  # [B, S, d_space]
             ctx_k = torch.einsum('bsn,nd->bsd', fqk_w_K, fqk_emb)
             ctx_v = torch.einsum('bsn,nd->bsd', fv_w, fv_emb)
 
-            # concat: [h_proj, neuron_context]
-            rqk_Q_input = torch.cat([h_q_proj, ctx_q], dim=-1)  # [B, S, 2*d_space]
-            rqk_K_input = torch.cat([h_k_proj, ctx_k], dim=-1)
-            rv_input = torch.cat([h_v_proj, ctx_v], dim=-1)
+            # v18.5: concat [neuron_context, raw_h] (no h projection)
+            rqk_Q_input = torch.cat([ctx_q, h_q], dim=-1)  # [B, S, d_space + rank]
+            rqk_K_input = torch.cat([ctx_k, h_k], dim=-1)
+            rv_input = torch.cat([ctx_v, h_v], dim=-1)
 
             # Restore routing
             w_q, aux_q, info_q = router.get_restore_attention_weights(rqk_Q_input, 'qk', 'Q', attention_mask)
@@ -1205,7 +1210,9 @@ class KnowledgeCircuit(nn.Module):
     v18.5: Multi-path Knowledge Circuit with context-aware restore routing.
 
     Feature processing: same as v18.4
-    Restore routing: context-based (h_proj + neuron_context) -> router callback
+    Restore routing: context-based ([neuron_context, h]) -> router callback
+      - No h projection, uses raw h directly
+      - Context dimension: d_space + knowledge_rank
     """
     def __init__(
         self,
@@ -1225,9 +1232,7 @@ class KnowledgeCircuit(nn.Module):
         self.knowledge_rank = knowledge_rank
         self.d_space = d_space
         self.dropout = nn.Dropout(dropout)
-
-        # v18.5: h -> d_space projection for restore context
-        self.proj_h_know = nn.Linear(knowledge_rank, d_space)
+        # v18.5: No h projection - uses raw h in restore context
 
     def forward(self, x, feature_paths, router, attention_mask=None):
         """
@@ -1266,14 +1271,11 @@ class KnowledgeCircuit(nn.Module):
             h = h_all[p]  # [B, S, R]
             f_w = feature_paths[p]  # [B, S, N_f]
 
-            # h projection
-            h_proj = self.proj_h_know(h)  # [B, S, d_space]
-
             # neuron context
             neuron_ctx = torch.einsum('bsn,nd->bsd', f_w, feature_emb)  # [B, S, d_space]
 
-            # concat: [h_proj, neuron_context]
-            restore_input = torch.cat([h_proj, neuron_ctx], dim=-1)  # [B, S, 2*d_space]
+            # v18.5: concat [neuron_context, raw_h] (no h projection)
+            restore_input = torch.cat([neuron_ctx, h], dim=-1)  # [B, S, d_space + knowledge_rank]
 
             # Restore routing
             w, aux, info = router.get_restore_knowledge_weights(restore_input, attention_mask)
@@ -1495,6 +1497,7 @@ class DAWN(nn.Module):
             n_restore_qk=n_restore_qk, n_restore_v=n_restore_v,
             n_feature_know=n_feature_know, n_restore_know=n_restore_know,
             rank=rank,
+            knowledge_rank=knowledge_rank,
             max_paths=max_paths,
             fixed_tau=fixed_tau,
             path_max_k=path_max_k,
