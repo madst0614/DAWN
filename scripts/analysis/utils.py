@@ -95,6 +95,18 @@ NEURON_TYPES_V18 = {
     'restore_know': ('R-Know', 'usage_ema_restore_know', 'n_restore_know', 'cyan'),
 }
 
+# v18.x: Embedding pool boundaries (6 unique pools, not 8 types)
+# Q/K share the same embedding pool
+EMBEDDING_POOLS_V18 = {
+    # (display_name, n_attr, color)
+    'feature_qk':   ('FQK',    'n_feature_qk',   'red'),
+    'feature_v':    ('FV',     'n_feature_v',    'orange'),
+    'restore_qk':   ('RQK',    'n_restore_qk',   'blue'),
+    'restore_v':    ('RV',     'n_restore_v',    'green'),
+    'feature_know': ('F-Know', 'n_feature_know', 'purple'),
+    'restore_know': ('R-Know', 'n_restore_know', 'cyan'),
+}
+
 ROUTING_KEYS = {
     # (display_name, pref_key, weight_key, pool_type)
     'fqk_q': ('F-QK_Q', 'fqk_q_pref', 'fqk_weights_Q', 'feature_qk'),

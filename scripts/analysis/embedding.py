@@ -16,7 +16,7 @@ import torch
 from typing import Dict, Optional
 
 from .utils import (
-    NEURON_TYPES, NEURON_TYPES_V18,
+    NEURON_TYPES, NEURON_TYPES_V18, EMBEDDING_POOLS_V18,
     HAS_MATPLOTLIB, HAS_SKLEARN, plt, sns
 )
 
@@ -43,27 +43,35 @@ class EmbeddingAnalyzer:
         self.is_v18 = hasattr(router, 'usage_ema_feature_q')
 
     def _get_neuron_types(self):
-        """Get appropriate NEURON_TYPES for model version."""
+        """Get appropriate NEURON_TYPES for model version (for EMA tracking)."""
         return NEURON_TYPES_V18 if self.is_v18 else NEURON_TYPES
+
+    def _get_embedding_pools(self):
+        """Get embedding pool boundaries (6 unique pools, Q/K share same pool)."""
+        if self.is_v18:
+            return EMBEDDING_POOLS_V18
+        # For non-v18, use NEURON_TYPES (no Q/K separation)
+        return {k: (v[0], v[2], v[3]) for k, v in NEURON_TYPES.items()}
 
     def get_embeddings_by_type(self, as_tensor: bool = False) -> Dict[str, np.ndarray]:
         """
-        Extract embeddings grouped by neuron type.
+        Extract embeddings grouped by embedding pool (not EMA type).
 
         Args:
             as_tensor: Return torch tensors on GPU instead of numpy arrays
 
         Returns:
-            Dictionary mapping type name to embedding array/tensor
+            Dictionary mapping pool name to embedding array/tensor
         """
         emb = self.router.neuron_emb.detach()
         if not as_tensor:
             emb = emb.cpu().numpy()
 
-        neuron_types = self._get_neuron_types()
+        # Use embedding pools (6 unique pools) not neuron types (8 with Q/K separate)
+        pools = self._get_embedding_pools()
         result = {}
         offset = 0
-        for name, (display, _, n_attr, _) in neuron_types.items():
+        for name, (display, n_attr, _) in pools.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
                 result[name] = emb[offset:offset + n]
@@ -159,12 +167,12 @@ class EmbeddingAnalyzer:
         # Compute pairwise similarities on GPU
         results = {}
         names = list(centroids.keys())
-        neuron_types = self._get_neuron_types()
+        pools = self._get_embedding_pools()
         for i, n1 in enumerate(names):
             for n2 in names[i+1:]:
                 c1, c2 = centroids[n1], centroids[n2]
                 sim = torch.dot(c1, c2) / (c1.norm() * c2.norm() + 1e-8)
-                key = f"{neuron_types[n1][0]}-{neuron_types[n2][0]}"
+                key = f"{pools[n1][0]}-{pools[n2][0]}"
                 results[key] = float(sim.item())
 
         return results
@@ -186,31 +194,56 @@ class EmbeddingAnalyzer:
         results = {}
         emb = self.router.neuron_emb.detach().cpu().numpy()
 
-        neuron_types = self._get_neuron_types()
-        # Build boundaries for each type
+        # Use embedding pools (6 unique pools) for correct boundaries
+        pools = self._get_embedding_pools()
+
+        # Map pool names to EMA attributes (for v18, QK pools use combined Q+K)
+        ema_mapping = {
+            'feature_qk': ('usage_ema_feature_q', 'usage_ema_feature_k'),  # tuple for combined
+            'feature_v': 'usage_ema_feature_v',
+            'restore_qk': ('usage_ema_restore_q', 'usage_ema_restore_k'),
+            'restore_v': 'usage_ema_restore_v',
+            'feature_know': 'usage_ema_feature_know',
+            'restore_know': 'usage_ema_restore_know',
+        }
+
+        # Build boundaries for each pool
         boundaries = {}
         offset = 0
-        for name, (display, ema_attr, n_attr, _) in neuron_types.items():
+        for name, (display, n_attr, _) in pools.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
-                boundaries[name] = (offset, offset + n, ema_attr)
+                ema_info = ema_mapping.get(name)
+                boundaries[name] = (offset, offset + n, ema_info, display)
                 offset += n
 
-        # Cluster each type
-        for name, (start, end, ema_attr) in boundaries.items():
-            type_emb = emb[start:end]
-            n_neurons = type_emb.shape[0]
+        # Cluster each pool
+        for name, (start, end, ema_info, display) in boundaries.items():
+            pool_emb = emb[start:end]
+            n_neurons = pool_emb.shape[0]
 
             if n_neurons < n_clusters:
                 results[name] = {'error': f'Not enough neurons for {n_clusters} clusters'}
                 continue
 
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(type_emb)
+            labels = kmeans.fit_predict(pool_emb)
+
+            # Get EMA (for QK pools, use max of Q and K)
+            ema = None
+            if ema_info is not None:
+                if isinstance(ema_info, tuple):
+                    # QK pool: combine Q and K EMA
+                    ema_q = getattr(self.router, ema_info[0], None)
+                    ema_k = getattr(self.router, ema_info[1], None)
+                    if ema_q is not None and ema_k is not None:
+                        ema = torch.maximum(ema_q, ema_k).cpu().numpy()
+                else:
+                    ema_attr = getattr(self.router, ema_info, None)
+                    if ema_attr is not None:
+                        ema = ema_attr.cpu().numpy()
 
             cluster_stats = []
-            ema = getattr(self.router, ema_attr).cpu().numpy() if hasattr(self.router, ema_attr) else None
-
             for c in range(n_clusters):
                 cluster_mask = labels == c
                 cluster_size = cluster_mask.sum()
@@ -232,7 +265,7 @@ class EmbeddingAnalyzer:
                     })
 
             results[name] = {
-                'display': neuron_types[name][0],
+                'display': display,
                 'n_clusters': n_clusters,
                 'clusters': sorted(cluster_stats, key=lambda x: -x.get('avg_usage', 0)),
                 'labels': labels.tolist(),
@@ -256,19 +289,18 @@ class EmbeddingAnalyzer:
         if n_types == 1:
             axes = [axes]
 
-        neuron_types = self._get_neuron_types()
         ax_idx = 0
-        for name, (start, end, _) in boundaries.items():
+        for name, (start, end, _, display) in boundaries.items():
             if name not in results or 'error' in results[name]:
                 continue
 
-            type_emb = emb[start:end]
+            pool_emb = emb[start:end]
             pca = PCA(n_components=2)
-            emb_2d = pca.fit_transform(type_emb)
+            emb_2d = pca.fit_transform(pool_emb)
 
             labels = results[name]['labels']
             axes[ax_idx].scatter(emb_2d[:, 0], emb_2d[:, 1], c=labels, cmap='tab10', alpha=0.6)
-            axes[ax_idx].set_title(f'{neuron_types[name][0]} Clusters')
+            axes[ax_idx].set_title(f'{display} Clusters')
             ax_idx += 1
 
         plt.tight_layout()
@@ -292,11 +324,12 @@ class EmbeddingAnalyzer:
 
         emb = self.router.neuron_emb.detach().cpu().numpy()
 
-        neuron_types = self._get_neuron_types()
+        # Use embedding pools (6 unique pools) for correct boundaries
+        pools = self._get_embedding_pools()
         # Build labels and color map
         labels = []
         colors_map = {}
-        for name, (display, _, n_attr, color) in neuron_types.items():
+        for name, (display, n_attr, color) in pools.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
                 labels.extend([display] * n)
