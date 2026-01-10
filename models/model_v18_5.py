@@ -1054,8 +1054,9 @@ class AttentionCircuit(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-        # v18.5: h -> d_space projection for restore context
-        self.proj_h_qk = nn.Linear(rank, d_space)
+        # v18.5: h -> d_space projection for restore context (Q/K separated)
+        self.proj_h_Q = nn.Linear(rank, d_space)
+        self.proj_h_K = nn.Linear(rank, d_space)
         self.proj_h_v = nn.Linear(rank, d_space)
 
     def forward(self, x, feature_weights, router, attention_mask=None):
@@ -1113,8 +1114,8 @@ class AttentionCircuit(nn.Module):
             fv_w = feature_weights['fv'][p]
 
             # h projection
-            h_q_proj = self.proj_h_qk(h_q)  # [B, S, d_space]
-            h_k_proj = self.proj_h_qk(h_k)
+            h_q_proj = self.proj_h_Q(h_q)  # [B, S, d_space]
+            h_k_proj = self.proj_h_K(h_k)
             h_v_proj = self.proj_h_v(h_v)
 
             # neuron context
