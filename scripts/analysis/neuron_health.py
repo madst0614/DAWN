@@ -32,6 +32,12 @@ class NeuronHealthAnalyzer:
             router: NeuronRouter instance from DAWN model
         """
         self.router = router
+        # Detect v18.x style (Q/K separated EMA)
+        self.is_v18 = hasattr(router, 'usage_ema_feature_q')
+
+    def _get_neuron_types(self):
+        """Get appropriate neuron types dict based on model version."""
+        return NEURON_TYPES_V18 if self.is_v18 else NEURON_TYPES
 
     def analyze_ema_distribution(self, threshold: float = 0.01) -> Dict:
         """
@@ -44,8 +50,9 @@ class NeuronHealthAnalyzer:
             Dictionary with per-type EMA statistics
         """
         results = {}
+        neuron_types = self._get_neuron_types()
 
-        for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
+        for name, (display, ema_attr, n_attr, _) in neuron_types.items():
             if not hasattr(self.router, ema_attr):
                 continue
 
@@ -85,8 +92,9 @@ class NeuronHealthAnalyzer:
             Dictionary with diversity metrics
         """
         results = {}
+        neuron_types = self._get_neuron_types()
 
-        for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
+        for name, (display, ema_attr, n_attr, _) in neuron_types.items():
             if not hasattr(self.router, ema_attr):
                 continue
 
@@ -157,8 +165,9 @@ class NeuronHealthAnalyzer:
         results = {}
         threshold = 0.01
         dying_threshold = 0.05
+        neuron_types = self._get_neuron_types()
 
-        for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
+        for name, (display, ema_attr, n_attr, _) in neuron_types.items():
             if not hasattr(self.router, ema_attr):
                 continue
 
@@ -260,9 +269,10 @@ class NeuronHealthAnalyzer:
             return {'error': 'matplotlib not available'}
 
         os.makedirs(output_dir, exist_ok=True)
+        neuron_types = self._get_neuron_types()
 
         data = []
-        for name, (display, ema_attr, _, color) in NEURON_TYPES.items():
+        for name, (display, ema_attr, _, color) in neuron_types.items():
             if hasattr(self.router, ema_attr):
                 ema = getattr(self.router, ema_attr)
                 data.append((display, ema, color))
