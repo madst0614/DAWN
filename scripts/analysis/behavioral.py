@@ -17,7 +17,7 @@ from typing import Dict, Optional
 from collections import defaultdict
 
 from .utils import (
-    NEURON_TYPES, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
+    NEURON_TYPES, NEURON_TYPES_V18, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
     calc_entropy_ratio, simple_pos_tag,
     get_batch_input_ids, get_routing_from_outputs,
     HAS_MATPLOTLIB, HAS_SKLEARN, HAS_TQDM, tqdm, plt
@@ -46,6 +46,12 @@ class BehavioralAnalyzer:
         self.router = router
         self.tokenizer = tokenizer
         self.device = device
+        # v18.x detection: Q/K separated EMA
+        self.is_v18 = hasattr(router, 'usage_ema_feature_q')
+
+    def _get_neuron_types(self):
+        """Get appropriate NEURON_TYPES for model version."""
+        return NEURON_TYPES_V18 if self.is_v18 else NEURON_TYPES
 
     def _enable_pref_tensors(self):
         """Enable store_pref_tensors for detailed analysis (v18.2+)."""
@@ -73,8 +79,10 @@ class BehavioralAnalyzer:
             'neuron_id': neuron_id,
         }
 
+        neuron_types = self._get_neuron_types()
+
         # Get EMA usage
-        type_info = NEURON_TYPES.get(neuron_type)
+        type_info = neuron_types.get(neuron_type)
         if type_info:
             ema_attr = type_info[1]
             if hasattr(self.router, ema_attr):
@@ -86,7 +94,7 @@ class BehavioralAnalyzer:
         emb = self.router.neuron_emb.detach().cpu().numpy()
 
         offset = 0
-        for name, (_, _, n_attr, _) in NEURON_TYPES.items():
+        for name, (_, _, n_attr, _) in neuron_types.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
                 if name == neuron_type:

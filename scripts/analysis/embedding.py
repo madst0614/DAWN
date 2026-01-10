@@ -16,7 +16,7 @@ import torch
 from typing import Dict, Optional
 
 from .utils import (
-    NEURON_TYPES,
+    NEURON_TYPES, NEURON_TYPES_V18,
     HAS_MATPLOTLIB, HAS_SKLEARN, plt, sns
 )
 
@@ -39,6 +39,12 @@ class EmbeddingAnalyzer:
         """
         self.router = router
         self.device = device
+        # v18.x detection: Q/K separated EMA
+        self.is_v18 = hasattr(router, 'usage_ema_feature_q')
+
+    def _get_neuron_types(self):
+        """Get appropriate NEURON_TYPES for model version."""
+        return NEURON_TYPES_V18 if self.is_v18 else NEURON_TYPES
 
     def get_embeddings_by_type(self, as_tensor: bool = False) -> Dict[str, np.ndarray]:
         """
@@ -54,9 +60,10 @@ class EmbeddingAnalyzer:
         if not as_tensor:
             emb = emb.cpu().numpy()
 
+        neuron_types = self._get_neuron_types()
         result = {}
         offset = 0
-        for name, (display, _, n_attr, _) in NEURON_TYPES.items():
+        for name, (display, _, n_attr, _) in neuron_types.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
                 result[name] = emb[offset:offset + n]
@@ -95,7 +102,8 @@ class EmbeddingAnalyzer:
             mask = ~torch.eye(n, dtype=torch.bool, device=self.device)
             off_diag = sim_matrix[mask]
 
-            display = NEURON_TYPES[name][0]
+            neuron_types = self._get_neuron_types()
+            display = neuron_types[name][0]
             results[name] = {
                 'display': display,
                 'n_neurons': n,
@@ -121,11 +129,12 @@ class EmbeddingAnalyzer:
         if n_types == 1:
             axes = [axes]
 
+        neuron_types = self._get_neuron_types()
         for ax, (name, emb) in zip(axes, embeddings.items()):
             emb_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
             sim_matrix = emb_norm @ emb_norm.T
             sns.heatmap(sim_matrix, ax=ax, cmap='coolwarm', vmin=-1, vmax=1)
-            ax.set_title(f'{NEURON_TYPES[name][0]} Similarity')
+            ax.set_title(f'{neuron_types[name][0]} Similarity')
 
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'similarity_heatmap.png'), dpi=150)
@@ -150,11 +159,12 @@ class EmbeddingAnalyzer:
         # Compute pairwise similarities on GPU
         results = {}
         names = list(centroids.keys())
+        neuron_types = self._get_neuron_types()
         for i, n1 in enumerate(names):
             for n2 in names[i+1:]:
                 c1, c2 = centroids[n1], centroids[n2]
                 sim = torch.dot(c1, c2) / (c1.norm() * c2.norm() + 1e-8)
-                key = f"{NEURON_TYPES[n1][0]}-{NEURON_TYPES[n2][0]}"
+                key = f"{neuron_types[n1][0]}-{neuron_types[n2][0]}"
                 results[key] = float(sim.item())
 
         return results
@@ -176,10 +186,11 @@ class EmbeddingAnalyzer:
         results = {}
         emb = self.router.neuron_emb.detach().cpu().numpy()
 
+        neuron_types = self._get_neuron_types()
         # Build boundaries for each type
         boundaries = {}
         offset = 0
-        for name, (display, ema_attr, n_attr, _) in NEURON_TYPES.items():
+        for name, (display, ema_attr, n_attr, _) in neuron_types.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
                 boundaries[name] = (offset, offset + n, ema_attr)
@@ -221,7 +232,7 @@ class EmbeddingAnalyzer:
                     })
 
             results[name] = {
-                'display': NEURON_TYPES[name][0],
+                'display': neuron_types[name][0],
                 'n_clusters': n_clusters,
                 'clusters': sorted(cluster_stats, key=lambda x: -x.get('avg_usage', 0)),
                 'labels': labels.tolist(),
@@ -245,6 +256,7 @@ class EmbeddingAnalyzer:
         if n_types == 1:
             axes = [axes]
 
+        neuron_types = self._get_neuron_types()
         ax_idx = 0
         for name, (start, end, _) in boundaries.items():
             if name not in results or 'error' in results[name]:
@@ -256,7 +268,7 @@ class EmbeddingAnalyzer:
 
             labels = results[name]['labels']
             axes[ax_idx].scatter(emb_2d[:, 0], emb_2d[:, 1], c=labels, cmap='tab10', alpha=0.6)
-            axes[ax_idx].set_title(f'{NEURON_TYPES[name][0]} Clusters')
+            axes[ax_idx].set_title(f'{neuron_types[name][0]} Clusters')
             ax_idx += 1
 
         plt.tight_layout()
@@ -280,10 +292,11 @@ class EmbeddingAnalyzer:
 
         emb = self.router.neuron_emb.detach().cpu().numpy()
 
+        neuron_types = self._get_neuron_types()
         # Build labels and color map
         labels = []
         colors_map = {}
-        for name, (display, _, n_attr, color) in NEURON_TYPES.items():
+        for name, (display, _, n_attr, color) in neuron_types.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
                 labels.extend([display] * n)
