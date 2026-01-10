@@ -1,9 +1,9 @@
 # DAWN v18.5 Training Config - 40M Scale, 5B tokens (Seed 1, QK-384)
 # v18.5: Context-Aware Restore Routing
 # - Feature routing: done on input x (same as v18.4)
-# - Restore routing: done on [h_proj, neuron_context]
-# - h_proj: intermediate representation h projected to d_space
-# - neuron_context: weighted sum of feature neuron embeddings
+# - Restore routing: done on [neuron_context, h] (no h projection)
+# - neuron_context: weighted sum of feature neuron embeddings (d_space)
+# - h: raw intermediate representation (rank for attn, knowledge_rank for know)
 
 seed: 1
 
@@ -33,14 +33,14 @@ model:
   rank: 16
   state_dim: 64
 
-  # Attention - 4x neurons from v17.1
-  n_feature_qk: 300
+  # Attention neurons
+  n_feature_qk: 350
   n_feature_v: 1000
   n_restore_qk: 300
-  n_restore_v: 1000
+  n_restore_v: 700
 
-  # Knowledge - 4x neurons from v17.1
-  n_feature_know: 650
+  # Knowledge neurons
+  n_feature_know: 900
   n_restore_know: 650
   knowledge_rank: 16
 
@@ -79,22 +79,24 @@ log_dir: /content/drive/MyDrive/dawn/logs_v18.5_40M_c4_5B_seed1_qk384
 #
 #   Key difference from v18.4:
 #   - Feature routing: same as v18.4 (on input x)
-#   - Restore routing: context-aware (on [h_proj, neuron_context])
-#     - h_proj: h projected to d_space via Linear
-#     - neuron_context: einsum('pbsn,nd->pbsd', feature_weights, feature_emb)
+#   - Restore routing: context-aware (on [neuron_context, h])
+#     - No h projection - uses raw h directly
+#     - Context dim: d_space + rank (attn) or d_space + knowledge_rank (know)
+#     - neuron_context: einsum('bsn,nd->bsd', feature_weights, feature_emb)
 #
 #   Benefits:
 #   - Restore routing sees feature processing results
 #   - More informed neuron selection for restoration
-#   - tau_proj_feature (4 pools) instead of tau_proj (8 pools)
-#   - Restore tau computed from context scores (mean-based)
+#   - Q/K fully separated: separate projections, norms, tau
+#   - tau_proj_feature (4 pools) for feature routing
+#   - tau_proj_restore_Q/K/v/know for context-based restore routing
 #
 #   Attention Circuit (2-path routing):
-#   - Feature_QK=384 (2 paths x 16): per-token Q/K compression - tau on x
+#   - Feature_QK=350 (2 paths x 16): per-token Q/K compression - tau on x
 #   - Feature_V=1000 (2 paths x 16): per-token V compression - tau on x
-#   - Restore_QK=384 (2 paths x 16): context-aware restoration
-#   - Restore_V=1000 (2 paths x 16): context-aware restoration
+#   - Restore_QK=300 (2 paths x 16): context-aware restoration
+#   - Restore_V=700 (2 paths x 16): context-aware restoration
 #
 #   Knowledge Circuit (2-path routing):
-#   - Feature_Know=580 (2 paths x 16): per-token compression - tau on x
-#   - Restore_Know=580 (2 paths x 16): context-aware restoration
+#   - Feature_Know=900 (2 paths x 16): per-token compression - tau on x
+#   - Restore_Know=650 (2 paths x 16): context-aware restoration
