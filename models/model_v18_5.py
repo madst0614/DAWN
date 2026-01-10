@@ -527,11 +527,13 @@ class GlobalRouters(nn.Module):
             nn.init.constant_(self.tau_proj_feature.bias, -0.5)
 
             # Restore tau projection (input: 2*d_space, context-based)
-            self.tau_proj_restore_qk = nn.Linear(2 * d_space, 1)    # rqk (Q/K shared)
+            # Q/K separated tau projections
+            self.tau_proj_restore_Q = nn.Linear(2 * d_space, 1)     # rQ
+            self.tau_proj_restore_K = nn.Linear(2 * d_space, 1)     # rK
             self.tau_proj_restore_v = nn.Linear(2 * d_space, 1)     # rv
             self.tau_proj_restore_know = nn.Linear(2 * d_space, 1)  # restore_know
 
-            for proj in [self.tau_proj_restore_qk, self.tau_proj_restore_v, self.tau_proj_restore_know]:
+            for proj in [self.tau_proj_restore_Q, self.tau_proj_restore_K, self.tau_proj_restore_v, self.tau_proj_restore_know]:
                 nn.init.zeros_(proj.weight)
                 nn.init.constant_(proj.bias, -0.5)
 
@@ -573,14 +575,15 @@ class GlobalRouters(nn.Module):
                 'fk': feat_bias[1].item(),
                 'fv': feat_bias[2].item(),
                 'feature_know': feat_bias[3].item(),
-                'rqk': self.tau_proj_restore_qk.bias.detach().item(),
+                'rQ': self.tau_proj_restore_Q.bias.detach().item(),
+                'rK': self.tau_proj_restore_K.bias.detach().item(),
                 'rv': self.tau_proj_restore_v.bias.detach().item(),
                 'restore_know': self.tau_proj_restore_know.bias.detach().item(),
             }
         else:
             return {
                 'fq': 0.0, 'fk': 0.0, 'fv': 0.0,
-                'rqk': 0.0, 'rv': 0.0,
+                'rQ': 0.0, 'rK': 0.0, 'rv': 0.0,
                 'feature_know': 0.0, 'restore_know': 0.0,
             }
 
@@ -802,13 +805,14 @@ class GlobalRouters(nn.Module):
         B, S, _ = ctx.shape
 
         if pool_type == 'qk':
-            # Q/K separated projections
+            # Q/K separated projections and tau
             if qk_type == 'Q':
                 logits = self.neuron_router.get_restore_Q_logits_from_context(ctx)  # [B, S, N_rqk]
+                tau_proj = self.tau_proj_restore_Q if self.learnable_tau else None
             else:  # 'K'
                 logits = self.neuron_router.get_restore_K_logits_from_context(ctx)  # [B, S, N_rqk]
+                tau_proj = self.tau_proj_restore_K if self.learnable_tau else None
             n_neurons = self.n_restore_qk
-            tau_proj = self.tau_proj_restore_qk if self.learnable_tau else None
         else:
             logits = self.neuron_router.get_restore_v_logits_from_context(ctx)   # [B, S, N_rv]
             n_neurons = self.n_restore_v
@@ -1526,7 +1530,8 @@ class DAWN(nn.Module):
                 if hasattr(self, 'router'):
                     skip_modules = [
                         getattr(self.router, 'tau_proj_feature', None),
-                        getattr(self.router, 'tau_proj_restore_qk', None),
+                        getattr(self.router, 'tau_proj_restore_Q', None),
+                        getattr(self.router, 'tau_proj_restore_K', None),
                         getattr(self.router, 'tau_proj_restore_v', None),
                         getattr(self.router, 'tau_proj_restore_know', None),
                     ]

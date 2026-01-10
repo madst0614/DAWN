@@ -1494,9 +1494,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                                     'weight': tau_proj.weight.grad.norm().item(),
                                     'bias': tau_proj.bias.grad.norm().item() if tau_proj.bias.grad is not None else 0
                                 }
-                                # v18.5: also log restore tau gradients
+                                # v18.5: also log restore tau gradients (Q/K separated)
                                 restore_tau_projs = [
-                                    ('rqk', getattr(base_model.router, 'tau_proj_restore_qk', None)),
+                                    ('rQ', getattr(base_model.router, 'tau_proj_restore_Q', None)),
+                                    ('rK', getattr(base_model.router, 'tau_proj_restore_K', None)),
                                     ('rv', getattr(base_model.router, 'tau_proj_restore_v', None)),
                                     ('rknow', getattr(base_model.router, 'tau_proj_restore_know', None)),
                                 ]
