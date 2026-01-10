@@ -657,6 +657,7 @@ class GlobalRouters(nn.Module):
             mask: [B, S, N] boolean mask for statistics
             gate: [B, S, k] gate values (with gradient flow)
             scaled_weights: [B, S, k] normalized exp gate weights
+            path_gate_strength: list of [B, S, 1] gate_strength per path
         """
         B, S, N = scores.shape
         k = min(path_max_k * max_paths, N)
@@ -693,12 +694,14 @@ class GlobalRouters(nn.Module):
         # 6. Chunk to paths (already sorted by topk)
         out_dtype = scaled_weights.dtype
         path_weights_list = []
+        path_gate_strength_list = []
         for p in range(max_paths):
             start_idx = p * path_max_k
             end_idx = min((p + 1) * path_max_k, k)
 
             if start_idx >= k:
                 path_weights_list.append(torch.zeros(B, S, N, device=scores.device, dtype=out_dtype))
+                path_gate_strength_list.append(torch.zeros(B, S, 1, device=scores.device, dtype=out_dtype))
                 continue
 
             path_weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
@@ -708,6 +711,11 @@ class GlobalRouters(nn.Module):
             path_weights.scatter_(dim=-1, index=path_indices, src=path_w)
             path_weights_list.append(path_weights)
 
+            # Per-path gate_strength
+            path_exp_gate = exp_gate[:, :, start_idx:end_idx]
+            path_gstr = torch.tanh(path_exp_gate.max(dim=-1, keepdim=True).values)
+            path_gate_strength_list.append(path_gstr)
+
         # 7. Create sparse full weights for aux_loss (use scaled_weights)
         weights = torch.zeros(B, S, N, device=scores.device, dtype=out_dtype)
         weights.scatter_(dim=-1, index=topk_indices, src=scaled_weights)
@@ -716,7 +724,7 @@ class GlobalRouters(nn.Module):
         mask = torch.zeros(B, S, N, device=scores.device, dtype=torch.bool)
         mask.scatter_(dim=-1, index=topk_indices, src=topk_mask)
 
-        return path_weights_list, weights, mask, gate, scaled_weights
+        return path_weights_list, weights, mask, gate, scaled_weights, path_gate_strength_list
 
     def get_feature_attention_weights(self, x, attention_mask=None, tau_feature=None, cached_emb=None):
         """
@@ -753,11 +761,11 @@ class GlobalRouters(nn.Module):
             tau_fv = fv_logits.mean(dim=-1, keepdim=True)
 
         # Top-k selection
-        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q, _ = self._topk_select_and_chunk(
+        fqk_paths_Q, fqk_weights_Q, fqk_mask_Q, fqk_gate_Q, _, fqk_gstr_Q = self._topk_select_and_chunk(
             fqk_logits_Q, tau_fq, self.path_max_k, self.max_paths)
-        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K, _ = self._topk_select_and_chunk(
+        fqk_paths_K, fqk_weights_K, fqk_mask_K, fqk_gate_K, _, fqk_gstr_K = self._topk_select_and_chunk(
             fqk_logits_K, tau_fk, self.path_max_k, self.max_paths)
-        fv_paths, fv_weights, fv_mask, fv_gate, _ = self._topk_select_and_chunk(
+        fv_paths, fv_weights, fv_mask, fv_gate, _, fv_gstr = self._topk_select_and_chunk(
             fv_logits, tau_fv, self.path_max_k, self.max_paths)
 
         # Aux loss (feature only)
@@ -796,6 +804,9 @@ class GlobalRouters(nn.Module):
             'fqk_Q': fqk_paths_Q,
             'fqk_K': fqk_paths_K,
             'fv': fv_paths,
+            'gate_Q': fqk_gstr_Q,  # list of [B, S, 1] per path
+            'gate_K': fqk_gstr_K,
+            'gate_V': fv_gstr,
         }
 
         # Debug info
@@ -835,7 +846,7 @@ class GlobalRouters(nn.Module):
 
         return feature_weights, routing_info, aux_loss
 
-    def get_restore_attention_weights(self, ctx, pool_type, qk_type=None, attention_mask=None, cached_emb=None):
+    def get_restore_attention_weights(self, ctx, pool_type, qk_type=None, attention_mask=None, cached_emb=None, feature_gate=None):
         """
         v18.5: Context-aware restore attention routing (single path).
 
@@ -845,6 +856,7 @@ class GlobalRouters(nn.Module):
             qk_type: 'Q' or 'K' (for usage tracking)
             attention_mask: [B, S]
             cached_emb: optional dict from neuron_router.get_cached_emb()
+            feature_gate: [B, S, 1] gate_strength from feature routing (for conservative gating)
 
         Returns:
             weights: [B, S, N] sparse weights
@@ -885,7 +897,14 @@ class GlobalRouters(nn.Module):
         exp_gate = torch.exp(gate) - 1
         exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
         ratio = torch.where(exp_gate_sum > 1e-8, exp_gate / (exp_gate_sum + 1e-8), exp_gate * 1e-8)
-        gate_strength = torch.tanh(exp_gate.max(dim=-1, keepdim=True).values)
+        restore_gate = torch.tanh(exp_gate.max(dim=-1, keepdim=True).values)
+
+        # Conservative gating: min of restore and feature gate_strength
+        if feature_gate is not None:
+            gate_strength = torch.min(restore_gate, feature_gate)
+        else:
+            gate_strength = restore_gate
+
         scaled_weights = ratio * gate_strength
 
         # Scatter
@@ -958,7 +977,7 @@ class GlobalRouters(nn.Module):
             tau_f = logits_f.mean(dim=-1, keepdim=True)
 
         # Top-k selection
-        f_paths, f_weights, f_mask, f_gate, _ = self._topk_select_and_chunk(
+        f_paths, f_weights, f_mask, f_gate, _, f_gstr = self._topk_select_and_chunk(
             logits_f, tau_f, self.path_max_k, self.max_paths)
 
         # Aux loss
@@ -997,9 +1016,9 @@ class GlobalRouters(nn.Module):
         else:
             know_info = {}
 
-        return f_paths, know_info, aux_loss
+        return (f_paths, f_gstr), know_info, aux_loss  # f_gstr: list of [B, S, 1] per path
 
-    def get_restore_knowledge_weights(self, ctx, attention_mask=None, cached_emb=None):
+    def get_restore_knowledge_weights(self, ctx, attention_mask=None, cached_emb=None, feature_gate=None):
         """
         v18.5: Context-aware restore knowledge routing (single path).
 
@@ -1007,6 +1026,7 @@ class GlobalRouters(nn.Module):
             ctx: [B, S, d_space+knowledge_rank] context for single path ([neuron_ctx, h])
             attention_mask: [B, S]
             cached_emb: optional dict from neuron_router.get_cached_emb()
+            feature_gate: [B, S, 1] gate_strength from feature routing (for conservative gating)
 
         Returns:
             weights: [B, S, N] sparse weights
@@ -1035,7 +1055,14 @@ class GlobalRouters(nn.Module):
         exp_gate = torch.exp(gate) - 1
         exp_gate_sum = exp_gate.sum(dim=-1, keepdim=True)
         ratio = torch.where(exp_gate_sum > 1e-8, exp_gate / (exp_gate_sum + 1e-8), exp_gate * 1e-8)
-        gate_strength = torch.tanh(exp_gate.max(dim=-1, keepdim=True).values)
+        restore_gate = torch.tanh(exp_gate.max(dim=-1, keepdim=True).values)
+
+        # Conservative gating: min of restore and feature gate_strength
+        if feature_gate is not None:
+            gate_strength = torch.min(restore_gate, feature_gate)
+        else:
+            gate_strength = restore_gate
+
         scaled_weights = ratio * gate_strength
 
         # Scatter
@@ -1173,10 +1200,14 @@ class AttentionCircuit(nn.Module):
             rqk_K_input = torch.cat([ctx_k, h_k], dim=-1)
             rv_input = torch.cat([ctx_v, h_v], dim=-1)
 
-            # Restore routing
-            w_q, aux_q, info_q = router.get_restore_attention_weights(rqk_Q_input, 'qk', 'Q', attention_mask, cached_emb)
-            w_k, aux_k, info_k = router.get_restore_attention_weights(rqk_K_input, 'qk', 'K', attention_mask, cached_emb)
-            w_v, aux_v, info_v = router.get_restore_attention_weights(rv_input, 'v', None, attention_mask, cached_emb)
+            # Restore routing with conservative gating
+            gate_Q = feature_weights['gate_Q'][p]  # [B, S, 1]
+            gate_K = feature_weights['gate_K'][p]
+            gate_V = feature_weights['gate_V'][p]
+
+            w_q, aux_q, info_q = router.get_restore_attention_weights(rqk_Q_input, 'qk', 'Q', attention_mask, cached_emb, feature_gate=gate_Q)
+            w_k, aux_k, info_k = router.get_restore_attention_weights(rqk_K_input, 'qk', 'K', attention_mask, cached_emb, feature_gate=gate_K)
+            w_v, aux_v, info_v = router.get_restore_attention_weights(rv_input, 'v', None, attention_mask, cached_emb, feature_gate=gate_V)
 
             restore_aux_loss += aux_q + aux_k + aux_v
 
@@ -1274,7 +1305,7 @@ class KnowledgeCircuit(nn.Module):
         self.dropout = nn.Dropout(dropout)
         # v18.5: No h projection - uses raw h in restore context
 
-    def forward(self, x, feature_paths, router, attention_mask=None, cached_emb=None):
+    def forward(self, x, feature_paths, router, attention_mask=None, cached_emb=None, feature_gate=None):
         """
         v18.5: Feature processing + context-aware restore routing.
 
@@ -1283,6 +1314,7 @@ class KnowledgeCircuit(nn.Module):
             feature_paths: list of [B, S, N] weights
             router: GlobalRouters instance for restore routing callback
             cached_emb: optional dict from router.neuron_router.get_cached_emb()
+            feature_gate: list of [B, S, 1] gate_strength per path (for conservative gating)
 
         Returns:
             output: [B, S, D]
@@ -1318,8 +1350,9 @@ class KnowledgeCircuit(nn.Module):
             # v18.5: concat [neuron_context, raw_h] (no h projection)
             restore_input = torch.cat([neuron_ctx, h], dim=-1)  # [B, S, d_space + knowledge_rank]
 
-            # Restore routing
-            w, aux, info = router.get_restore_knowledge_weights(restore_input, attention_mask, cached_emb)
+            # Restore routing with conservative gating
+            f_gate = feature_gate[p] if feature_gate is not None else None
+            w, aux, info = router.get_restore_knowledge_weights(restore_input, attention_mask, cached_emb, feature_gate=f_gate)
             restore_aux_loss += aux
 
             # Restore 처리 (accumulate output)
@@ -1385,13 +1418,15 @@ class DAWNBlock(nn.Module):
         normed_x_know = self.norm2(x)
         tau_feature_know = global_routers.get_tau_feature(normed_x_know)
 
-        # v18.5: Feature routing only
-        know_feature_paths, know_info, know_feature_aux_loss = global_routers.get_feature_knowledge_weights(
+        # v18.5: Feature routing only (returns (paths, gate_strength), info, aux_loss)
+        (know_feature_paths, know_feature_gate), know_info, know_feature_aux_loss = global_routers.get_feature_knowledge_weights(
             normed_x_know, attention_mask, tau_feature=tau_feature_know, cached_emb=cached_emb
         )
 
         # Circuit handles restore routing internally via router callback
-        know_out, know_restore_aux_loss, know_restore_info = self.knowledge(normed_x_know, know_feature_paths, global_routers, attention_mask, cached_emb)
+        know_out, know_restore_aux_loss, know_restore_info = self.knowledge(
+            normed_x_know, know_feature_paths, global_routers, attention_mask, cached_emb, feature_gate=know_feature_gate
+        )
         x = x + know_out
 
         know_aux_loss = know_feature_aux_loss + know_restore_aux_loss
