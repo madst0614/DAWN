@@ -34,7 +34,7 @@ model:
   state_dim: 64
 
   # Attention neurons
-  n_feature_qk: 350
+  n_feature_qk: 400
   n_feature_v: 1000
   n_restore_qk: 300
   n_restore_v: 700
@@ -92,7 +92,7 @@ log_dir: /content/drive/MyDrive/dawn/logs_v18.5_40M_c4_5B_seed1_qk384
 #   - tau_proj_restore_Q/K/v/know for context-based restore routing
 #
 #   Attention Circuit (2-path routing):
-#   - Feature_QK=350 (2 paths x 16): per-token Q/K compression - tau on x
+#   - Feature_QK=400 (2 paths x 16): per-token Q/K compression - tau on x
 #   - Feature_V=1000 (2 paths x 16): per-token V compression - tau on x
 #   - Restore_QK=300 (2 paths x 16): context-aware restoration
 #   - Restore_V=700 (2 paths x 16): context-aware restoration
