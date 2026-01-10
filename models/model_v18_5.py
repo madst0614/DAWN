@@ -81,11 +81,14 @@ class UnifiedNeuronRouter(nn.Module):
         self.norm_feature_know = nn.LayerNorm(d_space)
 
         # v18.5: Context-aware restore routing projections (from 2*d_space context)
-        self.proj_restore_qk_from_ctx = nn.Linear(2 * d_space, d_space)
+        # Q/K separated projections for restore routing
+        self.proj_restore_Q_from_ctx = nn.Linear(2 * d_space, d_space)
+        self.proj_restore_K_from_ctx = nn.Linear(2 * d_space, d_space)
         self.proj_restore_v_from_ctx = nn.Linear(2 * d_space, d_space)
         self.proj_restore_know_from_ctx = nn.Linear(2 * d_space, d_space)
 
-        self.norm_restore_qk_ctx = nn.LayerNorm(d_space)
+        self.norm_restore_Q_ctx = nn.LayerNorm(d_space)
+        self.norm_restore_K_ctx = nn.LayerNorm(d_space)
         self.norm_restore_v_ctx = nn.LayerNorm(d_space)
         self.norm_restore_know_ctx = nn.LayerNorm(d_space)
 
@@ -155,9 +158,9 @@ class UnifiedNeuronRouter(nn.Module):
 
         return logits_fqk_Q, logits_fqk_K, logits_fv
 
-    def get_restore_qk_logits_from_context(self, ctx):
+    def get_restore_Q_logits_from_context(self, ctx):
         """
-        v18.5: Context-aware restore QK routing
+        v18.5: Context-aware restore Q routing (separated from K)
         ctx: [P, B, S, 2*d_space] or [P*B, S, 2*d_space]
         Returns: [P, B, S, N_rqk] or [P*B, S, N_rqk]
         """
@@ -170,7 +173,30 @@ class UnifiedNeuronRouter(nn.Module):
         rqk_emb_raw = self.neuron_emb[self.feature_v_end:self.restore_qk_end]
         rqk_emb = F.normalize(rqk_emb_raw, dim=-1)
 
-        h = self.norm_restore_qk_ctx(self.dropout(self.proj_restore_qk_from_ctx(ctx)))
+        h = self.norm_restore_Q_ctx(self.dropout(self.proj_restore_Q_from_ctx(ctx)))
+        logits = torch.einsum('bsd,nd->bsn', h, rqk_emb)
+
+        if len(original_shape) == 4:
+            logits = logits.view(P, B, S, -1)
+
+        return logits
+
+    def get_restore_K_logits_from_context(self, ctx):
+        """
+        v18.5: Context-aware restore K routing (separated from Q)
+        ctx: [P, B, S, 2*d_space] or [P*B, S, 2*d_space]
+        Returns: [P, B, S, N_rqk] or [P*B, S, N_rqk]
+        """
+        original_shape = ctx.shape
+        if ctx.dim() == 4:
+            P, B, S, _ = ctx.shape
+            ctx = ctx.view(P * B, S, -1)
+
+        # Optimized: slice first, normalize after (5.5x less computation)
+        rqk_emb_raw = self.neuron_emb[self.feature_v_end:self.restore_qk_end]
+        rqk_emb = F.normalize(rqk_emb_raw, dim=-1)
+
+        h = self.norm_restore_K_ctx(self.dropout(self.proj_restore_K_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, rqk_emb)
 
         if len(original_shape) == 4:
@@ -776,7 +802,11 @@ class GlobalRouters(nn.Module):
         B, S, _ = ctx.shape
 
         if pool_type == 'qk':
-            logits = self.neuron_router.get_restore_qk_logits_from_context(ctx)  # [B, S, N_rqk]
+            # Q/K separated projections
+            if qk_type == 'Q':
+                logits = self.neuron_router.get_restore_Q_logits_from_context(ctx)  # [B, S, N_rqk]
+            else:  # 'K'
+                logits = self.neuron_router.get_restore_K_logits_from_context(ctx)  # [B, S, N_rqk]
             n_neurons = self.n_restore_qk
             tau_proj = self.tau_proj_restore_qk if self.learnable_tau else None
         else:
