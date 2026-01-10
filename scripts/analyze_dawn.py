@@ -299,7 +299,7 @@ class DAWNAnalyzer:
         Version differences:
         - v18.0-18.3: tau_proj with 8 outputs [fq,fk,fv,rq,rk,rv,f_know,r_know]
         - v18.4-18.5: tau_proj_feature with 4 outputs [fq,fk,fv,f_know]
-        - v18.5: restore tau is context-based (tau_proj_restore_qk/v/know)
+        - v18.5: restore tau is context-based (tau_proj_restore_Q/K/v/know)
         """
         # Detect model version
         model_version = getattr(self.model, '__version__', '18.2')
@@ -350,22 +350,24 @@ class DAWNAnalyzer:
                 'fqk_weight_cosine': F.cosine_similarity(weight_f[0:1], weight_f[1:2]).item(),
             }
 
-            # v18.5: context-based restore tau
-            if hasattr(self.model.router, 'tau_proj_restore_qk'):
+            # v18.5: context-based restore tau (Q/K separated)
+            if hasattr(self.model.router, 'tau_proj_restore_Q'):
                 print("\nRestore Tau (context-based, v18.5):")
                 restore_projs = {
-                    'restore_qk': self.model.router.tau_proj_restore_qk,
+                    'restore_Q': self.model.router.tau_proj_restore_Q,
+                    'restore_K': self.model.router.tau_proj_restore_K,
                     'restore_v': self.model.router.tau_proj_restore_v,
                     'restore_know': self.model.router.tau_proj_restore_know,
                 }
-                print("Pool         Weight Norm   Weight Std")
-                print("-" * 40)
+                print("Pool         Bias      Weight Norm   Weight Std")
+                print("-" * 50)
                 for name, proj in restore_projs.items():
                     w = proj.weight.detach().cpu()
+                    b = proj.bias.detach().cpu().item()
                     tau_params['tau_weight_norm'][name] = w.norm().item()
                     tau_params['tau_weight_std'][name] = w.std().item()
-                    tau_params['tau_bias'][name] = proj.bias.detach().cpu().item()
-                    print(f"{name:12} {w.norm().item():10.4f}   {w.std().item():.4f}")
+                    tau_params['tau_bias'][name] = b
+                    print(f"{name:12} {b:8.4f}  {w.norm().item():10.4f}   {w.std().item():.4f}")
 
             tau_params['qk_differentiation'] = qk_diff
 
