@@ -114,6 +114,32 @@ class UnifiedNeuronRouter(nn.Module):
         self.register_buffer('usage_ema_feature_know', torch.zeros(n_feature_know))
         self.register_buffer('usage_ema_restore_know', torch.zeros(n_restore_know))
 
+        # Normalized embedding cache (set during forward, cleared after)
+        self._fqk_emb = None
+        self._fv_emb = None
+        self._rqk_emb = None
+        self._rv_emb = None
+        self._feature_know_emb = None
+        self._restore_know_emb = None
+
+    def cache_normalized_emb(self):
+        """Cache normalized embeddings at start of forward pass to avoid redundant computation."""
+        self._fqk_emb = F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1)
+        self._fv_emb = F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1)
+        self._rqk_emb = F.normalize(self.neuron_emb[self.feature_v_end:self.restore_qk_end], dim=-1)
+        self._rv_emb = F.normalize(self.neuron_emb[self.restore_qk_end:self.restore_v_end], dim=-1)
+        self._feature_know_emb = F.normalize(self.neuron_emb[self.restore_v_end:self.feature_know_end], dim=-1)
+        self._restore_know_emb = F.normalize(self.neuron_emb[self.feature_know_end:], dim=-1)
+
+    def clear_cache(self):
+        """Clear normalized embedding cache after forward pass."""
+        self._fqk_emb = None
+        self._fv_emb = None
+        self._rqk_emb = None
+        self._rv_emb = None
+        self._feature_know_emb = None
+        self._restore_know_emb = None
+
     def get_thresholds(self, x):
         """
         Return fixed tau for all pools (no learnable threshold)
@@ -134,10 +160,13 @@ class UnifiedNeuronRouter(nn.Module):
         v18.5: Return feature knowledge logits only (restore is context-based)
         x: [B, S, d_model]
         """
-        # Optimized: slice first, normalize after
-        emb_feature_know = F.normalize(
-            self.neuron_emb[self.restore_v_end:self.feature_know_end], dim=-1
-        )
+        # Use cached embedding if available
+        if self._feature_know_emb is not None:
+            emb_feature_know = self._feature_know_emb
+        else:
+            emb_feature_know = F.normalize(
+                self.neuron_emb[self.restore_v_end:self.feature_know_end], dim=-1
+            )
 
         h_feature_know = self.norm_feature_know(self.dropout(self.proj_feature_know(x)))
         logits_feature_know = torch.einsum('bsd,nd->bsn', h_feature_know, emb_feature_know)
@@ -149,9 +178,13 @@ class UnifiedNeuronRouter(nn.Module):
         v18.5: Return 3 feature attention logits only (restore is context-based)
         x: [B, S, d_model]
         """
-        # Optimized: slice first, normalize after
-        fqk_emb = F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1)
-        fv_emb = F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1)
+        # Use cached embeddings if available
+        if self._fqk_emb is not None:
+            fqk_emb = self._fqk_emb
+            fv_emb = self._fv_emb
+        else:
+            fqk_emb = F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1)
+            fv_emb = F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1)
 
         all_proj = self.dropout(self.proj_feature(x))
         h_fqk_Q, h_fqk_K, h_fv = all_proj.chunk(3, dim=-1)
@@ -178,9 +211,11 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        # Optimized: slice first, normalize after (5.5x less computation)
-        rqk_emb_raw = self.neuron_emb[self.feature_v_end:self.restore_qk_end]
-        rqk_emb = F.normalize(rqk_emb_raw, dim=-1)
+        # Use cached embedding if available
+        if self._rqk_emb is not None:
+            rqk_emb = self._rqk_emb
+        else:
+            rqk_emb = F.normalize(self.neuron_emb[self.feature_v_end:self.restore_qk_end], dim=-1)
 
         h = self.norm_restore_Q_ctx(self.dropout(self.proj_restore_Q_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, rqk_emb)
@@ -201,9 +236,11 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        # Optimized: slice first, normalize after (5.5x less computation)
-        rqk_emb_raw = self.neuron_emb[self.feature_v_end:self.restore_qk_end]
-        rqk_emb = F.normalize(rqk_emb_raw, dim=-1)
+        # Use cached embedding if available
+        if self._rqk_emb is not None:
+            rqk_emb = self._rqk_emb
+        else:
+            rqk_emb = F.normalize(self.neuron_emb[self.feature_v_end:self.restore_qk_end], dim=-1)
 
         h = self.norm_restore_K_ctx(self.dropout(self.proj_restore_K_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, rqk_emb)
@@ -224,9 +261,11 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        # Optimized: slice first, normalize after
-        rv_emb_raw = self.neuron_emb[self.restore_qk_end:self.restore_v_end]
-        rv_emb = F.normalize(rv_emb_raw, dim=-1)
+        # Use cached embedding if available
+        if self._rv_emb is not None:
+            rv_emb = self._rv_emb
+        else:
+            rv_emb = F.normalize(self.neuron_emb[self.restore_qk_end:self.restore_v_end], dim=-1)
 
         h = self.norm_restore_v_ctx(self.dropout(self.proj_restore_v_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, rv_emb)
@@ -247,9 +286,11 @@ class UnifiedNeuronRouter(nn.Module):
             P, B, S, _ = ctx.shape
             ctx = ctx.view(P * B, S, -1)
 
-        # Optimized: slice first, normalize after
-        restore_know_emb_raw = self.neuron_emb[self.feature_know_end:]
-        restore_know_emb = F.normalize(restore_know_emb_raw, dim=-1)
+        # Use cached embedding if available
+        if self._restore_know_emb is not None:
+            restore_know_emb = self._restore_know_emb
+        else:
+            restore_know_emb = F.normalize(self.neuron_emb[self.feature_know_end:], dim=-1)
 
         h = self.norm_restore_know_ctx(self.dropout(self.proj_restore_know_from_ctx(ctx)))
         logits = torch.einsum('bsd,nd->bsn', h, restore_know_emb)
@@ -261,14 +302,20 @@ class UnifiedNeuronRouter(nn.Module):
 
     def get_fqk_emb(self):
         """Return normalized feature QK neuron embeddings"""
+        if self._fqk_emb is not None:
+            return self._fqk_emb
         return F.normalize(self.neuron_emb[:self.feature_qk_end], dim=-1)
 
     def get_fv_emb(self):
         """Return normalized feature V neuron embeddings"""
+        if self._fv_emb is not None:
+            return self._fv_emb
         return F.normalize(self.neuron_emb[self.feature_qk_end:self.feature_v_end], dim=-1)
 
     def get_feature_know_emb(self):
         """Return normalized feature knowledge neuron embeddings"""
+        if self._feature_know_emb is not None:
+            return self._feature_know_emb
         return F.normalize(self.neuron_emb[self.restore_v_end:self.feature_know_end], dim=-1)
 
     def update_usage(self, weights, neuron_type, attention_mask=None):
@@ -1559,42 +1606,49 @@ class DAWN(nn.Module):
         if S > self.max_seq_len:
             raise ValueError(f"Sequence length {S} exceeds max_seq_len {self.max_seq_len}")
 
-        positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-        x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
+        # Cache normalized embeddings for this forward pass
+        self.router.neuron_router.cache_normalized_emb()
 
-        # SSM only skipped when BOTH attention and knowledge use token routing
-        if self.attention_token_routing and self.knowledge_token_routing:
-            importance = None
-            context = None
-        else:
-            importance, context, raw_importance = self.global_ssm(x, attention_mask)
-            if context is not None:
-                if attention_mask is not None:
-                    context = context * attention_mask.unsqueeze(-1)
-                x = x + context
+        try:
+            positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
+            x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
 
-        routing_infos = []
-        total_aux_loss = 0.0
-
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                x, routing_info, aux_loss = checkpoint(
-                    layer, x, importance, self.router, attention_mask,
-                    use_reentrant=False
-                )
+            # SSM only skipped when BOTH attention and knowledge use token routing
+            if self.attention_token_routing and self.knowledge_token_routing:
+                importance = None
+                context = None
             else:
-                x, routing_info, aux_loss = layer(x, importance, self.router, attention_mask)
+                importance, context, raw_importance = self.global_ssm(x, attention_mask)
+                if context is not None:
+                    if attention_mask is not None:
+                        context = context * attention_mask.unsqueeze(-1)
+                    x = x + context
 
-            routing_infos.append(routing_info)
-            total_aux_loss += aux_loss
+            routing_infos = []
+            total_aux_loss = 0.0
 
-        self.aux_loss = total_aux_loss
-        x = self.norm(x)
-        logits = self.lm_head(x)
+            for layer in self.layers:
+                if self.gradient_checkpointing and self.training:
+                    x, routing_info, aux_loss = checkpoint(
+                        layer, x, importance, self.router, attention_mask,
+                        use_reentrant=False
+                    )
+                else:
+                    x, routing_info, aux_loss = layer(x, importance, self.router, attention_mask)
 
-        # Reset path_weights flag after forward
-        if return_path_weights:
-            self.router.store_path_weights = False
+                routing_infos.append(routing_info)
+                total_aux_loss += aux_loss
+
+            self.aux_loss = total_aux_loss
+            x = self.norm(x)
+            logits = self.lm_head(x)
+
+        finally:
+            # Clear embedding cache after forward pass
+            self.router.neuron_router.clear_cache()
+            # Reset path_weights flag after forward
+            if return_path_weights:
+                self.router.store_path_weights = False
 
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
