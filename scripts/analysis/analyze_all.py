@@ -272,7 +272,7 @@ class ModelAnalyzer:
             'seq_len': seq_len,
         }
 
-    def _generate_samples(self, max_length: int = 50) -> List[Tuple[str, str]]:
+    def _generate_samples(self, max_length: int = 50, temperature: float = 0.8) -> List[Tuple[str, str]]:
         """Generate text samples."""
         import torch.nn.functional as F
 
@@ -286,21 +286,31 @@ class ModelAnalyzer:
         self.model.eval()
 
         for prompt in prompts:
-            input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
+            # Encode without special tokens for cleaner generation
+            input_ids = self.tokenizer.encode(
+                prompt, add_special_tokens=False, return_tensors='pt'
+            ).to(self.device)
+            prompt_len = input_ids.shape[1]
 
             with torch.no_grad():
                 for _ in range(max_length):
                     outputs = self.model(input_ids)
                     logits = outputs[0] if isinstance(outputs, tuple) else outputs
-                    next_token_logits = logits[:, -1, :]
-                    next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+                    next_token_logits = logits[:, -1, :] / temperature
+
+                    # Apply softmax and sample
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
                     input_ids = torch.cat([input_ids, next_token], dim=1)
 
-                    if next_token.item() == self.tokenizer.sep_token_id:
+                    # Stop on EOS tokens
+                    if next_token.item() in [self.tokenizer.sep_token_id, self.tokenizer.pad_token_id, 0]:
                         break
 
-            generated = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-            results.append((prompt, generated))
+            # Decode full text and continuation
+            full_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            continuation = self.tokenizer.decode(input_ids[0, prompt_len:], skip_special_tokens=True)
+            results.append((prompt, f"{prompt}{continuation}"))
 
         return results
 
