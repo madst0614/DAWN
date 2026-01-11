@@ -56,14 +56,14 @@ class PaperFigureGenerator:
         from .semantic import SemanticAnalyzer
         from .coselection import CoselectionAnalyzer
 
-        # Initialize analyzers
-        self.health = NeuronHealthAnalyzer(self.router)
-        self.routing = RoutingAnalyzer(self.model, self.router, device)
-        self.embedding = EmbeddingAnalyzer(self.router, device)
-        self.weight = WeightAnalyzer(self.neurons, device)
-        self.behavioral = BehavioralAnalyzer(self.model, self.router, self.tokenizer, device)
-        self.semantic = SemanticAnalyzer(self.model, self.router, self.tokenizer, device)
-        self.coselection = CoselectionAnalyzer(self.model, self.router, self.neurons, device)
+        # Initialize analyzers (all inherit from BaseAnalyzer with auto-detection)
+        self.health = NeuronHealthAnalyzer(self.model, router=self.router, device=device)
+        self.routing = RoutingAnalyzer(self.model, router=self.router, device=device)
+        self.embedding = EmbeddingAnalyzer(self.model, router=self.router, device=device)
+        self.weight = WeightAnalyzer(model=self.model, neurons=self.neurons, device=device)
+        self.behavioral = BehavioralAnalyzer(self.model, router=self.router, tokenizer=self.tokenizer, device=device)
+        self.semantic = SemanticAnalyzer(self.model, router=self.router, tokenizer=self.tokenizer, device=device)
+        self.coselection = CoselectionAnalyzer(self.model, router=self.router, shared_neurons=self.neurons, device=device)
 
     def generate_all(self, output_dir: str = './paper_figures', n_batches: int = 50):
         """
