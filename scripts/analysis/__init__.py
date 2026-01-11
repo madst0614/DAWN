@@ -66,6 +66,10 @@ from .utils import (
     HAS_TQDM,
 )
 
+# Base analyzer
+from .base import BaseAnalyzer
+
+# Analyzers
 from .neuron_health import NeuronHealthAnalyzer
 from .routing import RoutingAnalyzer
 from .embedding import EmbeddingAnalyzer
@@ -74,6 +78,9 @@ from .behavioral import BehavioralAnalyzer
 from .semantic import SemanticAnalyzer
 from .coselection import CoselectionAnalyzer
 from .paper_figures import PaperFigureGenerator
+
+# Visualizers
+from . import visualizers
 from .routing_analysis import (
     GenerationRoutingAnalyzer,
     analyze_common_neurons,
@@ -119,6 +126,10 @@ __all__ = [
     'HAS_MATPLOTLIB',
     'HAS_SKLEARN',
     'HAS_TQDM',
+
+    # Base
+    'BaseAnalyzer',
+    'visualizers',
 
     # Analyzers
     'NeuronHealthAnalyzer',

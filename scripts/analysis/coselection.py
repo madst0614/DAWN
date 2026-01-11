@@ -21,40 +21,30 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Optional
 
+from .base import BaseAnalyzer
 from .utils import (
-    COSELECTION_PAIRS, NEURON_TYPES,
+    COSELECTION_PAIRS,
     get_batch_input_ids, get_routing_from_outputs,
     HAS_MATPLOTLIB, HAS_TQDM, tqdm, plt
 )
 
 
-class CoselectionAnalyzer:
-    """Co-selection pattern analyzer for DAWN v17.1."""
+class CoselectionAnalyzer(BaseAnalyzer):
+    """Co-selection pattern analyzer for DAWN."""
 
-    def __init__(self, model, router, shared_neurons, device='cuda'):
+    def __init__(self, model, router=None, shared_neurons=None, device='cuda'):
         """
         Initialize analyzer.
 
         Args:
             model: DAWN model
-            router: NeuronRouter instance
-            shared_neurons: SharedNeurons instance
+            router: NeuronRouter instance (auto-detected if None)
+            shared_neurons: SharedNeurons instance (auto-detected if None)
             device: Device for computation
         """
-        self.model = model
-        self.router = router
-        self.shared = shared_neurons
-        self.device = device
-
-    def _enable_pref_tensors(self):
-        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
-        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
-            self.model.router.store_pref_tensors = True
-
-    def _disable_pref_tensors(self):
-        """Disable store_pref_tensors after analysis."""
-        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
-            self.model.router.store_pref_tensors = False
+        super().__init__(model, router=router, shared_neurons=shared_neurons, device=device)
+        # Alias for backward compatibility
+        self.shared = self.shared_neurons
 
     def analyze_coselection(self, dataloader, pair_key: str, n_batches: int = 50, layer_idx: int = None) -> Dict:
         """
@@ -89,7 +79,7 @@ class CoselectionAnalyzer:
         total_samples = 0
 
         self.model.eval()
-        self._enable_pref_tensors()
+        self.enable_pref_tensors()
         try:
             with torch.no_grad():
                 for i, batch in enumerate(tqdm(dataloader, desc=pair_key, total=n_batches)):
@@ -155,7 +145,7 @@ class CoselectionAnalyzer:
                         # Store back
                         layer_matrices[lidx] = (co_matrix, a_counts, b_counts)
         finally:
-            self._disable_pref_tensors()
+            self.disable_pref_tensors()
 
         # Build results per layer
         results = {

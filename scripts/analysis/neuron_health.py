@@ -1,13 +1,13 @@
 """
 Neuron Health Analysis
 =======================
-Analyze neuron health status in DAWN v17 models.
+Analyze neuron health status in DAWN models.
 
 Includes:
 - EMA distribution analysis
 - Dead/Active neuron ratio
 - Diversity metrics (Gini, entropy)
-- Visualization utilities
+- Q/K EMA overlap analysis (v18.x)
 """
 
 import os
@@ -15,29 +15,23 @@ import numpy as np
 import torch
 from typing import Dict, Optional
 
-from .utils import (
-    NEURON_TYPES, NEURON_TYPES_V18, gini_coefficient,
-    HAS_MATPLOTLIB, plt
-)
+from .base import BaseAnalyzer
+from .utils import gini_coefficient
 
 
-class NeuronHealthAnalyzer:
+class NeuronHealthAnalyzer(BaseAnalyzer):
     """Neuron health and usage pattern analyzer."""
 
-    def __init__(self, router):
+    def __init__(self, model, router=None, device: str = 'cuda'):
         """
-        Initialize analyzer with router.
+        Initialize analyzer.
 
         Args:
-            router: NeuronRouter instance from DAWN model
+            model: DAWN model instance
+            router: NeuronRouter (auto-detected if None)
+            device: Device for computation
         """
-        self.router = router
-        # Detect v18.x style (Q/K separated EMA)
-        self.is_v18 = hasattr(router, 'usage_ema_feature_q')
-
-    def _get_neuron_types(self):
-        """Get appropriate neuron types dict based on model version."""
-        return NEURON_TYPES_V18 if self.is_v18 else NEURON_TYPES
+        super().__init__(model, router=router, device=device)
 
     def analyze_ema_distribution(self, threshold: float = 0.01) -> Dict:
         """
@@ -50,7 +44,7 @@ class NeuronHealthAnalyzer:
             Dictionary with per-type EMA statistics
         """
         results = {}
-        neuron_types = self._get_neuron_types()
+        neuron_types = self.get_neuron_types()
 
         for name, (display, ema_attr, n_attr, _) in neuron_types.items():
             if not hasattr(self.router, ema_attr):
@@ -92,7 +86,7 @@ class NeuronHealthAnalyzer:
             Dictionary with diversity metrics
         """
         results = {}
-        neuron_types = self._get_neuron_types()
+        neuron_types = self.get_neuron_types()
 
         for name, (display, ema_attr, n_attr, _) in neuron_types.items():
             if not hasattr(self.router, ema_attr):
@@ -165,7 +159,7 @@ class NeuronHealthAnalyzer:
         results = {}
         threshold = 0.01
         dying_threshold = 0.05
-        neuron_types = self._get_neuron_types()
+        neuron_types = self.get_neuron_types()
 
         for name, (display, ema_attr, n_attr, _) in neuron_types.items():
             if not hasattr(self.router, ema_attr):
@@ -213,47 +207,14 @@ class NeuronHealthAnalyzer:
         }
 
         # Visualization
-        if HAS_MATPLOTLIB and output_dir:
-            self._visualize_dead_neurons(results, type_names, output_dir)
+        if output_dir:
+            from .visualizers import plot_dead_neurons
+            os.makedirs(output_dir, exist_ok=True)
+            path = plot_dead_neurons(results, type_names, os.path.join(output_dir, 'dead_neurons.png'))
+            if path:
+                results['visualization'] = path
 
         return results
-
-    def _visualize_dead_neurons(self, results: Dict, type_names: list, output_dir: str):
-        """Generate dead neuron visualization."""
-        os.makedirs(output_dir, exist_ok=True)
-
-        n_types = len(type_names)
-        n_cols = 3
-        n_rows = (n_types + 1 + n_cols - 1) // n_cols
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
-        axes = axes.flatten() if n_rows > 1 else [axes] if n_types == 0 else list(axes)
-
-        colors = ['green', 'yellow', 'red']
-        labels = ['Active', 'Dying', 'Dead']
-
-        for ax, name in zip(axes[:n_types], type_names):
-            data = results[name]
-            sizes = [data['n_active'], data['n_dying'], data['n_dead']]
-            ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-            ax.set_title(f'{name.upper()}\n(removable: {data["n_removable"]})')
-
-        if n_types < len(axes):
-            ax = axes[n_types]
-            display_names = [n.upper()[:3] for n in type_names]
-            removable = [results[n]['n_removable'] for n in type_names]
-            ax.bar(display_names, removable, color='red', alpha=0.7)
-            ax.set_title('Removable Neurons')
-            ax.set_ylabel('Count')
-            ax.tick_params(axis='x', rotation=45)
-
-        for i in range(n_types + 1, len(axes)):
-            axes[i].axis('off')
-
-        plt.tight_layout()
-        path = os.path.join(output_dir, 'dead_neurons.png')
-        plt.savefig(path, dpi=150)
-        plt.close()
-        results['visualization'] = path
 
     def visualize_usage(self, output_dir: str) -> Dict:
         """
@@ -265,58 +226,23 @@ class NeuronHealthAnalyzer:
         Returns:
             Dictionary with visualization path
         """
-        if not HAS_MATPLOTLIB:
-            return {'error': 'matplotlib not available'}
+        from .visualizers import plot_usage_histogram
 
         os.makedirs(output_dir, exist_ok=True)
-        neuron_types = self._get_neuron_types()
+        neuron_types = self.get_neuron_types()
 
-        data = []
+        # Collect EMA data
+        ema_data = []
         for name, (display, ema_attr, _, color) in neuron_types.items():
             if hasattr(self.router, ema_attr):
                 ema = getattr(self.router, ema_attr)
-                data.append((display, ema, color))
+                ema_data.append((display, ema.detach().cpu().numpy(), color))
 
-        n_plots = len(data) + 1
-        n_cols = 3
-        n_rows = (n_plots + n_cols - 1) // n_cols
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
-        axes = axes.flatten() if n_rows > 1 else [axes] if n_plots == 1 else list(axes)
+        path = plot_usage_histogram(ema_data, os.path.join(output_dir, 'usage_histogram.png'))
 
-        for ax, (name, ema, color) in zip(axes, data):
-            values = ema.detach().cpu().numpy()
-            ax.hist(values, bins=50, color=color, alpha=0.7, edgecolor='black')
-            ax.axvline(x=0.01, color='red', linestyle='--', label='threshold=0.01')
-            ax.set_title(f'{name} Usage EMA')
-            ax.set_xlabel('EMA Value')
-            ax.set_ylabel('Count')
-
-            active = (values > 0.01).sum()
-            total = len(values)
-            ax.text(0.95, 0.95, f'Active: {active}/{total}', transform=ax.transAxes,
-                    ha='right', va='top', fontsize=10)
-
-        # Summary bar chart
-        if len(data) < len(axes):
-            ax = axes[len(data)]
-            names = [d[0] for d in data]
-            active_ratios = [(d[1] > 0.01).float().mean().item() for d in data]
-            colors = [d[2] for d in data]
-            ax.bar(names, active_ratios, color=colors, alpha=0.7, edgecolor='black')
-            ax.set_title('Active Neuron Ratio by Type')
-            ax.set_ylabel('Active Ratio')
-            ax.set_ylim(0, 1)
-            ax.tick_params(axis='x', rotation=45)
-
-        for i in range(len(data) + 1, len(axes)):
-            axes[i].axis('off')
-
-        plt.tight_layout()
-        path = os.path.join(output_dir, 'usage_histogram.png')
-        plt.savefig(path, dpi=150)
-        plt.close()
-
-        return {'visualization': path}
+        if path:
+            return {'visualization': path}
+        return {'error': 'matplotlib not available'}
 
     def analyze_qk_ema_overlap(self, threshold: float = 0.01) -> Dict:
         """
@@ -382,6 +308,25 @@ class NeuronHealthAnalyzer:
 
         return results
 
+    def visualize_qk_overlap(self, output_dir: str) -> Optional[str]:
+        """
+        Visualize Q/K EMA overlap.
+
+        Args:
+            output_dir: Directory for output
+
+        Returns:
+            Path to saved figure or None
+        """
+        from .visualizers import plot_qk_ema_overlap
+
+        qk_results = self.analyze_qk_ema_overlap()
+        if 'error' in qk_results:
+            return None
+
+        os.makedirs(output_dir, exist_ok=True)
+        return plot_qk_ema_overlap(qk_results, os.path.join(output_dir, 'qk_ema_overlap.png'))
+
     def run_all(self, output_dir: str = './neuron_health') -> Dict:
         """
         Run all neuron health analyses.
@@ -404,6 +349,8 @@ class NeuronHealthAnalyzer:
         qk_overlap = self.analyze_qk_ema_overlap()
         if 'error' not in qk_overlap:
             results['qk_ema_overlap'] = qk_overlap
+            # Visualize Q/K overlap
+            self.visualize_qk_overlap(output_dir)
 
         # Visualizations
         results['visualization'] = self.visualize_usage(output_dir)

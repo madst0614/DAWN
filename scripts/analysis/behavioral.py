@@ -16,8 +16,9 @@ import torch
 from typing import Dict, Optional
 from collections import defaultdict
 
+from .base import BaseAnalyzer
 from .utils import (
-    NEURON_TYPES, NEURON_TYPES_V18, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
+    ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
     calc_entropy_ratio, simple_pos_tag,
     get_batch_input_ids, get_routing_from_outputs,
     HAS_MATPLOTLIB, HAS_SKLEARN, HAS_TQDM, tqdm, plt
@@ -29,39 +30,20 @@ if HAS_SKLEARN:
     from sklearn.metrics import accuracy_score
 
 
-class BehavioralAnalyzer:
+class BehavioralAnalyzer(BaseAnalyzer):
     """Token-level behavioral analyzer."""
 
-    def __init__(self, model, router, tokenizer, device='cuda'):
+    def __init__(self, model, router=None, tokenizer=None, device='cuda'):
         """
         Initialize analyzer.
 
         Args:
             model: DAWN model
-            router: NeuronRouter instance
+            router: NeuronRouter instance (auto-detected if None)
             tokenizer: Tokenizer instance
             device: Device for computation
         """
-        self.model = model
-        self.router = router
-        self.tokenizer = tokenizer
-        self.device = device
-        # v18.x detection: Q/K separated EMA
-        self.is_v18 = hasattr(router, 'usage_ema_feature_q')
-
-    def _get_neuron_types(self):
-        """Get appropriate NEURON_TYPES for model version."""
-        return NEURON_TYPES_V18 if self.is_v18 else NEURON_TYPES
-
-    def _enable_pref_tensors(self):
-        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
-        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
-            self.model.router.store_pref_tensors = True
-
-    def _disable_pref_tensors(self):
-        """Disable store_pref_tensors after analysis."""
-        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
-            self.model.router.store_pref_tensors = False
+        super().__init__(model, router=router, tokenizer=tokenizer, device=device)
 
     def analyze_single_neuron(self, neuron_id: int, neuron_type: str) -> Dict:
         """
@@ -79,7 +61,7 @@ class BehavioralAnalyzer:
             'neuron_id': neuron_id,
         }
 
-        neuron_types = self._get_neuron_types()
+        neuron_types = self.get_neuron_types()
 
         # Get EMA usage
         type_info = neuron_types.get(neuron_type)
@@ -124,7 +106,7 @@ class BehavioralAnalyzer:
         layer_position_routing = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
         self.model.eval()
-        self._enable_pref_tensors()
+        self.enable_pref_tensors()
         try:
             with torch.no_grad():
                 for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Trajectory')):
@@ -159,7 +141,7 @@ class BehavioralAnalyzer:
                                 for pos in range(128):
                                     layer_position_routing[lidx][key][pos].append(ent)
         finally:
-            self._disable_pref_tensors()
+            self.disable_pref_tensors()
 
         # Build per-layer results
         results = {'per_layer': {}}
@@ -232,7 +214,7 @@ class BehavioralAnalyzer:
         y_labels = defaultdict(list)
 
         self.model.eval()
-        self._enable_pref_tensors()
+        self.enable_pref_tensors()
         try:
             with torch.no_grad():
                 for batch_idx, batch in enumerate(tqdm(dataloader, desc='Probing', total=max_batches)):
@@ -312,7 +294,7 @@ class BehavioralAnalyzer:
                         # Add POS labels for this layer
                         y_labels[layer_key].extend(batch_pos_labels)
         finally:
-            self._disable_pref_tensors()
+            self.disable_pref_tensors()
 
         # Convert tensors to numpy arrays
         X_data = defaultdict(lambda: defaultdict(list))
