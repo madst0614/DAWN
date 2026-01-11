@@ -6,7 +6,7 @@ Loads model config from checkpoint, no separate config file needed.
 Supports multiple checkpoints and directory paths.
 
 Usage:
-    python scripts/generate_samples.py \
+    python -m scripts.evaluation.generate \
         --checkpoints /path/to/ckpt1 /path/to/ckpt2 \
         --val_data /path/to/val_data.pt \
         --output generation_results.txt
@@ -14,9 +14,10 @@ Usage:
 
 import argparse
 import sys
-import os
 from pathlib import Path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import torch.nn.functional as F
