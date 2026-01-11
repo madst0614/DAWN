@@ -650,6 +650,94 @@ class RoutingAnalyzer(BaseAnalyzer):
 
         return results
 
+    def analyze_layer_contribution(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze per-layer contribution from attention vs knowledge circuits.
+
+        Paper Figure 6b data generation.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with layer-wise attention/knowledge ratios
+        """
+        # {layer_idx: {'attention': [], 'knowledge': []}}
+        layer_contributions = defaultdict(lambda: {'attention': [], 'knowledge': []})
+
+        self.model.eval()
+        self.enable_pref_tensors()
+
+        try:
+            with torch.no_grad():
+                for i, batch in enumerate(tqdm(dataloader, desc='Layer Contribution', total=n_batches)):
+                    if i >= n_batches:
+                        break
+
+                    input_ids = get_batch_input_ids(batch, self.device)
+
+                    try:
+                        outputs = self.model(input_ids, return_routing_info=True)
+                        routing_infos = get_routing_from_outputs(outputs)
+                        if routing_infos is None:
+                            continue
+                    except Exception:
+                        continue
+
+                    # Process all layers
+                    for layer_idx, layer_info in enumerate(routing_infos):
+                        attn = layer_info.get('attention', {})
+                        know = layer_info.get('knowledge', {})
+
+                        # Attention contribution: sum of all attention routing weights
+                        attn_contrib = 0.0
+                        for key in ['fv_weights', 'rv_weights', 'fqk_weights_Q', 'fqk_weights_K',
+                                   'rqk_weights_Q', 'rqk_weights_K']:
+                            w = attn.get(key)
+                            if w is not None:
+                                attn_contrib += w.sum().item()
+
+                        # Knowledge contribution: sum of knowledge weights
+                        know_contrib = 0.0
+                        for key in ['feature_know_w', 'restore_know_w']:
+                            w = know.get(key)
+                            if w is not None:
+                                know_contrib += w.sum().item()
+
+                        layer_contributions[layer_idx]['attention'].append(attn_contrib)
+                        layer_contributions[layer_idx]['knowledge'].append(know_contrib)
+        finally:
+            self.disable_pref_tensors()
+
+        # Aggregate results
+        results = {'per_layer': {}}
+        for layer_idx in sorted(layer_contributions.keys()):
+            contribs = layer_contributions[layer_idx]
+            attn_mean = np.mean(contribs['attention']) if contribs['attention'] else 0
+            know_mean = np.mean(contribs['knowledge']) if contribs['knowledge'] else 0
+            total = attn_mean + know_mean
+
+            results['per_layer'][f'L{layer_idx}'] = {
+                'layer_idx': layer_idx,
+                'attention_sum': float(attn_mean),
+                'knowledge_sum': float(know_mean),
+                'attention_ratio': float(attn_mean / total) if total > 0 else 0.5,
+                'knowledge_ratio': float(know_mean / total) if total > 0 else 0.5,
+            }
+
+        # Summary
+        if results['per_layer']:
+            attn_ratios = [v['attention_ratio'] for v in results['per_layer'].values()]
+            know_ratios = [v['knowledge_ratio'] for v in results['per_layer'].values()]
+            results['summary'] = {
+                'attention_ratio_mean': float(np.mean(attn_ratios)),
+                'knowledge_ratio_mean': float(np.mean(know_ratios)),
+                'n_layers': len(results['per_layer']),
+            }
+
+        return results
+
     def visualize_qk_usage(self, usage_results: Dict, output_dir: str) -> Optional[str]:
         """
         Visualize Q/K usage patterns.

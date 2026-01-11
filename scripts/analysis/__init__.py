@@ -88,12 +88,15 @@ from .routing_analysis import (
     plot_routing_heatmap,
     plot_routing_comparison,
 )
-from .pos_neuron_analysis import (
-    POSNeuronAnalyzer,
+# POS Neuron Analyzer (refactored)
+from .pos_neuron import POSNeuronAnalyzer
+
+# Legacy imports from visualizers for backward compatibility
+from .visualizers.pos_neurons import (
     plot_pos_heatmap,
     plot_pos_clustering,
     plot_top_neurons_by_pos,
-    plot_specificity,
+    plot_pos_specificity as plot_specificity,
 )
 
 

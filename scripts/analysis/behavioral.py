@@ -477,6 +477,159 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
         return path
 
+    def analyze_factual_neurons(
+        self,
+        prompts: list,
+        targets: list,
+        n_runs: int = 10,
+        pool_type: str = 'fv',
+        temperature: float = 1.0,
+    ) -> Dict:
+        """
+        Analyze neuron activations for factual knowledge prompts.
+
+        For each prompt, generates multiple times and tracks which neurons
+        consistently activate when producing the target token.
+
+        Paper Figure 7 data generation.
+
+        Args:
+            prompts: List of prompts (e.g., ["The capital of France is"])
+            targets: List of expected target tokens (e.g., ["Paris"])
+            n_runs: Number of generation runs per prompt
+            pool_type: Pool to analyze ('fv', 'rv', etc.)
+            temperature: Sampling temperature
+
+        Returns:
+            Dictionary with per-target neuron frequencies
+        """
+        from collections import Counter
+
+        results = {
+            'prompts': prompts,
+            'targets': targets,
+            'n_runs': n_runs,
+            'pool_type': pool_type,
+            'per_target': {},
+        }
+
+        # Map pool_type to routing info keys
+        mask_key_map = {
+            'fv': 'fv_mask', 'rv': 'rv_mask',
+            'fqk_q': 'fqk_mask_Q', 'fqk_k': 'fqk_mask_K',
+            'rqk_q': 'rqk_mask_Q', 'rqk_k': 'rqk_mask_K',
+        }
+        weight_key_map = {
+            'fv': 'fv_weights', 'rv': 'rv_weights',
+            'fqk_q': 'fqk_weights_Q', 'fqk_k': 'fqk_weights_K',
+            'rqk_q': 'rqk_weights_Q', 'rqk_k': 'rqk_weights_K',
+        }
+        mask_key = mask_key_map.get(pool_type, 'fv_mask')
+        weight_key = weight_key_map.get(pool_type, 'fv_weights')
+
+        self.model.eval()
+        self.enable_pref_tensors()
+
+        try:
+            for prompt, target in zip(prompts, targets):
+                neuron_counts = Counter()
+                matching_runs = 0
+
+                target_id = self.tokenizer.encode(target, add_special_tokens=False)
+                if target_id:
+                    target_id = target_id[0]
+                else:
+                    continue
+
+                for run_idx in range(n_runs):
+                    # Encode prompt
+                    input_ids = self.tokenizer.encode(
+                        prompt, add_special_tokens=False, return_tensors='pt'
+                    ).to(self.device)
+
+                    with torch.no_grad():
+                        outputs = self.model(input_ids, return_routing_info=True)
+
+                        if isinstance(outputs, tuple) and len(outputs) >= 2:
+                            logits, routing_infos = outputs[0], outputs[1]
+                        else:
+                            logits = outputs
+                            routing_infos = None
+
+                        # Get predicted token
+                        if temperature != 1.0:
+                            logits = logits / temperature
+                        next_token = logits[:, -1, :].argmax(dim=-1).item()
+
+                        # Check if matches target
+                        if next_token == target_id:
+                            matching_runs += 1
+
+                            # Extract active neurons from routing info
+                            if routing_infos:
+                                for layer_info in routing_infos:
+                                    attn = layer_info.get('attention', layer_info)
+
+                                    # Try mask first, then weights
+                                    mask = attn.get(mask_key)
+                                    if mask is not None:
+                                        # Last token position
+                                        if mask.dim() == 3:
+                                            m = mask[0, -1]
+                                        else:
+                                            m = mask[0]
+                                        active = m.nonzero(as_tuple=True)[0].cpu().tolist()
+                                        for n in active:
+                                            neuron_counts[n] += 1
+                                    else:
+                                        weights = attn.get(weight_key)
+                                        if weights is not None:
+                                            if weights.dim() == 3:
+                                                w = weights[0, -1]
+                                            else:
+                                                w = weights[0]
+                                            active = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                                            for n in active:
+                                                neuron_counts[n] += 1
+
+                # Store results for this target
+                if matching_runs > 0:
+                    # Calculate frequency (fraction of matching runs)
+                    neuron_freq = {
+                        n: count / matching_runs
+                        for n, count in neuron_counts.items()
+                    }
+                    # Filter to neurons appearing in >80% of runs
+                    common_neurons = [
+                        n for n, freq in neuron_freq.items()
+                        if freq >= 0.8
+                    ]
+
+                    results['per_target'][target] = {
+                        'prompt': prompt,
+                        'matching_runs': matching_runs,
+                        'total_runs': n_runs,
+                        'match_rate': matching_runs / n_runs,
+                        'neuron_frequencies': sorted(
+                            [(n, f) for n, f in neuron_freq.items()],
+                            key=lambda x: -x[1]
+                        )[:50],
+                        'common_neurons_80': common_neurons,
+                    }
+                else:
+                    results['per_target'][target] = {
+                        'prompt': prompt,
+                        'matching_runs': 0,
+                        'total_runs': n_runs,
+                        'match_rate': 0,
+                        'error': 'No matching runs',
+                    }
+
+        finally:
+            self.disable_pref_tensors()
+
+        return results
+
     def run_all(self, dataloader, output_dir: str = './behavioral_analysis', n_batches: int = 20) -> Dict:
         """
         Run all behavioral analyses.

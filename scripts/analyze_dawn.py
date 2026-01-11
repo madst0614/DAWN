@@ -713,6 +713,8 @@ def main():
                                 'clustering', 'trajectory', 'probing', 'ablation',
                                 'neuron', 'semantic', 'coselection', 'paper', 'v18'],
                         help='Analysis mode')
+    parser.add_argument('--figure', type=str, default=None,
+                        help='Generate paper figures: 3,4,6,6a,6b,7 or "all"')
     parser.add_argument('--val_data', type=str, default=None, help='Validation data path')
     parser.add_argument('--output_dir', type=str, default='./dawn_analysis', help='Output directory')
     parser.add_argument('--max_batches', type=int, default=50, help='Number of batches')
@@ -725,6 +727,17 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+
+    # Handle --figure option (paper figure generation)
+    if args.figure is not None:
+        gen = PaperFigureGenerator(args.checkpoint, args.val_data, str(device))
+        results = gen.generate(args.figure, args.output_dir, args.max_batches)
+        save_results(results, os.path.join(args.output_dir, 'figure_results.json'))
+        print(f"\n{'='*60}")
+        print(f"Paper figures generated: {args.output_dir}")
+        print(f"Figures: {args.figure}")
+        print(f"{'='*60}")
+        return
 
     # For paper mode, use PaperFigureGenerator directly
     if args.mode == 'paper':
