@@ -66,6 +66,10 @@ from .utils import (
     HAS_TQDM,
 )
 
+# Base analyzer
+from .base import BaseAnalyzer
+
+# Analyzers
 from .neuron_health import NeuronHealthAnalyzer
 from .routing import RoutingAnalyzer
 from .embedding import EmbeddingAnalyzer
@@ -74,6 +78,9 @@ from .behavioral import BehavioralAnalyzer
 from .semantic import SemanticAnalyzer
 from .coselection import CoselectionAnalyzer
 from .paper_figures import PaperFigureGenerator
+
+# Visualizers
+from . import visualizers
 from .routing_analysis import (
     GenerationRoutingAnalyzer,
     analyze_common_neurons,
@@ -81,12 +88,15 @@ from .routing_analysis import (
     plot_routing_heatmap,
     plot_routing_comparison,
 )
-from .pos_neuron_analysis import (
-    POSNeuronAnalyzer,
+# POS Neuron Analyzer (refactored)
+from .pos_neuron import POSNeuronAnalyzer
+
+# Legacy imports from visualizers for backward compatibility
+from .visualizers.pos_neurons import (
     plot_pos_heatmap,
     plot_pos_clustering,
     plot_top_neurons_by_pos,
-    plot_specificity,
+    plot_pos_specificity as plot_specificity,
 )
 
 
@@ -119,6 +129,10 @@ __all__ = [
     'HAS_MATPLOTLIB',
     'HAS_SKLEARN',
     'HAS_TQDM',
+
+    # Base
+    'BaseAnalyzer',
+    'visualizers',
 
     # Analyzers
     'NeuronHealthAnalyzer',

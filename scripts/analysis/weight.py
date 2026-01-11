@@ -14,25 +14,35 @@ import numpy as np
 import torch
 from typing import Dict, Optional
 
+from .base import BaseAnalyzer
 from .utils import (
     NEURON_TYPES, NEURON_ATTRS,
     HAS_MATPLOTLIB, plt
 )
 
 
-class WeightAnalyzer:
+class WeightAnalyzer(BaseAnalyzer):
     """Neuron weight matrix analyzer."""
 
-    def __init__(self, neurons, device='cuda'):
+    def __init__(self, model=None, neurons=None, device='cuda'):
         """
         Initialize analyzer.
 
         Args:
-            neurons: SharedNeurons instance from DAWN model
+            model: DAWN model (optional, for auto-detection)
+            neurons: SharedNeurons instance (direct, or auto-detected from model)
             device: Device for computation
         """
-        self.neurons = neurons
-        self.device = device
+        if model is not None:
+            super().__init__(model, device=device)
+            self.neurons = self.shared_neurons
+        else:
+            # Backward compatibility: direct neurons argument
+            self.model = None
+            self.router = None
+            self.shared_neurons = neurons
+            self.neurons = neurons
+            self.device = device
 
     def analyze_weight_svd(self, output_dir: Optional[str] = None) -> Dict:
         """

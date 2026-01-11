@@ -290,11 +290,16 @@ class DAWNAnalyzer:
         """v18.x-specific analysis: tau, gate, confidence, Q/K differentiation.
 
         Analyzes v18.x specific features:
-        1. Learnable Tau - 8 pool tau values (Q/K separated)
+        1. Learnable Tau - pool tau values (structure varies by version)
         2. Gate Distribution - log-gated threshold selection
         3. Token-level Tau - tau variance across tokens/positions
         4. Q/K Tau Differentiation - how Q and K taus diverge
         5. Confidence Stats (v18.3+) - confidence scaling metrics
+
+        Version differences:
+        - v18.0-18.3: tau_proj with 8 outputs [fq,fk,fv,rq,rk,rv,f_know,r_know]
+        - v18.4-18.5: tau_proj_feature with 4 outputs [fq,fk,fv,f_know]
+        - v18.5: restore tau is context-based (tau_proj_restore_Q/K/v/know)
         """
         # Detect model version
         model_version = getattr(self.model, '__version__', '18.2')
@@ -304,52 +309,113 @@ class DAWNAnalyzer:
 
         results = {'model_version': model_version}
 
-        # Check if model has v18 features
-        if not hasattr(self.model, 'router') or not hasattr(self.model.router, 'tau_proj'):
+        # Check if model has v18 features - support both old and new structure
+        has_old_tau = hasattr(self.model, 'router') and hasattr(self.model.router, 'tau_proj')
+        has_new_tau = hasattr(self.model, 'router') and hasattr(self.model.router, 'tau_proj_feature')
+
+        if not has_old_tau and not has_new_tau:
             print("Warning: Model does not have learnable tau (not v18.x)")
             return {'error': 'Not a v18.x model with learnable tau'}
 
-        tau_proj = self.model.router.tau_proj
-        pool_names = ['fq', 'fk', 'fv', 'rq', 'rk', 'rv', 'feature_know', 'restore_know']
+        import torch.nn.functional as F
 
         # 1. Tau Parameters Analysis
         print("\n--- Tau Parameters ---")
-        weight = tau_proj.weight.detach().cpu()  # [8, d_model]
-        bias = tau_proj.bias.detach().cpu()      # [8]
 
-        tau_params = {
-            'tau_bias': {name: bias[i].item() for i, name in enumerate(pool_names)},
-            'tau_weight_norm': {name: weight[i].norm().item() for i, name in enumerate(pool_names)},
-            'tau_weight_std': {name: weight[i].std().item() for i, name in enumerate(pool_names)},
-        }
+        if has_new_tau:
+            # v18.4/v18.5 structure
+            tau_proj_feature = self.model.router.tau_proj_feature
+            feature_names = ['fq', 'fk', 'fv', 'feature_know']
 
-        print("Pool         Bias      Weight Norm   Weight Std")
-        print("-" * 50)
-        for name in pool_names:
-            print(f"{name:12} {tau_params['tau_bias'][name]:8.4f}  "
-                  f"{tau_params['tau_weight_norm'][name]:10.4f}   "
-                  f"{tau_params['tau_weight_std'][name]:.4f}")
+            weight_f = tau_proj_feature.weight.detach().cpu()  # [4, d_model]
+            bias_f = tau_proj_feature.bias.detach().cpu()      # [4]
 
-        # Q/K Differentiation
-        import torch.nn.functional as F
-        qk_diff = {
-            'fqk_bias_diff': abs(bias[0].item() - bias[1].item()),
-            'rqk_bias_diff': abs(bias[3].item() - bias[4].item()),
-            'fqk_weight_cosine': F.cosine_similarity(weight[0:1], weight[1:2]).item(),
-            'rqk_weight_cosine': F.cosine_similarity(weight[3:4], weight[4:5]).item(),
-        }
-        tau_params['qk_differentiation'] = qk_diff
+            tau_params = {
+                'tau_bias': {name: bias_f[i].item() for i, name in enumerate(feature_names)},
+                'tau_weight_norm': {name: weight_f[i].norm().item() for i, name in enumerate(feature_names)},
+                'tau_weight_std': {name: weight_f[i].std().item() for i, name in enumerate(feature_names)},
+            }
 
-        print("\n--- Q/K Tau Differentiation ---")
-        print(f"  Feature Q/K bias diff:     {qk_diff['fqk_bias_diff']:.4f}")
-        print(f"  Restore Q/K bias diff:     {qk_diff['rqk_bias_diff']:.4f}")
-        print(f"  Feature Q/K weight cosine: {qk_diff['fqk_weight_cosine']:.4f}")
-        print(f"  Restore Q/K weight cosine: {qk_diff['rqk_weight_cosine']:.4f}")
+            print("Feature Tau (input-based):")
+            print("Pool         Bias      Weight Norm   Weight Std")
+            print("-" * 50)
+            for name in feature_names:
+                print(f"{name:12} {tau_params['tau_bias'][name]:8.4f}  "
+                      f"{tau_params['tau_weight_norm'][name]:10.4f}   "
+                      f"{tau_params['tau_weight_std'][name]:.4f}")
 
-        if qk_diff['fqk_bias_diff'] > 0.1 or qk_diff['rqk_bias_diff'] > 0.1:
-            print("  -> Q and K have learned DIFFERENT tau values (good!)")
+            # Q/K Differentiation (feature only for v18.4/v18.5)
+            qk_diff = {
+                'fqk_bias_diff': abs(bias_f[0].item() - bias_f[1].item()),
+                'fqk_weight_cosine': F.cosine_similarity(weight_f[0:1], weight_f[1:2]).item(),
+            }
+
+            # v18.5: context-based restore tau (Q/K separated)
+            if hasattr(self.model.router, 'tau_proj_restore_Q'):
+                print("\nRestore Tau (context-based, v18.5):")
+                restore_projs = {
+                    'restore_Q': self.model.router.tau_proj_restore_Q,
+                    'restore_K': self.model.router.tau_proj_restore_K,
+                    'restore_v': self.model.router.tau_proj_restore_v,
+                    'restore_know': self.model.router.tau_proj_restore_know,
+                }
+                print("Pool         Bias      Weight Norm   Weight Std")
+                print("-" * 50)
+                for name, proj in restore_projs.items():
+                    w = proj.weight.detach().cpu()
+                    b = proj.bias.detach().cpu().item()
+                    tau_params['tau_weight_norm'][name] = w.norm().item()
+                    tau_params['tau_weight_std'][name] = w.std().item()
+                    tau_params['tau_bias'][name] = b
+                    print(f"{name:12} {b:8.4f}  {w.norm().item():10.4f}   {w.std().item():.4f}")
+
+            tau_params['qk_differentiation'] = qk_diff
+
+            print("\n--- Q/K Tau Differentiation (Feature) ---")
+            print(f"  Feature Q/K bias diff:     {qk_diff['fqk_bias_diff']:.4f}")
+            print(f"  Feature Q/K weight cosine: {qk_diff['fqk_weight_cosine']:.4f}")
+            print("  (Restore Q/K: context-based, differentiated by input)")
+
         else:
-            print("  -> Q and K tau values are similar (may need more training)")
+            # v18.0-18.3 structure (original code)
+            tau_proj = self.model.router.tau_proj
+            pool_names = ['fq', 'fk', 'fv', 'rq', 'rk', 'rv', 'feature_know', 'restore_know']
+
+            weight = tau_proj.weight.detach().cpu()  # [8, d_model]
+            bias = tau_proj.bias.detach().cpu()      # [8]
+
+            tau_params = {
+                'tau_bias': {name: bias[i].item() for i, name in enumerate(pool_names)},
+                'tau_weight_norm': {name: weight[i].norm().item() for i, name in enumerate(pool_names)},
+                'tau_weight_std': {name: weight[i].std().item() for i, name in enumerate(pool_names)},
+            }
+
+            print("Pool         Bias      Weight Norm   Weight Std")
+            print("-" * 50)
+            for name in pool_names:
+                print(f"{name:12} {tau_params['tau_bias'][name]:8.4f}  "
+                      f"{tau_params['tau_weight_norm'][name]:10.4f}   "
+                      f"{tau_params['tau_weight_std'][name]:.4f}")
+
+            # Q/K Differentiation
+            qk_diff = {
+                'fqk_bias_diff': abs(bias[0].item() - bias[1].item()),
+                'rqk_bias_diff': abs(bias[3].item() - bias[4].item()),
+                'fqk_weight_cosine': F.cosine_similarity(weight[0:1], weight[1:2]).item(),
+                'rqk_weight_cosine': F.cosine_similarity(weight[3:4], weight[4:5]).item(),
+            }
+            tau_params['qk_differentiation'] = qk_diff
+
+            print("\n--- Q/K Tau Differentiation ---")
+            print(f"  Feature Q/K bias diff:     {qk_diff['fqk_bias_diff']:.4f}")
+            print(f"  Restore Q/K bias diff:     {qk_diff['rqk_bias_diff']:.4f}")
+            print(f"  Feature Q/K weight cosine: {qk_diff['fqk_weight_cosine']:.4f}")
+            print(f"  Restore Q/K weight cosine: {qk_diff['rqk_weight_cosine']:.4f}")
+
+            if qk_diff['fqk_bias_diff'] > 0.1 or qk_diff['rqk_bias_diff'] > 0.1:
+                print("  -> Q and K have learned DIFFERENT tau values (good!)")
+            else:
+                print("  -> Q and K tau values are similar (may need more training)")
 
         results['tau_parameters'] = tau_params
 
@@ -363,7 +429,7 @@ class DAWNAnalyzer:
             gate_stats = defaultdict(list)
             tau_runtime = defaultdict(list)
             qk_patterns = defaultdict(list)
-            conf_stats = defaultdict(list)  # v18.3 confidence
+            conf_stats = defaultdict(list)
 
             self.model.eval()
 
@@ -392,18 +458,54 @@ class DAWNAnalyzer:
 
                         for layer_idx, layer_info in enumerate(routing_infos):
                             attn = layer_info.get('attention', layer_info)
+                            know = layer_info.get('knowledge', {})
 
-                            # Gate statistics
-                            for pool in ['fq', 'fk', 'fv', 'rq', 'rk', 'rv']:
-                                mean_key = f'gate_{pool}_mean'
-                                if mean_key in attn:
-                                    gate_stats[f'L{layer_idx}_{pool}_gate'].append(attn[mean_key])
+                            # Gate statistics - v18.4/v18.5 use gstr_* keys
+                            for pool in ['fq', 'fk', 'fv']:
+                                # Try new key first, then old
+                                gstr_key = f'gstr_{pool}'
+                                old_key = f'gate_{pool}_mean'
+                                if gstr_key in attn:
+                                    gate_stats[f'L{layer_idx}_{pool}_gate'].append(attn[gstr_key])
+                                elif old_key in attn:
+                                    gate_stats[f'L{layer_idx}_{pool}_gate'].append(attn[old_key])
 
-                            # Tau statistics
-                            for pool in ['fq', 'fk', 'fv', 'rq', 'rk', 'rv']:
-                                tau_key = f'tau_{pool}'
-                                if tau_key in attn:
-                                    tau_runtime[f'L{layer_idx}_{pool}_tau'].append(attn[tau_key])
+                            # v18.5 restore gate_strength (context-based)
+                            for key, pool in [('gstr_rqk_Q', 'rq'), ('gstr_rqk_K', 'rk'), ('gstr_rv', 'rv')]:
+                                if key in attn:
+                                    gate_stats[f'L{layer_idx}_{pool}_gate'].append(attn[key])
+
+                            # Old-style restore gates (v18.0-18.3)
+                            for pool in ['rq', 'rk', 'rv']:
+                                old_key = f'gate_{pool}_mean'
+                                if old_key in attn and f'L{layer_idx}_{pool}_gate' not in gate_stats:
+                                    gate_stats[f'L{layer_idx}_{pool}_gate'].append(attn[old_key])
+
+                            # Tau statistics - v18.4/v18.5 use tau_offset_* keys
+                            for pool in ['fq', 'fk', 'fv']:
+                                new_key = f'tau_offset_{pool}'
+                                old_key = f'tau_{pool}'
+                                if new_key in attn:
+                                    tau_runtime[f'L{layer_idx}_{pool}_tau'].append(attn[new_key])
+                                elif old_key in attn:
+                                    tau_runtime[f'L{layer_idx}_{pool}_tau'].append(attn[old_key])
+
+                            # v18.5 restore tau_offset (context-based)
+                            for key, pool in [('tau_offset_rqk_Q', 'rq'), ('tau_offset_rqk_K', 'rk'), ('tau_offset_rv', 'rv')]:
+                                if key in attn:
+                                    tau_runtime[f'L{layer_idx}_{pool}_tau'].append(attn[key])
+
+                            # Knowledge tau
+                            if 'tau_offset_feature' in know:
+                                tau_runtime[f'L{layer_idx}_kf_tau'].append(know['tau_offset_feature'])
+                            if 'tau_offset_restore' in know:
+                                tau_runtime[f'L{layer_idx}_kr_tau'].append(know['tau_offset_restore'])
+
+                            # Knowledge gate_strength
+                            if 'gstr_feature' in know:
+                                gate_stats[f'L{layer_idx}_kf_gate'].append(know['gstr_feature'])
+                            if 'gstr_restore' in know:
+                                gate_stats[f'L{layer_idx}_kr_gate'].append(know['gstr_restore'])
 
                             # Q/K patterns
                             if 'overlap_fqk' in attn:
@@ -611,6 +713,8 @@ def main():
                                 'clustering', 'trajectory', 'probing', 'ablation',
                                 'neuron', 'semantic', 'coselection', 'paper', 'v18'],
                         help='Analysis mode')
+    parser.add_argument('--figure', type=str, default=None,
+                        help='Generate paper figures: 3,4,6,6a,6b,7 or "all"')
     parser.add_argument('--val_data', type=str, default=None, help='Validation data path')
     parser.add_argument('--output_dir', type=str, default='./dawn_analysis', help='Output directory')
     parser.add_argument('--max_batches', type=int, default=50, help='Number of batches')
@@ -623,6 +727,17 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+
+    # Handle --figure option (paper figure generation)
+    if args.figure is not None:
+        gen = PaperFigureGenerator(args.checkpoint, args.val_data, str(device))
+        results = gen.generate(args.figure, args.output_dir, args.max_batches)
+        save_results(results, os.path.join(args.output_dir, 'figure_results.json'))
+        print(f"\n{'='*60}")
+        print(f"Paper figures generated: {args.output_dir}")
+        print(f"Figures: {args.figure}")
+        print(f"{'='*60}")
+        return
 
     # For paper mode, use PaperFigureGenerator directly
     if args.mode == 'paper':

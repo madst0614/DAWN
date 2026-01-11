@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
+from .base import BaseAnalyzer
 from .utils import (
     ROUTING_KEYS,
     KNOWLEDGE_ROUTING_KEYS,
@@ -50,23 +51,20 @@ except ImportError:
 MIN_HEALTHY_ENTROPY = 10.0  # 10% of max entropy
 
 
-class SemanticAnalyzer:
+class SemanticAnalyzer(BaseAnalyzer):
     """Semantic analysis for DAWN routing patterns."""
 
-    def __init__(self, model, router, tokenizer, device='cuda'):
+    def __init__(self, model, router=None, tokenizer=None, device='cuda'):
         """
         Initialize analyzer.
 
         Args:
             model: DAWN model
-            router: NeuronRouter instance
+            router: NeuronRouter instance (auto-detected if None)
             tokenizer: Tokenizer instance
             device: Device for computation
         """
-        self.model = model
-        self.router = router
-        self.tokenizer = tokenizer
-        self.device = device
+        super().__init__(model, router=router, tokenizer=tokenizer, device=device)
 
         # Load spaCy for POS tagging
         self.nlp = None
@@ -79,16 +77,6 @@ class SemanticAnalyzer:
         # Cache for routing paths (optional)
         self._path_cache = {}
         self._cache_enabled = True
-
-    def _enable_pref_tensors(self):
-        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
-        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
-            self.model.router.store_pref_tensors = True
-
-    def _disable_pref_tensors(self):
-        """Disable store_pref_tensors after analysis."""
-        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
-            self.model.router.store_pref_tensors = False
 
     def clear_cache(self):
         """Clear routing path cache."""
@@ -206,7 +194,7 @@ class SemanticAnalyzer:
 
         # Single forward pass
         self.model.eval()
-        self._enable_pref_tensors()
+        self.enable_pref_tensors()
 
         try:
             with torch.no_grad():
@@ -277,7 +265,7 @@ class SemanticAnalyzer:
 
             return results
         finally:
-            self._disable_pref_tensors()
+            self.disable_pref_tensors()
 
     def get_routing_path(self, text: str) -> Dict[str, Dict[str, torch.Tensor]]:
         """
@@ -694,7 +682,7 @@ class SemanticAnalyzer:
         target_layers_set = set(target_layers)
 
         self.model.eval()
-        self._enable_pref_tensors()
+        self.enable_pref_tensors()
 
         try:
             with torch.no_grad():
@@ -745,7 +733,7 @@ class SemanticAnalyzer:
                                     elif w.dim() == 2:
                                         pos_weights[f"{routing_key}/{upos}"].append(w[0].cpu())
         finally:
-            self._disable_pref_tensors()
+            self.disable_pref_tensors()
 
         # Analyze results
         results = {
@@ -970,7 +958,7 @@ class SemanticAnalyzer:
         neuron_sizes = {}  # Track N for each routing_key
 
         self.model.eval()
-        self._enable_pref_tensors()
+        self.enable_pref_tensors()
 
         try:
             with torch.no_grad():
@@ -1040,7 +1028,7 @@ class SemanticAnalyzer:
                                     valid_weights
                                 )
         finally:
-            self._disable_pref_tensors()
+            self.disable_pref_tensors()
 
         # Convert to results format
         results = {}

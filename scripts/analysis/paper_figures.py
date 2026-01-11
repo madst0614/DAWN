@@ -26,6 +26,16 @@ if HAS_MATPLOTLIB:
 class PaperFigureGenerator:
     """Generate paper-ready figures from DAWN analysis."""
 
+    # Figure number to method mapping
+    FIGURE_MAP = {
+        '3': 'generate_figure3',   # Q/K Specialization
+        '4': 'generate_figure4',   # POS Neurons
+        '6': 'generate_figure6',   # Neuron Utilization + Layer Contribution
+        '6a': 'generate_figure6a', # Neuron Utilization only
+        '6b': 'generate_figure6b', # Layer Contribution only
+        '7': 'generate_figure7',   # Factual Knowledge Heatmap
+    }
+
     def __init__(self, checkpoint_path: str, val_data_path: Optional[str] = None,
                  device: str = 'cuda'):
         """
@@ -56,14 +66,14 @@ class PaperFigureGenerator:
         from .semantic import SemanticAnalyzer
         from .coselection import CoselectionAnalyzer
 
-        # Initialize analyzers
-        self.health = NeuronHealthAnalyzer(self.router)
-        self.routing = RoutingAnalyzer(self.model, self.router, device)
-        self.embedding = EmbeddingAnalyzer(self.router, device)
-        self.weight = WeightAnalyzer(self.neurons, device)
-        self.behavioral = BehavioralAnalyzer(self.model, self.router, self.tokenizer, device)
-        self.semantic = SemanticAnalyzer(self.model, self.router, self.tokenizer, device)
-        self.coselection = CoselectionAnalyzer(self.model, self.router, self.neurons, device)
+        # Initialize analyzers (all inherit from BaseAnalyzer with auto-detection)
+        self.health = NeuronHealthAnalyzer(self.model, router=self.router, device=device)
+        self.routing = RoutingAnalyzer(self.model, router=self.router, device=device)
+        self.embedding = EmbeddingAnalyzer(self.model, router=self.router, device=device)
+        self.weight = WeightAnalyzer(model=self.model, neurons=self.neurons, device=device)
+        self.behavioral = BehavioralAnalyzer(self.model, router=self.router, tokenizer=self.tokenizer, device=device)
+        self.semantic = SemanticAnalyzer(self.model, router=self.router, tokenizer=self.tokenizer, device=device)
+        self.coselection = CoselectionAnalyzer(self.model, router=self.router, shared_neurons=self.neurons, device=device)
 
     def generate_all(self, output_dir: str = './paper_figures', n_batches: int = 50):
         """
@@ -331,3 +341,166 @@ class PaperFigureGenerator:
         print(f"\nQuick analysis saved to: {output_dir}")
 
         return results
+
+    def generate(self, figures: str, output_dir: str, n_batches: int = 50) -> Dict:
+        """
+        Generate specified figures.
+
+        Args:
+            figures: Comma-separated list of figure numbers or 'all'
+            output_dir: Directory for outputs
+            n_batches: Number of batches for data-dependent analyses
+
+        Returns:
+            Dictionary of results
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        if figures == 'all':
+            figure_list = ['3', '4', '6', '7']
+        else:
+            figure_list = [f.strip() for f in figures.split(',')]
+
+        results = {}
+        for fig in figure_list:
+            if fig in self.FIGURE_MAP:
+                print(f"\nGenerating Figure {fig}...", flush=True)
+                method = getattr(self, self.FIGURE_MAP[fig])
+                try:
+                    results[f'figure_{fig}'] = method(output_dir, n_batches)
+                except Exception as e:
+                    print(f"  ERROR: {e}", flush=True)
+                    results[f'figure_{fig}'] = {'error': str(e)}
+            else:
+                print(f"Unknown figure: {fig}", flush=True)
+
+        return results
+
+    def generate_figure3(self, output_dir: str, n_batches: int = 100) -> Dict:
+        """
+        Figure 3: Q/K Specialization.
+
+        Shows Q vs K neuron usage patterns.
+        """
+        from .visualizers import plot_qk_specialization
+
+        if self.dataloader is None:
+            return {'error': 'Requires dataloader'}
+
+        print("  Analyzing Q/K usage...", flush=True)
+        qk_data = self.routing.analyze_qk_usage(self.dataloader, n_batches)
+
+        path = plot_qk_specialization(qk_data, os.path.join(output_dir, 'fig3_qk_specialization.png'))
+        print(f"  Saved: {path}", flush=True)
+
+        return {'qk_usage': qk_data, 'visualization': path}
+
+    def generate_figure4(self, output_dir: str, n_batches: int = 50) -> Dict:
+        """
+        Figure 4: POS Neuron Specialization.
+
+        Shows neuron specialization by part-of-speech.
+        """
+        from .pos_neuron import POSNeuronAnalyzer
+        from .visualizers import plot_pos_specificity
+
+        print("  Initializing POS analyzer...", flush=True)
+        pos_analyzer = POSNeuronAnalyzer(
+            self.model, router=self.router, tokenizer=self.tokenizer,
+            device=self.device, target_layer=None
+        )
+
+        print("  Loading UD dataset...", flush=True)
+        try:
+            dataset = pos_analyzer.load_ud_dataset('train', max_sentences=2000)
+        except Exception as e:
+            return {'error': f'Failed to load UD dataset: {e}'}
+
+        print("  Analyzing...", flush=True)
+        results = pos_analyzer.analyze_dataset(dataset, pool_type='fv', max_sentences=2000)
+
+        path = plot_pos_specificity(results, os.path.join(output_dir, 'fig4_pos_neurons.png'))
+        print(f"  Saved: {path}", flush=True)
+
+        return {'pos_analysis': results, 'visualization': path}
+
+    def generate_figure6(self, output_dir: str, n_batches: int = 50) -> Dict:
+        """
+        Figure 6: Neuron Utilization + Layer Contribution.
+
+        6a: Neuron utilization histogram
+        6b: Layer-wise contribution
+        """
+        results = {}
+        results.update(self.generate_figure6a(output_dir, n_batches))
+        results.update(self.generate_figure6b(output_dir, n_batches))
+        return results
+
+    def generate_figure6a(self, output_dir: str, n_batches: int = 50) -> Dict:
+        """
+        Figure 6a: Neuron Utilization.
+
+        Shows EMA distribution across neuron pools.
+        """
+        from .visualizers import plot_usage_histogram
+
+        print("  Analyzing EMA distribution...", flush=True)
+        health_data = self.health.analyze_ema_distribution()
+
+        # Collect EMA data for visualization
+        neuron_types = self.health.get_neuron_types()
+        ema_data = []
+        for name, (display, ema_attr, _, color) in neuron_types.items():
+            if hasattr(self.router, ema_attr):
+                ema = getattr(self.router, ema_attr)
+                ema_data.append((display, ema.detach().cpu().numpy(), color))
+
+        path = plot_usage_histogram(ema_data, os.path.join(output_dir, 'fig6a_neuron_util.png'))
+        print(f"  Saved: {path}", flush=True)
+
+        return {'ema_distribution': health_data, 'visualization_6a': path}
+
+    def generate_figure6b(self, output_dir: str, n_batches: int = 50) -> Dict:
+        """
+        Figure 6b: Layer-wise Contribution.
+
+        Shows attention vs knowledge circuit contribution per layer.
+        """
+        from .visualizers import plot_layer_contribution
+
+        if self.dataloader is None:
+            return {'error': 'Requires dataloader'}
+
+        print("  Analyzing layer contribution...", flush=True)
+        contrib_data = self.routing.analyze_layer_contribution(self.dataloader, n_batches)
+
+        path = plot_layer_contribution(contrib_data, os.path.join(output_dir, 'fig6b_layer_contrib.png'))
+        print(f"  Saved: {path}", flush=True)
+
+        return {'layer_contribution': contrib_data, 'visualization_6b': path}
+
+    def generate_figure7(self, output_dir: str, n_batches: int = 10) -> Dict:
+        """
+        Figure 7: Factual Knowledge Heatmap.
+
+        Shows which neurons activate for factual prompts.
+        """
+        from .visualizers import plot_factual_heatmap
+
+        prompts = [
+            "The capital of France is",
+            "The capital of Germany is",
+            "The capital of Japan is",
+            "The color of the sky is",
+        ]
+        targets = ["Paris", "Berlin", "Tokyo", "Blue"]
+
+        print("  Analyzing factual neurons...", flush=True)
+        factual_data = self.behavioral.analyze_factual_neurons(
+            prompts, targets, n_runs=n_batches, pool_type='fv'
+        )
+
+        path = plot_factual_heatmap(factual_data, os.path.join(output_dir, 'fig7_factual_heatmap.png'))
+        print(f"  Saved: {path}", flush=True)
+
+        return {'factual_analysis': factual_data, 'visualization': path}
