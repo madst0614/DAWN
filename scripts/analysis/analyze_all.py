@@ -197,24 +197,36 @@ class ModelAnalyzer:
         results = {}
 
         # Load validation tokens
-        print("  Loading validation data...")
+        print("  [1/3] Loading validation data...")
         val_tokens = load_val_data(self.val_data_path, max_tokens=n_batches * 32 * 512)
 
         # Validation metrics
-        print("  Running validation...")
+        print("  [2/3] Running validation...")
         val_results = evaluate_model(
             self.model, val_tokens,
             batch_size=32, seq_len=512, device=self.device
         )
         results['validation'] = val_results
 
+        # Print validation results
+        print(f"\n  ┌─ Validation Results ─────────────────")
+        print(f"  │ Loss:       {val_results.get('loss', 0):.4f}")
+        print(f"  │ Perplexity: {val_results.get('perplexity', 0):.2f}")
+        print(f"  │ Accuracy:   {val_results.get('accuracy', 0):.2f}%")
+        print(f"  └───────────────────────────────────────\n")
+
         with open(output_dir / 'validation.json', 'w') as f:
             json.dump(val_results, f, indent=2)
 
         # Speed benchmark
-        print("  Running speed benchmark...")
+        print("  [3/3] Running speed benchmark...")
         speed_results = self._benchmark_speed()
         results['speed'] = speed_results
+
+        print(f"  ┌─ Speed Results ─────────────────────")
+        print(f"  │ Avg Time:   {speed_results.get('avg_time_ms', 0):.2f} ms/batch")
+        print(f"  │ Throughput: {speed_results.get('tokens_per_sec', 0)/1000:.1f}K tokens/sec")
+        print(f"  └───────────────────────────────────────\n")
 
         with open(output_dir / 'speed_benchmark.json', 'w') as f:
             json.dump(speed_results, f, indent=2)
@@ -222,6 +234,13 @@ class ModelAnalyzer:
         # Generation samples
         print("  Generating samples...")
         samples = self._generate_samples()
+
+        print(f"  ┌─ Generation Samples ────────────────")
+        for prompt, generated in samples:
+            print(f"  │ Prompt: {prompt}")
+            print(f"  │ → {generated}")
+            print(f"  │")
+        print(f"  └───────────────────────────────────────\n")
 
         with open(output_dir / 'generation_samples.txt', 'w') as f:
             for prompt, generated in samples:
@@ -320,6 +339,7 @@ class ModelAnalyzer:
     def analyze_health(self) -> Dict:
         """Analyze neuron health (DAWN only)."""
         if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
             return {}
 
         from scripts.analysis.neuron_health import NeuronHealthAnalyzer
@@ -327,9 +347,24 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'health'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Running health analysis...")
+        print("  Analyzing neuron health...")
         analyzer = NeuronHealthAnalyzer(self.model, device=self.device)
         results = analyzer.run_all(str(output_dir))
+
+        # Print summary
+        ema = results.get('ema_distribution', {})
+        if ema:
+            print(f"\n  ┌─ Neuron Health Summary ─────────────")
+            total_active = 0
+            total_neurons = 0
+            for name, data in ema.items():
+                if isinstance(data, dict) and 'total' in data:
+                    total_active += data.get('active', 0)
+                    total_neurons += data.get('total', 0)
+                    print(f"  │ {data.get('display', name):12s}: {data['active']:4d}/{data['total']:4d} active ({data['active_ratio']*100:.1f}%)")
+            if total_neurons > 0:
+                print(f"  │ {'TOTAL':12s}: {total_active:4d}/{total_neurons:4d} active ({total_active/total_neurons*100:.1f}%)")
+            print(f"  └───────────────────────────────────────\n")
 
         self.results['health'] = results
         return results
@@ -337,6 +372,7 @@ class ModelAnalyzer:
     def analyze_routing(self, n_batches: int = 100) -> Dict:
         """Analyze routing patterns (DAWN only)."""
         if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
             return {}
 
         from scripts.analysis.routing import RoutingAnalyzer
@@ -344,10 +380,19 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'routing'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Running routing analysis...")
+        print(f"  Analyzing routing patterns ({n_batches} batches)...")
         dataloader = self._get_dataloader()
         analyzer = RoutingAnalyzer(self.model, device=self.device)
         results = analyzer.run_all(dataloader, str(output_dir), n_batches)
+
+        # Print summary
+        entropy = results.get('entropy', {})
+        if entropy:
+            print(f"\n  ┌─ Routing Entropy Summary ────────────")
+            for pool, data in entropy.items():
+                if isinstance(data, dict) and 'mean' in data:
+                    print(f"  │ {pool:12s}: mean={data['mean']:.3f}, std={data.get('std', 0):.3f}")
+            print(f"  └───────────────────────────────────────\n")
 
         self.results['routing'] = results
         return results
@@ -355,6 +400,7 @@ class ModelAnalyzer:
     def analyze_embedding(self) -> Dict:
         """Analyze embeddings (DAWN only)."""
         if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
             return {}
 
         from scripts.analysis.embedding import EmbeddingAnalyzer
@@ -362,9 +408,18 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'embedding'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Running embedding analysis...")
+        print("  Analyzing neuron embeddings...")
         analyzer = EmbeddingAnalyzer(self.model, device=self.device)
         results = analyzer.run_all(str(output_dir))
+
+        # Print summary
+        sim = results.get('similarity', {})
+        if sim:
+            print(f"\n  ┌─ Embedding Similarity Summary ───────")
+            for pool, data in sim.items():
+                if isinstance(data, dict) and 'mean' in data:
+                    print(f"  │ {pool:12s}: mean={data['mean']:.3f}")
+            print(f"  └───────────────────────────────────────\n")
 
         self.results['embedding'] = results
         return results
@@ -372,6 +427,7 @@ class ModelAnalyzer:
     def analyze_semantic(self, n_batches: int = 50) -> Dict:
         """Analyze semantic properties (DAWN only)."""
         if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
             return {}
 
         from scripts.analysis.semantic import SemanticAnalyzer
@@ -379,17 +435,19 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'semantic'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Running semantic analysis...")
+        print(f"  Analyzing semantic patterns ({n_batches} batches)...")
         dataloader = self._get_dataloader()
         analyzer = SemanticAnalyzer(self.model, tokenizer=self.tokenizer, device=self.device)
         results = analyzer.run_all(dataloader, str(output_dir), max_batches=n_batches)
 
+        print("  Done.")
         self.results['semantic'] = results
         return results
 
     def analyze_pos(self, max_sentences: int = 2000) -> Dict:
         """Analyze POS neuron specialization (DAWN only)."""
         if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
             return {}
 
         from scripts.analysis.pos_neuron import POSNeuronAnalyzer
@@ -397,11 +455,20 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'pos'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Running POS analysis...")
+        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences)...")
         analyzer = POSNeuronAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
         results = analyzer.run_all(str(output_dir), max_sentences=max_sentences)
+
+        # Print summary
+        specificity = results.get('neuron_specificity', {})
+        if specificity:
+            top_specific = list(specificity.items())[:5]
+            print(f"\n  ┌─ Top POS-Specific Neurons ───────────")
+            for neuron_id, data in top_specific:
+                print(f"  │ N{neuron_id}: {data['top_pos']} (specificity={data['specificity']:.3f})")
+            print(f"  └───────────────────────────────────────\n")
 
         self.results['pos'] = results
         return results
@@ -409,6 +476,7 @@ class ModelAnalyzer:
     def analyze_factual(self, n_runs: int = 10) -> Dict:
         """Analyze factual knowledge neurons (DAWN only)."""
         if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
             return {}
 
         from scripts.analysis.behavioral import BehavioralAnalyzer
@@ -416,7 +484,7 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Running factual analysis...")
+        print(f"  Analyzing factual neurons ({n_runs} runs per prompt)...")
         analyzer = BehavioralAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
@@ -430,6 +498,17 @@ class ModelAnalyzer:
         targets = ["Paris", "Berlin", "Tokyo", "blue"]
 
         results = analyzer.analyze_factual_neurons(prompts, targets, n_runs=n_runs)
+
+        # Print summary
+        per_target = results.get('per_target', {})
+        if per_target:
+            print(f"\n  ┌─ Factual Analysis Results ────────────")
+            for target, data in per_target.items():
+                if isinstance(data, dict):
+                    match_rate = data.get('match_rate', 0) * 100
+                    n_common = len(data.get('common_neurons_80', []))
+                    print(f"  │ {target:10s}: match={match_rate:.0f}%, common_neurons={n_common}")
+            print(f"  └───────────────────────────────────────\n")
 
         with open(output_dir / 'factual_neurons.json', 'w') as f:
             json.dump(results, f, indent=2, default=str)
@@ -448,6 +527,7 @@ class ModelAnalyzer:
     def analyze_behavioral(self, n_batches: int = 50) -> Dict:
         """Analyze behavioral patterns (DAWN only)."""
         if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
             return {}
 
         from scripts.analysis.behavioral import BehavioralAnalyzer
@@ -455,19 +535,21 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'behavioral'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Running behavioral analysis...")
+        print(f"  Analyzing behavioral patterns ({n_batches} batches)...")
         dataloader = self._get_dataloader()
         analyzer = BehavioralAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
         results = analyzer.run_all(dataloader, str(output_dir), n_batches)
 
+        print("  Done.")
         self.results['behavioral'] = results
         return results
 
     def analyze_coselection(self, n_batches: int = 50) -> Dict:
         """Analyze co-selection patterns (DAWN only)."""
         if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
             return {}
 
         from scripts.analysis.coselection import CoselectionAnalyzer
@@ -475,17 +557,19 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'coselection'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Running co-selection analysis...")
+        print(f"  Analyzing co-selection patterns ({n_batches} batches)...")
         dataloader = self._get_dataloader()
         analyzer = CoselectionAnalyzer(self.model, device=self.device)
         results = analyzer.run_all(dataloader, str(output_dir), 'all', n_batches)
 
+        print("  Done.")
         self.results['coselection'] = results
         return results
 
     def analyze_weight(self) -> Dict:
         """Analyze weight matrices (DAWN only)."""
         if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
             return {}
 
         from scripts.analysis.weight import WeightAnalyzer
@@ -493,10 +577,11 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'weight'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Running weight analysis...")
+        print("  Analyzing weight matrices...")
         analyzer = WeightAnalyzer(model=self.model, device=self.device)
         results = analyzer.run_all(str(output_dir))
 
+        print("  Done.")
         self.results['weight'] = results
         return results
 
@@ -770,8 +855,9 @@ class ModelAnalyzer:
         if only:
             analyses = [(n, f, a) for n, f, a in analyses if n in only]
 
-        for name, func, kwargs in analyses:
-            print(f"\n[{name.upper()}]")
+        total_analyses = len(analyses)
+        for i, (name, func, kwargs) in enumerate(analyses, 1):
+            print(f"\n[{i}/{total_analyses}] {name.upper()}")
             try:
                 func(**kwargs)
             except Exception as e:
@@ -781,14 +867,56 @@ class ModelAnalyzer:
                 self.results[name] = {'error': str(e)}
 
         # Paper outputs
-        print("\n[PAPER]")
+        print(f"\n[{total_analyses+1}/{total_analyses+2}] PAPER")
         self.generate_paper_outputs()
 
         # Report
-        print("\n[REPORT]")
+        print(f"\n[{total_analyses+2}/{total_analyses+2}] REPORT")
         self.generate_report()
 
+        # Final summary
+        self._print_final_summary()
+
         return self.results
+
+    def _print_final_summary(self):
+        """Print final analysis summary."""
+        print("\n" + "=" * 60)
+        print("ANALYSIS COMPLETE")
+        print("=" * 60)
+
+        # Model info
+        model_info = self.results.get('model_info', {})
+        print(f"\nModel: {self.name} ({self.model_type} v{self.version})")
+        print(f"Parameters: {model_info.get('total_M', 0):.2f}M")
+
+        # Performance
+        perf = self.results.get('performance', {})
+        val = perf.get('validation', {})
+        speed = perf.get('speed', {})
+        print(f"\nPerformance:")
+        print(f"  Loss: {val.get('loss', 0):.4f}")
+        print(f"  PPL:  {val.get('perplexity', 0):.2f}")
+        print(f"  Acc:  {val.get('accuracy', 0):.2f}%")
+        print(f"  Speed: {speed.get('tokens_per_sec', 0)/1000:.1f}K tok/s")
+
+        # Health summary (DAWN only)
+        health = self.results.get('health', {})
+        if health:
+            ema = health.get('ema_distribution', {})
+            total_active = sum(d.get('active', 0) for d in ema.values() if isinstance(d, dict))
+            total_neurons = sum(d.get('total', 0) for d in ema.values() if isinstance(d, dict))
+            if total_neurons > 0:
+                print(f"\nNeuron Health:")
+                print(f"  Active: {total_active}/{total_neurons} ({total_active/total_neurons*100:.1f}%)")
+
+        # Errors
+        errors = [k for k, v in self.results.items() if isinstance(v, dict) and 'error' in v]
+        if errors:
+            print(f"\nErrors in: {', '.join(errors)}")
+
+        print(f"\nOutput: {self.output_dir}")
+        print("=" * 60)
 
 
 class MultiModelAnalyzer:
