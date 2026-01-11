@@ -948,6 +948,12 @@ class GlobalRouters(nn.Module):
                     routing_info[f'tau_offset_r{pool_type}{key_suffix}'] = tau_offset.mean().item()
                 routing_info[f'gstr_r{pool_type}{key_suffix}'] = gate_strength.mean().item()
 
+        # Store pref tensors for analysis
+        if self.store_pref_tensors:
+            if pool_type == 'qk':
+                key = f'rqk_{qk_type.lower()}_pref'
+                routing_info[key] = logits
+
         return weights, aux_loss, routing_info
 
     def get_feature_knowledge_weights(self, x, attention_mask=None, tau_feature=None, cached_emb=None):
@@ -1224,12 +1230,18 @@ class AttentionCircuit(nn.Module):
                         restore_info['tau_offset_rqk_Q'] = info_q['tau_offset_rqk_Q']
                     if 'gstr_rqk_Q' in info_q:
                         restore_info['gstr_rqk_Q'] = info_q['gstr_rqk_Q']
+                    # Pref tensors for analysis
+                    if 'rqk_q_pref' in info_q:
+                        restore_info['rqk_q_pref'] = info_q['rqk_q_pref']
                 if info_k:
                     restore_info['selected_rqk_K'] = info_k.get('selected_rqk_K', 0)
                     if 'tau_offset_rqk_K' in info_k:
                         restore_info['tau_offset_rqk_K'] = info_k['tau_offset_rqk_K']
                     if 'gstr_rqk_K' in info_k:
                         restore_info['gstr_rqk_K'] = info_k['gstr_rqk_K']
+                    # Pref tensors for analysis
+                    if 'rqk_k_pref' in info_k:
+                        restore_info['rqk_k_pref'] = info_k['rqk_k_pref']
                 if info_v:
                     restore_info['selected_rv'] = info_v.get('selected_rv', 0)
                     if 'tau_offset_rv' in info_v:
