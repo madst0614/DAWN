@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from typing import Dict, Optional
 from collections import Counter, defaultdict
 
+from .base import BaseAnalyzer
 from .utils import (
     NEURON_TYPES, NEURON_TYPES_V18, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS, QK_POOLS,
     calc_entropy_ratio, gini_coefficient,
@@ -26,37 +27,26 @@ from .utils import (
 )
 
 
-class RoutingAnalyzer:
+class RoutingAnalyzer(BaseAnalyzer):
     """Routing pattern analyzer for DAWN v17.1+."""
 
-    def __init__(self, model, router, device='cuda'):
+    def __init__(self, model, router=None, device='cuda'):
         """
         Initialize analyzer.
 
         Args:
             model: DAWN model
-            router: NeuronRouter instance
+            router: NeuronRouter instance (auto-detected if None)
             device: Device for computation
         """
-        self.model = model
-        self.router = router
-        self.device = device
-        # v18.x detection: Q/K separated EMA
-        self.is_v18 = hasattr(router, 'usage_ema_feature_q')
+        super().__init__(model, router=router, device=device)
 
-    def _get_neuron_types(self):
-        """Get appropriate NEURON_TYPES for model version."""
-        return NEURON_TYPES_V18 if self.is_v18 else NEURON_TYPES
-
-    def _enable_pref_tensors(self):
-        """Enable store_pref_tensors for detailed analysis (v18.2+)."""
-        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
-            self.model.router.store_pref_tensors = True
-
-    def _disable_pref_tensors(self):
-        """Disable store_pref_tensors after analysis."""
-        if hasattr(self.model, 'router') and hasattr(self.model.router, 'store_pref_tensors'):
-            self.model.router.store_pref_tensors = False
+    # Use inherited methods from BaseAnalyzer:
+    # - is_v18 (property)
+    # - get_neuron_types()
+    # - enable_pref_tensors()
+    # - disable_pref_tensors()
+    # - run_analysis_loop()
 
     def analyze_entropy(self, dataloader, n_batches: int = 50) -> Dict:
         """
@@ -360,7 +350,7 @@ class RoutingAnalyzer:
             return jaccard.cpu().tolist()
 
         self.model.eval()
-        self._enable_pref_tensors()
+        self.enable_pref_tensors()
 
         try:
             with torch.no_grad():
@@ -390,7 +380,7 @@ class RoutingAnalyzer:
                         if rqk_q is not None and rqk_k is not None:
                             overlap_data['rqk'].extend(compute_jaccard_batch(rqk_q, rqk_k))
         finally:
-            self._disable_pref_tensors()
+            self.disable_pref_tensors()
 
         results = {}
         for key in ['fqk', 'rqk']:
@@ -421,7 +411,7 @@ class RoutingAnalyzer:
         """
         results = {}
         self.model.eval()
-        self._enable_pref_tensors()
+        self.enable_pref_tensors()
 
         try:
             for pool_name, pool_info in QK_POOLS.items():
@@ -554,7 +544,7 @@ class RoutingAnalyzer:
 
             results['n_batches'] = n_batches
         finally:
-            self._disable_pref_tensors()
+            self.disable_pref_tensors()
 
         return results
 
@@ -573,7 +563,7 @@ class RoutingAnalyzer:
         layer_entropy = {pool: {} for pool in QK_POOLS.keys()}
 
         self.model.eval()
-        self._enable_pref_tensors()
+        self.enable_pref_tensors()
 
         try:
             with torch.no_grad():
@@ -616,7 +606,7 @@ class RoutingAnalyzer:
                                 max_ent = np.log(pref_k.shape[-1])
                                 layer_entropy[pool_name][layer_idx]['k'].append(ent / max_ent * 100)
         finally:
-            self._disable_pref_tensors()
+            self.disable_pref_tensors()
 
         # Build results
         results = {}
@@ -664,6 +654,8 @@ class RoutingAnalyzer:
         """
         Visualize Q/K usage patterns.
 
+        Delegates to visualizers.qk_specialization.plot_qk_usage().
+
         Args:
             usage_results: Results from analyze_qk_usage()
             output_dir: Directory for output
@@ -671,69 +663,8 @@ class RoutingAnalyzer:
         Returns:
             Path to visualization or None
         """
-        if not HAS_MATPLOTLIB:
-            return None
-
-        os.makedirs(output_dir, exist_ok=True)
-
-        n_pools = len([k for k in usage_results if k not in ['n_batches']])
-        if n_pools == 0:
-            return None
-
-        fig, axes = plt.subplots(n_pools, 3, figsize=(18, 6 * n_pools))
-        if n_pools == 1:
-            axes = axes.reshape(1, -1)
-
-        row = 0
-        for pool_name, data in usage_results.items():
-            if pool_name == 'n_batches':
-                continue
-
-            q_counts = np.array(data['q_counts'])
-            k_counts = np.array(data['k_counts'])
-
-            # 1. Scatter: Q vs K
-            ax = axes[row, 0]
-            ax.scatter(q_counts, k_counts, alpha=0.6, s=30, c=QK_POOLS[pool_name]['color'])
-            max_val = max(q_counts.max(), k_counts.max())
-            ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='Q=K')
-            ax.set_xlabel('Q Selection Count')
-            ax.set_ylabel('K Selection Count')
-            ax.set_title(f'{data["display"]}: Q vs K Usage\n(corr={data["correlation"]:.3f})')
-            ax.legend()
-
-            # 2. Bar: Specialization
-            ax = axes[row, 1]
-            categories = ['Q-only', 'K-only', 'Shared', 'Inactive']
-            values = [data['q_specialized'], data['k_specialized'], data['shared'], data['inactive']]
-            colors = ['blue', 'orange', 'green', 'gray']
-            bars = ax.bar(categories, values, color=colors, alpha=0.7)
-            ax.set_ylabel('Neuron Count')
-            ax.set_title(f'{data["display"]}: Neuron Specialization')
-            for bar, val in zip(bars, values):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), str(val), ha='center', va='bottom')
-
-            # 3. Histogram: Q/(Q+K) ratio
-            ax = axes[row, 2]
-            total = q_counts + k_counts + 1e-8
-            q_ratio = q_counts / total
-            active_mask = (q_counts + k_counts) > 0
-            if active_mask.sum() > 0:
-                ax.hist(q_ratio[active_mask], bins=20, alpha=0.7, color='purple', edgecolor='black')
-            ax.axvline(x=0.5, color='red', linestyle='--', label='Q=K')
-            ax.set_xlabel('Q Ratio (Q / (Q+K))')
-            ax.set_ylabel('Neuron Count')
-            ax.set_title(f'{data["display"]}: Q/K Balance Distribution')
-            ax.legend()
-
-            row += 1
-
-        plt.tight_layout()
-        path = os.path.join(output_dir, 'qk_usage_analysis.png')
-        plt.savefig(path, dpi=150)
-        plt.close()
-
-        return path
+        from .visualizers import plot_qk_usage
+        return plot_qk_usage(usage_results, output_dir)
 
     def run_all(self, dataloader, output_dir: str = './routing_analysis', n_batches: int = 50) -> Dict:
         """
