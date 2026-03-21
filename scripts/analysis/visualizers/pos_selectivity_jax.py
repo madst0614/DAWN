@@ -202,6 +202,115 @@ _POOL_TO_ATTN_IDX = {
 _POOL_IS_KNOW = {'fknow': 0, 'rknow': 1}
 
 
+def _build_batched_forward(params, config, pool_type):
+    """Build a JIT-compiled batched forward that returns layer-averaged routing weights.
+
+    Returns:
+        forward_fn(input_ids_jnp) -> weights [B, S, N] averaged across layers
+    """
+    from models.model_v17_1_jax import (
+        _layer_norm, _router_attn_forward, _router_know_forward,
+        _attention_forward, _knowledge_forward,
+    )
+
+    all_params = params.get('params', params)
+    router_params = all_params.get('router', {})
+    sn_params = all_params.get('shared_neurons', {})
+    n_layers = config.get('n_layers', 16)
+
+    n_fqk = config.get('n_feature_qk', 88)
+    n_fv = config.get('n_feature_v', 352)
+    n_rqk = config.get('n_restore_qk', 88)
+    n_rv = config.get('n_restore_v', 352)
+    n_fk = config.get('n_feature_know', 224)
+    n_rk = config.get('n_restore_know', 224)
+    d_space = config.get('d_space', 256)
+    tk_fqk = config.get('top_k_feature_qk', 16)
+    tk_fv = config.get('top_k_feature_v', 16)
+    tk_rqk = config.get('top_k_restore_qk', 16)
+    tk_rv = config.get('top_k_restore_v', 16)
+    tk_fk = config.get('top_k_feature_know', 16)
+    tk_rk = config.get('top_k_restore_know', 16)
+    n_heads = config.get('n_heads', 8)
+    d_model = config.get('d_model', 768)
+
+    is_attn_pool = pool_type in _POOL_TO_ATTN_IDX
+    is_know_pool = pool_type in _POOL_IS_KNOW
+    attn_idx = _POOL_TO_ATTN_IDX.get(pool_type)
+    know_idx = _POOL_IS_KNOW.get(pool_type)
+
+    block_params_list = [all_params[f'block_{i}'] for i in range(n_layers)]
+
+    token_emb_table = all_params['token_emb']['embedding']
+    pos_emb_table = all_params['pos_emb']['embedding']
+
+    @jax.jit
+    def _forward(input_ids):
+        """input_ids: [B, S] -> weights: [B, S, N]"""
+        B, S = input_ids.shape
+        x = token_emb_table[input_ids] + pos_emb_table[jnp.arange(S)[jnp.newaxis, :]]
+
+        rng_key = jax.random.PRNGKey(0)
+        weight_sum = jnp.zeros((B, S, 1))  # placeholder shape, replaced on first hit
+        first = True
+
+        for li in range(n_layers):
+            bp = block_params_list[li]
+            rng_key, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng_key, 5)
+
+            normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            attn_results = _router_attn_forward(
+                normed, router_params,
+                n_fqk, n_fv, n_rqk, n_rv, d_space,
+                tk_fqk, tk_fv, tk_rqk, tk_rv,
+                0.0, None, True, rng_ar,
+            )
+            fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w = attn_results[:6]
+
+            if is_attn_pool:
+                w = attn_results[attn_idx]  # [B, S, N]
+                if first:
+                    weight_sum = w
+                    first = False
+                else:
+                    weight_sum = weight_sum + w
+
+            attn_out = _attention_forward(
+                normed, sn_params,
+                fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w,
+                bp['attn']['expand_O']['kernel'],
+                n_fqk, n_rqk, n_heads, d_model,
+                0.0, True, rng_a,
+            )
+            x = x + attn_out
+
+            normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            fk_w, rk_w, _ = _router_know_forward(
+                normed, router_params,
+                n_fqk, n_fv, n_rqk, n_rv, n_fk, n_rk,
+                tk_fk, tk_rk,
+                0.0, None, True, rng_kr,
+            )
+
+            if is_know_pool:
+                w = fk_w if know_idx == 0 else rk_w
+                if first:
+                    weight_sum = w
+                    first = False
+                else:
+                    weight_sum = weight_sum + w
+
+            know_out = _knowledge_forward(
+                normed, sn_params, fk_w, rk_w,
+                0.0, True, rng_k,
+            )
+            x = x + know_out
+
+        return weight_sum / n_layers
+
+    return _forward
+
+
 def _extract_multilayer_weights(
     params, config, token_ids_np, pool_type,
 ):
@@ -222,134 +331,78 @@ def _extract_multilayer_weights(
     if not HAS_JAX:
         return None
 
-    from models.model_v17_1_jax import (
-        _layer_norm, _router_attn_forward, _router_know_forward,
-        _attention_forward, _knowledge_forward,
-    )
-
-    all_params = params.get('params', params)
-    router_params = all_params.get('router', {})
-    sn_params = all_params.get('shared_neurons', {})
-    n_layers = config.get('n_layers', 16)
-
-    # Config values
-    n_fqk = config.get('n_feature_qk', 88)
-    n_fv = config.get('n_feature_v', 352)
-    n_rqk = config.get('n_restore_qk', 88)
-    n_rv = config.get('n_restore_v', 352)
-    n_fk = config.get('n_feature_know', 224)
-    n_rk = config.get('n_restore_know', 224)
-    d_space = config.get('d_space', 256)
-    tk_fqk = config.get('top_k_feature_qk', 16)
-    tk_fv = config.get('top_k_feature_v', 16)
-    tk_rqk = config.get('top_k_restore_qk', 16)
-    tk_rv = config.get('top_k_restore_v', 16)
-    tk_fk = config.get('top_k_feature_know', 16)
-    tk_rk = config.get('top_k_restore_know', 16)
-    n_heads = config.get('n_heads', 8)
-    d_model = config.get('d_model', 768)
-
     is_attn_pool = pool_type in _POOL_TO_ATTN_IDX
     is_know_pool = pool_type in _POOL_IS_KNOW
-
     if not is_attn_pool and not is_know_pool:
         return None
 
+    forward_fn = _build_batched_forward(params, config, pool_type)
     input_ids = jnp.array(token_ids_np)
-    B, S = input_ids.shape
+    w = np.array(forward_fn(input_ids))
+    if w.ndim == 3:
+        return w[0].astype(np.float32)
+    return w.astype(np.float32)
 
-    tok_emb = all_params['token_emb']['embedding'][input_ids]
-    pos_emb = all_params['pos_emb']['embedding'][jnp.arange(S)[jnp.newaxis, :]]
-    x = tok_emb + pos_emb
 
-    rng_key = jax.random.PRNGKey(0)
-    weight_sum = None
-    layer_count = 0
+def _extract_multilayer_weights_batched(
+    forward_fn, input_ids_batch, seq_lens,
+):
+    """Batched multi-layer extraction. Returns list of [S_i, N] arrays (unpadded).
 
-    for li in range(n_layers):
-        bp = all_params[f'block_{li}']
-        rng_key, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng_key, 5)
+    Args:
+        forward_fn: JIT-compiled forward from _build_batched_forward
+        input_ids_batch: [B, S_max] padded jnp array
+        seq_lens: list of actual sequence lengths per batch item
 
-        # Attention sub-block
-        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
-
-        attn_results = _router_attn_forward(
-            normed, router_params,
-            n_fqk, n_fv, n_rqk, n_rv, d_space,
-            tk_fqk, tk_fv, tk_rqk, tk_rv,
-            0.0, None, True, rng_ar,
-        )
-        fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w = attn_results[:6]
-
-        if is_attn_pool:
-            idx = _POOL_TO_ATTN_IDX[pool_type]
-            w = np.array(attn_results[idx])  # [B, S, N]
-            if w.ndim == 3:
-                w = w[0]  # [S, N]
-            else:
-                w = np.broadcast_to(w[0:1], (S, w.shape[-1]))
-            if weight_sum is None:
-                weight_sum = w.astype(np.float64)
-            else:
-                weight_sum += w
-            layer_count += 1
-
-        # Forward attention
-        attn_out = _attention_forward(
-            normed, sn_params,
-            fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w,
-            bp['attn']['expand_O']['kernel'],
-            n_fqk, n_rqk, n_heads, d_model,
-            0.0, True, rng_a,
-        )
-        x = x + attn_out
-
-        # Knowledge sub-block
-        normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
-
-        fk_w, rk_w, _ = _router_know_forward(
-            normed, router_params,
-            n_fqk, n_fv, n_rqk, n_rv, n_fk, n_rk,
-            tk_fk, tk_rk,
-            0.0, None, True, rng_kr,
-        )
-
-        if is_know_pool:
-            know_idx = _POOL_IS_KNOW[pool_type]
-            w = np.array(fk_w if know_idx == 0 else rk_w)
-            if w.ndim == 3:
-                w = w[0]
-            else:
-                w = np.broadcast_to(w[0:1], (S, w.shape[-1]))
-            if weight_sum is None:
-                weight_sum = w.astype(np.float64)
-            else:
-                weight_sum += w
-            layer_count += 1
-
-        know_out = _knowledge_forward(
-            normed, sn_params, fk_w, rk_w,
-            0.0, True, rng_k,
-        )
-        x = x + know_out
-
-    if weight_sum is None or layer_count == 0:
-        return None
-    return (weight_sum / layer_count).astype(np.float32)
+    Returns:
+        list of [S_i, N] numpy arrays
+    """
+    w_batch = np.array(forward_fn(input_ids_batch))  # [B, S_max, N]
+    results = []
+    for i, slen in enumerate(seq_lens):
+        results.append(w_batch[i, :slen].astype(np.float32))
+    return results
 
 
 # ============================================================
 # Analysis
 # ============================================================
 
+def _accumulate_weights(weight_sum, weight_count, pos_token_counts,
+                        w, pos_tags, n_neurons):
+    """Accumulate routing weights into POS accumulators for one sentence."""
+    seq_len = min(len(pos_tags), w.shape[0])
+    w = w[:seq_len]
+
+    if w.shape[1] > n_neurons:
+        w = w[:, :n_neurons]
+    elif w.shape[1] < n_neurons:
+        w = np.pad(w, ((0, 0), (0, n_neurons - w.shape[1])))
+
+    pos_indices = np.array([POS_TO_IDX.get(t, -1)
+                            for t in pos_tags[:seq_len]], dtype=np.int32)
+    valid = pos_indices >= 0
+    if valid.any():
+        vp = pos_indices[valid]
+        vw = w[valid]
+        active = (vw > 0).astype(np.int64)
+        np.add.at(weight_sum, vp, vw)
+        np.add.at(weight_count, vp, active)
+        np.add.at(pos_token_counts, vp, 1)
+
+
 def analyze_pos_selectivity(
     model_cls, params, config, dataset,
     pool_type='fv', max_sentences=None, multi_layer=False,
+    batch_size=16,
 ):
     """Compute POS selectivity matrix.
 
     For each (POS, neuron) pair, accumulates routing weights then computes:
         selectivity = mean_weight_given_pos / mean_weight_overall
+
+    In multi-layer mode, sentences are batched (padded to max length within batch)
+    and processed through a JIT-compiled full forward pass for efficiency.
 
     Returns dict with selectivity matrix, raw stats, top selective neurons.
     """
@@ -361,7 +414,6 @@ def analyze_pos_selectivity(
     model_instance = create_model_from_config(config)
     extractor = JAXRoutingDataExtractor(model_instance, params, config)
 
-    # Determine neuron count from pool type
     pool_to_n = {
         'fqk_q': config.get('n_feature_qk', 88),
         'fqk_k': config.get('n_feature_qk', 88),
@@ -375,7 +427,6 @@ def analyze_pos_selectivity(
     n_neurons = pool_to_n.get(pool_type, 352)
     n_pos = len(UPOS_TAGS)
 
-    # Accumulators
     weight_sum = np.zeros((n_pos, n_neurons), dtype=np.float64)
     weight_count = np.zeros((n_pos, n_neurons), dtype=np.int64)
     pos_token_counts = np.zeros(n_pos, dtype=np.int64)
@@ -388,7 +439,10 @@ def analyze_pos_selectivity(
         print("  Warning: JAX not available, falling back to embedding-only")
         multi_layer = False
 
-    for i in tqdm(range(n_sents), desc=f'POS selectivity ({pool_type}, {mode_label})'):
+    # ---- Phase 1: Pre-tokenize all sentences ----
+    print(f"  Pre-tokenizing {n_sents} sentences...")
+    tokenized = []
+    for i in range(n_sents):
         sent = dataset[i]
         try:
             pos_tags, token_ids = align_tokens_to_pos(
@@ -396,54 +450,85 @@ def analyze_pos_selectivity(
         except Exception:
             skipped += 1
             continue
-
         if not token_ids:
             skipped += 1
             continue
+        tokenized.append((pos_tags, token_ids))
 
-        input_ids = np.array([token_ids], dtype=np.int32)
+    print(f"  Tokenized {len(tokenized)}/{n_sents} sentences "
+          f"(skipped {skipped})")
 
-        if multi_layer:
-            # Partial forward through all layers, average weights (matches GPU)
-            w = _extract_multilayer_weights(params, config, input_ids, pool_type)
-        else:
-            # Embedding-level only (fast, but single-layer)
+    # ---- Phase 2: Process ----
+    if multi_layer:
+        # Sort by length for efficient padding (less wasted compute)
+        tokenized.sort(key=lambda x: len(x[1]))
+
+        # Build JIT-compiled forward and warm up
+        forward_fn = _build_batched_forward(params, config, pool_type)
+        print(f"  JIT compiling batched forward (batch_size={batch_size})...",
+              end=" ", flush=True)
+        import time
+        t0 = time.time()
+        # Warm-up with a small dummy batch to trigger compilation
+        max_seq = config.get('max_seq_len', 512)
+        dummy_len = min(32, max_seq)
+        dummy = jnp.zeros((batch_size, dummy_len), dtype=jnp.int32)
+        _ = forward_fn(dummy)
+        _.block_until_ready()
+        print(f"done ({time.time() - t0:.1f}s)")
+
+        # Process in batches
+        n_batches = (len(tokenized) + batch_size - 1) // batch_size
+        for bi in tqdm(range(n_batches),
+                       desc=f'POS selectivity ({pool_type}, {mode_label})'):
+            start = bi * batch_size
+            end = min(start + batch_size, len(tokenized))
+            batch_items = tokenized[start:end]
+
+            # Pad to max length in this batch
+            seq_lens = [len(ids) for _, ids in batch_items]
+            max_len = max(seq_lens)
+            # Clamp to max_seq_len
+            max_len = min(max_len, max_seq)
+            seq_lens = [min(s, max_len) for s in seq_lens]
+
+            padded = np.zeros((len(batch_items), max_len), dtype=np.int32)
+            for j, (_, ids) in enumerate(batch_items):
+                slen = seq_lens[j]
+                padded[j, :slen] = ids[:slen]
+
+            # Batched forward
+            w_list = _extract_multilayer_weights_batched(
+                forward_fn, jnp.array(padded), seq_lens)
+
+            # Accumulate per sentence
+            for j, (pos_tags, _) in enumerate(batch_items):
+                w = w_list[j]
+                if w is None:
+                    continue
+                _accumulate_weights(weight_sum, weight_count,
+                                    pos_token_counts, w, pos_tags, n_neurons)
+    else:
+        # Embedding-only mode (already fast, no batching needed)
+        for pos_tags, token_ids in tqdm(
+                tokenized,
+                desc=f'POS selectivity ({pool_type}, {mode_label})'):
+            input_ids = np.array([token_ids], dtype=np.int32)
             routing_info = extractor.extract_routing(input_ids)
             routing = JAXRoutingData(routing_info)
             weights = routing.get_weight(pool_type)
             if weights is None:
-                w = None
-            elif weights.ndim == 3:
-                w = weights[0]  # [S, N]
+                continue
+            if weights.ndim == 3:
+                w = weights[0]
             else:
-                w = np.broadcast_to(weights[0:1], (len(token_ids), weights.shape[-1]))
+                w = np.broadcast_to(weights[0:1],
+                                    (len(token_ids), weights.shape[-1]))
+            _accumulate_weights(weight_sum, weight_count,
+                                pos_token_counts, w, pos_tags, n_neurons)
 
-        if w is None:
-            skipped += 1
-            continue
-
-        seq_len = min(len(pos_tags), w.shape[0])
-        w = w[:seq_len]
-
-        # Truncate/pad neuron dim
-        if w.shape[1] > n_neurons:
-            w = w[:, :n_neurons]
-        elif w.shape[1] < n_neurons:
-            w = np.pad(w, ((0, 0), (0, n_neurons - w.shape[1])))
-
-        # Accumulate per POS
-        pos_indices = np.array([POS_TO_IDX.get(t, -1)
-                                for t in pos_tags[:seq_len]], dtype=np.int32)
-        valid = pos_indices >= 0
-        if valid.any():
-            vp = pos_indices[valid]
-            vw = w[valid]
-            active = (vw > 0).astype(np.int64)
-            np.add.at(weight_sum, vp, vw)
-            np.add.at(weight_count, vp, active)
-            np.add.at(pos_token_counts, vp, 1)
-
-    print(f"  Processed {n_sents - skipped}/{n_sents} sentences (skipped {skipped})")
+    print(f"  Processed {len(tokenized)}/{n_sents} sentences "
+          f"(skipped {skipped})")
 
     # Compute selectivity matrix — frequency-based (paper Section 4.2)
     #
@@ -627,6 +712,8 @@ def main():
     parser.add_argument('--embedding_only', action='store_true',
                         help='Use embedding-level routing only (fast, but single-layer). '
                              'Overrides --multi_layer.')
+    parser.add_argument('--batch_size', type=int, default=16,
+                        help='Batch size for multi-layer mode (default: 16)')
     parser.add_argument('--dpi', type=int, default=300)
     args = parser.parse_args()
 
@@ -654,6 +741,7 @@ def main():
         pool_type=args.pool_type,
         max_sentences=args.max_sentences,
         multi_layer=args.multi_layer,
+        batch_size=args.batch_size,
     )
 
     # Save JSON
