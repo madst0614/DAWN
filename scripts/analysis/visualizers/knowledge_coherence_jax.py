@@ -247,7 +247,7 @@ def analyze_knowledge_coherence(
         ]
 
         # Top shared neurons
-        shared_idx = np.where(cap_active & ctrl_active)[0]
+        shared_idx = np.where(cap_low & ctrl_low)[0]
         shared_sorted = shared_idx[np.argsort(cap_freq[shared_idx] + ctrl_freq[shared_idx])[::-1]]
         top_shared = [
             {'neuron': int(i), 'capital_freq': float(cap_freq[i]),
