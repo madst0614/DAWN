@@ -58,11 +58,24 @@ from scripts.analysis.utils_jax import (
     load_model_jax, load_val_data_jax, create_batches,
     convert_to_serializable, save_results,
 )
-from scripts.analysis.visualizers.style import PAPER_STYLE, apply_paper_style
+
+# Inline style (avoids __init__.py torch import chain)
+PAPER_STYLE = {
+    'font_family': 'serif', 'font_size_base': 10, 'font_size_label': 14,
+    'font_size_subtitle': 14, 'font_size_tick': 11, 'font_size_legend': 10,
+    'font_size_annotation': 12, 'font_size_category': 14,
+    'axes_linewidth': 0.8, 'spines_top': False, 'spines_right': False,
+}
+S = PAPER_STYLE
 
 if HAS_MATPLOTLIB:
-    apply_paper_style(plt)
-S = PAPER_STYLE
+    plt.rcParams.update({
+        'font.family': S['font_family'], 'font.size': S['font_size_base'],
+        'axes.linewidth': S['axes_linewidth'],
+        'axes.spines.top': S['spines_top'], 'axes.spines.right': S['spines_right'],
+        'axes.labelsize': S['font_size_label'],
+        'xtick.labelsize': S['font_size_tick'], 'ytick.labelsize': S['font_size_tick'],
+    })
 
 COLOR_ATTENTION = '#4A90D9'
 COLOR_KNOWLEDGE = '#50C878'
