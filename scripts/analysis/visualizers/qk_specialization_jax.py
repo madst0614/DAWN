@@ -136,16 +136,21 @@ def analyze_qk_specialization(
                 overlap_ratio = (overlap.sum(axis=-1) / (active_q + 1e-8)).mean()
                 batch_overlaps.append(float(overlap_ratio))
 
-        # Correlation
-        if q_counts.sum() > 0 and k_counts.sum() > 0:
-            corr = float(np.corrcoef(q_counts, k_counts)[0, 1])
-        else:
-            corr = 0.0
-
         # Specialization ratio
         total_usage = q_counts + k_counts
         q_ratio = np.zeros_like(q_counts)
         valid = total_usage > 0
+
+        # Correlation: r_all (all neurons), r_active (active only)
+        if q_counts.sum() > 0 and k_counts.sum() > 0:
+            corr_all = float(np.corrcoef(q_counts, k_counts)[0, 1])
+        else:
+            corr_all = 0.0
+
+        if valid.sum() >= 2:
+            corr_active = float(np.corrcoef(q_counts[valid], k_counts[valid])[0, 1])
+        else:
+            corr_active = corr_all
         q_ratio[valid] = q_counts[valid] / total_usage[valid]
 
         q_specialized = int((q_ratio > 0.7).sum())
@@ -175,7 +180,8 @@ def analyze_qk_specialization(
             'n_neurons': n_neurons,
             'q_counts': q_counts.tolist(),
             'k_counts': k_counts.tolist(),
-            'correlation': corr,
+            'correlation': corr_all,
+            'correlation_active': corr_active,
             'avg_overlap': float(np.mean(batch_overlaps)) if batch_overlaps else 0,
             'std_overlap': float(np.std(batch_overlaps)) if batch_overlaps else 0,
             'q_specialized': q_specialized,
@@ -249,7 +255,9 @@ def plot_qk_scatter(results, output_dir, dpi=300):
         ax1.plot([0, lim], [0, lim], '--', color='gray', linewidth=0.8, alpha=0.5)
         ax1.set_xlabel('Q Selection Count', fontsize=S['font_size_label'])
         ax1.set_ylabel('K Selection Count', fontsize=S['font_size_label'])
-        ax1.set_title(f'{data["display"]} — Q vs K Usage  (r={data["correlation"]:.3f})',
+        r_active = data.get('correlation_active', data['correlation'])
+        r_all = data['correlation']
+        ax1.set_title(f'{data["display"]} — Q vs K Usage  (r_active={r_active:.3f}, r_all={r_all:.3f})',
                        fontsize=S['font_size_subtitle'], fontweight='bold')
         ax1.legend(fontsize=S['font_size_legend'], loc='upper left')
 
@@ -333,7 +341,7 @@ def main():
         if d is None:
             continue
         print(f"\n  {d['display']} (n={d['n_neurons']}):")
-        print(f"    Correlation:    r = {d['correlation']:.4f}")
+        print(f"    Correlation:    r_all = {d['correlation']:.4f},  r_active = {d.get('correlation_active', d['correlation']):.4f}")
         print(f"    Q-specialized:  {d['q_specialized']}")
         print(f"    K-specialized:  {d['k_specialized']}")
         print(f"    Shared:         {d['shared']}")
