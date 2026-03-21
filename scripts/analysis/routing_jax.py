@@ -511,19 +511,21 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
             k_specialized = int((q_ratio < 0.3).sum())
             shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7)).sum())
 
-            # Sensitivity analysis
-            sensitivity_thresholds = [0.6, 0.65, 0.7, 0.75, 0.8]
-            sensitivity_analysis = {}
-            for t in sensitivity_thresholds:
-                q_spec = int((q_ratio > t).sum())
-                k_spec = int((q_ratio < (1 - t)).sum())
-                shared_t = int(((q_ratio >= (1 - t)) & (q_ratio <= t)).sum())
-                sensitivity_analysis[str(t)] = {
-                    'q_specialized': q_spec,
-                    'k_specialized': k_spec,
-                    'shared': shared_t,
+            # Sensitivity analysis (vectorized via broadcasting)
+            sensitivity_thresholds = np.array([0.6, 0.65, 0.7, 0.75, 0.8])
+            q_spec_all = (q_ratio[:, np.newaxis] > sensitivity_thresholds).sum(axis=0)
+            k_spec_all = (q_ratio[:, np.newaxis] < (1 - sensitivity_thresholds)).sum(axis=0)
+            shared_all = ((q_ratio[:, np.newaxis] >= (1 - sensitivity_thresholds)) &
+                          (q_ratio[:, np.newaxis] <= sensitivity_thresholds)).sum(axis=0)
+            sensitivity_analysis = {
+                str(float(t)): {
+                    'q_specialized': int(q_spec_all[i]),
+                    'k_specialized': int(k_spec_all[i]),
+                    'shared': int(shared_all[i]),
                     'total': n_neurons,
                 }
+                for i, t in enumerate(sensitivity_thresholds)
+            }
 
             results[pool_name] = {
                 'display': pool_info['display'],

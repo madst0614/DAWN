@@ -432,8 +432,8 @@ def analyze_pos_selectivity(
             w = np.pad(w, ((0, 0), (0, n_neurons - w.shape[1])))
 
         # Accumulate per POS
-        pos_indices = np.array([POS_TO_IDX.get(pos_tags[j], -1)
-                                for j in range(seq_len)], dtype=np.int32)
+        pos_indices = np.array([POS_TO_IDX.get(t, -1)
+                                for t in pos_tags[:seq_len]], dtype=np.int32)
         valid = pos_indices >= 0
         if valid.any():
             vp = pos_indices[valid]

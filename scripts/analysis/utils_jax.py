@@ -454,8 +454,15 @@ def load_val_data_jax(val_path: str, max_tokens: int = 10_000_000) -> np.ndarray
 # JAX Routing Data Extraction
 # ============================================================
 
+def _softmax_np(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically stable softmax (numpy)."""
+    x_max = np.max(x, axis=axis, keepdims=True)
+    e_x = np.exp(x - x_max)
+    return e_x / (np.sum(e_x, axis=axis, keepdims=True) + 1e-8)
+
+
 def topk_sparsify_np(weights: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Top-k sparsification with renormalization (numpy version).
+    """Top-k sparsification with renormalization (numpy version, vectorized).
 
     Args:
         weights: [..., N] softmax probabilities
@@ -465,21 +472,15 @@ def topk_sparsify_np(weights: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarra
         sparse_weights: [..., N] with only top-k nonzero, renormalized
         topk_idx: [..., k] indices
     """
-    # Get top-k indices and values
+    # Get top-k indices via argpartition (O(N) per row, much faster than full sort)
     topk_idx = np.argpartition(weights, -k, axis=-1)[..., -k:]
 
-    # Gather values at top-k positions
-    N = weights.shape[-1]
-    batch_shape = weights.shape[:-1]
+    # Gather top-k values — fully vectorized, no Python loops
+    topk_vals = np.take_along_axis(weights, topk_idx, axis=-1)  # [..., k]
 
-    # Create sparse output
+    # Scatter back: build sparse array using advanced indexing
     sparse = np.zeros_like(weights)
-
-    # For each position in batch, set top-k values
-    for idx in np.ndindex(batch_shape):
-        top_indices = topk_idx[idx]
-        top_values = weights[idx][top_indices]
-        sparse[idx][top_indices] = top_values
+    np.put_along_axis(sparse, topk_idx, topk_vals, axis=-1)
 
     # Renormalize
     sparse = sparse / (sparse.sum(axis=-1, keepdims=True) + 1e-8)
@@ -600,18 +601,12 @@ class JAXRoutingDataExtractor:
         logits_rqk_K = np.einsum('bsd,nd->bsn', h_rqk_K, rqk_emb)
         logits_rv = np.einsum('bsd,nd->bsn', h_rv, rv_emb)
 
-        # Softmax
-        def softmax(x, axis=-1):
-            x_max = np.max(x, axis=axis, keepdims=True)
-            e_x = np.exp(x - x_max)
-            return e_x / (np.sum(e_x, axis=axis, keepdims=True) + 1e-8)
-
-        pref_fqk_Q = softmax(logits_fqk_Q)
-        pref_fqk_K = softmax(logits_fqk_K)
-        pref_fv = softmax(logits_fv)
-        pref_rqk_Q = softmax(logits_rqk_Q)
-        pref_rqk_K = softmax(logits_rqk_K)
-        pref_rv = softmax(logits_rv)
+        pref_fqk_Q = _softmax_np(logits_fqk_Q)
+        pref_fqk_K = _softmax_np(logits_fqk_K)
+        pref_fv = _softmax_np(logits_fv)
+        pref_rqk_Q = _softmax_np(logits_rqk_Q)
+        pref_rqk_K = _softmax_np(logits_rqk_K)
+        pref_rv = _softmax_np(logits_rv)
 
         # Top-k sparsification
         fqk_w_Q, _ = topk_sparsify_np(pref_fqk_Q, self.top_k_feature_qk)
@@ -686,14 +681,8 @@ class JAXRoutingDataExtractor:
         logits_fk = np.einsum('bsd,nd->bsn', h_fk, emb_fk)
         logits_rk = np.einsum('bsd,nd->bsn', h_rk, emb_rk)
 
-        # Softmax
-        def softmax(x, axis=-1):
-            x_max = np.max(x, axis=axis, keepdims=True)
-            e_x = np.exp(x - x_max)
-            return e_x / (np.sum(e_x, axis=axis, keepdims=True) + 1e-8)
-
-        pref_fk = softmax(logits_fk)
-        pref_rk = softmax(logits_rk)
+        pref_fk = _softmax_np(logits_fk)
+        pref_rk = _softmax_np(logits_rk)
 
         # Top-k sparsification
         fk_w, _ = topk_sparsify_np(pref_fk, self.top_k_feature_know)

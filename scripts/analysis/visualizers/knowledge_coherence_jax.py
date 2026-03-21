@@ -193,11 +193,11 @@ def analyze_knowledge_coherence(
             'type': 'capital',
         }
         for pool_key in ['fknow', 'rknow']:
-            active = activations[pool_key]
-            for idx in active:
-                if idx < pool_sizes[pool_key]:
-                    capital_counts[pool_key][idx] += 1
-            per_query[f"capital_{label}"][pool_key] = sorted(active)
+            active_arr = np.array(sorted(activations[pool_key]), dtype=np.int32)
+            valid = active_arr[active_arr < pool_sizes[pool_key]]
+            if len(valid) > 0:
+                np.add.at(capital_counts[pool_key], valid, 1)
+            per_query[f"capital_{label}"][pool_key] = valid.tolist()
 
     print(f"  Processing {n_control} control queries...")
     for label, prompt in control_prompts:
@@ -207,11 +207,11 @@ def analyze_knowledge_coherence(
             'type': 'control',
         }
         for pool_key in ['fknow', 'rknow']:
-            active = activations[pool_key]
-            for idx in active:
-                if idx < pool_sizes[pool_key]:
-                    control_counts[pool_key][idx] += 1
-            per_query[f"control_{label}"][pool_key] = sorted(active)
+            active_arr = np.array(sorted(activations[pool_key]), dtype=np.int32)
+            valid = active_arr[active_arr < pool_sizes[pool_key]]
+            if len(valid) > 0:
+                np.add.at(control_counts[pool_key], valid, 1)
+            per_query[f"control_{label}"][pool_key] = valid.tolist()
 
     # Compute per-pool stats
     results = {'per_pool': {}, 'per_query': per_query}
@@ -405,8 +405,8 @@ def _plot_query_heatmap(results, pool_key, output_dir, dpi=300):
     rows = []
 
     for qname, qdata in sorted(per_query.items()):
-        active_set = set(qdata.get(pool_key, []))
-        row = np.array([1.0 if int(i) in active_set else 0.0 for i in top_idx])
+        active_arr = np.array(qdata.get(pool_key, []), dtype=np.int64)
+        row = np.isin(top_idx, active_arr).astype(float)
         query_labels.append(f"{'*' if qdata['type']=='capital' else ' '} {qdata['prompt']}")
         rows.append(row)
 
