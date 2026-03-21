@@ -621,11 +621,18 @@ def main():
     parser.add_argument('--ud_data', default=None, help='Local .conllu file path')
     parser.add_argument('--max_sentences', type=int, default=2000)
     parser.add_argument('--top_n_neurons', type=int, default=50)
-    parser.add_argument('--multi_layer', action='store_true',
+    parser.add_argument('--multi_layer', action='store_true', default=True,
                         help='Average routing weights across all layers via partial forward '
-                             '(matches GPU analysis). Slower but more accurate.')
+                             '(matches GPU analysis). Default: True for paper-consistent results.')
+    parser.add_argument('--embedding_only', action='store_true',
+                        help='Use embedding-level routing only (fast, but single-layer). '
+                             'Overrides --multi_layer.')
     parser.add_argument('--dpi', type=int, default=300)
     args = parser.parse_args()
+
+    # --embedding_only overrides --multi_layer
+    if args.embedding_only:
+        args.multi_layer = False
 
     os.makedirs(args.output, exist_ok=True)
 
