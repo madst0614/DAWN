@@ -1,38 +1,44 @@
 #!/usr/bin/env python3
 """
-Knowledge Neuron Coherence Analysis (JAX/TPU) — Section 4.3
+Knowledge Neuron Coherence Analysis (JAX/TPU) — Appendix D.3
 =============================================================
-Compare neuron activation patterns between capital-knowledge queries
-and control queries to identify knowledge-specific neurons.
+Autoregressive generation approach matching GPU paper method:
+  1. For each (prompt, target) pair, generate until target token appears
+  2. On target hit, extract routing weights at the last position via full forward
+  3. Repeat until target appears min_target_count times (default 100, max 20000 runs)
+  4. Compute per-neuron activation frequency from target-hit steps
 
-Capital queries:  "The capital of France is", "The capital of Japan is", ...
-Control queries:  "The sky is", "The water is", ...
-
-For F-Know and R-Know pools, classifies neurons as:
-  - Shared:           fires for both capital AND control (freq > threshold)
-  - Capital-specific: fires for capital queries only
-  - Control-specific: fires for control queries only
+Pools analyzed: fknow, rknow (+ optionally fv, rv)
 
 Designed for single-host TPU v4-8.
 
 Usage:
     python scripts/analysis/visualizers/knowledge_coherence_jax.py \
         --checkpoint gs://dawn-tpu-data-c4/checkpoints/... \
-        --output ./section4_results
+        --output ./section4_results \
+        --min_targets 100 --max_runs 20000
 """
 
 import sys
 import os
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
-from collections import defaultdict
+from collections import Counter
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
+
+try:
+    import jax
+    import jax.numpy as jnp
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
 
 try:
     import matplotlib
@@ -50,11 +56,10 @@ except ImportError:
 
 from scripts.analysis.utils_jax import (
     load_model_jax, create_model_from_config,
-    JAXRoutingDataExtractor, JAXRoutingData,
     convert_to_serializable, save_results,
 )
 
-# Inline style (avoids __init__.py torch import chain)
+# Inline style
 PAPER_STYLE = {
     'font_family': 'serif', 'font_size_base': 10, 'font_size_label': 14,
     'font_size_subtitle': 14, 'font_size_tick': 11, 'font_size_legend': 10,
@@ -79,74 +84,144 @@ COLOR_CONTROL = '#457B9D'
 COLOR_INACTIVE = '#95A5A6'
 
 # ============================================================
-# Default Prompts
+# Default Prompts (Appendix D.3)
 # ============================================================
 
 CAPITAL_PROMPTS = [
-    ("France",  "The capital of France is"),
-    ("UK",      "The capital of the United Kingdom is"),
-    ("Japan",   "The capital of Japan is"),
-    ("Germany", "The capital of Germany is"),
-    ("Italy",   "The capital of Italy is"),
-    ("Spain",   "The capital of Spain is"),
-    ("China",   "The capital of China is"),
-    ("Brazil",  "The capital of Brazil is"),
-    ("India",   "The capital of India is"),
-    ("Canada",  "The capital of Canada is"),
+    ("France",  "The capital of France is",  "Paris"),
+    ("UK",      "The capital of the United Kingdom is", "London"),
+    ("Japan",   "The capital of Japan is",   "Tokyo"),
+    ("Germany", "The capital of Germany is",  "Berlin"),
+    ("Italy",   "The capital of Italy is",    "Rome"),
+    ("Spain",   "The capital of Spain is",    "Madrid"),
+    ("China",   "The capital of China is",    "Beijing"),
+    ("Brazil",  "The capital of Brazil is",   "Bras"),  # Brasilia
+    ("India",   "The capital of India is",    "New"),    # New Delhi
+    ("Canada",  "The capital of Canada is",   "Ottawa"),
 ]
 
 CONTROL_PROMPTS = [
-    ("sky",     "The sky is"),
-    ("water",   "The water is"),
-    ("cat",     "The cat is"),
-    ("book",    "The book is"),
-    ("food",    "The food is"),
-    ("music",   "The music is"),
-    ("tree",    "The tree is"),
-    ("house",   "The house is"),
-    ("car",     "The car is"),
-    ("sun",     "The sun is"),
+    ("sky",     "The sky is",    "blue"),
+    ("water",   "The water is",  "clear"),
+    ("cat",     "The cat is",    "a"),
+    ("book",    "The book is",   "a"),
+    ("food",    "The food is",   "good"),
+    ("music",   "The music is",  "a"),
+    ("tree",    "The tree is",   "a"),
+    ("house",   "The house is",  "a"),
+    ("car",     "The car is",    "a"),
+    ("sun",     "The sun is",    "a"),
 ]
 
 
 # ============================================================
-# Analysis
+# Autoregressive Generation with Routing Extraction
 # ============================================================
 
-def _get_knowledge_activations(extractor, tokenizer, prompt, config):
-    """Get active neuron sets for F-Know and R-Know pools from a single prompt.
+def _extract_routing_at_last_pos(params, config, input_ids_np, pools):
+    """Full forward through all layers, extract routing weights at last position.
 
-    Uses ALL token positions (not just last). With embedding-only routing,
-    each token's embedding independently determines routing. Using all positions
-    captures the full prompt semantics — e.g., "capital" and country names
-    route to different neurons than "sky" or "water".
-
-    Returns dict: {pool: set_of_active_neuron_indices}
+    Returns dict: {pool_key: set_of_active_neuron_indices}
     """
-    input_ids = tokenizer.encode(prompt, add_special_tokens=True,
-                                  max_length=config.get('max_seq_len', 512),
-                                  truncation=True)
-    input_ids_np = np.array([input_ids], dtype=np.int32)
+    from models.model_v17_1_jax import (
+        _layer_norm, _router_attn_forward, _router_know_forward,
+        _attention_forward, _knowledge_forward,
+    )
 
-    routing_info = extractor.extract_routing(input_ids_np)
-    routing = JAXRoutingData(routing_info)
+    all_params = params.get('params', params)
+    router_params = all_params.get('router', {})
+    sn_params = all_params.get('shared_neurons', {})
+    n_layers = config.get('n_layers', 16)
 
-    result = {}
-    for pool_key in ['fknow', 'rknow']:
-        w = routing.get_weight(pool_key)
-        if w is None:
-            result[pool_key] = set()
-            continue
-        # Use ALL token positions — union of active neurons across the prompt
-        if w.ndim == 3:
-            w_all = w[0]  # [S, N]
-        else:
-            w_all = w  # [S, N] or [N]
-            if w_all.ndim == 1:
-                w_all = w_all[np.newaxis, :]  # [1, N]
-        # A neuron is "active" if it fires for ANY token in the prompt
-        active = set(int(i) for i in np.where((w_all > 0).any(axis=0))[0])
-        result[pool_key] = active
+    n_fqk = config.get('n_feature_qk', 88)
+    n_fv = config.get('n_feature_v', 352)
+    n_rqk = config.get('n_restore_qk', 88)
+    n_rv = config.get('n_restore_v', 352)
+    n_fk = config.get('n_feature_know', 224)
+    n_rk = config.get('n_restore_know', 224)
+    d_space = config.get('d_space', 256)
+    tk_fqk = config.get('top_k_feature_qk', 16)
+    tk_fv = config.get('top_k_feature_v', 16)
+    tk_rqk = config.get('top_k_restore_qk', 16)
+    tk_rv = config.get('top_k_restore_v', 16)
+    tk_fk = config.get('top_k_feature_know', 16)
+    tk_rk = config.get('top_k_restore_know', 16)
+    n_heads = config.get('n_heads', 8)
+    d_model = config.get('d_model', 768)
+
+    # Pool index mapping for attention routing results
+    _ATTN_IDX = {'fqk_q': 0, 'fqk_k': 1, 'fv': 2, 'rqk_q': 3, 'rqk_k': 4, 'rv': 5}
+    _KNOW_IDX = {'fknow': 0, 'rknow': 1}
+
+    input_ids = jnp.array(input_ids_np)
+    B, Seq = input_ids.shape
+
+    tok_emb = all_params['token_emb']['embedding'][input_ids]
+    pos_emb = all_params['pos_emb']['embedding'][jnp.arange(Seq)[jnp.newaxis, :]]
+    x = tok_emb + pos_emb
+
+    rng_key = jax.random.PRNGKey(0)
+
+    # Accumulate active neurons across all layers (union, matching GPU)
+    result = {p: set() for p in pools}
+
+    for li in range(n_layers):
+        bp = all_params[f'block_{li}']
+        rng_key, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng_key, 5)
+
+        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+        attn_results = _router_attn_forward(
+            normed, router_params,
+            n_fqk, n_fv, n_rqk, n_rv, d_space,
+            tk_fqk, tk_fv, tk_rqk, tk_rv,
+            0.0, None, True, rng_ar,
+        )
+        fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w = attn_results[:6]
+
+        # Extract attention pool activations at last position
+        for pool in pools:
+            if pool in _ATTN_IDX:
+                w = np.array(attn_results[_ATTN_IDX[pool]])
+                if w.ndim == 3:
+                    w_last = w[0, -1]  # [N]
+                else:
+                    w_last = w[0]
+                active = set(int(i) for i in np.where(w_last > 0)[0])
+                result[pool].update(active)
+
+        attn_out = _attention_forward(
+            normed, sn_params,
+            fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w,
+            bp['attn']['expand_O']['kernel'],
+            n_fqk, n_rqk, n_heads, d_model,
+            0.0, True, rng_a,
+        )
+        x = x + attn_out
+
+        normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+        fk_w, rk_w, _ = _router_know_forward(
+            normed, router_params,
+            n_fqk, n_fv, n_rqk, n_rv, n_fk, n_rk,
+            tk_fk, tk_rk,
+            0.0, None, True, rng_kr,
+        )
+
+        # Extract knowledge pool activations at last position
+        for pool in pools:
+            if pool in _KNOW_IDX:
+                w = np.array(fk_w if _KNOW_IDX[pool] == 0 else rk_w)
+                if w.ndim == 3:
+                    w_last = w[0, -1]
+                else:
+                    w_last = w[0]
+                active = set(int(i) for i in np.where(w_last > 0)[0])
+                result[pool].update(active)
+
+        know_out = _knowledge_forward(
+            normed, sn_params, fk_w, rk_w,
+            0.0, True, rng_k,
+        )
+        x = x + know_out
 
     return result
 
@@ -154,99 +229,243 @@ def _get_knowledge_activations(extractor, tokenizer, prompt, config):
 def analyze_knowledge_coherence(
     model_cls, params, config,
     capital_prompts=None, control_prompts=None,
+    pools=None,
+    min_target_count=100,
+    max_runs=20000,
+    max_tokens_per_run=30,
+    temperature=1.0,
+    top_k=50,
 ):
-    """Compare neuron activations between capital and control queries.
+    """Autoregressive knowledge coherence analysis (Appendix D.3).
 
-    For each pool (fknow, rknow), computes:
-      - Per-neuron activation frequency across capital and control queries
-      - Classification: shared / capital-specific / control-specific
-      - Contrastive score: capital_freq - control_freq
+    For each (prompt, target) pair:
+      1. Generate autoregressively until target token appears
+      2. On target hit, full forward to extract routing at last position
+      3. Repeat until min_target_count hits (or max_runs exhausted)
+      4. Activation frequency = hits / min_target_count
     """
+    if not HAS_JAX:
+        return {'error': 'JAX not available'}
+
     from transformers import AutoTokenizer
+    from models.model_v17_1_jax import dawn_init_kv_cache, dawn_cached_forward
+
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
     capital_prompts = capital_prompts or CAPITAL_PROMPTS
     control_prompts = control_prompts or CONTROL_PROMPTS
+    pools = pools or ['fknow', 'rknow']
 
-    model_instance = create_model_from_config(config)
-    extractor = JAXRoutingDataExtractor(model_instance, params, config)
+    pool_sizes = {
+        'fknow': config.get('n_feature_know', 224),
+        'rknow': config.get('n_restore_know', 224),
+        'fv': config.get('n_feature_v', 352),
+        'rv': config.get('n_restore_v', 352),
+    }
 
-    n_fknow = config.get('n_feature_know', 224)
-    n_rknow = config.get('n_restore_know', 224)
-    pool_sizes = {'fknow': n_fknow, 'rknow': n_rknow}
+    # JIT compile decode step
+    @jax.jit
+    def decode_step(params, token_ids, kv_k, kv_v, cache_pos):
+        return dawn_cached_forward(params, config, token_ids, kv_k, kv_v, cache_pos)
 
-    # Accumulate activation counts
-    capital_counts = {p: np.zeros(pool_sizes[p], dtype=np.int32) for p in pool_sizes}
-    control_counts = {p: np.zeros(pool_sizes[p], dtype=np.int32) for p in pool_sizes}
+    print("  JIT compiling decode step...", end=" ", flush=True)
+    t0 = time.time()
+    dummy_kv_k, dummy_kv_v = dawn_init_kv_cache(config, batch_size=1)
+    _out = decode_step(params, jnp.array([[0]]), dummy_kv_k, dummy_kv_v, 0)
+    _out[0].block_until_ready()
+    print(f"done ({time.time() - t0:.1f}s)")
 
-    # Per-query detail
-    per_query = {}
+    all_prompt_pairs = (
+        [(label, prompt, target, 'capital') for label, prompt, target in capital_prompts] +
+        [(label, prompt, target, 'control') for label, prompt, target in control_prompts]
+    )
 
-    n_capital = len(capital_prompts)
-    n_control = len(control_prompts)
+    results = {'per_pool': {p: {} for p in pools}, 'per_target': {}}
 
-    print(f"  Processing {n_capital} capital queries...")
-    for label, prompt in capital_prompts:
-        activations = _get_knowledge_activations(extractor, tokenizer, prompt, config)
-        per_query[f"capital_{label}"] = {
+    for pair_idx, (label, prompt, target_text, query_type) in enumerate(all_prompt_pairs):
+        # Validate target token
+        target_ids = tokenizer.encode(target_text, add_special_tokens=False)
+        if not target_ids:
+            print(f"    Skipping '{target_text}': cannot tokenize")
+            continue
+        target_token_id = target_ids[0]
+        target_lower = target_text.strip().lower()
+
+        # Encode prompt
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+        prompt_len = len(prompt_ids)
+
+        # Per-pool neuron counters for this (prompt, target)
+        target_neuron_counts = {p: Counter() for p in pools}
+        baseline_neuron_counts = {p: Counter() for p in pools}
+        successful_runs = 0
+        total_runs = 0
+        total_baseline_steps = 0
+        sample_generations = []
+        rng_key = jax.random.PRNGKey(pair_idx * 137)
+
+        print(f"\n    [{pair_idx+1}/{len(all_prompt_pairs)}] "
+              f"[{query_type}] \"{prompt}\" -> \"{target_text}\"")
+
+        while successful_runs < min_target_count and total_runs < max_runs:
+            total_runs += 1
+            if total_runs % 50 == 0 or successful_runs == min_target_count:
+                print(f"\r      {successful_runs}/{min_target_count} hits "
+                      f"(run {total_runs})", end='', flush=True)
+
+            # Init KV cache and prefill
+            kv_k, kv_v = dawn_init_kv_cache(config, batch_size=1)
+            prompt_2d = jnp.array(np.array(prompt_ids)[np.newaxis, :])
+            logits, kv_k, kv_v = dawn_cached_forward(
+                params, config, prompt_2d, kv_k, kv_v, 0)
+
+            generated_ids = list(prompt_ids)
+            cache_pos = prompt_len
+
+            # Sample first token from prefill logits
+            first_logits = np.array(logits[0, -1, :])
+            rng_key, subkey = jax.random.split(rng_key)
+            next_token = _sample_token(first_logits, temperature, top_k, subkey)
+            generated_ids.append(next_token)
+
+            found_target = False
+
+            for step in range(max_tokens_per_run - 1):
+                token_text = tokenizer.decode([next_token]).strip().lower()
+
+                if token_text == target_lower or next_token == target_token_id:
+                    # Target found — extract routing via full forward
+                    full_ids = np.array([generated_ids], dtype=np.int32)
+                    activations = _extract_routing_at_last_pos(
+                        params, config, full_ids, pools)
+
+                    for pool in pools:
+                        for n in activations[pool]:
+                            if n < pool_sizes.get(pool, 0):
+                                target_neuron_counts[pool][n] += 1
+
+                    successful_runs += 1
+                    found_target = True
+
+                    if len(sample_generations) < 3:
+                        gen_text = tokenizer.decode(generated_ids,
+                                                     skip_special_tokens=True)
+                        sample_generations.append(gen_text)
+                    break
+
+                # Not target — count as baseline step
+                # (we skip full forward for baseline to save time;
+                #  baseline frequency uses embedding-level routing only)
+                total_baseline_steps += 1
+
+                if next_token == tokenizer.sep_token_id:
+                    break
+                if cache_pos >= config.get('max_seq_len', 512) - 1:
+                    break
+
+                # Decode next token
+                token_2d = jnp.array([[next_token]])
+                logits, kv_k, kv_v = decode_step(
+                    params, token_2d, kv_k, kv_v, cache_pos)
+                cache_pos += 1
+
+                next_logits = np.array(logits[0, 0, :])
+                rng_key, subkey = jax.random.split(rng_key)
+                next_token = _sample_token(next_logits, temperature, top_k, subkey)
+                generated_ids.append(next_token)
+
+        print(f"\r      {successful_runs}/{min_target_count} hits "
+              f"(run {total_runs}) — Done!          ")
+
+        match_rate = successful_runs / total_runs if total_runs > 0 else 0
+        print(f"      Match rate: {match_rate*100:.1f}% "
+              f"({successful_runs}/{total_runs})")
+
+        # Compute frequencies
+        target_key = f"{query_type}_{label}"
+        target_result = {
             'prompt': prompt,
-            'type': 'capital',
+            'target_token': target_text,
+            'query_type': query_type,
+            'successful_runs': successful_runs,
+            'total_runs': total_runs,
+            'match_rate': match_rate,
+            'sample_generations': sample_generations,
+            'per_pool': {},
         }
-        for pool_key in ['fknow', 'rknow']:
-            active_arr = np.array(sorted(activations[pool_key]), dtype=np.int32)
-            valid = active_arr[active_arr < pool_sizes[pool_key]]
-            if len(valid) > 0:
-                np.add.at(capital_counts[pool_key], valid, 1)
-            per_query[f"capital_{label}"][pool_key] = valid.tolist()
 
-    print(f"  Processing {n_control} control queries...")
-    for label, prompt in control_prompts:
-        activations = _get_knowledge_activations(extractor, tokenizer, prompt, config)
-        per_query[f"control_{label}"] = {
-            'prompt': prompt,
-            'type': 'control',
-        }
-        for pool_key in ['fknow', 'rknow']:
-            active_arr = np.array(sorted(activations[pool_key]), dtype=np.int32)
-            valid = active_arr[active_arr < pool_sizes[pool_key]]
-            if len(valid) > 0:
-                np.add.at(control_counts[pool_key], valid, 1)
-            per_query[f"control_{label}"][pool_key] = valid.tolist()
+        if successful_runs > 0:
+            for pool in pools:
+                freq = {n: c / successful_runs
+                        for n, c in target_neuron_counts[pool].items()}
+                common_100 = sorted(n for n, f in freq.items() if f >= 1.0)
+                common_80 = sorted(n for n, f in freq.items() if f >= 0.8)
 
-    # Compute per-pool stats
-    results = {'per_pool': {}, 'per_query': per_query}
+                target_result['per_pool'][pool] = {
+                    'common_100': common_100,
+                    'common_80': common_80,
+                    'n_unique': len(target_neuron_counts[pool]),
+                    'all_frequencies': {int(n): float(f) for n, f in freq.items()},
+                    'top_neurons': sorted(
+                        [{'neuron': int(n), 'freq': float(f)}
+                         for n, f in freq.items()],
+                        key=lambda x: -x['freq']
+                    )[:20],
+                }
+                print(f"        {pool}: {len(common_100)} neurons@100%, "
+                      f"{len(common_80)} neurons@80%")
+        else:
+            target_result['note'] = (
+                f'Target "{target_text}" not found in {total_runs} runs')
 
-    for pool_key in ['fknow', 'rknow']:
-        n = pool_sizes[pool_key]
-        cap_freq = capital_counts[pool_key] / max(n_capital, 1)
-        ctrl_freq = control_counts[pool_key] / max(n_control, 1)
+        results['per_target'][target_key] = target_result
+
+    # Aggregate per-pool: capital vs control frequencies
+    for pool in pools:
+        n = pool_sizes.get(pool, 0)
+        cap_freq = np.zeros(n, dtype=np.float64)
+        ctrl_freq = np.zeros(n, dtype=np.float64)
+        n_cap = 0
+        n_ctrl = 0
+
+        for tkey, tdata in results['per_target'].items():
+            if tdata.get('successful_runs', 0) == 0:
+                continue
+            pool_data = tdata.get('per_pool', {}).get(pool, {})
+            all_freq = pool_data.get('all_frequencies', {})
+
+            if tdata['query_type'] == 'capital':
+                for nid, f in all_freq.items():
+                    nid = int(nid)
+                    if nid < n:
+                        cap_freq[nid] = max(cap_freq[nid], f)
+                n_cap += 1
+            else:
+                for nid, f in all_freq.items():
+                    nid = int(nid)
+                    if nid < n:
+                        ctrl_freq[nid] = max(ctrl_freq[nid], f)
+                n_ctrl += 1
+
         contrastive = cap_freq - ctrl_freq
 
-        # Classify neurons — matches GPU factual_heatmap.py thresholds
-        # GPU: shared = all >= 0.7; capital-specific = cap >= 0.7 AND ctrl < 0.3
-        # Also compute with relaxed threshold for JAX's smaller sample size
+        # Classify (paper thresholds: 0.7/0.3)
         thresh_high = 0.7
         thresh_low = 0.3
-
         cap_high = cap_freq >= thresh_high
         ctrl_high = ctrl_freq >= thresh_high
-        cap_low = cap_freq >= thresh_low
-        ctrl_low = ctrl_freq >= thresh_low
 
-        # Strict (GPU-compatible): matches factual_heatmap.py logic
-        shared_strict = int((cap_high & ctrl_high).sum())
-        capital_specific_strict = int((cap_high & (ctrl_freq < thresh_low)).sum())
-        control_specific_strict = int((ctrl_high & (cap_freq < thresh_low)).sum())
+        shared = int((cap_high & ctrl_high).sum())
+        capital_specific = int((cap_high & (ctrl_freq < thresh_low)).sum())
+        control_specific = int((ctrl_high & (cap_freq < thresh_low)).sum())
+        inactive = int((~(cap_freq >= thresh_low) & ~(ctrl_freq >= thresh_low)).sum())
 
-        # Relaxed (for JAX's 10-query sample): uses 0.3 as active threshold
-        shared = int((cap_low & ctrl_low).sum())
-        capital_specific = int((cap_low & ~ctrl_low).sum())
-        control_specific = int((~cap_low & ctrl_low).sum())
-        inactive = int((~cap_low & ~ctrl_low).sum())
-
-        # Top capital-specific neurons (use relaxed for ranking)
-        cap_spec_idx = np.where(cap_low & ~ctrl_low)[0]
-        cap_spec_sorted = cap_spec_idx[np.argsort(contrastive[cap_spec_idx])[::-1]]
+        # Top neurons
+        cap_spec_idx = np.where(cap_high & (ctrl_freq < thresh_low))[0]
+        if len(cap_spec_idx) > 0:
+            cap_spec_sorted = cap_spec_idx[np.argsort(contrastive[cap_spec_idx])[::-1]]
+        else:
+            cap_spec_sorted = np.array([], dtype=int)
         top_capital = [
             {'neuron': int(i), 'capital_freq': float(cap_freq[i]),
              'control_freq': float(ctrl_freq[i]),
@@ -254,49 +473,70 @@ def analyze_knowledge_coherence(
             for i in cap_spec_sorted[:15]
         ]
 
-        # Top shared neurons
-        shared_idx = np.where(cap_low & ctrl_low)[0]
-        shared_sorted = shared_idx[np.argsort(cap_freq[shared_idx] + ctrl_freq[shared_idx])[::-1]]
+        shared_idx = np.where(cap_high & ctrl_high)[0]
+        if len(shared_idx) > 0:
+            shared_sorted = shared_idx[np.argsort(
+                cap_freq[shared_idx] + ctrl_freq[shared_idx])[::-1]]
+        else:
+            shared_sorted = np.array([], dtype=int)
         top_shared = [
             {'neuron': int(i), 'capital_freq': float(cap_freq[i]),
              'control_freq': float(ctrl_freq[i])}
             for i in shared_sorted[:15]
         ]
 
-        results['per_pool'][pool_key] = {
+        results['per_pool'][pool] = {
             'n_neurons': n,
-            # Relaxed classification (threshold=0.3, for JAX sample size)
             'shared': shared,
             'capital_specific': capital_specific,
             'control_specific': control_specific,
             'inactive': inactive,
-            # Strict classification (matches GPU factual_heatmap.py: 0.7/0.3)
-            'shared_strict': shared_strict,
-            'capital_specific_strict': capital_specific_strict,
-            'control_specific_strict': control_specific_strict,
-            # Raw data
             'capital_freq': cap_freq.tolist(),
             'control_freq': ctrl_freq.tolist(),
             'contrastive_scores': contrastive.tolist(),
             'top_capital_specific': top_capital,
             'top_shared': top_shared,
+            'n_capital_queries': n_cap,
+            'n_control_queries': n_ctrl,
         }
 
     results['meta'] = {
-        'n_capital_queries': n_capital,
-        'n_control_queries': n_control,
-        'threshold_relaxed': 0.3,
-        'threshold_strict_high': 0.7,
-        'threshold_strict_low': 0.3,
-        'note': 'strict thresholds match GPU factual_heatmap.py; '
-                'relaxed thresholds adapted for smaller JAX sample size',
+        'method': 'autoregressive_generation',
+        'min_target_count': min_target_count,
+        'max_runs': max_runs,
+        'max_tokens_per_run': max_tokens_per_run,
+        'temperature': temperature,
+        'top_k': top_k,
+        'pools': pools,
+        'threshold_high': 0.7,
+        'threshold_low': 0.3,
+        'note': 'Matches GPU behavioral.py autoregressive method (Appendix D.3). '
+                'Routing extracted via full forward at target-hit step.',
     }
 
     return results
 
 
+def _sample_token(logits_np, temperature, top_k, rng_key):
+    """Sample next token from logits."""
+    if temperature <= 0:
+        return int(np.argmax(logits_np))
+
+    logits_np = logits_np / temperature
+
+    if top_k > 0:
+        top_idx = np.argpartition(logits_np, -top_k)[-top_k:]
+        mask = np.full_like(logits_np, -np.inf)
+        mask[top_idx] = logits_np[top_idx]
+        logits_np = mask
+
+    probs = np.exp(logits_np - np.max(logits_np))
+    probs = probs / (probs.sum() + 1e-8)
+    return int(jax.random.choice(rng_key, len(probs), p=probs))
+
+
 # ============================================================
-# Visualization
+# Visualization (unchanged from original)
 # ============================================================
 
 def plot_knowledge_coherence(results, output_dir, dpi=300):
@@ -307,24 +547,23 @@ def plot_knowledge_coherence(results, output_dir, dpi=300):
 
     saved = []
 
-    for pool_key in ['fknow', 'rknow']:
+    for pool_key in results.get('meta', {}).get('pools', ['fknow', 'rknow']):
         data = results['per_pool'].get(pool_key)
-        if data is None:
+        if data is None or not isinstance(data, dict) or 'capital_freq' not in data:
             continue
 
         cap_freq = np.array(data['capital_freq'])
         ctrl_freq = np.array(data['control_freq'])
         n = data['n_neurons']
-        pool_label = 'F-Know' if pool_key == 'fknow' else 'R-Know'
+        pool_label = {'fknow': 'F-Know', 'rknow': 'R-Know',
+                      'fv': 'F-V', 'rv': 'R-V'}.get(pool_key, pool_key)
 
-        # --- Figure: 2 panels ---
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-        # Panel 1: Scatter — capital freq vs control freq
+        # Panel 1: Scatter
         thresh = 0.3
         cap_act = cap_freq >= thresh
         ctrl_act = ctrl_freq >= thresh
-
         shared_m = cap_act & ctrl_act
         cap_only = cap_act & ~ctrl_act
         ctrl_only = ~cap_act & ctrl_act
@@ -351,7 +590,7 @@ def plot_knowledge_coherence(results, output_dir, dpi=300):
         ax1.set_xlim(-0.05, 1.05)
         ax1.set_ylim(-0.05, 1.05)
 
-        # Panel 2: Bar chart — classification breakdown
+        # Panel 2: Bar chart
         categories = ['Shared', 'Capital-\nspecific', 'Control-\nspecific', 'Inactive']
         counts = [data['shared'], data['capital_specific'],
                   data['control_specific'], data['inactive']]
@@ -375,68 +614,7 @@ def plot_knowledge_coherence(results, output_dir, dpi=300):
         print(f"  Saved: {path}")
         saved.append(path)
 
-    # Heatmap: neuron activation across all queries (fknow only, or both)
-    if HAS_SEABORN:
-        for pool_key in ['fknow', 'rknow']:
-            data = results['per_pool'].get(pool_key)
-            if data is None:
-                continue
-            _plot_query_heatmap(results, pool_key, output_dir, dpi)
-
     return saved
-
-
-def _plot_query_heatmap(results, pool_key, output_dir, dpi=300):
-    """Heatmap: queries (rows) x top neurons (columns)."""
-    data = results['per_pool'][pool_key]
-    per_query = results['per_query']
-    pool_label = 'F-Know' if pool_key == 'fknow' else 'R-Know'
-
-    # Collect active neuron sets per query
-    cap_freq = np.array(data['capital_freq'])
-    ctrl_freq = np.array(data['control_freq'])
-    contrastive = np.array(data['contrastive_scores'])
-
-    # Select top neurons by absolute contrastive score
-    top_idx = np.argsort(np.abs(contrastive))[-30:][::-1]
-
-    # Build matrix: queries x neurons
-    query_labels = []
-    rows = []
-
-    for qname, qdata in sorted(per_query.items()):
-        active_arr = np.array(qdata.get(pool_key, []), dtype=np.int64)
-        row = np.isin(top_idx, active_arr).astype(float)
-        query_labels.append(f"{'*' if qdata['type']=='capital' else ' '} {qdata['prompt']}")
-        rows.append(row)
-
-    if not rows:
-        return
-
-    mat = np.stack(rows)
-
-    fig, ax = plt.subplots(figsize=(max(10, len(top_idx) * 0.35),
-                                     max(5, len(rows) * 0.35)))
-    sns.heatmap(
-        mat,
-        xticklabels=[str(i) for i in top_idx],
-        yticklabels=query_labels,
-        cmap='YlOrRd',
-        cbar_kws={'label': 'Active (1) / Inactive (0)'},
-        linewidths=0.3,
-        ax=ax,
-    )
-    ax.set_xlabel('Neuron Index', fontsize=S['font_size_label'])
-    ax.set_title(f'{pool_label} — Query × Neuron Activation  (* = capital query)',
-                  fontsize=S['font_size_subtitle'], fontweight='bold')
-    plt.xticks(fontsize=6, rotation=90)
-    plt.yticks(fontsize=7)
-    plt.tight_layout()
-
-    path = os.path.join(output_dir, f'knowledge_heatmap_{pool_key}.png')
-    fig.savefig(path, dpi=dpi, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    print(f"  Saved: {path}")
 
 
 # ============================================================
@@ -444,9 +622,21 @@ def _plot_query_heatmap(results, pool_key, output_dir, dpi=300):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Knowledge Neuron Coherence (Section 4.3)')
+    parser = argparse.ArgumentParser(
+        description='Knowledge Neuron Coherence — Appendix D.3 '
+                    '(autoregressive generation)')
     parser.add_argument('--checkpoint', required=True, help='Checkpoint path')
-    parser.add_argument('--output', default='./section4_results', help='Output directory')
+    parser.add_argument('--output', default='./section4_results')
+    parser.add_argument('--min_targets', type=int, default=100,
+                        help='Target token occurrences to collect per prompt')
+    parser.add_argument('--max_runs', type=int, default=20000,
+                        help='Max generation runs per prompt (safety limit)')
+    parser.add_argument('--max_tokens', type=int, default=30,
+                        help='Max tokens per generation run')
+    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--top_k', type=int, default=50)
+    parser.add_argument('--pools', nargs='+', default=['fknow', 'rknow'],
+                        help='Pools to analyze (default: fknow rknow)')
     parser.add_argument('--dpi', type=int, default=300)
     args = parser.parse_args()
 
@@ -457,8 +647,19 @@ def main():
     print(f"  n_feature_know={config.get('n_feature_know')}, "
           f"n_restore_know={config.get('n_restore_know')}")
 
-    print("\n=== Knowledge Neuron Coherence Analysis ===")
-    results = analyze_knowledge_coherence(model_cls, params, config)
+    print(f"\n=== Knowledge Neuron Coherence (Appendix D.3) ===")
+    print(f"  Method: autoregressive generation")
+    print(f"  Target hits: {args.min_targets}, max runs: {args.max_runs}")
+
+    results = analyze_knowledge_coherence(
+        model_cls, params, config,
+        pools=args.pools,
+        min_target_count=args.min_targets,
+        max_runs=args.max_runs,
+        max_tokens_per_run=args.max_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+    )
 
     # Save JSON
     json_path = os.path.join(args.output, 'knowledge_coherence.json')
@@ -466,20 +667,21 @@ def main():
     print(f"  Saved: {json_path}")
 
     # Print summary
-    for pool_key in ['fknow', 'rknow']:
+    for pool_key in args.pools:
         d = results['per_pool'].get(pool_key)
-        if d is None:
+        if d is None or not isinstance(d, dict) or 'shared' not in d:
             continue
-        pool_label = 'F-Know' if pool_key == 'fknow' else 'R-Know'
+        pool_label = {'fknow': 'F-Know', 'rknow': 'R-Know',
+                      'fv': 'F-V', 'rv': 'R-V'}.get(pool_key, pool_key)
         print(f"\n  {pool_label} (n={d['n_neurons']}):")
         print(f"    Shared:           {d['shared']}")
         print(f"    Capital-specific: {d['capital_specific']}")
         print(f"    Control-specific: {d['control_specific']}")
         print(f"    Inactive:         {d['inactive']}")
-        if d['top_capital_specific']:
+        if d.get('top_capital_specific'):
             top3 = d['top_capital_specific'][:3]
             print(f"    Top capital neurons: " +
-                  ', '.join(f"N{t['neuron']}(Δ={t['contrastive']:.2f})" for t in top3))
+                  ', '.join(f"N{t['neuron']}(D={t['contrastive']:.2f})" for t in top3))
 
     # Plot
     plot_knowledge_coherence(results, args.output, dpi=args.dpi)
