@@ -268,35 +268,69 @@ def analyze_pos_selectivity(
 
     print(f"  Processed {n_sents - skipped}/{n_sents} sentences (skipped {skipped})")
 
-    # Compute selectivity matrix
-    # Mean weight per (POS, neuron)
-    mean_per_pos = np.zeros_like(weight_sum)
+    # Compute selectivity matrix — matches GPU formula in pos_neuron.py
+    # Step 1: mean_weight[pos, neuron] = weight_sum / weight_count (active only)
+    #   Uses weight_count (active tokens where w>0), NOT pos_token_counts (all tokens)
+    #   NaN where neuron was never active for this POS
     pos_mask = pos_token_counts > 0
-    for p in range(n_pos):
-        if pos_token_counts[p] > 0:
-            mean_per_pos[p] = weight_sum[p] / pos_token_counts[p]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mean_weight = np.where(
+            weight_count > 0,
+            weight_sum / weight_count,
+            np.nan,
+        )
 
-    # Global mean weight per neuron
-    total_tokens = pos_token_counts.sum()
-    global_mean = weight_sum.sum(axis=0) / max(total_tokens, 1)
+    # Step 2: neuron_avg = nanmean across POS (treats each POS equally)
+    #   NOT global token-weighted mean — this ensures rare POS aren't down-weighted
+    with np.errstate(divide='ignore', invalid='ignore'):
+        neuron_avg = np.nanmean(mean_weight, axis=0)  # [n_neurons]
 
-    # Selectivity = E[w|POS] / E[w|all]
-    selectivity = np.zeros_like(mean_per_pos)
-    nonzero = global_mean > 1e-10
-    for p in range(n_pos):
-        if pos_mask[p]:
-            selectivity[p, nonzero] = mean_per_pos[p, nonzero] / global_mean[nonzero]
+    # Step 3: selectivity = mean_weight / neuron_avg
+    with np.errstate(divide='ignore', invalid='ignore'):
+        selectivity = np.where(
+            neuron_avg > 0,
+            mean_weight / neuron_avg,
+            0.0,
+        )
 
-    # Top selective neurons per POS
+    # Clean up NaN/inf
+    mean_weight = np.nan_to_num(mean_weight, nan=0.0)
+    selectivity = np.nan_to_num(selectivity, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Top selective neurons per POS + specialist stats (matches GPU)
+    SPECIALIST_SEL_THRESHOLD = 2.0
+    SPECIALIST_MW_THRESHOLD = 0.1
+
     top_per_pos = {}
+    pos_specialist_stats = {}
     for p, pos in enumerate(UPOS_TAGS):
         if not pos_mask[p]:
             continue
-        row = selectivity[p]
-        top_idx = np.argsort(row)[-10:][::-1]
+        mw = mean_weight[p]
+        sel = selectivity[p]
+        active_mask = mw > 0
+
+        if not active_mask.any():
+            continue
+
+        n_sel_gt_1_5 = int(((sel > 1.5) & active_mask).sum())
+        n_sel_gt_2 = int(((sel > SPECIALIST_SEL_THRESHOLD) & active_mask).sum())
+        n_specialists = int(((sel > SPECIALIST_SEL_THRESHOLD) & (mw > SPECIALIST_MW_THRESHOLD)).sum())
+
+        pos_specialist_stats[pos] = {
+            'n_active': int(active_mask.sum()),
+            'n_sel_gt_1_5': n_sel_gt_1_5,
+            'n_sel_gt_2': n_sel_gt_2,
+            'n_specialists': n_specialists,
+        }
+
+        # Top 20 neurons (matches GPU)
+        top_idx = np.argsort(sel)[-20:][::-1]
         top_per_pos[pos] = [
-            {'neuron': int(idx), 'selectivity': float(row[idx])}
-            for idx in top_idx if row[idx] > 1.0
+            {'neuron': int(idx), 'selectivity': float(sel[idx]),
+             'mean_weight': float(mw[idx]),
+             'is_specialist': bool(sel[idx] > SPECIALIST_SEL_THRESHOLD and mw[idx] > SPECIALIST_MW_THRESHOLD)}
+            for idx in top_idx if sel[idx] > 1.0
         ]
 
     results = {
@@ -306,9 +340,11 @@ def analyze_pos_selectivity(
         'pos_token_counts': {UPOS_TAGS[p]: int(pos_token_counts[p])
                              for p in range(n_pos) if pos_token_counts[p] > 0},
         'selectivity_matrix': selectivity.tolist(),
+        'mean_weight_matrix': mean_weight.tolist(),
         'pos_tags': UPOS_TAGS,
         'top_selective_per_pos': top_per_pos,
-        'global_mean_weight': global_mean.tolist(),
+        'pos_specialist_stats': pos_specialist_stats,
+        'neuron_avg': neuron_avg.tolist(),
     }
     return results, selectivity
 

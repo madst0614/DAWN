@@ -201,18 +201,30 @@ def analyze_knowledge_coherence(
         ctrl_freq = control_counts[pool_key] / max(n_control, 1)
         contrastive = cap_freq - ctrl_freq
 
-        # Classify neurons (threshold = 0.3 for "active")
-        thresh = 0.3
-        cap_active = cap_freq >= thresh
-        ctrl_active = ctrl_freq >= thresh
+        # Classify neurons — matches GPU factual_heatmap.py thresholds
+        # GPU: shared = all >= 0.7; capital-specific = cap >= 0.7 AND ctrl < 0.3
+        # Also compute with relaxed threshold for JAX's smaller sample size
+        thresh_high = 0.7
+        thresh_low = 0.3
 
-        shared = int((cap_active & ctrl_active).sum())
-        capital_specific = int((cap_active & ~ctrl_active).sum())
-        control_specific = int((~cap_active & ctrl_active).sum())
-        inactive = int((~cap_active & ~ctrl_active).sum())
+        cap_high = cap_freq >= thresh_high
+        ctrl_high = ctrl_freq >= thresh_high
+        cap_low = cap_freq >= thresh_low
+        ctrl_low = ctrl_freq >= thresh_low
 
-        # Top capital-specific neurons
-        cap_spec_idx = np.where(cap_active & ~ctrl_active)[0]
+        # Strict (GPU-compatible): matches factual_heatmap.py logic
+        shared_strict = int((cap_high & ctrl_high).sum())
+        capital_specific_strict = int((cap_high & (ctrl_freq < thresh_low)).sum())
+        control_specific_strict = int((ctrl_high & (cap_freq < thresh_low)).sum())
+
+        # Relaxed (for JAX's 10-query sample): uses 0.3 as active threshold
+        shared = int((cap_low & ctrl_low).sum())
+        capital_specific = int((cap_low & ~ctrl_low).sum())
+        control_specific = int((~cap_low & ctrl_low).sum())
+        inactive = int((~cap_low & ~ctrl_low).sum())
+
+        # Top capital-specific neurons (use relaxed for ranking)
+        cap_spec_idx = np.where(cap_low & ~ctrl_low)[0]
         cap_spec_sorted = cap_spec_idx[np.argsort(contrastive[cap_spec_idx])[::-1]]
         top_capital = [
             {'neuron': int(i), 'capital_freq': float(cap_freq[i]),
@@ -232,10 +244,16 @@ def analyze_knowledge_coherence(
 
         results['per_pool'][pool_key] = {
             'n_neurons': n,
+            # Relaxed classification (threshold=0.3, for JAX sample size)
             'shared': shared,
             'capital_specific': capital_specific,
             'control_specific': control_specific,
             'inactive': inactive,
+            # Strict classification (matches GPU factual_heatmap.py: 0.7/0.3)
+            'shared_strict': shared_strict,
+            'capital_specific_strict': capital_specific_strict,
+            'control_specific_strict': control_specific_strict,
+            # Raw data
             'capital_freq': cap_freq.tolist(),
             'control_freq': ctrl_freq.tolist(),
             'contrastive_scores': contrastive.tolist(),
@@ -246,7 +264,11 @@ def analyze_knowledge_coherence(
     results['meta'] = {
         'n_capital_queries': n_capital,
         'n_control_queries': n_control,
-        'classification_threshold': 0.3,
+        'threshold_relaxed': 0.3,
+        'threshold_strict_high': 0.7,
+        'threshold_strict_low': 0.3,
+        'note': 'strict thresholds match GPU factual_heatmap.py; '
+                'relaxed thresholds adapted for smaller JAX sample size',
     }
 
     return results

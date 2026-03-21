@@ -97,6 +97,8 @@ def analyze_qk_specialization(
         if n_batches:
             batches = batches[:n_batches]
 
+        batch_overlaps = []
+
         for batch in tqdm(batches, desc=f'{pool_info["display"]} Q/K'):
             input_ids = np.array(batch)
             routing_info = extractor.extract_routing(input_ids)
@@ -113,6 +115,13 @@ def analyze_qk_specialization(
             else:
                 q_counts += (w_q > 0).astype(float).sum(axis=0)
                 k_counts += (w_k > 0).astype(float).sum(axis=0)
+
+            # Batch overlap (matches GPU routing_jax.py)
+            if w_q.ndim >= 2:
+                overlap = ((w_q > 0) & (w_k > 0)).astype(float)
+                active_q = (w_q > 0).astype(float).sum(axis=-1)
+                overlap_ratio = (overlap.sum(axis=-1) / (active_q + 1e-8)).mean()
+                batch_overlaps.append(float(overlap_ratio))
 
         # Correlation
         if q_counts.sum() > 0 and k_counts.sum() > 0:
@@ -131,18 +140,35 @@ def analyze_qk_specialization(
         shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7)).sum())
         inactive = int((~valid).sum())
 
+        # Sensitivity analysis (matches GPU routing_jax.py)
+        sensitivity_thresholds = [0.6, 0.65, 0.7, 0.75, 0.8]
+        sensitivity_analysis = {}
+        for t in sensitivity_thresholds:
+            q_spec = int((q_ratio > t).sum())
+            k_spec = int((q_ratio < (1 - t)).sum())
+            shared_t = int(((q_ratio >= (1 - t)) & (q_ratio <= t)).sum())
+            sensitivity_analysis[str(t)] = {
+                'q_specialized': q_spec, 'k_specialized': k_spec,
+                'shared': shared_t, 'total': n_neurons,
+            }
+
         results[pool_name] = {
             'display': pool_info['display'],
             'n_neurons': n_neurons,
             'q_counts': q_counts.tolist(),
             'k_counts': k_counts.tolist(),
             'correlation': corr,
+            'avg_overlap': float(np.mean(batch_overlaps)) if batch_overlaps else 0,
+            'std_overlap': float(np.std(batch_overlaps)) if batch_overlaps else 0,
             'q_specialized': q_specialized,
             'k_specialized': k_specialized,
             'shared': shared,
             'inactive': inactive,
             'q_total': int(q_counts.sum()),
             'k_total': int(k_counts.sum()),
+            'q_ratio': q_ratio.tolist(),
+            'specialization_thresholds': {'q_specialized': 0.7, 'k_specialized': 0.3},
+            'sensitivity_analysis': sensitivity_analysis,
         }
 
     results['meta'] = {
