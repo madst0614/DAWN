@@ -202,11 +202,20 @@ _POOL_TO_ATTN_IDX = {
 _POOL_IS_KNOW = {'fknow': 0, 'rknow': 1}
 
 
-def _build_batched_forward(params, config, pool_type):
+def _build_batched_forward(params, config, pool_type, pad_len):
     """Build a JIT-compiled batched forward that returns layer-averaged routing weights.
 
+    All inputs MUST be padded to exactly ``pad_len`` so that the JIT-compiled
+    function is traced once and reused for every batch (no recompilation).
+
+    Args:
+        params: FrozenDict model params
+        config: Model config dict
+        pool_type: Routing pool key
+        pad_len: Fixed sequence length that all inputs will be padded to
+
     Returns:
-        forward_fn(input_ids_jnp) -> weights [B, S, N] averaged across layers
+        forward_fn(input_ids_jnp[B, pad_len]) -> weights [B, pad_len, N]
     """
     from models.model_v17_1_jax import (
         _layer_norm, _router_attn_forward, _router_know_forward,
@@ -244,15 +253,18 @@ def _build_batched_forward(params, config, pool_type):
     token_emb_table = all_params['token_emb']['embedding']
     pos_emb_table = all_params['pos_emb']['embedding']
 
+    # Precompute position embeddings for the fixed pad_len OUTSIDE jit
+    # so there is no dynamic shape inside the traced function.
+    positions = jnp.arange(pad_len)                        # [pad_len]
+    pos_emb_fixed = pos_emb_table[positions][jnp.newaxis, :]  # [1, pad_len, D]
+
     @jax.jit
     def _forward(input_ids):
-        """input_ids: [B, S] -> weights: [B, S, N]"""
-        B, S = input_ids.shape
-        x = token_emb_table[input_ids] + pos_emb_table[jnp.arange(S)[jnp.newaxis, :]]
+        """input_ids: [B, pad_len] (int32, 0-padded) -> weights [B, pad_len, N]"""
+        x = token_emb_table[input_ids] + pos_emb_fixed
 
         rng_key = jax.random.PRNGKey(0)
-        weight_sum = jnp.zeros((B, S, 1))  # placeholder shape, replaced on first hit
-        first = True
+        weight_sum = None
 
         for li in range(n_layers):
             bp = block_params_list[li]
@@ -268,12 +280,8 @@ def _build_batched_forward(params, config, pool_type):
             fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w = attn_results[:6]
 
             if is_attn_pool:
-                w = attn_results[attn_idx]  # [B, S, N]
-                if first:
-                    weight_sum = w
-                    first = False
-                else:
-                    weight_sum = weight_sum + w
+                w = attn_results[attn_idx]  # [B, pad_len, N]
+                weight_sum = w if weight_sum is None else weight_sum + w
 
             attn_out = _attention_forward(
                 normed, sn_params,
@@ -294,11 +302,7 @@ def _build_batched_forward(params, config, pool_type):
 
             if is_know_pool:
                 w = fk_w if know_idx == 0 else rk_w
-                if first:
-                    weight_sum = w
-                    first = False
-                else:
-                    weight_sum = weight_sum + w
+                weight_sum = w if weight_sum is None else weight_sum + w
 
             know_out = _knowledge_forward(
                 normed, sn_params, fk_w, rk_w,
@@ -336,7 +340,9 @@ def _extract_multilayer_weights(
     if not is_attn_pool and not is_know_pool:
         return None
 
-    forward_fn = _build_batched_forward(params, config, pool_type)
+    seq_len = token_ids_np.shape[1]
+    pad_len = seq_len  # single sentence: pad_len = actual length (concrete)
+    forward_fn = _build_batched_forward(params, config, pool_type, pad_len)
     input_ids = jnp.array(token_ids_np)
     w = np.array(forward_fn(input_ids))
     if w.ndim == 3:
@@ -463,16 +469,22 @@ def analyze_pos_selectivity(
         # Sort by length for efficient padding (less wasted compute)
         tokenized.sort(key=lambda x: len(x[1]))
 
-        # Build JIT-compiled forward and warm up
-        forward_fn = _build_batched_forward(params, config, pool_type)
-        print(f"  JIT compiling batched forward (batch_size={batch_size})...",
+        # Determine a fixed pad_len: use the longest sentence (clamped to max_seq_len)
+        # so that JIT compiles exactly ONCE and every batch reuses the same trace.
+        max_seq = config.get('max_seq_len', 512)
+        pad_len = min(max(len(ids) for _, ids in tokenized), max_seq)
+        # Round up to multiple of 32 for hardware alignment
+        pad_len = ((pad_len + 31) // 32) * 32
+        pad_len = min(pad_len, max_seq)
+
+        # Build JIT-compiled forward with fixed pad_len and warm up
+        forward_fn = _build_batched_forward(params, config, pool_type, pad_len)
+        print(f"  JIT compiling batched forward "
+              f"(batch_size={batch_size}, pad_len={pad_len})...",
               end=" ", flush=True)
         import time
         t0 = time.time()
-        # Warm-up with a small dummy batch to trigger compilation
-        max_seq = config.get('max_seq_len', 512)
-        dummy_len = min(32, max_seq)
-        dummy = jnp.zeros((batch_size, dummy_len), dtype=jnp.int32)
+        dummy = jnp.zeros((batch_size, pad_len), dtype=jnp.int32)
         _ = forward_fn(dummy)
         _.block_until_ready()
         print(f"done ({time.time() - t0:.1f}s)")
@@ -485,23 +497,20 @@ def analyze_pos_selectivity(
             end = min(start + batch_size, len(tokenized))
             batch_items = tokenized[start:end]
 
-            # Pad to max length in this batch
-            seq_lens = [len(ids) for _, ids in batch_items]
-            max_len = max(seq_lens)
-            # Clamp to max_seq_len
-            max_len = min(max_len, max_seq)
-            seq_lens = [min(s, max_len) for s in seq_lens]
+            # Pad all sentences to the fixed pad_len
+            seq_lens = [min(len(ids), pad_len) for _, ids in batch_items]
 
-            padded = np.zeros((len(batch_items), max_len), dtype=np.int32)
+            # Last batch may be smaller than batch_size — pad batch dim too
+            padded = np.zeros((batch_size, pad_len), dtype=np.int32)
             for j, (_, ids) in enumerate(batch_items):
                 slen = seq_lens[j]
                 padded[j, :slen] = ids[:slen]
 
-            # Batched forward
+            # Batched forward (always [batch_size, pad_len] — fixed shape)
             w_list = _extract_multilayer_weights_batched(
                 forward_fn, jnp.array(padded), seq_lens)
 
-            # Accumulate per sentence
+            # Accumulate per sentence (only real items, not padding rows)
             for j, (pos_tags, _) in enumerate(batch_items):
                 w = w_list[j]
                 if w is None:
