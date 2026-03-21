@@ -94,7 +94,7 @@ def analyze_qk_specialization(
 
     for pool_name, pool_info in QK_POOLS.items():
         n_attr = pool_info['n_attr']
-        n_neurons = config.get(n_attr.replace('n_', ''), 0)
+        n_neurons = config.get(n_attr, 0)
         if n_neurons == 0:
             continue
 

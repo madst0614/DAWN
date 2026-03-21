@@ -116,6 +116,11 @@ CONTROL_PROMPTS = [
 def _get_knowledge_activations(extractor, tokenizer, prompt, config):
     """Get active neuron sets for F-Know and R-Know pools from a single prompt.
 
+    Uses ALL token positions (not just last). With embedding-only routing,
+    each token's embedding independently determines routing. Using all positions
+    captures the full prompt semantics — e.g., "capital" and country names
+    route to different neurons than "sky" or "water".
+
     Returns dict: {pool: set_of_active_neuron_indices}
     """
     input_ids = tokenizer.encode(prompt, add_special_tokens=True,
@@ -132,12 +137,15 @@ def _get_knowledge_activations(extractor, tokenizer, prompt, config):
         if w is None:
             result[pool_key] = set()
             continue
-        # Use last token position (prediction position)
+        # Use ALL token positions — union of active neurons across the prompt
         if w.ndim == 3:
-            w_last = w[0, -1]  # [N]
+            w_all = w[0]  # [S, N]
         else:
-            w_last = w[0]  # [N]
-        active = set(int(i) for i in np.where(w_last > 0)[0])
+            w_all = w  # [S, N] or [N]
+            if w_all.ndim == 1:
+                w_all = w_all[np.newaxis, :]  # [1, N]
+        # A neuron is "active" if it fires for ANY token in the prompt
+        active = set(int(i) for i in np.where((w_all > 0).any(axis=0))[0])
         result[pool_key] = active
 
     return result

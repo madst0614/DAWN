@@ -445,30 +445,52 @@ def analyze_pos_selectivity(
 
     print(f"  Processed {n_sents - skipped}/{n_sents} sentences (skipped {skipped})")
 
-    # Compute selectivity matrix — matches GPU formula in pos_neuron.py
-    # Step 1: mean_weight[pos, neuron] = weight_sum / weight_count (active only)
-    #   Uses weight_count (active tokens where w>0), NOT pos_token_counts (all tokens)
-    #   NaN where neuron was never active for this POS
+    # Compute selectivity matrix — frequency-based (paper Section 4.2)
+    #
+    # With top-k + renormalization, weight magnitudes are ~uniform (1/k),
+    # so weight-based selectivity ≈ 1. Instead we use activation frequency:
+    #   selectivity[p,n] = P(n active | POS=p) / P(n active | all)
+    # This measures how much MORE often a neuron fires for a specific POS.
+    #
+    # weight_count[p, n] = number of POS-p tokens that activated neuron n
+    # pos_token_counts[p] = total number of POS-p tokens
+
     pos_mask = pos_token_counts > 0
+    total_tokens = pos_token_counts.sum()
+
+    # Step 1: activation frequency per POS
+    #   freq[p, n] = weight_count[p,n] / pos_token_counts[p]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        activation_freq = np.where(
+            pos_token_counts[:, np.newaxis] > 0,
+            weight_count / pos_token_counts[:, np.newaxis],
+            0.0,
+        )
+
+    # Step 2: overall activation frequency per neuron
+    #   overall_freq[n] = sum_p(weight_count[p,n]) / total_tokens
+    overall_count = weight_count.sum(axis=0)  # [n_neurons]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        overall_freq = overall_count / max(total_tokens, 1)
+
+    # Step 3: selectivity = activation_freq / overall_freq
+    with np.errstate(divide='ignore', invalid='ignore'):
+        selectivity = np.where(
+            overall_freq > 0,
+            activation_freq / overall_freq,
+            0.0,
+        )
+
+    # Also compute mean_weight for backward compatibility (used in specialist stats)
     with np.errstate(divide='ignore', invalid='ignore'):
         mean_weight = np.where(
             weight_count > 0,
             weight_sum / weight_count,
-            np.nan,
-        )
-
-    # Step 2: neuron_avg = nanmean across POS (treats each POS equally)
-    #   NOT global token-weighted mean — this ensures rare POS aren't down-weighted
-    with np.errstate(divide='ignore', invalid='ignore'):
-        neuron_avg = np.nanmean(mean_weight, axis=0)  # [n_neurons]
-
-    # Step 3: selectivity = mean_weight / neuron_avg
-    with np.errstate(divide='ignore', invalid='ignore'):
-        selectivity = np.where(
-            neuron_avg > 0,
-            mean_weight / neuron_avg,
             0.0,
         )
+
+    # Neuron avg (for JSON output compatibility)
+    neuron_avg = overall_freq
 
     # Clean up NaN/inf
     mean_weight = np.nan_to_num(mean_weight, nan=0.0)
@@ -639,11 +661,20 @@ def main():
                             key=lambda x: -x[1])[:10]:
         print(f"    {pos:8s}: {cnt:6d}")
 
+    # Specialist stats
+    print(f"\n  POS specialist stats (selectivity > 2.0):")
+    for pos in ['NOUN', 'VERB', 'ADJ', 'DET', 'ADP', 'PUNCT', 'PROPN', 'NUM']:
+        stats = results.get('pos_specialist_stats', {}).get(pos)
+        if stats:
+            print(f"    {pos:8s}: {stats['n_specialists']:3d} specialists, "
+                  f"{stats['n_sel_gt_1_5']:3d} sel>1.5, "
+                  f"{stats['n_active']:4d} active")
+
     print(f"\n  Top selective neurons per POS (selectivity > 1):")
     for pos in ['NOUN', 'VERB', 'ADJ', 'DET', 'ADP', 'PUNCT']:
         top = results['top_selective_per_pos'].get(pos, [])
         if top:
-            top3 = ', '.join(f'N{t["neuron"]}({t["selectivity"]:.2f})'
+            top3 = ', '.join(f'N{t["neuron"]}({t["selectivity"]:.2f}×)'
                               for t in top[:3])
             print(f"    {pos:8s}: {top3}")
 
