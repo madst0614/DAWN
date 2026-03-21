@@ -282,6 +282,9 @@ def analyze_knowledge_coherence(
 
     results = {'per_pool': {p: {} for p in pools}, 'per_target': {}}
 
+    overall_start = time.time()
+    completed_pairs = 0
+
     for pair_idx, (label, prompt, target_text, query_type) in enumerate(all_prompt_pairs):
         # Validate target token
         target_ids = tokenizer.encode(target_text, add_special_tokens=False)
@@ -306,12 +309,23 @@ def analyze_knowledge_coherence(
 
         print(f"\n    [{pair_idx+1}/{len(all_prompt_pairs)}] "
               f"[{query_type}] \"{prompt}\" -> \"{target_text}\"")
+        pair_start = time.time()
 
         while successful_runs < min_target_count and total_runs < max_runs:
             total_runs += 1
-            if total_runs % 50 == 0 or successful_runs == min_target_count:
+            if total_runs % 20 == 0 or successful_runs == min_target_count:
+                elapsed = time.time() - pair_start
+                runs_per_sec = total_runs / elapsed if elapsed > 0 else 0
+                if successful_runs > 0 and runs_per_sec > 0:
+                    remaining_hits = min_target_count - successful_runs
+                    runs_per_hit = total_runs / successful_runs
+                    est_remaining = remaining_hits * runs_per_hit / runs_per_sec
+                    eta_str = f"ETA {est_remaining:.0f}s"
+                else:
+                    eta_str = "ETA --"
                 print(f"\r      {successful_runs}/{min_target_count} hits "
-                      f"(run {total_runs})", end='', flush=True)
+                      f"(run {total_runs}, {runs_per_sec:.1f} run/s, "
+                      f"{eta_str})   ", end='', flush=True)
 
             # Init KV cache and prefill
             kv_k, kv_v = dawn_init_kv_cache(config, batch_size=1)
@@ -374,12 +388,24 @@ def analyze_knowledge_coherence(
                 next_token = _sample_token(next_logits, temperature, top_k, subkey)
                 generated_ids.append(next_token)
 
+        pair_elapsed = time.time() - pair_start
         print(f"\r      {successful_runs}/{min_target_count} hits "
-              f"(run {total_runs}) — Done!          ")
+              f"(run {total_runs}) — Done! [{pair_elapsed:.1f}s]          ")
 
         match_rate = successful_runs / total_runs if total_runs > 0 else 0
         print(f"      Match rate: {match_rate*100:.1f}% "
               f"({successful_runs}/{total_runs})")
+
+        completed_pairs += 1
+        overall_elapsed = time.time() - overall_start
+        if completed_pairs < len(all_prompt_pairs):
+            avg_per_pair = overall_elapsed / completed_pairs
+            remaining_pairs = len(all_prompt_pairs) - completed_pairs
+            overall_eta = avg_per_pair * remaining_pairs
+            mins_elapsed = overall_elapsed / 60
+            mins_eta = overall_eta / 60
+            print(f"      [Overall: {completed_pairs}/{len(all_prompt_pairs)} pairs, "
+                  f"{mins_elapsed:.1f}min elapsed, ~{mins_eta:.1f}min remaining]")
 
         # Compute frequencies
         target_key = f"{query_type}_{label}"
