@@ -36,6 +36,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import numpy as np
 
 try:
+    import jax
+    import jax.numpy as jnp
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
+try:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -184,12 +191,160 @@ def align_tokens_to_pos(tokenizer, ud_tokens, ud_pos):
 
 
 # ============================================================
+# Multi-layer routing extraction (partial forward)
+# ============================================================
+
+# Map pool_type to the variable returned by _router_attn_forward / _router_know_forward
+_POOL_TO_ATTN_IDX = {
+    'fqk_q': 0, 'fqk_k': 1, 'fv': 2,
+    'rqk_q': 3, 'rqk_k': 4, 'rv': 5,
+}
+_POOL_IS_KNOW = {'fknow': 0, 'rknow': 1}
+
+
+def _extract_multilayer_weights(
+    params, config, token_ids_np, pool_type,
+):
+    """Run partial forward through all layers, return layer-averaged routing weights.
+
+    Mirrors GPU POSNeuronAnalyzer.extract_routing_weights() which averages
+    weights across all layers.
+
+    Args:
+        params: FrozenDict model params
+        config: Model config dict
+        token_ids_np: [1, S] int32 array
+        pool_type: Routing pool key ('fv', 'fqk_q', 'rv', 'fknow', etc.)
+
+    Returns:
+        weights: [S, N] numpy array averaged across layers, or None
+    """
+    if not HAS_JAX:
+        return None
+
+    from models.model_v17_1_jax import (
+        _layer_norm, _router_attn_forward, _router_know_forward,
+        _attention_forward, _knowledge_forward,
+    )
+
+    all_params = params.get('params', params)
+    router_params = all_params.get('router', {})
+    sn_params = all_params.get('shared_neurons', {})
+    n_layers = config.get('n_layers', 16)
+
+    # Config values
+    n_fqk = config.get('n_feature_qk', 88)
+    n_fv = config.get('n_feature_v', 352)
+    n_rqk = config.get('n_restore_qk', 88)
+    n_rv = config.get('n_restore_v', 352)
+    n_fk = config.get('n_feature_know', 224)
+    n_rk = config.get('n_restore_know', 224)
+    d_space = config.get('d_space', 256)
+    tk_fqk = config.get('top_k_feature_qk', 16)
+    tk_fv = config.get('top_k_feature_v', 16)
+    tk_rqk = config.get('top_k_restore_qk', 16)
+    tk_rv = config.get('top_k_restore_v', 16)
+    tk_fk = config.get('top_k_feature_know', 16)
+    tk_rk = config.get('top_k_restore_know', 16)
+    n_heads = config.get('n_heads', 8)
+    d_model = config.get('d_model', 768)
+
+    is_attn_pool = pool_type in _POOL_TO_ATTN_IDX
+    is_know_pool = pool_type in _POOL_IS_KNOW
+
+    if not is_attn_pool and not is_know_pool:
+        return None
+
+    input_ids = jnp.array(token_ids_np)
+    B, S = input_ids.shape
+
+    tok_emb = all_params['token_emb']['embedding'][input_ids]
+    pos_emb = all_params['pos_emb']['embedding'][jnp.arange(S)[jnp.newaxis, :]]
+    x = tok_emb + pos_emb
+
+    rng_key = jax.random.PRNGKey(0)
+    weight_sum = None
+    layer_count = 0
+
+    for li in range(n_layers):
+        bp = all_params[f'block_{li}']
+        rng_key, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng_key, 5)
+
+        # Attention sub-block
+        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+
+        attn_results = _router_attn_forward(
+            normed, router_params,
+            n_fqk, n_fv, n_rqk, n_rv, d_space,
+            tk_fqk, tk_fv, tk_rqk, tk_rv,
+            0.0, None, True, rng_ar,
+        )
+        fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w = attn_results[:6]
+
+        if is_attn_pool:
+            idx = _POOL_TO_ATTN_IDX[pool_type]
+            w = np.array(attn_results[idx])  # [B, S, N]
+            if w.ndim == 3:
+                w = w[0]  # [S, N]
+            else:
+                w = np.broadcast_to(w[0:1], (S, w.shape[-1]))
+            if weight_sum is None:
+                weight_sum = w.astype(np.float64)
+            else:
+                weight_sum += w
+            layer_count += 1
+
+        # Forward attention
+        attn_out = _attention_forward(
+            normed, sn_params,
+            fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w,
+            bp['attn']['expand_O']['kernel'],
+            n_fqk, n_rqk, n_heads, d_model,
+            0.0, True, rng_a,
+        )
+        x = x + attn_out
+
+        # Knowledge sub-block
+        normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+
+        fk_w, rk_w, _ = _router_know_forward(
+            normed, router_params,
+            n_fqk, n_fv, n_rqk, n_rv, n_fk, n_rk,
+            tk_fk, tk_rk,
+            0.0, None, True, rng_kr,
+        )
+
+        if is_know_pool:
+            know_idx = _POOL_IS_KNOW[pool_type]
+            w = np.array(fk_w if know_idx == 0 else rk_w)
+            if w.ndim == 3:
+                w = w[0]
+            else:
+                w = np.broadcast_to(w[0:1], (S, w.shape[-1]))
+            if weight_sum is None:
+                weight_sum = w.astype(np.float64)
+            else:
+                weight_sum += w
+            layer_count += 1
+
+        know_out = _knowledge_forward(
+            normed, sn_params, fk_w, rk_w,
+            0.0, True, rng_k,
+        )
+        x = x + know_out
+
+    if weight_sum is None or layer_count == 0:
+        return None
+    return (weight_sum / layer_count).astype(np.float32)
+
+
+# ============================================================
 # Analysis
 # ============================================================
 
 def analyze_pos_selectivity(
     model_cls, params, config, dataset,
-    pool_type='fv', max_sentences=None,
+    pool_type='fv', max_sentences=None, multi_layer=False,
 ):
     """Compute POS selectivity matrix.
 
@@ -228,7 +383,12 @@ def analyze_pos_selectivity(
     n_sents = min(len(dataset), max_sentences) if max_sentences else len(dataset)
     skipped = 0
 
-    for i in tqdm(range(n_sents), desc=f'POS selectivity ({pool_type})'):
+    mode_label = 'multi-layer' if multi_layer else 'embedding-only'
+    if multi_layer and not HAS_JAX:
+        print("  Warning: JAX not available, falling back to embedding-only")
+        multi_layer = False
+
+    for i in tqdm(range(n_sents), desc=f'POS selectivity ({pool_type}, {mode_label})'):
         sent = dataset[i]
         try:
             pos_tags, token_ids = align_tokens_to_pos(
@@ -241,22 +401,26 @@ def analyze_pos_selectivity(
             skipped += 1
             continue
 
-        # Get routing weights
         input_ids = np.array([token_ids], dtype=np.int32)
-        routing_info = extractor.extract_routing(input_ids)
-        routing = JAXRoutingData(routing_info)
-        weights = routing.get_weight(pool_type)
 
-        if weights is None:
+        if multi_layer:
+            # Partial forward through all layers, average weights (matches GPU)
+            w = _extract_multilayer_weights(params, config, input_ids, pool_type)
+        else:
+            # Embedding-level only (fast, but single-layer)
+            routing_info = extractor.extract_routing(input_ids)
+            routing = JAXRoutingData(routing_info)
+            weights = routing.get_weight(pool_type)
+            if weights is None:
+                w = None
+            elif weights.ndim == 3:
+                w = weights[0]  # [S, N]
+            else:
+                w = np.broadcast_to(weights[0:1], (len(token_ids), weights.shape[-1]))
+
+        if w is None:
             skipped += 1
             continue
-
-        # weights: [1, S, N] or [1, N]
-        if weights.ndim == 3:
-            w = weights[0]  # [S, N]
-        else:
-            # Expand batch-level to all positions
-            w = np.broadcast_to(weights[0:1], (len(token_ids), weights.shape[-1]))
 
         seq_len = min(len(pos_tags), w.shape[0])
         w = w[:seq_len]
@@ -348,6 +512,8 @@ def analyze_pos_selectivity(
 
     results = {
         'pool_type': pool_type,
+        'multi_layer': multi_layer,
+        'n_layers': config.get('n_layers', 16) if multi_layer else 1,
         'n_neurons': n_neurons,
         'n_sentences': n_sents - skipped,
         'pos_token_counts': {UPOS_TAGS[p]: int(pos_token_counts[p])
@@ -433,6 +599,9 @@ def main():
     parser.add_argument('--ud_data', default=None, help='Local .conllu file path')
     parser.add_argument('--max_sentences', type=int, default=2000)
     parser.add_argument('--top_n_neurons', type=int, default=50)
+    parser.add_argument('--multi_layer', action='store_true',
+                        help='Average routing weights across all layers via partial forward '
+                             '(matches GPU analysis). Slower but more accurate.')
     parser.add_argument('--dpi', type=int, default=300)
     args = parser.parse_args()
 
@@ -442,16 +611,20 @@ def main():
     print(f"Loading checkpoint: {args.checkpoint}")
     model_cls, params, config = load_model_jax(args.checkpoint)
     print(f"  d_model={config.get('d_model')}, n_layers={config.get('n_layers')}")
+    if args.multi_layer:
+        print(f"  Multi-layer mode: averaging across {config.get('n_layers', 16)} layers")
 
     # Load UD-EWT
     dataset = load_ud_ewt(args.ud_split, args.max_sentences, args.ud_data)
 
     # Analyze
-    print(f"\n=== POS Selectivity Analysis (pool={args.pool_type}) ===")
+    mode = 'multi-layer' if args.multi_layer else 'embedding-only'
+    print(f"\n=== POS Selectivity Analysis (pool={args.pool_type}, {mode}) ===")
     results, selectivity = analyze_pos_selectivity(
         model_cls, params, config, dataset,
         pool_type=args.pool_type,
         max_sentences=args.max_sentences,
+        multi_layer=args.multi_layer,
     )
 
     # Save JSON
