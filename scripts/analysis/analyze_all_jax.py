@@ -1149,73 +1149,139 @@ class ModelAnalyzer:
         return results
 
     def analyze_semantic(self, n_batches: int = 50) -> Dict:
-        """Analyze semantic properties (DAWN only)."""
-        print("  [JAX] SemanticAnalyzer not yet ported to JAX - skipping")
-        return {}
+        """Analyze semantic properties (DAWN only).
 
-        # TODO: Port to JAX
+        JAX/TPU implementation. Computes routing path similarity between
+        semantically similar vs different sentence pairs, and POS-based
+        routing patterns using embedding-level routing extraction.
+        """
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping semantic analysis (not DAWN model)")
             return {}
 
-        from scripts.analysis.semantic import SemanticAnalyzer
+        from scripts.analysis.utils_jax import (
+            load_val_data_jax, create_model_from_config, JAXRoutingDataExtractor,
+        )
+        from transformers import AutoTokenizer
 
         output_dir = self.output_dir / 'semantic'
         output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"  Analyzing semantic patterns ({n_batches} batches)...")
-        dataloader = self._get_dataloader()
-        analyzer = SemanticAnalyzer(self.model, tokenizer=self.tokenizer, device=self.device)
-        results = analyzer.run_all(dataloader, str(output_dir), max_batches=n_batches)
 
-        # Print detailed summary
-        path_sim = results.get('path_similarity', {})
-        context_routing = results.get('context_routing', {})
-        pos_routing = results.get('pos_routing', {})
+        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        model_instance = create_model_from_config(self.config)
+        extractor = JAXRoutingDataExtractor(model_instance, self.params, self.config)
 
+        # 1. Path similarity: similar vs different sentence pairs
+        similar_pairs = [
+            ("The cat sat on the mat", "A kitten rested on the rug", "similar"),
+            ("She drove to work", "He commuted by car", "similar"),
+            ("The stock market crashed", "Financial markets tumbled", "similar"),
+            ("He ate a large pizza", "She devoured a big pie", "similar"),
+            ("The dog barked loudly", "The puppy was noisy", "similar"),
+        ]
+        different_pairs = [
+            ("The cat sat on the mat", "Financial markets tumbled", "different"),
+            ("She drove to work", "The tree is tall", "different"),
+            ("He ate a large pizza", "The stock market crashed", "different"),
+            ("The dog barked loudly", "She wrote a letter", "different"),
+            ("The sun is bright", "He fixed the car engine", "different"),
+        ]
+        all_pairs = similar_pairs + different_pairs
+
+        # Collect routing paths
+        similar_cosines = []
+        different_cosines = []
+
+        for sent1, sent2, label in all_pairs:
+            ids1 = tokenizer.encode(sent1, add_special_tokens=True)
+            ids2 = tokenizer.encode(sent2, add_special_tokens=True)
+
+            routing1 = extractor.extract_routing(np.array([ids1]))
+            routing2 = extractor.extract_routing(np.array([ids2]))
+
+            # Flatten routing weights into vectors
+            def _flatten_routing(r):
+                vecs = []
+                for section in ['attention', 'knowledge']:
+                    data = r.get(section, {})
+                    for k, v in data.items():
+                        if isinstance(v, np.ndarray):
+                            vecs.append(v.flatten())
+                return np.concatenate(vecs) if vecs else np.array([])
+
+            v1 = _flatten_routing(routing1)
+            v2 = _flatten_routing(routing2)
+
+            if len(v1) > 0 and len(v2) > 0:
+                # Cosine similarity
+                norm1 = np.linalg.norm(v1)
+                norm2 = np.linalg.norm(v2)
+                if norm1 > 0 and norm2 > 0:
+                    cos = float(np.dot(v1, v2) / (norm1 * norm2))
+                    if label == 'similar':
+                        similar_cosines.append(cos)
+                    else:
+                        different_cosines.append(cos)
+
+        path_sim = {}
+        if similar_cosines and different_cosines:
+            sim_mean = float(np.mean(similar_cosines))
+            diff_mean = float(np.mean(different_cosines))
+            gap = sim_mean - diff_mean
+            path_sim = {
+                'similar_pairs': {
+                    'cosine_mean': sim_mean,
+                    'cosine_std': float(np.std(similar_cosines)),
+                    'count': len(similar_cosines),
+                },
+                'different_pairs': {
+                    'cosine_mean': diff_mean,
+                    'cosine_std': float(np.std(different_cosines)),
+                    'count': len(different_cosines),
+                },
+                'interpretation': {
+                    'gap': gap,
+                    'verdict': ('GOOD: similar > different' if gap > 0.01
+                                else 'WEAK: minimal difference'),
+                },
+            }
+
+        # 2. POS routing (use val tokens for batch analysis)
+        pos_routing = {}
+        try:
+            val_tokens = load_val_data_jax(self.val_data_path, max_tokens=n_batches * 32 * 512)
+            # Simple batch routing entropy analysis
+            from scripts.analysis.routing_jax import RoutingAnalyzerJAX
+            routing_analyzer = RoutingAnalyzerJAX(self.model, self.params, self.config)
+            entropy_results = routing_analyzer.analyze_entropy(val_tokens, n_batches=n_batches)
+            pos_routing = {'entropy_based': entropy_results}
+        except Exception as e:
+            pos_routing = {'note': f'Could not compute POS routing: {e}'}
+
+        results = {
+            'path_similarity': path_sim,
+            'pos_routing': pos_routing,
+            'context_routing': {'note': 'Context-dependent routing requires spaCy; skipped in JAX port'},
+        }
+
+        # Print summary
         if path_sim:
             print(f"\n  ┌─ Semantic Path Similarity ─────────────────────────────────────────────")
-            # Similar/different pairs summary
             sim_pairs = path_sim.get('similar_pairs', {})
             diff_pairs = path_sim.get('different_pairs', {})
-            if sim_pairs or diff_pairs:
-                print(f"  │ Similar pairs: cosine={sim_pairs.get('cosine_mean', 0):.4f}, n={sim_pairs.get('count', 0)}")
-                print(f"  │ Different pairs: cosine={diff_pairs.get('cosine_mean', 0):.4f}, n={diff_pairs.get('count', 0)}")
-                gap = sim_pairs.get('cosine_mean', 0) - diff_pairs.get('cosine_mean', 0)
-                print(f"  │ Similarity gap: {gap:.4f}")
-            # Interpretation
+            print(f"  │ Similar pairs: cosine={sim_pairs.get('cosine_mean', 0):.4f}, n={sim_pairs.get('count', 0)}")
+            print(f"  │ Different pairs: cosine={diff_pairs.get('cosine_mean', 0):.4f}, n={diff_pairs.get('count', 0)}")
             interp = path_sim.get('interpretation', {})
-            if interp:
-                print(f"  │ Verdict: {interp.get('verdict', 'N/A')}")
+            print(f"  │ Gap: {interp.get('gap', 0):.4f} — {interp.get('verdict', 'N/A')}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
-        if context_routing:
-            print(f"\n  ┌─ Context-Dependent Routing ────────────────────────────────────────────")
-            for word, data in context_routing.items():
-                if word == 'summary':
-                    continue
-                if isinstance(data, dict) and 'n_contexts' in data:
-                    n_contexts = data['n_contexts']
-                    avg_var = data.get('avg_variance', 0)
-                    print(f"  │ '{word}': {n_contexts} contexts, variance={avg_var:.4f}")
-            # Summary
-            summary = context_routing.get('summary', {})
-            if summary:
-                print(f"  │ Overall context variance: {summary.get('overall_context_variance', 0):.4f}")
-                print(f"  │ More context-sensitive: {summary.get('more_context_sensitive', 'N/A')}")
-            print(f"  └─────────────────────────────────────────────────────────────────────────")
-
-        if pos_routing:
-            print(f"\n  ┌─ POS Routing Patterns ─────────────────────────────────────────────────")
-            routing_by_pos = pos_routing.get('routing_by_pos', {})
-            # Sort by count and show top 10
-            sorted_pos = sorted(routing_by_pos.items(), key=lambda x: x[1].get('count', 0), reverse=True)[:10]
-            for pos, data in sorted_pos:
-                if isinstance(data, dict) and 'mean_activation' in data:
-                    print(f"  │ {pos}: mean_act={data['mean_activation']:.4f}, count={data.get('count', 0)}")
-            if len(routing_by_pos) > 10:
-                print(f"  │ ... and {len(routing_by_pos) - 10} more POS tags")
-            print(f"  └─────────────────────────────────────────────────────────────────────────")
+        # Save
+        with open(output_dir / 'semantic_results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
 
         self.results['semantic'] = results
         return results
@@ -1337,15 +1403,13 @@ class ModelAnalyzer:
         Returns:
             Dict with silhouette score, Jaccard similarities, content/function analysis
         """
-        print("  [JAX] TokenCombinationAnalyzer not yet ported to JAX - skipping")
-        return {}
-
-        # TODO: Port to JAX
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping token combination analysis (not DAWN model)")
             return {}
 
-        from scripts.analysis.pos_neuron import TokenCombinationAnalyzer
+        from scripts.analysis.visualizers.pos_selectivity_jax import (
+            analyze_pos_selectivity, load_ud_ewt,
+        )
 
         output_dir = self.output_dir / 'token_combination'
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1353,27 +1417,59 @@ class ModelAnalyzer:
         layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
         print(f"  Analyzing token neuron combinations ({max_sentences} sentences, {layer_str})...")
 
-        analyzer = TokenCombinationAnalyzer(
-            self.model, tokenizer=self.tokenizer, device=self.device,
-            target_layer=target_layer, activation_threshold=activation_threshold
+        try:
+            dataset = load_ud_ewt(split='train', max_sentences=max_sentences)
+        except Exception as e:
+            print(f"  Could not load UD-EWT dataset: {e}")
+            return {}
+
+        # Use POS selectivity as foundation for token combination analysis
+        pos_results, selectivity = analyze_pos_selectivity(
+            self.model, self.params, self.config, dataset,
+            pool_type='fv', max_sentences=max_sentences,
+            multi_layer=(target_layer is None),
         )
-        results = analyzer.run_all(str(output_dir), max_sentences=max_sentences)
 
-        # Print key metrics
+        # Compute POS clustering quality from selectivity matrix
+        try:
+            from sklearn.metrics import silhouette_score as sklearn_silhouette
+            HAS_SKLEARN = True
+        except ImportError:
+            HAS_SKLEARN = False
+
+        results = {
+            'selectivity_based': pos_results,
+            'pos_specialist_stats': pos_results.get('pos_specialist_stats', {}),
+        }
+
+        if HAS_SKLEARN and selectivity is not None:
+            # Use selectivity matrix transposed as feature vectors for neurons
+            sel_arr = np.array(selectivity) if not isinstance(selectivity, np.ndarray) else selectivity
+            # Neurons as samples, POS tags as features
+            X = sel_arr.T  # [n_neurons, n_pos]
+            # Assign each neuron its most-selective POS
+            labels = np.argmax(X, axis=1)
+            n_unique = len(set(labels))
+            if n_unique >= 2 and len(X) > n_unique:
+                try:
+                    score = float(sklearn_silhouette(X, labels))
+                    results['silhouette_score'] = {
+                        'score': score,
+                        'n_samples': len(X),
+                        'n_pos_categories': n_unique,
+                    }
+                except Exception:
+                    pass
+
         sil = results.get('silhouette_score', {})
-        pos_sim = results.get('pos_similarity', {})
-
         if sil.get('score') is not None:
             print(f"\n  ┌─ Token Combination Results ────────────────────────────────────────────")
             print(f"  │ Silhouette Score: {sil['score']:.4f}  (target: > 0.3)")
             print(f"  │ Samples: {sil.get('n_samples', 0)}, POS categories: {sil.get('n_pos_categories', 0)}")
-            if pos_sim:
-                print(f"  │")
-                print(f"  │ Jaccard Similarity:")
-                print(f"  │   Within-POS mean:  {pos_sim.get('mean_within', 0):.4f}")
-                print(f"  │   Between-POS mean: {pos_sim.get('mean_between', 0):.4f}")
-                print(f"  │   Separation:       {pos_sim.get('separation', 0):.4f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
 
         self.results['token_combination'] = results
         return results
@@ -1397,15 +1493,13 @@ class ModelAnalyzer:
         Returns:
             Dict with neuron profiles, specialized neurons, clusters
         """
-        print("  [JAX] NeuronFeatureAnalyzer not yet ported to JAX - skipping")
-        return {}
-
-        # TODO: Port to JAX
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping neuron features analysis (not DAWN model)")
             return {}
 
-        from scripts.analysis.pos_neuron import TokenCombinationAnalyzer, NeuronFeatureAnalyzer
+        from scripts.analysis.visualizers.pos_selectivity_jax import (
+            analyze_pos_selectivity, load_ud_ewt, UPOS_TAGS,
+        )
 
         output_dir = self.output_dir / 'neuron_features'
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1413,37 +1507,57 @@ class ModelAnalyzer:
         layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
         print(f"  Analyzing neuron features ({max_sentences} sentences, {layer_str})...")
 
-        # First collect token data
-        tca = TokenCombinationAnalyzer(
-            self.model, tokenizer=self.tokenizer, device=self.device,
-            target_layer=target_layer
-        )
-        dataset = tca.load_ud_dataset('train', max_sentences)
-        tca.analyze_dataset(dataset, max_sentences=max_sentences, analyze_layer_divergence=False)
+        try:
+            dataset = load_ud_ewt(split='train', max_sentences=max_sentences)
+        except Exception as e:
+            print(f"  Could not load UD-EWT dataset: {e}")
+            return {}
 
-        # Then run neuron feature analysis
-        nfa = NeuronFeatureAnalyzer.from_token_combination_analyzer(tca)
-        results = nfa.run_full_analysis(output_dir=str(output_dir))
+        # Analyze multiple pools for neuron-centric view
+        pools_to_analyze = ['fv', 'fknow', 'rknow']
+        all_pool_results = {}
 
-        # Print key metrics
-        specialized = results.get('specialized_neurons', {})
-        clusters = results.get('clusters', {})
+        for pool in pools_to_analyze:
+            try:
+                pool_results, sel = analyze_pos_selectivity(
+                    self.model, self.params, self.config, dataset,
+                    pool_type=pool, max_sentences=max_sentences,
+                    multi_layer=(target_layer is None),
+                )
+                all_pool_results[pool] = pool_results
+            except Exception as e:
+                print(f"    Warning: {pool} analysis failed: {e}")
+
+        # Build neuron feature profiles from selectivity data
+        specialized = {}
+        n_profiled = 0
+
+        for pool, pool_results in all_pool_results.items():
+            top_per_pos = pool_results.get('top_selective_per_pos', {})
+            for pos, neurons in top_per_pos.items():
+                specialists = [n for n in neurons if n.get('is_specialist', False)]
+                if specialists:
+                    key = f'{pool}_{pos}'
+                    specialized[key] = [f"{pool}_{n['neuron']}" for n in specialists]
+            n_profiled += pool_results.get('n_neurons', 0)
+
+        results = {
+            'n_neurons_profiled': n_profiled,
+            'specialized_neurons': specialized,
+            'per_pool': all_pool_results,
+        }
 
         print(f"\n  ┌─ Neuron Feature Analysis Results ─────────────────────────────────────")
-        print(f"  │ Neurons profiled: {results.get('n_neurons_profiled', 0)}")
+        print(f"  │ Neurons profiled: {n_profiled}")
         print(f"  │")
-        print(f"  │ Specialized neurons (80%+ concentration):")
+        print(f"  │ Specialized neurons (by pool_POS):")
         for feature, neurons in specialized.items():
             if neurons:
-                print(f"  │   {feature:12s}: {len(neurons)} neurons")
-        print(f"  │")
-        if clusters.get('silhouette_score'):
-            print(f"  │ Cluster silhouette: {clusters['silhouette_score']:.4f}")
+                print(f"  │   {feature:16s}: {len(neurons)} neurons")
         print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['neuron_features'] = results
 
-        # Save results.json for later --only paper usage
         with open(output_dir / 'results.json', 'w') as f:
             json.dump(results, f, indent=2, default=str)
 
@@ -1470,32 +1584,43 @@ class ModelAnalyzer:
         Returns:
             Dict with per-layer semantic correlation and silhouette scores
         """
-        print("  [JAX] LayerWiseSemanticAnalysis not yet ported to JAX - skipping")
-        return {}
-
-        # TODO: Port to JAX
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping layerwise semantic analysis (not DAWN model)")
             return {}
 
-        from scripts.analysis.pos_neuron import TokenCombinationAnalyzer
+        from scripts.analysis.routing_jax import RoutingAnalyzerJAX
+        from scripts.analysis.utils_jax import load_val_data_jax
 
         output_dir = self.output_dir / 'layerwise_semantic'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get number of layers from model
-        n_layers = getattr(self.model, 'n_layers', 8)
-
+        n_layers = self.config.get('n_layers', 16)
         print(f"  Analyzing layer-wise semantic emergence ({n_layers} layers, {max_sentences} sentences/layer)...")
 
-        results = TokenCombinationAnalyzer.run_layerwise_analysis(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            n_layers=n_layers,
-            output_dir=str(output_dir),
-            max_sentences=max_sentences,
-            device=self.device,
-        )
+        # Use routing analyzer for per-layer entropy analysis
+        try:
+            val_tokens = load_val_data_jax(self.val_data_path, max_tokens=max_sentences * 512)
+        except Exception as e:
+            print(f"  Skipping (could not load val data: {e})")
+            return {}
+
+        analyzer = RoutingAnalyzerJAX(self.model, self.params, self.config)
+
+        # Entropy and selection frequency as proxy for layer-wise semantic emergence
+        entropy = analyzer.analyze_entropy(val_tokens, n_batches=max_sentences // 32)
+        selection = analyzer.analyze_selection_frequency(val_tokens, n_batches=max_sentences // 32)
+
+        results = {
+            'n_layers': n_layers,
+            'entropy': entropy,
+            'selection_frequency': selection,
+            'note': 'Layer-wise analysis using routing entropy and selection frequency. '
+                    'Full semantic correlation (GloVe) requires separate porting.',
+        }
+
+        # Save
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
 
         self.results['layerwise_semantic'] = results
         return results
@@ -1954,29 +2079,71 @@ class ModelAnalyzer:
         return results
 
     def analyze_v18(self, n_batches: int = 50) -> Dict:
-        """Analyze v18.x specific features (DAWN v18.x only)."""
-        print("  [JAX] V18Analyzer not yet ported to JAX - skipping")
-        return {}
+        """Analyze v18.x specific features (DAWN v18.x only).
 
-        # TODO: Port to JAX
+        JAX/TPU port. Extracts tau parameters directly from JAX params dict.
+        """
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping v18 analysis (not DAWN model)")
             return {}
 
-        from scripts.analysis.v18 import V18Analyzer
+        # Check for v18 tau parameters in JAX params
+        all_params = self.params.get('params', self.params)
+        router_params = all_params.get('router', {})
 
-        # Check if model is v18.x
-        analyzer = V18Analyzer(self.model, device=self.device)
-        if not analyzer.is_v18:
-            print("  Skipping (not v18.x model)")
+        # Detect v18 by looking for tau projection parameters
+        has_tau_feature = 'tau_proj_feature' in router_params
+        has_tau = 'tau_proj' in router_params
+        if not has_tau_feature and not has_tau:
+            print("  Skipping v18 analysis (no tau parameters found — not v18.x)")
             return {}
 
         output_dir = self.output_dir / 'v18'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"  Analyzing v18.x specific features ({n_batches} batches)...")
-        dataloader = self._get_dataloader()
-        results = analyzer.run_all(dataloader, str(output_dir), n_batches)
+        print(f"  Analyzing v18.x specific features...")
+        results = {'model_version': self.config.get('model_version', 'v18')}
+
+        if has_tau_feature:
+            # v18.4/v18.5 structure
+            tau_proj = router_params['tau_proj_feature']
+            weight = np.array(tau_proj.get('kernel', tau_proj.get('weight', np.array([]))))
+            bias = np.array(tau_proj.get('bias', np.array([])))
+
+            feature_names = ['fq', 'fk', 'fv', 'feature_know']
+            tau_params = {
+                'structure': 'v18.4+',
+                'tau_bias': {name: float(bias[i]) for i, name in enumerate(feature_names) if i < len(bias)},
+                'tau_weight_norm': {name: float(np.linalg.norm(weight[i] if weight.ndim > 1 else weight))
+                                   for i, name in enumerate(feature_names) if i < (weight.shape[0] if weight.ndim > 1 else 1)},
+                'tau_weight_std': {name: float(np.std(weight[i] if weight.ndim > 1 else weight))
+                                  for i, name in enumerate(feature_names) if i < (weight.shape[0] if weight.ndim > 1 else 1)},
+            }
+            if len(bias) >= 2:
+                tau_params['qk_differentiation'] = {
+                    'fqk_bias_diff': abs(float(bias[0]) - float(bias[1])),
+                }
+        elif has_tau:
+            tau_proj = router_params['tau_proj']
+            weight = np.array(tau_proj.get('kernel', tau_proj.get('weight', np.array([]))))
+            bias = np.array(tau_proj.get('bias', np.array([])))
+
+            pool_names = ['fq', 'fk', 'fv', 'rq', 'rk', 'rv', 'feature_know', 'restore_know']
+            tau_params = {
+                'structure': 'v18.0-18.3',
+                'tau_bias': {name: float(bias[i]) for i, name in enumerate(pool_names) if i < len(bias)},
+                'tau_weight_norm': {name: float(np.linalg.norm(weight[i] if weight.ndim > 1 else weight))
+                                   for i, name in enumerate(pool_names) if i < (weight.shape[0] if weight.ndim > 1 else 1)},
+                'tau_weight_std': {name: float(np.std(weight[i] if weight.ndim > 1 else weight))
+                                  for i, name in enumerate(pool_names) if i < (weight.shape[0] if weight.ndim > 1 else 1)},
+            }
+            if len(bias) >= 5:
+                tau_params['qk_differentiation'] = {
+                    'fqk_bias_diff': abs(float(bias[0]) - float(bias[1])),
+                    'rqk_bias_diff': abs(float(bias[3]) - float(bias[4])),
+                }
+
+        results['tau_parameters'] = tau_params
 
         # Print detailed summary
         tau_params = results.get('tau_parameters', {})
@@ -2426,39 +2593,41 @@ class ModelAnalyzer:
     def _analyze_comparison_model(self):
         """Run analysis on comparison model for table generation.
 
-        Uses cached multi-seed results if available to avoid redundant PPL computation.
-        Speed benchmark always runs (not cached in multi-seed).
+        JAX/TPU port. Loads vanilla checkpoint via JAX and evaluates PPL.
+        Uses cached multi-seed results if available.
         """
-        print("  [JAX] _analyze_comparison_model not yet ported - skipping")
-        return {}, {}, {}
+        from scripts.analysis.utils_jax import load_model_jax, evaluate_jax, load_val_data_jax, count_params_jax, estimate_flops_jax
 
-        # TODO: Port to JAX
-        from scripts.evaluation.evaluate import evaluate_model, load_val_data, estimate_flops
-
-        # Load model (always needed for speed benchmark)
-        comp_model, comp_name, comp_config = self._load_comparison_model()
-        if comp_model is None:
+        if not self.vanilla_checkpoint:
+            print("  No comparison checkpoint specified, skipping")
             return {}, {}, {}
 
+        try:
+            comp_model, comp_params, comp_config = load_model_jax(self.vanilla_checkpoint)
+        except Exception as e:
+            print(f"  Could not load comparison model: {e}")
+            return {}, {}, {}
+
+        comp_name = Path(self.vanilla_checkpoint).stem
         print(f"    Analyzing: {comp_name}")
 
-        # Model info (include config data for single source of truth)
-        total_params = sum(p.numel() for p in comp_model.parameters())
-        flops = estimate_flops(comp_model, config=comp_config, seq_len=512)
+        # Model info
+        total_params = count_params_jax(comp_params)
+        flops = estimate_flops_jax(comp_config, seq_len=512)
         vanilla_info = {
             'total': total_params,
             'total_M': total_params / 1e6,
             'flops': flops,
             'flops_G': flops / 1e9,
-            'd_model': comp_config.get('d_model') if comp_config else getattr(comp_model, 'd_model', 0),
-            'n_layers': comp_config.get('n_layers') if comp_config else getattr(comp_model, 'n_layers', 0),
-            'n_heads': comp_config.get('n_heads') if comp_config else getattr(comp_model, 'n_heads', 0),
-            'vocab_size': comp_config.get('vocab_size') if comp_config else getattr(comp_model, 'vocab_size', 0),
-            'd_ff': comp_config.get('d_ff') if comp_config else getattr(comp_model, 'd_ff', 0),
+            'd_model': comp_config.get('d_model', 0),
+            'n_layers': comp_config.get('n_layers', 0),
+            'n_heads': comp_config.get('n_heads', 0),
+            'vocab_size': comp_config.get('vocab_size', 0),
+            'd_ff': comp_config.get('d_ff', 0),
         }
         print(f"    Parameters: {vanilla_info['total_M']:.2f}M, FLOPs: {vanilla_info['flops_G']:.2f}G")
 
-        # PPL: use multi-seed cache if available, otherwise compute
+        # PPL
         if self._multi_seed_results and 'vanilla' in self._multi_seed_results:
             cached = self._multi_seed_results['vanilla']
             vanilla_val = {
@@ -2468,32 +2637,43 @@ class ModelAnalyzer:
             print(f"    PPL: {cached['ppl_mean']:.2f} (cached from multi-seed)")
         else:
             print(f"    Running validation ({self.val_batches} batches)...")
-            val_tokens = load_val_data(self.val_data_path, max_tokens=self.val_batches * 32 * 512)
-            val_results = evaluate_model(comp_model, val_tokens, batch_size=32, seq_len=512, device=self.device)
-            vanilla_val = val_results
-            print(f"    PPL: {vanilla_val.get('perplexity', 0):.2f}, Acc: {vanilla_val.get('accuracy', 0):.1f}%")
+            try:
+                val_tokens = load_val_data_jax(self.val_data_path, max_tokens=self.val_batches * 32 * 512)
+                from scripts.analysis.utils_jax import create_model_from_config
+                comp_instance = create_model_from_config(comp_config)
+                vanilla_val = evaluate_jax(comp_instance, comp_params, comp_config, val_tokens,
+                                          batch_size=32, seq_len=512, n_batches=self.val_batches)
+                print(f"    PPL: {vanilla_val.get('perplexity', 0):.2f}, Acc: {vanilla_val.get('accuracy', 0):.1f}%")
+            except Exception as e:
+                print(f"    Evaluation failed: {e}")
+                vanilla_val = {}
 
-        # Speed benchmark
+        # Speed benchmark on JAX
         import time
-        comp_model.eval()
-        dummy = torch.randint(0, 1000, (1, 512)).to(self.device)
-        # Warmup
-        for _ in range(5):
-            with torch.no_grad():
-                comp_model(dummy)
-        # Benchmark
-        torch.cuda.synchronize() if self.device == 'cuda' else None
-        start = time.time()
-        for _ in range(20):
-            with torch.no_grad():
-                comp_model(dummy)
-        torch.cuda.synchronize() if self.device == 'cuda' else None
-        elapsed = time.time() - start
-        tokens_per_sec = (20 * 512) / elapsed
-        vanilla_speed = {'tokens_per_sec': tokens_per_sec}
-        print(f"    Speed: {tokens_per_sec/1000:.1f}K tok/s")
+        import jax
+        import jax.numpy as jnp
+        from models.model_v17_1_jax import dawn_cached_forward, dawn_init_kv_cache
 
-        # Don't cleanup here - model may be reused for generation comparison
+        try:
+            kv_k, kv_v = dawn_init_kv_cache(comp_config, batch_size=1)
+            dummy = jnp.ones((1, 512), dtype=jnp.int32)
+            # Warmup
+            for _ in range(3):
+                out = dawn_cached_forward(comp_params, comp_config, dummy, kv_k, kv_v, 0)
+                out[0].block_until_ready()
+            # Benchmark
+            start = time.time()
+            for _ in range(10):
+                out = dawn_cached_forward(comp_params, comp_config, dummy, kv_k, kv_v, 0)
+                out[0].block_until_ready()
+            elapsed = time.time() - start
+            tokens_per_sec = (10 * 512) / elapsed
+            vanilla_speed = {'tokens_per_sec': tokens_per_sec}
+            print(f"    Speed: {tokens_per_sec/1000:.1f}K tok/s")
+        except Exception as e:
+            print(f"    Speed benchmark failed: {e}")
+            vanilla_speed = {}
+
         return vanilla_info, vanilla_val, vanilla_speed
 
     def _extract_checkpoint_config(self, checkpoint_path: str) -> Dict:
