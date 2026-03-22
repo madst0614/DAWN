@@ -31,6 +31,18 @@ except ImportError:
 
 from .utils_jax import create_model_from_config, evaluate_jax, load_val_data_jax
 
+try:
+    from models.model_v17_1_jax import dawn_init_kv_cache, dawn_cached_forward
+    HAS_DAWN_CACHE = True
+except ImportError:
+    HAS_DAWN_CACHE = False
+
+try:
+    from models.baseline_transformer_jax import vanilla_init_kv_cache, vanilla_cached_forward
+    HAS_VANILLA_CACHE = True
+except ImportError:
+    HAS_VANILLA_CACHE = False
+
 
 # Standard prompt categories for generation
 GENERATION_PROMPTS = {
@@ -94,6 +106,35 @@ class TextGeneratorJAX:
         self.vocab_size = vocab_size
         self.eos_token_id = 102  # BERT [SEP]
 
+    def _sample_token(self, logits: np.ndarray, temperature: float,
+                      top_k: int, rng_key) -> Tuple[int, Any]:
+        """Sample a token from logits with temperature and top-k."""
+        if temperature > 0:
+            logits = logits / temperature
+            if top_k > 0:
+                top_indices = np.argsort(logits)[-top_k:]
+                mask = np.ones_like(logits) * float('-inf')
+                mask[top_indices] = logits[top_indices]
+                logits = mask
+            probs = np.exp(logits - np.max(logits))
+            probs = probs / (probs.sum() + 1e-8)
+            rng_key, subkey = jax.random.split(rng_key)
+            next_token = int(jax.random.choice(subkey, len(probs), p=probs))
+        else:
+            next_token = int(np.argmax(logits))
+        return next_token, rng_key
+
+    def _get_cache_fns(self, config: Dict):
+        """Get KV cache init/forward functions based on model type."""
+        model_version = str(config.get('model_version', ''))
+        is_baseline = model_version.lower() in ('baseline', 'vanilla', '')
+
+        if is_baseline and HAS_VANILLA_CACHE:
+            return vanilla_init_kv_cache, vanilla_cached_forward
+        elif not is_baseline and HAS_DAWN_CACHE:
+            return dawn_init_kv_cache, dawn_cached_forward
+        return None, None
+
     def generate(
         self,
         model,
@@ -105,7 +146,10 @@ class TextGeneratorJAX:
         top_k: int = 50,
         top_p: float = 0.9,
     ) -> Tuple[np.ndarray, float]:
-        """Generate text continuation.
+        """Generate text continuation with KV cache for fast decoding.
+
+        Uses cached forward pass (prefill + decode) when available,
+        falling back to full forward pass otherwise.
 
         Args:
             model: JAX/Flax model class (unused, uses config to create instance)
@@ -123,65 +167,106 @@ class TextGeneratorJAX:
         if not HAS_JAX:
             return prompt_ids, 0.0
 
-        # Ensure 2D input
-        if prompt_ids.ndim == 1:
-            prompt_ids = prompt_ids[np.newaxis, :]
+        if prompt_ids.ndim == 2:
+            prompt_ids = prompt_ids.flatten()
 
-        model_instance = create_model_from_config(config)
         max_seq_len = config.get('max_seq_len', 512)
-
-        generated = list(prompt_ids.flatten())
         rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**31)
 
-        # JIT-compile forward pass for generation
+        # Try KV-cached generation (fast path)
+        init_cache_fn, cached_fwd_fn = self._get_cache_fns(config)
+        if init_cache_fn is not None and cached_fwd_fn is not None:
+            return self._generate_with_kv_cache(
+                params, config, prompt_ids, max_new_tokens,
+                temperature, top_k, rng_key, max_seq_len,
+                init_cache_fn, cached_fwd_fn
+            )
+
+        # Fallback: full forward pass (slow, no cache)
+        return self._generate_no_cache(
+            params, config, prompt_ids, max_new_tokens,
+            temperature, top_k, rng_key, max_seq_len
+        )
+
+    def _generate_with_kv_cache(
+        self, params, config, prompt_ids, max_new_tokens,
+        temperature, top_k, rng_key, max_seq_len,
+        init_cache_fn, cached_fwd_fn
+    ) -> Tuple[np.ndarray, float]:
+        """Fast generation using KV cache (prefill + single-token decode)."""
+        eos_id = self.eos_token_id
+
+        # Truncate prompt if needed
+        if len(prompt_ids) > max_seq_len - 1:
+            prompt_ids = prompt_ids[-(max_seq_len - 1):]
+        prompt_len = len(prompt_ids)
+
+        @jax.jit
+        def decode_step(params, token_ids, kv_k, kv_v, cache_pos):
+            return cached_fwd_fn(params, config, token_ids, kv_k, kv_v, cache_pos)
+
+        # Prefill: process entire prompt at once
+        kv_k, kv_v = init_cache_fn(config, batch_size=1)
+        prompt_2d = jnp.array(prompt_ids[np.newaxis, :])
+        logits, kv_k, kv_v = cached_fwd_fn(params, config, prompt_2d, kv_k, kv_v, 0)
+        logits.block_until_ready()
+
+        generated = list(prompt_ids)
+        cache_pos = prompt_len
+
+        # Sample first token from prefill output
+        first_logits = np.array(logits[0, -1, :])
+        next_token, rng_key = self._sample_token(first_logits, temperature, top_k, rng_key)
+        generated.append(next_token)
+
+        if next_token == eos_id or cache_pos >= max_seq_len:
+            return np.array(generated), 0.0
+
+        # Decode loop: one token at a time with cached KV
+        start_time = time.time()
+        for _ in range(max_new_tokens - 1):
+            token_2d = jnp.array([[next_token]])
+            logits, kv_k, kv_v = decode_step(params, token_2d, kv_k, kv_v, cache_pos)
+
+            next_logits = np.array(logits[0, 0, :])
+            next_token, rng_key = self._sample_token(next_logits, temperature, top_k, rng_key)
+
+            generated.append(next_token)
+            cache_pos += 1
+            if next_token == eos_id or cache_pos >= max_seq_len:
+                break
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        return np.array(generated), elapsed_ms
+
+    def _generate_no_cache(
+        self, params, config, prompt_ids, max_new_tokens,
+        temperature, top_k, rng_key, max_seq_len
+    ) -> Tuple[np.ndarray, float]:
+        """Fallback generation without KV cache (recomputes full sequence each step)."""
+        model_instance = create_model_from_config(config)
+        generated = list(prompt_ids)
+
         @jax.jit
         def gen_step(params, input_ids):
             return model_instance.apply(
-                params,
-                input_ids,
-                deterministic=True,
+                params, input_ids, deterministic=True,
                 rngs={'dropout': rng_key}
             )
 
         start_time = time.time()
-
         for step in range(max_new_tokens):
-            # Truncate to max_seq_len
             input_ids = jnp.array([generated[-max_seq_len:]])
-
-            # Forward pass (JIT-compiled; recompiles only when seq length changes)
             result = gen_step(params, input_ids)
-
             logits = np.array(result['logits'][0, -1])
 
-            # Temperature scaling
-            if temperature > 0:
-                logits = logits / temperature
-
-                # Top-k filtering
-                if top_k > 0:
-                    top_indices = np.argsort(logits)[-top_k:]
-                    mask = np.ones_like(logits) * float('-inf')
-                    mask[top_indices] = logits[top_indices]
-                    logits = mask
-
-                # Sample
-                probs = np.exp(logits - np.max(logits))
-                probs = probs / (probs.sum() + 1e-8)
-                rng_key, subkey = jax.random.split(rng_key)
-                next_token = int(jax.random.choice(subkey, len(probs), p=probs))
-            else:
-                # Greedy
-                next_token = int(np.argmax(logits))
-
+            next_token, rng_key = self._sample_token(logits, temperature, top_k, rng_key)
             generated.append(next_token)
 
-            # Stop on EOS
             if next_token == self.eos_token_id:
                 break
 
         elapsed_ms = (time.time() - start_time) * 1000
-
         return np.array(generated), elapsed_ms
 
     def generate_simple(

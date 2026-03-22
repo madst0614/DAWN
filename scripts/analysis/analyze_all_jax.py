@@ -1301,6 +1301,8 @@ class ModelAnalyzer:
             print(f"  │ Knowledge variance: {summary.get('knowledge_context_variance', 0):.6f}")
             print(f"  │ {summary.get('interpretation', 'N/A')}")
             print(f"  │ More context-sensitive: {summary.get('more_context_sensitive', 'N/A')}")
+            if summary.get('note'):
+                print(f"  │ ⚠ NOTE: {summary['note']}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         # Print path similarity summary

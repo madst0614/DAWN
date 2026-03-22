@@ -310,9 +310,10 @@ class SemanticAnalyzerJAX(BaseAnalyzerJAX):
                     if w is None:
                         continue
                     if w.ndim == 3 and pos < w.shape[1]:
-                        word_routing[key] = w[0, pos]  # [N]
-                    elif w.ndim == 2:
-                        word_routing[key] = w[0]  # [N]
+                        word_routing[key] = w[0, pos]  # [B, S, N] → [N] at position
+                    # Skip 2D weights [B, N]: they lack position dimension,
+                    # so all tokens in a batch get the same value, making
+                    # cross-context variance artificially zero.
 
                 if word_routing:
                     word_paths.append(word_routing)
@@ -360,6 +361,13 @@ class SemanticAnalyzerJAX(BaseAnalyzerJAX):
                 'knowledge_context_variance': float(know_var),
                 'interpretation': interpretation,
                 'more_context_sensitive': 'knowledge' if know_var > attn_var else 'attention',
+                'note': (
+                    'JAX extractor computes routing from input embeddings (token+pos), '
+                    'not from deep hidden states. Same word at same position yields '
+                    'identical routing regardless of context. Low variance is expected '
+                    'and does NOT indicate context-independent routing in the full model. '
+                    'Use GPU analysis (full forward pass) for accurate context-dependence measurement.'
+                ),
             }
 
         return results

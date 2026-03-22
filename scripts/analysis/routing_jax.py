@@ -63,11 +63,19 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         """
         super().__init__(model, params, config)
         self._routing_cache = {}  # batch_id -> JAXRoutingData
+        self._routing_cache_maxsize = 1  # Only cache 1 batch to avoid OOM on large models
 
     def _get_routing_cached(self, input_ids: np.ndarray) -> 'JAXRoutingData':
-        """Get routing data with caching to avoid redundant extraction."""
+        """Get routing data with caching to avoid redundant extraction.
+
+        Uses a single-entry cache to avoid OOM on large models (e.g. 400M on v4-8).
+        Pre-extract caching of all batches caused RESOURCE_EXHAUSTED at ~75/100 batches.
+        """
         cache_key = input_ids.data.tobytes()[:64]  # First 64 bytes as key
         if cache_key not in self._routing_cache:
+            # Evict old entries to keep memory bounded
+            if len(self._routing_cache) >= self._routing_cache_maxsize:
+                self._routing_cache.clear()
             routing_info = self.extractor.extract_routing(input_ids)
             self._routing_cache[cache_key] = JAXRoutingData(routing_info)
         return self._routing_cache[cache_key]
@@ -1210,16 +1218,8 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         os.makedirs(output_dir, exist_ok=True)
 
         print("Running routing analysis...")
-
-        # Pre-extract routing data once and cache for all analyses
-        print("  Pre-extracting routing data...")
-        batches = create_batches(val_tokens, batch_size, seq_len)
-        if n_batches:
-            batches = batches[:n_batches]
-        for batch in tqdm(batches, desc='Pre-extract routing'):
-            input_ids = np.array(batch)
-            self._get_routing_cached(input_ids)
-        print(f"  Cached routing for {len(batches)} batches")
+        # Each analysis method extracts routing on-the-fly with bounded cache
+        # (pre-extract caching removed: caused OOM on 400M models at ~75/100 batches on v4-8)
 
         results = {
             'entropy': self.analyze_entropy(val_tokens, n_batches, batch_size, seq_len),

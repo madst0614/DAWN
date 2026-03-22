@@ -30,6 +30,7 @@ except ImportError:
 
 try:
     from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -481,11 +482,104 @@ class NeuronEmbeddingAnalyzerJAX(BaseAnalyzerJAX):
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Run basic embedding analysis
         basic_analyzer = EmbeddingAnalyzerJAX(self.model, self.params, self.config)
+
+        # Per-pool clustering
+        per_pool_clustering = basic_analyzer.analyze_clustering(output_dir=output_dir)
+
+        # Global clustering with optimal k (silhouette score search)
+        clustering = self._analyze_global_clustering(k_range, output_dir)
 
         return {
             'pool_distribution': basic_analyzer.analyze_similarity(output_dir),
-            'clustering': basic_analyzer.analyze_clustering(output_dir=output_dir),
+            'clustering': clustering,
+            'per_pool_clustering': per_pool_clustering,
             'cross_type_similarity': basic_analyzer.analyze_cross_type_similarity(),
         }
+
+    def _analyze_global_clustering(self, k_range: tuple = (5, 20),
+                                   output_dir: Optional[str] = None) -> Dict:
+        """Global clustering across all neuron embeddings with optimal k search."""
+        if not HAS_SKLEARN:
+            return {'error': 'sklearn not available'}
+
+        emb = get_neuron_embeddings_jax(self.params)
+        if emb is None or len(emb) == 0:
+            return {'n_embeddings': 0, 'best_silhouette': 0.0, 'error': 'No embeddings found'}
+
+        n = len(emb)
+        k_min, k_max = k_range
+        k_max = min(k_max, n - 1)  # Can't have more clusters than samples
+        if k_min > k_max:
+            k_min = max(2, k_max - 1)
+
+        best_k = k_min
+        best_sil = -1.0
+        silhouette_scores = {}
+
+        for k in range(k_min, k_max + 1):
+            try:
+                kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                labels = kmeans.fit_predict(emb)
+                sil = float(silhouette_score(emb, labels))
+                silhouette_scores[k] = sil
+                if sil > best_sil:
+                    best_sil = sil
+                    best_k = k
+            except Exception:
+                continue
+
+        # Final clustering with optimal k
+        kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(emb)
+
+        cluster_stats = []
+        for c in range(best_k):
+            mask = labels == c
+            cluster_stats.append({
+                'cluster_id': c,
+                'size': int(mask.sum()),
+            })
+
+        result = {
+            'n_embeddings': n,
+            'optimal_k': int(best_k),
+            'best_silhouette': float(best_sil),
+            'silhouette_scores': {str(k): float(s) for k, s in silhouette_scores.items()},
+            'cluster_labels': labels.tolist(),
+            'cluster_stats': sorted(cluster_stats, key=lambda x: -x['size']),
+        }
+
+        # Pool alignment analysis (which pool maps to which cluster)
+        pools = basic_analyzer_pools = EmbeddingAnalyzerJAX(self.model, self.params, self.config).get_embedding_pools()
+        pool_sizes = {
+            'feature_qk': self.n_feature_qk,
+            'feature_v': self.n_feature_v,
+            'restore_qk': self.n_restore_qk,
+            'restore_v': self.n_restore_v,
+            'feature_know': self.n_feature_know,
+            'restore_know': self.n_restore_know,
+        }
+        offset = 0
+        pool_labels = np.full(n, -1, dtype=int)
+        pool_id = 0
+        for name in ['feature_qk', 'feature_v', 'restore_qk', 'restore_v', 'feature_know', 'restore_know']:
+            sz = pool_sizes.get(name, 0)
+            if sz > 0 and offset + sz <= n:
+                pool_labels[offset:offset + sz] = pool_id
+                pool_id += 1
+                offset += sz
+
+        if offset > 0:
+            try:
+                sil_true = float(silhouette_score(emb[:offset], pool_labels[:offset]))
+                sil_pred = float(silhouette_score(emb[:offset], labels[:offset]))
+            except Exception:
+                sil_true = 0.0
+                sil_pred = 0.0
+            result['pool_alignment'] = {
+                'silhouette_true_labels': sil_true,
+                'silhouette_pred_labels': sil_pred,
+            }
+
+        return result
