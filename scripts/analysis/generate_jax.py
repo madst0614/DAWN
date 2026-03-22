@@ -89,7 +89,7 @@ def load_and_compile(checkpoint_path):
         params, config, name, decode_step, init_cache_fn, cached_fwd_fn
     """
     print(f"Loading: {checkpoint_path}")
-    model_cls, params, config = load_model_jax(checkpoint_path)
+    model_cls, params, _, config = load_model_jax(checkpoint_path)
     is_base = _is_baseline(config)
     version = config.get('model_version', '?')
     d_model = config.get('d_model', '?')

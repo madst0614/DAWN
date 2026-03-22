@@ -245,9 +245,10 @@ def load_model_jax(checkpoint_path: str, config_override: Dict = None):
         config_override: Optional config overrides
 
     Returns:
-        Tuple of (model_cls, params, config)
+        Tuple of (model_cls, params, tokenizer, config)
         - model_cls: DAWN class (not instance - use model.apply())
         - params: FrozenDict of model parameters
+        - tokenizer: BertTokenizerFast tokenizer instance
         - config: Model configuration dict
     """
     if not HAS_JAX:
@@ -314,7 +315,10 @@ def load_model_jax(checkpoint_path: str, config_override: Dict = None):
         params = dict(params)
     params = freeze({'params': params})
 
-    return model_cls, params, config
+    from transformers import BertTokenizerFast
+    tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
+
+    return model_cls, params, tokenizer, config
 
 
 def create_model_from_config(config: Dict):

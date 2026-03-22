@@ -770,7 +770,7 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     print(f"Loading checkpoint: {args.checkpoint}")
-    model_cls, params, config = load_model_jax(args.checkpoint)
+    model_cls, params, _, config = load_model_jax(args.checkpoint)
     print(f"  n_feature_know={config.get('n_feature_know')}, "
           f"n_restore_know={config.get('n_restore_know')}")
 

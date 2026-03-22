@@ -2638,7 +2638,7 @@ class ModelAnalyzer:
             return {}, {}, {}
 
         try:
-            comp_model, comp_params, comp_config = load_model_jax(self.vanilla_checkpoint)
+            comp_model, comp_params, _, comp_config = load_model_jax(self.vanilla_checkpoint)
         except Exception as e:
             print(f"  Could not load comparison model: {e}")
             return {}, {}, {}

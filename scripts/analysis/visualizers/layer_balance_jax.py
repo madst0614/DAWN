@@ -316,7 +316,7 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     print(f"Loading checkpoint: {args.checkpoint}")
-    model_cls, params, config = load_model_jax(args.checkpoint)
+    model_cls, params, _, config = load_model_jax(args.checkpoint)
     print(f"  n_layers={config.get('n_layers')}, d_model={config.get('d_model')}")
 
     # Load validation data

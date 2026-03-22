@@ -734,7 +734,7 @@ def main():
 
     # Load model
     print(f"Loading checkpoint: {args.checkpoint}")
-    model_cls, params, config = load_model_jax(args.checkpoint)
+    model_cls, params, _, config = load_model_jax(args.checkpoint)
     print(f"  d_model={config.get('d_model')}, n_layers={config.get('n_layers')}")
     if args.multi_layer:
         print(f"  Multi-layer mode: averaging across {config.get('n_layers', 16)} layers")

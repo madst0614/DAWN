@@ -199,7 +199,7 @@ def main():
 
     # --- Load model ---
     print(f"Loading checkpoint: {args.checkpoint}")
-    model_cls, params, config = load_model_jax(args.checkpoint)
+    model_cls, params, _, config = load_model_jax(args.checkpoint)
     model_instance = create_model_from_config(config)
     print(f"  Model: v{config.get('model_version', '?')}, "
           f"d_model={config.get('d_model')}, n_layers={config.get('n_layers')}")

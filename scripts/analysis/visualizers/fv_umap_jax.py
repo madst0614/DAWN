@@ -230,7 +230,7 @@ def main():
 
     # Load model
     print(f"Loading checkpoint: {args.checkpoint}")
-    model_cls, params, config = load_model_jax(args.checkpoint)
+    model_cls, params, _, config = load_model_jax(args.checkpoint)
     n_fv = config.get('n_feature_v', 0)
     print(f"  n_feature_v={n_fv}, d_space={config.get('d_space', '?')}")
 
