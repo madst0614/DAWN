@@ -11,7 +11,23 @@ import os
 import json
 from typing import Dict, Optional, List
 
-from .utils import HAS_MATPLOTLIB, convert_to_serializable
+try:
+    from .utils import HAS_MATPLOTLIB, convert_to_serializable
+except (ImportError, ModuleNotFoundError):
+    # Torch-free fallback (JAX-only environments)
+    HAS_MATPLOTLIB = False
+    try:
+        from .utils_jax import convert_to_serializable
+    except ImportError:
+        def convert_to_serializable(obj):
+            import numpy as np
+            if isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_serializable(v) for v in obj]
+            elif isinstance(obj, (np.ndarray, np.generic)):
+                return obj.tolist()
+            return obj
 
 if HAS_MATPLOTLIB:
     import matplotlib.pyplot as plt

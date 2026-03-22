@@ -105,6 +105,8 @@ class TextGeneratorJAX:
         self.tokenizer = tokenizer
         self.vocab_size = vocab_size
         self.eos_token_id = 102  # BERT [SEP]
+        self._cached_decode_step = None
+        self._cached_decode_key = None  # (model_version, is_baseline)
 
     def _sample_token(self, logits: np.ndarray, temperature: float,
                       top_k: int, rng_key) -> Tuple[int, Any]:
@@ -188,6 +190,27 @@ class TextGeneratorJAX:
             temperature, top_k, rng_key, max_seq_len
         )
 
+    def _get_decode_step(self, config, cached_fwd_fn):
+        """Get cached JIT-compiled decode step (avoids recompilation per prompt)."""
+        cache_key = (config.get('model_version', ''), config.get('d_model', 0))
+        if self._cached_decode_step is not None and self._cached_decode_key == cache_key:
+            return self._cached_decode_step
+
+        @jax.jit
+        def decode_step(params, token_ids, kv_k, kv_v, cache_pos):
+            return cached_fwd_fn(params, config, token_ids, kv_k, kv_v, cache_pos)
+
+        # Warm up JIT compilation with a dummy call
+        try:
+            from models.model_v17_1_jax import dawn_init_kv_cache
+            from models.baseline_transformer_jax import vanilla_init_kv_cache
+        except ImportError:
+            pass
+
+        self._cached_decode_step = decode_step
+        self._cached_decode_key = cache_key
+        return decode_step
+
     def _generate_with_kv_cache(
         self, params, config, prompt_ids, max_new_tokens,
         temperature, top_k, rng_key, max_seq_len,
@@ -201,14 +224,13 @@ class TextGeneratorJAX:
             prompt_ids = prompt_ids[-(max_seq_len - 1):]
         prompt_len = len(prompt_ids)
 
-        @jax.jit
-        def decode_step(params, token_ids, kv_k, kv_v, cache_pos):
-            return cached_fwd_fn(params, config, token_ids, kv_k, kv_v, cache_pos)
+        # Use cached JIT-compiled decode step (avoids recompilation per prompt)
+        decode_step = self._get_decode_step(config, cached_fwd_fn)
 
-        # Prefill: process entire prompt at once
+        # Prefill: process entire prompt at once (also JIT-compiled via decode_step)
         kv_k, kv_v = init_cache_fn(config, batch_size=1)
         prompt_2d = jnp.array(prompt_ids[np.newaxis, :])
-        logits, kv_k, kv_v = cached_fwd_fn(params, config, prompt_2d, kv_k, kv_v, 0)
+        logits, kv_k, kv_v = decode_step(params, prompt_2d, kv_k, kv_v, 0)
         logits.block_until_ready()
 
         generated = list(prompt_ids)

@@ -733,8 +733,8 @@ def convert_to_serializable(obj):
         JSON-serializable object
     """
     if isinstance(obj, dict):
-        return {k: convert_to_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
+        return {str(k): convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
         return [convert_to_serializable(v) for v in obj]
     elif isinstance(obj, (np.ndarray, np.generic)):
         return obj.tolist()
@@ -742,6 +742,9 @@ def convert_to_serializable(obj):
         return obj.cpu().tolist()
     elif isinstance(obj, (np.integer, np.floating)):
         return float(obj)
+    # Handle JAX arrays (if JAX is available in mixed environments)
+    if hasattr(obj, 'shape') and type(obj).__module__.startswith('jax'):
+        return np.asarray(obj).tolist()
     return obj
 
 

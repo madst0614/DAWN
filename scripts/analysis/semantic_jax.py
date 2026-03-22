@@ -348,12 +348,22 @@ class SemanticAnalyzerJAX(BaseAnalyzerJAX):
             attn_var = np.mean([r['attention_variance'] for r in word_results.values()])
             know_var = np.mean([r['knowledge_variance'] for r in word_results.values()])
 
+            # JAX routing extractor uses input embeddings (token+pos), NOT
+            # hidden states from self-attention.  The same word at the same
+            # sequence position always gets identical routing regardless of
+            # surrounding context, so near-zero variance is EXPECTED.
+            # This metric is NOT valid for measuring context-dependence on JAX.
             if avg_var > 0.1:
                 interpretation = 'HIGH: Strong context-dependent routing'
             elif avg_var > 0.01:
                 interpretation = 'MODERATE: Some context sensitivity'
             else:
-                interpretation = 'LOW: Routing mostly context-independent'
+                interpretation = (
+                    'N/A (JAX limitation): Embedding-level routing is position-dependent '
+                    'but context-independent by design. Low variance does NOT mean the '
+                    'full model lacks context-dependent routing. '
+                    'Use GPU/full forward pass analysis for accurate measurement.'
+                )
 
             results['summary'] = {
                 'overall_context_variance': float(avg_var),
@@ -361,6 +371,7 @@ class SemanticAnalyzerJAX(BaseAnalyzerJAX):
                 'knowledge_context_variance': float(know_var),
                 'interpretation': interpretation,
                 'more_context_sensitive': 'knowledge' if know_var > attn_var else 'attention',
+                'metric_valid': avg_var > 0.01,  # False = JAX limitation
                 'note': (
                     'JAX extractor computes routing from input embeddings (token+pos), '
                     'not from deep hidden states. Same word at same position yields '

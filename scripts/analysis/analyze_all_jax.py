@@ -793,6 +793,16 @@ class ModelAnalyzer:
                           f"{data.get('effective_count', 0):>14.1f} {data.get('coverage', 0)*100:>11.1f}%")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
+        # Diagnostic: print knowledge routing weight distribution for high dead-neuron pools
+        for pool_name in ['feature_know', 'restore_know']:
+            pool_data = activation.get(pool_name, {})
+            if isinstance(pool_data, dict) and pool_data.get('dead_ratio', 0) > 0.3:
+                stats = pool_data.get('stats', {})
+                print(f"\n  ⚠ {pool_name}: {pool_data['dead_ratio']*100:.0f}% dead neurons")
+                print(f"    Weight freq range: [{stats.get('min_freq', 0):.6f}, {stats.get('max_freq', 0):.6f}]")
+                print(f"    Mean freq: {stats.get('mean_freq', 0):.6f}, Median: {stats.get('median_freq', 0):.6f}")
+                print(f"    This may indicate knowledge routing concentration (normal for early training)")
+
         self.results['health'] = results
 
         # Save results.json for later --only paper usage
@@ -1021,12 +1031,27 @@ class ModelAnalyzer:
 
         if sim:
             print(f"\n  ┌─ Embedding Similarity ─────────────────────────────────────────────────")
-            print(f"  │ {'Pool':<12} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
-            print(f"  │ {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
+            print(f"  │ {'Pool':<12} {'N':>6} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10} {'Status':>12}")
+            print(f"  │ {'─'*12} {'─'*6} {'─'*10} {'─'*10} {'─'*10} {'─'*10} {'─'*12}")
             for pool, data in sim.items():
                 if isinstance(data, dict) and 'avg_similarity' in data:
-                    print(f"  │ {data.get('display', pool):<12} {data['avg_similarity']:>10.4f} {data.get('std_similarity', 0):>10.4f} "
-                          f"{data.get('min_similarity', 0):>10.4f} {data.get('max_similarity', 0):>10.4f}")
+                    avg = data['avg_similarity']
+                    n = data.get('n_neurons', 0)
+                    # Flag potential embedding collapse (high sim with many neurons)
+                    if avg > 0.4 and n > 50:
+                        status = '⚠ COLLAPSE?'
+                    elif avg > 0.3:
+                        status = 'HIGH'
+                    elif avg > 0.1:
+                        status = 'moderate'
+                    else:
+                        status = 'diverse'
+                    print(f"  │ {data.get('display', pool):<12} {n:>6} {avg:>10.4f} {data.get('std_similarity', 0):>10.4f} "
+                          f"{data.get('min_similarity', 0):>10.4f} {data.get('max_similarity', 0):>10.4f} {status:>12}")
+            print(f"  │")
+            print(f"  │ Note: QK pools (192 neurons, d_space=256) may show higher similarity")
+            print(f"  │ due to small pool size relative to embedding dimension.")
+            print(f"  │ Similarity > 0.4 with many neurons may indicate embedding collapse.")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if cross_sim:
@@ -1787,12 +1812,25 @@ class ModelAnalyzer:
             print(f"  Skipping (could not load val data: {e})")
             return {}
 
-        analyzer = RoutingAnalyzerJAX(self.model, self.params, self.config)
+        # Token trajectory analysis (entropy by position)
+        trajectory = {}
+        try:
+            from scripts.analysis.behavioral_jax import BehavioralAnalyzerJAX
+            from transformers import AutoTokenizer
 
-        # Entropy analysis (proxy for token trajectory)
-        trajectory = analyzer.analyze_entropy(
-            val_tokens, n_batches=n_batches,
-        )
+            tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+            traj_analyzer = BehavioralAnalyzerJAX(
+                self.model, self.params, self.config, tokenizer=tokenizer,
+            )
+            trajectory = traj_analyzer.analyze_token_trajectory(
+                val_tokens, n_batches=min(n_batches, 20),
+            )
+        except Exception as e:
+            print(f"  Token trajectory failed, falling back to entropy: {e}")
+            analyzer = RoutingAnalyzerJAX(self.model, self.params, self.config)
+            trajectory = analyzer.analyze_entropy(
+                val_tokens, n_batches=n_batches,
+            )
 
         # Probing classifier (ported to JAX)
         probing = {}
@@ -1825,22 +1863,33 @@ class ModelAnalyzer:
         probing = results.get('probing', {})
 
         if trajectory and 'error' not in trajectory:
-            print(f"\n  ┌─ Token Trajectory (Entropy by Position) ─────────────────────────────────")
-            print(f"  │ {'Pool':<12} {'Early (<10)':<12} {'Late (≥10)':<12} {'Δ Change':<12}")
-            print(f"  │ {'─'*48}")
-            for pool, data in trajectory.items():
-                if isinstance(data, dict) and 'early_avg' in data:
-                    display = data.get('display', pool)
-                    early = data['early_avg']
-                    late = data['late_avg']
-                    delta = late - early
-                    sign = '+' if delta >= 0 else ''
-                    print(f"  │ {display:<12} {early:>10.1f}% {late:>10.1f}% {sign}{delta:>10.1f}%")
-            n_layers = trajectory.get('n_layers', 0)
-            if n_layers:
+            # Check which format: token trajectory (early_avg/late_avg) or entropy (mean_entropy)
+            has_trajectory = any(isinstance(d, dict) and 'early_avg' in d for d in trajectory.values())
+            has_entropy = any(isinstance(d, dict) and 'mean_entropy' in d for d in trajectory.values())
+
+            if has_trajectory:
+                print(f"\n  ┌─ Token Trajectory (Entropy by Position) ─────────────────────────────────")
+                print(f"  │ {'Pool':<12} {'Early (<10)':<12} {'Late (≥10)':<12} {'Δ Change':<12}")
                 print(f"  │ {'─'*48}")
-                print(f"  │ Analyzed {n_layers} layers")
-            print(f"  └─────────────────────────────────────────────────────────────────────────")
+                for pool, data in trajectory.items():
+                    if isinstance(data, dict) and 'early_avg' in data:
+                        display = data.get('display', pool)
+                        early = data['early_avg']
+                        late = data['late_avg']
+                        delta = late - early
+                        sign = '+' if delta >= 0 else ''
+                        print(f"  │ {display:<12} {early:>10.1f}% {late:>10.1f}% {sign}{delta:>10.1f}%")
+                print(f"  └─────────────────────────────────────────────────────────────────────────")
+            elif has_entropy:
+                print(f"\n  ┌─ Routing Entropy (fallback) ─────────────────────────────────────────────")
+                print(f"  │ {'Pool':<12} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
+                print(f"  │ {'─'*48}")
+                for pool, data in trajectory.items():
+                    if isinstance(data, dict) and 'mean_entropy' in data:
+                        display = data.get('display', pool)
+                        print(f"  │ {display:<12} {data['mean_entropy']:>10.1f}% {data['std_entropy']:>10.1f}% "
+                              f"{data['min_entropy']:>10.1f}% {data['max_entropy']:>10.1f}%")
+                print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if probing and 'error' not in probing:
             print(f"\n  ┌─ Probing Classifier (POS Prediction from Routing Weights) ───────────────")

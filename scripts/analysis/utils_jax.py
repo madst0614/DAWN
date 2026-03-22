@@ -162,13 +162,18 @@ except (ImportError, ModuleNotFoundError):
 
     def convert_to_serializable(obj):
         if isinstance(obj, dict):
-            return {k: convert_to_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
+            return {str(k): convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
             return [convert_to_serializable(v) for v in obj]
         elif isinstance(obj, (np.ndarray, np.generic)):
             return obj.tolist()
         elif isinstance(obj, (np.integer, np.floating)):
             return float(obj)
+        # Handle JAX arrays if available
+        try:
+            return np.asarray(obj).tolist()
+        except (TypeError, ValueError):
+            pass
         return obj
 
     def save_results(results, output_path: str):
@@ -905,37 +910,51 @@ class JAXRoutingDataExtractor:
             self._build_jit_extract()
 
         input_ids_jax = jnp.asarray(input_ids)
-        attn_tuple = self._jit_extract_attn(input_ids_jax)
-        know_tuple = self._jit_extract_know(input_ids_jax) if self._jit_extract_know is not None else None
 
-        # Unpack attention results
+        # Extract attention routing (always available)
+        attn_tuple = self._jit_extract_attn(input_ids_jax)
+
+        # Extract knowledge routing separately to reduce peak memory
+        # (on 400M models this prevents OOM at ~75/100 batches on v4-8)
+        know_tuple = None
+        if self._jit_extract_know is not None:
+            # Block until attention results are materialized, then extract knowledge
+            attn_tuple[0].block_until_ready()
+            know_tuple = self._jit_extract_know(input_ids_jax)
+
+        # Unpack attention results — immediately convert to numpy to free
+        # JAX device memory (prevents RESOURCE_EXHAUSTED on large models)
         (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
          pref_fqk_Q, pref_fqk_K, pref_fv, pref_rqk_Q, pref_rqk_K, pref_rv) = attn_tuple
 
         attn_routing = {
-            'fqk_weights_Q': fqk_w_Q,
-            'fqk_weights_K': fqk_w_K,
-            'fv_weights': fv_w,
-            'rqk_weights_Q': rqk_w_Q,
-            'rqk_weights_K': rqk_w_K,
-            'rv_weights': rv_w,
-            'fqk_pref_Q': pref_fqk_Q,
-            'fqk_pref_K': pref_fqk_K,
-            'fv_pref': pref_fv,
-            'rqk_pref_Q': pref_rqk_Q,
-            'rqk_pref_K': pref_rqk_K,
-            'rv_pref': pref_rv,
+            'fqk_weights_Q': np.asarray(fqk_w_Q),
+            'fqk_weights_K': np.asarray(fqk_w_K),
+            'fv_weights': np.asarray(fv_w),
+            'rqk_weights_Q': np.asarray(rqk_w_Q),
+            'rqk_weights_K': np.asarray(rqk_w_K),
+            'rv_weights': np.asarray(rv_w),
+            'fqk_pref_Q': np.asarray(pref_fqk_Q),
+            'fqk_pref_K': np.asarray(pref_fqk_K),
+            'fv_pref': np.asarray(pref_fv),
+            'rqk_pref_Q': np.asarray(pref_rqk_Q),
+            'rqk_pref_K': np.asarray(pref_rqk_K),
+            'rv_pref': np.asarray(pref_rv),
         }
+        # Delete JAX device arrays to free TPU HBM
+        del attn_tuple, fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w
+        del pref_fqk_Q, pref_fqk_K, pref_fv, pref_rqk_Q, pref_rqk_K, pref_rv
 
         know_routing = {}
         if know_tuple is not None:
             fk_w, rk_w, pref_fk, pref_rk = know_tuple
             know_routing = {
-                'feature_know_w': fk_w,
-                'restore_know_w': rk_w,
-                'feature_know_pref': pref_fk,
-                'restore_know_pref': pref_rk,
+                'feature_know_w': np.asarray(fk_w),
+                'restore_know_w': np.asarray(rk_w),
+                'feature_know_pref': np.asarray(pref_fk),
+                'restore_know_pref': np.asarray(pref_rk),
             }
+            del know_tuple, fk_w, rk_w, pref_fk, pref_rk
 
         return {
             'attention': attn_routing,
@@ -1190,6 +1209,21 @@ def get_shared_neurons_jax(params) -> Dict[str, np.ndarray]:
     }
 
 
+def _deep_get(d, keys, default=None):
+    """Traverse nested dict/FrozenDict with fallback for bytes keys."""
+    for key in keys:
+        if d is None or not isinstance(d, dict):
+            return default
+        # Try string key, then bytes key (msgpack compat)
+        val = d.get(key)
+        if val is None and isinstance(key, str):
+            val = d.get(key.encode('utf-8'))
+        if val is None:
+            return default
+        d = val
+    return d
+
+
 def get_neuron_embeddings_jax(params) -> np.ndarray:
     """Extract neuron embeddings from JAX model params.
 
@@ -1199,17 +1233,40 @@ def get_neuron_embeddings_jax(params) -> np.ndarray:
     Returns:
         Normalized neuron embeddings [N_total, d_space]
     """
-    all_params = params.get('params', params)
-    router = all_params.get('router', {})
-    nr = router.get('neuron_router', {})
+    # Unwrap 'params' wrapper if present
+    all_params = params.get('params', params) if isinstance(params, dict) else params
 
-    emb = nr.get('neuron_emb')
+    # Try standard path: router -> neuron_router -> neuron_emb
+    emb = _deep_get(all_params, ['router', 'neuron_router', 'neuron_emb'])
+
+    # Fallback: direct neuron_router (flat checkpoint structure)
+    if emb is None:
+        emb = _deep_get(all_params, ['neuron_router', 'neuron_emb'])
+
+    # Fallback: search recursively for neuron_emb
+    if emb is None:
+        emb = _find_param(all_params, 'neuron_emb')
+
     if emb is None:
         return None
 
     emb = np.array(emb)
     norm = np.linalg.norm(emb, axis=-1, keepdims=True) + 1e-8
     return emb / norm
+
+
+def _find_param(d, target_key):
+    """Recursively search for a param key in nested dict."""
+    if not isinstance(d, dict):
+        return None
+    for key, val in d.items():
+        k = key.decode('utf-8') if isinstance(key, bytes) else key
+        if k == target_key and hasattr(val, 'shape'):
+            return val
+        result = _find_param(val, target_key)
+        if result is not None:
+            return result
+    return None
 
 
 # ============================================================
@@ -1386,14 +1443,23 @@ def convert_to_serializable(obj):
         JSON-serializable object
     """
     if isinstance(obj, dict):
-        return {k: convert_to_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
+        return {str(k): convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
         return [convert_to_serializable(v) for v in obj]
     elif isinstance(obj, (np.ndarray, np.generic)):
         return obj.tolist()
+    elif HAS_JAX and isinstance(obj, jax.Array):
+        # Modern JAX array (jax 0.4+: jax.Array replaces DeviceArray)
+        return np.asarray(obj).tolist()
     elif HAS_JAX and hasattr(obj, 'device_buffer'):
-        # JAX DeviceArray
+        # Legacy JAX DeviceArray (jax < 0.4)
         return np.asarray(obj).tolist()
     elif isinstance(obj, (np.integer, np.floating)):
         return float(obj)
-    return obj
+    elif isinstance(obj, (int, float, str, bool, type(None))):
+        return obj
+    # Last resort: try to convert unknown numeric types
+    try:
+        return float(obj)
+    except (TypeError, ValueError):
+        return str(obj)

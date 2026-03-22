@@ -17,6 +17,7 @@ Core analysis methods are fully ported; visualization requires matplotlib.
 """
 
 import os
+import gc
 import json
 import numpy as np
 from typing import Dict, Optional
@@ -1033,6 +1034,67 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         results['n_batches'] = n_batches
         return results
 
+    @staticmethod
+    def _compute_index_overlap(w_a, w_b):
+        """Compute neuron index overlap between two pools.
+
+        Instead of checking if pools are 'active' (always true with top-k),
+        measures what fraction of selected neuron indices overlap (Jaccard).
+        """
+        counts = {'both': 0, 'feature_only': 0, 'restore_only': 0, 'total': 0,
+                  'jaccard_sum': 0.0, 'jaccard_count': 0}
+
+        if w_a.ndim == 3:  # [B, S, N]
+            B, S, _ = w_a.shape
+            for b in range(B):
+                for s in range(S):
+                    a_idx = set(np.nonzero(w_a[b, s] > 0)[0].tolist())
+                    b_idx = set(np.nonzero(w_b[b, s] > 0)[0].tolist())
+
+                    if a_idx and b_idx:
+                        intersection = len(a_idx & b_idx)
+                        union = len(a_idx | b_idx)
+                        jaccard = intersection / union if union > 0 else 0
+
+                        counts['jaccard_sum'] += jaccard
+                        counts['jaccard_count'] += 1
+
+                        if intersection > 0:
+                            counts['both'] += 1
+                        elif a_idx:
+                            counts['feature_only'] += 1
+                        else:
+                            counts['restore_only'] += 1
+                    elif a_idx:
+                        counts['feature_only'] += 1
+                    elif b_idx:
+                        counts['restore_only'] += 1
+
+                    counts['total'] += 1
+        else:  # [B, N]
+            B = w_a.shape[0]
+            for b in range(B):
+                a_idx = set(np.nonzero(w_a[b] > 0)[0].tolist())
+                b_idx = set(np.nonzero(w_b[b] > 0)[0].tolist())
+
+                if a_idx and b_idx:
+                    intersection = len(a_idx & b_idx)
+                    union = len(a_idx | b_idx)
+                    jaccard = intersection / union if union > 0 else 0
+                    counts['jaccard_sum'] += jaccard
+                    counts['jaccard_count'] += 1
+
+                    if intersection > 0:
+                        counts['both'] += 1
+                    else:
+                        counts['feature_only'] += 1
+                else:
+                    counts['feature_only'] += 1
+
+                counts['total'] += 1
+
+        return counts
+
     def analyze_token_coselection(
         self,
         val_tokens: np.ndarray,
@@ -1067,59 +1129,39 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
 
             routing = self._get_routing_cached(input_ids)
 
-            # Compare FQK vs RQK selection
+            # Compare FQK vs RQK selection (neuron INDEX overlap, not just "both active")
+            # With top-k routing, both pools are always active for every token.
+            # The meaningful metric is: do the same neuron indices get selected?
             fqk_w = routing.get_weight('fqk_q')
             rqk_w = routing.get_weight('rqk_q')
 
             if fqk_w is not None and rqk_w is not None:
-                if fqk_w.ndim == 3:
-                    fqk_active = (fqk_w > 0).any(axis=-1)  # [B, S]
-                    rqk_active = (rqk_w > 0).any(axis=-1)  # [B, S]
-                else:
-                    fqk_active = (fqk_w > 0).any(axis=-1)
-                    rqk_active = (rqk_w > 0).any(axis=-1)
-
-                both = (fqk_active & rqk_active).sum()
-                fqk_only = (fqk_active & ~rqk_active).sum()
-                rqk_only = (~fqk_active & rqk_active).sum()
-                total = fqk_active.size
-
-                coselect_counts['qk']['both'] += int(both)
-                coselect_counts['qk']['feature_only'] += int(fqk_only)
-                coselect_counts['qk']['restore_only'] += int(rqk_only)
-                coselect_counts['qk']['total'] += int(total)
+                overlap = self._compute_index_overlap(fqk_w, rqk_w)
+                for k, v in overlap.items():
+                    coselect_counts['qk'][k] += v
 
             # Compare FV vs RV selection
             fv_w = routing.get_weight('fv')
             rv_w = routing.get_weight('rv')
 
             if fv_w is not None and rv_w is not None:
-                if fv_w.ndim == 3:
-                    fv_active = (fv_w > 0).any(axis=-1)
-                    rv_active = (rv_w > 0).any(axis=-1)
-                else:
-                    fv_active = (fv_w > 0).any(axis=-1)
-                    rv_active = (rv_w > 0).any(axis=-1)
-
-                both = (fv_active & rv_active).sum()
-                fv_only = (fv_active & ~rv_active).sum()
-                rv_only = (~fv_active & rv_active).sum()
-                total = fv_active.size
-
-                coselect_counts['v']['both'] += int(both)
-                coselect_counts['v']['feature_only'] += int(fv_only)
-                coselect_counts['v']['restore_only'] += int(rv_only)
-                coselect_counts['v']['total'] += int(total)
+                overlap = self._compute_index_overlap(fv_w, rv_w)
+                for k, v in overlap.items():
+                    coselect_counts['v'][k] += v
 
         results = {}
         for key, counts in coselect_counts.items():
             total = counts['total']
             if total > 0:
+                jac_count = counts.get('jaccard_count', 0)
+                jac_mean = counts.get('jaccard_sum', 0) / jac_count if jac_count > 0 else 0
                 results[key] = {
                     'both_pct': counts['both'] / total * 100,
                     'feature_only_pct': counts['feature_only'] / total * 100,
                     'restore_only_pct': counts['restore_only'] / total * 100,
-                    'counts': dict(counts),
+                    'index_jaccard': jac_mean,  # Neuron index overlap (0=disjoint, 1=identical)
+                    'counts': {k: v for k, v in counts.items()
+                               if k not in ('jaccard_sum', 'jaccard_count')},
                 }
 
         results['n_batches'] = n_batches
@@ -1221,21 +1263,29 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         # Each analysis method extracts routing on-the-fly with bounded cache
         # (pre-extract caching removed: caused OOM on 400M models at ~75/100 batches on v4-8)
 
-        results = {
-            'entropy': self.analyze_entropy(val_tokens, n_batches, batch_size, seq_len),
-            'selection_frequency': self.analyze_selection_frequency(val_tokens, n_batches, batch_size, seq_len),
-            'selection_diversity': self.analyze_selection_diversity(val_tokens, n_batches, batch_size=batch_size, seq_len=seq_len),
-            'qk_overlap': self.analyze_qk_overlap(val_tokens, n_batches, batch_size, seq_len),
-            'qk_usage': self.analyze_qk_usage(val_tokens, n_batches, batch_size, seq_len),
-            'qk_entropy': self.analyze_qk_entropy(val_tokens, n_batches, batch_size, seq_len),
-            'activation_sparsity': self.analyze_activation_sparsity(val_tokens, n_batches, batch_size, seq_len),
-            'weight_concentration': self.analyze_weight_concentration(val_tokens, n_batches, batch_size, seq_len),
-            'layer_contribution': self.analyze_layer_contribution(val_tokens, n_batches, batch_size, seq_len),
-            'qk_union_coverage': self.analyze_qk_union_coverage(val_tokens, n_batches, batch_size, seq_len),
-            'path_usage': self.analyze_path_usage(val_tokens, n_batches, batch_size, seq_len),
-            'token_coselection': self.analyze_token_coselection(val_tokens, n_batches, batch_size, seq_len),
-            'coverage_progression': self.analyze_coverage_progression(val_tokens, n_batches, batch_size, seq_len),
-        }
+        # Run each analysis with explicit cache cleanup between methods
+        # to prevent RESOURCE_EXHAUSTED on 400M models (v4-8/v4-32)
+        analysis_methods = [
+            ('entropy', lambda: self.analyze_entropy(val_tokens, n_batches, batch_size, seq_len)),
+            ('selection_frequency', lambda: self.analyze_selection_frequency(val_tokens, n_batches, batch_size, seq_len)),
+            ('selection_diversity', lambda: self.analyze_selection_diversity(val_tokens, n_batches, batch_size=batch_size, seq_len=seq_len)),
+            ('qk_overlap', lambda: self.analyze_qk_overlap(val_tokens, n_batches, batch_size, seq_len)),
+            ('qk_usage', lambda: self.analyze_qk_usage(val_tokens, n_batches, batch_size, seq_len)),
+            ('qk_entropy', lambda: self.analyze_qk_entropy(val_tokens, n_batches, batch_size, seq_len)),
+            ('activation_sparsity', lambda: self.analyze_activation_sparsity(val_tokens, n_batches, batch_size, seq_len)),
+            ('weight_concentration', lambda: self.analyze_weight_concentration(val_tokens, n_batches, batch_size, seq_len)),
+            ('layer_contribution', lambda: self.analyze_layer_contribution(val_tokens, n_batches, batch_size, seq_len)),
+            ('qk_union_coverage', lambda: self.analyze_qk_union_coverage(val_tokens, n_batches, batch_size, seq_len)),
+            ('path_usage', lambda: self.analyze_path_usage(val_tokens, n_batches, batch_size, seq_len)),
+            ('token_coselection', lambda: self.analyze_token_coselection(val_tokens, n_batches, batch_size, seq_len)),
+            ('coverage_progression', lambda: self.analyze_coverage_progression(val_tokens, n_batches, batch_size, seq_len)),
+        ]
+
+        results = {}
+        for name, method in analysis_methods:
+            results[name] = method()
+            self._clear_routing_cache()
+            gc.collect()
 
         # Free cached routing data
         self._clear_routing_cache()
