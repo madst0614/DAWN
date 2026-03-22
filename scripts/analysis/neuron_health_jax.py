@@ -39,7 +39,18 @@ from .utils_jax import (
     gini_coefficient,
     create_batches,
     JAXRoutingData,
+    extract_full_routing_jit,
 )
+
+# Map from full-routing pool keys to health pool names
+_ROUTING_KEY_TO_POOL = {
+    'fqk_q': 'feature_qk', 'fqk_k': 'feature_qk',
+    'fv': 'feature_v',
+    'rqk_q': 'restore_qk', 'rqk_k': 'restore_qk',
+    'rv': 'restore_v',
+    'fknow': 'feature_know', 'rknow': 'restore_know',
+}
+_ALL_ROUTING_POOL_KEYS = ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv', 'fknow', 'rknow']
 
 
 class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
@@ -65,7 +76,10 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
         seq_len: int = 512
     ) -> Dict:
         """
-        Analyze neuron activation distribution from forward passes.
+        Analyze neuron activation distribution using full forward routing.
+
+        Uses extract_full_routing_jit for all-layer routing extraction,
+        ensuring dead neuron detection accounts for activation across all layers.
 
         Args:
             val_tokens: Validation token array
@@ -94,65 +108,34 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
         activation_counts = {pool: np.zeros(n) for pool, n in pools.items() if n > 0}
         total_tokens = 0
 
+        n_layers = self.config.get('n_layers', 16)
+
         # Create batches
         batches = create_batches(val_tokens, batch_size, seq_len)
         if n_batches:
             batches = batches[:n_batches]
 
-        for batch in tqdm(batches, desc='Health Analysis'):
+        for batch in tqdm(batches, desc='Health Analysis (full routing)'):
             input_ids = np.array(batch)
             batch_tokens = input_ids.size
             total_tokens += batch_tokens
 
-            # Extract routing data
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            # Full forward routing across all layers
+            routing = extract_full_routing_jit(self.params, self.config, input_ids)
 
-            # Process attention weights
-            for key in ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']:
-                weights = routing.get_weight(key)
-                if weights is None:
-                    continue
-
-                # Map key to pool
-                if key.startswith('fqk'):
-                    pool = 'feature_qk'
-                elif key == 'fv':
-                    pool = 'feature_v'
-                elif key.startswith('rqk'):
-                    pool = 'restore_qk'
-                elif key == 'rv':
-                    pool = 'restore_v'
-                else:
-                    continue
-
-                if pool not in activation_counts:
-                    continue
-
-                # Count activations (weight > threshold)
-                if weights.ndim == 3:  # [B, S, N]
-                    active = (weights > threshold).astype(np.float32).sum(axis=(0, 1))
-                else:  # [B, N]
-                    active = (weights > threshold).astype(np.float32).sum(axis=0)
-
-                activation_counts[pool] += active
-
-            # Process knowledge weights
-            for key in ['fknow', 'rknow']:
-                weights = routing.get_weight(key)
-                if weights is None:
-                    continue
-
-                pool = 'feature_know' if key == 'fknow' else 'restore_know'
-                if pool not in activation_counts:
-                    continue
-
-                if weights.ndim == 3:
-                    active = (weights > threshold).astype(np.float32).sum(axis=(0, 1))
-                else:
-                    active = (weights > threshold).astype(np.float32).sum(axis=0)
-
-                activation_counts[pool] += active
+            for li in range(n_layers):
+                layer_data = routing.get(f'layer_{li}', {})
+                for key in _ALL_ROUTING_POOL_KEYS:
+                    pool = _ROUTING_KEY_TO_POOL.get(key)
+                    if pool not in activation_counts:
+                        continue
+                    weights = layer_data.get(key)
+                    if weights is None:
+                        continue
+                    w = np.asarray(weights)
+                    # [B, S, N] -> count activations per neuron
+                    active = (w > threshold).astype(np.float32).sum(axis=(0, 1))
+                    activation_counts[pool] += active
 
         # Compute statistics
         results = {}
@@ -161,8 +144,9 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
             n_active = int((counts > 0).sum())
             n_dead = n_total - n_active
 
-            # Normalize to get activation frequency
-            freq = counts / (total_tokens + 1e-8)
+            # Normalize: total observations = total_tokens * n_layers
+            total_obs = total_tokens * n_layers
+            freq = counts / (total_obs + 1e-8)
 
             results[pool] = {
                 'total': n_total,
@@ -179,6 +163,8 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
                     'median_freq': float(np.median(freq)),
                 },
                 'total_tokens': total_tokens,
+                'n_layers': n_layers,
+                'routing_mode': 'full_forward',
             }
 
         return results
@@ -193,7 +179,10 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
         seq_len: int = 512
     ) -> Dict:
         """
-        Identify dead neurons from forward passes.
+        Identify dead neurons using full forward routing across all layers.
+
+        Uses extract_full_routing_jit so that a neuron activated in ANY layer
+        is correctly classified as active (not just embedding-level).
 
         Args:
             val_tokens: Validation token array
@@ -219,6 +208,8 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
             'restore_know': self.n_restore_know,
         }
 
+        n_layers = self.config.get('n_layers', 16)
+
         # Track which neurons were ever activated
         ever_activated = {pool: np.zeros(n, dtype=bool) for pool, n in pools.items() if n > 0}
 
@@ -227,58 +218,25 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
         if n_batches:
             batches = batches[:n_batches]
 
-        for batch in tqdm(batches, desc='Dead Neuron Analysis'):
+        for batch in tqdm(batches, desc='Dead Neuron Analysis (full routing)'):
             input_ids = np.array(batch)
 
-            # Extract routing data
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            # Full forward routing across all layers
+            routing = extract_full_routing_jit(self.params, self.config, input_ids)
 
-            # Process attention weights
-            for key in ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']:
-                weights = routing.get_weight(key)
-                if weights is None:
-                    continue
-
-                # Map key to pool
-                if key.startswith('fqk'):
-                    pool = 'feature_qk'
-                elif key == 'fv':
-                    pool = 'feature_v'
-                elif key.startswith('rqk'):
-                    pool = 'restore_qk'
-                elif key == 'rv':
-                    pool = 'restore_v'
-                else:
-                    continue
-
-                if pool not in ever_activated:
-                    continue
-
-                # Mark neurons that were activated
-                if weights.ndim == 3:
-                    active = (weights > threshold).any(axis=0).any(axis=0)
-                else:
-                    active = (weights > threshold).any(axis=0)
-
-                ever_activated[pool] |= active
-
-            # Process knowledge weights
-            for key in ['fknow', 'rknow']:
-                weights = routing.get_weight(key)
-                if weights is None:
-                    continue
-
-                pool = 'feature_know' if key == 'fknow' else 'restore_know'
-                if pool not in ever_activated:
-                    continue
-
-                if weights.ndim == 3:
-                    active = (weights > threshold).any(axis=0).any(axis=0)
-                else:
-                    active = (weights > threshold).any(axis=0)
-
-                ever_activated[pool] |= active
+            for li in range(n_layers):
+                layer_data = routing.get(f'layer_{li}', {})
+                for key in _ALL_ROUTING_POOL_KEYS:
+                    pool = _ROUTING_KEY_TO_POOL.get(key)
+                    if pool not in ever_activated:
+                        continue
+                    weights = layer_data.get(key)
+                    if weights is None:
+                        continue
+                    w = np.asarray(weights)
+                    # [B, S, N] -> any activation across batch & sequence
+                    active = (w > threshold).any(axis=0).any(axis=0)
+                    ever_activated[pool] |= active
 
         # Compile results
         results = {}
@@ -306,12 +264,13 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
             'total_dead': total_dead,
             'total_neurons': total_neurons,
             'dead_ratio': total_dead / total_neurons if total_neurons > 0 else 0,
+            'n_layers': n_layers,
+            'routing_mode': 'full_forward',
         }
 
-        # Visualization (skip for JAX version - requires matplotlib)
+        # Visualization
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-            # TODO: Add JAX-compatible visualization
 
         return results
 
@@ -324,7 +283,9 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
         seq_len: int = 512
     ) -> Dict:
         """
-        Analyze neuron usage diversity from forward passes.
+        Analyze neuron usage diversity using full forward routing.
+
+        Uses extract_full_routing_jit for all-layer routing extraction.
 
         Args:
             val_tokens: Validation token array
@@ -349,6 +310,8 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
             'restore_know': self.n_restore_know,
         }
 
+        n_layers = self.config.get('n_layers', 16)
+
         # Initialize accumulators
         activation_counts = {pool: np.zeros(n) for pool, n in pools.items() if n > 0}
 
@@ -357,57 +320,24 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
         if n_batches:
             batches = batches[:n_batches]
 
-        for batch in tqdm(batches, desc='Diversity Analysis'):
+        for batch in tqdm(batches, desc='Diversity Analysis (full routing)'):
             input_ids = np.array(batch)
 
-            # Extract routing data
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            # Full forward routing across all layers
+            routing = extract_full_routing_jit(self.params, self.config, input_ids)
 
-            # Process attention weights
-            for key in ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']:
-                weights = routing.get_weight(key)
-                if weights is None:
-                    continue
-
-                # Map key to pool
-                if key.startswith('fqk'):
-                    pool = 'feature_qk'
-                elif key == 'fv':
-                    pool = 'feature_v'
-                elif key.startswith('rqk'):
-                    pool = 'restore_qk'
-                elif key == 'rv':
-                    pool = 'restore_v'
-                else:
-                    continue
-
-                if pool not in activation_counts:
-                    continue
-
-                if weights.ndim == 3:
-                    active = (weights > threshold).astype(np.float32).sum(axis=(0, 1))
-                else:
-                    active = (weights > threshold).astype(np.float32).sum(axis=0)
-
-                activation_counts[pool] += active
-
-            # Process knowledge weights
-            for key in ['fknow', 'rknow']:
-                weights = routing.get_weight(key)
-                if weights is None:
-                    continue
-
-                pool = 'feature_know' if key == 'fknow' else 'restore_know'
-                if pool not in activation_counts:
-                    continue
-
-                if weights.ndim == 3:
-                    active = (weights > threshold).astype(np.float32).sum(axis=(0, 1))
-                else:
-                    active = (weights > threshold).astype(np.float32).sum(axis=0)
-
-                activation_counts[pool] += active
+            for li in range(n_layers):
+                layer_data = routing.get(f'layer_{li}', {})
+                for key in _ALL_ROUTING_POOL_KEYS:
+                    pool = _ROUTING_KEY_TO_POOL.get(key)
+                    if pool not in activation_counts:
+                        continue
+                    weights = layer_data.get(key)
+                    if weights is None:
+                        continue
+                    w = np.asarray(weights)
+                    active = (w > threshold).astype(np.float32).sum(axis=(0, 1))
+                    activation_counts[pool] += active
 
         # Compute diversity metrics
         results = {}
