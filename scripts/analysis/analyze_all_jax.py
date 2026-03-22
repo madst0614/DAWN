@@ -1260,13 +1260,36 @@ class ModelAnalyzer:
         except Exception as e:
             pos_routing = {'note': f'Could not compute POS routing: {e}'}
 
+        # 3. Context-dependent routing (ported from semantic.py)
+        context_routing = {}
+        try:
+            from scripts.analysis.semantic_jax import SemanticAnalyzerJAX
+            sem_analyzer = SemanticAnalyzerJAX(
+                self.model, self.params, self.config, tokenizer=tokenizer,
+            )
+            word_contexts = sem_analyzer.get_default_word_contexts()
+            context_routing = sem_analyzer.analyze_context_dependent_routing(word_contexts)
+        except Exception as e:
+            context_routing = {'note': f'Context routing failed: {e}'}
+
         results = {
             'path_similarity': path_sim,
             'pos_routing': pos_routing,
-            'context_routing': {'note': 'Context-dependent routing requires spaCy; skipped in JAX port'},
+            'context_routing': context_routing,
         }
 
-        # Print summary
+        # Print context routing summary
+        if context_routing and 'summary' in context_routing:
+            summary = context_routing['summary']
+            print(f"\n  ┌─ Context-Dependent Routing ────────────────────────────────────────────")
+            print(f"  │ Overall variance: {summary.get('overall_context_variance', 0):.6f}")
+            print(f"  │ Attention variance: {summary.get('attention_context_variance', 0):.6f}")
+            print(f"  │ Knowledge variance: {summary.get('knowledge_context_variance', 0):.6f}")
+            print(f"  │ {summary.get('interpretation', 'N/A')}")
+            print(f"  │ More context-sensitive: {summary.get('more_context_sensitive', 'N/A')}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Print path similarity summary
         if path_sim:
             print(f"\n  ┌─ Semantic Path Similarity ─────────────────────────────────────────────")
             sim_pairs = path_sim.get('similar_pairs', {})
@@ -1755,8 +1778,20 @@ class ModelAnalyzer:
             val_tokens, n_batches=n_batches,
         )
 
-        # Probing not yet ported (requires sklearn + per-token routing extraction)
-        probing = {'note': 'Probing classifier not yet ported to JAX'}
+        # Probing classifier (ported to JAX)
+        probing = {}
+        try:
+            from scripts.analysis.behavioral_jax import BehavioralAnalyzerJAX
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+            beh_analyzer = BehavioralAnalyzerJAX(
+                self.model, self.params, self.config, tokenizer=tokenizer,
+            )
+            probing = beh_analyzer.run_probing(val_tokens, n_batches=n_batches)
+        except Exception as e:
+            print(f"  Probing skipped: {e}")
+            probing = {'note': f'Probing classifier failed: {e}'}
 
         results = {
             'trajectory': trajectory,
