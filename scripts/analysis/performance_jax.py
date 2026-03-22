@@ -382,34 +382,32 @@ class SpeedBenchmarkJAX:
         rng_key = jax.random.PRNGKey(42)
         input_ids = jax.random.randint(rng_key, (batch_size, seq_len), 0, vocab_size)
 
-        # Warmup (includes JIT compilation)
-        print(f"    Benchmark warmup ({n_warmup} iters)...", end="", flush=True)
-        t_warmup = time.time()
-        for _ in range(n_warmup):
-            _ = model_instance.apply(
+        # JIT-compile the forward pass
+        @jax.jit
+        def bench_step(params, input_ids):
+            return model_instance.apply(
                 params,
                 input_ids,
                 deterministic=True,
                 rngs={'dropout': rng_key}
             )
 
-        # Block until computation is complete
-        jax.block_until_ready(input_ids)
+        # Warmup (includes JIT compilation)
+        print(f"    Benchmark warmup ({n_warmup} iters)...", end="", flush=True)
+        t_warmup = time.time()
+        for _ in range(n_warmup):
+            result = bench_step(params, input_ids)
+            # Block on output to ensure JIT compilation + execution completes
+            jax.tree.map(lambda x: x.block_until_ready(), result)
         print(f" done ({time.time() - t_warmup:.1f}s)")
 
         # Timed runs
         times = []
         for _ in range(n_runs):
             start = time.time()
-            result = model_instance.apply(
-                params,
-                input_ids,
-                deterministic=True,
-                rngs={'dropout': rng_key}
-            )
+            result = bench_step(params, input_ids)
             # Block until complete
-            if 'logits' in result:
-                jax.block_until_ready(result['logits'])
+            jax.tree.map(lambda x: x.block_until_ready(), result)
             elapsed = time.time() - start
             times.append(elapsed * 1000)  # Convert to ms
 
