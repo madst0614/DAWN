@@ -133,19 +133,24 @@ class TextGeneratorJAX:
         generated = list(prompt_ids.flatten())
         rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**31)
 
-        start_time = time.time()
-
-        for _ in range(max_new_tokens):
-            # Truncate to max_seq_len
-            input_ids = np.array([generated[-max_seq_len:]])
-
-            # Forward pass
-            result = model_instance.apply(
+        # JIT-compile forward pass for generation
+        @jax.jit
+        def gen_step(params, input_ids):
+            return model_instance.apply(
                 params,
-                jnp.array(input_ids),
+                input_ids,
                 deterministic=True,
                 rngs={'dropout': rng_key}
             )
+
+        start_time = time.time()
+
+        for step in range(max_new_tokens):
+            # Truncate to max_seq_len
+            input_ids = jnp.array([generated[-max_seq_len:]])
+
+            # Forward pass (JIT-compiled; recompiles only when seq length changes)
+            result = gen_step(params, input_ids)
 
             logits = np.array(result['logits'][0, -1])
 
@@ -243,8 +248,8 @@ class TextGeneratorJAX:
         if self.tokenizer is None:
             return "", {'error': 'No tokenizer provided'}
 
-        # Encode prompt
-        encoded = self.tokenizer.encode(prompt, add_special_tokens=True)
+        # Encode prompt (no special tokens for causal generation)
+        encoded = self.tokenizer.encode(prompt, add_special_tokens=False)
         prompt_ids = np.array(encoded)
 
         # Generate

@@ -76,6 +76,17 @@ def evaluate(model_instance, params, val_tokens, batch_size=32, seq_len=512,
 
     rng_key = jax.random.PRNGKey(42)
 
+    # JIT-compile the eval step
+    @jax.jit
+    def eval_step(params, batch_jax):
+        return model_instance.apply(
+            params,
+            batch_jax,
+            labels=batch_jax,
+            deterministic=True,
+            rngs={'dropout': rng_key},
+        )
+
     total_loss = 0.0
     total_correct = 0
     total_tokens = 0
@@ -86,13 +97,7 @@ def evaluate(model_instance, params, val_tokens, batch_size=32, seq_len=512,
     for i, batch in enumerate(batches):
         batch_jax = jnp.array(batch)
 
-        result = model_instance.apply(
-            params,
-            batch_jax,
-            labels=batch_jax,
-            deterministic=True,
-            rngs={'dropout': rng_key},
-        )
+        result = eval_step(params, batch_jax)
 
         if 'loss' in result:
             loss_val = float(result['loss'])

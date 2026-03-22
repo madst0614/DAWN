@@ -718,15 +718,25 @@ class ModelAnalyzer:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature, top_k=top_k
             )
+            # Extract continuation (handle tokenizer adding/removing whitespace)
+            if generated_text.startswith(prompt):
+                continuation = generated_text[len(prompt):]
+            elif prompt.lower() in generated_text.lower():
+                idx = generated_text.lower().index(prompt.lower())
+                continuation = generated_text[idx + len(prompt):]
+            else:
+                continuation = generated_text
+
             samples.append({
                 'category': category,
                 'prompt': prompt,
                 'generated': generated_text,
+                'continuation': continuation.strip(),
                 'new_tokens': metadata.get('new_tokens', 0),
                 'time_ms': metadata.get('time_ms', 0),
                 'tokens_per_sec': metadata.get('tokens_per_sec', 0),
             })
-            print(f"  │ [{category}] {prompt[:30]}... → {generated_text[len(prompt):len(prompt)+50]}...")
+            print(f"  │ [{category}] {prompt[:30]}... → {continuation[:60].strip()}...")
 
         return samples
 
