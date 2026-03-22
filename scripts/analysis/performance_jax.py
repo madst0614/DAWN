@@ -382,7 +382,9 @@ class SpeedBenchmarkJAX:
         rng_key = jax.random.PRNGKey(42)
         input_ids = jax.random.randint(rng_key, (batch_size, seq_len), 0, vocab_size)
 
-        # Warmup
+        # Warmup (includes JIT compilation)
+        print(f"    Benchmark warmup ({n_warmup} iters)...", end="", flush=True)
+        t_warmup = time.time()
         for _ in range(n_warmup):
             _ = model_instance.apply(
                 params,
@@ -393,6 +395,7 @@ class SpeedBenchmarkJAX:
 
         # Block until computation is complete
         jax.block_until_ready(input_ids)
+        print(f" done ({time.time() - t_warmup:.1f}s)")
 
         # Timed runs
         times = []

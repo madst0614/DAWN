@@ -124,6 +124,7 @@ CLI Arguments:
 import os
 import sys
 import json
+import time
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -4017,8 +4018,11 @@ class ModelAnalyzer:
         has_figure_request = len(requested_figures) > 0
 
         total_analyses = len(analyses)
+        run_start = time.time()
         for i, (name, func, kwargs) in enumerate(analyses, 1):
-            print(f"\n[{i}/{total_analyses}] {name.upper()}")
+            elapsed_total = time.time() - run_start
+            print(f"\n[{i}/{total_analyses}] {name.upper()} (elapsed: {elapsed_total:.0f}s)")
+            step_start = time.time()
             try:
                 func(**kwargs)
             except Exception as e:
@@ -4026,6 +4030,8 @@ class ModelAnalyzer:
                 import traceback
                 traceback.print_exc()
                 self.results[name] = {'error': str(e)}
+            step_time = time.time() - step_start
+            print(f"  [{name}] completed in {step_time:.1f}s")
 
             # Print summary table after performance analysis
             if name == 'performance':

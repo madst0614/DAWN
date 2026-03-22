@@ -20,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import json
+import time
 from typing import Dict, List, Tuple, Optional, Any
 from collections import Counter, defaultdict
 
@@ -399,8 +400,11 @@ def load_bin_data(data_path: str, max_tokens: int = None) -> np.ndarray:
         else:
             bytes_needed = total_bytes
 
+        print(f"    Loading {bytes_needed / 1e6:.1f}MB from GCS...", end="", flush=True)
+        t0 = time.time()
         with fs.open(data_path, 'rb') as f:
             data = np.frombuffer(f.read(bytes_needed), dtype=np.int16)
+        print(f" done ({time.time() - t0:.1f}s, {len(data)/1e6:.1f}M tokens)")
     else:
         if max_tokens:
             data = np.memmap(data_path, dtype=np.int16, mode='r')[:max_tokens]
@@ -1101,6 +1105,8 @@ def evaluate_jax(model, params, config: Dict,
 
     rng_key = jax.random.PRNGKey(42)
 
+    n_batches = len(batches)
+
     # JIT-compile the forward pass for performance
     @jax.jit
     def eval_step(params, batch_jax):
@@ -1112,14 +1118,41 @@ def evaluate_jax(model, params, config: Dict,
             rngs={'dropout': rng_key}
         )
 
-    for batch in batches:
+    t_start = time.time()
+    for i, batch in enumerate(batches):
         batch_jax = jnp.array(batch)
+
+        if i == 0:
+            print(f"    JIT compiling eval_step (first batch)...", end="", flush=True)
+            t_jit = time.time()
+
         result = eval_step(params, batch_jax)
+
+        # Block until computation completes (for accurate timing)
+        jax.tree.map(lambda x: x.block_until_ready(), result)
+
+        if i == 0:
+            jit_time = time.time() - t_jit
+            print(f" done ({jit_time:.1f}s)")
 
         if 'loss' in result:
             total_loss += float(result['loss']) * (batch_size * (seq_len - 1))
             total_correct += int(result.get('correct', 0))
             total_tokens += int(result.get('valid_count', batch_size * (seq_len - 1)))
+
+        # Progress every 10 batches or at the end
+        if (i + 1) % 10 == 0 or (i + 1) == n_batches:
+            elapsed = time.time() - t_start
+            batches_done = i + 1
+            speed = batches_done / elapsed if elapsed > 0 else 0
+            eta = (n_batches - batches_done) / speed if speed > 0 else 0
+            current_loss = total_loss / total_tokens if total_tokens > 0 else 0
+            current_ppl = np.exp(current_loss) if current_loss < 100 else float('inf')
+            print(f"    [{batches_done}/{n_batches}] loss={current_loss:.4f} ppl={current_ppl:.2f} "
+                  f"({speed:.1f} batch/s, ETA {eta:.0f}s)", flush=True)
+
+    elapsed_total = time.time() - t_start
+    print(f"    Validation complete: {n_batches} batches in {elapsed_total:.1f}s")
 
     avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
     accuracy = (total_correct / total_tokens * 100) if total_tokens > 0 else 0.0
