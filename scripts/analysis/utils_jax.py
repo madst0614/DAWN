@@ -458,15 +458,19 @@ def load_val_data_jax(val_path: str, max_tokens: int = 10_000_000) -> np.ndarray
 # JAX Routing Data Extraction
 # ============================================================
 
-def _softmax_np(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    """Numerically stable softmax (numpy)."""
+def _softmax_np(x, axis: int = -1):
+    """Numerically stable softmax. Uses jnp if JAX available, else numpy."""
+    if HAS_JAX:
+        return jax.nn.softmax(x, axis=axis)
     x_max = np.max(x, axis=axis, keepdims=True)
     e_x = np.exp(x - x_max)
     return e_x / (np.sum(e_x, axis=axis, keepdims=True) + 1e-8)
 
 
-def topk_sparsify_np(weights: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Top-k sparsification with renormalization (numpy version, vectorized).
+def topk_sparsify_np(weights, k: int):
+    """Top-k sparsification with renormalization.
+
+    Uses JAX operations (jax.lax.top_k) when available for TPU acceleration.
 
     Args:
         weights: [..., N] softmax probabilities
@@ -476,19 +480,31 @@ def topk_sparsify_np(weights: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarra
         sparse_weights: [..., N] with only top-k nonzero, renormalized
         topk_idx: [..., k] indices
     """
-    # Get top-k indices via argpartition (O(N) per row, much faster than full sort)
+    if HAS_JAX:
+        # Reshape to 2D for jax.lax.top_k (only supports last axis on 2D)
+        orig_shape = weights.shape
+        flat = jnp.reshape(weights, (-1, orig_shape[-1]))
+        topk_vals, topk_idx_flat = jax.lax.top_k(flat, k)
+
+        # Scatter back into sparse array
+        sparse_flat = jnp.zeros_like(flat)
+        rows = jnp.arange(flat.shape[0])[:, None]
+        sparse_flat = sparse_flat.at[rows, topk_idx_flat].set(topk_vals)
+
+        # Renormalize
+        sparse_flat = sparse_flat / (sparse_flat.sum(axis=-1, keepdims=True) + 1e-8)
+
+        # Reshape back
+        sparse = jnp.reshape(sparse_flat, orig_shape)
+        topk_idx = jnp.reshape(topk_idx_flat, orig_shape[:-1] + (k,))
+        return sparse, topk_idx
+
+    # Numpy fallback
     topk_idx = np.argpartition(weights, -k, axis=-1)[..., -k:]
-
-    # Gather top-k values — fully vectorized, no Python loops
-    topk_vals = np.take_along_axis(weights, topk_idx, axis=-1)  # [..., k]
-
-    # Scatter back: build sparse array using advanced indexing
+    topk_vals = np.take_along_axis(weights, topk_idx, axis=-1)
     sparse = np.zeros_like(weights)
     np.put_along_axis(sparse, topk_idx, topk_vals, axis=-1)
-
-    # Renormalize
     sparse = sparse / (sparse.sum(axis=-1, keepdims=True) + 1e-8)
-
     return sparse, topk_idx
 
 
@@ -532,6 +548,162 @@ class JAXRoutingDataExtractor:
 
         self.d_space = config.get('d_space', 256)
 
+        # Pre-build JIT-compiled routing function (lazy init)
+        self._jit_extract_fn = None
+
+    def _build_jit_extract(self):
+        """Build a JIT-compiled routing extraction function."""
+        # Extract all static params once
+        all_params = self.params.get('params', self.params)
+        router_params = all_params.get('router', {})
+        nr_params = router_params.get('neuron_router', {})
+
+        # Token & position embeddings
+        token_emb_table = jnp.asarray(all_params.get('token_emb', {}).get('embedding'))
+        pos_emb_raw = all_params.get('pos_emb', {}).get('embedding')
+        pos_emb_table = jnp.asarray(pos_emb_raw) if pos_emb_raw is not None else None
+
+        # Neuron embeddings (normalized)
+        neuron_emb = nr_params.get('neuron_emb')
+        neuron_emb = jnp.asarray(neuron_emb)
+        emb_norm = neuron_emb / (jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8)
+
+        # Attention projection
+        proj_all = nr_params.get('proj_all', {})
+        attn_kernel = jnp.asarray(proj_all.get('kernel'))
+        attn_bias_raw = proj_all.get('bias')
+        attn_bias = jnp.asarray(attn_bias_raw) if attn_bias_raw is not None else None
+
+        # Knowledge projections
+        proj_fk = nr_params.get('proj_feature_know', {})
+        proj_rk = nr_params.get('proj_restore_know', {})
+        fk_kernel = proj_fk.get('kernel')
+        rk_kernel = proj_rk.get('kernel')
+        has_knowledge = fk_kernel is not None and rk_kernel is not None
+        if has_knowledge:
+            fk_kernel = jnp.asarray(fk_kernel)
+            rk_kernel = jnp.asarray(rk_kernel)
+            fk_bias_raw = proj_fk.get('bias')
+            rk_bias_raw = proj_rk.get('bias')
+            fk_bias = jnp.asarray(fk_bias_raw) if fk_bias_raw is not None else None
+            rk_bias = jnp.asarray(rk_bias_raw) if rk_bias_raw is not None else None
+
+        # Pool boundaries
+        fqk_end = self.n_feature_qk
+        fv_end = fqk_end + self.n_feature_v
+        rqk_end = fv_end + self.n_restore_qk
+        rv_end = rqk_end + self.n_restore_v
+        fk_end = rv_end + self.n_feature_know
+
+        # Pool embeddings (slices)
+        fqk_emb = emb_norm[:fqk_end]
+        fv_emb = emb_norm[fqk_end:fv_end]
+        rqk_emb = emb_norm[fv_end:rqk_end]
+        rv_emb = emb_norm[rqk_end:rv_end]
+        if has_knowledge:
+            emb_fk = emb_norm[rv_end:fk_end]
+            emb_rk = emb_norm[fk_end:]
+
+        # Top-k values
+        tk_fqk = self.top_k_feature_qk
+        tk_fv = self.top_k_feature_v
+        tk_rqk = self.top_k_restore_qk
+        tk_rv = self.top_k_restore_v
+        tk_fk = self.top_k_feature_know
+        tk_rk = self.top_k_restore_know
+
+        def _topk_sparse(prefs, k):
+            """JIT-friendly top-k sparsification."""
+            orig_shape = prefs.shape
+            flat = jnp.reshape(prefs, (-1, orig_shape[-1]))
+            topk_vals, topk_idx = jax.lax.top_k(flat, k)
+            sparse = jnp.zeros_like(flat)
+            rows = jnp.arange(flat.shape[0])[:, None]
+            sparse = sparse.at[rows, topk_idx].set(topk_vals)
+            sparse = sparse / (sparse.sum(axis=-1, keepdims=True) + 1e-8)
+            return jnp.reshape(sparse, orig_shape), jnp.reshape(topk_idx, orig_shape[:-1] + (k,))
+
+        @jax.jit
+        def _extract(input_ids):
+            """JIT-compiled routing extraction — runs entirely on TPU."""
+            B, S = input_ids.shape
+            tok_emb = token_emb_table[input_ids]
+            if pos_emb_table is not None:
+                positions = jnp.arange(S)[jnp.newaxis, :]
+                x = tok_emb + pos_emb_table[positions]
+            else:
+                x = tok_emb
+
+            # Attention routing
+            all_proj = jnp.einsum('bsd,df->bsf', x, attn_kernel)
+            if attn_bias is not None:
+                all_proj = all_proj + attn_bias
+
+            splits = jnp.split(all_proj, 6, axis=-1)
+            h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = splits
+
+            logits_fqk_Q = jnp.einsum('bsd,nd->bsn', h_fqk_Q, fqk_emb)
+            logits_fqk_K = jnp.einsum('bsd,nd->bsn', h_fqk_K, fqk_emb)
+            logits_fv = jnp.einsum('bsd,nd->bsn', h_fv, fv_emb)
+            logits_rqk_Q = jnp.einsum('bsd,nd->bsn', h_rqk_Q, rqk_emb)
+            logits_rqk_K = jnp.einsum('bsd,nd->bsn', h_rqk_K, rqk_emb)
+            logits_rv = jnp.einsum('bsd,nd->bsn', h_rv, rv_emb)
+
+            pref_fqk_Q = jax.nn.softmax(logits_fqk_Q, axis=-1)
+            pref_fqk_K = jax.nn.softmax(logits_fqk_K, axis=-1)
+            pref_fv = jax.nn.softmax(logits_fv, axis=-1)
+            pref_rqk_Q = jax.nn.softmax(logits_rqk_Q, axis=-1)
+            pref_rqk_K = jax.nn.softmax(logits_rqk_K, axis=-1)
+            pref_rv = jax.nn.softmax(logits_rv, axis=-1)
+
+            fqk_w_Q, _ = _topk_sparse(pref_fqk_Q, tk_fqk)
+            fqk_w_K, _ = _topk_sparse(pref_fqk_K, tk_fqk)
+            fv_w, _ = _topk_sparse(pref_fv, tk_fv)
+            rqk_w_Q, _ = _topk_sparse(pref_rqk_Q, tk_rqk)
+            rqk_w_K, _ = _topk_sparse(pref_rqk_K, tk_rqk)
+            rv_w, _ = _topk_sparse(pref_rv, tk_rv)
+
+            # Pack attention results as a tuple (JIT-friendly)
+            attn = (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+                    pref_fqk_Q, pref_fqk_K, pref_fv, pref_rqk_Q, pref_rqk_K, pref_rv)
+
+            return attn
+
+        self._jit_extract_attn = _extract
+
+        # Separate JIT for knowledge routing (optional)
+        if has_knowledge:
+            @jax.jit
+            def _extract_know(input_ids):
+                B, S = input_ids.shape
+                tok_emb = token_emb_table[input_ids]
+                if pos_emb_table is not None:
+                    positions = jnp.arange(S)[jnp.newaxis, :]
+                    x = tok_emb + pos_emb_table[positions]
+                else:
+                    x = tok_emb
+
+                h_fk = jnp.einsum('bsd,df->bsf', x, fk_kernel)
+                if fk_bias is not None:
+                    h_fk = h_fk + fk_bias
+                h_rk = jnp.einsum('bsd,df->bsf', x, rk_kernel)
+                if rk_bias is not None:
+                    h_rk = h_rk + rk_bias
+
+                logits_fk = jnp.einsum('bsd,nd->bsn', h_fk, emb_fk)
+                logits_rk = jnp.einsum('bsd,nd->bsn', h_rk, emb_rk)
+                pref_fk = jax.nn.softmax(logits_fk, axis=-1)
+                pref_rk = jax.nn.softmax(logits_rk, axis=-1)
+                fk_w, _ = _topk_sparse(pref_fk, tk_fk)
+                rk_w, _ = _topk_sparse(pref_rk, tk_rk)
+                return fk_w, rk_w, pref_fk, pref_rk
+
+            self._jit_extract_know = _extract_know
+        else:
+            self._jit_extract_know = None
+
+        self._has_knowledge = has_knowledge
+
     def _get_router_params(self):
         """Extract router parameters from full params."""
         # params structure: {'params': {'router': {...}, 'shared_neurons': {...}, ...}}
@@ -539,7 +711,10 @@ class JAXRoutingDataExtractor:
         return all_params.get('router', {})
 
     def _get_neuron_embeddings(self):
-        """Get normalized neuron embeddings."""
+        """Get normalized neuron embeddings (as jax arrays)."""
+        if hasattr(self, '_cached_emb_norm') and self._cached_emb_norm is not None:
+            return self._cached_emb_norm
+
         router_params = self._get_router_params()
         nr_params = router_params.get('neuron_router', {})
 
@@ -547,9 +722,11 @@ class JAXRoutingDataExtractor:
         if neuron_emb is None:
             return None
 
-        # Normalize embeddings
-        norm = np.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8
-        return neuron_emb / norm
+        # Normalize embeddings using jnp
+        neuron_emb = jnp.asarray(neuron_emb)
+        norm = jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8
+        self._cached_emb_norm = neuron_emb / norm
+        return self._cached_emb_norm
 
     def compute_attention_routing(self, x: np.ndarray) -> Dict[str, np.ndarray]:
         """Compute attention routing weights for input embeddings.
@@ -582,28 +759,31 @@ class JAXRoutingDataExtractor:
         if kernel is None:
             return {}
 
-        all_proj = np.einsum('bsd,df->bsf', x, kernel)
+        x = jnp.asarray(x)
+        kernel = jnp.asarray(kernel)
+
+        all_proj = jnp.einsum('bsd,df->bsf', x, kernel)
         if bias is not None:
-            all_proj = all_proj + bias
+            all_proj = all_proj + jnp.asarray(bias)
 
         # Split into 6 projections
         d_space = all_proj.shape[-1] // 6
-        splits = np.split(all_proj, 6, axis=-1)
+        splits = jnp.split(all_proj, 6, axis=-1)
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = splits
 
-        # Pool embeddings
+        # Pool embeddings (already jnp from _get_neuron_embeddings)
         fqk_emb = emb_norm[:fqk_end]
         fv_emb = emb_norm[fqk_end:fv_end]
         rqk_emb = emb_norm[fv_end:rqk_end]
         rv_emb = emb_norm[rqk_end:rv_end]
 
-        # Compute logits
-        logits_fqk_Q = np.einsum('bsd,nd->bsn', h_fqk_Q, fqk_emb)
-        logits_fqk_K = np.einsum('bsd,nd->bsn', h_fqk_K, fqk_emb)
-        logits_fv = np.einsum('bsd,nd->bsn', h_fv, fv_emb)
-        logits_rqk_Q = np.einsum('bsd,nd->bsn', h_rqk_Q, rqk_emb)
-        logits_rqk_K = np.einsum('bsd,nd->bsn', h_rqk_K, rqk_emb)
-        logits_rv = np.einsum('bsd,nd->bsn', h_rv, rv_emb)
+        # Compute logits — all on TPU via jnp
+        logits_fqk_Q = jnp.einsum('bsd,nd->bsn', h_fqk_Q, fqk_emb)
+        logits_fqk_K = jnp.einsum('bsd,nd->bsn', h_fqk_K, fqk_emb)
+        logits_fv = jnp.einsum('bsd,nd->bsn', h_fv, fv_emb)
+        logits_rqk_Q = jnp.einsum('bsd,nd->bsn', h_rqk_Q, rqk_emb)
+        logits_rqk_K = jnp.einsum('bsd,nd->bsn', h_rqk_K, rqk_emb)
+        logits_rv = jnp.einsum('bsd,nd->bsn', h_rv, rv_emb)
 
         pref_fqk_Q = _softmax_np(logits_fqk_Q)
         pref_fqk_K = _softmax_np(logits_fqk_K)
@@ -664,26 +844,30 @@ class JAXRoutingDataExtractor:
         if kernel_fk is None:
             return {}
 
-        h_fk = np.einsum('bsd,df->bsf', x, kernel_fk)
+        x = jnp.asarray(x)
+        kernel_fk = jnp.asarray(kernel_fk)
+
+        h_fk = jnp.einsum('bsd,df->bsf', x, kernel_fk)
         if bias_fk is not None:
-            h_fk = h_fk + bias_fk
+            h_fk = h_fk + jnp.asarray(bias_fk)
 
         # Restore knowledge projection
         proj_rk = nr_params.get('proj_restore_know', {})
         kernel_rk = proj_rk.get('kernel')
         bias_rk = proj_rk.get('bias')
 
-        h_rk = np.einsum('bsd,df->bsf', x, kernel_rk)
+        kernel_rk = jnp.asarray(kernel_rk)
+        h_rk = jnp.einsum('bsd,df->bsf', x, kernel_rk)
         if bias_rk is not None:
-            h_rk = h_rk + bias_rk
+            h_rk = h_rk + jnp.asarray(bias_rk)
 
-        # Pool embeddings
+        # Pool embeddings (already jnp from _get_neuron_embeddings)
         emb_fk = emb_norm[rv_end:fk_end]
         emb_rk = emb_norm[fk_end:]
 
-        # Compute logits
-        logits_fk = np.einsum('bsd,nd->bsn', h_fk, emb_fk)
-        logits_rk = np.einsum('bsd,nd->bsn', h_rk, emb_rk)
+        # Compute logits — all on TPU via jnp
+        logits_fk = jnp.einsum('bsd,nd->bsn', h_fk, emb_fk)
+        logits_rk = jnp.einsum('bsd,nd->bsn', h_rk, emb_rk)
 
         pref_fk = _softmax_np(logits_fk)
         pref_rk = _softmax_np(logits_rk)
@@ -702,9 +886,8 @@ class JAXRoutingDataExtractor:
     def extract_routing(self, input_ids: np.ndarray, layer_idx: int = 0) -> Dict[str, np.ndarray]:
         """Extract all routing weights for given input.
 
-        Note: This computes routing based on token embeddings + positional embeddings.
-        For layer-specific routing (after transformations), you'd need to run
-        partial forward passes.
+        Uses JIT-compiled function for TPU-native execution.
+        First call triggers XLA compilation (~5s), subsequent calls are fast.
 
         Args:
             input_ids: Token IDs [B, S]
@@ -713,31 +896,42 @@ class JAXRoutingDataExtractor:
         Returns:
             Dict with all routing weights
         """
-        # Get token embeddings
-        all_params = self.params.get('params', self.params)
+        # Lazy-init JIT functions on first call
+        if self._jit_extract_fn is None:
+            self._build_jit_extract()
 
-        # Token embedding
-        token_emb_table = all_params.get('token_emb', {}).get('embedding')
-        if token_emb_table is None:
-            return {}
+        input_ids_jax = jnp.asarray(input_ids)
+        attn_tuple = self._jit_extract_attn(input_ids_jax)
+        know_tuple = self._jit_extract_know(input_ids_jax) if self._jit_extract_know is not None else None
 
-        # Position embedding
-        pos_emb_table = all_params.get('pos_emb', {}).get('embedding')
+        # Unpack attention results
+        (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+         pref_fqk_Q, pref_fqk_K, pref_fv, pref_rqk_Q, pref_rqk_K, pref_rv) = attn_tuple
 
-        # Compute embeddings
-        B, S = input_ids.shape
-        tok_emb = token_emb_table[input_ids]  # [B, S, D]
+        attn_routing = {
+            'fqk_weights_Q': fqk_w_Q,
+            'fqk_weights_K': fqk_w_K,
+            'fv_weights': fv_w,
+            'rqk_weights_Q': rqk_w_Q,
+            'rqk_weights_K': rqk_w_K,
+            'rv_weights': rv_w,
+            'fqk_pref_Q': pref_fqk_Q,
+            'fqk_pref_K': pref_fqk_K,
+            'fv_pref': pref_fv,
+            'rqk_pref_Q': pref_rqk_Q,
+            'rqk_pref_K': pref_rqk_K,
+            'rv_pref': pref_rv,
+        }
 
-        if pos_emb_table is not None:
-            positions = np.arange(S)[np.newaxis, :]  # [1, S]
-            pos_emb = pos_emb_table[positions]  # [1, S, D]
-            x = tok_emb + pos_emb
-        else:
-            x = tok_emb
-
-        # Compute routing weights
-        attn_routing = self.compute_attention_routing(x)
-        know_routing = self.compute_knowledge_routing(x)
+        know_routing = {}
+        if know_tuple is not None:
+            fk_w, rk_w, pref_fk, pref_rk = know_tuple
+            know_routing = {
+                'feature_know_w': fk_w,
+                'restore_know_w': rk_w,
+                'feature_know_pref': pref_fk,
+                'restore_know_pref': pref_rk,
+            }
 
         return {
             'attention': attn_routing,
@@ -803,9 +997,9 @@ class JAXRoutingData:
 # Mathematical Utilities (NumPy versions)
 # ============================================================
 
-def gini_coefficient(values: np.ndarray) -> float:
-    """Calculate Gini coefficient (numpy version)."""
-    values = values.flatten().astype(np.float64)
+def gini_coefficient(values) -> float:
+    """Calculate Gini coefficient."""
+    values = np.asarray(values).flatten().astype(np.float64)
     if values.sum() == 0:
         return 0.0
     sorted_vals = np.sort(values)
@@ -814,30 +1008,33 @@ def gini_coefficient(values: np.ndarray) -> float:
     return float(1 - 2 * cumsum.sum() / (n * sorted_vals.sum()) + 1/n)
 
 
-def calc_entropy(probs: np.ndarray, axis: int = -1) -> np.ndarray:
-    """Calculate entropy along dimension (numpy version)."""
-    probs = np.clip(probs, 1e-8, None)
-    return -np.sum(probs * np.log(probs), axis=axis)
+def calc_entropy(probs, axis: int = -1):
+    """Calculate entropy along dimension. Uses jnp if input is jax array."""
+    xp = jnp if HAS_JAX and hasattr(probs, 'device') else np
+    probs = xp.clip(probs, 1e-8, None)
+    return -xp.sum(probs * xp.log(probs), axis=axis)
 
 
-def calc_entropy_ratio(probs: np.ndarray) -> float:
-    """Calculate entropy as percentage of maximum (numpy version)."""
+def calc_entropy_ratio(probs) -> float:
+    """Calculate entropy as percentage of maximum."""
     if probs.size == 0:
         return 0.0
+
+    xp = jnp if HAS_JAX and hasattr(probs, 'device') else np
 
     if probs.ndim == 1:
         avg_probs = probs
     elif probs.ndim == 2:
         avg_probs = probs.mean(axis=0)
     else:
-        avg_probs = probs.reshape(-1, probs.shape[-1]).mean(axis=0)
+        avg_probs = xp.reshape(probs, (-1, probs.shape[-1])).mean(axis=0)
 
     ent = calc_entropy(avg_probs, axis=-1)
 
-    if isinstance(ent, np.ndarray) and ent.ndim > 0:
+    if hasattr(ent, 'ndim') and ent.ndim > 0:
         ent = ent.mean()
 
-    max_ent = np.log(probs.shape[-1])
+    max_ent = float(np.log(probs.shape[-1]))
     return float(ent / max_ent * 100) if max_ent > 0 else 0.0
 
 
