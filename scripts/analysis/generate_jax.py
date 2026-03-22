@@ -355,6 +355,8 @@ def main():
                         help='Second checkpoint for comparison')
     parser.add_argument('--prompt', type=str, default=None,
                         help='Single prompt to generate from')
+    parser.add_argument('--prompts', type=str, nargs='+', default=None,
+                        help='Multiple prompts to generate from')
     parser.add_argument('--suite', action='store_true',
                         help='Run predefined prompt suite')
     parser.add_argument('--max_tokens', type=int, default=50)
@@ -367,7 +369,7 @@ def main():
                         help='Save results to JSON (or dir for comparison)')
     args = parser.parse_args()
 
-    if args.prompt is None and not args.suite:
+    if args.prompt is None and args.prompts is None and not args.suite:
         args.suite = True
 
     temperature = 0.0 if args.greedy else args.temperature
@@ -395,6 +397,8 @@ def main():
     prompts = PROMPT_SUITE
     if args.prompt:
         prompts = {'Custom': [args.prompt]}
+    elif args.prompts:
+        prompts = {'Custom': args.prompts}
 
     # ---- Run ----
     if model_b is not None:

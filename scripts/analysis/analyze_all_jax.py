@@ -1000,6 +1000,81 @@ class ModelAnalyzer:
                           f"({data['trend']}, {data['growth_ratio']:.2f}x)")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
+        # Cross-check: Selection frequency coverage vs Health dead neurons
+        health = self.results.get('health', {})
+        health_activation = health.get('activation_distribution', {})
+        if health_activation and selection_freq:
+            print(f"\n  ┌─ Cross-Check: Selection Coverage vs Dead Neurons ─────────────────────")
+            print(f"  │ {'Pool':<14} {'Health':>12} {'Sel.Freq':>14} {'Diff':>8} {'Explanation'}")
+            print(f"  │ {'':14} {'Active/Total':>12} {'Coverage':>14} {'':>8}")
+            print(f"  │ {'─'*14} {'─'*12} {'─'*14} {'─'*8} {'─'*30}")
+
+            # Map routing keys to health pool names
+            routing_to_health = {
+                'fqk_q': 'feature_qk', 'fqk_k': 'feature_qk',
+                'fv': 'feature_v',
+                'rqk_q': 'restore_qk', 'rqk_k': 'restore_qk',
+                'rv': 'restore_v',
+            }
+
+            # Track QK pool Q-only, K-only, union
+            qk_pools = {}  # pool_name -> {q_unique: set, k_unique: set}
+
+            for rkey, freq_data in selection_freq.items():
+                if not isinstance(freq_data, dict) or 'unique_selected' not in freq_data:
+                    continue
+
+                health_pool = routing_to_health.get(rkey)
+                if not health_pool or health_pool not in health_activation:
+                    continue
+
+                h_data = health_activation[health_pool]
+                h_active = h_data.get('active', 0)
+                h_total = h_data.get('total', 0)
+                f_unique = freq_data.get('unique_selected', 0)
+                f_total = h_total  # Same pool size
+
+                diff = h_active - f_unique
+
+                # Track Q/K breakdown for QK pools
+                if health_pool in ('feature_qk', 'restore_qk'):
+                    if health_pool not in qk_pools:
+                        qk_pools[health_pool] = {'q_unique': 0, 'k_unique': 0, 'h_active': h_active, 'h_total': h_total}
+                    if rkey.endswith('_q'):
+                        qk_pools[health_pool]['q_unique'] = f_unique
+                    elif rkey.endswith('_k'):
+                        qk_pools[health_pool]['k_unique'] = f_unique
+
+                explanation = ''
+                if diff > 0 and rkey.endswith(('_q', '_k')):
+                    explanation = f'{diff} neurons active via other Q/K path'
+                elif diff == 0:
+                    explanation = 'exact match'
+                elif diff < 0:
+                    explanation = f'{-diff} neurons below health threshold'
+
+                display = freq_data.get('display', rkey)
+                print(f"  │ {display:<14} {h_active:>5}/{h_total:<5} {f_unique:>5}/{f_total:<5}   {diff:>+5}   {explanation}")
+
+            # QK union analysis
+            for pool_name, qk_data in qk_pools.items():
+                q_n = qk_data['q_unique']
+                k_n = qk_data['k_unique']
+                h_active = qk_data['h_active']
+                h_total = qk_data['h_total']
+                h_dead = h_total - h_active
+                union_upper = min(q_n + k_n, h_total)
+                display = 'F-QK' if pool_name == 'feature_qk' else 'R-QK'
+                print(f"  │")
+                print(f"  │ {display} breakdown: Q-selected={q_n}, K-selected={k_n}, "
+                      f"health-active={h_active}, dead={h_dead}")
+                if h_active > q_n:
+                    k_only = h_active - q_n
+                    print(f"  │ → {k_only} neurons active via K-path only "
+                          f"(Q coverage {q_n/h_total*100:.1f}% < active {h_active/h_total*100:.1f}%)")
+
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
         self.results['routing'] = results
 
         # Save results.json for later --only paper usage
