@@ -1432,6 +1432,248 @@ def count_params_jax(params) -> int:
         return total
 
 
+def extract_full_routing(params, config, input_ids):
+    """Full forward pass routing extraction — returns all pool weights for every layer.
+
+    Runs a layer-by-layer partial forward pass (attention + knowledge per layer),
+    building the residual stream exactly as in training, and extracts all 8 routing
+    weight tensors at each layer. This captures context-dependent routing that
+    embedding-level extraction misses.
+
+    Args:
+        params: Model parameters (with or without 'params' wrapper)
+        config: Model config dict
+        input_ids: jnp.array or np.array [B, S] of token IDs
+
+    Returns:
+        dict keyed by 'layer_{i}', each containing:
+            'fqk_q':  [B, S, n_feature_qk]   - Feature Q/K routing weights (Q path)
+            'fqk_k':  [B, S, n_feature_qk]   - Feature Q/K routing weights (K path)
+            'fv':     [B, S, n_feature_v]     - Feature V routing weights
+            'rqk_q':  [B, S, n_restore_qk]   - Restore Q/K routing weights (Q path)
+            'rqk_k':  [B, S, n_restore_qk]   - Restore Q/K routing weights (K path)
+            'rv':     [B, S, n_restore_v]     - Restore V routing weights
+            'fknow':  [B, S, n_feature_know]  - Feature knowledge routing weights
+            'rknow':  [B, S, n_restore_know]  - Restore knowledge routing weights
+    """
+    if not HAS_JAX:
+        raise RuntimeError('JAX not available')
+
+    from models.model_v17_1_jax import (
+        _layer_norm, _router_attn_forward, _router_know_forward,
+        _attention_forward, _knowledge_forward,
+    )
+
+    all_params = params.get('params', params)
+    router_params = all_params.get('router', {})
+    sn_params = all_params.get('shared_neurons', {})
+
+    n_layers = config.get('n_layers', 16)
+    n_fqk = config.get('n_feature_qk', 88)
+    n_fv = config.get('n_feature_v', 352)
+    n_rqk = config.get('n_restore_qk', 88)
+    n_rv = config.get('n_restore_v', 352)
+    n_fknow = config.get('n_feature_know', 224)
+    n_rknow = config.get('n_restore_know', 224)
+    d_space = config.get('d_space', 256)
+    tk_fqk = config.get('top_k_feature_qk', 16)
+    tk_fv = config.get('top_k_feature_v', 16)
+    tk_rqk = config.get('top_k_restore_qk', 16)
+    tk_rv = config.get('top_k_restore_v', 16)
+    tk_fknow = config.get('top_k_feature_know', 16)
+    tk_rknow = config.get('top_k_restore_know', 16)
+    n_heads = config.get('n_heads', 8)
+    d_model = config.get('d_model', 768)
+
+    block_params_list = [all_params[f'block_{i}'] for i in range(n_layers)]
+
+    input_ids = jnp.asarray(input_ids)
+    B, S = input_ids.shape
+
+    # Initial embeddings
+    token_emb_table = all_params['token_emb']['embedding']
+    pos_emb_table = all_params['pos_emb']['embedding']
+    positions = jnp.arange(S)[jnp.newaxis, :]
+    x = jnp.take(token_emb_table, input_ids, axis=0) + pos_emb_table[positions]
+
+    rng_key = jax.random.PRNGKey(0)
+    result = {}
+
+    for li in range(n_layers):
+        bp = block_params_list[li]
+        rng_key, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng_key, 5)
+
+        # === Attention sub-block ===
+        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+
+        (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+         _aux) = _router_attn_forward(
+            normed, router_params,
+            n_fqk, n_fv, n_rqk, n_rv, d_space,
+            tk_fqk, tk_fv, tk_rqk, tk_rv,
+            0.0, None, True, rng_ar)
+
+        # Forward attention to update residual
+        attn_out = _attention_forward(
+            normed, sn_params,
+            fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+            bp['attn']['expand_O']['kernel'],
+            n_fqk, n_rqk, n_heads, d_model,
+            0.0, True, rng_a)
+        x = x + attn_out
+
+        # === Knowledge sub-block ===
+        normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+
+        feat_know_w, rest_know_w, _aux = _router_know_forward(
+            normed, router_params,
+            n_fqk, n_fv, n_rqk, n_rv, n_fknow, n_rknow,
+            tk_fknow, tk_rknow,
+            0.0, None, True, rng_kr)
+
+        # Forward knowledge to update residual
+        know_out = _knowledge_forward(
+            normed, sn_params,
+            feat_know_w, rest_know_w,
+            0.0, True, rng_k)
+        x = x + know_out
+
+        # Store all weights for this layer
+        result[f'layer_{li}'] = {
+            'fqk_q': fqk_w_Q,
+            'fqk_k': fqk_w_K,
+            'fv': fv_w,
+            'rqk_q': rqk_w_Q,
+            'rqk_k': rqk_w_K,
+            'rv': rv_w,
+            'fknow': feat_know_w,
+            'rknow': rest_know_w,
+        }
+
+    return result
+
+
+def extract_full_routing_jit(params, config, input_ids):
+    """JIT-compiled version of extract_full_routing.
+
+    Compiles a single function that runs the full forward pass and returns
+    all routing weights. Much faster for repeated calls (batched analysis).
+
+    First call incurs JIT compilation overhead. Subsequent calls with the
+    same input shape are fast.
+
+    Args:
+        params: Model parameters
+        config: Model config dict
+        input_ids: jnp.array [B, S]
+
+    Returns:
+        Same structure as extract_full_routing — dict keyed by 'layer_{i}'
+        with all 8 pool weights per layer.
+    """
+    if not HAS_JAX:
+        raise RuntimeError('JAX not available')
+
+    from models.model_v17_1_jax import (
+        _layer_norm, _router_attn_forward, _router_know_forward,
+        _attention_forward, _knowledge_forward,
+    )
+
+    all_params = params.get('params', params)
+    router_params = all_params.get('router', {})
+    sn_params = all_params.get('shared_neurons', {})
+
+    n_layers = config.get('n_layers', 16)
+    n_fqk = config.get('n_feature_qk', 88)
+    n_fv = config.get('n_feature_v', 352)
+    n_rqk = config.get('n_restore_qk', 88)
+    n_rv = config.get('n_restore_v', 352)
+    n_fknow = config.get('n_feature_know', 224)
+    n_rknow = config.get('n_restore_know', 224)
+    d_space = config.get('d_space', 256)
+    tk_fqk = config.get('top_k_feature_qk', 16)
+    tk_fv = config.get('top_k_feature_v', 16)
+    tk_rqk = config.get('top_k_restore_qk', 16)
+    tk_rv = config.get('top_k_restore_v', 16)
+    tk_fknow = config.get('top_k_feature_know', 16)
+    tk_rknow = config.get('top_k_restore_know', 16)
+    n_heads = config.get('n_heads', 8)
+    d_model = config.get('d_model', 768)
+
+    block_params_list = [all_params[f'block_{i}'] for i in range(n_layers)]
+
+    @jax.jit
+    def _extract_all(input_ids):
+        B, S = input_ids.shape
+
+        token_emb_table = all_params['token_emb']['embedding']
+        pos_emb_table = all_params['pos_emb']['embedding']
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = jnp.take(token_emb_table, input_ids, axis=0) + pos_emb_table[positions]
+
+        rng_key = jax.random.PRNGKey(0)
+
+        all_attn_w = []
+        all_know_w = []
+
+        for li in range(n_layers):
+            bp = block_params_list[li]
+            rng_key, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng_key, 5)
+
+            normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+
+            (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+             _aux) = _router_attn_forward(
+                normed, router_params,
+                n_fqk, n_fv, n_rqk, n_rv, d_space,
+                tk_fqk, tk_fv, tk_rqk, tk_rv,
+                0.0, None, True, rng_ar)
+
+            attn_out = _attention_forward(
+                normed, sn_params,
+                fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+                bp['attn']['expand_O']['kernel'],
+                n_fqk, n_rqk, n_heads, d_model,
+                0.0, True, rng_a)
+            x = x + attn_out
+
+            normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+
+            feat_know_w, rest_know_w, _aux = _router_know_forward(
+                normed, router_params,
+                n_fqk, n_fv, n_rqk, n_rv, n_fknow, n_rknow,
+                tk_fknow, tk_rknow,
+                0.0, None, True, rng_kr)
+
+            know_out = _knowledge_forward(
+                normed, sn_params,
+                feat_know_w, rest_know_w,
+                0.0, True, rng_k)
+            x = x + know_out
+
+            all_attn_w.append((fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w))
+            all_know_w.append((feat_know_w, rest_know_w))
+
+        return all_attn_w, all_know_w
+
+    input_ids = jnp.asarray(input_ids)
+    all_attn_w, all_know_w = _extract_all(input_ids)
+
+    pool_names_attn = ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']
+    pool_names_know = ['fknow', 'rknow']
+
+    result = {}
+    for li in range(n_layers):
+        layer_dict = {}
+        for pi, name in enumerate(pool_names_attn):
+            layer_dict[name] = all_attn_w[li][pi]
+        for pi, name in enumerate(pool_names_know):
+            layer_dict[name] = all_know_w[li][pi]
+        result[f'layer_{li}'] = layer_dict
+
+    return result
+
+
 def convert_to_serializable(obj):
     """
     Convert numpy/JAX types to JSON-serializable format.
