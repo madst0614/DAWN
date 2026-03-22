@@ -70,6 +70,41 @@ from scripts.analysis.utils_jax import (
     convert_to_serializable, save_results,
 )
 
+
+def _extract_active_neurons_from_routing(routing_info, pools):
+    """Extract active neuron sets from routing_info returned by cached forward.
+
+    routing_info values are [n_layers, B, S, N] or [n_layers, B, N].
+    We take the union across all layers at the last sequence position.
+
+    Returns dict: {pool_key: set_of_active_neuron_indices}
+    """
+    # Map pool names to routing_info keys
+    _POOL_TO_KEY = {
+        'fv': 'fv_w', 'rv': 'rv_w',
+        'fknow': 'fknow_w', 'rknow': 'rknow_w',
+        'fqk_q': 'fqk_wQ', 'fqk_k': 'fqk_wK',
+        'rqk_q': 'rqk_wQ', 'rqk_k': 'rqk_wK',
+    }
+    result = {p: set() for p in pools}
+    for pool in pools:
+        key = _POOL_TO_KEY.get(pool)
+        if key is None or key not in routing_info:
+            continue
+        w = np.array(routing_info[key])  # [n_layers, B, S, N] or [n_layers, B, N]
+        # Take last position and union across layers
+        for li in range(w.shape[0]):
+            w_layer = w[li]
+            if w_layer.ndim == 3:  # [B, S, N]
+                w_last = w_layer[0, -1]  # [N]
+            elif w_layer.ndim == 2:  # [B, N]
+                w_last = w_layer[0]  # [N]
+            else:
+                continue
+            active = set(int(i) for i in np.where(w_last > 0)[0])
+            result[pool].update(active)
+    return result
+
 # Inline style
 PAPER_STYLE = {
     'font_family': 'serif', 'font_size_base': 10, 'font_size_label': 14,
@@ -266,7 +301,10 @@ def analyze_knowledge_coherence(
         return {'error': 'JAX not available'}
 
     from transformers import AutoTokenizer
-    from models.model_v17_1_jax import dawn_init_kv_cache, dawn_cached_forward
+    from models.model_v17_1_jax import (
+        dawn_init_kv_cache, dawn_cached_forward,
+        dawn_cached_forward_with_routing,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
@@ -308,15 +346,17 @@ def analyze_knowledge_coherence(
                   f"(tokenizes to {len(tids)} tokens: "
                   f"{tokenizer.convert_ids_to_tokens(tids)})")
 
-    # JIT compile decode step
+    # JIT compile decode step with routing (returns logits + routing weights)
     @jax.jit
-    def decode_step(params, token_ids, kv_k, kv_v, cache_pos):
-        return dawn_cached_forward(params, config, token_ids, kv_k, kv_v, cache_pos)
+    def decode_step_with_routing(params, token_ids, kv_k, kv_v, cache_pos):
+        return dawn_cached_forward_with_routing(
+            params, config, token_ids, kv_k, kv_v, cache_pos)
 
-    print("  JIT compiling decode step...", end=" ", flush=True)
+    print("  JIT compiling decode step (with routing)...", end=" ", flush=True)
     t0 = time.time()
     dummy_kv_k, dummy_kv_v = dawn_init_kv_cache(config, batch_size=1)
-    _out = decode_step(params, jnp.array([[0]]), dummy_kv_k, dummy_kv_v, 0)
+    _out = decode_step_with_routing(
+        params, jnp.array([[0]]), dummy_kv_k, dummy_kv_v, 0)
     _out[0].block_until_ready()
     print(f"done ({time.time() - t0:.1f}s)")
 
@@ -378,11 +418,11 @@ def analyze_knowledge_coherence(
                 print(f"\r      {successful_runs}/{min_target_count} hits "
                       f"(run {total_runs})", end='', flush=True)
 
-            # Init KV cache and prefill
+            # Init KV cache and prefill (with routing)
             kv_k, kv_v = dawn_init_kv_cache(config, batch_size=1)
             prompt_2d = jnp.array(np.array(prompt_ids)[np.newaxis, :])
-            logits, kv_k, kv_v = dawn_cached_forward(
-                params, config, prompt_2d, kv_k, kv_v, 0)
+            logits, kv_k, kv_v, routing_info = decode_step_with_routing(
+                params, prompt_2d, kv_k, kv_v, 0)
 
             generated_ids = list(prompt_ids)
             cache_pos = prompt_len
@@ -393,13 +433,15 @@ def analyze_knowledge_coherence(
             next_token = _sample_token(first_logits, temperature, top_k, subkey)
             generated_ids.append(next_token)
 
+            # Extract routing from prefill (last position of prompt)
+            prev_routing_info = routing_info
+
             for step in range(max_tokens_per_run - 1):
                 token_text = tokenizer.decode([next_token]).strip().lower()
 
-                # Extract routing at current step via full forward (all pools)
-                full_ids = np.array([generated_ids], dtype=np.int32)
-                activations = _extract_routing_at_last_pos(
-                    params, config, full_ids, pools)
+                # Use routing from previous cached forward (no extra full forward!)
+                activations = _extract_active_neurons_from_routing(
+                    prev_routing_info, pools)
 
                 if token_text == target_lower or next_token == target_token_id:
                     # Target found — record neurons with unified naming
@@ -433,10 +475,11 @@ def analyze_knowledge_coherence(
                 if cache_pos >= config.get('max_seq_len', 512) - 1:
                     break
 
-                # Decode next token
+                # Decode next token WITH routing (single cached forward)
                 token_2d = jnp.array([[next_token]])
-                logits, kv_k, kv_v = decode_step(
+                logits, kv_k, kv_v, routing_info = decode_step_with_routing(
                     params, token_2d, kv_k, kv_v, cache_pos)
+                prev_routing_info = routing_info
                 cache_pos += 1
 
                 next_logits = np.array(logits[0, 0, :])

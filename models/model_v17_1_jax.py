@@ -1261,3 +1261,128 @@ def dawn_cached_forward(params, config, input_ids,
     logits = x @ token_emb.T                            # [B, S, V]
 
     return logits, outputs['kv_k'], outputs['kv_v']
+
+
+def dawn_cached_forward_with_routing(params, config, input_ids,
+                                      kv_caches_k, kv_caches_v, cache_index):
+    """Cached forward that also returns per-layer routing weights.
+
+    Same as dawn_cached_forward but scan_body additionally outputs
+    routing weights so callers can extract active neurons without a
+    separate full forward pass.
+
+    Returns:
+        (logits [B,S,V], updated_kv_k, updated_kv_v, routing_info)
+        routing_info is a dict of stacked arrays [n_layers, ...]:
+          fv_w, rv_w, fknow_w, rknow_w  (and fqk_wQ/K, rqk_wQ/K)
+    """
+    # --- unpack config (same as dawn_cached_forward) ---
+    n_layers       = config['n_layers']
+    d_model        = config.get('d_model', 320)
+    n_heads        = config.get('n_heads', 8)
+    n_feature_qk   = config.get('n_feature_qk', 56)
+    n_feature_v    = config.get('n_feature_v', 24)
+    n_restore_qk   = config.get('n_restore_qk', 56)
+    n_restore_v    = config.get('n_restore_v', 24)
+    n_feature_know = config.get('n_feature_know', 24)
+    n_restore_know = config.get('n_restore_know', 24)
+    d_space        = config.get('d_space', 64)
+    top_k_fqk = config.get('top_k_feature_qk', 16)
+    top_k_fv  = config.get('top_k_feature_v', 6)
+    top_k_rqk = config.get('top_k_restore_qk', 16)
+    top_k_rv  = config.get('top_k_restore_v', 6)
+    top_k_fk  = config.get('top_k_feature_know', 4)
+    top_k_rk  = config.get('top_k_restore_know', 4)
+
+    p = params
+    if hasattr(p, 'get') and 'params' in p:
+        p = p['params']
+
+    token_emb   = p['token_emb']['embedding']
+    pos_emb     = p['pos_emb']['embedding']
+    sn_params   = p['shared_neurons']
+    router_params = p['router']
+    norm_params = p['norm']
+
+    B, S = input_ids.shape
+    x = token_emb[input_ids]
+    positions = jnp.arange(S) + cache_index
+    x = x + pos_emb[positions][None, :]
+
+    block_params_list = [p[f'block_{i}'] for i in range(n_layers)]
+    stacked_bp = jax.tree.map(lambda *a: jnp.stack(a), *block_params_list)
+
+    rng = jax.random.PRNGKey(0)
+    layer_rngs = jax.random.split(rng, n_layers)
+    deterministic = True
+
+    def scan_body(carry, xs):
+        x = carry
+        bp   = xs['params']
+        kv_k = xs['kv_k']
+        kv_v = xs['kv_v']
+        rng_l = xs['rng']
+        rng_l, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng_l, 5)
+
+        normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+
+        (fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w,
+         _aux) = _router_attn_forward(
+            normed, router_params,
+            n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
+            d_space, top_k_fqk, top_k_fv, top_k_rqk, top_k_rv,
+            0.0, None, deterministic, rng_ar)
+
+        attn_out, kv_k, kv_v = _attention_forward_cached(
+            normed, sn_params,
+            fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w,
+            bp['attn']['expand_O']['kernel'],
+            n_feature_qk, n_restore_qk, n_heads, d_model,
+            kv_k, kv_v, cache_index)
+
+        x = x + attn_out
+
+        normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+
+        fknow_w, rknow_w, _kaux = _router_know_forward(
+            normed, router_params,
+            n_feature_qk, n_feature_v, n_restore_qk, n_restore_v,
+            n_feature_know, n_restore_know, top_k_fk, top_k_rk,
+            0.0, None, deterministic, rng_kr)
+
+        know_out = _knowledge_forward(
+            normed, sn_params, fknow_w, rknow_w,
+            0.0, deterministic, rng_k)
+
+        x = x + know_out
+        return x, {
+            'kv_k': kv_k, 'kv_v': kv_v,
+            'fv_w': fv_w, 'rv_w': rv_w,
+            'fknow_w': fknow_w, 'rknow_w': rknow_w,
+            'fqk_wQ': fqk_wQ, 'fqk_wK': fqk_wK,
+            'rqk_wQ': rqk_wQ, 'rqk_wK': rqk_wK,
+        }
+
+    xs = {
+        'params': stacked_bp,
+        'kv_k':   kv_caches_k,
+        'kv_v':   kv_caches_v,
+        'rng':    layer_rngs,
+    }
+    x, outputs = jax.lax.scan(scan_body, x, xs)
+
+    x = _layer_norm(x, norm_params['scale'], norm_params['bias'])
+    logits = x @ token_emb.T
+
+    routing_info = {
+        'fv_w':    outputs['fv_w'],      # [n_layers, B, S, N] or [n_layers, B, N]
+        'rv_w':    outputs['rv_w'],
+        'fknow_w': outputs['fknow_w'],
+        'rknow_w': outputs['rknow_w'],
+        'fqk_wQ':  outputs['fqk_wQ'],
+        'fqk_wK':  outputs['fqk_wK'],
+        'rqk_wQ':  outputs['rqk_wQ'],
+        'rqk_wK':  outputs['rqk_wK'],
+    }
+
+    return logits, outputs['kv_k'], outputs['kv_v'], routing_info
