@@ -1274,7 +1274,7 @@ class ModelAnalyzer:
             return {}
 
         from scripts.analysis.utils_jax import (
-            load_val_data_jax, create_model_from_config, JAXRoutingDataExtractor,
+            load_val_data_jax, extract_full_routing_jit,
         )
         from transformers import AutoTokenizer
 
@@ -1284,8 +1284,6 @@ class ModelAnalyzer:
         print(f"  Analyzing semantic patterns ({n_batches} batches)...")
 
         tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-        model_instance = create_model_from_config(self.config)
-        extractor = JAXRoutingDataExtractor(model_instance, self.params, self.config)
 
         # 1. Path similarity: similar vs different sentence pairs
         similar_pairs = [
@@ -1304,32 +1302,35 @@ class ModelAnalyzer:
         ]
         all_pairs = similar_pairs + different_pairs
 
-        # Collect routing paths
+        # Collect routing paths using full forward pass
         similar_cosines = []
         different_cosines = []
+
+        def _flatten_full_routing(routing_dict):
+            """Flatten all-layer routing into a single vector."""
+            vecs = []
+            for layer_key in sorted(routing_dict.keys()):
+                layer_data = routing_dict[layer_key]
+                for pool_key in sorted(layer_data.keys()):
+                    vecs.append(np.asarray(layer_data[pool_key]).flatten())
+            return np.concatenate(vecs) if vecs else np.array([])
 
         for sent1, sent2, label in all_pairs:
             ids1 = tokenizer.encode(sent1, add_special_tokens=True)
             ids2 = tokenizer.encode(sent2, add_special_tokens=True)
 
-            routing1 = extractor.extract_routing(np.array([ids1]))
-            routing2 = extractor.extract_routing(np.array([ids2]))
+            # Pad to same length for JIT reuse
+            max_len = max(len(ids1), len(ids2))
+            ids1_pad = ids1 + [0] * (max_len - len(ids1))
+            ids2_pad = ids2 + [0] * (max_len - len(ids2))
 
-            # Flatten routing weights into vectors
-            def _flatten_routing(r):
-                vecs = []
-                for section in ['attention', 'knowledge']:
-                    data = r.get(section, {})
-                    for k, v in data.items():
-                        if isinstance(v, np.ndarray):
-                            vecs.append(v.flatten())
-                return np.concatenate(vecs) if vecs else np.array([])
+            routing1 = extract_full_routing_jit(self.params, self.config, np.array([ids1_pad]))
+            routing2 = extract_full_routing_jit(self.params, self.config, np.array([ids2_pad]))
 
-            v1 = _flatten_routing(routing1)
-            v2 = _flatten_routing(routing2)
+            v1 = _flatten_full_routing(routing1)
+            v2 = _flatten_full_routing(routing2)
 
             if len(v1) > 0 and len(v2) > 0:
-                # Cosine similarity
                 norm1 = np.linalg.norm(v1)
                 norm2 = np.linalg.norm(v2)
                 if norm1 > 0 and norm2 > 0:
@@ -1461,14 +1462,47 @@ class ModelAnalyzer:
             print(f"  Could not load UD-EWT dataset: {e}")
             return {}
 
-        # Analyze fv pool (primary), matching PyTorch legacy behavior
-        results, selectivity = analyze_pos_selectivity(
-            self.model, self.params, self.config, dataset,
-            pool_type='fv', max_sentences=max_sentences,
-            multi_layer=multi_layer,
-        )
+        # Analyze multiple pools: fv (primary) + knowledge pools
+        all_pool_results = {}
+        pool_types = ['fv', 'fknow', 'rknow']
 
-        # Print summary
+        for pool_type in pool_types:
+            print(f"  Analyzing pool: {pool_type}...")
+            try:
+                pool_results, selectivity = analyze_pos_selectivity(
+                    self.model, self.params, self.config, dataset,
+                    pool_type=pool_type, max_sentences=max_sentences,
+                    multi_layer=multi_layer,
+                )
+                all_pool_results[pool_type] = {
+                    'results': pool_results,
+                    'selectivity': selectivity,
+                }
+
+                # Generate heatmap per pool
+                try:
+                    import numpy as np
+                    plot_pos_heatmap(
+                        np.array(selectivity) if not isinstance(selectivity, np.ndarray) else selectivity,
+                        pool_results, str(output_dir), pool_type=pool_type,
+                    )
+                except Exception as e:
+                    print(f"    Warning: Could not generate POS heatmap for {pool_type}: {e}")
+            except Exception as e:
+                print(f"    Warning: POS analysis for {pool_type} failed: {e}")
+
+        # Use fv as primary results (backward compatible)
+        if 'fv' in all_pool_results:
+            results = all_pool_results['fv']['results']
+        else:
+            results = {}
+
+        # Add knowledge pool results
+        for pool_type in ['fknow', 'rknow']:
+            if pool_type in all_pool_results:
+                results[f'{pool_type}_selectivity'] = all_pool_results[pool_type]['results']
+
+        # Print summary for primary pool (fv)
         pos_counts = results.get('pos_token_counts', {})
         top_per_pos = results.get('top_selective_per_pos', {})
 
@@ -1488,7 +1522,7 @@ class ModelAnalyzer:
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         if top_per_pos:
-            print(f"\n  ┌─ Top Neurons per POS ──────────────────────────────────────────────────")
+            print(f"\n  ┌─ Top Neurons per POS (F-V) ───────────────────────────────────────────")
             print(f"  │ {'POS':<10} {'Top Neurons (id:sel)':<50}")
             print(f"  │ {'─'*60}")
             for pos in ['NOUN', 'VERB', 'ADJ', 'ADV', 'DET', 'PUNCT']:
@@ -1500,15 +1534,23 @@ class ModelAnalyzer:
                     print(f"  │ {pos:<10} {neuron_str}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
-        # Generate heatmap
-        try:
-            import numpy as np
-            plot_pos_heatmap(
-                np.array(selectivity) if not isinstance(selectivity, np.ndarray) else selectivity,
-                results, str(output_dir), pool_type='fv',
-            )
-        except Exception as e:
-            print(f"    Warning: Could not generate POS heatmap: {e}")
+        # Print knowledge pool POS summary
+        for pool_type in ['fknow', 'rknow']:
+            pool_data = results.get(f'{pool_type}_selectivity', {})
+            pool_top = pool_data.get('top_selective_per_pos', {})
+            if pool_top:
+                display = 'F-Know' if pool_type == 'fknow' else 'R-Know'
+                print(f"\n  ┌─ Top Neurons per POS ({display}) ──────────────────────────────────")
+                print(f"  │ {'POS':<10} {'Top Neurons (id:sel)':<50}")
+                print(f"  │ {'─'*60}")
+                for pos in ['NOUN', 'VERB', 'ADJ', 'ADV', 'DET', 'PUNCT']:
+                    neurons = pool_top.get(pos, [])[:5]
+                    if neurons:
+                        neuron_str = ', '.join(
+                            f"N{n['neuron']}:{n['selectivity']:.2f}" for n in neurons
+                        )
+                        print(f"  │ {pos:<10} {neuron_str}")
+                print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         # Save results
         with open(output_dir / 'pos_selectivity.json', 'w') as f:
@@ -2251,6 +2293,67 @@ class ModelAnalyzer:
             json.dump(results, f, indent=2, default=str)
 
         self.results['weight'] = results
+        return results
+
+    def analyze_dead_neuron(self, n_batches: int = 50) -> Dict:
+        """Dead neuron weight norm analysis using full forward routing.
+
+        Uses extract_full_routing_jit to compute per-neuron activation
+        frequency across all layers, then compares dead vs active neurons
+        by weight norm and embedding norm.
+
+        Args:
+            n_batches: Number of batches (default: 50)
+
+        Returns:
+            Dict with per-pool dead neuron stats, weight norms, scatter plots
+        """
+        if self.model_type != 'dawn':
+            print("  Skipping dead neuron analysis (not DAWN model)")
+            return {}
+
+        from scripts.analysis.visualizers.dead_neuron_analysis import (
+            analyze_dead_neuron_norms, plot_dead_neuron_scatter,
+        )
+
+        output_dir = self.output_dir / 'dead_neuron'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"  Analyzing dead neurons via full forward routing ({n_batches} batches)...")
+        dataloader = self._get_dataloader()
+
+        results = analyze_dead_neuron_norms(
+            self.params, self.config, dataloader,
+            n_batches=n_batches, batch_size=4, seq_len=512,
+        )
+
+        # Print summary
+        print(f"\n  ┌─ Dead Neuron Weight Norm Analysis ───────────────────────────────────────")
+        print(f"  │ {'Pool':<14} {'Dead':>6} {'Total':>6} {'Ratio':>8} {'Dead WN':>10} {'Active WN':>10}")
+        print(f"  │ {'─'*14} {'─'*6} {'─'*6} {'─'*8} {'─'*10} {'─'*10}")
+        for key, data in results.get('per_pool', {}).items():
+            display = data.get('display', key)
+            dead_wn = data.get('dead_weight_norm_mean', 0)
+            active_wn = data.get('active_weight_norm_mean', 0)
+            print(f"  │ {display:<14} {data['n_dead']:>6d} {data['n_total']:>6d} "
+                  f"{data['dead_ratio']*100:>7.1f}% {dead_wn:>10.3f} {active_wn:>10.3f}")
+        summary = results.get('summary', {})
+        print(f"  │")
+        print(f"  │ Total: {summary.get('total_dead', 0)}/{summary.get('total_neurons', 0)} "
+              f"dead ({summary.get('overall_dead_ratio', 0)*100:.1f}%)")
+        print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Generate scatter plots
+        try:
+            plot_dead_neuron_scatter(results, str(output_dir))
+        except Exception as e:
+            print(f"    Warning: Could not generate dead neuron plots: {e}")
+
+        # Save results
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+
+        self.results['dead_neuron'] = results
         return results
 
     def analyze_v18(self, n_batches: int = 50) -> Dict:
@@ -4078,6 +4181,7 @@ class ModelAnalyzer:
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
             ('weight', self.analyze_weight, {}),
+            ('dead_neuron', self.analyze_dead_neuron, {'n_batches': self.n_batches // 2}),
             ('v18', self.analyze_v18, {'n_batches': self.n_batches // 2}),
         ]
 
@@ -4212,6 +4316,7 @@ class ModelAnalyzer:
             'layerwise_semantic': 'layerwise_semantic/results.json',
             'v18': 'v18/results.json',
             'weight': 'weight/results.json',
+            'dead_neuron': 'dead_neuron/results.json',
         }
 
         # Load each result file if exists
@@ -4722,7 +4827,7 @@ Examples:
                         'Shortcuts: train (model_info,performance,health,routing,embedding) | '
                         'Analyses: model_info,performance,health,routing,embedding,semantic,pos,'
                         'token_combination,neuron_features,layerwise_semantic,factual,behavioral,'
-                        'coselection,weight,v18,paper,report')
+                        'coselection,weight,dead_neuron,v18,paper,report')
 
     # Analysis parameters
     parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')
