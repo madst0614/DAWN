@@ -261,7 +261,7 @@ def _build_batched_forward(params, config, pool_type, pad_len):
     @jax.jit
     def _forward(input_ids):
         """input_ids: [B, pad_len] (int32, 0-padded) -> weights [B, pad_len, N]"""
-        x = token_emb_table[input_ids] + pos_emb_fixed
+        x = jnp.take(token_emb_table, input_ids, axis=0) + pos_emb_fixed
 
         rng_key = jax.random.PRNGKey(0)
         weight_sum = None

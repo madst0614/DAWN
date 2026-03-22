@@ -1118,7 +1118,8 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
             return {'error': 'JAX not available'}
 
         # Track co-selection between Feature and Restore pools
-        coselect_counts = defaultdict(lambda: {'both': 0, 'feature_only': 0, 'restore_only': 0, 'total': 0})
+        coselect_counts = defaultdict(lambda: {'both': 0, 'feature_only': 0, 'restore_only': 0, 'total': 0,
+                                              'jaccard_sum': 0.0, 'jaccard_count': 0})
 
         batches = create_batches(val_tokens, batch_size, seq_len)
         if n_batches:
