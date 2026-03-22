@@ -239,8 +239,11 @@ class ModelAnalyzer:
 
         self.model, self.params, self.tokenizer, self.config = load_model_jax(self.checkpoint_path)
 
-        # Detect model type
-        if hasattr(self.model, 'router') or hasattr(self.model, 'shared_neurons'):
+        # Detect model type from config (JAX model classes don't have instance attrs)
+        is_dawn = (self.config.get('n_feature_know', 0) > 0
+                   or self.config.get('shared_neurons', 0) > 0
+                   or self.config.get('n_feature_qk', 0) > 0)
+        if is_dawn:
             self.model_type = 'dawn'
             self.version = self.config.get('model_version', 'unknown')
         else:
