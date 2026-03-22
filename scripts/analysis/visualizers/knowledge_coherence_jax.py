@@ -28,6 +28,13 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from collections import Counter
 
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    def tqdm(x, **kwargs): return x
+
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -282,14 +289,21 @@ def analyze_knowledge_coherence(
 
     results = {'per_pool': {p: {} for p in pools}, 'per_target': {}}
 
-    overall_start = time.time()
-    completed_pairs = 0
+    pbar_overall = tqdm(
+        total=len(all_prompt_pairs),
+        desc="  Pairs",
+        unit="pair",
+        position=0,
+        leave=True,
+    ) if HAS_TQDM else None
 
     for pair_idx, (label, prompt, target_text, query_type) in enumerate(all_prompt_pairs):
         # Validate target token
         target_ids = tokenizer.encode(target_text, add_special_tokens=False)
         if not target_ids:
             print(f"    Skipping '{target_text}': cannot tokenize")
+            if pbar_overall:
+                pbar_overall.update(1)
             continue
         target_token_id = target_ids[0]
         target_lower = target_text.strip().lower()
@@ -307,25 +321,23 @@ def analyze_knowledge_coherence(
         sample_generations = []
         rng_key = jax.random.PRNGKey(pair_idx * 137)
 
-        print(f"\n    [{pair_idx+1}/{len(all_prompt_pairs)}] "
-              f"[{query_type}] \"{prompt}\" -> \"{target_text}\"")
-        pair_start = time.time()
+        pair_desc = f"[{query_type}] \"{prompt}\" -> \"{target_text}\""
+        if pbar_overall:
+            pbar_overall.set_postfix_str(pair_desc, refresh=True)
+
+        pbar_hits = tqdm(
+            total=min_target_count,
+            desc=f"    Hits",
+            unit="hit",
+            position=1,
+            leave=False,
+        ) if HAS_TQDM else None
 
         while successful_runs < min_target_count and total_runs < max_runs:
             total_runs += 1
-            if total_runs % 20 == 0 or successful_runs == min_target_count:
-                elapsed = time.time() - pair_start
-                runs_per_sec = total_runs / elapsed if elapsed > 0 else 0
-                if successful_runs > 0 and runs_per_sec > 0:
-                    remaining_hits = min_target_count - successful_runs
-                    runs_per_hit = total_runs / successful_runs
-                    est_remaining = remaining_hits * runs_per_hit / runs_per_sec
-                    eta_str = f"ETA {est_remaining:.0f}s"
-                else:
-                    eta_str = "ETA --"
+            if not HAS_TQDM and (total_runs % 50 == 0 or successful_runs == min_target_count):
                 print(f"\r      {successful_runs}/{min_target_count} hits "
-                      f"(run {total_runs}, {runs_per_sec:.1f} run/s, "
-                      f"{eta_str})   ", end='', flush=True)
+                      f"(run {total_runs})", end='', flush=True)
 
             # Init KV cache and prefill
             kv_k, kv_v = dawn_init_kv_cache(config, batch_size=1)
@@ -360,6 +372,9 @@ def analyze_knowledge_coherence(
 
                     successful_runs += 1
                     found_target = True
+                    if pbar_hits:
+                        pbar_hits.update(1)
+                        pbar_hits.set_postfix(runs=total_runs, refresh=True)
 
                     if len(sample_generations) < 3:
                         gen_text = tokenizer.decode(generated_ids,
@@ -388,24 +403,18 @@ def analyze_knowledge_coherence(
                 next_token = _sample_token(next_logits, temperature, top_k, subkey)
                 generated_ids.append(next_token)
 
-        pair_elapsed = time.time() - pair_start
-        print(f"\r      {successful_runs}/{min_target_count} hits "
-              f"(run {total_runs}) — Done! [{pair_elapsed:.1f}s]          ")
+        if pbar_hits:
+            pbar_hits.close()
 
         match_rate = successful_runs / total_runs if total_runs > 0 else 0
-        print(f"      Match rate: {match_rate*100:.1f}% "
-              f"({successful_runs}/{total_runs})")
+        if not HAS_TQDM:
+            print(f"\r      {successful_runs}/{min_target_count} hits "
+                  f"(run {total_runs}) — Done!          ")
+            print(f"      Match rate: {match_rate*100:.1f}% "
+                  f"({successful_runs}/{total_runs})")
 
-        completed_pairs += 1
-        overall_elapsed = time.time() - overall_start
-        if completed_pairs < len(all_prompt_pairs):
-            avg_per_pair = overall_elapsed / completed_pairs
-            remaining_pairs = len(all_prompt_pairs) - completed_pairs
-            overall_eta = avg_per_pair * remaining_pairs
-            mins_elapsed = overall_elapsed / 60
-            mins_eta = overall_eta / 60
-            print(f"      [Overall: {completed_pairs}/{len(all_prompt_pairs)} pairs, "
-                  f"{mins_elapsed:.1f}min elapsed, ~{mins_eta:.1f}min remaining]")
+        if pbar_overall:
+            pbar_overall.update(1)
 
         # Compute frequencies
         target_key = f"{query_type}_{label}"
@@ -445,6 +454,9 @@ def analyze_knowledge_coherence(
                 f'Target "{target_text}" not found in {total_runs} runs')
 
         results['per_target'][target_key] = target_result
+
+    if pbar_overall:
+        pbar_overall.close()
 
     # Aggregate per-pool: capital vs control frequencies
     for pool in pools:
