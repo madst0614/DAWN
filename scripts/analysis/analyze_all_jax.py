@@ -1224,9 +1224,7 @@ class ModelAnalyzer:
                      compute_coactivation: bool = False) -> Dict:
         """Analyze POS neuron specialization (DAWN only).
 
-        Note: This is legacy single-pool analysis kept for backward compatibility.
-        For unified all-pool analysis with physical neuron naming (fqk_0, fv_0, etc.),
-        use analyze_neuron_features() which is the primary analysis for paper figures.
+        JAX/TPU implementation using pos_selectivity_jax.analyze_pos_selectivity().
 
         Args:
             max_sentences: Number of sentences to analyze (default: 2000)
@@ -1236,46 +1234,44 @@ class ModelAnalyzer:
         Returns:
             Dict with selectivity matrix, top neurons per POS, clustering results
         """
-        print("  [JAX] POSNeuronAnalyzer not yet ported to JAX - skipping")
-        return {}
-
-        # TODO: Port to JAX
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping POS analysis (not DAWN model)")
             return {}
 
-        from scripts.analysis.pos_neuron import POSNeuronAnalyzer
+        from scripts.analysis.visualizers.pos_selectivity_jax import (
+            analyze_pos_selectivity, plot_pos_heatmap, load_ud_ewt,
+        )
 
         output_dir = self.output_dir / 'pos'
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        multi_layer = target_layer is None
         layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
-        coact_str = ", coactivation=ON" if compute_coactivation else ""
+        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, {layer_str})...")
 
-        # Legacy: analyze fv pool only (use analyze_neuron_features for all-pool analysis)
-        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, {layer_str}{coact_str})...")
-        print(f"  Note: For all-pool unified analysis, see neuron_features results")
+        # Load UD-EWT dataset
+        try:
+            dataset = load_ud_ewt(split='train', max_sentences=max_sentences)
+        except Exception as e:
+            print(f"  Could not load UD-EWT dataset: {e}")
+            return {}
 
-        analyzer = POSNeuronAnalyzer(
-            self.model, tokenizer=self.tokenizer, device=self.device,
-            target_layer=target_layer
+        # Analyze fv pool (primary), matching PyTorch legacy behavior
+        results, selectivity = analyze_pos_selectivity(
+            self.model, self.params, self.config, dataset,
+            pool_type='fv', max_sentences=max_sentences,
+            multi_layer=multi_layer,
         )
-        results = analyzer.run_all(
-            str(output_dir), pool_type='fv', max_sentences=max_sentences,
-            compute_coactivation=compute_coactivation
-        )
 
-        # Print detailed summary
+        # Print summary
         pos_counts = results.get('pos_token_counts', {})
-        top_neurons = results.get('top_neurons_per_pos', {})
-        specificity = results.get('neuron_specificity', {})
+        top_per_pos = results.get('top_selective_per_pos', {})
 
         if pos_counts:
             print(f"\n  ┌─ POS Token Distribution ───────────────────────────────────────────────")
             total_tokens = sum(pos_counts.values())
             print(f"  │ Total tokens analyzed: {total_tokens:,}")
             print(f"  │")
-            # Sort by count and show top POS
             sorted_pos = sorted(pos_counts.items(), key=lambda x: x[1], reverse=True)
             print(f"  │ {'POS':<10} {'Count':>10} {'Ratio':>10}")
             print(f"  │ {'─'*30}")
@@ -1286,34 +1282,34 @@ class ModelAnalyzer:
                 print(f"  │ ... and {len(sorted_pos) - 10} more POS tags")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
-        if top_neurons:
+        if top_per_pos:
             print(f"\n  ┌─ Top Neurons per POS ──────────────────────────────────────────────────")
             print(f"  │ {'POS':<10} {'Top Neurons (id:sel)':<50}")
             print(f"  │ {'─'*60}")
             for pos in ['NOUN', 'VERB', 'ADJ', 'ADV', 'DET', 'PUNCT']:
-                if pos in top_neurons and top_neurons[pos]:
-                    neurons = top_neurons[pos][:5]
-                    # Handle both old format (tuples) and new format (dicts)
-                    if neurons and isinstance(neurons[0], dict):
-                        neuron_str = ', '.join(f"N{n['neuron']}:{n['selectivity']:.2f}" for n in neurons)
-                    else:
-                        neuron_str = ', '.join(f'{n}:{f:.2f}' for n, f in neurons)
+                neurons = top_per_pos.get(pos, [])[:5]
+                if neurons:
+                    neuron_str = ', '.join(
+                        f"N{n['neuron']}:{n['selectivity']:.2f}" for n in neurons
+                    )
                     print(f"  │ {pos:<10} {neuron_str}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
-        if specificity:
-            print(f"\n  ┌─ POS-Specific Neurons (High Selectivity) ──────────────────────────────")
-            top_specific = list(specificity.items())[:10]
-            print(f"  │ {'Neuron':<10} {'Top POS':<10} {'Selectivity':>12} {'Mean Weight':>12}")
-            print(f"  │ {'─'*44}")
-            for neuron_id, data in top_specific:
-                # Handle both old format and new format
-                selectivity = data.get('selectivity', data.get('specificity', 0))
-                mean_weight = data.get('mean_weight', data.get('top_score', 0))
-                print(f"  │ N{neuron_id:<9} {data['top_pos']:<10} {selectivity:>12.2f}x {mean_weight:>12.4f}")
-            print(f"  │")
-            print(f"  │ Total specific neurons: {len(specificity)}")
-            print(f"  └─────────────────────────────────────────────────────────────────────────")
+        # Generate heatmap
+        try:
+            import numpy as np
+            plot_pos_heatmap(
+                np.array(selectivity) if not isinstance(selectivity, np.ndarray) else selectivity,
+                results, str(output_dir), pool_type='fv',
+            )
+        except Exception as e:
+            print(f"    Warning: Could not generate POS heatmap: {e}")
+
+        # Save results
+        with open(output_dir / 'pos_selectivity.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
 
         self.results['pos'] = results
         return results
@@ -1507,8 +1503,8 @@ class ModelAnalyzer:
     def analyze_factual(self, min_target_count: int = 100, max_runs: int = 500) -> Dict:
         """Analyze factual knowledge neurons (DAWN only).
 
-        Finds neurons that consistently activate for factual knowledge
-        (e.g., "The capital of France is" -> Paris).
+        JAX/TPU implementation using knowledge_coherence_jax.analyze_knowledge_coherence(),
+        which is a direct port of BehavioralAnalyzer.analyze_factual_neurons().
 
         Analyzes all V/Knowledge pools: fv, rv, fknow, rknow with unified naming.
 
@@ -1519,54 +1515,34 @@ class ModelAnalyzer:
         Returns:
             Dict with per-pool, per-target neuron activations (unified naming: fv_0, fknow_12, etc.)
         """
-        print("  [JAX] FactualAnalyzer not yet ported to JAX - skipping")
-        return {}
-
-        # TODO: Port to JAX
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping factual analysis (not DAWN model)")
             return {}
 
-        from scripts.analysis.behavioral import BehavioralAnalyzer
+        from scripts.analysis.visualizers.knowledge_coherence_jax import (
+            analyze_knowledge_coherence, plot_knowledge_coherence,
+        )
 
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Analyze all V/Knowledge pools in single pass (efficient)
         pools_to_analyze = ['fv', 'rv', 'fknow', 'rknow']
 
         print(f"  Analyzing factual neurons (min_targets={min_target_count}, max_runs={max_runs})...")
-        analyzer = BehavioralAnalyzer(
-            self.model, tokenizer=self.tokenizer, device=self.device
-        )
 
-        prompts = [
-            "The capital of France is",
-            "The capital of England is",
-            "The capital of Japan is",
-            "The color of the sky is",
-        ]
-        targets = ["Paris", "London", "Tokyo", "blue"]
-
-        # Single call analyzes ALL pools simultaneously (efficient!)
-        results = analyzer.analyze_factual_neurons(
-            prompts, targets,
+        results = analyze_knowledge_coherence(
+            self.model, self.params, self.config,
             pools=pools_to_analyze,
             min_target_count=min_target_count,
-            max_tokens_per_run=self.factual_tokens,
             max_runs=max_runs,
+            max_tokens_per_run=self.factual_tokens,
             temperature=1.0,
             top_k=50,
         )
 
-        # Summary: which pool has most factual knowledge
-        per_pool = results.get('per_pool', {})
-        most_factual = max(per_pool.items(),
-                          key=lambda x: x[1].get('n_common_80', 0)) if per_pool else ('unknown', {})
-        results['summary'] = {
-            'most_factual_pool': most_factual[0],
-            'total_factual_neurons': sum(p.get('n_common_80', 0) for p in per_pool.values()),
-        }
+        if not results or 'error' in results:
+            print(f"  Factual analysis failed: {results.get('error', 'unknown')}")
+            return results
 
         # Print detailed summary
         print(f"\n  {'='*70}")
@@ -1609,6 +1585,11 @@ class ModelAnalyzer:
 
         # Generate visualizations
         try:
+            plot_knowledge_coherence(results, str(output_dir))
+        except Exception as e:
+            print(f"    Warning: Could not generate factual plots: {e}")
+
+        try:
             from scripts.analysis.visualizers import plot_factual_heatmap, plot_factual_comparison
             plot_factual_heatmap(results, str(output_dir / 'factual_heatmap.png'))
             plot_factual_comparison(results, str(output_dir / 'factual_comparison.png'))
@@ -1619,26 +1600,49 @@ class ModelAnalyzer:
         return results
 
     def analyze_behavioral(self, n_batches: int = 50) -> Dict:
-        """Analyze behavioral patterns (DAWN only)."""
-        print("  [JAX] BehavioralAnalyzer not yet ported to JAX - skipping")
-        return {}
+        """Analyze behavioral patterns (DAWN only).
 
-        # TODO: Port to JAX
+        JAX/TPU implementation using RoutingAnalyzerJAX for entropy-based
+        trajectory analysis. Probing classifier is skipped (requires PyTorch dataloader).
+        """
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping behavioral analysis (not DAWN model)")
             return {}
 
-        from scripts.analysis.behavioral import BehavioralAnalyzer
+        from scripts.analysis.routing_jax import RoutingAnalyzerJAX
+        from scripts.analysis.utils_jax import load_val_data_jax
 
         output_dir = self.output_dir / 'behavioral'
         output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"  Analyzing behavioral patterns ({n_batches} batches)...")
-        dataloader = self._get_dataloader()
-        analyzer = BehavioralAnalyzer(
-            self.model, tokenizer=self.tokenizer, device=self.device
+
+        try:
+            val_tokens = load_val_data_jax(self.val_data_path, max_tokens=n_batches * 32 * 512)
+        except Exception as e:
+            print(f"  Skipping (could not load val data: {e})")
+            return {}
+
+        analyzer = RoutingAnalyzerJAX(self.model, self.params, self.config)
+
+        # Entropy analysis (proxy for token trajectory)
+        trajectory = analyzer.analyze_entropy(
+            val_tokens, n_batches=n_batches,
         )
-        results = analyzer.run_all(dataloader, str(output_dir), n_batches)
+
+        # Probing not yet ported (requires sklearn + per-token routing extraction)
+        probing = {'note': 'Probing classifier not yet ported to JAX'}
+
+        results = {
+            'trajectory': trajectory,
+            'probing': probing,
+        }
+
+        # Save
+        with open(output_dir / 'behavioral_results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
 
         # Print detailed summary
         trajectory = results.get('trajectory', {})
@@ -1706,98 +1710,245 @@ class ModelAnalyzer:
         return results
 
     def analyze_coselection(self, n_batches: int = 50) -> Dict:
-        """Analyze co-selection patterns (DAWN only)."""
-        print("  [JAX] CoselectionAnalyzer not yet ported to JAX - skipping")
-        return {}
+        """Analyze co-selection patterns (DAWN only).
 
-        # TODO: Port to JAX
+        JAX/TPU implementation using RoutingAnalyzerJAX.analyze_token_coselection()
+        which analyzes Feature vs Restore co-selection for QK and V pools.
+        """
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping coselection analysis (not DAWN model)")
             return {}
 
-        from scripts.analysis.coselection import CoselectionAnalyzer
+        from scripts.analysis.routing_jax import RoutingAnalyzerJAX
 
         output_dir = self.output_dir / 'coselection'
         output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"  Analyzing co-selection patterns ({n_batches} batches)...")
-        dataloader = self._get_dataloader()
-        analyzer = CoselectionAnalyzer(self.model, device=self.device)
-        results = analyzer.run_all(dataloader, str(output_dir), 'all', n_batches)
 
-        # Print detailed summary
+        analyzer = RoutingAnalyzerJAX(self.model, self.params, self.config)
+        from scripts.analysis.utils_jax import load_val_data_jax
+        try:
+            val_tokens = load_val_data_jax(self.val_data_path, max_tokens=n_batches * 32 * 512)
+        except Exception as e:
+            print(f"  Skipping (could not load val data: {e})")
+            return {}
+        if val_tokens is None or len(val_tokens) == 0:
+            print("  Skipping (no validation tokens available)")
+            return {}
+
+        results = analyzer.analyze_token_coselection(
+            val_tokens, n_batches=n_batches,
+        )
+
+        # Also compute weight-based subspace diversity
+        all_params = self.params.get('params', self.params)
+        sn = all_params.get('shared_neurons', {})
+        if sn:
+            diversity = {}
+            n_fqk = self.config.get('n_feature_qk', 88)
+            n_rqk = self.config.get('n_restore_qk', 88)
+
+            pool_pairs = [
+                ('F-QK', 'f_neurons', 0, n_fqk),
+                ('F-V', 'f_neurons', n_fqk, None),
+                ('R-QK', 'r_neurons', 0, n_rqk),
+                ('R-V', 'r_neurons', n_rqk, None),
+                ('F-Know', 'feature_know', None, None),
+                ('R-Know', 'restore_know', None, None),
+            ]
+            for display, key, start, end in pool_pairs:
+                if key not in sn:
+                    continue
+                W = np.array(sn[key])
+                if start is not None:
+                    W = W[start:end] if end else W[start:]
+                n = W.shape[0]
+                if n < 2:
+                    continue
+                W_flat = W.reshape(n, -1)
+                W_norm = W_flat / (np.linalg.norm(W_flat, axis=1, keepdims=True) + 1e-8)
+                sim = W_norm @ W_norm.T
+                mask = ~np.eye(n, dtype=bool)
+                off_diag = sim[mask]
+                avg_sim = float(off_diag.mean())
+                diversity[display] = {
+                    'n_neurons': n,
+                    'mean_similarity': avg_sim,
+                    'std_similarity': float(off_diag.std()),
+                    'interpretation': (
+                        'DIVERSE' if avg_sim < 0.3 else
+                        'MODERATE' if avg_sim < 0.6 else 'COLLAPSED'
+                    ),
+                }
+
+            results['subspace_diversity'] = diversity
+
+        # Print summary
         print(f"\n  ┌─ Co-Selection Analysis ───────────────────────────────────────────────────")
-        for pair_name, data in results.items():
-            if isinstance(data, dict) and 'pair_name' in data:
-                print(f"  │ {data['pair_name']}:")
-                # Show concentration metrics
-                conc = data.get('concentration', {})
-                if conc:
-                    print(f"  │   Top10: {conc.get('top10_pct', 0):.1f}%, Top50: {conc.get('top50_pct', 0):.1f}%")
-                    print(f"  │   Entropy: {conc.get('normalized_entropy', 0):.3f} (normalized)")
-                # Show top pairs
-                top_pairs = data.get('top_pairs', [])
-                if top_pairs:
-                    top_3 = [(p['a_idx'], p['b_idx'], p['pct']) for p in top_pairs[:3]]
-                    print(f"  │   Top pairs: {', '.join(f'({a},{b}):{pct:.1f}%' for a,b,pct in top_3)}")
+        for key in ['qk', 'v']:
+            data = results.get(key, {})
+            if data:
+                print(f"  │ {key.upper()}: both={data.get('both_pct', 0):.1f}%, "
+                      f"feature_only={data.get('feature_only_pct', 0):.1f}%, "
+                      f"restore_only={data.get('restore_only_pct', 0):.1f}%")
+
+        div = results.get('subspace_diversity', {})
+        if div:
+            print(f"  │")
+            print(f"  │ Subspace Diversity:")
+            for name, d in div.items():
+                print(f"  │   {name}: sim={d['mean_similarity']:.4f} ({d['interpretation']})")
         print(f"  └─────────────────────────────────────────────────────────────────────────────")
+
+        # Save
+        with open(output_dir / 'coselection.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
 
         self.results['coselection'] = results
         return results
 
     def analyze_weight(self) -> Dict:
-        """Analyze weight matrices (DAWN only)."""
-        print("  [JAX] WeightAnalyzer not yet ported to JAX - skipping")
-        return {}
+        """Analyze weight matrices (DAWN only).
 
-        # TODO: Port to JAX
+        JAX/TPU port of WeightAnalyzer. Extracts shared neuron weight matrices
+        from JAX params and computes SVD, norms, and pairwise similarity.
+        """
         if self.model_type != 'dawn':
-            print("  Skipping (not DAWN model)")
+            print("  Skipping weight analysis (not DAWN model)")
             return {}
-
-        from scripts.analysis.weight import WeightAnalyzer
 
         output_dir = self.output_dir / 'weight'
         output_dir.mkdir(parents=True, exist_ok=True)
 
         print("  Analyzing weight matrices...")
-        analyzer = WeightAnalyzer(model=self.model, device=self.device)
 
-        # Check if shared_neurons is available
-        if analyzer.neurons is None:
-            print("  Skipping (no shared_neurons found - may be v18.5+ model)")
+        all_params = self.params.get('params', self.params)
+        sn = all_params.get('shared_neurons', {})
+        if not sn:
+            print("  Skipping (no shared_neurons in params)")
             return {}
 
-        results = analyzer.run_all(str(output_dir))
+        n_fqk = self.config.get('n_feature_qk', 88)
+        n_fv = self.config.get('n_feature_v', 352)
+        n_rqk = self.config.get('n_restore_qk', 88)
+        n_rv = self.config.get('n_restore_v', 352)
 
-        # Print detailed summary
-        svd = results.get('svd', {})
-        norms = results.get('norms', {})
-        similarity = results.get('similarity', {})
+        # Extract weight matrices (matching PyTorch NEURON_ATTRS)
+        weight_matrices = {}
+        if 'f_neurons' in sn:
+            f_neurons = np.array(sn['f_neurons'])
+            weight_matrices['feature_qk'] = f_neurons[:n_fqk]
+            weight_matrices['feature_v'] = f_neurons[n_fqk:n_fqk + n_fv]
+        if 'r_neurons' in sn:
+            r_neurons = np.array(sn['r_neurons'])
+            weight_matrices['restore_qk'] = r_neurons[:n_rqk]
+            weight_matrices['restore_v'] = r_neurons[n_rqk:n_rqk + n_rv]
+        if 'feature_know' in sn:
+            weight_matrices['feature_know'] = np.array(sn['feature_know'])
+        if 'restore_know' in sn:
+            weight_matrices['restore_know'] = np.array(sn['restore_know'])
 
-        if norms:
+        display_names = {
+            'feature_qk': 'F-QK', 'feature_v': 'F-V',
+            'restore_qk': 'R-QK', 'restore_v': 'R-V',
+            'feature_know': 'F-Know', 'restore_know': 'R-Know',
+        }
+
+        # SVD analysis
+        svd_results = {}
+        for name, W in weight_matrices.items():
+            n_neurons = W.shape[0]
+            W_flat = W.reshape(n_neurons, -1)
+            try:
+                S = np.linalg.svd(W_flat, compute_uv=False)
+                S_norm = S / S.sum()
+                cumsum = np.cumsum(S_norm)
+                effective_rank = float((S > S.max() * 0.01).sum())
+                svd_results[name] = {
+                    'display': display_names.get(name, name),
+                    'n_neurons': n_neurons,
+                    'weight_shape': list(W.shape),
+                    'effective_rank': effective_rank,
+                    'var_explained_by_top5': float(cumsum[min(4, len(cumsum)-1)]),
+                    'var_explained_by_top10': float(cumsum[min(9, len(cumsum)-1)]),
+                    'top_singular_values': S[:10].tolist(),
+                    'condition_number': float(S[0] / S[-1]) if S[-1] > 0 else float('inf'),
+                }
+            except Exception as e:
+                svd_results[name] = {'error': str(e)}
+
+        # Norm analysis
+        norm_results = {}
+        for name, W in weight_matrices.items():
+            n_neurons = W.shape[0]
+            W_flat = W.reshape(n_neurons, -1)
+            norms = np.linalg.norm(W_flat, axis=1)
+            norm_results[name] = {
+                'display': display_names.get(name, name),
+                'n_neurons': n_neurons,
+                'mean_norm': float(norms.mean()),
+                'std_norm': float(norms.std()),
+                'min_norm': float(norms.min()),
+                'max_norm': float(norms.max()),
+            }
+
+        # Similarity analysis
+        sim_results = {}
+        for name, W in weight_matrices.items():
+            n_neurons = W.shape[0]
+            if n_neurons < 2:
+                continue
+            W_flat = W.reshape(n_neurons, -1)
+            W_norm = W_flat / (np.linalg.norm(W_flat, axis=1, keepdims=True) + 1e-8)
+            sim = W_norm @ W_norm.T
+            mask = ~np.eye(n_neurons, dtype=bool)
+            off_diag = sim[mask]
+            sim_results[name] = {
+                'display': display_names.get(name, name),
+                'n_neurons': n_neurons,
+                'mean_similarity': float(off_diag.mean()),
+                'std_similarity': float(off_diag.std()),
+                'max_similarity': float(off_diag.max()),
+                'min_similarity': float(off_diag.min()),
+            }
+
+        results = {
+            'svd': svd_results,
+            'norms': norm_results,
+            'similarity': sim_results,
+        }
+
+        # Print summary
+        if norm_results:
             print(f"\n  ┌─ Weight Norms ─────────────────────────────────────────────────────────")
-            for name, data in norms.items():
-                if isinstance(data, dict) and 'frobenius' in data:
-                    print(f"  │ {name}:")
-                    print(f"  │   Frobenius: {data['frobenius']:.4f}, Spectral: {data.get('spectral', 0):.4f}")
+            for name, data in norm_results.items():
+                print(f"  │ {data['display']}: mean={data['mean_norm']:.4f}, "
+                      f"std={data['std_norm']:.4f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
-        if svd:
+        if svd_results:
             print(f"\n  ┌─ SVD Analysis ─────────────────────────────────────────────────────────")
-            for name, data in svd.items():
-                if isinstance(data, dict) and 'rank' in data:
-                    print(f"  │ {name}: rank={data['rank']}, condition={data.get('condition_number', 0):.2f}")
+            for name, data in svd_results.items():
+                if 'effective_rank' in data:
+                    print(f"  │ {data['display']}: rank={data['effective_rank']:.0f}, "
+                          f"condition={data.get('condition_number', 0):.2f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
-        if similarity:
+        if sim_results:
             print(f"\n  ┌─ Weight Similarity ────────────────────────────────────────────────────")
-            for pair, data in similarity.items():
-                if isinstance(data, (int, float)):
-                    print(f"  │ {pair}: {data:.4f}")
-                elif isinstance(data, dict) and 'cosine' in data:
-                    print(f"  │ {pair}: cosine={data['cosine']:.4f}")
+            for name, data in sim_results.items():
+                print(f"  │ {data['display']}: mean={data['mean_similarity']:.4f}, "
+                      f"max={data['max_similarity']:.4f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Save
+        with open(output_dir / 'weight_analysis.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        with open(output_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
 
         self.results['weight'] = results
         return results
@@ -1910,10 +2061,6 @@ class ModelAnalyzer:
             requested_figures: List of specific figures/tables to generate (e.g., ['fig5', 'table2'])
                               If None, generates all figures and tables.
         """
-        print("  [JAX] PaperFigureGenerator not yet ported to JAX - skipping")
-        return
-
-        # TODO: Port to JAX
         paper_dir = self.output_dir / 'paper'
         figures_dir = paper_dir / 'figures'
         tables_dir = paper_dir / 'tables'
