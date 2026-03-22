@@ -2,21 +2,25 @@
 """
 Knowledge Neuron Coherence Analysis (JAX/TPU) — Appendix D.3
 =============================================================
+JAX/TPU port of BehavioralAnalyzer.analyze_factual_neurons().
+
 Autoregressive generation approach matching GPU paper method:
   1. For each (prompt, target) pair, generate until target token appears
   2. On target hit, extract routing weights at the last position via full forward
-  3. Repeat until target appears min_target_count times (default 100, max 20000 runs)
-  4. Compute per-neuron activation frequency from target-hit steps
+  3. On non-target steps, also extract routing for baseline frequency
+  4. Repeat until target appears min_target_count times (default 100, max 500 runs)
+  5. Compute per-neuron: target_freq, baseline_freq, contrastive_score
 
-Pools analyzed: fknow, rknow (+ optionally fv, rv)
+Uses unified naming convention: '{pool}_{neuron_id}' (e.g. 'fknow_12').
+Pools analyzed: fv, rv, fknow, rknow (all V/Knowledge pools by default).
 
 Designed for single-host TPU v4-8.
 
 Usage:
-    python scripts/analysis/visualizers/knowledge_coherence_jax.py \
-        --checkpoint gs://dawn-tpu-data-c4/checkpoints/... \
-        --output ./section4_results \
-        --min_targets 100 --max_runs 20000
+    python scripts/analysis/visualizers/knowledge_coherence_jax.py \\
+        --checkpoint gs://dawn-tpu-data-c4/checkpoints/... \\
+        --output ./section4_results \\
+        --min_targets 100 --max_runs 500
 """
 
 import sys
@@ -238,18 +242,25 @@ def analyze_knowledge_coherence(
     capital_prompts=None, control_prompts=None,
     pools=None,
     min_target_count=100,
-    max_runs=20000,
-    max_tokens_per_run=30,
+    max_runs=500,
+    max_tokens_per_run=200,
     temperature=1.0,
     top_k=50,
 ):
     """Autoregressive knowledge coherence analysis (Appendix D.3).
 
+    JAX/TPU port of BehavioralAnalyzer.analyze_factual_neurons().
+    Analyzes ALL specified pools simultaneously in a single generation pass.
+
     For each (prompt, target) pair:
       1. Generate autoregressively until target token appears
       2. On target hit, full forward to extract routing at last position
-      3. Repeat until min_target_count hits (or max_runs exhausted)
-      4. Activation frequency = hits / min_target_count
+      3. On non-target step, also extract routing for baseline frequency
+      4. Repeat until min_target_count hits (or max_runs exhausted)
+      5. Compute per-neuron: target_freq, baseline_freq, contrastive_score
+
+    Uses unified naming convention: '{pool}_{neuron_id}' (e.g. 'fknow_12')
+    matching BehavioralAnalyzer output schema.
     """
     if not HAS_JAX:
         return {'error': 'JAX not available'}
@@ -261,14 +272,41 @@ def analyze_knowledge_coherence(
 
     capital_prompts = capital_prompts or CAPITAL_PROMPTS
     control_prompts = control_prompts or CONTROL_PROMPTS
-    pools = pools or ['fknow', 'rknow']
+    pools = pools or ['fv', 'rv', 'fknow', 'rknow']
 
     pool_sizes = {
         'fknow': config.get('n_feature_know', 224),
         'rknow': config.get('n_restore_know', 224),
         'fv': config.get('n_feature_v', 352),
         'rv': config.get('n_restore_v', 352),
+        'fqk_q': config.get('n_feature_qk', 88),
+        'fqk_k': config.get('n_feature_qk', 88),
+        'rqk_q': config.get('n_restore_qk', 88),
+        'rqk_k': config.get('n_restore_qk', 88),
     }
+
+    print(f"    Analyzing {len(pools)} pools simultaneously: {pools}")
+
+    # Token validation (matching BehavioralAnalyzer)
+    all_prompt_pairs = (
+        [(label, prompt, target, 'capital') for label, prompt, target in capital_prompts] +
+        [(label, prompt, target, 'control') for label, prompt, target in control_prompts]
+    )
+    all_targets = list(set(t for _, _, t, _ in all_prompt_pairs))
+
+    token_validation = {}
+    for target_text in all_targets:
+        tids = tokenizer.encode(target_text, add_special_tokens=False)
+        is_single = len(tids) == 1
+        token_validation[target_text] = {
+            'is_single_token': is_single,
+            'token_ids': tids,
+            'tokens': tokenizer.convert_ids_to_tokens(tids),
+        }
+        if not is_single:
+            print(f"    Warning: '{target_text}' is not a single token "
+                  f"(tokenizes to {len(tids)} tokens: "
+                  f"{tokenizer.convert_ids_to_tokens(tids)})")
 
     # JIT compile decode step
     @jax.jit
@@ -282,12 +320,13 @@ def analyze_knowledge_coherence(
     _out[0].block_until_ready()
     print(f"done ({time.time() - t0:.1f}s)")
 
-    all_prompt_pairs = (
-        [(label, prompt, target, 'capital') for label, prompt, target in capital_prompts] +
-        [(label, prompt, target, 'control') for label, prompt, target in control_prompts]
-    )
-
-    results = {'per_pool': {p: {} for p in pools}, 'per_target': {}}
+    results = {
+        'pools_analyzed': pools,
+        'min_target_count': min_target_count,
+        'token_validation': token_validation,
+        'per_pool': {p: {} for p in pools},
+        'per_target': {},
+    }
 
     pbar_overall = tqdm(
         total=len(all_prompt_pairs),
@@ -312,7 +351,7 @@ def analyze_knowledge_coherence(
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
         prompt_len = len(prompt_ids)
 
-        # Per-pool neuron counters for this (prompt, target)
+        # Per-pool neuron counters — unified naming: '{pool}_{n}'
         target_neuron_counts = {p: Counter() for p in pools}
         baseline_neuron_counts = {p: Counter() for p in pools}
         successful_runs = 0
@@ -354,24 +393,22 @@ def analyze_knowledge_coherence(
             next_token = _sample_token(first_logits, temperature, top_k, subkey)
             generated_ids.append(next_token)
 
-            found_target = False
-
             for step in range(max_tokens_per_run - 1):
                 token_text = tokenizer.decode([next_token]).strip().lower()
 
-                if token_text == target_lower or next_token == target_token_id:
-                    # Target found — extract routing via full forward
-                    full_ids = np.array([generated_ids], dtype=np.int32)
-                    activations = _extract_routing_at_last_pos(
-                        params, config, full_ids, pools)
+                # Extract routing at current step via full forward (all pools)
+                full_ids = np.array([generated_ids], dtype=np.int32)
+                activations = _extract_routing_at_last_pos(
+                    params, config, full_ids, pools)
 
+                if token_text == target_lower or next_token == target_token_id:
+                    # Target found — record neurons with unified naming
                     for pool in pools:
                         for n in activations[pool]:
                             if n < pool_sizes.get(pool, 0):
-                                target_neuron_counts[pool][n] += 1
+                                target_neuron_counts[pool][f'{pool}_{n}'] += 1
 
                     successful_runs += 1
-                    found_target = True
                     if pbar_hits:
                         pbar_hits.update(1)
                         pbar_hits.set_postfix(runs=total_runs, refresh=True)
@@ -381,13 +418,17 @@ def analyze_knowledge_coherence(
                                                      skip_special_tokens=True)
                         sample_generations.append(gen_text)
                     break
-
-                # Not target — count as baseline step
-                # (we skip full forward for baseline to save time;
-                #  baseline frequency uses embedding-level routing only)
-                total_baseline_steps += 1
+                else:
+                    # Non-target step — record as baseline with unified naming
+                    for pool in pools:
+                        for n in activations[pool]:
+                            if n < pool_sizes.get(pool, 0):
+                                baseline_neuron_counts[pool][f'{pool}_{n}'] += 1
+                    total_baseline_steps += 1
 
                 if next_token == tokenizer.sep_token_id:
+                    break
+                if next_token == tokenizer.eos_token_id:
                     break
                 if cache_pos >= config.get('max_seq_len', 512) - 1:
                     break
@@ -416,7 +457,7 @@ def analyze_knowledge_coherence(
         if pbar_overall:
             pbar_overall.update(1)
 
-        # Compute frequencies
+        # Compute per-pool results (matching BehavioralAnalyzer schema)
         target_key = f"{query_type}_{label}"
         target_result = {
             'prompt': prompt,
@@ -431,24 +472,42 @@ def analyze_knowledge_coherence(
 
         if successful_runs > 0:
             for pool in pools:
-                freq = {n: c / successful_runs
-                        for n, c in target_neuron_counts[pool].items()}
-                common_100 = sorted(n for n, f in freq.items() if f >= 1.0)
-                common_80 = sorted(n for n, f in freq.items() if f >= 0.8)
+                pool_target_counts = target_neuron_counts[pool]
+                pool_baseline_counts = baseline_neuron_counts[pool]
+
+                target_freq = {n: c / successful_runs
+                               for n, c in pool_target_counts.items()}
+                baseline_freq = ({n: c / total_baseline_steps
+                                  for n, c in pool_baseline_counts.items()}
+                                 if total_baseline_steps > 0 else {})
+
+                # Contrastive = target_freq - baseline_freq (positive = target-specific)
+                all_neurons_in_pool = set(target_freq.keys()) | set(baseline_freq.keys())
+                contrastive_scores = {
+                    n: target_freq.get(n, 0) - baseline_freq.get(n, 0)
+                    for n in all_neurons_in_pool
+                }
+
+                common_100 = sorted(n for n, f in target_freq.items() if f >= 1.0)
+                common_80 = sorted(n for n, f in target_freq.items() if f >= 0.8)
+                common_50 = sorted(n for n, f in target_freq.items() if f >= 0.5)
 
                 target_result['per_pool'][pool] = {
                     'common_100': common_100,
                     'common_80': common_80,
-                    'n_unique': len(target_neuron_counts[pool]),
-                    'all_frequencies': {int(n): float(f) for n, f in freq.items()},
+                    'common_50': common_50,
+                    'n_unique': len(pool_target_counts),
+                    'all_frequencies': {n: float(f) for n, f in target_freq.items()},
+                    'contrastive_scores': contrastive_scores,
                     'top_neurons': sorted(
-                        [{'neuron': int(n), 'freq': float(f)}
-                         for n, f in freq.items()],
+                        [{'neuron': n, 'freq': float(f * 100)}
+                         for n, f in target_freq.items()],
                         key=lambda x: -x['freq']
                     )[:20],
                 }
                 print(f"        {pool}: {len(common_100)} neurons@100%, "
-                      f"{len(common_80)} neurons@80%")
+                      f"{len(common_80)} neurons@80%, "
+                      f"{len(common_50)} neurons@50%")
         else:
             target_result['note'] = (
                 f'Target "{target_text}" not found in {total_runs} runs')
@@ -458,7 +517,22 @@ def analyze_knowledge_coherence(
     if pbar_overall:
         pbar_overall.close()
 
-    # Aggregate per-pool: capital vs control frequencies
+    # Aggregate per-pool summary (matching BehavioralAnalyzer)
+    for pool in pools:
+        all_common_100 = set()
+        all_common_80 = set()
+        for target_data in results['per_target'].values():
+            if 'per_pool' in target_data and pool in target_data['per_pool']:
+                all_common_100.update(target_data['per_pool'][pool].get('common_100', []))
+                all_common_80.update(target_data['per_pool'][pool].get('common_80', []))
+        results['per_pool'][pool] = {
+            'n_common_100': len(all_common_100),
+            'n_common_80': len(all_common_80),
+            'top_neurons': sorted(all_common_100)[:20],
+        }
+
+    # Also compute capital vs control aggregate (for visualization)
+    pool_vis = {}
     for pool in pools:
         n = pool_sizes.get(pool, 0)
         cap_freq = np.zeros(n, dtype=np.float64)
@@ -473,14 +547,15 @@ def analyze_knowledge_coherence(
             all_freq = pool_data.get('all_frequencies', {})
 
             if tdata['query_type'] == 'capital':
-                for nid, f in all_freq.items():
-                    nid = int(nid)
+                for nname, f in all_freq.items():
+                    # Extract raw neuron id from unified name '{pool}_{id}'
+                    nid = int(nname.split('_')[-1]) if isinstance(nname, str) and '_' in nname else int(nname)
                     if nid < n:
                         cap_freq[nid] = max(cap_freq[nid], f)
                 n_cap += 1
             else:
-                for nid, f in all_freq.items():
-                    nid = int(nid)
+                for nname, f in all_freq.items():
+                    nid = int(nname.split('_')[-1]) if isinstance(nname, str) and '_' in nname else int(nname)
                     if nid < n:
                         ctrl_freq[nid] = max(ctrl_freq[nid], f)
                 n_ctrl += 1
@@ -505,7 +580,7 @@ def analyze_knowledge_coherence(
         else:
             cap_spec_sorted = np.array([], dtype=int)
         top_capital = [
-            {'neuron': int(i), 'capital_freq': float(cap_freq[i]),
+            {'neuron': f'{pool}_{int(i)}', 'capital_freq': float(cap_freq[i]),
              'control_freq': float(ctrl_freq[i]),
              'contrastive': float(contrastive[i])}
             for i in cap_spec_sorted[:15]
@@ -518,12 +593,12 @@ def analyze_knowledge_coherence(
         else:
             shared_sorted = np.array([], dtype=int)
         top_shared = [
-            {'neuron': int(i), 'capital_freq': float(cap_freq[i]),
+            {'neuron': f'{pool}_{int(i)}', 'capital_freq': float(cap_freq[i]),
              'control_freq': float(ctrl_freq[i])}
             for i in shared_sorted[:15]
         ]
 
-        results['per_pool'][pool] = {
+        pool_vis[pool] = {
             'n_neurons': n,
             'shared': shared,
             'capital_specific': capital_specific,
@@ -538,6 +613,17 @@ def analyze_knowledge_coherence(
             'n_control_queries': n_ctrl,
         }
 
+    results['per_pool_visualization'] = pool_vis
+
+    # Summary (matching BehavioralAnalyzer)
+    per_pool = results['per_pool']
+    most_factual = max(per_pool.items(),
+                       key=lambda x: x[1].get('n_common_80', 0)) if per_pool else ('unknown', {})
+    results['summary'] = {
+        'most_factual_pool': most_factual[0],
+        'total_factual_neurons': sum(p.get('n_common_80', 0) for p in per_pool.values()),
+    }
+
     results['meta'] = {
         'method': 'autoregressive_generation',
         'min_target_count': min_target_count,
@@ -548,8 +634,9 @@ def analyze_knowledge_coherence(
         'pools': pools,
         'threshold_high': 0.7,
         'threshold_low': 0.3,
-        'note': 'Matches GPU behavioral.py autoregressive method (Appendix D.3). '
-                'Routing extracted via full forward at target-hit step.',
+        'note': 'JAX/TPU port of BehavioralAnalyzer.analyze_factual_neurons(). '
+                'Uses unified naming ({pool}_{neuron_id}), per-step baseline extraction, '
+                'and contrastive scoring (target_freq - baseline_freq).',
     }
 
     return results
@@ -585,8 +672,10 @@ def plot_knowledge_coherence(results, output_dir, dpi=300):
 
     saved = []
 
-    for pool_key in results.get('meta', {}).get('pools', ['fknow', 'rknow']):
-        data = results['per_pool'].get(pool_key)
+    for pool_key in results.get('meta', {}).get('pools', ['fv', 'rv', 'fknow', 'rknow']):
+        # Use per_pool_visualization for capital vs control aggregate data
+        vis_data = results.get('per_pool_visualization', results.get('per_pool', {}))
+        data = vis_data.get(pool_key)
         if data is None or not isinstance(data, dict) or 'capital_freq' not in data:
             continue
 
@@ -667,14 +756,14 @@ def main():
     parser.add_argument('--output', default='./section4_results')
     parser.add_argument('--min_targets', type=int, default=100,
                         help='Target token occurrences to collect per prompt')
-    parser.add_argument('--max_runs', type=int, default=20000,
+    parser.add_argument('--max_runs', type=int, default=500,
                         help='Max generation runs per prompt (safety limit)')
-    parser.add_argument('--max_tokens', type=int, default=30,
+    parser.add_argument('--max_tokens', type=int, default=200,
                         help='Max tokens per generation run')
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top_k', type=int, default=50)
-    parser.add_argument('--pools', nargs='+', default=['fknow', 'rknow'],
-                        help='Pools to analyze (default: fknow rknow)')
+    parser.add_argument('--pools', nargs='+', default=['fv', 'rv', 'fknow', 'rknow'],
+                        help='Pools to analyze (default: fv rv fknow rknow)')
     parser.add_argument('--dpi', type=int, default=300)
     args = parser.parse_args()
 
@@ -704,9 +793,26 @@ def main():
     save_results(results, json_path)
     print(f"  Saved: {json_path}")
 
-    # Print summary
+    # Print summary (BehavioralAnalyzer style)
+    summary = results.get('summary', {})
+    print(f"\n  {'='*60}")
+    print(f"  FACTUAL NEURON ANALYSIS SUMMARY")
+    print(f"  {'='*60}")
+
+    print(f"\n  Per-Pool Results:")
+    for pool, pool_data in results.get('per_pool', {}).items():
+        n_common = pool_data.get('n_common_80', 0)
+        top_neurons = pool_data.get('top_neurons', [])[:3]
+        print(f"    {pool:8s}: {n_common:3d} neurons (80%+), top: {top_neurons}")
+
+    print(f"\n  Summary:")
+    print(f"    Most factual pool: {summary.get('most_factual_pool', 'unknown')}")
+    print(f"    Total factual neurons: {summary.get('total_factual_neurons', 0)}")
+
+    # Capital vs control visualization data
+    vis_data = results.get('per_pool_visualization', {})
     for pool_key in args.pools:
-        d = results['per_pool'].get(pool_key)
+        d = vis_data.get(pool_key)
         if d is None or not isinstance(d, dict) or 'shared' not in d:
             continue
         pool_label = {'fknow': 'F-Know', 'rknow': 'R-Know',
@@ -719,7 +825,9 @@ def main():
         if d.get('top_capital_specific'):
             top3 = d['top_capital_specific'][:3]
             print(f"    Top capital neurons: " +
-                  ', '.join(f"N{t['neuron']}(D={t['contrastive']:.2f})" for t in top3))
+                  ', '.join(f"{t['neuron']}(D={t['contrastive']:.2f})" for t in top3))
+
+    print(f"\n  {'='*60}")
 
     # Plot
     plot_knowledge_coherence(results, args.output, dpi=args.dpi)
