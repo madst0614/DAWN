@@ -511,7 +511,7 @@ class ModelAnalyzer:
         }
 
         with open(output_dir / 'parameters.json', 'w') as f:
-            json.dump(params_info, f, indent=2)
+            json.dump(params_info, f, indent=2, default=lambda x: int(x) if hasattr(x, 'item') else str(x))
 
         # Architecture summary
         arch_lines = [

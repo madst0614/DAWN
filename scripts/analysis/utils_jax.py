@@ -904,17 +904,20 @@ def evaluate_jax(model, params, config: Dict,
 
     rng_key = jax.random.PRNGKey(42)
 
-    for batch in batches:
-        batch_jax = jnp.array(batch)
-
-        # Forward pass with labels for loss computation
-        result = model.apply(
+    # JIT-compile the forward pass for performance
+    @jax.jit
+    def eval_step(params, batch_jax):
+        return model.apply(
             params,
             batch_jax,
             labels=batch_jax,
             deterministic=True,
             rngs={'dropout': rng_key}
         )
+
+    for batch in batches:
+        batch_jax = jnp.array(batch)
+        result = eval_step(params, batch_jax)
 
         if 'loss' in result:
             total_loss += float(result['loss']) * (batch_size * (seq_len - 1))

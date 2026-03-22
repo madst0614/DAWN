@@ -62,6 +62,19 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
             config: Model configuration dict
         """
         super().__init__(model, params, config)
+        self._routing_cache = {}  # batch_id -> JAXRoutingData
+
+    def _get_routing_cached(self, input_ids: np.ndarray) -> 'JAXRoutingData':
+        """Get routing data with caching to avoid redundant extraction."""
+        cache_key = input_ids.data.tobytes()[:64]  # First 64 bytes as key
+        if cache_key not in self._routing_cache:
+            routing_info = self.extractor.extract_routing(input_ids)
+            self._routing_cache[cache_key] = JAXRoutingData(routing_info)
+        return self._routing_cache[cache_key]
+
+    def _clear_routing_cache(self):
+        """Clear routing cache to free memory."""
+        self._routing_cache.clear()
 
     def analyze_entropy(
         self,
@@ -94,8 +107,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Entropy Analysis'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             for key in ROUTING_KEYS.keys():
                 weights = routing.get_weight(key)
@@ -161,8 +173,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Selection Frequency'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             for key in ROUTING_KEYS.keys():
                 weights = routing.get_weight(key)
@@ -253,8 +264,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Selection Diversity'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             # Attention routing
             for key in ROUTING_KEYS.keys():
@@ -388,8 +398,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Q/K Overlap'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             # F-QK Q/K overlap
             fqk_q = routing.get_weight('fqk_q')
@@ -467,8 +476,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
             for batch in tqdm(batches, desc=f'{pool_info["display"]} Q/K'):
                 input_ids = np.array(batch)
 
-                routing_info = self.extractor.extract_routing(input_ids)
-                routing = JAXRoutingData(routing_info)
+                routing = self._get_routing_cached(input_ids)
 
                 w_q = routing.get_weight(std_q_key)
                 w_k = routing.get_weight(std_k_key)
@@ -587,8 +595,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Q/K Entropy'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             for pool_name, pool_info in QK_POOLS.items():
                 std_q_key, std_k_key = POOL_STD_KEYS.get(pool_name, (None, None))
@@ -665,8 +672,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Activation Sparsity'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             for key, (display, _, _, pool) in ROUTING_KEYS.items():
                 weights = routing.get_weight(key)
@@ -744,8 +750,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Weight Concentration'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             for key in ROUTING_KEYS.keys():
                 weights = routing.get_weight(key)
@@ -824,17 +829,21 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         if n_batches:
             batches = batches[:n_batches]
 
-        for batch in tqdm(batches, desc='Layer Contribution'):
-            input_ids = np.array(batch)
+        # JIT-compile the forward pass for performance
+        rng_key = jax.random.PRNGKey(0)
 
-            # Forward pass to get hidden states
-            rng_key = jax.random.PRNGKey(0)
-            result = self.model_instance.apply(
-                self.params,
-                jnp.array(input_ids),
+        @jax.jit
+        def forward_step(params, batch_jax):
+            return self.model_instance.apply(
+                params,
+                batch_jax,
                 deterministic=True,
                 rngs={'dropout': rng_key}
             )
+
+        for batch in tqdm(batches, desc='Layer Contribution'):
+            input_ids = np.array(batch)
+            result = forward_step(self.params, jnp.array(input_ids))
 
             # Get hidden states if available
             if 'hidden_states' in result:
@@ -899,8 +908,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Q/K Union Coverage'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             for pool_name in ['feature_qk', 'restore_qk']:
                 prefix = 'fqk' if pool_name == 'feature_qk' else 'rqk'
@@ -994,7 +1002,8 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Path Usage'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
+            routing = self._get_routing_cached(input_ids)
+            routing_info = routing.routing_info
 
             # Look for path selection info
             if 'path_indices' in routing_info:
@@ -1048,8 +1057,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch in tqdm(batches, desc='Token Coselection'):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             # Compare FQK vs RQK selection
             fqk_w = routing.get_weight('fqk_q')
@@ -1149,8 +1157,7 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         for batch_idx, batch in enumerate(tqdm(batches, desc='Coverage Progression')):
             input_ids = np.array(batch)
 
-            routing_info = self.extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+            routing = self._get_routing_cached(input_ids)
 
             for key in ROUTING_KEYS.keys():
                 pool = ROUTING_KEYS[key][3]
@@ -1204,6 +1211,16 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
 
         print("Running routing analysis...")
 
+        # Pre-extract routing data once and cache for all analyses
+        print("  Pre-extracting routing data...")
+        batches = create_batches(val_tokens, batch_size, seq_len)
+        if n_batches:
+            batches = batches[:n_batches]
+        for batch in tqdm(batches, desc='Pre-extract routing'):
+            input_ids = np.array(batch)
+            self._get_routing_cached(input_ids)
+        print(f"  Cached routing for {len(batches)} batches")
+
         results = {
             'entropy': self.analyze_entropy(val_tokens, n_batches, batch_size, seq_len),
             'selection_frequency': self.analyze_selection_frequency(val_tokens, n_batches, batch_size, seq_len),
@@ -1219,6 +1236,9 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
             'token_coselection': self.analyze_token_coselection(val_tokens, n_batches, batch_size, seq_len),
             'coverage_progression': self.analyze_coverage_progression(val_tokens, n_batches, batch_size, seq_len),
         }
+
+        # Free cached routing data
+        self._clear_routing_cache()
 
         # Save results
         with open(os.path.join(output_dir, 'results.json'), 'w') as f:
