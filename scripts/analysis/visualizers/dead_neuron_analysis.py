@@ -2,7 +2,7 @@
 """
 Dead Neuron Weight Norm Analysis
 =================================
-Uses extract_full_routing_jit to run full forward passes and compute
+Uses extract_full_routing to run full forward passes and compute
 per-neuron activation frequency across all layers. Compares dead vs active
 neurons by weight norm and embedding norm.
 
@@ -51,7 +51,7 @@ except ImportError:
         return x
 
 from scripts.analysis.utils_jax import (
-    extract_full_routing_jit, create_batches, convert_to_serializable,
+    extract_full_routing, create_batches, convert_to_serializable,
 )
 
 # Paper style
@@ -187,14 +187,14 @@ def analyze_dead_neuron_norms(
     activation_counts = {}
     total_tokens = 0
 
-    print(f"  Running {len(batches)} batches through extract_full_routing_jit...")
+    print(f"  Running {len(batches)} batches through extract_full_routing...")
 
     for bi, batch in enumerate(tqdm(batches, desc='Dead Neuron Analysis')):
         input_ids = np.array(batch)
         B, S = input_ids.shape
         total_tokens += B * S
 
-        routing = extract_full_routing_jit(params, config, input_ids)
+        routing = extract_full_routing(params, config, input_ids)
 
         for li in range(n_layers):
             layer_data = routing[f'layer_{li}']

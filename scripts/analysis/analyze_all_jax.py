@@ -1274,7 +1274,7 @@ class ModelAnalyzer:
             return {}
 
         from scripts.analysis.utils_jax import (
-            load_val_data_jax, extract_full_routing_jit,
+            load_val_data_jax, extract_full_routing,
         )
         from transformers import AutoTokenizer
 
@@ -1324,8 +1324,8 @@ class ModelAnalyzer:
             ids1_pad = ids1 + [0] * (max_len - len(ids1))
             ids2_pad = ids2 + [0] * (max_len - len(ids2))
 
-            routing1 = extract_full_routing_jit(self.params, self.config, np.array([ids1_pad]))
-            routing2 = extract_full_routing_jit(self.params, self.config, np.array([ids2_pad]))
+            routing1 = extract_full_routing(self.params, self.config, np.array([ids1_pad]))
+            routing2 = extract_full_routing(self.params, self.config, np.array([ids2_pad]))
 
             v1 = _flatten_full_routing(routing1)
             v2 = _flatten_full_routing(routing2)
@@ -2298,7 +2298,7 @@ class ModelAnalyzer:
     def analyze_dead_neuron(self, n_batches: int = 50) -> Dict:
         """Dead neuron weight norm analysis using full forward routing.
 
-        Uses extract_full_routing_jit to compute per-neuron activation
+        Uses extract_full_routing to compute per-neuron activation
         frequency across all layers, then compares dead vs active neurons
         by weight norm and embedding norm.
 

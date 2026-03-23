@@ -39,7 +39,7 @@ from .utils_jax import (
     gini_coefficient,
     create_batches,
     JAXRoutingData,
-    extract_full_routing_jit,
+    extract_full_routing,
 )
 
 # Map from full-routing pool keys to health pool names
@@ -78,7 +78,7 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
         """
         Analyze neuron activation distribution using full forward routing.
 
-        Uses extract_full_routing_jit for all-layer routing extraction,
+        Uses extract_full_routing for all-layer routing extraction,
         ensuring dead neuron detection accounts for activation across all layers.
 
         Args:
@@ -121,7 +121,7 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
             total_tokens += batch_tokens
 
             # Full forward routing across all layers
-            routing = extract_full_routing_jit(self.params, self.config, input_ids)
+            routing = extract_full_routing(self.params, self.config, input_ids)
 
             for li in range(n_layers):
                 layer_data = routing.get(f'layer_{li}', {})
@@ -181,7 +181,7 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
         """
         Identify dead neurons using full forward routing across all layers.
 
-        Uses extract_full_routing_jit so that a neuron activated in ANY layer
+        Uses extract_full_routing so that a neuron activated in ANY layer
         is correctly classified as active (not just embedding-level).
 
         Args:
@@ -222,7 +222,7 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
             input_ids = np.array(batch)
 
             # Full forward routing across all layers
-            routing = extract_full_routing_jit(self.params, self.config, input_ids)
+            routing = extract_full_routing(self.params, self.config, input_ids)
 
             for li in range(n_layers):
                 layer_data = routing.get(f'layer_{li}', {})
@@ -285,7 +285,7 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
         """
         Analyze neuron usage diversity using full forward routing.
 
-        Uses extract_full_routing_jit for all-layer routing extraction.
+        Uses extract_full_routing for all-layer routing extraction.
 
         Args:
             val_tokens: Validation token array
@@ -324,7 +324,7 @@ class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
             input_ids = np.array(batch)
 
             # Full forward routing across all layers
-            routing = extract_full_routing_jit(self.params, self.config, input_ids)
+            routing = extract_full_routing(self.params, self.config, input_ids)
 
             for li in range(n_layers):
                 layer_data = routing.get(f'layer_{li}', {})
