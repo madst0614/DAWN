@@ -18,7 +18,7 @@ set -euo pipefail
 # ---- Configuration (override via env vars) ----
 DAWN_CHECKPOINT="${DAWN_CHECKPOINT:-gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_400M_c4_20B_v4_32/run_v17.1_20260210_160828_3201}"
 BASELINE_CHECKPOINT="${BASELINE_CHECKPOINT:-gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_20B_v4_32/run_vbaseline_20260215_113114_3201}"
-VAL_DATA="${VAL_DATA:-gs://dawn-tpu-data-c4/data/c4_val_20M.bin}"
+VAL_DATA="${VAL_DATA:-gs://dawn-tpu-data-c4/c4_val.bin}"
 OUTPUT_DIR="${OUTPUT_DIR:-analysis_results}"
 GCS_UPLOAD_DIR="${GCS_UPLOAD_DIR:-gs://dawn-tpu-data-c4/analysis_results}"
 

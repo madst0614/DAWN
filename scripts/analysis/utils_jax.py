@@ -1602,14 +1602,18 @@ def extract_full_routing_jit(params, config, input_ids):
 
     block_params_list = [all_params[f'block_{i}'] for i in range(n_layers)]
 
+    # Extract concrete shape BEFORE entering JIT (S must not be a tracer)
+    input_ids = jnp.asarray(input_ids)
+    B_concrete, S_concrete = input_ids.shape
+
+    # Precompute position embeddings outside JIT (fixed shape, no retracing)
+    token_emb_table = all_params['token_emb']['embedding']
+    pos_emb_table = all_params['pos_emb']['embedding']
+    pos_emb_fixed = pos_emb_table[jnp.arange(S_concrete)][jnp.newaxis, :]  # [1, S, D]
+
     @jax.jit
     def _extract_all(input_ids):
-        B, S = input_ids.shape
-
-        token_emb_table = all_params['token_emb']['embedding']
-        pos_emb_table = all_params['pos_emb']['embedding']
-        positions = jnp.arange(S)[jnp.newaxis, :]
-        x = jnp.take(token_emb_table, input_ids, axis=0) + pos_emb_table[positions]
+        x = jnp.take(token_emb_table, input_ids, axis=0) + pos_emb_fixed
 
         rng_key = jax.random.PRNGKey(0)
 
@@ -1656,7 +1660,6 @@ def extract_full_routing_jit(params, config, input_ids):
 
         return all_attn_w, all_know_w
 
-    input_ids = jnp.asarray(input_ids)
     all_attn_w, all_know_w = _extract_all(input_ids)
 
     pool_names_attn = ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']
