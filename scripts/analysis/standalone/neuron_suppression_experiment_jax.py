@@ -418,7 +418,9 @@ def main():
                         help='Top-k for sampling (0=greedy)')
     parser.add_argument('--top_n_pct', type=float, default=0.10,
                         help='Suppress top N%% neurons by contrastive score '
-                             '(default: 0.10 = top 10%%)')
+                             '(default: 0.10 = top 10%%). Ignored if --top_n_neurons is set.')
+    parser.add_argument('--top_n_neurons', type=int, default=None,
+                        help='Suppress exactly N neurons per pool (overrides --top_n_pct)')
     parser.add_argument('--mode', type=str, default='intersection',
                         choices=['intersection', 'union'])
     parser.add_argument('--output', type=str, default=None)
@@ -470,6 +472,7 @@ def main():
         temperature=args.temperature,
         top_k_sampling=args.top_k_sampling,
         top_n_pct=args.top_n_pct,
+        top_n_neurons=args.top_n_neurons,
         mode=args.mode,
         target_label=target_label,
         control_label=control_label,
@@ -778,16 +781,20 @@ class NeuronSuppressionExperimentJAX:
     # ----------------------------------------------------------
 
     def identify_suppression_targets(self, freq_results, top_n_pct=0.10,
-                                     mode='intersection'):
+                                     top_n_neurons=None, mode='intersection'):
         """
         Select neurons to suppress based on contrastive scores.
 
         Uses paper method: neurons that are activated significantly MORE
         when the target token is generated vs baseline steps.
 
-        Selects top N% neurons by contrastive score per pool.
-        mode='intersection': must be in top N% for ALL capital queries.
-        mode='union': in top N% for ANY capital query.
+        Selection per pool:
+          - top_n_neurons (int): fixed count — take top N neurons
+          - top_n_pct (float): percentage — take top N% of pool size
+          top_n_neurons takes priority if provided.
+
+        mode='intersection': must be selected for ALL queries.
+        mode='union': selected in ANY query.
         """
         targets = {}
 
@@ -813,7 +820,10 @@ class NeuronSuppressionExperimentJAX:
                     per_query_sets.append(set())
                     continue
 
-                n_select = max(1, int(len(sorted_neurons) * top_n_pct))
+                if top_n_neurons is not None:
+                    n_select = top_n_neurons
+                else:
+                    n_select = max(1, int(len(sorted_neurons) * top_n_pct))
                 meeting = {int(n) for n, _ in positive[:n_select]}
                 per_query_sets.append(meeting)
 
@@ -878,7 +888,7 @@ class NeuronSuppressionExperimentJAX:
         min_target_count=100, max_runs=500,
         max_tokens_per_run=200,
         temperature=1.0, top_k_sampling=50,
-        top_n_pct=0.10, mode='intersection',
+        top_n_pct=0.10, top_n_neurons=None, mode='intersection',
         target_label='target', control_label='control',
         control_min_target_count=None,
     ):
@@ -895,7 +905,8 @@ class NeuronSuppressionExperimentJAX:
                 'max_runs': max_runs,
                 'temperature': temperature,
                 'top_k_sampling': top_k_sampling,
-                'top_n_pct': top_n_pct, 'mode': mode,
+                'top_n_pct': top_n_pct, 'top_n_neurons': top_n_neurons,
+                'mode': mode,
                 'capital_queries': capital_queries,
                 'control_queries': control_queries,
                 'target_label': target_label,
@@ -976,10 +987,14 @@ class NeuronSuppressionExperimentJAX:
         print("=" * 70)
 
         suppressed = self.identify_suppression_targets(
-            freq_results, top_n_pct=top_n_pct, mode=mode)
+            freq_results, top_n_pct=top_n_pct,
+            top_n_neurons=top_n_neurons, mode=mode)
         total_suppressed = sum(len(v) for v in suppressed.values())
 
-        print(f"\n  Mode: {mode} | Top {top_n_pct:.0%} by contrastive score")
+        if top_n_neurons is not None:
+            print(f"\n  Mode: {mode} | Top {top_n_neurons} neurons per pool")
+        else:
+            print(f"\n  Mode: {mode} | Top {top_n_pct:.0%} by contrastive score")
         print(f"  Total neurons to suppress: {total_suppressed}")
         for pool, indices in sorted(suppressed.items()):
             idx_preview = sorted(indices)[:10]
@@ -1091,8 +1106,12 @@ class NeuronSuppressionExperimentJAX:
 
         config = results['config']
         phase2 = results['phase2']
-        print(f"  Top {config['top_n_pct']:.0%} by contrastive score | "
-              f"Mode: {config['mode']}")
+        if config.get('top_n_neurons') is not None:
+            print(f"  Top {config['top_n_neurons']} neurons per pool | "
+                  f"Mode: {config['mode']}")
+        else:
+            print(f"  Top {config['top_n_pct']:.0%} by contrastive score | "
+                  f"Mode: {config['mode']}")
         print(f"  Suppressed: {phase2['total_suppressed']} neurons")
         for pool, indices in sorted(phase2['suppressed_neurons'].items()):
             print(f"    {pool}: {len(indices)}")
