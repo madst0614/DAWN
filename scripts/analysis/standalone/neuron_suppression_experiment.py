@@ -107,12 +107,18 @@ class SuppressionHookManager:
 
     By setting logits[:,:,idx] = -inf, softmax produces ~0 for
     those neurons, so they can never be selected by top-k.
+
+    TPU optimization:
+      Pre-compute boolean mask tensors on-device at install time.
+      Use torch.where(mask, -inf, logits) — pure element-wise op,
+      no Python-side indexing, no CPU sync, no clone().
     """
 
     def __init__(self):
         self.hooks = []
         self.suppressed = {}  # pool_name → set of neuron indices
         self.active = False
+        self._masks = {}      # pool_name → bool tensor [N_pool], True = suppress
 
     def set_suppressed_neurons(self, suppressed: Dict[str, Set[int]]):
         """
@@ -123,27 +129,65 @@ class SuppressionHookManager:
         """
         self.suppressed = {k: set(v) for k, v in suppressed.items()}
 
+    def _build_mask(self, pool_name: str, pool_size: int, device) -> Optional[torch.Tensor]:
+        """
+        Build a [N_pool] boolean mask tensor on device.
+        True at positions to suppress. Returns None if no suppression needed.
+        """
+        indices = self.suppressed.get(pool_name)
+        if not indices:
+            return None
+        mask = torch.zeros(pool_size, dtype=torch.bool, device=device)
+        idx_tensor = torch.tensor(sorted(indices), dtype=torch.long, device=device)
+        mask[idx_tensor] = True
+        return mask
+
     def install(self, model):
         """Install hooks on the router's neuron_router module."""
         self.remove()  # clean up any prior hooks
 
         router = model.router.neuron_router
+        device = router.neuron_emb.device
+
+        # Pre-compute pool sizes from router boundaries
+        pool_sizes = {
+            'fqk_Q': router.n_feature_qk,
+            'fqk_K': router.n_feature_qk,
+            'fv':    router.n_feature_v,
+            'rqk_Q': router.n_restore_qk,
+            'rqk_K': router.n_restore_qk,
+            'rv':    router.n_restore_v,
+            'feature_know': router.n_feature_know,
+            'restore_know': router.n_restore_know,
+        }
+
+        # Build all masks on-device once
+        masks = {}
+        for pool_name, size in pool_sizes.items():
+            m = self._build_mask(pool_name, size, device)
+            if m is not None:
+                masks[pool_name] = m
+        self._masks = masks
+
+        neg_inf = torch.tensor(float('-inf'), device=device)
 
         # Hook get_all_logits — returns 6 tensors
         orig_get_all_logits = router.get_all_logits
+        attn_names = ['fqk_Q', 'fqk_K', 'fv', 'rqk_Q', 'rqk_K', 'rv']
 
-        suppressed = self.suppressed  # capture reference
+        # Snapshot which attention pools need masking (avoid dict lookup per call)
+        attn_masks = [masks.get(name) for name in attn_names]
+        has_any_attn_mask = any(m is not None for m in attn_masks)
 
         def hooked_get_all_logits(x):
             results = orig_get_all_logits(x)
-            # results: (fqk_Q, fqk_K, fv, rqk_Q, rqk_K, rv)
-            names = ['fqk_Q', 'fqk_K', 'fv', 'rqk_Q', 'rqk_K', 'rv']
+            if not has_any_attn_mask:
+                return results
             out = []
-            for logits, name in zip(results, names):
-                if name in suppressed and suppressed[name]:
-                    idx = sorted(suppressed[name])
-                    logits = logits.clone()
-                    logits[:, :, idx] = float('-inf')
+            for logits, mask in zip(results, attn_masks):
+                if mask is not None:
+                    # mask: [N], broadcast to [B, S, N] — pure element-wise, no sync
+                    logits = torch.where(mask, neg_inf, logits)
                 out.append(logits)
             return tuple(out)
 
@@ -151,17 +195,18 @@ class SuppressionHookManager:
 
         # Hook get_knowledge_logits — returns 2 tensors
         orig_get_knowledge_logits = router.get_knowledge_logits
+        fknow_mask = masks.get('feature_know')
+        rknow_mask = masks.get('restore_know')
+        has_any_know_mask = fknow_mask is not None or rknow_mask is not None
 
         def hooked_get_knowledge_logits(x):
             logits_f, logits_r = orig_get_knowledge_logits(x)
-            if 'feature_know' in suppressed and suppressed['feature_know']:
-                idx = sorted(suppressed['feature_know'])
-                logits_f = logits_f.clone()
-                logits_f[:, :, idx] = float('-inf')
-            if 'restore_know' in suppressed and suppressed['restore_know']:
-                idx = sorted(suppressed['restore_know'])
-                logits_r = logits_r.clone()
-                logits_r[:, :, idx] = float('-inf')
+            if not has_any_know_mask:
+                return logits_f, logits_r
+            if fknow_mask is not None:
+                logits_f = torch.where(fknow_mask, neg_inf, logits_f)
+            if rknow_mask is not None:
+                logits_r = torch.where(rknow_mask, neg_inf, logits_r)
             return logits_f, logits_r
 
         router.get_knowledge_logits = hooked_get_knowledge_logits
@@ -178,6 +223,7 @@ class SuppressionHookManager:
             self._router.get_all_logits = self._orig_get_all_logits
             self._router.get_knowledge_logits = self._orig_get_knowledge_logits
             self.active = False
+            self._masks = {}
 
 
 # ============================================================
