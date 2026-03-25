@@ -561,8 +561,13 @@ class NeuronSuppressionExperimentJAX:
             # Init KV cache + prefill with routing
             kv_k, kv_v = dawn_init_kv_cache(self.config, batch_size=1)
             prompt_2d = jnp.array(np.array(prompt_ids)[np.newaxis, :])
+            if total_runs == 1:
+                print(f"\n    [DEBUG] prompt_ids={prompt_ids[:10]}... (len={len(prompt_ids)})")
+                print(f"    [DEBUG] prompt_2d.shape={prompt_2d.shape}, calling _decode_step_with_routing...")
             logits, kv_k, kv_v, routing_info = self._decode_step_with_routing(
                 self.params, prompt_2d, kv_k, kv_v, 0)
+            if total_runs == 1:
+                print(f"    [DEBUG] logits.shape={logits.shape}, routing_info keys={list(routing_info.keys())}")
 
             generated_ids = list(prompt_ids)
             cache_pos = prompt_len
