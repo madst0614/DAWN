@@ -89,6 +89,34 @@ DEFAULT_CONTROL_QUERIES = [
 
 
 # ============================================================
+# Domain-specific presets
+# ============================================================
+
+QUERY_PRESETS = {
+    'capital': {
+        'description': 'Capital city knowledge (original experiment)',
+        'target_queries': DEFAULT_CAPITAL_QUERIES,
+        'control_queries': DEFAULT_CONTROL_QUERIES,
+    },
+    'physics': {
+        'description': 'Physics/astronomy vs biology/geography/history',
+        'target_queries': [
+            {"prompt": "light travels at the speed of",  "target": "light"},
+            {"prompt": "the earth orbits the",           "target": "sun"},
+            {"prompt": "the earth revolves around the",  "target": "sun"},
+        ],
+        'control_queries': [
+            {"prompt": "plants need sunlight to",         "target": "grow"},
+            {"prompt": "the amazon is the longest",       "target": "river"},
+            {"prompt": "the lungs are used for",          "target": "breathing"},
+            {"prompt": "the french revolution began in",  "target": "1789"},
+            {"prompt": "mount everest is the",            "target": "highest"},
+        ],
+    },
+}
+
+
+# ============================================================
 # Suppressed router pure functions (Phase 2 core)
 # ============================================================
 
@@ -393,6 +421,10 @@ def main():
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--queries', type=str, default=None,
                         help='Custom queries JSON file')
+    parser.add_argument('--preset', type=str, default=None,
+                        choices=list(QUERY_PRESETS.keys()),
+                        help='Use a built-in query preset '
+                             f'({", ".join(QUERY_PRESETS.keys())})')
     args = parser.parse_args()
 
     print(f"JAX devices: {jax.devices()}")
@@ -406,10 +438,15 @@ def main():
           f"RQK={config.get('n_restore_qk')}, RV={config.get('n_restore_v')}, "
           f"FK={config.get('n_feature_know')}, RK={config.get('n_restore_know')}")
 
-    # Load custom queries
+    # Load queries: --preset > --queries > defaults
     capital_queries = DEFAULT_CAPITAL_QUERIES
     control_queries = DEFAULT_CONTROL_QUERIES
-    if args.queries:
+    if args.preset:
+        preset = QUERY_PRESETS[args.preset]
+        capital_queries = preset['target_queries']
+        control_queries = preset['control_queries']
+        print(f"  Preset: {args.preset} — {preset['description']}")
+    elif args.queries:
         with open(args.queries) as f:
             qdata = json.load(f)
         capital_queries = qdata.get('capital', capital_queries)
@@ -976,8 +1013,61 @@ class NeuronSuppressionExperimentJAX:
                 print(f"    {prob:>6.2%}  '{tok}' (was {bp_prob:>5.2%}, delta={delta:>+6.2%}){marker}")
         results['phase3']['suppressed_top10'] = suppressed_probs
 
+        # Compute selectivity metrics
+        results['selectivity'] = self._compute_selectivity(
+            capital_queries, control_queries, baseline_probs, suppressed_probs)
+
         self._print_summary(results)
         return results
+
+    def _compute_selectivity(self, capital_queries, control_queries,
+                             baseline_probs, suppressed_probs):
+        """
+        Compute selectivity metrics from probability shifts.
+
+        - target_drop: avg probability drop for target token in domain queries
+        - control_drop: avg probability drop for target token in control queries
+        - selectivity_index: target_drop - control_drop
+          (positive = selective suppression; >0.1 = strong domain specificity)
+        """
+        def _get_target_prob(probs_dict, prompt, target):
+            target_lower = target.strip().lower()
+            entry = probs_dict.get(prompt, {})
+            for tok, _, prob in entry.get('top_tokens', []):
+                if tok.lower() == target_lower:
+                    return prob
+            return 0.0
+
+        target_drops = []
+        for q in capital_queries:
+            pre = _get_target_prob(baseline_probs, q['prompt'], q['target'])
+            post = _get_target_prob(suppressed_probs, q['prompt'], q['target'])
+            target_drops.append(pre - post)
+
+        control_drops = []
+        for q in control_queries:
+            pre = _get_target_prob(baseline_probs, q['prompt'], q['target'])
+            post = _get_target_prob(suppressed_probs, q['prompt'], q['target'])
+            control_drops.append(pre - post)
+
+        avg_target = float(np.mean(target_drops)) if target_drops else 0.0
+        avg_control = float(np.mean(control_drops)) if control_drops else 0.0
+        selectivity = avg_target - avg_control
+
+        return {
+            'target_drops': [float(d) for d in target_drops],
+            'control_drops': [float(d) for d in control_drops],
+            'avg_target_drop': avg_target,
+            'avg_control_drop': avg_control,
+            'selectivity_index': selectivity,
+            'interpretation': (
+                'SELECTIVE: target domain dropped significantly more than control'
+                if selectivity > 0.1
+                else 'WEAK: suppression affected both domains similarly'
+                if selectivity > 0.0
+                else 'NON-SELECTIVE: control dropped more than target'
+            ),
+        }
 
     def _print_summary(self, results):
         print("\n" + "=" * 70)
@@ -1027,6 +1117,15 @@ class NeuronSuppressionExperimentJAX:
                   f"{pre_prob:>10.2%}  {post_prob:>11.2%}  {delta:>+7.2%}{tag}")
 
         print("-" * 95)
+
+        # Selectivity metrics
+        sel = results.get('selectivity')
+        if sel:
+            print(f"\n  SELECTIVITY METRICS:")
+            print(f"    Avg target prob drop:  {sel['avg_target_drop']:>+.2%}")
+            print(f"    Avg control prob drop: {sel['avg_control_drop']:>+.2%}")
+            print(f"    Selectivity index:     {sel['selectivity_index']:>+.2%}")
+            print(f"    Verdict: {sel['interpretation']}")
 
 
 if __name__ == '__main__':
