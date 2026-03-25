@@ -46,6 +46,7 @@ from models.model_v17_1_jax import (
     safe_dropout, topk_sparsify, feature_fn, restore_fn, _layer_norm,
     _attention_forward, _knowledge_forward,
     _router_attn_forward, _router_know_forward,
+    dawn_init_kv_cache, dawn_cached_forward_with_routing,
 )
 
 
@@ -377,12 +378,16 @@ def main():
     )
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to .flax checkpoint (file or directory)')
-    parser.add_argument('--n_runs', type=int, default=100)
-    parser.add_argument('--threshold', type=float, default=0.7,
-                        help='Absolute activation freq threshold (used if --top_n_pct not set)')
+    parser.add_argument('--min_target_count', type=int, default=100,
+                        help='Min target token hits to collect per query')
+    parser.add_argument('--max_runs', type=int, default=500,
+                        help='Max generation runs per query')
+    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--top_k_sampling', type=int, default=50,
+                        help='Top-k for sampling (0=greedy)')
     parser.add_argument('--top_n_pct', type=float, default=0.10,
-                        help='Percentile-based: suppress top N%% neurons by frequency '
-                             '(default: 0.10 = top 10%%). Set to 0 to use absolute threshold.')
+                        help='Suppress top N%% neurons by contrastive score '
+                             '(default: 0.10 = top 10%%)')
     parser.add_argument('--mode', type=str, default='intersection',
                         choices=['intersection', 'union'])
     parser.add_argument('--output', type=str, default=None)
@@ -414,14 +419,15 @@ def main():
     experiment = NeuronSuppressionExperimentJAX(
         model, params, config, tokenizer
     )
-    top_n_pct = args.top_n_pct if args.top_n_pct > 0 else None
     results = experiment.run_full_experiment(
         capital_queries=capital_queries,
         control_queries=control_queries,
-        n_runs=args.n_runs,
-        threshold=args.threshold,
+        min_target_count=args.min_target_count,
+        max_runs=args.max_runs,
+        temperature=args.temperature,
+        top_k_sampling=args.top_k_sampling,
+        top_n_pct=args.top_n_pct,
         mode=args.mode,
-        top_n_pct=top_n_pct,
     )
 
     # Save
@@ -429,7 +435,7 @@ def main():
         output_dir = Path(args.output)
         output_dir.mkdir(parents=True, exist_ok=True)
         ckpt_name = Path(args.checkpoint).name or 'checkpoint'
-        filename = f"suppression_jax_{ckpt_name}_t{args.threshold}_n{args.n_runs}_{args.mode}.json"
+        filename = f"suppression_jax_{ckpt_name}_pct{args.top_n_pct}_{args.mode}.json"
         output_path = output_dir / filename
         with open(output_path, 'w') as f:
             json.dump(make_serializable(results), f, indent=2, ensure_ascii=False)
@@ -475,202 +481,245 @@ class NeuronSuppressionExperimentJAX:
         self._baseline_forward = _baseline_forward
 
     # ----------------------------------------------------------
-    # Phase 1: Collect activation frequencies
+    # Phase 1: Collect activation frequencies (paper method)
+    # ----------------------------------------------------------
+    # Mirrors behavioral.py:analyze_factual_neurons (GPU) and
+    # knowledge_coherence_jax.py:analyze_knowledge_coherence (TPU).
+    #
+    # Method: sampling-based autoregressive generation.
+    #   1. Generate tokens autoregressively (temperature=1, top_k=50)
+    #   2. At each step, extract routing weights from KV-cached forward
+    #   3. If generated token == target → record as "target hit"
+    #      otherwise → record as "baseline"
+    #   4. Repeat until min_target_count hits collected
+    #   5. Compute contrastive score per neuron:
+    #      target_freq / target_runs - baseline_freq / baseline_steps
     # ----------------------------------------------------------
 
-    def collect_activation_frequencies(self, prompt, target_token, n_runs=100):
-        """
-        Run baseline forward n_runs times, record which neurons are
-        in top-k at the last token position.
-
-        Returns dict with match_rate, top-5 tokens, and per-pool neuron frequencies.
-        """
-        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-        input_arr = jnp.array([input_ids])
-
-        # Encode target — handle subword: check all tokens that START with target
+    def collect_activation_frequencies(
+        self, prompt, target_token,
+        min_target_count=100, max_runs=500, max_tokens_per_run=200,
+        temperature=1.0, top_k=50,
+    ):
+        """Paper method: sampling generation + routing at target hit."""
         target_ids = self.tokenizer.encode(target_token, add_special_tokens=False)
-        if len(target_ids) == 0:
+        if not target_ids:
             raise ValueError(f"Target token '{target_token}' not in vocabulary")
-        target_id = target_ids[0]
+        target_token_id = target_ids[0]
+        target_lower = target_token.strip().lower()
 
-        # Log tokenization info
-        target_tokens_decoded = [self.tokenizer.decode([t]) for t in target_ids]
+        target_tokens_decoded = self.tokenizer.convert_ids_to_tokens(target_ids)
         print(f"    [tokenizer] '{target_token}' -> ids={target_ids}, "
-              f"decoded={target_tokens_decoded}")
+              f"tokens={target_tokens_decoded}")
 
-        extractor = self._build_routing_extractor()
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+        prompt_len = len(prompt_ids)
 
-        freq = {pool: defaultdict(int) for pool in ALL_POOL_NAMES}
-        match_count = 0
-        token_counts = defaultdict(int)
+        # Pool name → routing_info key mapping
+        _POOL_KEY = {
+            'fqk_Q': 'fqk_wQ', 'fqk_K': 'fqk_wK',
+            'fv': 'fv_w', 'rqk_Q': 'rqk_wQ', 'rqk_K': 'rqk_wK',
+            'rv': 'rv_w',
+            'feature_know': 'fknow_w', 'restore_know': 'rknow_w',
+        }
 
-        for _ in range(n_runs):
-            logits = self._baseline_forward(input_arr)
-            next_id = int(jnp.argmax(logits[0, -1, :]))
-            token_counts[next_id] += 1
-            if next_id == target_id:
-                match_count += 1
+        target_neuron_counts = {pool: defaultdict(int) for pool in ALL_POOL_NAMES}
+        baseline_neuron_counts = {pool: defaultdict(int) for pool in ALL_POOL_NAMES}
+        successful_runs = 0
+        total_runs = 0
+        total_baseline_steps = 0
+        sample_generations = []
 
-            # Extract per-layer routing weights from real forward
-            # all_routing: {pool_name: [n_layers, B, S, N_pool]}
-            all_routing = extractor(input_arr)
+        rng_key = jax.random.PRNGKey(42)
 
-            for pool_name in ALL_POOL_NAMES:
-                w = all_routing[pool_name]  # [n_layers, B, S, N_pool]
-                # Sum across layers, take last token position
-                # A neuron is "active" if selected in ANY layer
-                w_np = np.asarray(w)  # [L, B, S, N]
-                for layer_idx in range(w_np.shape[0]):
-                    w_last = w_np[layer_idx, 0, -1]  # [N_pool]
-                    active = np.where(w_last > 0)[0]
-                    for idx in active:
-                        freq[pool_name][int(idx)] += 1
+        while successful_runs < min_target_count and total_runs < max_runs:
+            total_runs += 1
+            if total_runs % 20 == 0 or successful_runs == min_target_count:
+                print(f"\r      {successful_runs}/{min_target_count} hits "
+                      f"(run {total_runs})", end='', flush=True)
 
-        # Top-5 predicted tokens
-        top5 = sorted(token_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        top5_decoded = [
-            (self.tokenizer.decode([tid]).strip(), count, count / n_runs)
-            for tid, count in top5
-        ]
+            # Init KV cache + prefill with routing
+            kv_k, kv_v = dawn_init_kv_cache(self.config, batch_size=1)
+            prompt_2d = jnp.array(np.array(prompt_ids)[np.newaxis, :])
+            logits, kv_k, kv_v, routing_info = self._decode_step_with_routing(
+                self.params, prompt_2d, kv_k, kv_v, 0)
+
+            generated_ids = list(prompt_ids)
+            cache_pos = prompt_len
+
+            # Sample first token
+            first_logits = np.array(logits[0, -1, :])
+            rng_key, subkey = jax.random.split(rng_key)
+            next_token = self._sample_token(first_logits, temperature, top_k, subkey)
+            generated_ids.append(next_token)
+
+            prev_routing_info = routing_info
+
+            for step in range(max_tokens_per_run - 1):
+                token_text = self.tokenizer.decode([next_token]).strip().lower()
+
+                # Extract active neurons from routing (union across layers)
+                step_neurons = self._extract_active_from_routing(
+                    prev_routing_info, _POOL_KEY)
+
+                if token_text == target_lower or next_token == target_token_id:
+                    # Target hit — record routing
+                    for pool in ALL_POOL_NAMES:
+                        for n in step_neurons[pool]:
+                            target_neuron_counts[pool][n] += 1
+                    successful_runs += 1
+                    if len(sample_generations) < 3:
+                        gen_text = self.tokenizer.decode(
+                            generated_ids, skip_special_tokens=True)
+                        sample_generations.append(gen_text)
+                    break
+                else:
+                    # Baseline step
+                    for pool in ALL_POOL_NAMES:
+                        for n in step_neurons[pool]:
+                            baseline_neuron_counts[pool][n] += 1
+                    total_baseline_steps += 1
+
+                if next_token in (self.tokenizer.sep_token_id,
+                                  self.tokenizer.eos_token_id):
+                    break
+                if cache_pos >= self.config.get('max_seq_len', 512) - 1:
+                    break
+
+                # Decode next with routing
+                token_2d = jnp.array([[next_token]])
+                logits, kv_k, kv_v, routing_info = \
+                    self._decode_step_with_routing(
+                        self.params, token_2d, kv_k, kv_v, cache_pos)
+                prev_routing_info = routing_info
+                cache_pos += 1
+
+                next_logits = np.array(logits[0, 0, :])
+                rng_key, subkey = jax.random.split(rng_key)
+                next_token = self._sample_token(
+                    next_logits, temperature, top_k, subkey)
+                generated_ids.append(next_token)
+
+        print(f"\r      {successful_runs}/{min_target_count} hits "
+              f"(run {total_runs}) — Done!          ")
+
+        match_rate = successful_runs / total_runs if total_runs > 0 else 0
+        print(f"    Match rate: {match_rate*100:.1f}% "
+              f"({successful_runs}/{total_runs})")
+        if sample_generations:
+            print(f"    Sample: \"{sample_generations[0][:80]}...\"")
+
+        # Compute contrastive scores per neuron per pool
+        neuron_scores = {}
+        for pool in ALL_POOL_NAMES:
+            pool_scores = {}
+            all_neurons = set(target_neuron_counts[pool].keys()) | \
+                          set(baseline_neuron_counts[pool].keys())
+            for n in all_neurons:
+                t_freq = target_neuron_counts[pool].get(n, 0) / max(successful_runs, 1)
+                b_freq = baseline_neuron_counts[pool].get(n, 0) / max(total_baseline_steps, 1)
+                pool_scores[n] = {
+                    'target_freq': t_freq,
+                    'baseline_freq': b_freq,
+                    'contrastive': t_freq - b_freq,
+                }
+            neuron_scores[pool] = pool_scores
 
         return {
             'prompt': prompt,
             'target_token': target_token,
-            'target_token_id': target_id,
-            'target_token_ids_all': target_ids,
-            'match_count': match_count,
-            'total_runs': n_runs,
-            'match_rate': match_count / n_runs,
-            'top5': top5_decoded,
-            'neuron_frequencies': {pool: dict(counts) for pool, counts in freq.items()},
+            'target_token_id': target_token_id,
+            'successful_runs': successful_runs,
+            'total_runs': total_runs,
+            'match_rate': match_rate,
+            'total_baseline_steps': total_baseline_steps,
+            'sample_generations': sample_generations,
+            'neuron_scores': neuron_scores,
+            'target_neuron_counts': {p: dict(c) for p, c in target_neuron_counts.items()},
+            'baseline_neuron_counts': {p: dict(c) for p, c in baseline_neuron_counts.items()},
         }
 
-    def _build_routing_extractor(self):
-        """
-        Build JIT-compiled function that runs a REAL forward pass
-        and returns per-layer routing weights via jax.lax.scan.
+    # ----------------------------------------------------------
+    # Helpers for sampling-based generation
+    # ----------------------------------------------------------
 
-        This mirrors the model's actual __call__ scan body so routing
-        reflects the hidden state at each layer (not just layer-0 input).
-
-        Returns fn(input_ids) → {pool_name: [n_layers, B, S, N_pool]}
-        """
-        all_params = self.params['params']
-        sn_params = all_params['shared_neurons']
-        router_params = all_params['router']
-        token_emb_table = jnp.asarray(all_params['token_emb']['embedding'])
-        pos_emb_table = jnp.asarray(all_params['pos_emb']['embedding'])
-        norm_scale = all_params['norm']['scale']
-        norm_bias = all_params['norm']['bias']
-
-        n_layers = self.config.get('n_layers', 16)
-        n_fqk = self.config.get('n_feature_qk', 88)
-        n_fv = self.config.get('n_feature_v', 352)
-        n_rqk = self.config.get('n_restore_qk', 88)
-        n_rv = self.config.get('n_restore_v', 352)
-        n_fk = self.config.get('n_feature_know', 224)
-        n_rk = self.config.get('n_restore_know', 224)
-        n_heads = self.config.get('n_heads', 8)
-        d_model = self.config.get('d_model', 768)
-        d_space = self.config.get('d_space', 256)
-        tk_fqk = self.config.get('top_k_feature_qk', 16)
-        tk_fv = self.config.get('top_k_feature_v', 16)
-        tk_rqk = self.config.get('top_k_restore_qk', 16)
-        tk_rv = self.config.get('top_k_restore_v', 16)
-        tk_fk = self.config.get('top_k_feature_know', 16)
-        tk_rk = self.config.get('top_k_restore_know', 16)
-
-        # Stack block params
-        block_params_list = [all_params[f'block_{i}'] for i in range(n_layers)]
-        stacked_block_params = jax.tree.map(
-            lambda *arrays: jnp.stack(arrays), *block_params_list)
+    def _init_decode_step(self):
+        """JIT compile the cached forward with routing (once)."""
+        if hasattr(self, '_jit_decode_step'):
+            return
+        params = self.params
+        config = self.config
 
         @jax.jit
-        def extract(input_ids):
-            B, S = input_ids.shape
-            positions = jnp.arange(S)[jnp.newaxis, :]
-            x = jnp.take(token_emb_table, input_ids, axis=0) + \
-                jnp.take(pos_emb_table, positions, axis=0)
+        def _step(params, token_ids, kv_k, kv_v, cache_pos):
+            return dawn_cached_forward_with_routing(
+                params, config, token_ids, kv_k, kv_v, cache_pos)
 
-            rng = jax.random.PRNGKey(0)
-            layer_rngs = jax.random.split(rng, n_layers)
+        # Warmup
+        print("  JIT compiling decode step (with routing)...", end=" ", flush=True)
+        t0 = time.time()
+        dummy_kv_k, dummy_kv_v = dawn_init_kv_cache(config, batch_size=1)
+        _out = _step(params, jnp.array([[0]]), dummy_kv_k, dummy_kv_v, 0)
+        _out[0].block_until_ready()
+        print(f"done ({time.time() - t0:.1f}s)")
 
-            def scan_body(carry, xs):
-                x = carry
-                bp = xs['params']
-                rng = xs['rng']
-                rng, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng, 5)
+        self._jit_decode_step = _step
 
-                # --- Attention sub-block (real forward) ---
-                normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+    def _decode_step_with_routing(self, params, token_ids, kv_k, kv_v, cache_pos):
+        self._init_decode_step()
+        return self._jit_decode_step(params, token_ids, kv_k, kv_v, cache_pos)
 
-                (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
-                 _) = _router_attn_forward(
-                    normed, router_params,
-                    n_fqk, n_fv, n_rqk, n_rv, d_space,
-                    tk_fqk, tk_fv, tk_rqk, tk_rv,
-                    0.0, None, True, rng_ar)
+    @staticmethod
+    def _sample_token(logits_np, temperature, top_k, rng_key):
+        if temperature <= 0:
+            return int(np.argmax(logits_np))
+        logits_np = logits_np / temperature
+        if top_k > 0:
+            top_idx = np.argpartition(logits_np, -top_k)[-top_k:]
+            mask = np.full_like(logits_np, -np.inf)
+            mask[top_idx] = logits_np[top_idx]
+            logits_np = mask
+        probs = np.exp(logits_np - np.max(logits_np))
+        probs = probs / (probs.sum() + 1e-8)
+        return int(jax.random.choice(rng_key, len(probs), p=probs))
 
-                attn_out = _attention_forward(
-                    normed, sn_params,
-                    fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
-                    bp['attn']['expand_O']['kernel'],
-                    n_fqk, n_rqk, n_heads, d_model,
-                    0.0, True, rng_a)
-
-                x = x + attn_out
-
-                # --- Knowledge sub-block (real forward) ---
-                normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
-
-                fknow_w, rknow_w, _ = _router_know_forward(
-                    normed, router_params,
-                    n_fqk, n_fv, n_rqk, n_rv, n_fk, n_rk,
-                    tk_fk, tk_rk,
-                    0.0, None, True, rng_kr)
-
-                know_out = _knowledge_forward(
-                    normed, sn_params, fknow_w, rknow_w,
-                    0.0, True, rng_k)
-
-                x = x + know_out
-
-                # Collect routing weights for this layer
-                routing = {
-                    'fqk_Q': fqk_w_Q, 'fqk_K': fqk_w_K,
-                    'fv': fv_w, 'rqk_Q': rqk_w_Q,
-                    'rqk_K': rqk_w_K, 'rv': rv_w,
-                    'feature_know': fknow_w, 'restore_know': rknow_w,
-                }
-                return x, routing
-
-            xs = {'params': stacked_block_params, 'rng': layer_rngs}
-            _, all_routing = jax.lax.scan(scan_body, x, xs)
-            # all_routing: {pool: [n_layers, B, S, N_pool]}
-            return all_routing
-
-        return extract
+    @staticmethod
+    def _extract_active_from_routing(routing_info, pool_key_map):
+        """Extract active neuron indices from routing_info (union across layers)."""
+        result = {}
+        for pool_name, key in pool_key_map.items():
+            if key not in routing_info:
+                result[pool_name] = set()
+                continue
+            w = np.array(routing_info[key])  # [n_layers, B, S, N] or [n_layers, B, N]
+            active = set()
+            for li in range(w.shape[0]):
+                w_layer = w[li]
+                if w_layer.ndim == 3:
+                    w_last = w_layer[0, -1]
+                elif w_layer.ndim == 2:
+                    w_last = w_layer[0]
+                else:
+                    continue
+                active.update(int(i) for i in np.where(w_last > 0)[0])
+            result[pool_name] = active
+        return result
 
     # ----------------------------------------------------------
     # Phase 1→2: Identify suppression targets
     # ----------------------------------------------------------
 
-    def identify_suppression_targets(self, freq_results, threshold=0.7,
-                                     mode='intersection', top_n_pct=None):
+    def identify_suppression_targets(self, freq_results, top_n_pct=0.10,
+                                     mode='intersection'):
         """
-        Find neurons to suppress based on activation frequency.
+        Select neurons to suppress based on contrastive scores.
 
-        Two strategies (controlled by top_n_pct):
-          1. top_n_pct=None (default): absolute threshold — neurons active
-             in ≥(threshold * n_runs) runs.  Works when pool_size >> top_k.
-          2. top_n_pct=float (e.g. 0.1): **percentile-based** — within each
-             pool, rank neurons by frequency and take the top N%.
-             This is the correct approach when top_k ≈ pool_size, because
-             nearly all neurons will exceed any absolute threshold.
+        Uses paper method: neurons that are activated significantly MORE
+        when the target token is generated vs baseline steps.
 
-        mode='intersection': must qualify in ALL capital queries.
-        mode='union': qualifies in ANY capital query.
+        Selects top N% neurons by contrastive score per pool.
+        mode='intersection': must be in top N% for ALL capital queries.
+        mode='union': in top N% for ANY capital query.
         """
         targets = {}
 
@@ -678,25 +727,26 @@ class NeuronSuppressionExperimentJAX:
             per_query_sets = []
 
             for result in freq_results:
-                n_runs = result['total_runs']
-                pool_freq = result['neuron_frequencies'].get(pool, {})
-
-                if not pool_freq:
+                pool_scores = result['neuron_scores'].get(pool, {})
+                if not pool_scores:
                     per_query_sets.append(set())
                     continue
 
-                if top_n_pct is not None:
-                    # --- Percentile-based: top N% by frequency ---
-                    sorted_neurons = sorted(pool_freq.items(),
-                                            key=lambda x: x[1], reverse=True)
-                    n_select = max(1, int(len(sorted_neurons) * top_n_pct))
-                    meeting = {int(idx) for idx, _ in sorted_neurons[:n_select]}
-                else:
-                    # --- Absolute threshold ---
-                    min_count = int(n_runs * threshold)
-                    meeting = {int(idx) for idx, count in pool_freq.items()
-                               if count >= min_count}
+                # Rank by contrastive score (target_freq - baseline_freq)
+                sorted_neurons = sorted(
+                    pool_scores.items(),
+                    key=lambda x: x[1]['contrastive'], reverse=True)
 
+                # Only take neurons with positive contrastive score
+                positive = [(n, s) for n, s in sorted_neurons
+                            if s['contrastive'] > 0]
+
+                if not positive:
+                    per_query_sets.append(set())
+                    continue
+
+                n_select = max(1, int(len(sorted_neurons) * top_n_pct))
+                meeting = {int(n) for n, _ in positive[:n_select]}
                 per_query_sets.append(meeting)
 
             if not per_query_sets:
@@ -706,7 +756,7 @@ class NeuronSuppressionExperimentJAX:
                 combined = per_query_sets[0]
                 for s in per_query_sets[1:]:
                     combined = combined & s
-            else:  # union
+            else:
                 combined = set()
                 for s in per_query_sets:
                     combined |= s
@@ -769,8 +819,10 @@ class NeuronSuppressionExperimentJAX:
     def run_full_experiment(
         self,
         capital_queries=None, control_queries=None,
-        n_runs=100, threshold=0.7, mode='intersection',
-        top_n_pct=0.10,
+        min_target_count=100, max_runs=500,
+        max_tokens_per_run=200,
+        temperature=1.0, top_k_sampling=50,
+        top_n_pct=0.10, mode='intersection',
     ):
         if capital_queries is None:
             capital_queries = DEFAULT_CAPITAL_QUERIES
@@ -779,17 +831,22 @@ class NeuronSuppressionExperimentJAX:
 
         results = {
             'config': {
-                'n_runs': n_runs, 'threshold': threshold, 'mode': mode,
-                'top_n_pct': top_n_pct,
+                'min_target_count': min_target_count,
+                'max_runs': max_runs,
+                'temperature': temperature,
+                'top_k_sampling': top_k_sampling,
+                'top_n_pct': top_n_pct, 'mode': mode,
                 'capital_queries': capital_queries,
                 'control_queries': control_queries,
             },
             'phase1': {}, 'phase2': {}, 'phase3': {},
         }
 
-        # === Phase 1: Activation frequency ===
+        # === Phase 1: Sampling-based activation frequency (paper method) ===
         print("=" * 70)
-        print("PHASE 1: Collecting activation frequencies")
+        print("PHASE 1: Sampling-based routing extraction (paper method)")
+        print(f"  min_target_count={min_target_count}, max_runs={max_runs}, "
+              f"temp={temperature}, top_k={top_k_sampling}")
         print("=" * 70)
 
         freq_results = []
@@ -797,67 +854,66 @@ class NeuronSuppressionExperimentJAX:
             print(f"\n  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
             t0 = time.time()
             freq = self.collect_activation_frequencies(
-                q['prompt'], q['target'], n_runs=n_runs)
+                q['prompt'], q['target'],
+                min_target_count=min_target_count,
+                max_runs=max_runs,
+                max_tokens_per_run=max_tokens_per_run,
+                temperature=temperature,
+                top_k=top_k_sampling)
             elapsed = time.time() - t0
-            print(f"    Match rate: {freq['match_count']}/{n_runs} "
-                  f"({freq['match_rate']:.0%})  [{elapsed:.1f}s]")
-            # Show top-5 predicted tokens
-            if freq['top5']:
-                top5_str = ", ".join(
-                    f"'{tok}' ({pct:.0%})" for tok, _, pct in freq['top5'])
-                print(f"    Top-5 predictions: {top5_str}")
-            # Show frequency stats per pool
+            # Show top contrastive neurons per pool
             for pool in ALL_POOL_NAMES:
-                pf = freq['neuron_frequencies'].get(pool, {})
-                if not pf:
+                scores = freq['neuron_scores'].get(pool, {})
+                if not scores:
                     continue
-                counts = sorted(pf.values(), reverse=True)
-                n_total = len(counts)
-                n_high = sum(1 for c in counts if c >= n_runs * threshold)
-                # Show distribution: min/median/max
-                print(f"    {pool}: {n_total} neurons active, "
-                      f"{n_high}/{n_total} >= {threshold:.0%}, "
-                      f"freq range [{counts[-1]}-{counts[0]}]/{n_runs}")
+                top3 = sorted(scores.items(),
+                              key=lambda x: x[1]['contrastive'], reverse=True)[:3]
+                top3_str = ", ".join(
+                    f"n{n}({s['contrastive']:+.2f})" for n, s in top3)
+                print(f"    {pool}: top contrastive = {top3_str}")
+            print(f"    [{elapsed:.1f}s]")
             freq_results.append(freq)
 
         results['phase1']['capital_frequencies'] = freq_results
 
-        # Control baselines
-        print(f"\n  --- Control queries (baseline) ---")
-        control_baselines = []
+        # Control queries — same sampling method
+        print(f"\n  --- Control queries ---")
+        control_freqs = []
         for q in control_queries:
-            print(f"  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
-            baseline = self.measure_target_frequency(
-                q['prompt'], q['target'], n_runs=n_runs)
-            print(f"    Match rate: {baseline['match_count']}/{n_runs} "
-                  f"({baseline['match_rate']:.0%})")
-            control_baselines.append(baseline)
-        results['phase1']['control_baselines'] = control_baselines
+            print(f"\n  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+            freq = self.collect_activation_frequencies(
+                q['prompt'], q['target'],
+                min_target_count=min_target_count,
+                max_runs=max_runs,
+                max_tokens_per_run=max_tokens_per_run,
+                temperature=temperature,
+                top_k=top_k_sampling)
+            control_freqs.append(freq)
+        results['phase1']['control_frequencies'] = control_freqs
 
-        # === Phase 2: Identify & build suppression ===
+        # === Phase 2: Identify suppression targets (contrastive) ===
         print("\n" + "=" * 70)
-        print("PHASE 2: Identifying suppression targets")
+        print("PHASE 2: Identifying suppression targets (contrastive)")
         print("=" * 70)
 
         suppressed = self.identify_suppression_targets(
-            freq_results, threshold, mode, top_n_pct=top_n_pct)
+            freq_results, top_n_pct=top_n_pct, mode=mode)
         total_suppressed = sum(len(v) for v in suppressed.values())
 
-        strategy = (f"top {top_n_pct:.0%} by frequency" if top_n_pct
-                    else f"absolute >= {threshold:.0%}")
-        print(f"\n  Mode: {mode} | Strategy: {strategy}")
+        print(f"\n  Mode: {mode} | Top {top_n_pct:.0%} by contrastive score")
         print(f"  Total neurons to suppress: {total_suppressed}")
         for pool, indices in sorted(suppressed.items()):
             idx_preview = sorted(indices)[:10]
-            print(f"    {pool}: {len(indices)} neurons — {idx_preview}{'...' if len(indices) > 10 else ''}")
+            print(f"    {pool}: {len(indices)} neurons — "
+                  f"{idx_preview}{'...' if len(indices) > 10 else ''}")
 
         results['phase2']['suppressed_neurons'] = {
             k: sorted(v) for k, v in suppressed.items()}
         results['phase2']['total_suppressed'] = total_suppressed
 
         if total_suppressed == 0:
-            print("\n  WARNING: No neurons met threshold! "
-                  "Try --threshold lower or --mode union")
+            print("\n  WARNING: No neurons with positive contrastive score! "
+                  "Try --top_n_pct higher or --mode union")
             results['phase3']['note'] = 'no neurons to suppress'
             self._print_summary(results)
             return results
@@ -876,27 +932,20 @@ class NeuronSuppressionExperimentJAX:
         print("\n  --- Capital queries (suppressed) ---")
         capital_post = []
         for q in capital_queries:
-            print(f"  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+            print(f"\n  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
             post = self.measure_target_frequency(
-                q['prompt'], q['target'], n_runs=n_runs,
+                q['prompt'], q['target'], n_runs=max_runs,
                 forward_fn=suppressed_forward)
-            print(f"    Match rate: {post['match_count']}/{n_runs} "
-                  f"({post['match_rate']:.0%})")
-            if post['top5']:
-                top_tok, _, top_pct = post['top5'][0]
-                print(f"    Most frequent: '{top_tok}' ({top_pct:.0%})")
             capital_post.append(post)
         results['phase3']['capital_post_suppression'] = capital_post
 
         print(f"\n  --- Control queries (suppressed) ---")
         control_post = []
         for q in control_queries:
-            print(f"  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+            print(f"\n  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
             post = self.measure_target_frequency(
-                q['prompt'], q['target'], n_runs=n_runs,
+                q['prompt'], q['target'], n_runs=max_runs,
                 forward_fn=suppressed_forward)
-            print(f"    Match rate: {post['match_count']}/{n_runs} "
-                  f"({post['match_rate']:.0%})")
             control_post.append(post)
         results['phase3']['control_post_suppression'] = control_post
 
@@ -910,11 +959,8 @@ class NeuronSuppressionExperimentJAX:
 
         config = results['config']
         phase2 = results['phase2']
-        top_n_pct = config.get('top_n_pct')
-        strategy = (f"top {top_n_pct:.0%} by frequency" if top_n_pct
-                    else f"absolute >= {config['threshold']:.0%}")
-        print(f"  Strategy: {strategy} | "
-              f"Mode: {config['mode']} | Runs: {config['n_runs']}")
+        print(f"  Top {config['top_n_pct']:.0%} by contrastive score | "
+              f"Mode: {config['mode']}")
         print(f"  Suppressed: {phase2['total_suppressed']} neurons")
         for pool, indices in sorted(phase2['suppressed_neurons'].items()):
             print(f"    {pool}: {len(indices)}")
@@ -934,13 +980,13 @@ class NeuronSuppressionExperimentJAX:
 
         print("-" * 90)
 
-        ctrl_bases = results['phase1'].get('control_baselines', [])
+        ctrl_freqs = results['phase1'].get('control_frequencies', [])
         ctrl_posts = results['phase3'].get('control_post_suppression', [])
-        for base, post in zip(ctrl_bases, ctrl_posts):
-            pre = base['match_rate']
+        for freq, post in zip(ctrl_freqs, ctrl_posts):
+            pre = freq['match_rate']
             pst = post['match_rate']
             delta = pst - pre
-            print(f"  {base['prompt'][:38]:<40s} {base['target_token']:<8s} "
+            print(f"  {freq['prompt'][:38]:<40s} {freq['target_token']:<8s} "
                   f"{pre:>6.0%}  {pst:>6.0%}  {delta:>+6.0%}  (control)")
 
         print("-" * 90)
