@@ -15,26 +15,26 @@ import jax.numpy as jnp
 from scripts.analysis.utils_jax import load_model_jax, create_model_from_config
 
 QUERIES = [
-    ("the earth orbits the",                    "sun"),
-    ("the sun rises in the",                    "east"),
-    ("mount fuji is in",                        "japan"),
-    ("the eiffel tower is in",                  "paris"),
-    ("water boils at",                          "hundred"),
-    ("the moon orbits the",                     "earth"),
-    ("tokyo is the capital of",                 "japan"),
-    ("berlin is the capital of",                "germany"),
-    ("rome is the capital of",                  "italy"),
-    ("the nile is a",                           "river"),
-    ("the great wall is in",                    "china"),
-    ("the pyramids are in",                     "egypt"),
-    ("honey is made by",                        "bees"),
-    ("the heart pumps",                         "blood"),
-    ("the amazon river is in",                  "brazil"),
-    ("einstein was born in",                    "germany"),
-    ("the pacific is an",                       "ocean"),
-    ("the capital of the united kingdom is",    "london"),
-    ("the capital of france is",                "paris"),
-    ("the capital of japan is",                 "tokyo"),
+    ("the sky is",                              "blue"),
+    ("fire is",                                 "hot"),
+    ("ice is",                                  "cold"),
+    ("the earth is a",                          "planet"),
+    ("humans breathe",                          "air"),
+    ("the opposite of hot is",                  "cold"),
+    ("one plus one is",                         "two"),
+    ("the sun is a",                            "star"),
+    ("birds can",                               "fly"),
+    ("fish live in",                            "water"),
+    ("the earth is",                            "round"),
+    ("snow is",                                 "white"),
+    ("grass is",                                "green"),
+    ("the moon is a",                           "satellite"),
+    ("cats and dogs are",                       "animals"),
+    ("the sun is in the",                       "sky"),
+    ("london is in",                            "england"),
+    ("paris is in",                             "france"),
+    ("tokyo is in",                             "japan"),
+    ("rome is in",                              "italy"),
 ]
 
 
@@ -106,28 +106,42 @@ def main():
     print(f"  {'#':<3s} {'Prompt':<42s} {'Target':<10s} {'Rank':>5s} {'Prob':>8s}  Top-{args.top_k}")
     print("=" * 100)
 
-    hits = []
+    elite = []   # >= 90%
+    hits = []    # top-k but < 90%
     misses = []
     for i, (prompt, target, rank, prob, top_tokens) in enumerate(all_results, 1):
         top_str = ", ".join(f"{tok}({p:.1%})" for tok, p in top_tokens)
         in_topk = rank is not None and rank <= args.top_k
         rank_str = f"#{rank}" if rank else "-"
         prob_str = f"{prob:.2%}" if rank else "-"
-        marker = " *" if in_topk else ""
+        if prob >= 0.90:
+            marker = " *** 90%+ ***"
+        elif in_topk:
+            marker = " *"
+        else:
+            marker = ""
         print(f"  {i:<3d} {prompt:<42s} {target:<10s} {rank_str:>5s} {prob_str:>8s}  {top_str}{marker}")
 
-        if in_topk:
+        if prob >= 0.90:
+            elite.append((prompt, target, rank, prob))
+        elif in_topk:
             hits.append((prompt, target, rank, prob))
         else:
             misses.append((prompt, target, rank, prob, top_tokens))
 
     print("=" * 100)
 
-    print(f"\n  === HITS (target in top-{args.top_k}): {len(hits)}/{len(all_results)} ===")
-    print(f"  {'Prompt':<42s} {'Target':<10s} {'Rank':>5s} {'Prob':>8s}")
-    print(f"  {'-'*42} {'-'*10} {'-'*5} {'-'*8}")
-    for prompt, target, rank, prob in hits:
-        print(f"  {prompt:<42s} {target:<10s} #{rank:>3d} {prob:>7.2%}")
+    if elite:
+        print(f"\n  >>> 90%+ QUERIES: {len(elite)}/{len(all_results)} <<<")
+        print(f"  {'Prompt':<42s} {'Target':<10s} {'Rank':>5s} {'Prob':>8s}")
+        print(f"  {'-'*42} {'-'*10} {'-'*5} {'-'*8}")
+        for prompt, target, rank, prob in elite:
+            print(f"  {prompt:<42s} {target:<10s} #{rank:>3d} {prob:>7.2%}")
+
+    if hits:
+        print(f"\n  === OTHER HITS (target in top-{args.top_k}): {len(hits)} ===")
+        for prompt, target, rank, prob in hits:
+            print(f"  {prompt:<42s} {target:<10s} #{rank:>3d} {prob:>7.2%}")
 
     if misses:
         print(f"\n  === MISSES: {len(misses)}/{len(all_results)} ===")
