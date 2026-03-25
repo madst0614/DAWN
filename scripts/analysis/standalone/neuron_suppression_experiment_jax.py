@@ -407,7 +407,10 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to .flax checkpoint (file or directory)')
     parser.add_argument('--min_target_count', type=int, default=100,
-                        help='Min target token hits to collect per query')
+                        help='Min target token hits for domain queries (default: 100)')
+    parser.add_argument('--control_min_target_count', type=int, default=20,
+                        help='Min target token hits for control queries (default: 20). '
+                             'Control queries are not used for neuron selection.')
     parser.add_argument('--max_runs', type=int, default=500,
                         help='Max generation runs per query')
     parser.add_argument('--temperature', type=float, default=1.0)
@@ -470,6 +473,7 @@ def main():
         mode=args.mode,
         target_label=target_label,
         control_label=control_label,
+        control_min_target_count=args.control_min_target_count,
     )
 
     # Save
@@ -876,11 +880,14 @@ class NeuronSuppressionExperimentJAX:
         temperature=1.0, top_k_sampling=50,
         top_n_pct=0.10, mode='intersection',
         target_label='target', control_label='control',
+        control_min_target_count=None,
     ):
         if capital_queries is None:
             capital_queries = DEFAULT_CAPITAL_QUERIES
         if control_queries is None:
             control_queries = DEFAULT_CONTROL_QUERIES
+        if control_min_target_count is None:
+            control_min_target_count = min_target_count
 
         results = {
             'config': {
@@ -946,14 +953,14 @@ class NeuronSuppressionExperimentJAX:
 
         results['phase1']['capital_frequencies'] = freq_results
 
-        print(f"\n  --- Control queries ---")
+        print(f"\n  --- Control queries (min_target_count={control_min_target_count}) ---")
         control_freqs = []
         for qi, q in enumerate(control_queries, 1):
             print(f"\n  [{qi}/{len(control_queries)}] Query: \"{q['prompt']}\" -> target: '{q['target']}'")
             t0 = time.time()
             freq = self.collect_activation_frequencies(
                 q['prompt'], q['target'],
-                min_target_count=min_target_count,
+                min_target_count=control_min_target_count,
                 max_runs=max_runs,
                 max_tokens_per_run=max_tokens_per_run,
                 temperature=temperature,
