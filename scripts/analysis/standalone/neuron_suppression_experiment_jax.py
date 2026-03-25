@@ -512,7 +512,7 @@ class NeuronSuppressionExperimentJAX:
         print(f"    [tokenizer] '{target_token}' -> ids={target_ids}, "
               f"tokens={target_tokens_decoded}")
 
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+        prompt_ids = [101] + self.tokenizer.encode(prompt, add_special_tokens=False)  # [CLS] only, no [SEP]
         prompt_len = len(prompt_ids)
 
         # Pool name → routing_info key mapping
