@@ -272,7 +272,7 @@ def build_suppressed_forward(model, params, config, masks):
     def forward(input_ids):
         B, S = input_ids.shape
         positions = jnp.arange(S)[jnp.newaxis, :]
-        x = token_emb_table[input_ids] + pos_emb_table[positions]
+        x = jnp.take(token_emb_table, input_ids, axis=0) + jnp.take(pos_emb_table, positions, axis=0)
 
         rng = jax.random.PRNGKey(0)
         layer_rngs = jax.random.split(rng, n_layers)
@@ -562,7 +562,7 @@ class NeuronSuppressionExperimentJAX:
         def extract(input_ids):
             B, S = input_ids.shape
             positions = jnp.arange(S)[jnp.newaxis, :]
-            x = token_emb_table[input_ids] + pos_emb_table[positions]
+            x = jnp.take(token_emb_table, input_ids, axis=0) + jnp.take(pos_emb_table, positions, axis=0)
 
             emb_norm = neuron_emb / (jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8)
 
