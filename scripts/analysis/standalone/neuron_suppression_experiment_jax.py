@@ -45,6 +45,7 @@ from scripts.analysis.utils_jax import load_model_jax, create_model_from_config
 from models.model_v17_1_jax import (
     safe_dropout, topk_sparsify, feature_fn, restore_fn, _layer_norm,
     _attention_forward, _knowledge_forward,
+    _router_attn_forward, _router_know_forward,
 )
 
 
@@ -511,25 +512,20 @@ class NeuronSuppressionExperimentJAX:
             if next_id == target_id:
                 match_count += 1
 
-            # Extract routing weights
-            routing = extractor(input_arr)
-            attn_weights, know_weights = routing
+            # Extract per-layer routing weights from real forward
+            # all_routing: {pool_name: [n_layers, B, S, N_pool]}
+            all_routing = extractor(input_arr)
 
-            # Attention: 6 weight tensors [B, S, N_pool]
-            attn_names = ['fqk_Q', 'fqk_K', 'fv', 'rqk_Q', 'rqk_K', 'rv']
-            for w, name in zip(attn_weights, attn_names):
-                w_last = np.asarray(w[0, -1])  # [N_pool] at last position
-                active = np.where(w_last > 0)[0]
-                for idx in active:
-                    freq[name][int(idx)] += 1
-
-            # Knowledge: 2 weight tensors
-            know_names = ['feature_know', 'restore_know']
-            for w, name in zip(know_weights, know_names):
-                w_last = np.asarray(w[0, -1])
-                active = np.where(w_last > 0)[0]
-                for idx in active:
-                    freq[name][int(idx)] += 1
+            for pool_name in ALL_POOL_NAMES:
+                w = all_routing[pool_name]  # [n_layers, B, S, N_pool]
+                # Sum across layers, take last token position
+                # A neuron is "active" if selected in ANY layer
+                w_np = np.asarray(w)  # [L, B, S, N]
+                for layer_idx in range(w_np.shape[0]):
+                    w_last = w_np[layer_idx, 0, -1]  # [N_pool]
+                    active = np.where(w_last > 0)[0]
+                    for idx in active:
+                        freq[pool_name][int(idx)] += 1
 
         # Top-5 predicted tokens
         top5 = sorted(token_counts.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -551,34 +547,33 @@ class NeuronSuppressionExperimentJAX:
         }
 
     def _build_routing_extractor(self):
-        """Build JIT-compiled function that returns routing weights only."""
+        """
+        Build JIT-compiled function that runs a REAL forward pass
+        and returns per-layer routing weights via jax.lax.scan.
+
+        This mirrors the model's actual __call__ scan body so routing
+        reflects the hidden state at each layer (not just layer-0 input).
+
+        Returns fn(input_ids) → {pool_name: [n_layers, B, S, N_pool]}
+        """
         all_params = self.params['params']
+        sn_params = all_params['shared_neurons']
         router_params = all_params['router']
-        nr = router_params['neuron_router']
+        token_emb_table = jnp.asarray(all_params['token_emb']['embedding'])
+        pos_emb_table = jnp.asarray(all_params['pos_emb']['embedding'])
+        norm_scale = all_params['norm']['scale']
+        norm_bias = all_params['norm']['bias']
 
-        token_emb_table = all_params['token_emb']['embedding']
-        pos_emb_table = all_params['pos_emb']['embedding']
-
-        neuron_emb = nr['neuron_emb']
-        attn_kernel = nr['proj_all']['kernel']
-        attn_bias = nr['proj_all']['bias']
-        fk_kernel = nr['proj_feature_know']['kernel']
-        fk_bias = nr['proj_feature_know']['bias']
-        rk_kernel = nr['proj_restore_know']['kernel']
-        rk_bias = nr['proj_restore_know']['bias']
-
+        n_layers = self.config.get('n_layers', 16)
         n_fqk = self.config.get('n_feature_qk', 88)
         n_fv = self.config.get('n_feature_v', 352)
         n_rqk = self.config.get('n_restore_qk', 88)
         n_rv = self.config.get('n_restore_v', 352)
         n_fk = self.config.get('n_feature_know', 224)
-
-        fqk_end = n_fqk
-        fv_end = fqk_end + n_fv
-        rqk_end = fv_end + n_rqk
-        rv_end = rqk_end + n_rv
-        fk_end = rv_end + n_fk
-
+        n_rk = self.config.get('n_restore_know', 224)
+        n_heads = self.config.get('n_heads', 8)
+        d_model = self.config.get('d_model', 768)
+        d_space = self.config.get('d_space', 256)
         tk_fqk = self.config.get('top_k_feature_qk', 16)
         tk_fv = self.config.get('top_k_feature_v', 16)
         tk_rqk = self.config.get('top_k_restore_qk', 16)
@@ -586,41 +581,74 @@ class NeuronSuppressionExperimentJAX:
         tk_fk = self.config.get('top_k_feature_know', 16)
         tk_rk = self.config.get('top_k_restore_know', 16)
 
+        # Stack block params
+        block_params_list = [all_params[f'block_{i}'] for i in range(n_layers)]
+        stacked_block_params = jax.tree.map(
+            lambda *arrays: jnp.stack(arrays), *block_params_list)
+
         @jax.jit
         def extract(input_ids):
             B, S = input_ids.shape
             positions = jnp.arange(S)[jnp.newaxis, :]
-            x = jnp.take(token_emb_table, input_ids, axis=0) + jnp.take(pos_emb_table, positions, axis=0)
+            x = jnp.take(token_emb_table, input_ids, axis=0) + \
+                jnp.take(pos_emb_table, positions, axis=0)
 
-            emb_norm = neuron_emb / (jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8)
+            rng = jax.random.PRNGKey(0)
+            layer_rngs = jax.random.split(rng, n_layers)
 
-            # Attention routing
-            all_proj = x @ attn_kernel + attn_bias
-            splits = jnp.split(all_proj, 6, axis=-1)
-            embs = [emb_norm[:fqk_end], emb_norm[:fqk_end],
-                    emb_norm[fqk_end:fv_end], emb_norm[fv_end:rqk_end],
-                    emb_norm[fv_end:rqk_end], emb_norm[rqk_end:rv_end]]
-            tks = [tk_fqk, tk_fqk, tk_fv, tk_rqk, tk_rqk, tk_rv]
+            def scan_body(carry, xs):
+                x = carry
+                bp = xs['params']
+                rng = xs['rng']
+                rng, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng, 5)
 
-            attn_results = []
-            for h, emb, tk in zip(splits, embs, tks):
-                logits = jnp.einsum('bsd,nd->bsn', h, emb)
-                pref = jax.nn.softmax(logits, axis=-1)
-                w, _ = topk_sparsify(pref, tk)
-                attn_results.append(w)
+                # --- Attention sub-block (real forward) ---
+                normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
 
-            # Knowledge routing
-            h_fk = x @ fk_kernel + fk_bias
-            logits_fk = jnp.einsum('bsd,nd->bsn', h_fk, emb_norm[rv_end:fk_end])
-            pref_fk = jax.nn.softmax(logits_fk, axis=-1)
-            w_fk, _ = topk_sparsify(pref_fk, tk_fk)
+                (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+                 _) = _router_attn_forward(
+                    normed, router_params,
+                    n_fqk, n_fv, n_rqk, n_rv, d_space,
+                    tk_fqk, tk_fv, tk_rqk, tk_rv,
+                    0.0, None, True, rng_ar)
 
-            h_rk = x @ rk_kernel + rk_bias
-            logits_rk = jnp.einsum('bsd,nd->bsn', h_rk, emb_norm[fk_end:])
-            pref_rk = jax.nn.softmax(logits_rk, axis=-1)
-            w_rk, _ = topk_sparsify(pref_rk, tk_rk)
+                attn_out = _attention_forward(
+                    normed, sn_params,
+                    fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+                    bp['attn']['expand_O']['kernel'],
+                    n_fqk, n_rqk, n_heads, d_model,
+                    0.0, True, rng_a)
 
-            return attn_results, (w_fk, w_rk)
+                x = x + attn_out
+
+                # --- Knowledge sub-block (real forward) ---
+                normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+
+                fknow_w, rknow_w, _ = _router_know_forward(
+                    normed, router_params,
+                    n_fqk, n_fv, n_rqk, n_rv, n_fk, n_rk,
+                    tk_fk, tk_rk,
+                    0.0, None, True, rng_kr)
+
+                know_out = _knowledge_forward(
+                    normed, sn_params, fknow_w, rknow_w,
+                    0.0, True, rng_k)
+
+                x = x + know_out
+
+                # Collect routing weights for this layer
+                routing = {
+                    'fqk_Q': fqk_w_Q, 'fqk_K': fqk_w_K,
+                    'fv': fv_w, 'rqk_Q': rqk_w_Q,
+                    'rqk_K': rqk_w_K, 'rv': rv_w,
+                    'feature_know': fknow_w, 'restore_know': rknow_w,
+                }
+                return x, routing
+
+            xs = {'params': stacked_block_params, 'rng': layer_rngs}
+            _, all_routing = jax.lax.scan(scan_body, x, xs)
+            # all_routing: {pool: [n_layers, B, S, N_pool]}
+            return all_routing
 
         return extract
 
