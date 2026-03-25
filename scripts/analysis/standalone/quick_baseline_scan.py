@@ -15,20 +15,26 @@ import jax.numpy as jnp
 from scripts.analysis.utils_jax import load_model_jax, create_model_from_config
 
 QUERIES = [
-    ("the capital of france is",    "paris"),
-    ("the capital of germany is",   "berlin"),
-    ("the capital of italy is",     "rome"),
-    ("the capital of spain is",     "madrid"),
-    ("the capital of china is",     "beijing"),
-    ("the eiffel tower is in",      "paris"),
-    ("the colosseum is in",         "rome"),
-    ("mount fuji is in",            "japan"),
-    ("shakespeare was born in",     "england"),
-    ("the sun rises in the",        "east"),
-    ("ice is made of",              "water"),
-    ("the earth orbits the",        "sun"),
-    ("humans have two",             "eyes"),
-    ("fire is",                     "hot"),
+    ("the earth orbits the",                    "sun"),
+    ("the sun rises in the",                    "east"),
+    ("mount fuji is in",                        "japan"),
+    ("the eiffel tower is in",                  "paris"),
+    ("water boils at",                          "hundred"),
+    ("the moon orbits the",                     "earth"),
+    ("tokyo is the capital of",                 "japan"),
+    ("berlin is the capital of",                "germany"),
+    ("rome is the capital of",                  "italy"),
+    ("the nile is a",                           "river"),
+    ("the great wall is in",                    "china"),
+    ("the pyramids are in",                     "egypt"),
+    ("honey is made by",                        "bees"),
+    ("the heart pumps",                         "blood"),
+    ("the amazon river is in",                  "brazil"),
+    ("einstein was born in",                    "germany"),
+    ("the pacific is an",                       "ocean"),
+    ("the capital of the united kingdom is",    "london"),
+    ("the capital of france is",                "paris"),
+    ("the capital of japan is",                 "tokyo"),
 ]
 
 
@@ -59,14 +65,11 @@ def main():
     _.block_until_ready()
     print("done\n")
 
-    hits = []
-    misses = []
+    all_results = []
 
-    print("=" * 80)
-    print(f"  {'Prompt':<35s} {'Target':<10s} {'Rank':>4s}  {'Prob':>7s}  Top-{args.top_k}")
-    print("=" * 80)
+    print(f"Scanning {len(QUERIES)} queries...\n")
 
-    for prompt, target in QUERIES:
+    for qi, (prompt, target) in enumerate(QUERIES, 1):
         input_ids = [101] + tokenizer.encode(prompt, add_special_tokens=False)
         input_arr = jnp.array([input_ids])
 
@@ -79,35 +82,59 @@ def main():
         top_indices = np.argsort(probs)[::-1][:args.top_k]
         top_tokens = [(tokenizer.decode([i]).strip(), float(probs[i])) for i in top_indices]
 
-        # Find target rank
+        # Find target in full vocab (not just top-k)
         target_lower = target.strip().lower()
         target_rank = None
         target_prob = 0.0
-        for rank, (tok, prob) in enumerate(top_tokens, 1):
-            if tok.lower() == target_lower:
+        sorted_indices = np.argsort(probs)[::-1]
+        for rank, idx in enumerate(sorted_indices, 1):
+            tok = tokenizer.decode([idx]).strip().lower()
+            if tok == target_lower:
                 target_rank = rank
-                target_prob = prob
+                target_prob = float(probs[idx])
                 break
 
-        top_str = ", ".join(f"{tok}({prob:.1%})" for tok, prob in top_tokens)
+        all_results.append((prompt, target, target_rank, target_prob, top_tokens))
+        print(f"  [{qi}/{len(QUERIES)}] done", end="\r", flush=True)
 
-        if target_rank:
-            marker = f"#{target_rank}"
-            print(f"  {prompt:<35s} {target:<10s} {marker:>4s}  {target_prob:>6.1%}  {top_str}")
-            hits.append((prompt, target, target_rank, target_prob, top_tokens))
+    print(" " * 40)  # clear progress line
+
+    # Sort by target_prob descending
+    all_results.sort(key=lambda x: x[3], reverse=True)
+
+    print("=" * 100)
+    print(f"  {'#':<3s} {'Prompt':<42s} {'Target':<10s} {'Rank':>5s} {'Prob':>8s}  Top-{args.top_k}")
+    print("=" * 100)
+
+    hits = []
+    misses = []
+    for i, (prompt, target, rank, prob, top_tokens) in enumerate(all_results, 1):
+        top_str = ", ".join(f"{tok}({p:.1%})" for tok, p in top_tokens)
+        in_topk = rank is not None and rank <= args.top_k
+        rank_str = f"#{rank}" if rank else "-"
+        prob_str = f"{prob:.2%}" if rank else "-"
+        marker = " *" if in_topk else ""
+        print(f"  {i:<3d} {prompt:<42s} {target:<10s} {rank_str:>5s} {prob_str:>8s}  {top_str}{marker}")
+
+        if in_topk:
+            hits.append((prompt, target, rank, prob))
         else:
-            print(f"  {prompt:<35s} {target:<10s}    -      -  {top_str}")
-            misses.append((prompt, target, top_tokens))
+            misses.append((prompt, target, rank, prob, top_tokens))
 
-    print("=" * 80)
-    print(f"\n  Hits (target in top-{args.top_k}): {len(hits)}/{len(QUERIES)}")
-    for prompt, target, rank, prob, _ in hits:
-        print(f"    #{rank} {prob:>5.1%}  \"{prompt}\" -> {target}")
+    print("=" * 100)
+
+    print(f"\n  === HITS (target in top-{args.top_k}): {len(hits)}/{len(all_results)} ===")
+    print(f"  {'Prompt':<42s} {'Target':<10s} {'Rank':>5s} {'Prob':>8s}")
+    print(f"  {'-'*42} {'-'*10} {'-'*5} {'-'*8}")
+    for prompt, target, rank, prob in hits:
+        print(f"  {prompt:<42s} {target:<10s} #{rank:>3d} {prob:>7.2%}")
 
     if misses:
-        print(f"\n  Misses: {len(misses)}/{len(QUERIES)}")
-        for prompt, target, top in misses:
-            print(f"    \"{prompt}\" -> {target}  (top: {top[0][0]})")
+        print(f"\n  === MISSES: {len(misses)}/{len(all_results)} ===")
+        for prompt, target, rank, prob, top in misses:
+            rank_str = f"#{rank}" if rank else "N/A"
+            prob_str = f"{prob:.2%}" if rank else "N/A"
+            print(f"  {prompt:<42s} {target:<10s} {rank_str:>5s} {prob_str:>8s}  (top1: {top[0][0]})")
 
 
 if __name__ == "__main__":
