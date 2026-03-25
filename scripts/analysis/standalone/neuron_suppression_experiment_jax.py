@@ -546,11 +546,17 @@ class NeuronSuppressionExperimentJAX:
         prompt_hash = hash(prompt) & 0xFFFFFFFF
         rng_key = jax.random.PRNGKey(prompt_hash)
 
+        phase1_t0 = time.time()
         while successful_runs < min_target_count and total_runs < max_runs:
             total_runs += 1
-            if total_runs % 20 == 0 or successful_runs == min_target_count:
+            if total_runs % 10 == 0 or successful_runs == min_target_count:
+                elapsed_p1 = time.time() - phase1_t0
+                rate = successful_runs / elapsed_p1 if elapsed_p1 > 0 and successful_runs > 0 else 0
+                eta = (min_target_count - successful_runs) / rate if rate > 0 else 0
                 print(f"\r      {successful_runs}/{min_target_count} hits "
-                      f"(run {total_runs})", end='', flush=True)
+                      f"(run {total_runs}/{max_runs}) "
+                      f"[{elapsed_p1:.0f}s elapsed, ~{eta:.0f}s remaining]",
+                      end='', flush=True)
 
             # Init KV cache + prefill with routing
             kv_k, kv_v = dawn_init_kv_cache(self.config, batch_size=1)
@@ -805,12 +811,15 @@ class NeuronSuppressionExperimentJAX:
         match_count = 0
         token_counts = defaultdict(int)
 
-        for _ in range(n_runs):
+        for ri in range(n_runs):
+            if ri % 20 == 0 or ri == n_runs - 1:
+                print(f"\r      run {ri+1}/{n_runs} (matches: {match_count})", end='', flush=True)
             logits = forward_fn(input_arr)
             next_id = int(jnp.argmax(logits[0, -1, :]))
             token_counts[next_id] += 1
             if next_id == target_id:
                 match_count += 1
+        print()  # newline after progress
 
         top5 = sorted(token_counts.items(), key=lambda x: x[1], reverse=True)[:5]
         top5_decoded = [
@@ -866,8 +875,8 @@ class NeuronSuppressionExperimentJAX:
         print("=" * 70)
 
         freq_results = []
-        for q in capital_queries:
-            print(f"\n  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+        for qi, q in enumerate(capital_queries, 1):
+            print(f"\n  [{qi}/{len(capital_queries)}] Query: \"{q['prompt']}\" -> target: '{q['target']}'")
             t0 = time.time()
             freq = self.collect_activation_frequencies(
                 q['prompt'], q['target'],
@@ -895,8 +904,9 @@ class NeuronSuppressionExperimentJAX:
         # Control queries — same sampling method
         print(f"\n  --- Control queries ---")
         control_freqs = []
-        for q in control_queries:
-            print(f"\n  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+        for qi, q in enumerate(control_queries, 1):
+            print(f"\n  [{qi}/{len(control_queries)}] Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+            t0 = time.time()
             freq = self.collect_activation_frequencies(
                 q['prompt'], q['target'],
                 min_target_count=min_target_count,
@@ -904,6 +914,8 @@ class NeuronSuppressionExperimentJAX:
                 max_tokens_per_run=max_tokens_per_run,
                 temperature=temperature,
                 top_k=top_k_sampling)
+            elapsed = time.time() - t0
+            print(f"    [{elapsed:.1f}s]")
             control_freqs.append(freq)
         results['phase1']['control_frequencies'] = control_freqs
 
@@ -947,21 +959,27 @@ class NeuronSuppressionExperimentJAX:
 
         print("\n  --- Capital queries (suppressed) ---")
         capital_post = []
-        for q in capital_queries:
-            print(f"\n  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+        for qi, q in enumerate(capital_queries, 1):
+            print(f"\n  [{qi}/{len(capital_queries)}] Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+            t0 = time.time()
             post = self.measure_target_frequency(
                 q['prompt'], q['target'], n_runs=max_runs,
                 forward_fn=suppressed_forward)
+            elapsed = time.time() - t0
+            print(f"    Result: {post['match_rate']:.1%} | top5: {', '.join(f'{t}({p:.0%})' for t,_,p in post['top5'])} [{elapsed:.1f}s]")
             capital_post.append(post)
         results['phase3']['capital_post_suppression'] = capital_post
 
         print(f"\n  --- Control queries (suppressed) ---")
         control_post = []
-        for q in control_queries:
-            print(f"\n  Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+        for qi, q in enumerate(control_queries, 1):
+            print(f"\n  [{qi}/{len(control_queries)}] Query: \"{q['prompt']}\" -> target: '{q['target']}'")
+            t0 = time.time()
             post = self.measure_target_frequency(
                 q['prompt'], q['target'], n_runs=max_runs,
                 forward_fn=suppressed_forward)
+            elapsed = time.time() - t0
+            print(f"    Result: {post['match_rate']:.1%} | top5: {', '.join(f'{t}({p:.0%})' for t,_,p in post['top5'])} [{elapsed:.1f}s]")
             control_post.append(post)
         results['phase3']['control_post_suppression'] = control_post
 
