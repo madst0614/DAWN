@@ -523,6 +523,18 @@ class NeuronSuppressionExperimentJAX:
             'feature_know': 'fknow_w', 'restore_know': 'rknow_w',
         }
 
+        # Pool size bounds for validation (matching knowledge_coherence_jax)
+        _POOL_SIZES = {
+            'fqk_Q': self.config.get('n_feature_qk', 88),
+            'fqk_K': self.config.get('n_feature_qk', 88),
+            'fv':    self.config.get('n_feature_v', 352),
+            'rqk_Q': self.config.get('n_restore_qk', 88),
+            'rqk_K': self.config.get('n_restore_qk', 88),
+            'rv':    self.config.get('n_restore_v', 352),
+            'feature_know': self.config.get('n_feature_know', 224),
+            'restore_know': self.config.get('n_restore_know', 224),
+        }
+
         target_neuron_counts = {pool: defaultdict(int) for pool in ALL_POOL_NAMES}
         baseline_neuron_counts = {pool: defaultdict(int) for pool in ALL_POOL_NAMES}
         successful_runs = 0
@@ -530,7 +542,9 @@ class NeuronSuppressionExperimentJAX:
         total_baseline_steps = 0
         sample_generations = []
 
-        rng_key = jax.random.PRNGKey(42)
+        # Different seed per prompt for diverse sampling
+        prompt_hash = hash(prompt) & 0xFFFFFFFF
+        rng_key = jax.random.PRNGKey(prompt_hash)
 
         while successful_runs < min_target_count and total_runs < max_runs:
             total_runs += 1
@@ -566,7 +580,8 @@ class NeuronSuppressionExperimentJAX:
                     # Target hit — record routing
                     for pool in ALL_POOL_NAMES:
                         for n in step_neurons[pool]:
-                            target_neuron_counts[pool][n] += 1
+                            if n < _POOL_SIZES.get(pool, 0):
+                                target_neuron_counts[pool][n] += 1
                     successful_runs += 1
                     if len(sample_generations) < 3:
                         gen_text = self.tokenizer.decode(
@@ -577,7 +592,8 @@ class NeuronSuppressionExperimentJAX:
                     # Baseline step
                     for pool in ALL_POOL_NAMES:
                         for n in step_neurons[pool]:
-                            baseline_neuron_counts[pool][n] += 1
+                            if n < _POOL_SIZES.get(pool, 0):
+                                baseline_neuron_counts[pool][n] += 1
                     total_baseline_steps += 1
 
                 if next_token in (self.tokenizer.sep_token_id,
