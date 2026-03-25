@@ -377,7 +377,11 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to .flax checkpoint (file or directory)')
     parser.add_argument('--n_runs', type=int, default=100)
-    parser.add_argument('--threshold', type=float, default=0.7)
+    parser.add_argument('--threshold', type=float, default=0.7,
+                        help='Absolute activation freq threshold (used if --top_n_pct not set)')
+    parser.add_argument('--top_n_pct', type=float, default=0.10,
+                        help='Percentile-based: suppress top N%% neurons by frequency '
+                             '(default: 0.10 = top 10%%). Set to 0 to use absolute threshold.')
     parser.add_argument('--mode', type=str, default='intersection',
                         choices=['intersection', 'union'])
     parser.add_argument('--output', type=str, default=None)
@@ -409,12 +413,14 @@ def main():
     experiment = NeuronSuppressionExperimentJAX(
         model, params, config, tokenizer
     )
+    top_n_pct = args.top_n_pct if args.top_n_pct > 0 else None
     results = experiment.run_full_experiment(
         capital_queries=capital_queries,
         control_queries=control_queries,
         n_runs=args.n_runs,
         threshold=args.threshold,
         mode=args.mode,
+        top_n_pct=top_n_pct,
     )
 
     # Save
@@ -467,28 +473,32 @@ class NeuronSuppressionExperimentJAX:
         Run baseline forward n_runs times, record which neurons are
         in top-k at the last token position.
 
-        Returns dict with match_rate and per-pool neuron frequencies.
+        Returns dict with match_rate, top-5 tokens, and per-pool neuron frequencies.
         """
         input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         input_arr = jnp.array([input_ids])
 
-        target_id = self.tokenizer.encode(target_token, add_special_tokens=False)
-        if len(target_id) == 0:
+        # Encode target — handle subword: check all tokens that START with target
+        target_ids = self.tokenizer.encode(target_token, add_special_tokens=False)
+        if len(target_ids) == 0:
             raise ValueError(f"Target token '{target_token}' not in vocabulary")
-        target_id = target_id[0]
+        target_id = target_ids[0]
 
-        # We need routing weights for frequency analysis.
-        # Use JAXRoutingDataExtractor-style extraction: compute routing
-        # from embedding layer output (first layer input).
-        # This captures the router's neuron selection.
+        # Log tokenization info
+        target_tokens_decoded = [self.tokenizer.decode([t]) for t in target_ids]
+        print(f"    [tokenizer] '{target_token}' -> ids={target_ids}, "
+              f"decoded={target_tokens_decoded}")
+
         extractor = self._build_routing_extractor()
 
         freq = {pool: defaultdict(int) for pool in ALL_POOL_NAMES}
         match_count = 0
+        token_counts = defaultdict(int)
 
         for _ in range(n_runs):
             logits = self._baseline_forward(input_arr)
             next_id = int(jnp.argmax(logits[0, -1, :]))
+            token_counts[next_id] += 1
             if next_id == target_id:
                 match_count += 1
 
@@ -512,13 +522,22 @@ class NeuronSuppressionExperimentJAX:
                 for idx in active:
                     freq[name][int(idx)] += 1
 
+        # Top-5 predicted tokens
+        top5 = sorted(token_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        top5_decoded = [
+            (self.tokenizer.decode([tid]).strip(), count, count / n_runs)
+            for tid, count in top5
+        ]
+
         return {
             'prompt': prompt,
             'target_token': target_token,
             'target_token_id': target_id,
+            'target_token_ids_all': target_ids,
             'match_count': match_count,
             'total_runs': n_runs,
             'match_rate': match_count / n_runs,
+            'top5': top5_decoded,
             'neuron_frequencies': {pool: dict(counts) for pool, counts in freq.items()},
         }
 
@@ -600,20 +619,47 @@ class NeuronSuppressionExperimentJAX:
     # Phase 1→2: Identify suppression targets
     # ----------------------------------------------------------
 
-    def identify_suppression_targets(self, freq_results, threshold=0.7, mode='intersection'):
+    def identify_suppression_targets(self, freq_results, threshold=0.7,
+                                     mode='intersection', top_n_pct=None):
         """
-        Find neurons active ≥threshold across capital queries.
-        mode='intersection': must meet threshold in ALL queries.
-        mode='union': meets threshold in ANY query.
+        Find neurons to suppress based on activation frequency.
+
+        Two strategies (controlled by top_n_pct):
+          1. top_n_pct=None (default): absolute threshold — neurons active
+             in ≥(threshold * n_runs) runs.  Works when pool_size >> top_k.
+          2. top_n_pct=float (e.g. 0.1): **percentile-based** — within each
+             pool, rank neurons by frequency and take the top N%.
+             This is the correct approach when top_k ≈ pool_size, because
+             nearly all neurons will exceed any absolute threshold.
+
+        mode='intersection': must qualify in ALL capital queries.
+        mode='union': qualifies in ANY capital query.
         """
         targets = {}
+
         for pool in ALL_POOL_NAMES:
             per_query_sets = []
+
             for result in freq_results:
                 n_runs = result['total_runs']
-                min_count = int(n_runs * threshold)
                 pool_freq = result['neuron_frequencies'].get(pool, {})
-                meeting = {int(idx) for idx, count in pool_freq.items() if count >= min_count}
+
+                if not pool_freq:
+                    per_query_sets.append(set())
+                    continue
+
+                if top_n_pct is not None:
+                    # --- Percentile-based: top N% by frequency ---
+                    sorted_neurons = sorted(pool_freq.items(),
+                                            key=lambda x: x[1], reverse=True)
+                    n_select = max(1, int(len(sorted_neurons) * top_n_pct))
+                    meeting = {int(idx) for idx, _ in sorted_neurons[:n_select]}
+                else:
+                    # --- Absolute threshold ---
+                    min_count = int(n_runs * threshold)
+                    meeting = {int(idx) for idx, count in pool_freq.items()
+                               if count >= min_count}
+
                 per_query_sets.append(meeting)
 
             if not per_query_sets:
@@ -687,6 +733,7 @@ class NeuronSuppressionExperimentJAX:
         self,
         capital_queries=None, control_queries=None,
         n_runs=100, threshold=0.7, mode='intersection',
+        top_n_pct=0.10,
     ):
         if capital_queries is None:
             capital_queries = DEFAULT_CAPITAL_QUERIES
@@ -696,6 +743,7 @@ class NeuronSuppressionExperimentJAX:
         results = {
             'config': {
                 'n_runs': n_runs, 'threshold': threshold, 'mode': mode,
+                'top_n_pct': top_n_pct,
                 'capital_queries': capital_queries,
                 'control_queries': control_queries,
             },
@@ -716,11 +764,23 @@ class NeuronSuppressionExperimentJAX:
             elapsed = time.time() - t0
             print(f"    Match rate: {freq['match_count']}/{n_runs} "
                   f"({freq['match_rate']:.0%})  [{elapsed:.1f}s]")
+            # Show top-5 predicted tokens
+            if freq['top5']:
+                top5_str = ", ".join(
+                    f"'{tok}' ({pct:.0%})" for tok, _, pct in freq['top5'])
+                print(f"    Top-5 predictions: {top5_str}")
+            # Show frequency stats per pool
             for pool in ALL_POOL_NAMES:
                 pf = freq['neuron_frequencies'].get(pool, {})
-                high = {k: v for k, v in pf.items() if v >= n_runs * threshold}
-                if high:
-                    print(f"    {pool}: {len(high)} neurons >= {threshold:.0%}")
+                if not pf:
+                    continue
+                counts = sorted(pf.values(), reverse=True)
+                n_total = len(counts)
+                n_high = sum(1 for c in counts if c >= n_runs * threshold)
+                # Show distribution: min/median/max
+                print(f"    {pool}: {n_total} neurons active, "
+                      f"{n_high}/{n_total} >= {threshold:.0%}, "
+                      f"freq range [{counts[-1]}-{counts[0]}]/{n_runs}")
             freq_results.append(freq)
 
         results['phase1']['capital_frequencies'] = freq_results
@@ -743,10 +803,12 @@ class NeuronSuppressionExperimentJAX:
         print("=" * 70)
 
         suppressed = self.identify_suppression_targets(
-            freq_results, threshold, mode)
+            freq_results, threshold, mode, top_n_pct=top_n_pct)
         total_suppressed = sum(len(v) for v in suppressed.values())
 
-        print(f"\n  Mode: {mode} | Threshold: {threshold:.0%}")
+        strategy = (f"top {top_n_pct:.0%} by frequency" if top_n_pct
+                    else f"absolute >= {threshold:.0%}")
+        print(f"\n  Mode: {mode} | Strategy: {strategy}")
         print(f"  Total neurons to suppress: {total_suppressed}")
         for pool, indices in sorted(suppressed.items()):
             idx_preview = sorted(indices)[:10]
@@ -811,7 +873,10 @@ class NeuronSuppressionExperimentJAX:
 
         config = results['config']
         phase2 = results['phase2']
-        print(f"  Threshold: {config['threshold']:.0%} | "
+        top_n_pct = config.get('top_n_pct')
+        strategy = (f"top {top_n_pct:.0%} by frequency" if top_n_pct
+                    else f"absolute >= {config['threshold']:.0%}")
+        print(f"  Strategy: {strategy} | "
               f"Mode: {config['mode']} | Runs: {config['n_runs']}")
         print(f"  Suppressed: {phase2['total_suppressed']} neurons")
         for pool, indices in sorted(phase2['suppressed_neurons'].items()):
