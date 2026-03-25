@@ -561,13 +561,8 @@ class NeuronSuppressionExperimentJAX:
             # Init KV cache + prefill with routing
             kv_k, kv_v = dawn_init_kv_cache(self.config, batch_size=1)
             prompt_2d = jnp.array(np.array(prompt_ids)[np.newaxis, :])
-            if total_runs == 1:
-                print(f"\n    [DEBUG] prompt_ids={prompt_ids[:10]}... (len={len(prompt_ids)})")
-                print(f"    [DEBUG] prompt_2d.shape={prompt_2d.shape}, calling _decode_step_with_routing...")
             logits, kv_k, kv_v, routing_info = self._decode_step_with_routing(
                 self.params, prompt_2d, kv_k, kv_v, 0)
-            if total_runs == 1:
-                print(f"    [DEBUG] logits.shape={logits.shape}, routing_info keys={list(routing_info.keys())}")
 
             generated_ids = list(prompt_ids)
             cache_pos = prompt_len
@@ -794,52 +789,37 @@ class NeuronSuppressionExperimentJAX:
         return targets
 
     # ----------------------------------------------------------
-    # Phase 3: Measure target frequency
+    # Top-k probability extraction (single forward, no sampling)
     # ----------------------------------------------------------
 
-    def measure_target_frequency(self, prompt, target_token, n_runs=100, forward_fn=None):
+    def get_next_token_probs(self, prompt, forward_fn=None, top_k=10):
         """
-        Run forward n_runs times, count target token hits.
-        Uses forward_fn (suppressed or baseline).
+        Single forward pass → softmax → top-k token probabilities.
         """
         if forward_fn is None:
             forward_fn = self._baseline_forward
 
-        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        input_ids = [101] + self.tokenizer.encode(prompt, add_special_tokens=False)
         input_arr = jnp.array([input_ids])
 
-        target_id = self.tokenizer.encode(target_token, add_special_tokens=False)
-        if len(target_id) == 0:
-            raise ValueError(f"Target token '{target_token}' not in vocabulary")
-        target_id = target_id[0]
+        logits = forward_fn(input_arr)
+        last_logits = np.array(logits[0, -1, :]).astype(np.float64)
 
-        match_count = 0
-        token_counts = defaultdict(int)
+        # Stable softmax
+        last_logits -= last_logits.max()
+        probs = np.exp(last_logits)
+        probs /= probs.sum()
 
-        for ri in range(n_runs):
-            if ri % 20 == 0 or ri == n_runs - 1:
-                print(f"\r      run {ri+1}/{n_runs} (matches: {match_count})", end='', flush=True)
-            logits = forward_fn(input_arr)
-            next_id = int(jnp.argmax(logits[0, -1, :]))
-            token_counts[next_id] += 1
-            if next_id == target_id:
-                match_count += 1
-        print()  # newline after progress
-
-        top5 = sorted(token_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        top5_decoded = [
-            (self.tokenizer.decode([tid]).strip(), count, count / n_runs)
-            for tid, count in top5
-        ]
+        top_indices = np.argsort(probs)[::-1][:top_k]
+        top_tokens = []
+        for idx in top_indices:
+            tok = self.tokenizer.decode([idx]).strip()
+            top_tokens.append((tok, int(idx), float(probs[idx])))
 
         return {
             'prompt': prompt,
-            'target_token': target_token,
-            'target_token_id': target_id,
-            'match_count': match_count,
-            'total_runs': n_runs,
-            'match_rate': match_count / n_runs,
-            'top5': top5_decoded,
+            'input_len': len(input_ids),
+            'top_tokens': top_tokens,
         }
 
     # ----------------------------------------------------------
@@ -879,6 +859,22 @@ class NeuronSuppressionExperimentJAX:
               f"temp={temperature}, top_k={top_k_sampling}")
         print("=" * 70)
 
+        # --- Baseline top-10 (before suppression) ---
+        print("\n  --- Baseline next-token probabilities (pre-suppression) ---")
+        all_queries = capital_queries + control_queries
+        baseline_probs = {}
+        for qi, q in enumerate(all_queries, 1):
+            tag = 'capital' if qi <= len(capital_queries) else 'control'
+            print(f"\n  [{qi}/{len(all_queries)}] [{tag}] \"{q['prompt']}\" -> target: '{q['target']}'")
+            bp = self.get_next_token_probs(q['prompt'])
+            baseline_probs[q['prompt']] = bp
+            target_lower = q['target'].strip().lower()
+            for tok, tid, prob in bp['top_tokens']:
+                marker = ' <-- TARGET' if tok.lower() == target_lower else ''
+                print(f"    {prob:>6.2%}  '{tok}' (id={tid}){marker}")
+        results['phase1']['baseline_top10'] = baseline_probs
+
+        # --- Sampling-based activation collection ---
         freq_results = []
         for qi, q in enumerate(capital_queries, 1):
             print(f"\n  [{qi}/{len(capital_queries)}] Query: \"{q['prompt']}\" -> target: '{q['target']}'")
@@ -891,7 +887,6 @@ class NeuronSuppressionExperimentJAX:
                 temperature=temperature,
                 top_k=top_k_sampling)
             elapsed = time.time() - t0
-            # Show top contrastive neurons per pool
             for pool in ALL_POOL_NAMES:
                 scores = freq['neuron_scores'].get(pool, {})
                 if not scores:
@@ -906,7 +901,6 @@ class NeuronSuppressionExperimentJAX:
 
         results['phase1']['capital_frequencies'] = freq_results
 
-        # Control queries — same sampling method
         print(f"\n  --- Control queries ---")
         control_freqs = []
         for qi, q in enumerate(control_queries, 1):
@@ -957,43 +951,37 @@ class NeuronSuppressionExperimentJAX:
             self.model, self.params, self.config, masks)
         print("  Suppressed forward compiled (JIT)")
 
-        # === Phase 3: Post-suppression measurement ===
+        # === Phase 3: Post-suppression top-10 comparison ===
         print("\n" + "=" * 70)
-        print("PHASE 3: Measuring post-suppression effect")
+        print("PHASE 3: Post-suppression next-token probabilities")
         print("=" * 70)
 
-        print("\n  --- Capital queries (suppressed) ---")
-        capital_post = []
-        for qi, q in enumerate(capital_queries, 1):
-            print(f"\n  [{qi}/{len(capital_queries)}] Query: \"{q['prompt']}\" -> target: '{q['target']}'")
-            t0 = time.time()
-            post = self.measure_target_frequency(
-                q['prompt'], q['target'], n_runs=max_runs,
-                forward_fn=suppressed_forward)
-            elapsed = time.time() - t0
-            print(f"    Result: {post['match_rate']:.1%} | top5: {', '.join(f'{t}({p:.0%})' for t,_,p in post['top5'])} [{elapsed:.1f}s]")
-            capital_post.append(post)
-        results['phase3']['capital_post_suppression'] = capital_post
-
-        print(f"\n  --- Control queries (suppressed) ---")
-        control_post = []
-        for qi, q in enumerate(control_queries, 1):
-            print(f"\n  [{qi}/{len(control_queries)}] Query: \"{q['prompt']}\" -> target: '{q['target']}'")
-            t0 = time.time()
-            post = self.measure_target_frequency(
-                q['prompt'], q['target'], n_runs=max_runs,
-                forward_fn=suppressed_forward)
-            elapsed = time.time() - t0
-            print(f"    Result: {post['match_rate']:.1%} | top5: {', '.join(f'{t}({p:.0%})' for t,_,p in post['top5'])} [{elapsed:.1f}s]")
-            control_post.append(post)
-        results['phase3']['control_post_suppression'] = control_post
+        suppressed_probs = {}
+        for qi, q in enumerate(all_queries, 1):
+            tag = 'capital' if qi <= len(capital_queries) else 'control'
+            print(f"\n  [{qi}/{len(all_queries)}] [{tag}] \"{q['prompt']}\" -> target: '{q['target']}'")
+            sp = self.get_next_token_probs(q['prompt'], forward_fn=suppressed_forward)
+            suppressed_probs[q['prompt']] = sp
+            target_lower = q['target'].strip().lower()
+            for tok, tid, prob in sp['top_tokens']:
+                # Find baseline prob for comparison
+                bp_prob = 0.0
+                bp = baseline_probs.get(q['prompt'], {})
+                for bt, _, bprob in bp.get('top_tokens', []):
+                    if bt == tok:
+                        bp_prob = bprob
+                        break
+                delta = prob - bp_prob
+                marker = ' <-- TARGET' if tok.lower() == target_lower else ''
+                print(f"    {prob:>6.2%}  '{tok}' (was {bp_prob:>5.2%}, delta={delta:>+6.2%}){marker}")
+        results['phase3']['suppressed_top10'] = suppressed_probs
 
         self._print_summary(results)
         return results
 
     def _print_summary(self, results):
         print("\n" + "=" * 70)
-        print("SUMMARY: Pseudo-Neuron Suppression Results")
+        print("SUMMARY: Pre vs Post Suppression (next-token top-10)")
         print("=" * 70)
 
         config = results['config']
@@ -1004,38 +992,41 @@ class NeuronSuppressionExperimentJAX:
         for pool, indices in sorted(phase2['suppressed_neurons'].items()):
             print(f"    {pool}: {len(indices)}")
 
-        print("\n" + "-" * 90)
-        print(f"  {'Query':<40s} {'Target':<8s} {'Pre':>7s} {'Post':>7s} {'Delta':>7s}")
-        print("-" * 90)
+        baseline = results['phase1'].get('baseline_top10', {})
+        suppressed = results['phase3'].get('suppressed_top10', {})
+        all_queries = config['capital_queries'] + config['control_queries']
+        n_capital = len(config['capital_queries'])
 
-        cap_freqs = results['phase1']['capital_frequencies']
-        cap_posts = results['phase3'].get('capital_post_suppression', [])
-        for freq, post in zip(cap_freqs, cap_posts):
-            pre = freq['match_rate']
-            pst = post['match_rate']
-            delta = pst - pre
-            print(f"  {freq['prompt'][:38]:<40s} {freq['target_token']:<8s} "
-                  f"{pre:>6.0%}  {pst:>6.0%}  {delta:>+6.0%}")
+        print("\n" + "-" * 95)
+        print(f"  {'Query':<35s} {'Target':<8s} {'Pre(target)':>11s} {'Post(target)':>12s} {'Delta':>8s}")
+        print("-" * 95)
 
-        print("-" * 90)
+        for qi, q in enumerate(all_queries):
+            tag = '' if qi < n_capital else '  (ctrl)'
+            prompt = q['prompt']
+            target_lower = q['target'].strip().lower()
 
-        ctrl_freqs = results['phase1'].get('control_frequencies', [])
-        ctrl_posts = results['phase3'].get('control_post_suppression', [])
-        for freq, post in zip(ctrl_freqs, ctrl_posts):
-            pre = freq['match_rate']
-            pst = post['match_rate']
-            delta = pst - pre
-            print(f"  {freq['prompt'][:38]:<40s} {freq['target_token']:<8s} "
-                  f"{pre:>6.0%}  {pst:>6.0%}  {delta:>+6.0%}  (control)")
+            # Find target prob in baseline
+            pre_prob = 0.0
+            bp = baseline.get(prompt, {})
+            for tok, _, prob in bp.get('top_tokens', []):
+                if tok.lower() == target_lower:
+                    pre_prob = prob
+                    break
 
-        print("-" * 90)
+            # Find target prob in suppressed
+            post_prob = 0.0
+            sp = suppressed.get(prompt, {})
+            for tok, _, prob in sp.get('top_tokens', []):
+                if tok.lower() == target_lower:
+                    post_prob = prob
+                    break
 
-        if cap_posts:
-            print("\n  Post-suppression top-5 tokens (capital queries):")
-            for post in cap_posts:
-                tokens_str = ", ".join(
-                    f"'{tok}' ({pct:.0%})" for tok, _, pct in post['top5'])
-                print(f"    \"{post['prompt']}\" -> {tokens_str}")
+            delta = post_prob - pre_prob
+            print(f"  {prompt[:33]:<35s} {q['target']:<8s} "
+                  f"{pre_prob:>10.2%}  {post_prob:>11.2%}  {delta:>+7.2%}{tag}")
+
+        print("-" * 95)
 
 
 if __name__ == '__main__':
