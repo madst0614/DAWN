@@ -843,7 +843,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
-    model_cls, params, config = load_model_jax(args.checkpoint)
+    model_cls, params, _, config = load_model_jax(args.checkpoint)
     print(f"  Model: {config.get('model_version', '?')}, "
           f"d_model={config.get('d_model', '?')}, "
           f"n_layers={config.get('n_layers', '?')}")

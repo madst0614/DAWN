@@ -338,7 +338,7 @@ def test_with_checkpoint(checkpoint_path):
     print("Sanity Check: Partial Forward vs Full Forward (Real Checkpoint)")
     print("=" * 70)
 
-    model_cls, params, config = load_model_jax(checkpoint_path)
+    model_cls, params, _, config = load_model_jax(checkpoint_path)
     print(f"  Model: {config.get('model_version')}, d_model={config.get('d_model')}, "
           f"n_layers={config.get('n_layers')}")
 

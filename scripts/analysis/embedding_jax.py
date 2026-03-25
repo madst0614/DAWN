@@ -30,9 +30,24 @@ except ImportError:
 
 try:
     from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+try:
+    from sklearn.decomposition import PCA
+    HAS_PCA = True
+except ImportError:
+    HAS_PCA = False
 
 from .base_jax import BaseAnalyzerJAX
 from .utils_jax import (
@@ -135,10 +150,42 @@ class EmbeddingAnalyzerJAX(BaseAnalyzerJAX):
                 'std_similarity': float(off_diag.std()),
             }
 
-        # Visualization (skip for JAX version - requires matplotlib)
-        if output_dir:
+        # Visualization
+        if output_dir and HAS_MATPLOTLIB:
             os.makedirs(output_dir, exist_ok=True)
-            # TODO: Add JAX-compatible visualization
+            try:
+                pool_names = list(results.keys())
+                n = len(pool_names)
+                if n > 0:
+                    # Cross-pool similarity matrix
+                    sim_matrix = np.zeros((n, n))
+                    for i, p1 in enumerate(pool_names):
+                        for j, p2 in enumerate(pool_names):
+                            if i == j:
+                                sim_matrix[i, j] = results[p1]['avg_similarity']
+                            else:
+                                e1, e2 = embeddings[p1], embeddings[p2]
+                                n1 = e1 / (np.linalg.norm(e1, axis=1, keepdims=True) + 1e-8)
+                                n2 = e2 / (np.linalg.norm(e2, axis=1, keepdims=True) + 1e-8)
+                                c1, c2 = n1.mean(axis=0), n2.mean(axis=0)
+                                sim_matrix[i, j] = float(np.dot(c1, c2) / (np.linalg.norm(c1) * np.linalg.norm(c2) + 1e-8))
+
+                    display_names = [results[p]['display'] for p in pool_names]
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    im = ax.imshow(sim_matrix, cmap='RdYlBu_r', vmin=-1, vmax=1)
+                    ax.set_xticks(range(n))
+                    ax.set_yticks(range(n))
+                    ax.set_xticklabels(display_names, rotation=45, ha='right')
+                    ax.set_yticklabels(display_names)
+                    plt.colorbar(im, label='Cosine Similarity')
+                    ax.set_title('Neuron Embedding Similarity')
+                    plt.tight_layout()
+                    path = os.path.join(output_dir, 'similarity_heatmap.png')
+                    plt.savefig(path, dpi=150)
+                    plt.close()
+                    results['visualization'] = path
+            except Exception as e:
+                print(f"  Visualization error: {e}")
 
         return results
 
@@ -253,16 +300,58 @@ class EmbeddingAnalyzerJAX(BaseAnalyzerJAX):
                 'labels': labels.tolist(),
             }
 
-        # Visualization (skip for JAX version - requires matplotlib)
-        if output_dir:
+        # Visualization
+        if output_dir and HAS_MATPLOTLIB and HAS_PCA:
             os.makedirs(output_dir, exist_ok=True)
-            # TODO: Add JAX-compatible visualization
+            try:
+                # PCA projection of each pool's clusters
+                n_pools = len(results)
+                if n_pools > 0:
+                    cols = min(3, n_pools)
+                    rows = (n_pools + cols - 1) // cols
+                    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
+                    if rows == 1 and cols == 1:
+                        axes = np.array([axes])
+                    axes = axes.flatten()
+
+                    ax_idx = 0
+                    for name, (start, end, display) in boundaries.items():
+                        if name not in results or 'labels' not in results[name]:
+                            continue
+                        if end > len(emb_full) or ax_idx >= len(axes):
+                            continue
+
+                        pool_emb = emb_full[start:end]
+                        labels = np.array(results[name]['labels'])
+
+                        pca = PCA(n_components=2)
+                        coords = pca.fit_transform(pool_emb)
+
+                        scatter = axes[ax_idx].scatter(
+                            coords[:, 0], coords[:, 1],
+                            c=labels, cmap='tab10', s=5, alpha=0.6
+                        )
+                        axes[ax_idx].set_title(f'{display} ({n_clusters} clusters)')
+                        axes[ax_idx].set_xlabel('PC1')
+                        axes[ax_idx].set_ylabel('PC2')
+                        ax_idx += 1
+
+                    for i in range(ax_idx, len(axes)):
+                        axes[i].axis('off')
+
+                    plt.tight_layout()
+                    path = os.path.join(output_dir, 'clustering.png')
+                    plt.savefig(path, dpi=150)
+                    plt.close()
+                    results['visualization'] = path
+            except Exception as e:
+                print(f"  Clustering visualization error: {e}")
 
         return results
 
     def visualize(self, output_dir: str) -> Optional[str]:
         """
-        Generate t-SNE/PCA visualization of all embeddings.
+        Generate PCA visualization of all embeddings colored by pool.
 
         Args:
             output_dir: Directory for output
@@ -270,8 +359,71 @@ class EmbeddingAnalyzerJAX(BaseAnalyzerJAX):
         Returns:
             Path to visualization or None
         """
-        # TODO: Implement JAX-compatible visualization
-        return None
+        if not HAS_MATPLOTLIB or not HAS_PCA:
+            return None
+
+        emb = get_neuron_embeddings_jax(self.params)
+        if emb is None:
+            return None
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        pools = self.get_embedding_pools()
+        pool_sizes = {
+            'feature_qk': self.n_feature_qk,
+            'feature_v': self.n_feature_v,
+            'restore_qk': self.n_restore_qk,
+            'restore_v': self.n_restore_v,
+            'feature_know': self.n_feature_know,
+            'restore_know': self.n_restore_know,
+        }
+
+        # Build labels and colors
+        labels = []
+        colors_list = []
+        pool_colors = {
+            'feature_qk': '#e41a1c', 'feature_v': '#ff7f00',
+            'restore_qk': '#377eb8', 'restore_v': '#4daf4a',
+            'feature_know': '#984ea3', 'restore_know': '#00bfc4',
+        }
+
+        offset = 0
+        for name, (display, _, _) in pools.items():
+            n = pool_sizes.get(name, 0)
+            if n > 0 and offset + n <= len(emb):
+                labels.extend([display] * n)
+                colors_list.extend([pool_colors.get(name, '#999999')] * n)
+                offset += n
+
+        if len(labels) != len(emb[:offset]):
+            return None
+
+        try:
+            pca = PCA(n_components=2)
+            coords = pca.fit_transform(emb[:offset])
+
+            fig, ax = plt.subplots(figsize=(10, 8))
+
+            unique_labels = list(dict.fromkeys(labels))
+            for label in unique_labels:
+                mask = np.array([l == label for l in labels])
+                color = colors_list[labels.index(label)]
+                ax.scatter(coords[mask, 0], coords[mask, 1],
+                          c=color, s=5, alpha=0.5, label=label)
+
+            ax.legend(markerscale=3, fontsize=9)
+            ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)')
+            ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)')
+            ax.set_title('DAWN Neuron Embeddings (PCA)')
+            plt.tight_layout()
+
+            path = os.path.join(output_dir, 'dawn_embeddings.png')
+            plt.savefig(path, dpi=150)
+            plt.close()
+            return path
+        except Exception as e:
+            print(f"  Embedding visualization error: {e}")
+            return None
 
     def run_all(self, output_dir: str = './embedding_analysis', n_clusters: int = 5) -> Dict:
         """
@@ -330,11 +482,104 @@ class NeuronEmbeddingAnalyzerJAX(BaseAnalyzerJAX):
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Run basic embedding analysis
         basic_analyzer = EmbeddingAnalyzerJAX(self.model, self.params, self.config)
+
+        # Per-pool clustering
+        per_pool_clustering = basic_analyzer.analyze_clustering(output_dir=output_dir)
+
+        # Global clustering with optimal k (silhouette score search)
+        clustering = self._analyze_global_clustering(k_range, output_dir)
 
         return {
             'pool_distribution': basic_analyzer.analyze_similarity(output_dir),
-            'clustering': basic_analyzer.analyze_clustering(output_dir=output_dir),
+            'clustering': clustering,
+            'per_pool_clustering': per_pool_clustering,
             'cross_type_similarity': basic_analyzer.analyze_cross_type_similarity(),
         }
+
+    def _analyze_global_clustering(self, k_range: tuple = (5, 20),
+                                   output_dir: Optional[str] = None) -> Dict:
+        """Global clustering across all neuron embeddings with optimal k search."""
+        if not HAS_SKLEARN:
+            return {'error': 'sklearn not available'}
+
+        emb = get_neuron_embeddings_jax(self.params)
+        if emb is None or len(emb) == 0:
+            return {'n_embeddings': 0, 'best_silhouette': 0.0, 'error': 'No embeddings found'}
+
+        n = len(emb)
+        k_min, k_max = k_range
+        k_max = min(k_max, n - 1)  # Can't have more clusters than samples
+        if k_min > k_max:
+            k_min = max(2, k_max - 1)
+
+        best_k = k_min
+        best_sil = -1.0
+        silhouette_scores = {}
+
+        for k in range(k_min, k_max + 1):
+            try:
+                kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                labels = kmeans.fit_predict(emb)
+                sil = float(silhouette_score(emb, labels))
+                silhouette_scores[k] = sil
+                if sil > best_sil:
+                    best_sil = sil
+                    best_k = k
+            except Exception:
+                continue
+
+        # Final clustering with optimal k
+        kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(emb)
+
+        cluster_stats = []
+        for c in range(best_k):
+            mask = labels == c
+            cluster_stats.append({
+                'cluster_id': c,
+                'size': int(mask.sum()),
+            })
+
+        result = {
+            'n_embeddings': n,
+            'optimal_k': int(best_k),
+            'best_silhouette': float(best_sil),
+            'silhouette_scores': {str(k): float(s) for k, s in silhouette_scores.items()},
+            'cluster_labels': labels.tolist(),
+            'cluster_stats': sorted(cluster_stats, key=lambda x: -x['size']),
+        }
+
+        # Pool alignment analysis (which pool maps to which cluster)
+        pools = basic_analyzer_pools = EmbeddingAnalyzerJAX(self.model, self.params, self.config).get_embedding_pools()
+        pool_sizes = {
+            'feature_qk': self.n_feature_qk,
+            'feature_v': self.n_feature_v,
+            'restore_qk': self.n_restore_qk,
+            'restore_v': self.n_restore_v,
+            'feature_know': self.n_feature_know,
+            'restore_know': self.n_restore_know,
+        }
+        offset = 0
+        pool_labels = np.full(n, -1, dtype=int)
+        pool_id = 0
+        for name in ['feature_qk', 'feature_v', 'restore_qk', 'restore_v', 'feature_know', 'restore_know']:
+            sz = pool_sizes.get(name, 0)
+            if sz > 0 and offset + sz <= n:
+                pool_labels[offset:offset + sz] = pool_id
+                pool_id += 1
+                offset += sz
+
+        if offset > 0:
+            try:
+                sil_true = float(silhouette_score(emb[:offset], pool_labels[:offset]))
+                sil_pred = float(silhouette_score(emb[:offset], labels[:offset]))
+            except Exception:
+                sil_true = 0.0
+                sil_pred = 0.0
+            result['pool_alignment'] = {
+                'silhouette_true_labels': sil_true,
+                'silhouette_pred_labels': sil_pred,
+            }
+
+        return result

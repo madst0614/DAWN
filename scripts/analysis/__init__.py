@@ -119,6 +119,16 @@ try:
 except (ImportError, ModuleNotFoundError):
     # Running in a torch-free environment (e.g., TPU with JAX only).
     # Individual submodules like utils_jax can still be imported directly.
+    #
+    # Clean up partially-initialized torch-dependent modules from sys.modules
+    # to prevent cascading import failures (e.g., utils.py loaded up to
+    # `import torch` but never defined NEURON_TYPES etc.).
+    import sys as _sys
+    _torch_modules = [k for k in _sys.modules
+                      if k.startswith('scripts.analysis.') and 'jax' not in k
+                      and k != 'scripts.analysis']
+    for _k in _torch_modules:
+        del _sys.modules[_k]
     _HAS_TORCH = False
 
 

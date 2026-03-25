@@ -170,7 +170,7 @@ class BaseAnalyzerJAX(ABC):
 
     def forward(self, input_ids: np.ndarray, deterministic: bool = True) -> Dict:
         """
-        Run forward pass on model.
+        Run forward pass on model (JIT-compiled).
 
         Args:
             input_ids: Input token IDs [B, S]
@@ -182,14 +182,20 @@ class BaseAnalyzerJAX(ABC):
         if not HAS_JAX:
             raise RuntimeError("JAX not available")
 
-        rng_key = jax.random.PRNGKey(0)
+        if not hasattr(self, '_jit_forward'):
+            rng_key = jax.random.PRNGKey(0)
 
-        return self.model_instance.apply(
-            self.params,
-            jnp.array(input_ids),
-            deterministic=deterministic,
-            rngs={'dropout': rng_key}
-        )
+            @jax.jit
+            def _forward(params, input_ids):
+                return self.model_instance.apply(
+                    params,
+                    input_ids,
+                    deterministic=True,
+                    rngs={'dropout': rng_key}
+                )
+            self._jit_forward = _forward
+
+        return self._jit_forward(self.params, jnp.array(input_ids))
 
     def get_neuron_count(self, neuron_type: str) -> int:
         """Get number of neurons for a given type."""
