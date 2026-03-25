@@ -441,10 +441,13 @@ def main():
     # Load queries: --preset > --queries > defaults
     capital_queries = DEFAULT_CAPITAL_QUERIES
     control_queries = DEFAULT_CONTROL_QUERIES
+    target_label = 'target'
+    control_label = 'control'
     if args.preset:
         preset = QUERY_PRESETS[args.preset]
         capital_queries = preset['target_queries']
         control_queries = preset['control_queries']
+        target_label = args.preset
         print(f"  Preset: {args.preset} — {preset['description']}")
     elif args.queries:
         with open(args.queries) as f:
@@ -465,6 +468,8 @@ def main():
         top_k_sampling=args.top_k_sampling,
         top_n_pct=args.top_n_pct,
         mode=args.mode,
+        target_label=target_label,
+        control_label=control_label,
     )
 
     # Save
@@ -870,6 +875,7 @@ class NeuronSuppressionExperimentJAX:
         max_tokens_per_run=200,
         temperature=1.0, top_k_sampling=50,
         top_n_pct=0.10, mode='intersection',
+        target_label='target', control_label='control',
     ):
         if capital_queries is None:
             capital_queries = DEFAULT_CAPITAL_QUERIES
@@ -885,6 +891,8 @@ class NeuronSuppressionExperimentJAX:
                 'top_n_pct': top_n_pct, 'mode': mode,
                 'capital_queries': capital_queries,
                 'control_queries': control_queries,
+                'target_label': target_label,
+                'control_label': control_label,
             },
             'phase1': {}, 'phase2': {}, 'phase3': {},
         }
@@ -901,7 +909,7 @@ class NeuronSuppressionExperimentJAX:
         all_queries = capital_queries + control_queries
         baseline_probs = {}
         for qi, q in enumerate(all_queries, 1):
-            tag = 'capital' if qi <= len(capital_queries) else 'control'
+            tag = target_label if qi <= len(capital_queries) else control_label
             print(f"\n  [{qi}/{len(all_queries)}] [{tag}] \"{q['prompt']}\" -> target: '{q['target']}'")
             bp = self.get_next_token_probs(q['prompt'])
             baseline_probs[q['prompt']] = bp
@@ -995,7 +1003,7 @@ class NeuronSuppressionExperimentJAX:
 
         suppressed_probs = {}
         for qi, q in enumerate(all_queries, 1):
-            tag = 'capital' if qi <= len(capital_queries) else 'control'
+            tag = target_label if qi <= len(capital_queries) else control_label
             print(f"\n  [{qi}/{len(all_queries)}] [{tag}] \"{q['prompt']}\" -> target: '{q['target']}'")
             sp = self.get_next_token_probs(q['prompt'], forward_fn=suppressed_forward)
             suppressed_probs[q['prompt']] = sp
@@ -1092,7 +1100,7 @@ class NeuronSuppressionExperimentJAX:
         print("-" * 95)
 
         for qi, q in enumerate(all_queries):
-            tag = '' if qi < n_capital else '  (ctrl)'
+            tag = '' if qi < n_capital else f'  ({config.get("control_label", "ctrl")})'
             prompt = q['prompt']
             target_lower = q['target'].strip().lower()
 
