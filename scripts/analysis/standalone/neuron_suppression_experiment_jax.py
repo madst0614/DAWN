@@ -461,8 +461,17 @@ class NeuronSuppressionExperimentJAX:
         self.config = config
         self.tokenizer = tokenizer
 
-        # Build baseline forward (no suppression — empty masks)
-        self._baseline_forward = build_suppressed_forward(model, params, config, {})
+        # Baseline forward uses model.apply (the real model, not custom forward)
+        @jax.jit
+        def _baseline_forward(input_ids):
+            result = model.apply(
+                params, input_ids,
+                deterministic=True,
+                rngs={'dropout': jax.random.PRNGKey(0)},
+            )
+            return result['logits']
+
+        self._baseline_forward = _baseline_forward
 
     # ----------------------------------------------------------
     # Phase 1: Collect activation frequencies
