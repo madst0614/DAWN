@@ -97,6 +97,15 @@ def parse_args():
     parser.add_argument('--d4_batches', type=int, default=None,
                         help='D.4 batch count (default: 200, fast: 20)')
 
+    # D.5 Suppression sweep controls
+    parser.add_argument('--d5_mode', type=str, default='intersection',
+                        choices=['intersection', 'union'],
+                        help='Suppression neuron selection mode (default: intersection)')
+    parser.add_argument('--d5_pcts', type=str, default='0.05,0.10,0.15,0.20',
+                        help='Comma-separated sweep pct values (default: 0.05,0.10,0.15,0.20)')
+    parser.add_argument('--d5_gen_pct', type=float, default=None,
+                        help='Run generation at this specific pct. If omitted, run at first sweep point.')
+
     # Fast mode
     parser.add_argument('--fast', action='store_true',
                         help='Fast mode: reduced counts for quick verification')
@@ -119,6 +128,7 @@ def parse_args():
             setattr(args, key, val)
 
     args.skip_set = {s.strip().lower() for s in args.skip.split(',') if s.strip()}
+    args.d5_pcts_list = [float(x.strip()) for x in args.d5_pcts.split(',')]
 
     return args
 
@@ -460,16 +470,17 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
               f"(top1: '{top1_tok}' {top1_p:.2%})")
 
     # --- Sweep over top_n_pct values ---
-    sweep_pcts = [0.03, 0.04, 0.05, 0.10]
+    sweep_pcts = args.d5_pcts_list
+    sup_mode = args.d5_mode
     sweep_results = []
 
     for pct in sweep_pcts:
         print(f"\n  {'='*60}")
-        print(f"  Sweep: top_n_pct={pct:.2f}, mode=union")
+        print(f"  Sweep: top_n_pct={pct:.2f}, mode={sup_mode}")
         print(f"  {'='*60}")
 
         suppressed = experiment.identify_suppression_targets(
-            freq_results, top_n_pct=pct, mode='union')
+            freq_results, top_n_pct=pct, mode=sup_mode)
         total_neurons = sum(len(v) for v in suppressed.values())
 
         if total_neurons == 0:
@@ -561,8 +572,9 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
             'verdict': verdict,
         }
 
-        # Generation samples at last (most aggressive) sweep point
-        if pct == sweep_pcts[-1]:
+        # Generation samples at specified pct (default: first sweep point)
+        gen_pct = args.d5_gen_pct if args.d5_gen_pct is not None else sweep_pcts[0]
+        if pct == gen_pct:
             print(f"\n    === Post-suppression Generation (pct={pct}) ===")
             post_generations = {}
             for q in target_queries:
@@ -810,6 +822,7 @@ def main():
     print(f"  Params: d1_batches={args.d1_batches}, d2_sentences={args.d2_sentences}, "
           f"d3_min_targets={args.d3_min_targets}, d3_max_runs={args.d3_max_runs}, "
           f"d4_batches={args.d4_batches}")
+    print(f"  D.5: mode={args.d5_mode}, pcts={args.d5_pcts_list}, gen_pct={args.d5_gen_pct}")
     print("=" * 70)
 
     # --- Load model (shared across all analyses) ---
