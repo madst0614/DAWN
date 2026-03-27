@@ -42,6 +42,25 @@ try:
 except ImportError:
     raise RuntimeError("JAX required — this script is designed for TPU")
 
+
+def make_serializable(obj):
+    """Convert JAX/numpy types for JSON."""
+    if isinstance(obj, dict):
+        return {str(k): make_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_serializable(v) for v in obj]
+    if isinstance(obj, set):
+        return sorted(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    try:
+        return np.asarray(obj).tolist()
+    except (TypeError, ValueError):
+        pass
+    return obj
+
 # Query constants (used in summary generation)
 PHYSICS_QUERIES = [
     {"prompt": "light travels at the speed of",  "target": "light"},
@@ -150,7 +169,6 @@ def run_d1_qk_specialization(model_cls, params, config, val_tokens, args):
     # Save intermediate
     output_dir = Path(args.output) / 'd1_qk_specialization'
     output_dir.mkdir(parents=True, exist_ok=True)
-    from scripts.analysis.standalone.neuron_suppression_experiment_jax import make_serializable
     with open(output_dir / 'results.json', 'w') as f:
         json.dump(make_serializable(results), f, indent=2)
     print(f"\n  Saved: {output_dir / 'results.json'}")
@@ -195,7 +213,6 @@ def run_d2_pos_selectivity(model_cls, params, config, args):
     # Save intermediate
     output_dir = Path(args.output) / 'd2_pos_selectivity'
     output_dir.mkdir(parents=True, exist_ok=True)
-    from scripts.analysis.standalone.neuron_suppression_experiment_jax import make_serializable
     with open(output_dir / 'results.json', 'w') as f:
         json.dump(make_serializable(all_pool_results), f, indent=2)
     print(f"\n  Saved: {output_dir / 'results.json'}")
@@ -248,17 +265,17 @@ def run_d3_knowledge_neurons(model_cls, params, config, tokenizer, args):
         )
         freq_results.append(freq)
 
-        # Top contrastive neurons per pool
-        for pool in ['fv', 'rv', 'fknow', 'rknow']:
-            pool_key = {'fv': 'fv', 'rv': 'rv', 'fknow': 'feature_know',
-                        'rknow': 'restore_know'}.get(pool, pool)
-            scores = freq['neuron_scores'].get(pool_key, {})
+        # Top contrastive neurons per pool (all 8 pools)
+        for pool_key in freq['neuron_scores']:
+            scores = freq['neuron_scores'][pool_key]
             if not scores:
                 continue
             top3 = sorted(scores.items(),
                           key=lambda x: x[1]['contrastive'], reverse=True)[:3]
+            if top3[0][1]['contrastive'] <= 0:
+                continue
             top3_str = ", ".join(f"n{n}({s['contrastive']:+.3f})" for n, s in top3)
-            print(f"      {pool}: {top3_str}")
+            print(f"      {pool_key}: {top3_str}")
 
     # Also collect for control queries (with reduced count)
     print("\n  --- Contrastive score collection (control queries) ---")
@@ -314,7 +331,6 @@ def run_d4_layer_balance(params, config, val_tokens, args):
     # Save intermediate
     output_dir = Path(args.output) / 'd4_layer_balance'
     output_dir.mkdir(parents=True, exist_ok=True)
-    from scripts.analysis.standalone.neuron_suppression_experiment_jax import make_serializable
     with open(output_dir / 'results.json', 'w') as f:
         json.dump(make_serializable(results), f, indent=2)
     print(f"\n  Saved: {output_dir / 'results.json'}")
@@ -796,7 +812,6 @@ def main():
 
     # Save raw results JSON
     raw_path = output_dir / 'rebuttal_results.json'
-    from scripts.analysis.standalone.neuron_suppression_experiment_jax import make_serializable
     with open(raw_path, 'w') as f:
         json.dump(make_serializable(all_results), f, indent=2, ensure_ascii=False)
     print(f"  Raw results: {raw_path}")
