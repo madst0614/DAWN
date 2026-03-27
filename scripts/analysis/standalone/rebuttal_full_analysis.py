@@ -103,7 +103,52 @@ def parse_args():
 
 def run_d1_qk_specialization(model_cls, params, config, val_tokens, args):
     """D.1 Q/K Specialization reproduction."""
-    pass  # Part 2
+    from scripts.analysis.visualizers.qk_specialization_jax import analyze_qk_specialization
+
+    print(f"  Batches: {args.d1_batches}, batch_size=16, seq_len=512")
+    results = analyze_qk_specialization(
+        model_cls, params, config, val_tokens,
+        n_batches=args.d1_batches, batch_size=16, seq_len=512,
+    )
+
+    # Print results per pool
+    for pool_name, pool_data in results.items():
+        if pool_name == 'meta':
+            continue
+        display = pool_data['display']
+        n = pool_data['n_neurons']
+        q_spec = pool_data['q_specialized']
+        k_spec = pool_data['k_specialized']
+        shared = pool_data['shared']
+        inactive = pool_data['inactive']
+        active = n - inactive
+        spec_pct = (q_spec + k_spec) / active * 100 if active > 0 else 0
+
+        print(f"\n  {display} ({n} neurons):")
+        print(f"    Correlation (all): r={pool_data['correlation']:.4f}")
+        print(f"    Correlation (active): r={pool_data['correlation_active']:.4f}")
+        print(f"    Q-only: {q_spec}  K-only: {k_spec}  Shared: {shared}  Inactive: {inactive}")
+        print(f"    Specialization: {spec_pct:.1f}% (of {active} active)")
+        print(f"    Avg Q/K overlap: {pool_data['avg_overlap']:.4f}")
+
+        # Threshold sensitivity
+        print(f"    Threshold sensitivity:")
+        for thresh, stats in sorted(pool_data['sensitivity_analysis'].items()):
+            t_active = stats['q_specialized'] + stats['k_specialized'] + stats['shared']
+            t_spec = stats['q_specialized'] + stats['k_specialized']
+            t_pct = t_spec / t_active * 100 if t_active > 0 else 0
+            print(f"      θ={thresh}: Q={stats['q_specialized']} K={stats['k_specialized']} "
+                  f"Shared={stats['shared']} → {t_pct:.1f}% specialized")
+
+    # Save intermediate
+    output_dir = Path(args.output) / 'd1_qk_specialization'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    from scripts.analysis.standalone.neuron_suppression_experiment_jax import make_serializable
+    with open(output_dir / 'results.json', 'w') as f:
+        json.dump(make_serializable(results), f, indent=2)
+    print(f"\n  Saved: {output_dir / 'results.json'}")
+
+    return results
 
 def run_d2_pos_selectivity(model_cls, params, config, args):
     """D.2 POS Selectivity reproduction."""
