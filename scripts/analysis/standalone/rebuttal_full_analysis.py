@@ -282,7 +282,37 @@ def run_d3_knowledge_neurons(model_cls, params, config, tokenizer, args):
 
 def run_d4_layer_balance(params, config, val_tokens, args):
     """D.4 Layer-wise Attention/Knowledge Balance."""
-    pass  # Part 5
+    from scripts.analysis.visualizers.layer_balance_jax import analyze_layer_balance
+
+    print(f"  Batches: {args.d4_batches}, batch_size=4, seq_len=512")
+    results = analyze_layer_balance(
+        params, config, val_tokens,
+        n_batches=args.d4_batches, batch_size=4, seq_len=512,
+    )
+
+    # Print per-layer results
+    n_layers = results['n_layers']
+    print(f"\n  Layer-wise Attention Contribution (%):")
+    for p in results['per_layer']:
+        bar_len = int(p['attention_ratio'] / 2)
+        bar = '#' * bar_len + '.' * (50 - bar_len)
+        print(f"    L{p['layer']:2d}: {p['attention_ratio']:5.1f}% attn  "
+              f"{p['knowledge_ratio']:5.1f}% know  |{bar}|")
+
+    s = results['summary']
+    print(f"\n  Early layers (L0-{n_layers//3-1}):  {s['early_layers_attn']:.1f}% attention")
+    print(f"  Mid layers:              {s['mid_layers_attn']:.1f}% attention")
+    print(f"  Late layers:             {s['late_layers_attn']:.1f}% attention")
+
+    # Save intermediate
+    output_dir = Path(args.output) / 'd4_layer_balance'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    from scripts.analysis.standalone.neuron_suppression_experiment_jax import make_serializable
+    with open(output_dir / 'results.json', 'w') as f:
+        json.dump(make_serializable(results), f, indent=2)
+    print(f"\n  Saved: {output_dir / 'results.json'}")
+
+    return results
 
 def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
     """D.5 Suppression Sweep + generation samples."""
