@@ -15,7 +15,7 @@ Usage:
     # Full run (TPU)
     python scripts/analysis/standalone/rebuttal_full_analysis.py \
         --checkpoint gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_400M_c4_20B_v4_32/run_v17.1_20260210_160828_3201 \
-        --val_data gs://dawn-tpu-data-c4/data/c4_val.bin \
+        --val_data gs://dawn-tpu-data-c4/c4_val.bin \
         --output results/rebuttal/
 
     # Fast mode (verification)
@@ -390,6 +390,12 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
         pre_generations[q['prompt']] = text
         print(f"    '{q['prompt']}' → '{text[:80]}...'")
 
+    # --- Cache baseline probs (shared across all sweep points) ---
+    print("\n  Caching baseline probabilities...")
+    baseline_cache = {}
+    for q in target_queries + control_queries:
+        baseline_cache[q['prompt']] = experiment.get_next_token_probs(q['prompt'])
+
     # --- Sweep over top_n_pct values ---
     sweep_pcts = [0.03, 0.04, 0.05, 0.10]
     sweep_results = []
@@ -416,10 +422,10 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
         suppressed_forward = build_suppressed_forward(
             model_instance, params, config, masks)
 
-        # Measure target probs
+        # Measure target probs (baseline from cache)
         target_drops = []
         for q in target_queries:
-            bp = experiment.get_next_token_probs(q['prompt'])
+            bp = baseline_cache[q['prompt']]
             sp = experiment.get_next_token_probs(q['prompt'], forward_fn=suppressed_forward)
             target_lower = q['target'].strip().lower()
 
@@ -429,7 +435,7 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
 
         control_drops = []
         for q in control_queries:
-            bp = experiment.get_next_token_probs(q['prompt'])
+            bp = baseline_cache[q['prompt']]
             sp = experiment.get_next_token_probs(q['prompt'], forward_fn=suppressed_forward)
             target_lower = q['target'].strip().lower()
 
