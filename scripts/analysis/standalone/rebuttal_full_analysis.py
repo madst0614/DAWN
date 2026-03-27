@@ -196,8 +196,89 @@ def run_d2_pos_selectivity(model_cls, params, config, args):
     return all_pool_results
 
 def run_d3_knowledge_neurons(model_cls, params, config, tokenizer, args):
-    """D.3 Knowledge Neurons — Physics domain."""
-    pass  # Part 4
+    """D.3 Knowledge Neurons — Physics domain via contrastive score."""
+    from scripts.analysis.standalone.neuron_suppression_experiment_jax import (
+        NeuronSuppressionExperimentJAX, QUERY_PRESETS,
+        make_serializable,
+    )
+    from scripts.analysis.utils_jax import create_model_from_config
+
+    model_instance = create_model_from_config(config)
+    preset = QUERY_PRESETS['physics']
+    target_queries = preset['target_queries']
+    control_queries = preset['control_queries']
+
+    experiment = NeuronSuppressionExperimentJAX(
+        model_instance, params, config, tokenizer)
+
+    print(f"  min_target_count={args.d3_min_targets}, max_runs={args.d3_max_runs}")
+    print(f"  Target queries: {len(target_queries)}, Control queries: {len(control_queries)}")
+
+    # Baseline top-10 probabilities
+    print("\n  --- Baseline probabilities ---")
+    baseline_probs = {}
+    for q in target_queries + control_queries:
+        bp = experiment.get_next_token_probs(q['prompt'])
+        baseline_probs[q['prompt']] = bp
+        target_lower = q['target'].strip().lower()
+        target_prob = 0.0
+        for tok, _, prob in bp['top_tokens']:
+            if tok.lower() == target_lower:
+                target_prob = prob
+                break
+        tag = 'physics' if q in target_queries else 'control'
+        print(f"    [{tag}] \"{q['prompt']}\" → '{q['target']}': {target_prob:.2%}")
+
+    # Collect activation frequencies (contrastive scores) for physics queries
+    print("\n  --- Contrastive score collection (physics queries) ---")
+    freq_results = []
+    for q in target_queries:
+        print(f"\n    \"{q['prompt']}\" → '{q['target']}'")
+        freq = experiment.collect_activation_frequencies(
+            q['prompt'], q['target'],
+            min_target_count=args.d3_min_targets,
+            max_runs=args.d3_max_runs,
+        )
+        freq_results.append(freq)
+
+        # Top contrastive neurons per pool
+        for pool in ['fv', 'rv', 'fknow', 'rknow']:
+            pool_key = {'fv': 'fv', 'rv': 'rv', 'fknow': 'feature_know',
+                        'rknow': 'restore_know'}.get(pool, pool)
+            scores = freq['neuron_scores'].get(pool_key, {})
+            if not scores:
+                continue
+            top3 = sorted(scores.items(),
+                          key=lambda x: x[1]['contrastive'], reverse=True)[:3]
+            top3_str = ", ".join(f"n{n}({s['contrastive']:+.3f})" for n, s in top3)
+            print(f"      {pool}: {top3_str}")
+
+    # Also collect for control queries (with reduced count)
+    print("\n  --- Contrastive score collection (control queries) ---")
+    control_freqs = []
+    for q in control_queries:
+        print(f"    \"{q['prompt']}\" → '{q['target']}'")
+        freq = experiment.collect_activation_frequencies(
+            q['prompt'], q['target'],
+            min_target_count=max(20, args.d3_min_targets // 5),
+            max_runs=args.d3_max_runs,
+        )
+        control_freqs.append(freq)
+
+    results = {
+        'baseline_probs': baseline_probs,
+        'physics_frequencies': freq_results,
+        'control_frequencies': control_freqs,
+    }
+
+    # Save intermediate
+    output_dir = Path(args.output) / 'd3_knowledge_neurons'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(output_dir / 'results.json', 'w') as f:
+        json.dump(make_serializable(results), f, indent=2)
+    print(f"\n  Saved: {output_dir / 'results.json'}")
+
+    return results
 
 def run_d4_layer_balance(params, config, val_tokens, args):
     """D.4 Layer-wise Attention/Knowledge Balance."""
