@@ -314,9 +314,177 @@ def run_d4_layer_balance(params, config, val_tokens, args):
 
     return results
 
+def greedy_generate(forward_fn, tokenizer, prompt, max_tokens=50):
+    """Greedy decode up to max_tokens using a forward function (baseline or suppressed)."""
+    input_ids = [101] + tokenizer.encode(prompt, add_special_tokens=False)
+    generated = list(input_ids)
+
+    for _ in range(max_tokens):
+        input_arr = jnp.array([generated])
+        logits = forward_fn(input_arr)
+        next_id = int(jnp.argmax(logits[0, -1, :]))
+        if next_id in (tokenizer.sep_token_id, tokenizer.eos_token_id, 0):
+            break
+        generated.append(next_id)
+
+    return tokenizer.decode(generated, skip_special_tokens=True)
+
+
 def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
     """D.5 Suppression Sweep + generation samples."""
-    pass  # Part 6
+    from scripts.analysis.standalone.neuron_suppression_experiment_jax import (
+        NeuronSuppressionExperimentJAX, QUERY_PRESETS,
+        build_suppressed_forward, build_masks_from_sets,
+        make_serializable,
+    )
+    from scripts.analysis.utils_jax import create_model_from_config
+
+    model_instance = create_model_from_config(config)
+    preset = QUERY_PRESETS['physics']
+    target_queries = preset['target_queries']
+    control_queries = preset['control_queries']
+
+    experiment = NeuronSuppressionExperimentJAX(
+        model_instance, params, config, tokenizer)
+
+    # --- Collect activation frequencies (reuse D.3 if available) ---
+    d3_path = Path(args.output) / 'd3_knowledge_neurons' / 'results.json'
+    if d3_path.exists():
+        print("  Reusing D.3 activation frequencies from cache")
+        with open(d3_path) as f:
+            d3_data = json.load(f)
+        freq_results = d3_data.get('physics_frequencies', [])
+        # Need to reconstruct neuron_scores format for identify_suppression_targets
+        if freq_results and 'neuron_scores' in freq_results[0]:
+            print(f"  Found {len(freq_results)} cached frequency results")
+        else:
+            freq_results = None
+    else:
+        freq_results = None
+
+    if not freq_results:
+        print("  Collecting activation frequencies for physics queries...")
+        freq_results = []
+        for q in target_queries:
+            print(f"    \"{q['prompt']}\" → '{q['target']}'")
+            freq = experiment.collect_activation_frequencies(
+                q['prompt'], q['target'],
+                min_target_count=args.d3_min_targets,
+                max_runs=args.d3_max_runs,
+            )
+            freq_results.append(freq)
+
+    # --- Pre-suppression generation samples ---
+    print("\n  === Pre-suppression Generation Samples ===")
+    baseline_forward = experiment._baseline_forward
+    pre_generations = {}
+    for q in target_queries:
+        text = greedy_generate(baseline_forward, tokenizer, q['prompt'], max_tokens=50)
+        pre_generations[q['prompt']] = text
+        print(f"    '{q['prompt']}' → '{text[:80]}...'")
+
+    # --- Sweep over top_n_pct values ---
+    sweep_pcts = [0.03, 0.04, 0.05, 0.10]
+    sweep_results = []
+
+    for pct in sweep_pcts:
+        print(f"\n  --- Sweep: top_n_pct={pct:.2f}, mode=union ---")
+
+        suppressed = experiment.identify_suppression_targets(
+            freq_results, top_n_pct=pct, mode='union')
+        total_neurons = sum(len(v) for v in suppressed.values())
+        print(f"    Suppressed neurons: {total_neurons}")
+
+        if total_neurons == 0:
+            sweep_results.append({
+                'pct': pct, 'n_neurons': 0,
+                'target_drops': [], 'control_drops': [],
+                'avg_target_drop': 0, 'avg_control_drop': 0,
+                'selectivity_index': 0, 'verdict': 'NO NEURONS',
+            })
+            continue
+
+        # Build suppressed forward
+        masks = build_masks_from_sets(suppressed, config)
+        suppressed_forward = build_suppressed_forward(
+            model_instance, params, config, masks)
+
+        # Measure target probs
+        target_drops = []
+        for q in target_queries:
+            bp = experiment.get_next_token_probs(q['prompt'])
+            sp = experiment.get_next_token_probs(q['prompt'], forward_fn=suppressed_forward)
+            target_lower = q['target'].strip().lower()
+
+            pre_p = next((p for t, _, p in bp['top_tokens'] if t.lower() == target_lower), 0.0)
+            post_p = next((p for t, _, p in sp['top_tokens'] if t.lower() == target_lower), 0.0)
+            target_drops.append(pre_p - post_p)
+
+        control_drops = []
+        for q in control_queries:
+            bp = experiment.get_next_token_probs(q['prompt'])
+            sp = experiment.get_next_token_probs(q['prompt'], forward_fn=suppressed_forward)
+            target_lower = q['target'].strip().lower()
+
+            pre_p = next((p for t, _, p in bp['top_tokens'] if t.lower() == target_lower), 0.0)
+            post_p = next((p for t, _, p in sp['top_tokens'] if t.lower() == target_lower), 0.0)
+            control_drops.append(pre_p - post_p)
+
+        avg_td = float(np.mean(target_drops))
+        avg_cd = float(np.mean(control_drops))
+        sel_idx = avg_td - avg_cd
+
+        verdict = ('SELECTIVE' if sel_idx > 0.1
+                   else 'WEAK' if sel_idx > 0
+                   else 'NON-SELECTIVE')
+
+        print(f"    Target drop: {avg_td:+.2%}  Control drop: {avg_cd:+.2%}  "
+              f"Selectivity: {sel_idx:+.2%}  → {verdict}")
+
+        entry = {
+            'pct': pct, 'n_neurons': total_neurons,
+            'suppressed_per_pool': {k: len(v) for k, v in suppressed.items()},
+            'target_drops': [float(d) for d in target_drops],
+            'control_drops': [float(d) for d in control_drops],
+            'avg_target_drop': avg_td,
+            'avg_control_drop': avg_cd,
+            'selectivity_index': sel_idx,
+            'verdict': verdict,
+        }
+
+        # Generation samples at this sweep point
+        if pct == sweep_pcts[-1]:  # last (most aggressive) sweep
+            print(f"\n  === Post-suppression Generation (pct={pct}) ===")
+            post_generations = {}
+            for q in target_queries:
+                text = greedy_generate(suppressed_forward, tokenizer, q['prompt'], max_tokens=50)
+                post_generations[q['prompt']] = text
+                print(f"    '{q['prompt']}' → '{text[:80]}...'")
+            entry['post_generations'] = post_generations
+
+        sweep_results.append(entry)
+
+    # Print sweep summary table
+    print(f"\n  === Suppression Sweep Summary ===")
+    print(f"  {'pct':>5s} | {'neurons':>7s} | {'target_drop':>11s} | {'control_drop':>12s} | {'selectivity':>11s} | verdict")
+    print(f"  {'-'*5}-+-{'-'*7}-+-{'-'*11}-+-{'-'*12}-+-{'-'*11}-+--------")
+    for r in sweep_results:
+        print(f"  {r['pct']:5.2f} | {r['n_neurons']:7d} | {r['avg_target_drop']:>+10.2%} | "
+              f"{r['avg_control_drop']:>+11.2%} | {r['selectivity_index']:>+10.2%} | {r['verdict']}")
+
+    results = {
+        'sweep': sweep_results,
+        'pre_generations': pre_generations,
+    }
+
+    # Save intermediate
+    output_dir = Path(args.output) / 'd5_suppression_sweep'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(output_dir / 'results.json', 'w') as f:
+        json.dump(make_serializable(results), f, indent=2)
+    print(f"\n  Saved: {output_dir / 'results.json'}")
+
+    return results
 
 def generate_summary(all_results, args):
     """Generate rebuttal_summary.txt."""
