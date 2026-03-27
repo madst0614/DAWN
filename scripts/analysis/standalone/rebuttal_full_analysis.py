@@ -152,7 +152,48 @@ def run_d1_qk_specialization(model_cls, params, config, val_tokens, args):
 
 def run_d2_pos_selectivity(model_cls, params, config, args):
     """D.2 POS Selectivity reproduction."""
-    pass  # Part 3
+    from scripts.analysis.visualizers.pos_selectivity_jax import (
+        analyze_pos_selectivity, load_ud_ewt,
+    )
+
+    print(f"  Loading UD-EWT (max {args.d2_sentences} sentences)...")
+    dataset = load_ud_ewt(split='train', max_sentences=args.d2_sentences)
+    print(f"  Loaded {len(dataset)} sentences")
+
+    # Run on key pools: F-V and R-V (paper D.2 focus)
+    pools_to_analyze = ['fv', 'rv']
+    all_pool_results = {}
+
+    for pool in pools_to_analyze:
+        print(f"\n  Analyzing pool: {pool} (multi-layer)")
+        results, selectivity = analyze_pos_selectivity(
+            model_cls, params, config, dataset,
+            pool_type=pool, max_sentences=args.d2_sentences,
+            multi_layer=True, batch_size=16,
+        )
+        all_pool_results[pool] = results
+
+        # Print top selective neurons per POS
+        print(f"\n  [{pool.upper()}] Top POS selectivity:")
+        top_per_pos = results.get('top_selective_per_pos', {})
+        for pos, neurons in sorted(top_per_pos.items()):
+            if not neurons:
+                continue
+            top1 = neurons[0]
+            n_specialists = sum(1 for n in neurons if n.get('is_specialist'))
+            print(f"    {pos:<6s}: top neuron={top1['neuron']:3d} "
+                  f"sel={top1['selectivity']:.1f}x  "
+                  f"({n_specialists} specialists)")
+
+    # Save intermediate
+    output_dir = Path(args.output) / 'd2_pos_selectivity'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    from scripts.analysis.standalone.neuron_suppression_experiment_jax import make_serializable
+    with open(output_dir / 'results.json', 'w') as f:
+        json.dump(make_serializable(all_pool_results), f, indent=2)
+    print(f"\n  Saved: {output_dir / 'results.json'}")
+
+    return all_pool_results
 
 def run_d3_knowledge_neurons(model_cls, params, config, tokenizer, args):
     """D.3 Knowledge Neurons — Physics domain."""
