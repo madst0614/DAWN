@@ -239,19 +239,17 @@ def run_d3_knowledge_neurons(model_cls, params, config, tokenizer, args):
     print(f"  Target queries: {len(target_queries)}, Control queries: {len(control_queries)}")
 
     # Baseline top-10 probabilities
-    print("\n  --- Baseline probabilities ---")
+    print("\n  --- Baseline next-token probabilities ---")
     baseline_probs = {}
     for q in target_queries + control_queries:
         bp = experiment.get_next_token_probs(q['prompt'])
         baseline_probs[q['prompt']] = bp
         target_lower = q['target'].strip().lower()
-        target_prob = 0.0
-        for tok, _, prob in bp['top_tokens']:
-            if tok.lower() == target_lower:
-                target_prob = prob
-                break
         tag = 'physics' if q in target_queries else 'control'
-        print(f"    [{tag}] \"{q['prompt']}\" → '{q['target']}': {target_prob:.2%}")
+        print(f"\n    [{tag}] \"{q['prompt']}\" → target: '{q['target']}'")
+        for tok, tid, prob in bp['top_tokens']:
+            marker = ' <-- TARGET' if tok.lower() == target_lower else ''
+            print(f"      {prob:>6.2%}  '{tok}' (id={tid}){marker}")
 
     # Collect activation frequencies (contrastive scores) for physics queries
     print("\n  --- Contrastive score collection (physics queries) ---")
@@ -337,15 +335,58 @@ def run_d4_layer_balance(params, config, val_tokens, args):
 
     return results
 
-def greedy_generate(forward_fn, tokenizer, prompt, max_tokens=50):
-    """Greedy decode up to max_tokens using a forward function (baseline or suppressed)."""
+def greedy_generate_baseline(experiment, prompt, max_tokens=50):
+    """Greedy decode using KV-cache based generation (no JIT recompile)."""
+    tokenizer = experiment.tokenizer
+    config = experiment.config
+
+    from models.model_v17_1_jax import dawn_init_kv_cache
+
+    prompt_ids = [101] + tokenizer.encode(prompt, add_special_tokens=False)
+    prompt_len = len(prompt_ids)
+
+    kv_k, kv_v = dawn_init_kv_cache(config, batch_size=1)
+    prompt_2d = jnp.array(np.array(prompt_ids)[np.newaxis, :])
+
+    # Prefill
+    logits, kv_k, kv_v, _ = experiment._decode_step_with_routing(
+        experiment.params, prompt_2d, kv_k, kv_v, 0)
+
+    generated = list(prompt_ids)
+    cache_pos = prompt_len
+    next_id = int(jnp.argmax(logits[0, -1, :]))
+    generated.append(next_id)
+
+    for _ in range(max_tokens - 1):
+        if next_id in (tokenizer.sep_token_id, tokenizer.eos_token_id, 0):
+            break
+        if cache_pos >= config.get('max_seq_len', 512) - 1:
+            break
+
+        token_2d = jnp.array([[next_id]])
+        logits, kv_k, kv_v, _ = experiment._decode_step_with_routing(
+            experiment.params, token_2d, kv_k, kv_v, cache_pos)
+        cache_pos += 1
+        next_id = int(jnp.argmax(logits[0, 0, :]))
+        generated.append(next_id)
+
+    return tokenizer.decode(generated, skip_special_tokens=True)
+
+
+def greedy_generate_suppressed(forward_fn, tokenizer, prompt, max_tokens=50):
+    """Greedy decode with suppressed forward (padded to fixed length to avoid JIT recompile)."""
     input_ids = [101] + tokenizer.encode(prompt, add_special_tokens=False)
+    max_len = len(input_ids) + max_tokens
     generated = list(input_ids)
 
     for _ in range(max_tokens):
-        input_arr = jnp.array([generated])
+        # Pad to fixed length to avoid recompilation
+        padded = generated + [0] * (max_len - len(generated))
+        input_arr = jnp.array([padded])
         logits = forward_fn(input_arr)
-        next_id = int(jnp.argmax(logits[0, -1, :]))
+        # Take logit at the actual last token position
+        pos = len(generated) - 1
+        next_id = int(jnp.argmax(logits[0, pos, :]))
         if next_id in (tokenizer.sep_token_id, tokenizer.eos_token_id, 0):
             break
         generated.append(next_id)
@@ -397,34 +438,42 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
             )
             freq_results.append(freq)
 
-    # --- Pre-suppression generation samples ---
+    # --- Pre-suppression generation samples (KV-cache, no recompile) ---
     print("\n  === Pre-suppression Generation Samples ===")
-    baseline_forward = experiment._baseline_forward
     pre_generations = {}
     for q in target_queries:
-        text = greedy_generate(baseline_forward, tokenizer, q['prompt'], max_tokens=50)
+        text = greedy_generate_baseline(experiment, q['prompt'], max_tokens=50)
         pre_generations[q['prompt']] = text
         print(f"    '{q['prompt']}' → '{text[:80]}...'")
 
     # --- Cache baseline probs (shared across all sweep points) ---
-    print("\n  Caching baseline probabilities...")
+    print("\n  --- Baseline next-token probabilities ---")
     baseline_cache = {}
     for q in target_queries + control_queries:
-        baseline_cache[q['prompt']] = experiment.get_next_token_probs(q['prompt'])
+        bp = experiment.get_next_token_probs(q['prompt'])
+        baseline_cache[q['prompt']] = bp
+        target_lower = q['target'].strip().lower()
+        target_prob = next((p for t, _, p in bp['top_tokens'] if t.lower() == target_lower), 0.0)
+        tag = 'physics' if q in target_queries else 'control'
+        top1_tok, _, top1_p = bp['top_tokens'][0]
+        print(f"    [{tag}] \"{q['prompt']}\" → target '{q['target']}': {target_prob:.2%}  "
+              f"(top1: '{top1_tok}' {top1_p:.2%})")
 
     # --- Sweep over top_n_pct values ---
     sweep_pcts = [0.03, 0.04, 0.05, 0.10]
     sweep_results = []
 
     for pct in sweep_pcts:
-        print(f"\n  --- Sweep: top_n_pct={pct:.2f}, mode=union ---")
+        print(f"\n  {'='*60}")
+        print(f"  Sweep: top_n_pct={pct:.2f}, mode=union")
+        print(f"  {'='*60}")
 
         suppressed = experiment.identify_suppression_targets(
             freq_results, top_n_pct=pct, mode='union')
         total_neurons = sum(len(v) for v in suppressed.values())
-        print(f"    Suppressed neurons: {total_neurons}")
 
         if total_neurons == 0:
+            print(f"    No neurons to suppress!")
             sweep_results.append({
                 'pct': pct, 'n_neurons': 0,
                 'target_drops': [], 'control_drops': [],
@@ -433,13 +482,20 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
             })
             continue
 
+        print(f"    Suppressed: {total_neurons} neurons")
+        for pool, indices in sorted(suppressed.items()):
+            print(f"      {pool}: {len(indices)} — {sorted(indices)[:8]}"
+                  f"{'...' if len(indices) > 8 else ''}")
+
         # Build suppressed forward
         masks = build_masks_from_sets(suppressed, config)
         suppressed_forward = build_suppressed_forward(
             model_instance, params, config, masks)
 
-        # Measure target probs (baseline from cache)
+        # Measure target probs (baseline from cache) — per-query detail
+        print(f"\n    --- Target queries (physics/astronomy) ---")
         target_drops = []
+        target_details = []
         for q in target_queries:
             bp = baseline_cache[q['prompt']]
             sp = experiment.get_next_token_probs(q['prompt'], forward_fn=suppressed_forward)
@@ -447,9 +503,23 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
 
             pre_p = next((p for t, _, p in bp['top_tokens'] if t.lower() == target_lower), 0.0)
             post_p = next((p for t, _, p in sp['top_tokens'] if t.lower() == target_lower), 0.0)
-            target_drops.append(pre_p - post_p)
+            drop = pre_p - post_p
+            target_drops.append(drop)
 
+            # Top-5 post-suppression
+            top5_str = ", ".join(f"'{t}' {p:.1%}" for t, _, p in sp['top_tokens'][:5])
+            print(f"      \"{q['prompt']}\" → '{q['target']}'")
+            print(f"        pre={pre_p:.2%}  post={post_p:.2%}  drop={drop:+.2%}")
+            print(f"        post top-5: {top5_str}")
+            target_details.append({
+                'prompt': q['prompt'], 'target': q['target'],
+                'pre': pre_p, 'post': post_p, 'drop': drop,
+                'post_top5': [(t, p) for t, _, p in sp['top_tokens'][:5]],
+            })
+
+        print(f"\n    --- Control queries (bio/geo/history) ---")
         control_drops = []
+        control_details = []
         for q in control_queries:
             bp = baseline_cache[q['prompt']]
             sp = experiment.get_next_token_probs(q['prompt'], forward_fn=suppressed_forward)
@@ -457,7 +527,15 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
 
             pre_p = next((p for t, _, p in bp['top_tokens'] if t.lower() == target_lower), 0.0)
             post_p = next((p for t, _, p in sp['top_tokens'] if t.lower() == target_lower), 0.0)
-            control_drops.append(pre_p - post_p)
+            drop = pre_p - post_p
+            control_drops.append(drop)
+
+            print(f"      \"{q['prompt']}\" → '{q['target']}'")
+            print(f"        pre={pre_p:.2%}  post={post_p:.2%}  drop={drop:+.2%}")
+            control_details.append({
+                'prompt': q['prompt'], 'target': q['target'],
+                'pre': pre_p, 'post': post_p, 'drop': drop,
+            })
 
         avg_td = float(np.mean(target_drops))
         avg_cd = float(np.mean(control_drops))
@@ -467,39 +545,45 @@ def run_d5_suppression_sweep(model_cls, params, config, tokenizer, args):
                    else 'WEAK' if sel_idx > 0
                    else 'NON-SELECTIVE')
 
-        print(f"    Target drop: {avg_td:+.2%}  Control drop: {avg_cd:+.2%}  "
-              f"Selectivity: {sel_idx:+.2%}  → {verdict}")
+        print(f"\n    >> Avg target drop: {avg_td:+.2%}  |  Avg control drop: {avg_cd:+.2%}")
+        print(f"    >> Selectivity index: {sel_idx:+.2%}  →  {verdict}")
 
         entry = {
             'pct': pct, 'n_neurons': total_neurons,
             'suppressed_per_pool': {k: len(v) for k, v in suppressed.items()},
             'target_drops': [float(d) for d in target_drops],
             'control_drops': [float(d) for d in control_drops],
+            'target_details': target_details,
+            'control_details': control_details,
             'avg_target_drop': avg_td,
             'avg_control_drop': avg_cd,
             'selectivity_index': sel_idx,
             'verdict': verdict,
         }
 
-        # Generation samples at this sweep point
-        if pct == sweep_pcts[-1]:  # last (most aggressive) sweep
-            print(f"\n  === Post-suppression Generation (pct={pct}) ===")
+        # Generation samples at last (most aggressive) sweep point
+        if pct == sweep_pcts[-1]:
+            print(f"\n    === Post-suppression Generation (pct={pct}) ===")
             post_generations = {}
             for q in target_queries:
-                text = greedy_generate(suppressed_forward, tokenizer, q['prompt'], max_tokens=50)
+                text = greedy_generate_suppressed(
+                    suppressed_forward, tokenizer, q['prompt'], max_tokens=50)
                 post_generations[q['prompt']] = text
-                print(f"    '{q['prompt']}' → '{text[:80]}...'")
+                print(f"      '{q['prompt']}' → '{text[:80]}...'")
             entry['post_generations'] = post_generations
 
         sweep_results.append(entry)
 
     # Print sweep summary table
-    print(f"\n  === Suppression Sweep Summary ===")
+    print(f"\n  {'='*90}")
+    print(f"  SUPPRESSION SWEEP SUMMARY")
+    print(f"  {'='*90}")
     print(f"  {'pct':>5s} | {'neurons':>7s} | {'target_drop':>11s} | {'control_drop':>12s} | {'selectivity':>11s} | verdict")
     print(f"  {'-'*5}-+-{'-'*7}-+-{'-'*11}-+-{'-'*12}-+-{'-'*11}-+--------")
     for r in sweep_results:
         print(f"  {r['pct']:5.2f} | {r['n_neurons']:7d} | {r['avg_target_drop']:>+10.2%} | "
               f"{r['avg_control_drop']:>+11.2%} | {r['selectivity_index']:>+10.2%} | {r['verdict']}")
+    print(f"  {'-'*90}")
 
     results = {
         'sweep': sweep_results,
