@@ -384,19 +384,19 @@ def greedy_generate_baseline(experiment, prompt, max_tokens=50):
 
 
 def greedy_generate_suppressed(forward_fn, tokenizer, prompt, max_tokens=50):
-    """Greedy decode with suppressed forward (padded to fixed length to avoid JIT recompile)."""
+    """Greedy decode with suppressed forward.
+
+    No padding — each step uses actual sequence length.
+    Recompiles per length but guarantees identical behavior to single-pass
+    inference (get_next_token_probs). 3 queries × 50 steps = manageable on TPU.
+    """
     input_ids = [101] + tokenizer.encode(prompt, add_special_tokens=False)
-    max_len = len(input_ids) + max_tokens
     generated = list(input_ids)
 
     for _ in range(max_tokens):
-        # Pad to fixed length to avoid recompilation
-        padded = generated + [0] * (max_len - len(generated))
-        input_arr = jnp.array([padded])
+        input_arr = jnp.array([generated])
         logits = forward_fn(input_arr)
-        # Take logit at the actual last token position
-        pos = len(generated) - 1
-        next_id = int(jnp.argmax(logits[0, pos, :]))
+        next_id = int(jnp.argmax(logits[0, -1, :]))
         if next_id in (tokenizer.sep_token_id, tokenizer.eos_token_id, 0):
             break
         generated.append(next_id)
