@@ -118,7 +118,7 @@ def parse_args():
 
     # Resolve defaults: explicit > fast > full
     FULL = {'d1_batches': 50, 'd2_sentences': 5000,
-            'd3_min_targets': 100, 'd3_max_runs': 500, 'd4_batches': 50}
+            'd3_min_targets': 100, 'd3_max_runs': 20000, 'd4_batches': 50}
     FAST = {'d1_batches': 5, 'd2_sentences': 500,
             'd3_min_targets': 20, 'd3_max_runs': 100, 'd4_batches': 5}
 
