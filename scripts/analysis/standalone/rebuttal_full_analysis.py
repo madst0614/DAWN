@@ -384,19 +384,31 @@ def greedy_generate_baseline(experiment, prompt, max_tokens=50):
 
 
 def greedy_generate_suppressed(forward_fn, tokenizer, prompt, max_tokens=50):
-    """Greedy decode with suppressed forward.
+    """Greedy decode with suppressed forward (fixed-length padding, 1 JIT compile).
 
-    No padding — each step uses actual sequence length.
-    Recompiles per length but guarantees identical behavior to single-pass
-    inference (get_next_token_probs). 3 queries × 50 steps = manageable on TPU.
+    All operations in build_suppressed_forward are per-token or causal-masked:
+    - LayerNorm: per-token (axis=-1)
+    - Router projection: per-token einsum (bsd,nd->bsn)
+    - Feature/Restore: per-token einsum
+    - Attention: causal mask (jnp.tril) blocks future/padding positions
+    - Knowledge circuit: per-token
+    So padding tokens do NOT affect logits at real token positions.
+
+    Fixed pad_len across all calls avoids JIT recompilation.
     """
     input_ids = [101] + tokenizer.encode(prompt, add_special_tokens=False)
+    # Fixed length: max_seq_len (512) to share JIT trace across all queries
+    pad_len = 512
     generated = list(input_ids)
 
     for _ in range(max_tokens):
-        input_arr = jnp.array([generated])
+        actual_len = len(generated)
+        if actual_len >= pad_len:
+            break
+        padded = generated + [0] * (pad_len - actual_len)
+        input_arr = jnp.array([padded])
         logits = forward_fn(input_arr)
-        next_id = int(jnp.argmax(logits[0, -1, :]))
+        next_id = int(jnp.argmax(logits[0, actual_len - 1, :]))
         if next_id in (tokenizer.sep_token_id, tokenizer.eos_token_id, 0):
             break
         generated.append(next_id)
