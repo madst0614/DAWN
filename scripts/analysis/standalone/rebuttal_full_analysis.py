@@ -687,6 +687,7 @@ def generate_summary(all_results, args):
     d3 = all_results.get('d3')
     w("[D.3] Knowledge Neurons — Physics Domain (400M)")
     w("  Method: contrastive score = target_freq - baseline_freq")
+    w("  Pools (paper D.3): F-V, R-V, F-Know, R-Know")
     if d3:
         baseline_probs = d3.get('baseline_probs', {})
         for q in PHYSICS_QUERIES:
@@ -698,6 +699,24 @@ def generate_summary(all_results, args):
                     prob = p
                     break
             w(f"  \"{q['prompt']}\" → '{q['target']}': {prob:.2%}")
+
+        # Top contrastive neurons per paper-specified pool
+        PAPER_POOLS = ['fv', 'rv', 'feature_know', 'restore_know']
+        freq_results = d3.get('physics_frequencies', [])
+        if freq_results:
+            w("  Top contrastive neurons (paper pools):")
+            for pool_key in PAPER_POOLS:
+                # Aggregate across physics queries
+                all_scores = {}
+                for freq in freq_results:
+                    scores = freq.get('neuron_scores', {}).get(pool_key, {})
+                    for n, s in scores.items():
+                        c = s.get('contrastive', s) if isinstance(s, dict) else s
+                        all_scores[n] = all_scores.get(n, 0) + (c if isinstance(c, (int, float)) else 0)
+                if all_scores:
+                    top3 = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                    top3_str = ", ".join(f"n{n}({v:+.3f})" for n, v in top3)
+                    w(f"    {pool_key}: {top3_str}")
     else:
         w("  SKIPPED")
     w()
