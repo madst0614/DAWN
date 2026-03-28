@@ -117,10 +117,10 @@ def parse_args():
     args = parser.parse_args()
 
     # Resolve defaults: explicit > fast > full
-    FULL = {'d1_batches': 200, 'd2_sentences': 5000,
-            'd3_min_targets': 100, 'd3_max_runs': 500, 'd4_batches': 200}
-    FAST = {'d1_batches': 20, 'd2_sentences': 500,
-            'd3_min_targets': 20, 'd3_max_runs': 100, 'd4_batches': 20}
+    FULL = {'d1_batches': 50, 'd2_sentences': 5000,
+            'd3_min_targets': 100, 'd3_max_runs': 500, 'd4_batches': 50}
+    FAST = {'d1_batches': 5, 'd2_sentences': 500,
+            'd3_min_targets': 20, 'd3_max_runs': 100, 'd4_batches': 5}
 
     defaults = FAST if args.fast else FULL
     for key, val in defaults.items():
@@ -141,10 +141,10 @@ def run_d1_qk_specialization(model_cls, params, config, val_tokens, args):
     """D.1 Q/K Specialization reproduction."""
     from scripts.analysis.visualizers.qk_specialization_jax import analyze_qk_specialization
 
-    print(f"  Batches: {args.d1_batches}, batch_size=16, seq_len=512")
+    print(f"  Batches: {args.d1_batches}, batch_size=64, seq_len=512")
     results = analyze_qk_specialization(
         model_cls, params, config, val_tokens,
-        n_batches=args.d1_batches, batch_size=16, seq_len=512,
+        n_batches=args.d1_batches, batch_size=64, seq_len=512,
     )
 
     # Print results per pool
@@ -316,10 +316,10 @@ def run_d4_layer_balance(params, config, val_tokens, args):
     """D.4 Layer-wise Attention/Knowledge Balance."""
     from scripts.analysis.visualizers.layer_balance_jax import analyze_layer_balance
 
-    print(f"  Batches: {args.d4_batches}, batch_size=4, seq_len=512")
+    print(f"  Batches: {args.d4_batches}, batch_size=16, seq_len=512")
     results = analyze_layer_balance(
         params, config, val_tokens,
-        n_batches=args.d4_batches, batch_size=4, seq_len=512,
+        n_batches=args.d4_batches, batch_size=16, seq_len=512,
     )
 
     # Print per-layer results
@@ -836,7 +836,7 @@ def main():
 
     # --- Load validation data (shared by D.1, D.4) ---
     print("\n  Loading validation data...")
-    max_tokens = max(args.d1_batches, args.d4_batches) * 32 * 512
+    max_tokens = max(args.d1_batches * 64, args.d4_batches * 16) * 512
     val_tokens = load_val_data_jax(args.val_data, max_tokens=max_tokens)
     print(f"  Loaded {len(val_tokens):,} tokens")
 
