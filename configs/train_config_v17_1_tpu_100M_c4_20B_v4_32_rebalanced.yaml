@@ -31,8 +31,8 @@ model:
   top_k_restore_qk: 4
   top_k_restore_v: 6
 
-  n_feature_know: 526
-  n_restore_know: 526
+  n_feature_know: 615
+  n_restore_know: 615
   knowledge_rank: 64
   top_k_feature_know: 44
   top_k_restore_know: 44
