@@ -1,5 +1,6 @@
 # DAWN v17.1-TPU Training Config - 100M Scale, 20B tokens, v4-32 Pod (FAIR)
 # Parameter-matched with baseline 100M (d_model=768, n_layers=11, ~101.4M)
+# FLOPs-matched: top_k=12 → ~114.9B vs baseline ~112.5B (+2.2%)
 # Pool ratio V/QK=4.69 matches 400M FAIR (QK=192, V=Know=900)
 # Total params ≈ 101,295,616 (~0.1% match with baseline ~101,400,000)
 # Global batch: 1024 = 32 chips × 32 per_device_batch
@@ -22,19 +23,19 @@ model:
 
   n_feature_qk: 68
   n_feature_v: 319
-  top_k_feature_qk: 24
-  top_k_feature_v: 24
+  top_k_feature_qk: 12
+  top_k_feature_v: 12
 
   n_restore_qk: 68
   n_restore_v: 319
-  top_k_restore_qk: 24
-  top_k_restore_v: 24
+  top_k_restore_qk: 12
+  top_k_restore_v: 12
 
   n_feature_know: 319
   n_restore_know: 319
   knowledge_rank: 64
-  top_k_feature_know: 24
-  top_k_restore_know: 24
+  top_k_feature_know: 12
+  top_k_restore_know: 12
 
   max_seq_len: 512
   dropout: 0.1
