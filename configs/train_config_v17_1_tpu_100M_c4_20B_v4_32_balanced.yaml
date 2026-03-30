@@ -1,8 +1,8 @@
 # DAWN v17.1-TPU Training Config - 100M Scale, 20B tokens, v4-32 Pod (BALANCED)
 # Parameter-matched with baseline 100M (~101.4M)
-# QK:V:Know capacity ratio = 1:1.5:5
-# Pool redistribution for uniform ~5% selection rate
-# Compute ~105% of baseline
+# QK:V:Know capacity ratio = 1:1.4:5
+# Compute ~104% of baseline (router included)
+# Know/FFN = 73%
 # Global batch: 1024 = 32 chips × 32 per_device_batch
 
 seed: 1
@@ -23,19 +23,19 @@ model:
 
   n_feature_qk: 96
   n_feature_v: 144
-  top_k_feature_qk: 5
-  top_k_feature_v: 8
+  top_k_feature_qk: 7
+  top_k_feature_v: 10
 
   n_restore_qk: 96
   n_restore_v: 144
-  top_k_restore_qk: 5
-  top_k_restore_v: 8
+  top_k_restore_qk: 7
+  top_k_restore_v: 10
 
   n_feature_know: 479
   n_restore_know: 479
   knowledge_rank: 64
-  top_k_feature_know: 25
-  top_k_restore_know: 25
+  top_k_feature_know: 35
+  top_k_restore_know: 35
 
   max_seq_len: 512
   dropout: 0.1
