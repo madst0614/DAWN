@@ -686,6 +686,10 @@ def main():
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
     weight_decay = tcfg.get('weight_decay', 0.1)
     warmup_ratio = tcfg.get('warmup_ratio', 0.06)
+    lr_schedule_type = tcfg.get('lr_schedule', 'cosine')  # "cosine" or "wsd"
+    stable_ratio = tcfg.get('stable_ratio', 0.62)  # WSD only
+    decay_ratio = tcfg.get('decay_ratio', 0.30)    # WSD only
+    min_lr_ratio = tcfg.get('min_lr_ratio', 0.1)   # min_lr = lr * min_lr_ratio
     orth_weight = tcfg.get('orthogonality_weight', 0.01)
     div_weight = tcfg.get('diversity_weight', 0.1)
     lb_weight = tcfg.get('load_balance_weight', 2e-5)
@@ -796,6 +800,10 @@ def main():
                 lr = saved_training_config.get('lr', lr)
             weight_decay = saved_training_config.get('weight_decay', weight_decay)
             warmup_ratio = saved_training_config.get('warmup_ratio', warmup_ratio)
+            lr_schedule_type = saved_training_config.get('lr_schedule', lr_schedule_type)
+            stable_ratio = saved_training_config.get('stable_ratio', stable_ratio)
+            decay_ratio = saved_training_config.get('decay_ratio', decay_ratio)
+            min_lr_ratio = saved_training_config.get('min_lr_ratio', min_lr_ratio)
             orth_weight = saved_training_config.get('orthogonality_weight', orth_weight)
             div_weight = saved_training_config.get('diversity_weight', div_weight)
             lb_weight = saved_training_config.get('load_balance_weight', lb_weight)
@@ -809,6 +817,10 @@ def main():
         'lr': lr,
         'weight_decay': weight_decay,
         'warmup_ratio': warmup_ratio,
+        'lr_schedule': lr_schedule_type,
+        'stable_ratio': stable_ratio,
+        'decay_ratio': decay_ratio,
+        'min_lr_ratio': min_lr_ratio,
         'orthogonality_weight': orth_weight,
         'diversity_weight': div_weight,
         'load_balance_weight': lb_weight,
@@ -914,13 +926,42 @@ def main():
     total_steps = num_epochs * effective_steps_per_epoch
     warmup_steps = int(total_steps * warmup_ratio)
 
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=lr * 0.1,
-        peak_value=lr,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
-        end_value=lr * 0.1,
-    )
+    if lr_schedule_type == 'wsd':
+        # Warmup-Stable-Decay schedule
+        # warmup_ratio + stable_ratio + decay_ratio should = 1.0
+        stable_steps = int(total_steps * stable_ratio)
+        decay_steps = total_steps - warmup_steps - stable_steps
+        if decay_steps < 0:
+            decay_steps = 0
+
+        schedule = optax.join_schedules(
+            schedules=[
+                # Phase 1: linear warmup from min_lr to peak_lr
+                optax.linear_schedule(
+                    init_value=lr * min_lr_ratio,
+                    end_value=lr,
+                    transition_steps=max(warmup_steps, 1),
+                ),
+                # Phase 2: stable at peak_lr
+                optax.constant_schedule(lr),
+                # Phase 3: linear decay from peak_lr to min_lr
+                optax.linear_schedule(
+                    init_value=lr,
+                    end_value=lr * min_lr_ratio,
+                    transition_steps=max(decay_steps, 1),
+                ),
+            ],
+            boundaries=[warmup_steps, warmup_steps + stable_steps],
+        )
+    else:
+        # Default: cosine schedule
+        schedule = optax.warmup_cosine_decay_schedule(
+            init_value=lr * min_lr_ratio,
+            peak_value=lr,
+            warmup_steps=warmup_steps,
+            decay_steps=total_steps,
+            end_value=lr * min_lr_ratio,
+        )
 
     base_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -947,6 +988,12 @@ def main():
         print(f"  Steps/epoch: {steps_per_epoch}")
         print(f"  Total optimizer steps: {total_steps}")
         print(f"  Warmup steps: {warmup_steps}")
+        print(f"  LR schedule: {lr_schedule_type}")
+        if lr_schedule_type == 'wsd':
+            print(f"    Warmup: {warmup_ratio:.0%} ({warmup_steps} steps)")
+            print(f"    Stable: {stable_ratio:.0%} ({int(total_steps * stable_ratio)} steps)")
+            print(f"    Decay:  {decay_ratio:.0%} ({total_steps - warmup_steps - int(total_steps * stable_ratio)} steps)")
+            print(f"    Min LR: {lr * min_lr_ratio:.6f}")
         print(f"  LR: {lr}")
         print(f"  Weight decay: {weight_decay}")
         print(f"  Orth weight: {orth_weight}")
