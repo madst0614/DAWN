@@ -1,0 +1,68 @@
+# DAWN v17.1-TPU Training Config - 400M Scale, 40B tokens, v4-32 Pod (BALANCED + WSD)
+# Balanced + WSD: QK:V:Know ratio = 1:1.4:4.8 (from 100M balanced)
+# Know/FFN = 72.5%, Compute ~100.1% of baseline
+# Parameter-matched with fair config (~393M)
+# WSD schedule: 10% warmup, 70% stable, 20% decay
+# Global batch: 1024 = 32 chips × 32 per_device_batch
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "17.1"
+  d_model: 1280
+  n_layers: 18
+  n_heads: 16
+  rank: 64
+
+  n_feature_qk: 267
+  n_feature_v: 401
+  top_k_feature_qk: 12
+  top_k_feature_v: 17
+
+  n_restore_qk: 267
+  n_restore_v: 401
+  top_k_restore_qk: 12
+  top_k_restore_v: 17
+
+  n_feature_know: 1334
+  n_restore_know: 1334
+  knowledge_rank: 64
+  top_k_feature_know: 58
+  top_k_restore_know: 58
+
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+  d_space: 128
+  router_dropout: 0.1
+
+training:
+  batch_size: 1024
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.0003
+  weight_decay: 0.1
+  lr_schedule: "wsd"
+  warmup_ratio: 0.10
+  stable_ratio: 0.70
+  decay_ratio: 0.20
+  min_lr_ratio: 0.1
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0001
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+  checkpoint_interval: 200
+  val_interval: 200
+
+use_amp: true
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_400M_c4_40B_v4_32_balanced_wsd
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_v17_1_400M_c4_40B_v4_32_balanced_wsd
