@@ -62,6 +62,9 @@ training:
   checkpoint_interval: 200
   val_interval: 200
 
+parallelism:
+  mp: 4
+
 use_amp: true
 
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_400M_c4_40B_v4_32_balanced_wsd
