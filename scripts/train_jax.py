@@ -360,22 +360,25 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         (total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-        # All-reduce gradients across dp axis.
-        # Must be called within `with mesh:` context so 'dp' axis is resolved.
-        grads = jax.lax.pmean(grads, axis_name='dp')
+        # Gradient all-reduce: XLA SPMD handles this automatically.
+        # For replicated params with dp-sharded inputs, XLA inserts
+        # all-reduce-mean on gradients. For mp-sharded params, XLA
+        # inserts the correct reduce-scatter. No explicit pmean needed.
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
-        # Aggregate metrics across dp axis
+        # Metrics: with replicated params + dp-sharded input, each device
+        # computes the same loss (XLA auto all-reduces the forward pass
+        # intermediates for replicated outputs). Scalars are replicated.
         metrics = {
-            'total_loss': jax.lax.pmean(total_loss, axis_name='dp'),
-            'ce_loss': jax.lax.pmean(ce_loss, axis_name='dp'),
-            'aux_loss': jax.lax.pmean(aux_loss, axis_name='dp'),
-            'orth_loss': jax.lax.pmean(orth_loss, axis_name='dp'),
-            'div_loss': jax.lax.pmean(div_loss, axis_name='dp'),
-            'correct': jax.lax.psum(result['correct'], axis_name='dp'),
-            'valid_count': jax.lax.psum(result['valid_count'], axis_name='dp'),
+            'total_loss': total_loss,
+            'ce_loss': ce_loss,
+            'aux_loss': aux_loss,
+            'orth_loss': orth_loss,
+            'div_loss': div_loss,
+            'correct': result['correct'],
+            'valid_count': result['valid_count'],
         }
 
         return new_params, new_opt_state, metrics
@@ -388,7 +391,7 @@ def create_eval_step(model, mesh=None):
 
     Note: dropout RNG is required because the lax.scan forward path always
     calls make_rng('dropout') (safe_dropout neutralizes it via deterministic flag).
-    Must be called within `with mesh:` context.
+    Shardings are inferred from input/param placement on mesh.
     """
 
     @jax.jit
@@ -407,11 +410,7 @@ def create_eval_step(model, mesh=None):
         correct = result['correct']
         valid_count = result['valid_count']
 
-        return (
-            jax.lax.pmean(ce_loss, axis_name='dp'),
-            jax.lax.psum(correct, axis_name='dp'),
-            jax.lax.psum(valid_count, axis_name='dp'),
-        )
+        return ce_loss, correct, valid_count
 
     return eval_step
 
@@ -534,7 +533,7 @@ def gather_params_to_host(params):
 def evaluate(eval_step_fn, params, val_loader, mesh, max_batches=200, verbose=True):
     """Run evaluation and return avg loss and accuracy.
 
-    All hosts must call this. Must be inside `with mesh:` context.
+    All hosts must call this.
     """
     total_loss = 0.0
     total_correct = 0
@@ -1170,12 +1169,11 @@ def main():
         rng, dummy_step_rng = jax.random.split(rng)
         dummy_dropout_key = dummy_step_rng  # single key, not per-device
 
-        # First call: JIT compilation (slow). Must be inside mesh context.
+        # First call: JIT compilation (slow)
         jit_start = time.time()
-        with mesh:
-            _dummy_params, _dummy_opt, dummy_metrics = train_step_fn(
-                params, opt_state, dummy_ids, dummy_mask, dummy_dropout_key,
-            )
+        _dummy_params, _dummy_opt, dummy_metrics = train_step_fn(
+            params, opt_state, dummy_ids, dummy_mask, dummy_dropout_key,
+        )
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         if is_host0:
@@ -1184,10 +1182,9 @@ def main():
         # Second call: measure actual step time (post-JIT)
         rng, dummy_step_rng2 = jax.random.split(rng)
         step_start = time.time()
-        with mesh:
-            _dummy_params2, _dummy_opt2, dummy_metrics2 = train_step_fn(
-                params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
-            )
+        _dummy_params2, _dummy_opt2, dummy_metrics2 = train_step_fn(
+            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
+        )
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
@@ -1331,11 +1328,10 @@ def main():
             # Single dropout key per step (jit handles RNG internally)
             rng, step_rng = jax.random.split(rng)
 
-            with mesh:
-                params, opt_state, metrics = train_step_fn(
-                    params, opt_state,
-                    input_ids, attention_mask, step_rng,
-                )
+            params, opt_state, metrics = train_step_fn(
+                params, opt_state,
+                input_ids, attention_mask, step_rng,
+            )
 
             # With jit+Mesh, metrics are regular scalars (already aggregated)
             m_total = float(metrics['total_loss'])
@@ -1453,9 +1449,8 @@ def main():
                 if is_host0:
                     log_message(f"\n  Mid-epoch validation at step {global_step}...")
                 val_loader.reset()
-                with mesh:
-                    val_loss, val_acc = evaluate(eval_step_fn, params, val_loader,
-                                                 mesh, verbose=is_host0)
+                val_loss, val_acc = evaluate(eval_step_fn, params, val_loader,
+                                             mesh, verbose=is_host0)
                 if is_host0:
                     log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
                     log_jsonl({
@@ -1519,9 +1514,8 @@ def main():
         if is_host0:
             log_message("  Running end-of-epoch validation...")
         val_loader.reset()
-        with mesh:
-            val_loss, val_acc = evaluate(eval_step_fn, params, val_loader,
-                                         mesh, verbose=is_host0)
+        val_loss, val_acc = evaluate(eval_step_fn, params, val_loader,
+                                     mesh, verbose=is_host0)
 
         is_best = val_loss < best_val_loss
         if is_best:
