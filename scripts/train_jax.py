@@ -1209,8 +1209,8 @@ def main():
             est_hours = est_seconds / 3600
             print(f"  Estimated time: {est_hours:.1f}h ({remaining_steps:,} steps @ {step_time*1000:.1f}ms)", flush=True)
 
-        del _dummy_params, _dummy_opt, dummy_metrics, dummy_ids, dummy_mask, dummy_dropout_keys
-        del _dummy_params2, _dummy_opt2, dummy_metrics2, dummy_dropout_keys2
+        del _dummy_params, _dummy_opt, dummy_metrics, dummy_ids, dummy_mask, dummy_dropout_key
+        del _dummy_params2, _dummy_opt2, dummy_metrics2
         if is_host0:
             print("=== OOM check passed (JIT compiled) ===\n", flush=True)
     except Exception as e:
