@@ -45,7 +45,7 @@ except ImportError:
 
 from scripts.analysis.utils_jax import (
     load_model_jax, create_model_from_config, load_val_data_jax,
-    create_batches, JAXRoutingDataExtractor, JAXRoutingData,
+    create_batches,
     QK_POOLS, convert_to_serializable, save_results,
 )
 
@@ -67,11 +67,120 @@ if HAS_MATPLOTLIB:
         'xtick.labelsize': S['font_size_tick'], 'ytick.labelsize': S['font_size_tick'],
     })
 
+import jax
+import jax.numpy as jnp
+
+
 # Colors (consistent with qk_specialization.py)
 COLOR_Q = '#C0392B'
 COLOR_K = '#2471A3'
 COLOR_SHARED = '#50C878'
 COLOR_INACTIVE = '#95A5A6'
+
+
+# ============================================================
+# Multi-layer Q/K routing forward
+# ============================================================
+
+def _build_qk_forward(params, config, pad_len):
+    """Build a JIT-compiled full forward that returns layer-summed Q/K weights.
+
+    Runs all n_layers of attention + knowledge (full forward pass), collects
+    Q and K routing weights for both feature_qk and restore_qk pools at each
+    layer, and returns the sum across all layers.
+
+    This matches paper Appendix D.1: "accumulated across all tokens and layers."
+
+    Returns:
+        fn(input_ids[B, pad_len]) -> (fqk_wQ, fqk_wK, rqk_wQ, rqk_wK)
+        each [B, pad_len, N_pool], summed over n_layers.
+    """
+    from models.model_v17_1_jax import (
+        _layer_norm, _router_attn_forward, _router_know_forward,
+        _attention_forward, _knowledge_forward,
+    )
+
+    all_params = params.get('params', params)
+    router_params = all_params.get('router', {})
+    sn_params = all_params.get('shared_neurons', {})
+    n_layers = config.get('n_layers', 16)
+
+    n_fqk = config.get('n_feature_qk', 88)
+    n_fv = config.get('n_feature_v', 352)
+    n_rqk = config.get('n_restore_qk', 88)
+    n_rv = config.get('n_restore_v', 352)
+    n_fk = config.get('n_feature_know', 224)
+    n_rk = config.get('n_restore_know', 224)
+    d_space = config.get('d_space', 256)
+    tk_fqk = config.get('top_k_feature_qk', 16)
+    tk_fv = config.get('top_k_feature_v', 16)
+    tk_rqk = config.get('top_k_restore_qk', 16)
+    tk_rv = config.get('top_k_restore_v', 16)
+    tk_fk = config.get('top_k_feature_know', 16)
+    tk_rk = config.get('top_k_restore_know', 16)
+    n_heads = config.get('n_heads', 8)
+    d_model = config.get('d_model', 768)
+
+    block_params_list = [all_params[f'block_{i}'] for i in range(n_layers)]
+    token_emb_table = all_params['token_emb']['embedding']
+    pos_emb_table = all_params['pos_emb']['embedding']
+    positions = jnp.arange(pad_len)
+    pos_emb_fixed = pos_emb_table[positions][jnp.newaxis, :]
+
+    @jax.jit
+    def _forward(input_ids):
+        """input_ids: [B, pad_len] -> (fqk_wQ, fqk_wK, rqk_wQ, rqk_wK) each [B, pad_len, N]"""
+        x = jnp.take(token_emb_table, input_ids, axis=0) + pos_emb_fixed
+        rng_key = jax.random.PRNGKey(0)
+
+        fqk_q_sum = jnp.zeros((input_ids.shape[0], pad_len, n_fqk))
+        fqk_k_sum = jnp.zeros((input_ids.shape[0], pad_len, n_fqk))
+        rqk_q_sum = jnp.zeros((input_ids.shape[0], pad_len, n_rqk))
+        rqk_k_sum = jnp.zeros((input_ids.shape[0], pad_len, n_rqk))
+
+        for li in range(n_layers):
+            bp = block_params_list[li]
+            rng_key, rng_ar, rng_kr, rng_a, rng_k = jax.random.split(rng_key, 5)
+
+            normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            attn_results = _router_attn_forward(
+                normed, router_params,
+                n_fqk, n_fv, n_rqk, n_rv, d_space,
+                tk_fqk, tk_fv, tk_rqk, tk_rv,
+                0.0, None, True, rng_ar,
+            )
+            fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w = attn_results[:6]
+
+            fqk_q_sum = fqk_q_sum + fqk_wQ
+            fqk_k_sum = fqk_k_sum + fqk_wK
+            rqk_q_sum = rqk_q_sum + rqk_wQ
+            rqk_k_sum = rqk_k_sum + rqk_wK
+
+            attn_out = _attention_forward(
+                normed, sn_params,
+                fqk_wQ, fqk_wK, fv_w, rqk_wQ, rqk_wK, rv_w,
+                bp['attn']['expand_O']['kernel'],
+                n_fqk, n_rqk, n_heads, d_model,
+                0.0, True, rng_a,
+            )
+            x = x + attn_out
+
+            normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            fk_w, rk_w, _ = _router_know_forward(
+                normed, router_params,
+                n_fqk, n_fv, n_rqk, n_rv, n_fk, n_rk,
+                tk_fk, tk_rk,
+                0.0, None, True, rng_kr,
+            )
+            know_out = _knowledge_forward(
+                normed, sn_params, fk_w, rk_w,
+                0.0, True, rng_k,
+            )
+            x = x + know_out
+
+        return fqk_q_sum, fqk_k_sum, rqk_q_sum, rqk_k_sum
+
+    return _forward
 
 
 # ============================================================
@@ -84,64 +193,101 @@ def analyze_qk_specialization(
 ):
     """Compute per-neuron Q/K selection counts for each QK pool.
 
+    Uses full forward pass through all layers (paper Appendix D.1:
+    "accumulated across all tokens and layers").
+
     Returns dict keyed by pool name with q_counts, k_counts, correlation,
     specialization breakdown, etc.
     """
-    model_instance = create_model_from_config(config)
-    extractor = JAXRoutingDataExtractor(model_instance, params, config)
+    # Pad seq_len to hardware-aligned length
+    max_seq = config.get('max_seq_len', 512)
+    pad_len = min(seq_len, max_seq)
+    pad_len = ((pad_len + 31) // 32) * 32
+    pad_len = min(pad_len, max_seq)
 
-    results = {}
+    # Build JIT-compiled multi-layer forward
+    print(f"  JIT compiling multi-layer Q/K forward (batch_size={batch_size}, "
+          f"pad_len={pad_len})...", end=" ", flush=True)
+    import time
+    t0 = time.time()
+    forward_fn = _build_qk_forward(params, config, pad_len)
+    dummy = jnp.zeros((batch_size, pad_len), dtype=jnp.int32)
+    _ = forward_fn(dummy)
+    _[0].block_until_ready()
+    print(f"done ({time.time() - t0:.1f}s)")
 
-    for pool_name, pool_info in QK_POOLS.items():
-        n_attr = pool_info['n_attr']
-        n_neurons = config.get(n_attr, 0)
-        if n_neurons == 0:
-            continue
+    # Pre-init accumulators
+    n_fqk = config.get('n_feature_qk', 88)
+    n_rqk = config.get('n_restore_qk', 88)
+    pool_data = {
+        'feature_qk': {
+            'info': QK_POOLS['feature_qk'],
+            'n_neurons': n_fqk,
+            'q_counts': np.zeros(n_fqk, dtype=np.float64),
+            'k_counts': np.zeros(n_fqk, dtype=np.float64),
+            'overlaps': [],
+        },
+        'restore_qk': {
+            'info': QK_POOLS['restore_qk'],
+            'n_neurons': n_rqk,
+            'q_counts': np.zeros(n_rqk, dtype=np.float64),
+            'k_counts': np.zeros(n_rqk, dtype=np.float64),
+            'overlaps': [],
+        },
+    }
 
-        q_counts = np.zeros(n_neurons, dtype=np.float64)
-        k_counts = np.zeros(n_neurons, dtype=np.float64)
+    batches = create_batches(val_tokens, batch_size, seq_len)
+    if n_batches:
+        batches = batches[:n_batches]
 
-        if pool_name == 'feature_qk':
-            std_q_key, std_k_key = 'fqk_q', 'fqk_k'
+    for batch in tqdm(batches, desc='Q/K Specialization (multi-layer)'):
+        input_ids = np.array(batch)
+        B, S_actual = input_ids.shape
+
+        # Pad to fixed pad_len
+        if S_actual < pad_len:
+            padded = np.zeros((B, pad_len), dtype=np.int32)
+            padded[:, :S_actual] = input_ids
         else:
-            std_q_key, std_k_key = 'rqk_q', 'rqk_k'
+            padded = input_ids[:, :pad_len]
 
-        batches = create_batches(val_tokens, batch_size, seq_len)
-        if n_batches:
-            batches = batches[:n_batches]
+        fqk_q, fqk_k, rqk_q, rqk_k = forward_fn(jnp.array(padded))
 
-        batch_overlaps = []
+        # Convert to numpy, slice to actual length
+        fqk_q_np = np.asarray(fqk_q)[:, :S_actual, :]
+        fqk_k_np = np.asarray(fqk_k)[:, :S_actual, :]
+        rqk_q_np = np.asarray(rqk_q)[:, :S_actual, :]
+        rqk_k_np = np.asarray(rqk_k)[:, :S_actual, :]
 
-        for batch in tqdm(batches, desc=f'{pool_info["display"]} Q/K'):
-            input_ids = np.array(batch)
-            routing_info = extractor.extract_routing(input_ids)
-            routing = JAXRoutingData(routing_info)
+        # Feature QK: accumulate
+        pd = pool_data['feature_qk']
+        pd['q_counts'] += (fqk_q_np > 0).astype(float).sum(axis=(0, 1))
+        pd['k_counts'] += (fqk_k_np > 0).astype(float).sum(axis=(0, 1))
+        overlap = ((fqk_q_np > 0) & (fqk_k_np > 0)).astype(float)
+        active_q = (fqk_q_np > 0).astype(float).sum(axis=-1)
+        pd['overlaps'].append(float((overlap.sum(axis=-1) / (active_q + 1e-8)).mean()))
 
-            w_q = routing.get_weight(std_q_key)
-            w_k = routing.get_weight(std_k_key)
-            if w_q is None or w_k is None:
-                continue
+        # Restore QK: accumulate
+        pd = pool_data['restore_qk']
+        pd['q_counts'] += (rqk_q_np > 0).astype(float).sum(axis=(0, 1))
+        pd['k_counts'] += (rqk_k_np > 0).astype(float).sum(axis=(0, 1))
+        overlap = ((rqk_q_np > 0) & (rqk_k_np > 0)).astype(float)
+        active_q = (rqk_q_np > 0).astype(float).sum(axis=-1)
+        pd['overlaps'].append(float((overlap.sum(axis=-1) / (active_q + 1e-8)).mean()))
 
-            if w_q.ndim == 3:
-                q_counts += (w_q > 0).astype(float).sum(axis=(0, 1))
-                k_counts += (w_k > 0).astype(float).sum(axis=(0, 1))
-            else:
-                q_counts += (w_q > 0).astype(float).sum(axis=0)
-                k_counts += (w_k > 0).astype(float).sum(axis=0)
+        del fqk_q, fqk_k, rqk_q, rqk_k
 
-            # Batch overlap (matches GPU routing_jax.py)
-            if w_q.ndim >= 2:
-                overlap = ((w_q > 0) & (w_k > 0)).astype(float)
-                active_q = (w_q > 0).astype(float).sum(axis=-1)
-                overlap_ratio = (overlap.sum(axis=-1) / (active_q + 1e-8)).mean()
-                batch_overlaps.append(float(overlap_ratio))
+    # Post-process: compute stats per pool
+    results = {}
+    for pool_name, pd in pool_data.items():
+        q_counts = pd['q_counts']
+        k_counts = pd['k_counts']
+        n_neurons = pd['n_neurons']
 
-        # Specialization ratio
         total_usage = q_counts + k_counts
         q_ratio = np.zeros_like(q_counts)
         valid = total_usage > 0
 
-        # Correlation: r_all (all neurons), r_active (active only)
         if q_counts.sum() > 0 and k_counts.sum() > 0:
             corr_all = float(np.corrcoef(q_counts, k_counts)[0, 1])
         else:
@@ -158,9 +304,7 @@ def analyze_qk_specialization(
         shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7)).sum())
         inactive = int((~valid).sum())
 
-        # Sensitivity analysis (vectorized via broadcasting)
         sensitivity_thresholds = np.array([0.6, 0.65, 0.7, 0.75, 0.8])
-        # q_ratio [N] vs thresholds [T] → broadcast [N, T]
         q_spec_all = (q_ratio[:, np.newaxis] > sensitivity_thresholds).sum(axis=0)
         k_spec_all = (q_ratio[:, np.newaxis] < (1 - sensitivity_thresholds)).sum(axis=0)
         shared_all = ((q_ratio[:, np.newaxis] >= (1 - sensitivity_thresholds)) &
@@ -176,14 +320,14 @@ def analyze_qk_specialization(
         }
 
         results[pool_name] = {
-            'display': pool_info['display'],
+            'display': pd['info']['display'],
             'n_neurons': n_neurons,
             'q_counts': q_counts.tolist(),
             'k_counts': k_counts.tolist(),
             'correlation': corr_all,
             'correlation_active': corr_active,
-            'avg_overlap': float(np.mean(batch_overlaps)) if batch_overlaps else 0,
-            'std_overlap': float(np.std(batch_overlaps)) if batch_overlaps else 0,
+            'avg_overlap': float(np.mean(pd['overlaps'])) if pd['overlaps'] else 0,
+            'std_overlap': float(np.std(pd['overlaps'])) if pd['overlaps'] else 0,
             'q_specialized': q_specialized,
             'k_specialized': k_specialized,
             'shared': shared,
@@ -196,9 +340,11 @@ def analyze_qk_specialization(
         }
 
     results['meta'] = {
-        'n_batches': len(batches) if 'batches' in dir() else n_batches,
+        'n_batches': len(batches),
         'batch_size': batch_size,
         'seq_len': seq_len,
+        'multi_layer': True,
+        'n_layers': config.get('n_layers', 16),
     }
     return results
 

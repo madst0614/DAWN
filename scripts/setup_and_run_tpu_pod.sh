@@ -16,6 +16,7 @@ set -euo pipefail
 REPO_URL="https://github.com/madst0614/DAWN.git"
 BRANCH="${BRANCH:?ERROR: BRANCH env var not set}"
 CONFIG="${CONFIG:?ERROR: CONFIG env var not set}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-scripts/train_jax.py}"
 WORK_DIR="$HOME/dawn"
 
 echo "============================================"
@@ -78,7 +79,7 @@ tmux kill-session -t train 2>/dev/null || true
 
 # Start new tmux session running training, tee to ~/train.log
 tmux new-session -d -s train \
-    "python scripts/train_jax.py --config '$CONFIG' 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "python $TRAIN_SCRIPT --config '$CONFIG' 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"

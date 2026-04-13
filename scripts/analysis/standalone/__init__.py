@@ -3,33 +3,9 @@ Standalone Analysis Scripts
 ============================
 CLI tools for specific analysis tasks.
 
-Scripts:
-    routing_analysis.py - Token-level routing analysis during generation
-    compare_factual_neurons.py - Compare neurons across factual prompts
+Scripts are designed to run independently. Import specific modules directly:
+    from scripts.analysis.standalone.routing_analysis import GenerationRoutingAnalyzer
+    from scripts.analysis.standalone.neuron_suppression_experiment_jax import ...
 
-Usage:
-    python scripts/analysis/standalone/routing_analysis.py \
-        --checkpoint path/to/checkpoint \
-        --prompt "The capital of France is" \
-        --output routing_analysis/
-
-    python scripts/analysis/standalone/compare_factual_neurons.py \
-        --input factual_results/ \
-        --output comparison/
+No top-level imports to avoid torch/jax dependency conflicts.
 """
-
-from .routing_analysis import (
-    GenerationRoutingAnalyzer,
-    analyze_common_neurons,
-    analyze_token_neurons,
-    plot_routing_heatmap,
-    plot_routing_comparison,
-)
-
-__all__ = [
-    'GenerationRoutingAnalyzer',
-    'analyze_common_neurons',
-    'analyze_token_neurons',
-    'plot_routing_heatmap',
-    'plot_routing_comparison',
-]

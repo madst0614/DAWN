@@ -1,0 +1,64 @@
+# DAWN v17.1-TPU Training Config - 100M Scale, 20B tokens, v4-32 Pod (REBALANCED)
+# Parameter-matched & FLOPs-matched with baseline 100M (~101.4M, ~112.5B FLOPs)
+# Rebalanced: Attention compute reduced, Knowledge compute increased
+# Know/FFN ratio: 92% (vs fair's 25%) — 3.7x improvement
+# d_space: 256→128, QK pools shrunk, V pools shrunk, Know pools expanded
+# Global batch: 1024 = 32 chips × 32 per_device_batch
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 20000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "17.1"
+  d_model: 768
+  n_layers: 11
+  n_heads: 12
+  rank: 64
+
+  n_feature_qk: 34
+  n_feature_v: 69
+  top_k_feature_qk: 4
+  top_k_feature_v: 6
+
+  n_restore_qk: 34
+  n_restore_v: 69
+  top_k_restore_qk: 4
+  top_k_restore_v: 6
+
+  n_feature_know: 615
+  n_restore_know: 615
+  knowledge_rank: 64
+  top_k_feature_know: 44
+  top_k_restore_know: 44
+
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+  d_space: 128
+  router_dropout: 0.1
+
+training:
+  batch_size: 1024
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.0005
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0001
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+  checkpoint_interval: 200
+  val_interval: 200
+
+use_amp: true
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_100M_c4_20B_v4_32_rebalanced
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_v17_1_100M_c4_20B_v4_32_rebalanced

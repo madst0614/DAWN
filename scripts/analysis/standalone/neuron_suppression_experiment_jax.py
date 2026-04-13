@@ -89,6 +89,34 @@ DEFAULT_CONTROL_QUERIES = [
 
 
 # ============================================================
+# Domain-specific presets
+# ============================================================
+
+QUERY_PRESETS = {
+    'capital': {
+        'description': 'Capital city knowledge (original experiment)',
+        'target_queries': DEFAULT_CAPITAL_QUERIES,
+        'control_queries': DEFAULT_CONTROL_QUERIES,
+    },
+    'physics': {
+        'description': 'Physics/astronomy vs biology/geography/history',
+        'target_queries': [
+            {"prompt": "light travels at the speed of",  "target": "light"},
+            {"prompt": "the earth orbits the",           "target": "sun"},
+            {"prompt": "the earth revolves around the",  "target": "sun"},
+        ],
+        'control_queries': [
+            {"prompt": "plants need sunlight to",         "target": "grow"},
+            {"prompt": "the amazon is the longest",       "target": "river"},
+            {"prompt": "the lungs are used for",          "target": "breathing"},
+            {"prompt": "the french revolution began in",  "target": "1789"},
+            {"prompt": "mount everest is the",            "target": "highest"},
+        ],
+    },
+}
+
+
+# ============================================================
 # Suppressed router pure functions (Phase 2 core)
 # ============================================================
 
@@ -379,7 +407,10 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to .flax checkpoint (file or directory)')
     parser.add_argument('--min_target_count', type=int, default=100,
-                        help='Min target token hits to collect per query')
+                        help='Min target token hits for domain queries (default: 100)')
+    parser.add_argument('--control_min_target_count', type=int, default=20,
+                        help='Min target token hits for control queries (default: 20). '
+                             'Control queries are not used for neuron selection.')
     parser.add_argument('--max_runs', type=int, default=500,
                         help='Max generation runs per query')
     parser.add_argument('--temperature', type=float, default=1.0)
@@ -387,12 +418,18 @@ def main():
                         help='Top-k for sampling (0=greedy)')
     parser.add_argument('--top_n_pct', type=float, default=0.10,
                         help='Suppress top N%% neurons by contrastive score '
-                             '(default: 0.10 = top 10%%)')
+                             '(default: 0.10 = top 10%%). Ignored if --top_n_neurons is set.')
+    parser.add_argument('--top_n_neurons', type=int, default=None,
+                        help='Suppress exactly N neurons per pool (overrides --top_n_pct)')
     parser.add_argument('--mode', type=str, default='intersection',
                         choices=['intersection', 'union'])
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--queries', type=str, default=None,
                         help='Custom queries JSON file')
+    parser.add_argument('--preset', type=str, default=None,
+                        choices=list(QUERY_PRESETS.keys()),
+                        help='Use a built-in query preset '
+                             f'({", ".join(QUERY_PRESETS.keys())})')
     args = parser.parse_args()
 
     print(f"JAX devices: {jax.devices()}")
@@ -406,10 +443,18 @@ def main():
           f"RQK={config.get('n_restore_qk')}, RV={config.get('n_restore_v')}, "
           f"FK={config.get('n_feature_know')}, RK={config.get('n_restore_know')}")
 
-    # Load custom queries
+    # Load queries: --preset > --queries > defaults
     capital_queries = DEFAULT_CAPITAL_QUERIES
     control_queries = DEFAULT_CONTROL_QUERIES
-    if args.queries:
+    target_label = 'target'
+    control_label = 'control'
+    if args.preset:
+        preset = QUERY_PRESETS[args.preset]
+        capital_queries = preset['target_queries']
+        control_queries = preset['control_queries']
+        target_label = args.preset
+        print(f"  Preset: {args.preset} — {preset['description']}")
+    elif args.queries:
         with open(args.queries) as f:
             qdata = json.load(f)
         capital_queries = qdata.get('capital', capital_queries)
@@ -427,7 +472,11 @@ def main():
         temperature=args.temperature,
         top_k_sampling=args.top_k_sampling,
         top_n_pct=args.top_n_pct,
+        top_n_neurons=args.top_n_neurons,
         mode=args.mode,
+        target_label=target_label,
+        control_label=control_label,
+        control_min_target_count=args.control_min_target_count,
     )
 
     # Save
@@ -732,16 +781,20 @@ class NeuronSuppressionExperimentJAX:
     # ----------------------------------------------------------
 
     def identify_suppression_targets(self, freq_results, top_n_pct=0.10,
-                                     mode='intersection'):
+                                     top_n_neurons=None, mode='intersection'):
         """
         Select neurons to suppress based on contrastive scores.
 
         Uses paper method: neurons that are activated significantly MORE
         when the target token is generated vs baseline steps.
 
-        Selects top N% neurons by contrastive score per pool.
-        mode='intersection': must be in top N% for ALL capital queries.
-        mode='union': in top N% for ANY capital query.
+        Selection per pool:
+          - top_n_neurons (int): fixed count — take top N neurons
+          - top_n_pct (float): percentage — take top N% of pool size
+          top_n_neurons takes priority if provided.
+
+        mode='intersection': must be selected for ALL queries.
+        mode='union': selected in ANY query.
         """
         targets = {}
 
@@ -767,7 +820,10 @@ class NeuronSuppressionExperimentJAX:
                     per_query_sets.append(set())
                     continue
 
-                n_select = max(1, int(len(sorted_neurons) * top_n_pct))
+                if top_n_neurons is not None:
+                    n_select = top_n_neurons
+                else:
+                    n_select = max(1, int(len(sorted_neurons) * top_n_pct))
                 meeting = {int(n) for n, _ in positive[:n_select]}
                 per_query_sets.append(meeting)
 
@@ -832,12 +888,16 @@ class NeuronSuppressionExperimentJAX:
         min_target_count=100, max_runs=500,
         max_tokens_per_run=200,
         temperature=1.0, top_k_sampling=50,
-        top_n_pct=0.10, mode='intersection',
+        top_n_pct=0.10, top_n_neurons=None, mode='intersection',
+        target_label='target', control_label='control',
+        control_min_target_count=None,
     ):
         if capital_queries is None:
             capital_queries = DEFAULT_CAPITAL_QUERIES
         if control_queries is None:
             control_queries = DEFAULT_CONTROL_QUERIES
+        if control_min_target_count is None:
+            control_min_target_count = min_target_count
 
         results = {
             'config': {
@@ -845,9 +905,12 @@ class NeuronSuppressionExperimentJAX:
                 'max_runs': max_runs,
                 'temperature': temperature,
                 'top_k_sampling': top_k_sampling,
-                'top_n_pct': top_n_pct, 'mode': mode,
+                'top_n_pct': top_n_pct, 'top_n_neurons': top_n_neurons,
+                'mode': mode,
                 'capital_queries': capital_queries,
                 'control_queries': control_queries,
+                'target_label': target_label,
+                'control_label': control_label,
             },
             'phase1': {}, 'phase2': {}, 'phase3': {},
         }
@@ -864,7 +927,7 @@ class NeuronSuppressionExperimentJAX:
         all_queries = capital_queries + control_queries
         baseline_probs = {}
         for qi, q in enumerate(all_queries, 1):
-            tag = 'capital' if qi <= len(capital_queries) else 'control'
+            tag = target_label if qi <= len(capital_queries) else control_label
             print(f"\n  [{qi}/{len(all_queries)}] [{tag}] \"{q['prompt']}\" -> target: '{q['target']}'")
             bp = self.get_next_token_probs(q['prompt'])
             baseline_probs[q['prompt']] = bp
@@ -901,14 +964,14 @@ class NeuronSuppressionExperimentJAX:
 
         results['phase1']['capital_frequencies'] = freq_results
 
-        print(f"\n  --- Control queries ---")
+        print(f"\n  --- Control queries (min_target_count={control_min_target_count}) ---")
         control_freqs = []
         for qi, q in enumerate(control_queries, 1):
             print(f"\n  [{qi}/{len(control_queries)}] Query: \"{q['prompt']}\" -> target: '{q['target']}'")
             t0 = time.time()
             freq = self.collect_activation_frequencies(
                 q['prompt'], q['target'],
-                min_target_count=min_target_count,
+                min_target_count=control_min_target_count,
                 max_runs=max_runs,
                 max_tokens_per_run=max_tokens_per_run,
                 temperature=temperature,
@@ -924,10 +987,14 @@ class NeuronSuppressionExperimentJAX:
         print("=" * 70)
 
         suppressed = self.identify_suppression_targets(
-            freq_results, top_n_pct=top_n_pct, mode=mode)
+            freq_results, top_n_pct=top_n_pct,
+            top_n_neurons=top_n_neurons, mode=mode)
         total_suppressed = sum(len(v) for v in suppressed.values())
 
-        print(f"\n  Mode: {mode} | Top {top_n_pct:.0%} by contrastive score")
+        if top_n_neurons is not None:
+            print(f"\n  Mode: {mode} | Top {top_n_neurons} neurons per pool")
+        else:
+            print(f"\n  Mode: {mode} | Top {top_n_pct:.0%} by contrastive score")
         print(f"  Total neurons to suppress: {total_suppressed}")
         for pool, indices in sorted(suppressed.items()):
             idx_preview = sorted(indices)[:10]
@@ -958,7 +1025,7 @@ class NeuronSuppressionExperimentJAX:
 
         suppressed_probs = {}
         for qi, q in enumerate(all_queries, 1):
-            tag = 'capital' if qi <= len(capital_queries) else 'control'
+            tag = target_label if qi <= len(capital_queries) else control_label
             print(f"\n  [{qi}/{len(all_queries)}] [{tag}] \"{q['prompt']}\" -> target: '{q['target']}'")
             sp = self.get_next_token_probs(q['prompt'], forward_fn=suppressed_forward)
             suppressed_probs[q['prompt']] = sp
@@ -976,8 +1043,61 @@ class NeuronSuppressionExperimentJAX:
                 print(f"    {prob:>6.2%}  '{tok}' (was {bp_prob:>5.2%}, delta={delta:>+6.2%}){marker}")
         results['phase3']['suppressed_top10'] = suppressed_probs
 
+        # Compute selectivity metrics
+        results['selectivity'] = self._compute_selectivity(
+            capital_queries, control_queries, baseline_probs, suppressed_probs)
+
         self._print_summary(results)
         return results
+
+    def _compute_selectivity(self, capital_queries, control_queries,
+                             baseline_probs, suppressed_probs):
+        """
+        Compute selectivity metrics from probability shifts.
+
+        - target_drop: avg probability drop for target token in domain queries
+        - control_drop: avg probability drop for target token in control queries
+        - selectivity_index: target_drop - control_drop
+          (positive = selective suppression; >0.1 = strong domain specificity)
+        """
+        def _get_target_prob(probs_dict, prompt, target):
+            target_lower = target.strip().lower()
+            entry = probs_dict.get(prompt, {})
+            for tok, _, prob in entry.get('top_tokens', []):
+                if tok.lower() == target_lower:
+                    return prob
+            return 0.0
+
+        target_drops = []
+        for q in capital_queries:
+            pre = _get_target_prob(baseline_probs, q['prompt'], q['target'])
+            post = _get_target_prob(suppressed_probs, q['prompt'], q['target'])
+            target_drops.append(pre - post)
+
+        control_drops = []
+        for q in control_queries:
+            pre = _get_target_prob(baseline_probs, q['prompt'], q['target'])
+            post = _get_target_prob(suppressed_probs, q['prompt'], q['target'])
+            control_drops.append(pre - post)
+
+        avg_target = float(np.mean(target_drops)) if target_drops else 0.0
+        avg_control = float(np.mean(control_drops)) if control_drops else 0.0
+        selectivity = avg_target - avg_control
+
+        return {
+            'target_drops': [float(d) for d in target_drops],
+            'control_drops': [float(d) for d in control_drops],
+            'avg_target_drop': avg_target,
+            'avg_control_drop': avg_control,
+            'selectivity_index': selectivity,
+            'interpretation': (
+                'SELECTIVE: target domain dropped significantly more than control'
+                if selectivity > 0.1
+                else 'WEAK: suppression affected both domains similarly'
+                if selectivity > 0.0
+                else 'NON-SELECTIVE: control dropped more than target'
+            ),
+        }
 
     def _print_summary(self, results):
         print("\n" + "=" * 70)
@@ -986,8 +1106,12 @@ class NeuronSuppressionExperimentJAX:
 
         config = results['config']
         phase2 = results['phase2']
-        print(f"  Top {config['top_n_pct']:.0%} by contrastive score | "
-              f"Mode: {config['mode']}")
+        if config.get('top_n_neurons') is not None:
+            print(f"  Top {config['top_n_neurons']} neurons per pool | "
+                  f"Mode: {config['mode']}")
+        else:
+            print(f"  Top {config['top_n_pct']:.0%} by contrastive score | "
+                  f"Mode: {config['mode']}")
         print(f"  Suppressed: {phase2['total_suppressed']} neurons")
         for pool, indices in sorted(phase2['suppressed_neurons'].items()):
             print(f"    {pool}: {len(indices)}")
@@ -1002,7 +1126,7 @@ class NeuronSuppressionExperimentJAX:
         print("-" * 95)
 
         for qi, q in enumerate(all_queries):
-            tag = '' if qi < n_capital else '  (ctrl)'
+            tag = '' if qi < n_capital else f'  ({config.get("control_label", "ctrl")})'
             prompt = q['prompt']
             target_lower = q['target'].strip().lower()
 
@@ -1027,6 +1151,15 @@ class NeuronSuppressionExperimentJAX:
                   f"{pre_prob:>10.2%}  {post_prob:>11.2%}  {delta:>+7.2%}{tag}")
 
         print("-" * 95)
+
+        # Selectivity metrics
+        sel = results.get('selectivity')
+        if sel:
+            print(f"\n  SELECTIVITY METRICS:")
+            print(f"    Avg target prob drop:  {sel['avg_target_drop']:>+.2%}")
+            print(f"    Avg control prob drop: {sel['avg_control_drop']:>+.2%}")
+            print(f"    Selectivity index:     {sel['selectivity_index']:>+.2%}")
+            print(f"    Verdict: {sel['interpretation']}")
 
 
 if __name__ == '__main__':

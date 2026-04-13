@@ -1,0 +1,63 @@
+# DAWN v17.1-TPU Training Config - 40M Balanced, 5B tokens
+# Parameter-matched with baseline 40M (~40M params)
+# QK:V:Know = 1:1.7:4.3, Compute ~104% (router included)
+# Know/FFN = 54%
+# Pool ratio 1:1.5:5 with uniform ~5% selection rate
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "17.1"
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  rank: 64
+
+  n_feature_qk: 52
+  n_feature_v: 78
+  top_k_feature_qk: 3
+  top_k_feature_v: 5
+
+  n_restore_qk: 52
+  n_restore_v: 78
+  top_k_restore_qk: 3
+  top_k_restore_v: 5
+
+  n_feature_know: 260
+  n_restore_know: 260
+  knowledge_rank: 64
+  top_k_feature_know: 13
+  top_k_restore_know: 13
+
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+  d_space: 128
+  router_dropout: 0.1
+
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0001
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+  checkpoint_interval: 500
+  val_interval: 500
+
+use_amp: true
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_40M_c4_5B_balanced
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_v17_1_40M_c4_5B_balanced

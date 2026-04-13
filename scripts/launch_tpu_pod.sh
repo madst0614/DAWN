@@ -23,6 +23,7 @@ ZONE="us-central2-b"
 PROJECT="dawn-486218"
 BRANCH="main"
 CONFIG="configs/train_config_v17_1_tpu_400M_c4_5B_v4_64.yaml"
+TRAIN_SCRIPT="scripts/train_jax.py"
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -32,14 +33,16 @@ while [[ $# -gt 0 ]]; do
         --project)  PROJECT="$2";  shift 2 ;;
         --branch)   BRANCH="$2";   shift 2 ;;
         --config)   CONFIG="$2";   shift 2 ;;
+        --script)   TRAIN_SCRIPT="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG]"
+            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--script SCRIPT]"
             echo ""
             echo "  --tpu      TPU VM name         (default: $TPU_NAME)"
             echo "  --zone     GCP zone            (default: $ZONE)"
             echo "  --project  GCP project          (default: $PROJECT)"
             echo "  --branch   Git branch to clone  (default: $BRANCH)"
             echo "  --config   Training config YAML (default: $CONFIG)"
+            echo "  --script   Training script      (default: $TRAIN_SCRIPT)"
             exit 0
             ;;
         *)
@@ -56,6 +59,7 @@ echo "  Zone:    $ZONE"
 echo "  Project: $PROJECT"
 echo "  Branch:  $BRANCH"
 echo "  Config:  $CONFIG"
+echo "  Script:  $TRAIN_SCRIPT"
 echo "============================================"
 
 # Check TPU status
@@ -73,7 +77,8 @@ set -e
 REPO_URL='${REPO_URL}'
 BRANCH='${BRANCH}'
 CONFIG='${CONFIG}'
-export BRANCH CONFIG
+TRAIN_SCRIPT='${TRAIN_SCRIPT}'
+export BRANCH CONFIG TRAIN_SCRIPT
 
 # Bootstrap: ensure ~/dawn exists with the right branch
 if [ -d ~/dawn/.git ]; then

@@ -567,10 +567,15 @@ def analyze_pos_selectivity(
     with np.errstate(divide='ignore', invalid='ignore'):
         overall_freq = overall_count / max(total_tokens, 1)
 
+    # Step 2.5: minimum activation filter (paper Appendix D.2)
+    #   Neurons with fewer than 10 total activations are excluded.
+    MIN_ACTIVATIONS = 10
+    active_mask = overall_count >= MIN_ACTIVATIONS  # [n_neurons]
+
     # Step 3: selectivity = activation_freq / overall_freq
     with np.errstate(divide='ignore', invalid='ignore'):
         selectivity = np.where(
-            overall_freq > 0,
+            (overall_freq > 0) & active_mask,
             activation_freq / overall_freq,
             0.0,
         )

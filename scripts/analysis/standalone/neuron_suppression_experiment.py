@@ -92,6 +92,34 @@ DEFAULT_CONTROL_QUERIES = [
 
 
 # ============================================================
+# Domain-specific presets
+# ============================================================
+
+QUERY_PRESETS = {
+    'capital': {
+        'description': 'Capital city knowledge (original experiment)',
+        'target_queries': DEFAULT_CAPITAL_QUERIES,
+        'control_queries': DEFAULT_CONTROL_QUERIES,
+    },
+    'physics': {
+        'description': 'Physics/astronomy vs biology/geography/history',
+        'target_queries': [
+            {"prompt": "light travels at the speed of",  "target": "light"},
+            {"prompt": "the earth orbits the",           "target": "sun"},
+            {"prompt": "the earth revolves around the",  "target": "sun"},
+        ],
+        'control_queries': [
+            {"prompt": "plants need sunlight to",         "target": "grow"},
+            {"prompt": "the amazon is the longest",       "target": "river"},
+            {"prompt": "the lungs are used for",          "target": "breathing"},
+            {"prompt": "the french revolution began in",  "target": "1789"},
+            {"prompt": "mount everest is the",            "target": "highest"},
+        ],
+    },
+}
+
+
+# ============================================================
 # Suppression hooks
 # ============================================================
 
@@ -630,11 +658,61 @@ class NeuronSuppressionExperiment:
         self.remove_suppression()
 
         # ==============================
+        # Selectivity metrics
+        # ==============================
+        selectivity = self._compute_selectivity(
+            freq_results, capital_post, control_baselines, control_post
+        )
+        results['selectivity'] = selectivity
+
+        # ==============================
         # Summary table
         # ==============================
         self._print_summary(results)
 
         return results
+
+    def _compute_selectivity(
+        self,
+        target_pre: List[Dict],
+        target_post: List[Dict],
+        control_pre: List[Dict],
+        control_post: List[Dict],
+    ) -> Dict:
+        """
+        Compute selectivity metrics for domain-specific suppression.
+
+        - target_drop: avg accuracy drop in suppression-target queries
+        - control_drop: avg accuracy change in control queries
+        - selectivity_index: target_drop - control_drop
+          (positive = selective; >0.1 = strong evidence of domain specificity)
+        """
+        target_drops = []
+        for pre, post in zip(target_pre, target_post):
+            target_drops.append(pre['match_rate'] - post['match_rate'])
+
+        control_drops = []
+        for pre, post in zip(control_pre, control_post):
+            control_drops.append(pre['match_rate'] - post['match_rate'])
+
+        avg_target = float(np.mean(target_drops)) if target_drops else 0.0
+        avg_control = float(np.mean(control_drops)) if control_drops else 0.0
+        selectivity = avg_target - avg_control
+
+        return {
+            'target_drops': target_drops,
+            'control_drops': control_drops,
+            'avg_target_drop': avg_target,
+            'avg_control_drop': avg_control,
+            'selectivity_index': selectivity,
+            'interpretation': (
+                'SELECTIVE: target domain dropped significantly more than control'
+                if selectivity > 0.1
+                else 'WEAK: suppression affected both domains similarly'
+                if selectivity > 0.0
+                else 'NON-SELECTIVE: control dropped more than target'
+            ),
+        }
 
     def _print_summary(self, results):
         """Print a clean comparison table."""
@@ -681,6 +759,15 @@ class NeuronSuppressionExperiment:
                   f"{pre_rate:>6.0%}  {post_rate:>6.0%}  {delta:>+6.0%}  (control)")
 
         print("-" * 90)
+
+        # Selectivity metrics
+        sel = results.get('selectivity')
+        if sel:
+            print(f"\n  SELECTIVITY METRICS:")
+            print(f"    Avg target drop:    {sel['avg_target_drop']:>+.1%}")
+            print(f"    Avg control drop:   {sel['avg_control_drop']:>+.1%}")
+            print(f"    Selectivity index:  {sel['selectivity_index']:>+.1%}")
+            print(f"    Verdict: {sel['interpretation']}")
 
         # Post-suppression top tokens for capital queries
         if cap_posts:
@@ -738,6 +825,10 @@ def main():
                         help='Output directory for results JSON')
     parser.add_argument('--queries', type=str, default=None,
                         help='Path to custom queries JSON file')
+    parser.add_argument('--preset', type=str, default=None,
+                        choices=list(QUERY_PRESETS.keys()),
+                        help='Use a built-in query preset '
+                             f'({", ".join(QUERY_PRESETS.keys())})')
 
     args = parser.parse_args()
 
@@ -747,10 +838,15 @@ def main():
     print(f"  Model version: {model.__version__}")
     print(f"  Vocab size: {model.vocab_size}")
 
-    # Load custom queries if provided
+    # Load queries: --preset > --queries > defaults
     capital_queries = None
     control_queries = None
-    if args.queries:
+    if args.preset:
+        preset = QUERY_PRESETS[args.preset]
+        capital_queries = preset['target_queries']
+        control_queries = preset['control_queries']
+        print(f"  Preset: {args.preset} — {preset['description']}")
+    elif args.queries:
         with open(args.queries) as f:
             qdata = json.load(f)
         capital_queries = qdata.get('capital', DEFAULT_CAPITAL_QUERIES)
